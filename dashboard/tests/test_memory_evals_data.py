@@ -1497,6 +1497,137 @@ class TestEscalationJoin:
 
 
 # ---------------------------------------------------------------------------
+# a verdict value outside the closed M2 vocabulary
+# ---------------------------------------------------------------------------
+
+_FP_UNKNOWN_VERDICT = '9876543210fedcba9876543210fedcba'
+
+
+def _unknown_verdict_tree(tmp_path: Path, verdict: Any, *, linked: bool) -> tuple[Path, Path]:
+    """One metric whose verdict value is outside the M2 vocabulary.
+
+    Built standalone rather than folded into ``_join_tree``: that tree is
+    asserted to be issue-free by several tests, and this one exists precisely
+    to raise an issue.  The entry is written as a literal dict because
+    ``_verdict()`` takes a ``str`` and one of these cases is not a string at
+    all — the artifact is unvalidated JSON, so that shape is reachable.
+    """
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    _write_metrics(root, 'eval-a', _JOIN_RUN, [
+        _metric('drifted-metric', 'count', 3.0, direction='higher_is_worse'),
+    ])
+    _write_limits(root, 'eval-a', run_stamp=_JOIN_RUN)
+    _write_verdicts(root, [{
+        'eval_id': 'eval-a',
+        'metric_id': 'drifted-metric',
+        'verdict': verdict,
+        'fingerprint': _FP_UNKNOWN_VERDICT,
+        'run_stamp': _JOIN_RUN,
+    }], run_stamp=_JOIN_RUN)
+    if linked:
+        _write_escalation(
+            esc_dir, 'esc-drifted',
+            dedupe_fingerprint=_FP_UNKNOWN_VERDICT,
+            summary='drifted-metric regressed', timestamp=_JOIN_ESC_TIMESTAMP,
+        )
+    return root, esc_dir
+
+
+class TestUnknownVerdict:
+    """A verdict this reader cannot render is NAMED, never rendered healthy.
+
+    The same shape the module already applies twice: ``unknown_kind`` for a
+    metric kind with no chart primitive, and ``unknown_escalation_status`` for
+    a status it cannot classify.  Both are justified by one rule — an
+    unrecognised value must fail toward "visibly unrenderable", never toward
+    the healthy label.  A verdict outside the closed M2 set is the third
+    instance, and it used to fail the other way: straight to ``clear``.
+
+    The drift is realistic rather than hypothetical.  The LIMITS artifact
+    carries its OWN verdict vocabulary (``baseline_snapshot|ok|alarm|improved|
+    insufficient_data``), so a producer-side mix-up lands ``improved`` in this
+    field — and ``improved`` reading as ``clear`` is very nearly plausible,
+    which is what makes the silent version of this dangerous.
+    """
+
+    def test_unknown_verdict_is_named_not_rendered_clear(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _unknown_verdict_tree(tmp_path, 'improved', linked=False)
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
+
+        assert row['parity'] == 'unknown_verdict'
+        # The reader NAMES the value it cannot render; it never rewrites it.
+        assert row['verdict'] == 'improved'
+
+        named = [i for i in payload['issues'] if i['kind'] == 'unknown_verdict']
+        assert len(named) == 1
+        assert named[0]['eval_id'] == 'eval-a'
+        assert 'drifted-metric' in named[0]['detail']
+        assert "'improved'" in named[0]['detail']
+        # The ROOT verdicts artifact is where the offending value lives.
+        assert named[0]['path'] == str(root / 'verdicts-current.json')
+
+    def test_unknown_verdict_with_an_open_escalation_keeps_the_link(
+        self, tmp_path: Path,
+    ) -> None:
+        """Unrenderable is not unlinked: the escalation is real and still open."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _unknown_verdict_tree(tmp_path, 'improved', linked=True)
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
+
+        assert row['parity'] == 'unknown_verdict_open'
+        assert row['verdict'] == 'improved'
+        assert row['escalation']['id'] == 'esc-drifted'
+        assert len([i for i in payload['issues'] if i['kind'] == 'unknown_verdict']) == 1
+
+    def test_non_string_verdict_is_named_not_raised(self, tmp_path: Path) -> None:
+        """An unhashable verdict must not raise on the vocabulary lookup.
+
+        Mirrors ``test_unhashable_status_is_named_not_raised``: the artifact is
+        unvalidated JSON, so ``verdict`` can be any type, and a bare
+        ``in _KNOWN_VERDICTS`` on a dict would raise ``TypeError``.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _unknown_verdict_tree(tmp_path, {}, linked=False)
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'drifted-metric')
+
+        assert row['parity'] == 'unknown_verdict'
+        # Passed through verbatim, exactly as a recognised value would be.
+        assert row['verdict'] == {}
+        named = [i for i in payload['issues'] if i['kind'] == 'unknown_verdict']
+        assert len(named) == 1
+        assert '{}' in named[0]['detail']
+
+    def test_absent_verdict_earns_no_unknown_issue(self, tmp_path: Path) -> None:
+        """"Nothing judged this" is a legitimate state, not a discard.
+
+        The payload already models it — ``unjudged`` parity, plus
+        ``missing_verdicts``/``orphan_verdict`` at the artifact level — so
+        naming it again here would put a standing issue on a healthy tree and
+        train operators past the list.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert _only(payload['evals'][0]['metrics'], 'unjudged-metric')['parity'] == 'unjudged'
+        assert [i for i in payload['issues'] if i['kind'] == 'unknown_verdict'] == []
+
+
+# ---------------------------------------------------------------------------
 # step-13 — storm collapse, modelled (gamma's gate owns the full matrix)
 # ---------------------------------------------------------------------------
 
