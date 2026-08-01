@@ -1638,9 +1638,10 @@ class TestB9SubmitCli:
 def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
     """Invoke α's deterministic_task_error validator.
 
-    Tries in-process import first (succeeds in workspace-root venv).
-    Falls back to ``uv run --project fused-memory`` subprocess if
-    ModuleNotFoundError (e.g. orchestrator-only venv).
+    Tries in-process import first (succeeds in workspace-root venv). Falls
+    back to ``uv run --project fused-memory`` subprocess on
+    ModuleNotFoundError (e.g. an orchestrator-only venv) — dead under this
+    repo's own conftest.py, where the in-process import always succeeds.
 
     Returns the error dict or None (valid).
 
@@ -1655,6 +1656,13 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
       with ``json.loads(...)`` so both paths receive a ``dict``, not a string.
     - ``uv`` is invoked as a standalone binary (``['uv', 'run', ...]``), NOT
       via ``python -m uv`` (uv is not an importable Python module).
+    - Failure policy: a missing ``uv`` binary (``FileNotFoundError``) is a
+      legitimate environment gap and is skipped. A mis-wired ``--project``
+      dir, a uv that runs and returns non-zero, or a uv that hangs past
+      ``timeout=30`` (all ``subprocess.SubprocessError``) fail loudly via
+      ``pytest.fail`` carrying the computed path/returncode/stderr — none
+      of those are skips, since masking a failing validator as SKIPPED
+      would silently drop real coverage.
     """
     try:
         from fused_memory.middleware.deterministic_task_guard import (  # type: ignore[reportMissingImports]
@@ -1691,11 +1699,20 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
                 ['uv', 'run', '--project', str(fm_project), 'python', '-c', code],
                 text=True,
                 timeout=30,
+                stderr=subprocess.PIPE,
             )
             return json.loads(out.strip()) if out.strip() != 'null' else None
-        except (subprocess.SubprocessError, FileNotFoundError) as exc:
-            pytest.skip(f'fused_memory not importable and uv fallback unavailable: {exc}')
-            return None  # unreachable but satisfies type checker
+        except FileNotFoundError as exc:
+            pytest.skip(f'uv binary not available, cannot run fused_memory fallback: {exc}')
+        except subprocess.SubprocessError as exc:
+            pytest.fail(
+                'fused_memory uv fallback ran and failed — not skipping (a failing '
+                'validator must not be masked as SKIPPED).\n'
+                f'  error:      {type(exc).__name__}: {exc}\n'
+                f'  returncode: {getattr(exc, "returncode", None)}\n'
+                f'  stderr:     {getattr(exc, "stderr", None)}\n'
+                f'  --project:  {fm_project}'
+            )
 
 
 class TestB10Validation:
