@@ -2958,13 +2958,14 @@ async def test_auto_unhalt_resumes_after_cooldown_expiry(
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    with (
-        patch.object(
-            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
-        ) as rfc_mock,
-        contextlib.suppress(TimeoutError),
-    ):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.5)
+    # Both events are named even though `cycled` strictly implies `unhalted`
+    # (the auto-unhalt branch precedes the fall-through cycle): keeping the
+    # witness set in one-to-one correspondence with the assertion set is what
+    # makes a future assertion edit obviously require a witness edit.
+    with patch.object(
+        harness, 'run_full_cycle', side_effect=_signal_cycle,
+    ) as rfc_mock:
+        await _drive_run_loop_until(harness, unhalted, cycled)
 
     unhalt_spy.assert_awaited()
     assert unhalt_spy.await_args is not None
