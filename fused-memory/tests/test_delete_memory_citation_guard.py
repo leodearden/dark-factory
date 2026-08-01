@@ -52,17 +52,27 @@ def _task(task_id, status, metadata):
     return {'id': task_id, 'status': status, 'title': f'task {task_id}', 'metadata': metadata}
 
 
-def _make_service():
-    """MemoryService whose delete_memory is an EXPLICIT AsyncMock.
+def _make_service(resolvable=(SURVIVOR,)):
+    """MemoryService whose awaited children are EXPLICIT AsyncMocks.
 
     Required by tests/test_check_bare_magicmock_config.py and
     tests/test_check_asyncmock_assertion_style.py — an awaited child must be
     declared, not left as an auto-attribute.
+
+    ``get_memory_by_id`` models the real Mem0 point read: the full record for a
+    resolvable id, ``None`` on a genuine miss (memory_service.py:3339-3375).
     """
     svc = AsyncMock()
     svc.delete_memory = AsyncMock(
         return_value={'status': 'deleted', 'store': 'mem0', 'id': DOOMED},
     )
+
+    async def _get(project_id, memory_id):
+        if memory_id in resolvable:
+            return {'id': memory_id, 'content': 'surviving canonical advice', 'metadata': {}}
+        return None
+
+    svc.get_memory_by_id = AsyncMock(side_effect=_get)
     return svc
 
 
@@ -559,3 +569,134 @@ class TestTombstonedTaskIsNotALiveCiter:
         assert len(ledger) == 1
         assert ledger[0]['superseded_memory_id'] == DOOMED
         assert ledger[0]['replacement_memory_id'] == SURVIVOR
+
+
+# Well-formed, canonical, and addresses nothing — the shape check cannot tell
+# it apart from a real survivor.
+HALLUCINATED = 'deadbeef-1111-4aaa-8bbb-000000000099'
+
+
+class TestReplacementMustResolveAndDiffer:
+    """A concrete-looking replacement is not yet a usable one.
+
+    ``is_concrete_memory_id`` only rules out PROSE — its docstring claims
+    nothing about existence — so the shape check alone accepts any canonical
+    UUID string. That leaves two holes which reproduce exactly the harm this
+    gate exists to prevent, with the original now destroyed and unrecoverable:
+
+    - a hallucinated/typo'd id (root cause (1) named in ``verify_cited_memories``'
+      own docstring) rewrites every live citer to point at nothing, and THEN
+      lands the delete — the incident's dangling pointers, merely relocated;
+    - ``replacement_memory_id == memory_id`` makes the rewrite a
+      self-substitution that still reports ``count > 0`` and zero failures, so
+      the gate declares a successful repoint while every citation still
+      addresses the entry being destroyed.
+    """
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1001', 'pending', {'mem0_canonical_entry': DOOMED}),
+            _task('1002', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+    def _server(self, service, interceptor):
+        return create_mcp_server(
+            service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_replacement_is_refused(self, interceptor):
+        """(a) A well-formed id that addresses nothing must never become the
+        destination of a live citation."""
+        service = _make_service()
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=HALLUCINATED)
+
+        assert result['error_type'] == 'CitationReplacementNotFound'
+        assert result['replacement_memory_id'] == HALLUCINATED
+        assert result['memory_id'] == DOOMED
+        assert [c['task_id'] for c in result['citing_tasks']] == ['1001']
+        # Neither half of the harm happened: nothing was repointed at a phantom,
+        # and the original still exists.
+        service.delete_memory.assert_not_awaited()
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_repoint_is_refused(self, interceptor):
+        """(b) Repointing an id to ITSELF is a no-op dressed as a success."""
+        service = _make_service()
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=DOOMED)
+
+        assert result['error_type'] == 'CitationReplacementInvalid'
+        assert result['replacement_memory_id'] == DOOMED
+        assert 'itself' in result['error'] or 'same' in result['error']
+        service.delete_memory.assert_not_awaited()
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_existence_check_failure_fails_closed(self, interceptor):
+        """(c) A raised backend read is 'unknown', not 'resolves' — matching the
+        scan's fail-closed posture ahead of an irreversible delete."""
+        service = _make_service()
+        service.get_memory_by_id = AsyncMock(side_effect=TimeoutError('qdrant timeout'))
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['error_type'] == 'CitationReplacementCheckFailed'
+        service.delete_memory.assert_not_awaited()
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resolvable_different_replacement_still_repoints_then_deletes(
+        self, interceptor,
+    ):
+        """(d) The happy path is unchanged, and the existence read targets the
+        REPLACEMENT — checking the doomed id would prove nothing."""
+        service = _make_service()
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['status'] == 'deleted'
+        service.delete_memory.assert_awaited_once()
+        interceptor.update_task.assert_awaited_once()
+        service.get_memory_by_id.assert_awaited_once_with('dark_factory', SURVIVOR)
+
+    @pytest.mark.asyncio
+    async def test_no_live_citers_pays_for_no_existence_read(self):
+        """(e) The checks sit AFTER the no-live-citers early-out, so an ordinary
+        uncited delete takes no extra store read."""
+        service = _make_service()
+        interceptor = _make_interceptor([_task('1101', 'pending', {'cited': SURVIVOR})])
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=HALLUCINATED)
+
+        assert result['status'] == 'deleted'
+        service.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_inactive_gate_pays_for_no_existence_read(self, interceptor):
+        """(e) An out-of-scope caller (non-recon agent, or a graphiti store)
+        bypasses the gate entirely and reads nothing."""
+        for overrides in (
+            {'agent_id': 'claude-interactive'},
+            {'store': 'graphiti'},
+        ):
+            service = _make_service()
+            mcp_server = self._server(service, interceptor)
+
+            result = await _call_delete(
+                mcp_server, replacement_memory_id=HALLUCINATED, **overrides,
+            )
+
+            assert result['status'] == 'deleted', overrides
+            service.get_memory_by_id.assert_not_awaited()
+            interceptor.get_tasks.assert_not_awaited()
