@@ -233,7 +233,7 @@ def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
 
 def _mock_verify_pass() -> AsyncMock:
     """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=MagicMock(passed=True, summary=''))
+    return AsyncMock(return_value=_fake_verify_result(passed=True, summary=''))
 
 
 def _gated_runner(
@@ -1972,8 +1972,7 @@ class TestOverlapSignal:
         async def _gated_local_verify(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(passed=True, summary='', test_output='', lint_output='',
-                             type_output='', category='')
+            return _fake_verify_result(passed=True, summary='', test_output='', category='')
 
         # ── Branches ───────────────────────────────────────────────────────
         wt_a = await _make_branch_with_file(git_ops, 'task/ov-a', 'ov_a.py', 'a = 1\n')
@@ -2124,8 +2123,7 @@ class TestLastItemOfBurstFinalizes:
         async def _gated_local_verify(*args: Any, **kwargs: Any) -> MagicMock:
             gate_entered.set()
             await gate_release.wait()
-            return MagicMock(passed=True, summary='', test_output='',
-                             lint_output='', type_output='', category='')
+            return _fake_verify_result(passed=True, summary='', test_output='', category='')
 
         # Remote runner exists (→ free_host_count()>1 so the fill loop continues
         # past the local dispatch) but is never used by this single-item burst.
@@ -2241,27 +2239,14 @@ class TestChainInvalidationUnderOverlap:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # N+1's re-dispatched local verify (GREEN step-20 cascade path)
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -2423,27 +2408,14 @@ class TestChainInvalidationUnderOverlap:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # N+1's re-dispatched local verify (cascade path)
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -2641,11 +2613,7 @@ class TestHaltAndUnavailable:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # N+1's remote verify: gated (passes when released)
         gated_remote = _gated_runner(
@@ -2756,11 +2724,7 @@ class TestHaltAndUnavailable:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # N+1's remote runner: gates on entered, then raises RunnerUnavailable
         async def _unavailable_side(*args: Any, **kwargs: Any) -> Any:
@@ -3453,16 +3417,7 @@ class TestRunnerUnavailableHeadCascade:
                 await gate_a_release.wait()
                 raise RunnerUnavailable('simulated host failure for cascade test')
             # Re-dispatched verifies (N and N+1 after cascade re-merge): pass
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── Branches ─────────────────────────────────────────────────────────
         wt_a = await _make_branch_with_file(git_ops, 'task/rucascade-a', 'rucascade_a.py', 'a=1\n')
@@ -3985,27 +3940,14 @@ class TestCascadeFiresRemoteCancel:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # N+1 re-dispatched locally after cascade (pass immediately)
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: id-liveness fake ────────────────────────────
         gate_b_release = asyncio.Event()
@@ -4151,27 +4093,14 @@ class TestCascadeErrorContainment:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # Any subsequent call (req_c's local verify) passes immediately.
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -4367,26 +4296,13 @@ class TestCascadeErrorContainment:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated ────────────────────────────────────────
         gate_b_release = asyncio.Event()
@@ -4632,16 +4548,14 @@ class TestRedispatchSpeculativeConservation:
                 # A's verify: gate, then FAIL.
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='test_failure', test_output='FAILED',
-                    lint_output='', type_output='', category='test_failure',
-                    timed_out=False, verify_skipped=False,
+                return _fake_verify_result(
+                    passed=False,
+                    summary='test_failure',
+                    test_output='FAILED',
+                    category='test_failure',
                 )
             # B's re-dispatched local verify (after the previous_failed remerge).
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok', lint_output='',
-                type_output='', category='', timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         wt_a = await _make_branch_with_file(git_ops, 'task/rc-a', 'rc_a.py', 'a = 1\n')
         wt_b = await _make_branch_with_file(git_ops, 'task/rc-b', 'rc_b.py', 'b = 2\n')
