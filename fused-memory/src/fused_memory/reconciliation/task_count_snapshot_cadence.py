@@ -201,10 +201,28 @@ def extract_snapshot_written(stage_report: object) -> bool | None:
     Accepts a real ``StageReport`` (attribute access), a raw dict shape (e.g.
     a journal-reconstructed ``_error`` entry or test double), or ``None``.
 
+    Key precedence (task 3045): :data:`SNAPSHOT_WRITTEN_STAT_KEY` is read
+    first, and :data:`LEGACY_SNAPSHOT_WRITTEN_STAT_KEY` is consulted ONLY
+    when the new key is ABSENT — not merely falsy. A legitimate ``0`` under
+    the new key is a CONFIRMED miss and must never be re-read from the
+    legacy key, hence the absence sentinel rather than a truthiness check.
+
+    The fallback exists because ``harness._maybe_escalate_stale_task_count_snapshot``
+    recomputes its consecutive-miss streak from ``journal.get_recent_runs``
+    — i.e. from ``stage_reports`` blobs persisted by cycles that ran BEFORE
+    the rename (see ``journal.py``'s stage-report serialization). Without it
+    every such historical row reads as ``None``,
+    :func:`compute_snapshot_miss_streak` stops at the first one, and the
+    ``recon_stale_task_count_snapshot`` escalation silently never fires
+    across the rename boundary — fail-quiet, the worst failure mode for a
+    guard whose entire job is to notice an absence. The fallback can be
+    dropped once no journal rows older than the rename remain inside the
+    harness's ``max(20, threshold * 4)`` lookback window.
+
     Returns:
-        ``True`` when ``stats['task_count_snapshot_mem0_written'] == 1``,
-        ``False`` when ``== 0``, and ``None`` when the report is ``None``,
-        the ``stats`` dict is absent, or the key itself is absent —
+        ``True`` when the resolved stat ``== 1``, ``False`` when ``== 0``,
+        and ``None`` when the report is ``None``, the ``stats`` dict is
+        absent, neither key is present, or the value is unrecognized —
         "unknown", never miscounted as a confirmed miss.
     """
     if stage_report is None:
@@ -213,7 +231,10 @@ def extract_snapshot_written(stage_report: object) -> bool | None:
         stats = stage_report.get('stats') or {}
     else:
         stats = getattr(stage_report, 'stats', None) or {}
-    value = stats.get(SNAPSHOT_WRITTEN_STAT_KEY)
+    _ABSENT = object()
+    value = stats.get(SNAPSHOT_WRITTEN_STAT_KEY, _ABSENT)
+    if value is _ABSENT:
+        value = stats.get(LEGACY_SNAPSHOT_WRITTEN_STAT_KEY)
     if value == 1:
         return True
     if value == 0:
