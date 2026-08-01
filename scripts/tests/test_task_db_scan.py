@@ -291,17 +291,6 @@ def test_group_matches_by_db_empty_input_yields_empty_dict():
     assert group_matches_by_db([]) == {}
 
 
-# --- NO_DB_RESOLVED_MESSAGE ------------------------------------------------
-
-def test_no_db_resolved_message_is_the_exact_string_both_scanners_emit():
-    """Pinned verbatim: both leak scanners' CLI tests assert on this text, and
-    it is the documented exit-2 signal."""
-    assert NO_DB_RESOLVED_MESSAGE == (
-        "no tasks.db resolvable (checked --db / --project-root / "
-        "DASHBOARD_KNOWN_PROJECT_ROOTS / the dark-factory default)"
-    )
-
-
 # --- add_db_discovery_args(parser, json_help=...) --------------------------
 
 def _json_action_help(parser):
