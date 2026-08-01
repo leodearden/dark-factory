@@ -1182,11 +1182,12 @@ _PLAN_QUALITY_MEAN_COLUMNS = (
 #
 # Spelled 'excluded', not 'cap-excluded' (reviewer: design-coherence): the
 # ``cap_tainted`` flag covers every unmeasurable cause — cap hit, auth failure,
-# model-not-found, zero-output wedge, harness error — and a PERMANENT config
-# error ("this candidate can never run") must not render as a TRANSIENT one
-# ("rerun after the cap window"). The cause is always carried in the adjacent
-# ``invocation_error`` column and broken out by cause in the summary line, so
-# the marker itself stays cause-neutral rather than asserting a cap.
+# model-not-found, server error (5xx), zero-output wedge, harness error — and a
+# PERMANENT config error ("this candidate can never run") must not render as a
+# TRANSIENT one ("rerun after the cap window"). The cause is always carried in
+# the adjacent ``invocation_error`` column and broken out by cause in the
+# summary line, so the marker itself stays cause-neutral rather than asserting
+# a cap.
 _CAP_EXCLUDED_CELL = 'excluded'
 _PLAN_QUALITY_MEAN_HEADER = 'plan_quality by config:'
 
