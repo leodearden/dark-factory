@@ -273,6 +273,126 @@ async def test_await_shell_ready_fails_loudly_when_readiness_never_arrives():
             await proc3.wait()
 
 
+@pytest.mark.asyncio
+@pytest.mark.timeout(45)
+async def test_await_group_membership_polls_through_fork_exec_window():
+    """_await_group_membership polls for the full expected group shape rather
+    than judging on a single snapshot, and fails loudly (never a bare
+    TimeoutError, never a silent return) when that shape can never be
+    reached.
+
+    Direct meta-test for the (not-yet-existing) polling helper, following
+    the precedent test_await_shell_ready_fails_loudly_when_readiness_never_
+    arrives sets in this file for unit-testing a private helper's contract
+    on its own rather than only indirectly through the grandchild test that
+    consumes it.
+
+    Rationale: `_await_shell_ready`'s "ready" line proves only that bash's
+    fork() calls for a background job RETURNED IN THE PARENT — not that the
+    child has finished execve() into its target binary. Between fork and
+    exec a child still reports the parent's comm/cmdline, so judging group
+    membership from a single post-ready snapshot races the fork->exec
+    window (task 3347 review round 2, confirmed empirically: ~4.5% hit rate
+    over 200 idle iterations). `_await_group_membership` absorbs that
+    window by polling for the full expected shape, bounded by both a
+    wall-clock deadline and a minimum attempt count.
+
+    Each sub-case spawns its own shell with start_new_session=True,
+    consumes the ready line via the existing `_await_shell_ready`, and
+    cleans up in try/finally with `_kill_group` + `await proc.wait()` — the
+    same cleanup shape the prior review round required of the grandchild
+    test.
+
+    (a) CONVERGES LATE — 'echo ready; sleep 0.3; sleep 60 & sleep 60 &
+        wait'. The foreground `sleep 0.3` runs to completion BEFORE either
+        background `sleep 60` is even forked, so the group is deliberately
+        NOT yet in the expected shape at the ready line — the helper must
+        poll rather than judge on a single observation. Validated 30/30
+        idle and 30/30 under 128-spinner load on a 32-core host, needing
+        2-4 attempts and at most 2.67s. This cannot false-positive on the
+        transient foreground `sleep 0.3` (which also has comm=sleep): it is
+        reaped before the shell forks the two `sleep 60`s, so the group
+        never presents 3 rows with 2 sleeps until the real grandchildren
+        exist. Asserts the call returns normally and the returned snapshot
+        contains exactly 2 comm=sleep rows.
+
+    (b) NEVER CONVERGES — 'echo ready; sleep 60', a group that can never
+        reach 3 rows / 2 sleeps. Called with a deliberately small budget
+        (timeout=0.2, min_attempts=2) so this sub-case stays fast. Asserts
+        it raises `_GroupMembershipTimeout` — an AssertionError subclass,
+        so an unmet precondition can only ever surface as a test FAILURE,
+        never a bare TimeoutError and never a silent return — with a
+        message embedding the last snapshot (a `pid=` row) and both
+        observed counts. Validated 30/30 idle and loaded, max 4.05s
+        (dominated by /proc walk cost, not the deadline).
+
+    This test must fail first: `_await_group_membership` and
+    `_GroupMembershipTimeout` do not exist until the next step lands, so
+    name resolution fails until then.
+    """
+    # (a) Converges late: NOT in the expected shape at the ready line — the
+    # helper must poll through the fork->exec window rather than judge on
+    # a single snapshot.
+    proc = await asyncio.create_subprocess_shell(
+        'echo ready; sleep 0.3; sleep 60 & sleep 60 & wait',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    pgid = proc.pid
+    try:
+        await _await_shell_ready(proc, what='readiness line printed')
+        snapshot = await _await_group_membership(
+            pgid, total=3, comm='sleep', comm_count=2,
+        )
+        sleep_rows = [
+            line for line in snapshot.splitlines() if 'comm=sleep' in line
+        ]
+        assert len(sleep_rows) == 2, (
+            f'expected exactly 2 comm=sleep rows in the returned snapshot '
+            f'once _await_group_membership converged:\n{snapshot}'
+        )
+    finally:
+        if proc.returncode is None:
+            _kill_group(pgid)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+
+    # (b) Never converges: the group can never reach 3 rows / 2 sleeps, so
+    # the helper must exhaust its (deliberately small) budget and raise
+    # rather than hang or silently return.
+    proc2 = await asyncio.create_subprocess_shell(
+        'echo ready; sleep 60',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    pgid2 = proc2.pid
+    try:
+        await _await_shell_ready(proc2, what='readiness line printed')
+        with pytest.raises(_GroupMembershipTimeout) as excinfo:
+            await _await_group_membership(
+                pgid2, total=3, comm='sleep', comm_count=2,
+                timeout=0.2, min_attempts=2,
+            )
+        assert isinstance(excinfo.value, AssertionError)
+        message = str(excinfo.value)
+        assert 'pid=' in message, (
+            f'expected the last snapshot (a pid= row) embedded in the '
+            f'exhaustion message, got: {message}'
+        )
+        assert 'expected 3' in message and 'expected 2' in message, (
+            f'expected both observed counts (total vs expected 3, comm '
+            f'count vs expected 2) embedded in the exhaustion message, '
+            f'got: {message}'
+        )
+    finally:
+        if proc2.returncode is None:
+            _kill_group(pgid2)
+        with contextlib.suppress(Exception):
+            await proc2.wait()
+
+
 class TestTerminateProcessGroup:
     """Unit/integration tests for terminate_process_group."""
 
