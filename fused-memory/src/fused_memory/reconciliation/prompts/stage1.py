@@ -112,6 +112,21 @@ This is a recurrent failure that reinforcement memories alone have not prevented
 this section is the canonical enforcement point for UUID resolution. \
 (Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
 
+**Consolidation deletes MUST name the survivor.** When you delete a duplicate in favour \
+of a surviving entry, pass `replacement_memory_id=<the surviving entry's full 36-char UUID>` \
+to `delete_memory`. Task metadata that still cites the doomed entry is repointed to that \
+survivor BEFORE the delete runs — and the delete is REFUSED outright if any live \
+(non-terminal) task still cites it and you supplied no concrete replacement. Terminal \
+(done/cancelled) citers are reported back to you on the result, never rewritten.
+
+**A `search(...)` instruction is never an acceptable replacement value.** Do not pass — or \
+write into any task's metadata — a value like `'re-derive the current canonical entry via \
+search(query=...)'`. It is rejected mechanically (`CitationReplacementInvalid`), because \
+re-deriving at read time resolves back to the superseded cluster members the consolidation \
+was collapsing, routing dispatch into exactly the contradictory advice you just removed. \
+Only a concrete UUID forwards. \
+(Regression-pinned in fused-memory/tests/test_delete_memory_citation_guard.py.)
+
 ## Terminal-State Pre-Check Discipline
 Before writing a `temporal_fact` whose content states or implies that a task reached a \
 terminal state (done / cancelled / deferred / blocked), follow this verification:

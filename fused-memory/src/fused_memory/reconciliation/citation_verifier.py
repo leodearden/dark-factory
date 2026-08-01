@@ -409,7 +409,10 @@ async def repoint_task_citations(
         stats['stage1_citation_tasks_scanned'] += 1
         metadata = task.get('metadata')
         paths = find_citation_occurrences(metadata, memory_id)
-        if not paths:
+        if not paths or not isinstance(metadata, dict):
+            # find_citation_occurrences only reports paths for a dict blob, so
+            # the isinstance is redundant at runtime — it is the narrowing the
+            # rewrite below needs to be provably safe rather than incidentally so.
             continue
 
         task_id = str(task.get('id'))

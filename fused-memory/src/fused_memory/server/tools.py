@@ -1438,7 +1438,7 @@ def create_mcp_server(
         memory_id: str,
         store: str,
         project_id: str,
-        agent_id: str,
+        agent_id: str | None,
         replacement_memory_id: str | None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Repoint live task-metadata citations BEFORE an irreversible delete.
