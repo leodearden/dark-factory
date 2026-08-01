@@ -1008,3 +1008,97 @@ def apply_topic_anchor(
     if not pinned:
         return hits
     return [*hits, *pinned]
+
+
+# ---------------------------------------------------------------------------
+# Retrieval metrics — rank and set membership ONLY
+# ---------------------------------------------------------------------------
+#
+# WHY THESE DO NOT DELEGATE TO calibrate_write_triage.compute_recall_at_k
+# (INV-5: a reader should not have to wonder why there are two recall@k
+# implementations in this repo).
+#
+# That helper's unit is ID MEMBERSHIP: for each retrieval it asks whether one
+# ``canonical_id`` appears in a flat list of candidate ids, and it drops
+# retrievals flagged ``canonical_present: False`` as corpus gaps.  E2's unit
+# is CLAIM REALIZATION: a single hit realizes a SET of claims, and a grouped
+# document deliberately realizes many at once — which is the entire point of
+# crediting arm (b) fairly.  There is no flat candidate-id list to test
+# membership against, and E2 has no corpus-gap class (fixture
+# cross-validation already guarantees every expected claim is realizable in
+# every arm).  Reshaping E2's data into that signature would mean
+# synthesising a fake id list per (query, claim) pair — more code, and it
+# would hide the grouped-document case rather than express it.
+#
+# What IS reused from it, deliberately, is its rule that an empty denominator
+# reports None rather than 0.0: "no measurement is not a measured zero".
+
+
+def claim_recall_at_k(
+    hits: list[ArmRecord],
+    expected_claim_ids: list[str],
+    k: int,
+) -> float | None:
+    """Fraction of *expected_claim_ids* realized by the top-*k* hits.
+
+    Rank/set-based only (eval-design §1): the sole inputs are the ORDER of
+    *hits* and the claim ids each realizes.  No score is read — and none
+    could be, since :class:`ArmRecord` has no score field.
+
+    A grouped document realizes every claim it absorbed, so arm (b) is not
+    penalised for grouping correctly.  A claim realized by several hits
+    counts once — this is recall over the expected SET, not a hit count.
+
+    Returns ``None`` when *expected_claim_ids* is empty: no measurement is
+    not a measured zero, and averaging one in would drag an arm's reported
+    recall down with non-observations.  An empty *hits* list with a real
+    expectation IS a measured zero — the query was scorable and returned
+    nothing.
+    """
+    if not expected_claim_ids:
+        return None
+    realized: set[str] = set()
+    for hit in hits[:k]:
+        realized.update(hit.claim_ids)
+    expected = set(expected_claim_ids)
+    return len(expected & realized) / len(expected)
+
+
+def topic_discoverability(
+    hits: list[ArmRecord],
+    topic: str,
+    canonical_record_id: str,
+    k: int,
+) -> dict[str, Any]:
+    """Can the topic's canonical be found, and how much of the topic surfaced?
+
+    Returns ``canonical_in_top_k`` (bool), ``canonical_rank`` (**1-based**,
+    or ``None`` when the canonical is absent from *hits* entirely) and
+    ``topic_member_count`` (distinct records carrying ``metadata['topic'] ==
+    topic`` within the top-*k*).
+
+    ``canonical_rank`` is reported even when the canonical falls OUTSIDE the
+    window: "absent from top-5" and "absent entirely" are different findings,
+    and a decision table that conflated them would hide a shape that gets the
+    canonical *nearly* there.
+
+    ``None`` rather than ``0`` for a missing rank is deliberate — ``0`` would
+    collide with a real rank under any 0-based reading and would silently
+    average as "very good" in a mean-rank summary.
+
+    Rank/set-based only: no score is read.
+    """
+    rank: int | None = None
+    for position, hit in enumerate(hits, 1):
+        if hit.record_id == canonical_record_id:
+            rank = position
+            break
+
+    member_ids = {
+        hit.record_id for hit in hits[:k] if hit.metadata.get('topic') == topic
+    }
+    return {
+        'canonical_in_top_k': rank is not None and rank <= k,
+        'canonical_rank': rank,
+        'topic_member_count': len(member_ids),
+    }
