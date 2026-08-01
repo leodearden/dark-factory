@@ -53,6 +53,24 @@ function trendGaps(values) {
   return gaps;
 }
 
+// Missing scalars render an em-dash, never `|| 0`: a synthetic zero reads as a
+// measured zero.  Same placeholder the Memory tab already uses (tabs.jsx:589).
+function dash(v) {
+  if (v === null || v === undefined) return '\u2014';
+  return v;
+}
+
+// Compact age from `latest_run_age_seconds`.  Display only — the staleness
+// THRESHOLD lives server-side and is deliberately absent from the payload, so
+// nothing here can re-derive `stale`.
+function ageText(seconds) {
+  if (seconds === null || seconds === undefined) return '\u2014';
+  const h = seconds / 3600;
+  if (h < 1) return `${Math.round(seconds / 60)}m ago`;
+  if (h < 48) return `${Math.round(h)}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
 // ── Verdict badge ──
 //
 // `verdict` and `parity` are the ONLY badge inputs.  Re-deriving alarm state
@@ -181,11 +199,11 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
       {/* `value` is what the evaluator judged; `current_value` is what the
           metrics artifact says.  Two separate labelled fields — never
           conflated into one "the number". */}
-      <td className="num">{m.value}</td>
-      <td className="num">{m.current_value}</td>
-      <td className="num">{m.n}</td>
-      <td className="num">{m.denominator}</td>
-      <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{m.direction}</td>
+      <td className="num">{dash(m.value)}</td>
+      <td className="num">{dash(m.current_value)}</td>
+      <td className="num">{dash(m.n)}</td>
+      <td className="num">{dash(m.denominator)}</td>
+      <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{dash(m.direction)}</td>
       <td style={{ width: 160 }}>
         {Chart
           ? (
@@ -371,7 +389,21 @@ function MemoryEvalCard({ ev, onNavigate }) {
     <div className="panel">
       <div className="panel-head">
         <span className="title mono">{ev.eval_id}</span>
-        <span className="meta">{ev.latest_run_stamp}</span>
+        {/* Stale is a HINT, never an alarm: the eval runner self-escalates on
+            a missed run (PRD DD6/INV-5), and the threshold that decides
+            `stale` lives server-side and never reaches this payload. */}
+        {ev.stale && (
+          <span
+            className="badge muted"
+            style={{ marginLeft: 8 }}
+            title="displayed here for context; the eval runner is what reports a missed run"
+          >
+            stale — no run in a while
+          </span>
+        )}
+        <span className="meta">
+          {dash(ev.latest_run_stamp)} · {ageText(ev.latest_run_age_seconds)}
+        </span>
       </div>
       <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {/* Truncation disclosure — names BOTH counts, so how much was dropped
@@ -414,6 +446,40 @@ function MemoryEvalCard({ ev, onNavigate }) {
   );
 }
 
+// ── Artifact-issues notice ──
+//
+// Expanded by default, on purpose.  Collapsing a degraded-state notice
+// reproduces the silent degradation it exists to prevent (INV-2/INV-4, the
+// 2658 parse_failures precedent).  Each issue names its kind, eval_id, path
+// and detail — a bare count tells the operator something is wrong but not what.
+function IssuesNotice({ issues, issueCount }) {
+  if (!(issueCount > 0)) return null;
+  const rows = issues || [];
+  return (
+    <div
+      data-testid="memory-eval-issues"
+      style={{
+        padding: '8px 12px',
+        border: '1px solid var(--line)',
+        borderRadius: 4,
+        background: 'var(--bg-2)',
+        color: 'var(--fg-2)',
+        fontFamily: 'var(--mono)',
+        fontSize: 11,
+      }}
+    >
+      <div style={{ color: 'var(--warn)', marginBottom: 4 }}>
+        {issueCount} artifact issue(s)
+      </div>
+      {rows.map((iss, i) => (
+        <div key={`${iss.kind}-${iss.eval_id}-${i}`} style={{ color: 'var(--fg-3)' }}>
+          {iss.kind} · {dash(iss.eval_id)} · {dash(iss.path)} — {dash(iss.detail)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ── The section ──
 function MemoryEvalsSection({ onNavigate }) {
   const payload = MEDF.MEMORY_EVALS;
@@ -424,7 +490,29 @@ function MemoryEvalsSection({ onNavigate }) {
         <span className="lbl" style={{ color: 'var(--fg-3)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>
           memory evals
         </span>
+        <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+          generated {dash(payload.generated_at)}
+        </span>
       </div>
+      {payload.issue_count > 0 && (
+        <div className="col-span-12">
+          <IssuesNotice issues={payload.issues} issueCount={payload.issue_count} />
+        </div>
+      )}
+      {/* Two DISTINCT empty states. root_present false means the artifact tree
+          does not exist yet; root_present true with zero evals is an
+          empty-but-healthy system (memory_evals.py:972-974). Sharing one
+          message would report a working system as a broken one. */}
+      {!payload.root_present && (
+        <div className="col-span-12 empty" data-testid="memory-eval-empty">
+          no eval artifacts yet
+        </div>
+      )}
+      {payload.root_present && evals.length === 0 && (
+        <div className="col-span-12 empty">
+          eval root present, no eval directories yet
+        </div>
+      )}
       {payload.storm_escape && (
         <div className="col-span-12">
           <StormBanner storm={payload.storm_escape} onNavigate={onNavigate} />
