@@ -699,6 +699,148 @@ class TestJudgePlanQuality:
 
 
 # ---------------------------------------------------------------------------
+# The plan judge REFUSES an unjudgeable artifact (task 3303)
+#
+# The reported defect, from the 2026-07-29 corpus cell
+# ``reify_task_12__architect-opus-high__52c66767.json``: ``plan_steps=0``
+# alongside ``plan_quality=0.31`` — an artifact carrying NOTHING to judge,
+# scored a confident-looking third of a point. That number cannot have come
+# from the deterministic floor at all: PLAN_QUALITY_RUBRIC's weights sum to
+# 8.0 and score_plan_structure returns ``round(satisfied_weight / 8, 4)``, so
+# its outputs are multiples of 0.125 and 0.31 is not one. It came from the LLM
+# judge, which scored an empty artifact because it had no scorability guard of
+# its own — its coherence rested ENTIRELY on its one caller remembering to gate.
+#
+# Task 3302 closed the two OUTER halves: the CALL SITE (run_architect_eval
+# gates on is_scorable_plan) and the READER (report._plan_quality_score floors
+# an on-disk no-plan cell). This class pins the INSTRUMENT itself, so a second
+# caller — a backfill/re-scoring script, a new eval path, prompt_opt, a resume
+# wave — cannot silently re-open the same defect.
+#
+# Parametrized over the SHARED _UNSCORABLE_PLAN_SHAPES corpus (line 103), the
+# same list TestIsScorablePlan uses: any shape added to the predicate's corpus
+# automatically extends the judge path's coverage, so the two instruments can
+# never be tested out of step with each other.
+# ---------------------------------------------------------------------------
+
+def _confident_judge_result() -> MagicMock:
+    """What the UNGATED judge really does with an artifact carrying no content.
+
+    A high, confident-looking score with per-criterion detail — at the call
+    site indistinguishable from a real judgement of a real plan. This is the
+    payload the guard must never let through.
+    """
+    payload = {
+        'plan_quality': 0.95,
+        'per_criterion': {'has_steps': 1.0},
+        'reasoning': 'looks fine',
+    }
+    fake = MagicMock()
+    fake.structured_output = payload
+    fake.output = json.dumps(payload)
+    return fake
+
+
+@pytest.mark.asyncio
+class TestJudgePlanQualityRefusesAnUnjudgeableArtifact:
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    async def test_scores_the_deterministic_floor_not_the_judges_number(self, plan):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_confident_judge_result()),
+        ):
+            verdict = await judge_plan_quality(plan, 'diff', _judge_task())
+
+        assert verdict.plan_quality == 0.0
+
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    async def test_the_two_instruments_agree(self, plan):
+        """THE coherence identity — the property whose violation 3303 reports.
+
+        Stated against the floor rather than a magic number, so the two
+        plan-quality instruments are structurally incapable of disagreeing on
+        an unjudgeable artifact even if the floor's semantics later change.
+        """
+        from orchestrator.evals.judge import judge_plan_quality, score_plan_structure
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_confident_judge_result()),
+        ):
+            verdict = await judge_plan_quality(plan, 'diff', _judge_task())
+
+        assert verdict.plan_quality == score_plan_structure(plan)
+
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    async def test_no_opus_call_is_made(self, plan):
+        # Nothing to judge, so no spend: the refusal happens BEFORE the prompt
+        # is built and before invoke_agent is awaited.
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_confident_judge_result()),
+        ) as mock_invoke:
+            await judge_plan_quality(plan, 'diff', _judge_task())
+
+        mock_invoke.assert_not_awaited()
+
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    async def test_the_refusal_is_a_content_verdict_not_an_infra_failure(self, plan):
+        """A stepless plan from a healthy judge call is a REAL 0.0.
+
+        Never the None sentinel (parse failure / transport refusal) and never
+        the cap-tainted exclusion shape — the content-failure vs infra-failure
+        distinction tasks 3118 and 3302 both turn on.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_confident_judge_result()),
+        ):
+            verdict = await judge_plan_quality(plan, 'diff', _judge_task())
+
+        assert verdict.invocation_error is None
+        assert verdict.per_criterion == {}
+
+    async def test_a_real_plan_still_reaches_the_judge(self):
+        # CONTROL: the guard keys on scorability, so a real plan is untouched.
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_confident_judge_result()),
+        ) as mock_invoke:
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        mock_invoke.assert_awaited()
+        assert verdict.plan_quality == 0.95
+
+    async def test_a_degenerate_but_scorable_plan_still_reaches_the_judge(self):
+        # CONTROL: one lonely impl step — SCORABLE but structurally poor. The
+        # guard asks "is there content to judge?", never "is the content good?",
+        # so a bad plan keeps earning its low score from the judge rather than
+        # being laundered into a floor.
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_confident_judge_result()),
+        ) as mock_invoke:
+            verdict = await judge_plan_quality(
+                _degenerate_plan(), 'diff', _judge_task(),
+            )
+
+        mock_invoke.assert_awaited()
+        assert verdict.plan_quality == 0.95
+
+
+# ---------------------------------------------------------------------------
 # Architect-role candidate in configs.py (step-7/8)
 #
 # EvalConfig gains role (default 'implementer' → every existing EVAL_CONFIGS
