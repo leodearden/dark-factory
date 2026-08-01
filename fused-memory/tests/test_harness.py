@@ -2296,8 +2296,9 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
     """run_loop() must skip run_full_cycle for projects that are halted by the judge.
 
     Bug 3: judge.is_halted() is never called in run_loop, so halted projects keep
-    processing new cycles.  This test drives one run_loop iteration via a short
-    asyncio.wait_for and confirms run_full_cycle is never called for a halted project.
+    processing new cycles.  This test drives run_loop until the halt-SKIP branch
+    is observed (see _halt_skip_event) and confirms run_full_cycle is never
+    called for a halted project.
     """
     import asyncio
     from unittest.mock import AsyncMock, patch
@@ -2343,12 +2344,8 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
     # Positive witness for the halt-SKIP branch — see _halt_skip_event.
     skipped = _halt_skip_event(harness)
 
-    with (
-        patch.object(harness, 'run_full_cycle', side_effect=spy_rfc),
-        contextlib.suppress(TimeoutError),
-    ):
-        # Run loop for one sleep cycle (loop sleeps 5s; we wait 0.2s — enough for 1 iteration)
-        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+    with patch.object(harness, 'run_full_cycle', side_effect=spy_rfc):
+        await _drive_run_loop_until(harness, skipped)
 
     assert skipped.is_set(), (
         'halt check never reached — the run_full_cycle absence assertion below '
