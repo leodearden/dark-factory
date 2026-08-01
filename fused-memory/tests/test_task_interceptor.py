@@ -10800,6 +10800,174 @@ class TestPathGuardEscalationWordingEndToEnd:
         assert payload['suggested_action'] == 'resubmit_to_dark_factory', payload
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not sve_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestRoutingOverrideEndToEndAudit:
+    """Task 3123's USER-OBSERVABLE SIGNAL, end-to-end through ``submit_task``.
+
+    Both halves have to hold at once, so both are asserted on the same call:
+    the override KEEPS WORKING (the task is still created and the reason is
+    still persisted), and the bypass is now AUDITED (a record an operator can
+    actually find exists on disk).  A REAL ``ScopeViolationEscalator`` writing
+    into ``tmp_path`` is used rather than a double — the signal is the record
+    in the operator's queue, so a doubles-only assertion would not check it.
+    """
+
+    REASON = 'self-referential: this task is about the guard'
+
+    @staticmethod
+    def _registry(tmp_path):
+        """A registry that knows ONLY the foreign ``reify`` root.
+
+        Leaving the filing project UNKNOWN is deliberate: it keeps the
+        esc-3004-2 cross-repo allow-and-tag narrowing out of the way, so the
+        no-override control below is a genuine FILES-certain hard reject.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        return ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+
+    @staticmethod
+    def _payloads(tmp_path):
+        """Escalations written into the FILING project's queue."""
+        queue_dir = tmp_path / 'dark-factory' / 'data' / 'escalations'
+        return [
+            json.loads(f.read_text())
+            for f in sorted(queue_dir.glob('esc-*.json'))
+        ]
+
+    def _wire(self, interceptor_with_store, tmp_path):
+        from fused_memory.middleware.scope_violation_escalator import (
+            ScopeViolationEscalator,
+        )
+
+        interceptor_with_store._prefix_registry = self._registry(tmp_path)
+        interceptor_with_store._scope_violation_escalator = ScopeViolationEscalator()
+
+    async def test_override_submission_creates_task_and_files_audit_escalation(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+        tmp_path,
+    ):
+        self._wire(interceptor_with_store, tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'dark-factory'),
+                title='Harden the path-scope guard override',
+                description='the guard itself',
+                metadata={'files': ['crates/widget.rs']},
+                routing_override_reason=self.REASON,
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        # HALF ONE — the override still works.
+        assert 'error_type' not in result, (
+            f'the override must still bypass the hard reject, got: {result}'
+        )
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'expected a ticket, got: {result}'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?', (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'expected persisted row for {ticket_id!r}'
+        blob = json.loads(row['candidate_json'])
+        assert (blob.get('metadata') or {}).get('routing_override_reason') == self.REASON
+        # Re-pins the no-leak invariant THROUGH the new code path.
+        assert 'routing_override_reason' not in blob.get('kwargs', {})
+
+        # HALF TWO — the bypass is now audited.
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1, f'expected exactly one audit record, found: {payloads}'
+        payload = payloads[0]
+        assert payload['category'] == 'scope_violation'
+        assert payload['id'].startswith('esc-task-path-guard-override'), payload['id']
+        assert self.REASON in payload['detail']
+        assert 'dark_factory' in payload['detail']
+        # The path that WOULD have hard-rejected is named in the record.
+        assert 'crates/widget.rs' in payload['detail']
+
+    async def test_override_submission_planning_mode_also_audits(
+        self,
+        interceptor_with_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """``_path_guard_or_skip`` runs BEFORE the planning-mode split, so one
+        mechanism has to cover both submission paths."""
+        self._wire(interceptor_with_store, tmp_path)
+
+        result = await interceptor_with_store.submit_task(
+            project_root=str(tmp_path / 'dark-factory'),
+            title='Harden the path-scope guard override',
+            description='the guard itself',
+            metadata={'files': ['crates/widget.rs']},
+            planning_mode=True,
+            routing_override_reason=self.REASON,
+        )
+
+        assert 'error_type' not in result, result
+        assert result.get('status') == 'deferred', result
+        assert result.get('task_id') is not None, result
+
+        taskmaster.add_task.assert_called_once()
+        decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+        assert decoded.get('routing_override_reason') == self.REASON
+
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1, f'expected exactly one audit record, found: {payloads}'
+        assert payloads[0]['id'].startswith('esc-task-path-guard-override')
+        assert self.REASON in payloads[0]['detail']
+
+    async def test_no_override_submission_files_no_override_escalation(
+        self,
+        interceptor_with_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """The control: the two records are distinguishable ON DISK.
+
+        Without the override the same submission still hard-rejects, and the
+        record it writes is a rejection — not an override audit.
+        """
+        self._wire(interceptor_with_store, tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'dark-factory'),
+                title='Harden the path-scope guard override',
+                description='the guard itself',
+                metadata={'files': ['crates/widget.rs']},
+                # routing_override_reason intentionally omitted
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', result
+
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1, f'expected exactly one record, found: {payloads}'
+        assert not payloads[0]['id'].startswith('esc-task-path-guard-override'), (
+            f'a rejection must not be filed as an override audit: {payloads[0]["id"]}'
+        )
+        assert payloads[0]['summary'].startswith('Misrouted task rejected: ')
+
+
 # ─────────────────────────────────────────────────────────────────────
 # planning_mode: synchronous, curator-bypassing submit_task path
 # ─────────────────────────────────────────────────────────────────────
