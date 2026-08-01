@@ -2406,3 +2406,358 @@ class TestAuditRecallReusesTheRealImplementations:
         import inspect  # noqa: PLC0415
 
         assert '0.85' not in inspect.getsource(_mod())
+
+
+# ===========================================================================
+# step-17 — the report: build_report + render_markdown
+# ===========================================================================
+#
+# `plans/e2-storage-shape-bakeoff-report.{json,md}` is this task's
+# user-observable output and the signal gate leaf η puts in front of an
+# operator: the PRD's choice between δ-as-default and peers-as-default gets
+# made by reading it. So the artifact is held to artifact standards.
+#
+#   * SIX arm variants — three shapes x pin on/off. The pin is a read-side
+#     transform, so its variants share their shape's seeded collection, but
+#     they are separate ROWS: "does the pin help?" is a question the table
+#     must answer per shape.
+#   * A partial table RAISES. A decision table with a silently blank cell is
+#     worse than no table: the reader cannot tell "measured and equal" from
+#     "never measured", and the blank always reads as the former.
+#   * Rendering is byte-deterministic, so a rerun's diff is signal.
+#
+# NO metric value, rate or bound is asserted (G6) — every measurement below
+# is synthetic, chosen to make a shape assertion legible, and means nothing.
+
+
+def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words'):
+    """One arm's four metrics, fully populated. Values are arbitrary."""
+    return {
+        'claim_recall': {'at_5': recall5, 'at_10': recall10},
+        'discoverability': {
+            'canonical_in_top_5_rate': 0.7,
+            'median_canonical_rank': 2.0,
+            'mean_topic_member_count': 3.0,
+        },
+        'tokens_per_query': {'mean': 412.0, 'estimator': estimator},
+        'guard_adequacy': {
+            'clusters_measured': 15,
+            'candidate_present_rate': 0.6,
+            'guard_matched_rate': 0.2,
+            'threshold_replay': True,
+            'threshold': 0.92,
+        },
+    }
+
+
+def _all_arms():
+    return {arm: _arm_measurement() for arm in _mod().ARM_VARIANTS}
+
+
+def _protocol():
+    return {
+        'blind_authoring': 'single-author-blind-to-metrics (commit ordering)',
+        'fixtures': [
+            {'path': 'tests/fixtures/e2_arm_claims.jsonl', 'commit': 'abc1234'},
+            {'path': 'tests/fixtures/e2_query_set.jsonl', 'commit': 'def5678'},
+        ],
+        'token_estimator': 'char-proxy:4-chars-per-token',
+        'guard_threshold': 0.92,
+        'distractor_slab_size': 40,
+        'embedder_model': 'text-embedding-3-small',
+    }
+
+
+def _audit_recall():
+    return {
+        'detector': 'audit_duplicate_memories.find_near_duplicate_memory_groups',
+        'threshold': 0.85,
+        'groups_found': 0,
+        'true_dup': {
+            'pairs': 301, 'recovered': 0, 'recall': 0.0,
+            'lexical_band': {'pairs': 0, 'recovered': 0, 'recall': None},
+            'paraphrase_band': {'pairs': 301, 'recovered': 0, 'recall': 0.0},
+        },
+        'hard_negative': {'pairs': 18, 'falsely_grouped': 0, 'rate': 0.0},
+        'unrelated': {'pairs': 5037, 'falsely_grouped': 0, 'rate': 0.0},
+        'paraphrase_exemplars': [{'a': 'x', 'b': 'y', 'max_ratio': 0.55}],
+    }
+
+
+def _report():
+    return _mod().build_report(
+        arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+    )
+
+
+class TestArmVariants:
+    """Three shapes x pin on/off, named once."""
+
+    def test_there_are_exactly_six_named_variants(self):
+        mod = _mod()
+
+        assert mod.ARM_VARIANTS == (
+            'status_quo', 'status_quo+pin',
+            'c_peers', 'c_peers+pin',
+            'b_grouped', 'b_grouped+pin',
+        )
+
+    def test_every_shape_appears_with_and_without_the_pin(self):
+        mod = _mod()
+
+        for shape in mod.ARM_SHAPES:
+            assert shape in mod.ARM_VARIANTS
+            assert f'{shape}+pin' in mod.ARM_VARIANTS
+
+
+class TestBuildReportShape:
+    """What gate η reads."""
+
+    def test_it_carries_an_entry_for_every_arm_variant(self):
+        report = _report()
+
+        assert list(report['arms']) == list(_mod().ARM_VARIANTS)
+
+    def test_every_arm_carries_all_four_e2_metrics(self):
+        report = _report()
+
+        for arm, measurement in report['arms'].items():
+            assert set(measurement) >= {
+                'claim_recall', 'discoverability', 'tokens_per_query',
+                'guard_adequacy',
+            }, arm
+
+    def test_claim_recall_is_reported_at_both_k(self):
+        """k=5 because the near-dup guard lives there; k=10 because a shape
+        that merely ranks slower is a different finding from one that loses
+        the claim outright."""
+        report = _report()
+
+        for measurement in report['arms'].values():
+            assert set(measurement['claim_recall']) == {'at_5', 'at_10'}
+
+    def test_guard_adequacy_keeps_both_of_its_parts(self):
+        report = _report()
+
+        for measurement in report['arms'].values():
+            guard = measurement['guard_adequacy']
+            assert 'candidate_present_rate' in guard  # rank/set-based
+            assert 'guard_matched_rate' in guard      # threshold replay
+            assert guard['threshold_replay'] is True
+
+    def test_it_carries_the_d10_audit_recall_block(self):
+        report = _report()
+
+        assert report['audit_recall']['true_dup']['paraphrase_band']['pairs'] == 301
+
+    def test_the_protocol_block_records_how_the_experiment_was_run(self):
+        """An arbitration artifact whose provenance is not in it cannot be
+        re-read six months later by somebody who was not here."""
+        protocol = _report()['protocol']
+
+        assert 'blind' in protocol['blind_authoring']
+        assert protocol['fixtures'][0]['commit']       # the audit trail
+        assert protocol['token_estimator']             # which numbers these are
+        assert protocol['guard_threshold'] == 0.92
+        assert protocol['distractor_slab_size'] == 40
+        assert protocol['embedder_model']
+
+    def test_the_report_is_json_serializable(self):
+        """It is written to disk as JSON; a non-serializable value would fail
+        at the very end of an hour-long run."""
+        json.dumps(_report())
+
+
+class TestBuildReportRefusesAPartialTable:
+    """A blank cell reads as "measured and equal". It never is."""
+
+    def test_a_missing_arm_raises(self):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped+pin']
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'b_grouped+pin' in str(excinfo.value)
+
+    def test_a_missing_metric_names_both_the_arm_and_the_metric(self):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['c_peers']['tokens_per_query']
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'c_peers' in str(excinfo.value)
+        assert 'tokens_per_query' in str(excinfo.value)
+
+    def test_a_missing_k_within_claim_recall_raises(self):
+        """The nested case is the one that would actually slip through: the
+        metric key is present, so a shallow check passes and the column
+        renders blank."""
+        mod = _mod()
+        arms = _all_arms()
+        del arms['status_quo']['claim_recall']['at_10']
+
+        with pytest.raises(mod.IncompleteReportError):
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+    def test_a_missing_guard_part_raises(self):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped']['guard_adequacy']['candidate_present_rate']
+
+        with pytest.raises(mod.IncompleteReportError):
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+    def test_an_unknown_arm_name_raises(self):
+        """A typo would otherwise drop a real arm AND add a phantom one, and
+        the table would still look complete."""
+        mod = _mod()
+        arms = _all_arms()
+        arms['c_peers_pin'] = arms.pop('c_peers+pin')
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'c_peers_pin' in str(excinfo.value)
+
+    def test_a_missing_protocol_key_raises(self):
+        mod = _mod()
+        protocol = _protocol()
+        del protocol['token_estimator']
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=_all_arms(), audit_recall=_audit_recall(), protocol=protocol,
+            )
+
+        assert 'token_estimator' in str(excinfo.value)
+
+    def test_a_none_measurement_is_accepted_and_is_not_a_missing_one(self):
+        """"Measured, no denominator" is a legitimate result and must survive
+        to the table as such — only an ABSENT key is a broken run."""
+        mod = _mod()
+        arms = _all_arms()
+        arms['status_quo']['claim_recall']['at_10'] = None
+
+        report = mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        assert report['arms']['status_quo']['claim_recall']['at_10'] is None
+
+
+class TestRenderMarkdown:
+    """The operator-facing decision table."""
+
+    def test_it_renders_exactly_one_row_per_arm_in_the_json(self):
+        report = _report()
+
+        rendered = _mod().render_markdown(report)
+
+        rows = [
+            line for line in rendered.splitlines()
+            if line.startswith('| ') and not line.startswith('| ---')
+        ]
+        # header + one row per arm
+        assert len(rows) == 1 + len(report['arms'])
+        for arm in report['arms']:
+            assert sum(1 for row in rows if row.startswith(f'| {arm} |')) == 1
+
+    def test_the_table_header_is_pinned_column_for_column(self):
+        """Pinned by equality, not by substring: a column quietly dropped from
+        a decision table is a metric quietly dropped from the decision."""
+        mod = _mod()
+
+        rendered = mod.render_markdown(_report())
+        header = next(
+            line for line in rendered.splitlines() if line.startswith('| arm ')
+        )
+
+        assert header == '| ' + ' | '.join(mod.DECISION_TABLE_COLUMNS) + ' |'
+
+    def test_it_states_in_prose_which_number_is_a_threshold_replay(self):
+        """eval-design §1's discipline has to survive contact with a reader
+        who never opens the script."""
+        rendered = _mod().render_markdown(_report())
+
+        assert 'threshold replay' in rendered.lower()
+        assert 'rank' in rendered.lower()
+
+    def test_it_names_the_estimator_that_produced_the_token_column(self):
+        rendered = _mod().render_markdown(_report())
+
+        assert 'char-proxy:4-chars-per-token' in rendered
+
+    def test_it_reports_the_d10_band_split(self):
+        rendered = _mod().render_markdown(_report())
+
+        assert 'paraphrase' in rendered.lower()
+        assert '301' in rendered
+
+    def test_a_missing_measurement_renders_as_no_measurement_not_zero(self):
+        mod = _mod()
+        arms = _all_arms()
+        arms['status_quo']['claim_recall']['at_5'] = None
+        report = mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        row = next(
+            line for line in mod.render_markdown(report).splitlines()
+            if line.startswith('| status_quo |')
+        )
+
+        assert '0.00' not in row.split('|')[2]
+        assert '—' in row
+
+    def test_rendering_is_byte_identical_for_identical_input(self):
+        """A rerun's diff is only signal if formatting contributes nothing."""
+        mod = _mod()
+
+        assert mod.render_markdown(_report()) == mod.render_markdown(_report())
+
+    def test_it_records_the_fixture_commits_that_prove_the_blind_protocol(self):
+        rendered = _mod().render_markdown(_report())
+
+        assert 'abc1234' in rendered
+        assert 'e2_arm_claims.jsonl' in rendered
+
+
+class TestFixtureProvenance:
+    """The blind-authoring audit trail is git history; the report cites it."""
+
+    def test_it_reports_the_commit_that_last_touched_a_committed_fixture(self):
+        provenance = _mod().fixture_provenance([ARM_CLAIMS_PATH])
+
+        assert len(provenance) == 1
+        assert provenance[0]['path'].endswith('e2_arm_claims.jsonl')
+        assert len(provenance[0]['commit']) == 40  # a full sha
+
+    def test_an_untracked_path_reports_no_commit_rather_than_a_wrong_one(self,
+                                                                        tmp_path):
+        untracked = tmp_path / 'never_committed.jsonl'
+        untracked.write_text('{}\n')
+
+        provenance = _mod().fixture_provenance([untracked])
+
+        assert provenance[0]['commit'] is None
+
+    def test_paths_are_reported_repo_relative_not_absolute(self):
+        """An artifact naming `/home/<someone>/src/...` is not reproducible
+        and leaks the checkout it happened to run in."""
+        provenance = _mod().fixture_provenance([ARM_CLAIMS_PATH])
+
+        assert not provenance[0]['path'].startswith('/')
