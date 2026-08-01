@@ -711,6 +711,150 @@ class TestDeriveVerifyPlanTaskRoleFloor:
 
 
 # ---------------------------------------------------------------------------
+# derive_verify_plan: the MIXED-diff case the λ floor left open (task 3294)
+# ---------------------------------------------------------------------------
+
+# task 3294: the 3033-shaped MIXED diff — a production file plus a
+# co-committed collectable test file under the SAME module prefix. Pre-3294
+# this hit _derive_module_runs' `elif collectable_tests:` branch (which sat
+# ABOVE the λ floor) and narrowed pytest to just the touched test file, so
+# adding a test to a source-only diff REMOVED coverage. Synthetic paths,
+# matching SOURCE_ONLY_DIFF's invented-path convention.
+MIXED_SOURCE_DIFF: list[str] = [
+    'orchestrator/src/orchestrator/some_module.py',
+    'orchestrator/tests/test_new_thing.py',
+]
+
+# The same shape with the production file being a STRUCTURAL one — the REAL
+# orchestrator/src/orchestrator/workflow.py case, which classify_file returns
+# STRUCTURAL (not SOURCE) for whenever content is read, because it defines
+# `class _McpLike(Protocol)`. A SOURCE-only widening predicate would miss the
+# exact file that motivated this task.
+MIXED_STRUCTURAL_DIFF: list[str] = [
+    STRUCTURAL_DIFF[0],
+    'orchestrator/tests/test_new_thing.py',
+]
+
+
+class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
+    """Task 3294: at role='task', a touched PRODUCTION file full-suites the
+    owning module even when a test file is co-committed.
+
+    λ (task 2589, R3) placed the task-role floor BELOW the collectable-test
+    branch, so it only ever fired when the module's touched files contained no
+    collectable test at all. That made coverage non-monotone in the diff: a
+    source-only diff paid the owning module's full suite, but the SAME diff
+    plus a test file narrowed to that one test file. Task 3033 is the
+    incident — its diff touched orchestrator/src/orchestrator/workflow.py plus
+    tests, the plan file-scoped to 36 items instead of the module's ~13188,
+    and a regression in test_workflow_resume_on_progress.py (a DIFFERENT
+    consumer of workflow.py) was structurally invisible.
+
+    The rule pinned here: ANY touched SOURCE/STRUCTURAL file under the prefix
+    runs the owning module's full test_command at role='task'; only a
+    test-tree-ONLY diff keeps FILE_SCOPED selection (PRD R3). role='merge' is
+    untouched (PRD R4).
+    """
+
+    def test_mixed_source_plus_touched_test_full_suites_at_task_role(self):
+        """(a) SOURCE production file + co-committed collectable test ->
+        FULL_SUITE at role='task'. The co-committed test must NOT narrow the
+        run: the command is the module's verbatim test_command and carries no
+        scoped_targets, so the whole owning package is collected."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert run.scoped_targets == ()
+        # The widened run targets the package, never the touched test file.
+        assert run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' not in run.cmd.targets
+
+    def test_mixed_structural_plus_touched_test_full_suites_at_task_role(self):
+        """(b) The REAL workflow.py case: the production file classifies
+        STRUCTURAL (Protocol-bearing content, read because type_check_command
+        is configured), not SOURCE. It must widen pytest exactly as the SOURCE
+        variant does — the predicate is SOURCE ∪ STRUCTURAL, so pytest breadth
+        never becomes silently type-check-config-dependent. Control: pyright
+        is still FULL_SUITE via the untouched D2 rule."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+            type_check_command=(
+                'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+            ),
+        )
+        plan = derive_verify_plan(
+            MIXED_STRUCTURAL_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+
+        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert pytest_run.cmd == parse_config_command(mc.test_command)
+        assert pytest_run.scoped_targets == ()
+        assert pytest_run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' not in pytest_run.cmd.targets
+
+        # Control: D2 is role-independent and untouched by this task.
+        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.type_check_command is not None
+        assert pyright_run.cmd == parse_config_command(mc.type_check_command)
+
+    def test_mixed_diff_stays_file_scoped_at_merge_role(self):
+        """(c) PRD R4 rollback golden: the SAME mixed diff at role='merge'
+        (breadth 'scoped') keeps the byte-identical legacy FILE_SCOPED shape.
+        The widening is role='task'-gated and never reaches the merge gate."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='merge',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
+        assert run.scoped_targets == ('orchestrator/tests/test_new_thing.py',)
+
+    def test_touched_test_only_diff_still_file_scoped_at_task_role(self):
+        """(d) The widening is PRODUCTION-triggered, not blanket: a
+        test-tree-ONLY diff at role='task' still file-scopes (PRD R3,
+        "touched-test-only diffs keep file-scoped selection")."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            ['orchestrator/tests/test_new_thing.py', 'orchestrator/tests/test_other.py'],
+            [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
+        assert 'orchestrator/tests/test_other.py' in run.cmd.targets
+
+
+# ---------------------------------------------------------------------------
 # derive_verify_plan: merge role + merge_verify_breadth fork (λ, task 2589 step-5: RED)
 # ---------------------------------------------------------------------------
 
