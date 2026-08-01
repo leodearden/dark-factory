@@ -2183,6 +2183,67 @@ class TestStalenessAndDegradedStates:
         assert payload['issues'][0]['path'] == str(esc_dir)
         assert set(payload) == _PAYLOAD_KEYS
 
+    def test_unreadable_queue_file_is_named_in_issues(self, tmp_path: Path) -> None:
+        """The one discard that happens a frame DOWN is named too.
+
+        ``load_queue_escalations`` skips an unparseable queue file — correct,
+        one corrupt escalation must not crash the join.  But the skip used to
+        stop at a WARNING log, so a corrupt file holding an open alarm left
+        ``unmatched_escalations`` silently short one record while
+        ``issue_count`` stayed 0: the parity view reporting "nothing
+        unexplained" in exactly the case it exists to catch.  The module
+        docstring's no-silent-discard invariant covers every discard INSIDE
+        this module; this pins the one it reaches through the shared reader.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        _write_escalation(esc_dir, 'esc-good', dedupe_fingerprint='g' * 32)
+        bad = _corrupt(_write_escalation(esc_dir, 'esc-bad', dedupe_fingerprint='b' * 32))
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'unreadable_escalation_file'
+        # The FILE, not the queue dir — the discriminator against the sibling
+        # record-level issues (``unknown_escalation_status`` and friends), which
+        # name the dir because they describe records inside a file that DID
+        # parse.  Here the reader knows exactly which file to go repair.
+        assert issue['path'] == str(bad)
+        assert issue['detail']
+        # The readable escalation still joins — one bad file degrades one
+        # record, never the queue.
+        assert [e['id'] for e in payload['unmatched_escalations']] == ['esc-good']
+        assert set(payload) == _PAYLOAD_KEYS
+
+    def test_every_unreadable_queue_file_gets_its_own_issue(self, tmp_path: Path) -> None:
+        """One issue per file, and emission is not gated on any record surviving.
+
+        File-level failures get one issue apiece here (like
+        ``unreadable_metrics``); only RECORD-level failures inside a parsed
+        file are collapsed with a count, because one artifact can hold
+        thousands of records.  A queue file is a file-level artifact, and each
+        corrupt one is a distinct operator action — go read and repair *that*
+        file — which a collapsed count would erase.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        first = _corrupt(_write_escalation(esc_dir, 'esc-bad-1'))
+        second = _corrupt(_write_escalation(esc_dir, 'esc-bad-2'))
+
+        payload = build_memory_evals(root, esc_dir)
+
+        named = [i for i in payload['issues'] if i['kind'] == 'unreadable_escalation_file']
+        assert len(named) == 2
+        assert {i['path'] for i in named} == {str(first), str(second)}
+        assert payload['issue_count'] == len(payload['issues']) == 2
+        # Nothing survived the read, and the issues are emitted anyway.
+        assert payload['unmatched_escalations'] == []
+        assert payload['evals'] != []
+        assert set(payload) == _PAYLOAD_KEYS
+
     def test_missing_run_stamp_is_named(self, tmp_path: Path) -> None:
         from dashboard.data.memory_evals import build_memory_evals
 
@@ -2551,18 +2612,21 @@ class TestMemoryEvalsEndpoint:
         the section still renders and the row degrades to unlinked rather than
         the whole poll 500ing.
 
-        A characterisation test, not a RED-first one — the behaviour holds
-        today by virtue of ``load_queue_escalations``'s own contract.  It is
-        worth pinning because that contract is a dependency: if the shared
-        reader ever started propagating a ``JSONDecodeError``, this route would
-        be one of the callers that breaks, and nothing else here would catch it.
+        The reader-level contract it depends on is a dependency worth pinning
+        here: if ``load_queue_escalations`` ever started propagating a
+        ``JSONDecodeError``, this route would be one of the callers that
+        breaks, and nothing else here would catch it.
 
-        Note the asymmetry it also documents: the skip produces NO payload
-        issue, because the discard happens inside the shared reader rather than
-        in this module.  A corrupt file holding an open alarm therefore leaves
-        the parity view silently short one escalation — the reason
-        ``unmatched_escalations`` cannot be read as exhaustive, and a gap that
-        can only be closed in ``dashboard/data/escalations.py``.
+        This test also holds the LOUD half closed.  The skip used to produce no
+        payload issue at all — the discard happened inside the shared reader,
+        one frame below the module that owns the ``issues`` channel — so a
+        corrupt file holding an open alarm left the parity view silently short
+        one escalation and ``unmatched_escalations`` could not be read as
+        exhaustive.  The reader now reports its skips through an opt-in
+        ``skipped`` accumulator and this module names each one; the assertions
+        below (``issue_count`` rising from 0, and the
+        ``unreadable_escalation_file`` kind present) are what keep the gap
+        closed at the route level, where the operator actually sees it.
         """
         from dashboard.app import _memory_evals_cache_clear
 
@@ -2572,6 +2636,7 @@ class TestMemoryEvalsEndpoint:
 
         pre = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
         assert _only(pre['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_open'
+        assert pre['issue_count'] == 0
 
         _corrupt(config.reconciliation_escalations_dir / 'esc-eval-1.json')
         _memory_evals_cache_clear()
@@ -2585,6 +2650,9 @@ class TestMemoryEvalsEndpoint:
         assert row['escalation'] is None
         # Degraded to unlinked — never silently re-rendered as still-linked.
         assert row['parity'] == 'alarmed_unlinked'
+        # ...and LOUDLY: the lost alarm is named, not merely absent.
+        assert payload['issue_count'] == 1
+        assert 'unreadable_escalation_file' in {i['kind'] for i in payload['issues']}
 
     def test_ttl_cache_single_flights_the_scan(self, client, tmp_path: Path) -> None:
         """Within the TTL window the disk is not re-scanned.
