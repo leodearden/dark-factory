@@ -5558,7 +5558,9 @@ class TestRunScopedVerificationOptsFallbackIntoSegmentedTest:
             )
 
         assert run_verification_double.await_count == 1
-        assert run_verification_double.await_args.kwargs.get('segment_chained_test') is True
+        await_args = run_verification_double.await_args
+        assert await_args is not None, 'run_verification was not awaited'
+        assert await_args.kwargs.get('segment_chained_test') is True
 
 
 class TestBuildFallbackConfigDataModule:
