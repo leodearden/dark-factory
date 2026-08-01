@@ -7,16 +7,28 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
   - TestCapabilityManifestDoc: the doc-level label uniqueness invariant.
   - TestLoader: load_capability_manifest / parse_capability_manifest, including
     the committed exemplar sidecar as a CI fixture.
+  - TestManifestCorpusDiscovery / TestCheckManifest / TestMissingFromWorktreeMessage /
+    TestCheckedInManifestCorpus: a corpus-wide guard validating every
+    checked-in sidecar (not just the one committed exemplar TestLoader
+    covers), built on the sibling test-support module
+    shared/tests/capability_manifest_corpus.py (task 3362).
   - TestDeliveredCheckMeta / TestMetadataRegistration: the
     metadata.delivered_checks registered sub-model.
 """
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
+from capability_manifest_corpus import (
+    MANIFEST_SUFFIX,
+    REPO_ROOT,
+    check_manifest,
+    discover_manifests,
+)
 from pydantic import BaseModel, ValidationError
 
 import shared.task_metadata as task_metadata_module
@@ -348,6 +360,13 @@ class TestCapabilityManifestDoc:
         assert 'task label must be non-empty' in str(exc_info.value)
 
 
+#: The one committed exemplar sidecar TestLoader validates directly, and the
+#: anchor TestManifestCorpusDiscovery asserts is present in the full corpus
+#: sweep — hoisted once (code-review amendment, task 3362) so a rename of
+#: this PRD or its sidecar breaks exactly one place instead of two.
+_EXEMPLAR_SIDECAR_REL = 'plans/capability-delivered-checks-prd.capability-manifest.yaml'
+
+
 class TestLoader:
     _VALID_YAML = """\
 prd: plans/example-prd.md
@@ -430,10 +449,7 @@ tasks:
         # CI fixture: this PRD's own committed exemplar sidecar (PRD
         # §Contract signal for task α — "this PRD's own committed exemplar
         # sidecar parses and validates in a CI test").
-        repo_root = Path(__file__).resolve().parents[2]
-        sidecar_path = (
-            repo_root / 'plans' / 'capability-delivered-checks-prd.capability-manifest.yaml'
-        )
+        sidecar_path = REPO_ROOT / _EXEMPLAR_SIDECAR_REL
         doc = load_capability_manifest(sidecar_path)
         assert doc.prd == 'plans/capability-delivered-checks-prd.md'
         assert doc.schema_version == 1
@@ -454,6 +470,313 @@ tasks:
         manual_check = manual_caps[0].delivered_check
         assert manual_check is not None
         assert manual_check.reason
+
+
+class TestManifestCorpusDiscovery:
+    """discover_manifests() — git-ls-files-based corpus discovery.
+
+    Not Path.rglob: see capability_manifest_corpus.py's module docstring for
+    the measurement (30 tracked sidecars via git ls-files, 0 of them under
+    .worktrees/, vs 3793 extra sidecars an rglob from the main checkout would
+    sweep in from other in-flight tasks' gitignored worktree checkouts).
+    """
+
+    def test_returns_nonempty_list_for_a_git_checkout(self):
+        paths = discover_manifests()
+        assert paths is not None
+        assert paths != []
+
+    def test_returns_none_for_a_non_checkout_directory(self, tmp_path):
+        assert discover_manifests(tmp_path) is None
+
+    def test_returns_none_when_git_binary_is_missing(self, tmp_path, monkeypatch):
+        # subprocess.run raises OSError (FileNotFoundError, not a non-zero
+        # exit) when the git binary itself can't be found. _MANIFEST_PATHS =
+        # discover_manifests() or [] runs at *module import time* below, so
+        # an uncaught exception here would take down collection of this
+        # entire test module, not just the corpus-guard classes.
+        def _raise(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError('git')
+
+        monkeypatch.setattr(subprocess, 'run', _raise)
+        assert discover_manifests(tmp_path) is None
+
+    def test_returns_none_when_git_invocation_times_out(self, tmp_path, monkeypatch):
+        # A wedged git (e.g. index.lock contention) must fail fast via the
+        # explicit timeout=, not hang the test run indefinitely.
+        def _raise(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(cmd='git', timeout=30)
+
+        monkeypatch.setattr(subprocess, 'run', _raise)
+        assert discover_manifests(tmp_path) is None
+
+    def test_every_path_is_a_valid_sidecar_not_nested_in_worktrees(self):
+        # The three properties that are real assertions on discover_manifests()'s
+        # behavior, folded into one test (code-review amendment, task 3362:
+        # the individual is_absolute() and sorted-with-no-duplicates cases
+        # dropped as guaranteed by construction — repo_root / rel with an
+        # absolute repo_root; sorted(set(...)) — three lines inside
+        # discover_manifests itself, so they can't fail without a rewrite
+        # that would also break this test and added no regression signal of
+        # their own).
+        paths = discover_manifests()
+        assert paths is not None
+        for path in paths:
+            assert path.name.endswith(MANIFEST_SUFFIX)
+            assert path.exists()
+            # Load-bearing anti-rglob assertion — see class docstring. Checked
+            # relative to REPO_ROOT, not as an absolute-path substring: when
+            # this suite itself runs from inside a worktree, REPO_ROOT (this
+            # file's own parents[2]) legitimately resolves to
+            # .../.worktrees/<n>, so the absolute path always contains that
+            # segment. What must never happen is a *nested* .worktrees
+            # segment relative to REPO_ROOT — that would mean discovery
+            # walked into another task's checkout.
+            assert '.worktrees' not in path.relative_to(REPO_ROOT).parts
+
+    def test_known_stable_anchor_is_present(self):
+        # Shares _EXEMPLAR_SIDECAR_REL with
+        # TestLoader.test_committed_exemplar_sidecar_validates (code-review
+        # amendment, task 3362) so a rename of that PRD/sidecar breaks
+        # exactly one place instead of two independently-hardcoded ones.
+        # Deliberately does NOT also assert that both docs/prds/ and plans/
+        # are represented (a dropped sibling test) — that pinned a corpus
+        # fact (today's directory layout), not a discover_manifests()
+        # invariant, and would go red on a harmless doc reorganization.
+        paths = discover_manifests()
+        assert paths is not None
+        rels = {str(path.relative_to(REPO_ROOT)) for path in paths}
+        assert _EXEMPLAR_SIDECAR_REL in rels
+
+
+class TestCheckManifest:
+    """check_manifest(path) — the file-attributed reporting wrapper.
+
+    Each case writes a single inline sidecar to tmp_path (matching
+    TestLoader._VALID_YAML / _MALFORMED_YAML_DUP_LABEL's convention — no
+    committed bad-fixture files) and drives one of check_manifest's failure
+    modes. This is the mutation proof TestCheckedInManifestCorpus rests its
+    corpus sweep on.
+    """
+
+    _VALID_YAML = """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-one"
+        binding: "capability→producer (wired)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "foo"
+          expect: present
+"""
+
+    def test_valid_sidecar_returns_none(self, tmp_path):
+        sidecar = tmp_path / 'ok.capability-manifest.yaml'
+        sidecar.write_text(self._VALID_YAML)
+        assert check_manifest(sidecar) is None
+
+    def test_unknown_capability_key_names_file_and_key(self, tmp_path):
+        sidecar = tmp_path / 'bad-cap-key.capability-manifest.yaml'
+        sidecar.write_text(
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-one"
+        binding: "b"
+        verdict: PASS
+        verdcit: PASS
+"""
+        )
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-cap-key.capability-manifest.yaml' in message
+        assert 'verdcit' in message
+
+    def test_unknown_delivered_check_key_names_file_and_key(self, tmp_path):
+        sidecar = tmp_path / 'bad-check-key.capability-manifest.yaml'
+        sidecar.write_text(
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-one"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "foo"
+          expect: present
+          bogus_field: x
+"""
+        )
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-check-key.capability-manifest.yaml' in message
+        assert 'bogus_field' in message
+
+    def test_broken_yaml_syntax_names_file_and_is_a_yaml_error(self, tmp_path):
+        sidecar = tmp_path / 'bad-syntax.capability-manifest.yaml'
+        sidecar.write_text('prd: [unterminated')
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-syntax.capability-manifest.yaml' in message
+        assert 'YAML' in message
+
+    def test_duplicate_task_label_names_file_and_label(self, tmp_path):
+        sidecar = tmp_path / 'bad-dup-label.capability-manifest.yaml'
+        sidecar.write_text(
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities: []
+  - label: "alpha"
+    capabilities: []
+"""
+        )
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-dup-label.capability-manifest.yaml' in message
+        assert 'alpha' in message
+
+    def test_unsupported_schema_version_names_file(self, tmp_path):
+        sidecar = tmp_path / 'bad-schema-version.capability-manifest.yaml'
+        sidecar.write_text(
+            """\
+prd: plans/example-prd.md
+schema_version: 2
+tasks: []
+"""
+        )
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-schema-version.capability-manifest.yaml' in message
+
+    def test_missing_file_propagates_file_not_found(self, tmp_path):
+        # A missing file is a caller bug, not manifest drift — check_manifest
+        # must not silently absorb it into a reported "problem" string.
+        with pytest.raises(FileNotFoundError):
+            check_manifest(tmp_path / 'does-not-exist.capability-manifest.yaml')
+
+
+_MANIFEST_PATHS = discover_manifests() or []
+_MANIFEST_IDS = [str(p.relative_to(REPO_ROOT)) for p in _MANIFEST_PATHS]
+
+
+def _missing_from_worktree_message(manifest_path: Path) -> str:
+    """Message for a sidecar ``git ls-files`` tracks but the working tree lacks.
+
+    ``git ls-files`` reports index entries, not working-tree entries: an
+    unstaged deletion (``rm sidecar.yaml`` without ``git rm``) or a
+    skip-worktree/sparse-checkout entry makes :func:`discover_manifests`
+    return a path that doesn't exist on disk. ``check_manifest`` letting
+    ``FileNotFoundError`` propagate is correct for a direct caller (see
+    ``TestCheckManifest.test_missing_file_propagates_file_not_found`` — a
+    missing file is a caller bug, not manifest drift) — but in the corpus
+    sweep below, the "caller" is the guard itself, so a tracked-but-missing
+    file must fail loudly and name the file, not surface as an uncaught
+    traceback from this guard (code-review amendment, task 3362).
+    """
+    rel = manifest_path.relative_to(REPO_ROOT)
+    return f'{rel}: tracked in git but missing from the working tree'
+
+
+class TestMissingFromWorktreeMessage:
+    def test_names_the_repo_relative_path(self):
+        target = REPO_ROOT / 'plans' / 'nonexistent.capability-manifest.yaml'
+        assert _missing_from_worktree_message(target) == (
+            'plans/nonexistent.capability-manifest.yaml: '
+            'tracked in git but missing from the working tree'
+        )
+
+
+class TestCheckedInManifestCorpus:
+    """Every checked-in capability-manifest sidecar validates against the schema.
+
+    This is the guard the task was filed for: TestLoader above covers exactly
+    one committed exemplar; this class sweeps all of them (measured at
+    planning time: 30 files under docs/prds/ and plans/, 447 capabilities,
+    0 failures — see task 3362's plan.json for the full measurement). It is
+    GREEN on arrival, which is inherent to a preventative guard, not a
+    reason to trust it unverified — so the RED signal was proven by mutation
+    instead of relying on a naturally-failing first run:
+
+        1. Inserted an unknown key (`verdcit: PASS`) into one real capability
+           entry of plans/capability-delivered-checks-prd.capability-manifest.yaml
+           (the "sidecar-loader-models-exist" capability under task α).
+        2. Ran this class: both parametrized cases keyed to that one file
+           failed (test_checked_in_manifest_validates and
+           _prd_field_matches_its_own_filename — each loads the same mutated
+           file), while every other file's cases across both methods stayed
+           green. The test_checked_in_manifest_validates failure carried the
+           exact assertion message: "plans/capability-delivered-checks-prd.
+           capability-manifest.yaml: schema validation failed: 1 validation
+           error for CapabilityManifestDoc tasks.0.capabilities.1.verdcit
+           Extra inputs are not permitted [...]" — naming both the mutated
+           file and the offending `verdcit` key, exactly as check_manifest's
+           docstring promises.
+        3. Reverted the sidecar (`git checkout --`) and reran: full class
+           green again, all 30 files (150 tests across the whole module —
+           re-measured after the code-review amendments, task 3362, that
+           dropped the third, tautological parametrization and trimmed
+           TestManifestCorpusDiscovery).
+
+    Does NOT assert delivered_check `script:` targets exist on disk —
+    deliberately out of scope (n=1 in the corpus at planning time, and it
+    would couple this authoring guard to script lifecycle rather than
+    manifest shape). Does NOT separately re-validate each capability via
+    `ManifestCapability.model_validate(cap.model_dump()) == cap`
+    (code-review amendment, task 3362: dropped as tautological) —
+    `load_capability_manifest` already constructs every `ManifestCapability`
+    through that same `extra='forbid'` model with plain str/list/int fields,
+    so the round trip could only fail when `load_capability_manifest` itself
+    already raised, which `test_checked_in_manifest_validates` already
+    reports with a better, file-attributed message.
+    """
+
+    def test_corpus_discovery_is_not_vacuous(self):
+        # An empty parametrize list below would collect ZERO test cases and
+        # pass silently — exactly the fail-soft this guard exists to
+        # prevent. Skip (not fail) when the tree genuinely isn't a git
+        # checkout, mirroring test_lock_charter_guard.py's own split.
+        if discover_manifests() is None:
+            pytest.skip('not a git checkout (git ls-files failed)')
+        assert _MANIFEST_PATHS, 'discover_manifests() returned an empty corpus'
+
+    @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
+    def test_checked_in_manifest_validates(self, manifest_path):
+        try:
+            message = check_manifest(manifest_path)
+        except FileNotFoundError:
+            pytest.fail(_missing_from_worktree_message(manifest_path))
+        assert message is None, message
+
+    @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
+    def test_checked_in_manifest_prd_field_matches_its_own_filename(self, manifest_path):
+        # manifest_stamping.py derives the sidecar path as
+        # re.sub(r'\.md$', '', prd_path) + MANIFEST_SUFFIX, so a doc.prd that
+        # disagrees with its own sidecar's filename means commit_planning
+        # looks for a sidecar that isn't there and silently no-ops (its
+        # documented "no sidecar on disk is a complete no-op" contract) —
+        # the drift is invisible at exactly the moment it matters.
+        try:
+            doc = load_capability_manifest(manifest_path)
+        except FileNotFoundError:
+            pytest.fail(_missing_from_worktree_message(manifest_path))
+        rel = str(manifest_path.relative_to(REPO_ROOT))
+        expected_prd = rel[: -len(MANIFEST_SUFFIX)] + '.md'
+        assert doc.prd == expected_prd
+        assert (REPO_ROOT / doc.prd).is_file()
 
 
 class TestDeliveredCheckMeta:
