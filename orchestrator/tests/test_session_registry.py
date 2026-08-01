@@ -455,6 +455,50 @@ def test_transcript_path_for_cwd_encodes_dot() -> None:
     )
 
 
+def test_transcript_path_for_cwd_encodes_underscore() -> None:
+    # The third character (task 3272). Derived from 738 real (encoded-dir,
+    # decoded-cwd) pairs sampled off a live ~/.claude/projects tree, where
+    # two thirds of the dirs carried an underscore — the former two-character
+    # rule mismatched 492 of the 738.
+    assert (
+        sr.transcript_path_for_cwd('/media/leo/data_lv_1/leo/reify-build')
+        == '~/.claude/projects/-media-leo-data-lv-1-leo-reify-build'
+    )
+
+
+def test_encode_cwd_returns_bare_dir_name() -> None:
+    # encode_cwd is the bare encoded dir name — no '~/.claude/projects/'
+    # prefix — so callers that need a lookup key (not a display path) have
+    # one canonical source instead of string-slicing the prefix back off.
+    assert sr.encode_cwd('/home/leo/src/dark-factory') == '-home-leo-src-dark-factory'
+
+
+def test_encode_cwd_preserves_case() -> None:
+    # A real on-disk dir name with its capitals intact — the encoder does NOT
+    # lowercase, which rules out a case-folding step in the rule.
+    assert sr.encode_cwd('/opt/Auto-Claude/resources/backend') == (
+        '-opt-Auto-Claude-resources-backend'
+    )
+
+
+def test_encode_cwd_maps_all_three_characters() -> None:
+    # '/' , '.' and '_' all collapse to '-'; a leading '_' on a path component
+    # yields a doubled '--' just as a leading '.' does.
+    assert sr.encode_cwd('/home/leo/src/warm-lanes/worktrees/_lane-39') == (
+        '-home-leo-src-warm-lanes-worktrees--lane-39'
+    )
+    assert sr.encode_cwd('/home/leo/src/dark-factory/.eval-worktrees/df_task_12') == (
+        '-home-leo-src-dark-factory--eval-worktrees-df-task-12'
+    )
+
+
+def test_transcript_path_for_cwd_delegates_to_encode_cwd() -> None:
+    # The two can never drift apart: the path form is exactly the prefix plus
+    # the bare encoding, over a cwd exercising all three characters.
+    cwd = '/home/leo/src/dark-factory/.eval-worktrees/df_task_12/run-5383f6a8'
+    assert sr.transcript_path_for_cwd(cwd) == f'~/.claude/projects/{sr.encode_cwd(cwd)}'
+
+
 # ---------------------------------------------------------------------------
 # Step-5: single-writer atomic write / read / update
 # ---------------------------------------------------------------------------
