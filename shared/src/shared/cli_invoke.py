@@ -1399,15 +1399,44 @@ async def invoke_with_cap_retry(
                         except Exception:
                             logger.warning('Failed to save cap_hit event', exc_info=True)
 
-                    # Resume the capped session on the next account if possible
-                    if result.session_id:
-                        invoke_kwargs['resume_session_id'] = result.session_id
-                        invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
-                        resume_or_fresh = 'resuming'
-                    else:
+                    # Resume the capped session on the next account if possible.
+                    #
+                    # A session is resumable only if its transcript is actually
+                    # REACHABLE: Claude CLI sessions are local JSONL files at
+                    # <config_dir>/projects/*/<session_id>.jsonl (see
+                    # _resolve_transcript_path), and --resume replays that file.
+                    # Resuming a session whose transcript is gone (cleaned-up
+                    # TaskConfigDir, a different config dir, a swept temp dir)
+                    # starts an effectively EMPTY session, and the agent then
+                    # restarts on CAP_HIT_RESUME_PROMPT with no context to
+                    # continue from — silent context loss.  Mirrors the
+                    # orchestrator's own resume-eligibility guard
+                    # (harness.py, 'no_transcript').
+                    #
+                    # config_dir is None -> resume as today: without a concrete
+                    # directory there is no correct place to glob (the process
+                    # default ~/.claude would be wrong for any caller under an
+                    # isolated CLAUDE_CONFIG_DIR), so the veto is scoped to "we
+                    # have a directory and the transcript is provably not in it".
+                    if not result.session_id:
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh'
+                    elif config_dir is not None and not transcript_exists(
+                        config_dir.path, result.session_id
+                    ):
+                        logger.warning(
+                            f'{label}: capped session {result.session_id} has no transcript '
+                            f'under {config_dir.path} — retrying FRESH instead of resuming '
+                            f'into an empty session (context from this attempt is lost)',
+                        )
+                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                        await _rebuild_fresh_prompt()
+                        resume_or_fresh = 'fresh'
+                    else:
+                        invoke_kwargs['resume_session_id'] = result.session_id
+                        invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
+                        resume_or_fresh = 'resuming'
 
                     if acct_name:
                         logger.warning(
