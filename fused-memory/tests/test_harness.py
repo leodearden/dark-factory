@@ -5434,10 +5434,23 @@ async def test_run_loop_releases_stale_claims_on_startup(
     if harness.judge is not None:
         harness.judge.initialize = AsyncMock()
 
-    # Spy on release_stale_claims: side_effect passes through to the real method,
-    # so return_value is intentionally omitted (side_effect takes precedence).
+    # Spy on release_stale_claims: side_effect DELEGATES to the real method (so
+    # return_value is intentionally omitted — side_effect takes precedence) and
+    # sets the witness Event in a finally, i.e. only once the real release has
+    # actually completed. Delegating rather than replacing keeps the real
+    # behaviour under test; setting the Event after the await (not before it)
+    # means the drive below waits for release COMPLETION, which is strictly
+    # stronger than the call-recorded assertion at the bottom of this test.
+    released = asyncio.Event()
     original_release = event_buffer.release_stale_claims
-    harness.buffer.release_stale_claims = AsyncMock(side_effect=original_release)
+
+    async def _signal_release(*args, **kwargs):
+        try:
+            return await original_release(*args, **kwargs)
+        finally:
+            released.set()
+
+    harness.buffer.release_stale_claims = AsyncMock(side_effect=_signal_release)
 
     with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(harness.run_loop(), timeout=0.2)
