@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -4108,3 +4109,84 @@ class TestDelegatesToSharedAtomicWriter:
         assert loaded is not None
         assert loaded.session_slug == 'sess-3223'
         assert loaded.task_id == '3223'
+
+
+#: Repo root of this worktree, resolved from THIS FILE so the subprocess
+#: contract test below is CWD-independent (the suite is run from
+#: ``<worktree>/orchestrator``, but a scratch-CWD run must behave identically).
+_SR_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _non_venv_interpreter() -> str | None:
+    """Return an interpreter that has no workspace packages installed, or None.
+
+    ``sys.executable`` is the venv interpreter, which HAS ``shared`` installed
+    and therefore cannot discriminate — the contract under test is precisely
+    "imports without a venv".  Prefer the system interpreter, then the base
+    interpreter this venv was built from.
+    """
+    candidates = ['/usr/bin/python3', str(Path(sys.base_prefix) / 'bin' / 'python3')]
+    for candidate in candidates:
+        if Path(candidate).is_file() and Path(candidate).resolve() != Path(
+            sys.executable
+        ).resolve():
+            return candidate
+    return None
+
+
+class TestStdlibOnlySelfContainment:
+    """``session_registry`` must import with NO venv, install or workspace deps.
+
+    This is an architectural contract, not a style preference.  The module
+    docstring (lines 5-12) states it is "deliberately stdlib-only and
+    self-contained (no intra-orchestrator imports)" so it can be "invoked
+    directly by ``skills/spawn/spawn-claude.sh`` via an absolute path (no
+    venv/PYTHONPATH/install required)".  That hook runs under an interpreter
+    with no workspace packages available, so ANY ``from shared import ...`` or
+    third-party import at module scope breaks the spawn path — and does so far
+    from here, as a hook subprocess that silently never writes ``record.json``.
+
+    Task 3223's consolidation added ``from shared import safe_io`` and broke
+    exactly this (escalation esc-3223-2); the only symptom in the suite was two
+    downstream ``test_session_hooks.py`` failures, which is why the contract is
+    now pinned directly.  A future migration that finds this test in its way
+    should read the module docstring before deleting it.
+    """
+
+    def test_imports_under_a_bare_interpreter_with_no_workspace_packages(self):
+        """`import orchestrator.session_registry` succeeds with only orchestrator/src."""
+        interpreter = _non_venv_interpreter()
+        if interpreter is None:
+            pytest.skip('no non-venv interpreter available on this host')
+
+        env = {
+            'PYTHONPATH': str(_SR_REPO_ROOT / 'orchestrator' / 'src'),
+            'PATH': '/usr/bin:/bin',
+            'HOME': os.environ.get('HOME', '/tmp'),
+            'PYTHONDONTWRITEBYTECODE': '1',
+        }
+
+        # Guard against a vacuous pass: if this host can already import
+        # `shared` with only orchestrator/src on the path, the assertion below
+        # would succeed even with the contract broken.
+        probe = subprocess.run(
+            [interpreter, '-c', 'import shared'],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        if probe.returncode == 0:
+            pytest.skip(
+                'this interpreter can already import `shared`; the test cannot '
+                'discriminate a stdlib-only module from one that imports it'
+            )
+
+        result = subprocess.run(
+            [interpreter, '-c', 'import orchestrator.session_registry'],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+
+        assert result.returncode == 0, (
+            'session_registry must import with no venv/install — it is executed '
+            'by absolute path from skills/spawn/spawn-claude.sh. Remove the '
+            'non-stdlib module-scope import.\n'
+            f'stderr:\n{result.stderr}'
+        )
