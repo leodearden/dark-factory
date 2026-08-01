@@ -447,9 +447,11 @@ authoritative allowlist.
 allowlist over `fused-memory/config/config.yaml`, applied by
 `mcp__fused-memory__reload_config` — same tier discipline, different
 process, different file. Do not look for one config's leaves in the
-other's list. Its green tier currently covers the `reconciliation.*`
-near-dup/topic-guard knobs, `write_triage.*`, and the five in-place-update
-leaves:
+other's list. Its green tier currently covers several `reconciliation.*`
+leaves (the near-dup/topic-guard knobs and `stale_run_recovery_seconds`),
+`write_triage.*`, and the five in-place-update leaves below — read
+`RELOADABLE_FIELDS` in `fused-memory/src/fused_memory/config/reload.py` as
+the authoritative list rather than treating this enumeration as exhaustive:
 
 - `mem0_update.enabled` — **the kill switch for `update_memory`**, the
   in-place Mem0 amend tool. Green-tier on purpose: this is what you flip

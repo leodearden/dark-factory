@@ -59,6 +59,34 @@ class StormCounter:
         self._events: deque[tuple[float, str | None]] = deque()
         self._last_fire_ts: float | None = None
 
+    def _prune(self, now: float, window_seconds: float) -> int:
+        """Drop events older than the window as of *now*; return how many remain.
+
+        The window is half-open: an event aged exactly *window_seconds* is
+        already out.
+        """
+        cutoff = now - window_seconds
+        while self._events and self._events[0][0] <= cutoff:
+            self._events.popleft()
+        return len(self._events)
+
+    def prune(self, window_seconds: float) -> int:
+        """Age out stale events without recording one; return the live count.
+
+        The sweep hook for a caller that keys counters by an UNBOUNDED label
+        (``MemoryService`` keys them by caller-supplied ``agent_id``): each
+        counter self-prunes its own deque, but nothing evicts the counter
+        OBJECT, so a long-lived server would accumulate one per label it ever
+        saw. A caller can sweep with this and drop whatever returns ``0``.
+
+        Dropping an empty counter is behaviour-preserving, not merely cheap.
+        The only other state is ``_last_fire_ts``, stamped while its own event
+        was still in the deque — so an empty window implies that fire has
+        already aged past the rate limit, and a freshly constructed counter
+        would decide identically on the next event.
+        """
+        return self._prune(self._now(), window_seconds)
+
     def record(
         self,
         *,
@@ -89,14 +117,9 @@ class StormCounter:
         """
         now = self._now()
 
-        # Append, then prune. The window is half-open: an event aged exactly
-        # window_seconds is already out.
+        # Append, then prune.
         self._events.append((now, label))
-        cutoff = now - window_seconds
-        while self._events and self._events[0][0] <= cutoff:
-            self._events.popleft()
-
-        count = len(self._events)
+        count = self._prune(now, window_seconds)
         if count < threshold:
             return None
 

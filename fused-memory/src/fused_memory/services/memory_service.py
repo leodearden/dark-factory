@@ -3606,6 +3606,23 @@ class MemoryService:
             window_seconds=float(window_seconds),
             label=label,
         )
+
+        # Evict counters whose window has gone empty. Each counter self-prunes
+        # its own deque, but nothing would drop the counter OBJECT, and
+        # ``agent_id`` is caller-supplied and unbounded in cardinality — the
+        # gate is a self-reported prefix match, so a widened prefix admits
+        # arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
+        # every run). A server designed to run for weeks between restarts would
+        # otherwise accumulate one dead counter per agent it ever saw.
+        #
+        # Runs on EVERY amend, not just a breach: the leak is on the common
+        # path. It is O(live agents) because the sweep is itself what keeps
+        # that from becoming O(agents ever seen). See StormCounter.prune on why
+        # dropping an empty counter is behaviour-preserving.
+        for other, dormant in list(self._mem0_update_storm_counters.items()):
+            if other != label and dormant.prune(float(window_seconds)) == 0:
+                del self._mem0_update_storm_counters[other]
+
         if storm is None:
             return
 
@@ -3758,10 +3775,23 @@ class MemoryService:
         existing_payload: dict[str, Any] = dict(existing.get('metadata') or {})
         managed, existing_custom = split_managed_metadata(existing_payload)
 
-        # ONE delta computation for every arm. Sharing it is what keeps the
-        # merge/replace/delete semantics from drifting between the combined path
-        # and the metadata-only path (INV-5) — a caller must get the same
-        # resulting metadata whether or not it also amended the content.
+        # ONE delta computation, consumed by the two routes that must construct
+        # a full metadata dict themselves: the content arm's ``mem0.update``
+        # (whose backend starts from a FRESH payload) and the metadata-only
+        # ``overwrite_payload`` route. Sharing it is what keeps merge / replace
+        # / delete semantics from drifting between the combined path and the
+        # metadata-only path — a caller must get the same resulting metadata
+        # whether or not it also amended the content.
+        #
+        # The set_payload / delete_payload fast paths deliberately do NOT read
+        # it: they hand the raw patch / key list to Qdrant and let it apply
+        # merge and delete SERVER-side, which is the entire reason those routes
+        # can skip a read-modify-write. So the INV-5 single-home claim is
+        # narrower than "every arm calls _apply_metadata_delta": merge and
+        # delete semantics have two implementations that have to agree — this
+        # one and Qdrant's primitives. ``TestMetadataFastPathEquivalence`` pins
+        # that agreement, so a new rule added here (a second protected key,
+        # say) fails a test instead of silently splitting the routes apart.
         new_custom = self._apply_metadata_delta(
             existing_custom,
             metadata_patch=metadata_patch,
@@ -3772,6 +3802,16 @@ class MemoryService:
         scope = Scope(project_id=project_id)
 
         if content is not None:
+            # Journal the PRIOR text beside the new one, so the audit row is a
+            # genuine before/after rather than a record of what the text was
+            # rewritten TO. The read leg above already fetched it, so this costs
+            # nothing; without it the storm escalation's "inspect the affected
+            # records" instruction sends an operator to a journal with nothing
+            # to diff against, which is exactly the forensic evidence a
+            # silent-rewrite alarm exists to make reachable. Truncated at 200
+            # like `content`, same convention update_edge uses for `fact`.
+            params['content_before'] = (existing.get('content') or '')[:200]
+
             # Content-amend arm, folding in any metadata delta rather than
             # issuing a second write for it — a combined call must never leave
             # the record carrying new content with stale metadata.

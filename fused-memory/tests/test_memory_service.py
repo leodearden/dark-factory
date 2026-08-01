@@ -1616,6 +1616,49 @@ class TestUpdateMemoryContentArm:
         assert kwargs['params']['reason'] == 'test amend'
 
     @pytest.mark.asyncio
+    async def test_journal_row_carries_the_prior_text(self, service):
+        """The audit row is a before/after, not just an after.
+
+        The storm escalation tells an operator to inspect the affected records
+        via the write journal. An in-place amend leaves NO other trace of what
+        the record used to say — the point id is preserved and the old text is
+        overwritten — so a row carrying only the new text gives the responder
+        nothing to diff against, which is precisely the forensic evidence the
+        alarm exists to make reachable. The read leg already fetched it.
+        """
+        journal = _journal_mock()
+        service._write_journal = journal
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value={**DEFAULT_POINT_PAYLOAD, 'data': 'y' * 500}
+        )
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        params = journal.log_write_op.await_args.kwargs['params']
+        assert params['content_before'] == 'y' * 200, (
+            'the prior text must be journaled, truncated like `content`'
+        )
+        assert params['content'] == 'amended text'
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_route_journals_no_prior_text(self, service):
+        """A patch does not change the text, so there is no before to record."""
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        params = journal.log_write_op.await_args.kwargs['params']
+        assert 'content_before' not in params
+        assert 'content' not in params
+
+    @pytest.mark.asyncio
     async def test_emits_memory_updated_event(self, service):
         """The amendment is announced — an in-place rewrite is otherwise invisible."""
         from fused_memory.models.reconciliation import EventType
@@ -1840,6 +1883,85 @@ class TestUpdateMemoryMetadataArm:
         )
 
         buffer.push.assert_awaited_once()
+
+
+class TestMetadataFastPathEquivalence:
+    """The two fast paths must agree with ``_apply_metadata_delta``.
+
+    ``update_memory`` computes ``new_custom`` once, but only two of its four
+    write routes consume it (``mem0.update`` and ``overwrite_payload``). The
+    ``set_payload`` / ``delete_payload`` fast paths hand the raw patch / key
+    list to Qdrant and let it apply merge and delete SERVER-side — that is what
+    lets them skip a read-modify-write, and it is also a SECOND implementation
+    of the same semantics.
+
+    So the single-home guarantee is not structural here, it is an agreement
+    between two implementations, and this class is what turns that agreement
+    into a test. A rule added to ``_apply_metadata_delta`` that Qdrant's
+    primitives cannot reproduce (a second entry in
+    ``_FUSED_MEMORY_OWNED_METADATA_KEYS`` needing protection in MERGE mode,
+    say) would otherwise split the fast paths away from the combined path
+    silently — nothing else in the suite compares them.
+
+    Both models below are Qdrant's documented payload semantics, deliberately
+    restated in the test rather than mocked off the backend: mocking the
+    backend would only re-assert what the service passed it, which is what the
+    routing tests already do.
+    """
+
+    @staticmethod
+    def _qdrant_set_payload(payload: dict, patch: dict) -> dict:
+        """Qdrant ``set_payload``: shallow merge of *patch* over the point."""
+        return {**payload, **patch}
+
+    @staticmethod
+    def _qdrant_delete_payload(payload: dict, keys: list[str]) -> dict:
+        """Qdrant ``delete_payload``: drop exactly the named keys."""
+        return {k: v for k, v in payload.items() if k not in keys}
+
+    @staticmethod
+    def _via_delta(payload: dict, **delta) -> dict:
+        """The full payload the read-modify-overwrite route would have written."""
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        managed, custom = split_managed_metadata(dict(payload))
+        return {
+            **managed,
+            **MemoryService._apply_metadata_delta(custom, **delta),
+        }
+
+    @pytest.mark.parametrize('patch', [
+        {'topic': 'cgl-eta'},                       # overwrite an existing key
+        {'parent_id': 'mem-9'},                     # add a new key
+        {'topic': 'cgl-eta', 'parent_id': 'mem-9'}, # both at once
+        {'category': 'procedural_knowledge'},       # a fused-memory-owned key
+    ], ids=['overwrite', 'add', 'both', 'protected_key'])
+    def test_set_payload_agrees_with_the_delta_helper(self, patch):
+        """merge + patch-only: Qdrant's server-side merge == the helper's."""
+        payload = dict(DEFAULT_POINT_PAYLOAD)
+
+        assert self._qdrant_set_payload(payload, patch) == self._via_delta(
+            payload,
+            metadata_patch=patch,
+            metadata_delete_keys=None,
+            metadata_mode='merge',
+        )
+
+    @pytest.mark.parametrize('keys', [
+        ['topic'],
+        ['topic', 'kind'],
+        ['not_present_at_all'],
+    ], ids=['one', 'several', 'absent'])
+    def test_delete_payload_agrees_with_the_delta_helper(self, keys):
+        """merge + delete-only: Qdrant's server-side delete == the helper's."""
+        payload = dict(DEFAULT_POINT_PAYLOAD)
+
+        assert self._qdrant_delete_payload(payload, keys) == self._via_delta(
+            payload,
+            metadata_patch=None,
+            metadata_delete_keys=keys,
+            metadata_mode='merge',
+        )
 
 
 class TestUpdateMemoryCombinedArms:
@@ -2257,6 +2379,87 @@ class TestUpdateMemoryStormCounter:
             await self._amend(service)
 
         service._mem0_update_storm_escalator.report_storm.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_escalator_failure_never_reaches_the_caller(self, stormy, caplog):
+        """The belt to the escalator's braces.
+
+        The escalator is itself never-raise, but the service must not DEPEND on
+        that: the write has already landed by the time the alarm runs, so a
+        monitoring failure that propagated would turn a completed amendment
+        into a tool exception — telling the caller its write failed when it
+        did not, and inviting a retry that amends the record twice. Losing the
+        signal is strictly the lesser harm, and it is still logged.
+        """
+        service, _clock = stormy
+        service._mem0_update_storm_escalator.report_storm = MagicMock(
+            side_effect=RuntimeError('boom')
+        )
+        threshold = service.config.mem0_update.storm_threshold
+
+        result = None
+        with caplog.at_level(logging.ERROR):
+            for _ in range(threshold):
+                result = await self._amend(service)
+
+        assert result is not None
+        assert result['status'] == 'updated'
+        assert result['id'] == 'point-1'
+        assert result['content_amended'] is True
+        assert service.mem0.update.await_count == threshold
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+        assert any(
+            'storm escalation failed' in r.getMessage() for r in caplog.records
+        ), 'the swallowed failure must still be logged, not silently dropped'
+
+    @pytest.mark.asyncio
+    async def test_dormant_agent_counters_are_evicted(self, stormy):
+        """Counters are keyed by an UNBOUNDED, caller-supplied ``agent_id``.
+
+        The gate is a self-reported prefix match, so a widened prefix admits
+        arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
+        every run). Each counter self-prunes its deque, but without an eviction
+        sweep the counter OBJECTS accumulate for the process lifetime — small
+        each, unbounded in total, in a server that runs for weeks between
+        restarts.
+        """
+        service, clock = stormy
+        window = service.config.mem0_update.storm_window_seconds
+
+        for i in range(5):
+            await self._amend(service, agent_id=f'recon-stage-1-run-{i}')
+        assert len(service._mem0_update_storm_counters) == 5
+
+        # Every one of those agents has now gone quiet for a full window.
+        clock.advance(window + 1)
+        await self._amend(service, agent_id='recon-stage-2')
+
+        assert set(service._mem0_update_storm_counters) == {'recon-stage-2'}, (
+            'a counter whose window has emptied carries no state that could '
+            'change a later decision, so it must not survive'
+        )
+
+    @pytest.mark.asyncio
+    async def test_eviction_does_not_disarm_a_live_burst(self, stormy):
+        """The sweep must only ever drop counters that have gone quiet."""
+        service, clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+        window = service.config.mem0_update.storm_window_seconds
+
+        # A slow burst from one agent, interleaved with chatter from throwaway
+        # agent_ids that each go dormant. The sweep runs on every amend.
+        for i in range(threshold - 1):
+            await self._amend(service, agent_id='recon-stage-1')
+            await self._amend(service, agent_id=f'throwaway-{i}')
+            clock.advance(window / (threshold * 2))
+
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+        await self._amend(service, agent_id='recon-stage-1')
+
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+        assert service._mem0_update_storm_escalator.report_storm.call_args.kwargs[
+            'agent_id'
+        ] == 'recon-stage-1'
 
     def test_escalator_is_constructed_unconditionally(self, service):
         """Owned by MemoryService — never borrowed from a conditional component."""

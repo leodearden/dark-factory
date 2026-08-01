@@ -215,8 +215,11 @@ class Mem0UpdateStormEscalator:
             'loop leaves no new records, no id churn and no failed calls — this '
             'alarm is the only signal it produces.  Check whether the agent is '
             'looping over the same record ids; if so, stop it, then inspect the '
-            'affected records (the write journal records every amendment with '
-            'its memory_id and a truncated before/after).',
+            'affected records.  The write journal carries one '
+            "`operation='update_memory'` row per amendment, whose params hold "
+            'the memory_id, the reason, and both `content_before` and '
+            '`content` (each truncated to 200 chars) — enough to diff what the '
+            'loop actually rewrote.',
             '',
             'The writes were NOT blocked: this counter is a monitoring alarm, '
             'not a rate limiter, so a legitimate large consolidation cycle is '

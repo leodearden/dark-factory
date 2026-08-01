@@ -84,6 +84,57 @@ class TestWindowPruning:
             clock.advance(101.0)
 
 
+class TestPruneSweepHook:
+    """``prune()`` — the hook a caller with UNBOUNDED label cardinality needs.
+
+    ``MemoryService`` keys one counter per caller-supplied ``agent_id``. Each
+    counter self-prunes its own deque on ``record()``, but nothing would ever
+    drop the counter OBJECT, so a server that runs for weeks accumulates one
+    per label it ever saw. ``prune()`` lets the caller ask "has this one gone
+    quiet?" without recording a phantom event that would itself keep it alive.
+    """
+
+    def test_reports_the_live_count_without_recording_an_event(self, counter, clock):
+        counter.record(threshold=99, window_seconds=100.0, label='p')
+        counter.record(threshold=99, window_seconds=100.0, label='p')
+
+        assert counter.prune(100.0) == 2
+        assert counter.prune(100.0) == 2, 'prune must not itself count as an event'
+
+    def test_returns_zero_once_the_window_has_emptied(self, counter, clock):
+        counter.record(threshold=99, window_seconds=100.0, label='p')
+        clock.advance(101.0)
+
+        assert counter.prune(100.0) == 0
+
+    def test_a_pruned_counter_decides_like_a_fresh_one(self, counter, clock):
+        """Why dropping an empty counter is behaviour-preserving, not just cheap.
+
+        The only state besides the deque is ``_last_fire_ts``, and it is stamped
+        while its own event is still inside the window — so an empty window
+        implies that fire has already aged past the rate limit. A caller that
+        evicts on ``prune() == 0`` and reconstructs later must therefore get the
+        same answer it would have got by keeping the object.
+        """
+        for _ in range(3):
+            counter.record(threshold=3, window_seconds=100.0, label='p')
+        clock.advance(101.0)
+        assert counter.prune(100.0) == 0
+
+        kept = [
+            counter.record(threshold=3, window_seconds=100.0, label='p')
+            for _ in range(3)
+        ]
+        fresh_counter = StormCounter(time_provider=clock)
+        fresh = [
+            fresh_counter.record(threshold=3, window_seconds=100.0, label='p')
+            for _ in range(3)
+        ]
+
+        assert [f is not None for f in kept] == [f is not None for f in fresh]
+        assert kept[-1] == fresh[-1]
+
+
 class TestRateLimit:
     def test_burst_of_hundreds_yields_exactly_one_fire(self, counter):
         fires = [
