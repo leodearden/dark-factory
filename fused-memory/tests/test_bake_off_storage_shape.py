@@ -607,6 +607,51 @@ class TestClaimCoverageParity:
         assert totals['c_peers'] == totals['b_grouped']  # same claim bodies
 
 
+class TestCategoryIsPreservedAcrossArms:
+    """Every arm record carries the SAME category the same knowledge has in
+    arm (a) — otherwise the guard replay measures the wrong thing.
+
+    `find_near_duplicate_memory` defensively filters on `category`
+    (near_duplicate_guard.py:78), so an arm whose records carried no category
+    — or a shifted one — would score zero guard adequacy for a reason that
+    has nothing to do with its storage shape. That failure would look exactly
+    like a genuine result, which is what makes it worth pinning.
+    """
+
+    def test_every_record_in_every_arm_carries_a_category(self):
+        for shape in _mod().ARM_SHAPES:
+            for record in _arm(shape):
+                assert record.metadata.get('category'), (shape, record.record_id)
+
+    def test_a_claims_category_matches_its_source_record_in_arm_a(self):
+        mod = _mod()
+        claims = {c.claim_id: c for c in _committed_inputs()['claims']}
+        status_quo = {r.record_id: r for r in _knowledge(_arm('status_quo'))}
+
+        for shape in ('c_peers', 'b_grouped'):
+            for record in _knowledge(_arm(shape)):
+                claim = claims[record.claim_ids[0]]
+                source = status_quo[claim.source_memory_id]
+                assert record.metadata['category'] == source.metadata['category']
+
+    def test_the_two_category_mixed_alpha_clusters_are_not_flattened(self):
+        """Two of the twenty α clusters are genuinely category-mixed.
+
+        Deriving category per-cluster instead of per-source-record would
+        silently edit the corpus — so assert the mixing survives.
+        """
+        mixed = 0
+        for shape in _mod().ARM_SHAPES:
+            per_cluster: dict[str, set] = {}
+            for record in _knowledge(_arm(shape)):
+                per_cluster.setdefault(record.cluster_id, set()).add(
+                    record.metadata['category']
+                )
+            mixed = max(mixed, sum(1 for v in per_cluster.values() if len(v) > 1))
+            assert sum(1 for v in per_cluster.values() if len(v) > 1) == 2, shape
+        assert mixed == 2
+
+
 class TestBetaVocabularyConformance:
     """Every emitted metadata dict must be storable through the real seam.
 

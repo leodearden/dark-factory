@@ -113,6 +113,7 @@ embedder.
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -467,3 +468,296 @@ def cross_validate_fixtures(
                     f'query {query.query_id!r} (cluster {query.cluster_id!r}) expects claim '
                     f'{claim_id!r} from cluster {expected.cluster_id!r}'
                 )
+
+
+# ---------------------------------------------------------------------------
+# Arm materialization
+# ---------------------------------------------------------------------------
+#
+# The three storage shapes E2 arbitrates between (eval-design §5 E2, PRD D9).
+# Pinned as a tuple and asserted by EQUALITY in the tests: a fourth arm must
+# not be able to appear without the decision table growing a column for it.
+
+ARM_SHAPES: tuple[str, ...] = ('status_quo', 'c_peers', 'b_grouped')
+
+#: Role marking a contamination-slab record, in every arm.
+DISTRACTOR_ROLE = 'distractor'
+
+#: Namespace for deriving this experiment's synthetic record ids.
+#:
+#: uuid5 (SHA-1 over namespace+name) rather than uuid4: arm records must be
+#: REPRODUCIBLE across runs, or two runs seed different collections and the
+#: report diff stops being signal.  The namespace is a fixed literal — a
+#: value derived at runtime would reintroduce exactly the nondeterminism
+#: this avoids.  It also keeps the ids canonical 36-char dashed UUIDs, which
+#: is what β's ``parent_id`` shape rule (``_is_full_uuid``) requires.
+_E2_ID_NAMESPACE = uuid.UUID('6f2b7c14-9a3d-4e58-8b71-2c5d0a4f9e63')
+
+
+def _derive_record_id(shape: str, key: str) -> str:
+    """Deterministic canonical dashed UUID for a synthetic arm record."""
+    return str(uuid.uuid5(_E2_ID_NAMESPACE, f'{shape}:{key}'))
+
+
+@dataclass(frozen=True)
+class ArmRecord:
+    """One record as a single arm would store it.
+
+    ``metadata`` carries ONLY what would really be written to Mem0 — the
+    reserved vocabulary keys plus ``category`` — so that
+    ``validate_memory_metadata`` can be run over it as a conformance oracle.
+    Bookkeeping the experiment needs but the store does not (``record_id``,
+    ``cluster_id``, ``claim_ids``, ``role``) lives on the dataclass instead,
+    where it cannot manufacture ``unknown_key`` census noise or accidentally
+    become a retrievable payload field that flatters one arm.
+    """
+
+    record_id: str
+    content: str
+    metadata: dict[str, Any]
+    #: ``None`` for a distractor: it belongs to no cluster by construction.
+    cluster_id: str | None
+    #: Which blind-authored claims this record realizes.  The basis of the
+    #: claim-coverage parity check and of grouped-read recall crediting.
+    claim_ids: list[str]
+    role: str
+
+
+def _distractor_records(distractors: list[Distractor]) -> list[ArmRecord]:
+    """The shared contamination slab, identical in every arm.
+
+    Carries ``category`` (server-stamped, and what mem0 routes on) but NOT a
+    single reserved vocabulary key: a distractor that were topic-anchorable
+    would stop being a distractor and start being a right answer for the
+    topic pin to find, quietly deleting the contamination variable.
+    """
+    return [
+        ArmRecord(
+            record_id=d.distractor_id,
+            content=d.content,
+            metadata={'category': d.category},
+            cluster_id=None,
+            claim_ids=[],
+            role=DISTRACTOR_ROLE,
+        )
+        for d in distractors
+    ]
+
+
+def _materialize_status_quo(
+    clusters: dict[str, CalibrationCluster], claims: list[ArmClaim],
+) -> list[ArmRecord]:
+    """Arm (a) — the corpus EXACTLY as it actually existed.
+
+    Long original records, no vocabulary metadata at all (the α fixture
+    genuinely carries no ``metadata`` key on any record).  The arm is
+    deliberately not "cleaned up": it is the baseline the other two shapes
+    are measured against, so any improvement made here would be silently
+    subtracted from both of their results.
+
+    A claim is realized in this arm by its ``source_memory_id`` record being
+    present — that is what makes claim-coverage parity checkable for an arm
+    that was never decomposed into claims.  One original may carry several
+    claims, and an original that carries none keeps an empty list.
+    """
+    claims_by_source: dict[str, list[str]] = {}
+    for claim in claims:
+        claims_by_source.setdefault(claim.source_memory_id, []).append(claim.claim_id)
+
+    records: list[ArmRecord] = []
+    for cluster_id in sorted(clusters):
+        for member in sorted(clusters[cluster_id].members, key=lambda r: r['memory_id']):
+            memory_id = member['memory_id']
+            records.append(ArmRecord(
+                record_id=memory_id,
+                content=member['content'],
+                metadata={'category': member['category']},
+                cluster_id=cluster_id,
+                claim_ids=sorted(claims_by_source.get(memory_id, [])),
+                # The α label IS this record's role in the corpus as it
+                # existed, and the guard-adequacy probe selects on it.
+                role=member['label'],
+            ))
+    return records
+
+
+def _cluster_claims(claims: list[ArmClaim]) -> dict[str, list[ArmClaim]]:
+    """Claims grouped by cluster, deterministically ordered by claim id."""
+    grouped: dict[str, list[ArmClaim]] = {}
+    for claim in claims:
+        grouped.setdefault(claim.cluster_id, []).append(claim)
+    return {
+        cluster_id: sorted(grouped[cluster_id], key=lambda c: c.claim_id)
+        for cluster_id in sorted(grouped)
+    }
+
+
+def _claim_categories(
+    clusters: dict[str, CalibrationCluster], claims: list[ArmClaim],
+) -> dict[str, str]:
+    """Map each claim to the category of the α record it was decomposed from.
+
+    Every arm record MUST carry a category, and it must be the SAME category
+    the same knowledge has in the status-quo arm.  Two reasons, both
+    load-bearing:
+
+    * ``find_near_duplicate_memory`` defensively filters on ``category``
+      (``near_duplicate_guard.py:78``).  An arm whose records carried no
+      category, or a different one, would score zero guard adequacy for a
+      reason that has nothing to do with its storage shape — a silent
+      false negative attributable to materialization, not to the arm.
+    * mem0 routes and filters on category, so a shifted category would make
+      the arms retrieve from differently-shaped candidate pools.
+
+    Deriving it from ``source_memory_id`` rather than assuming one category
+    per cluster is deliberate: two of the twenty α clusters are genuinely
+    category-mixed, and flattening them would edit the corpus.
+    """
+    by_memory_id = {
+        record['memory_id']: record['category']
+        for cluster in clusters.values()
+        for record in cluster.members
+    }
+    categories: dict[str, str] = {}
+    for claim in claims:
+        category = by_memory_id.get(claim.source_memory_id)
+        if category is None:
+            raise FixtureError(
+                f'claim {claim.claim_id!r} cites source_memory_id '
+                f'{claim.source_memory_id!r}, which is not in the α fixture — '
+                f'its category cannot be derived'
+            )
+        categories[claim.claim_id] = category
+    return categories
+
+
+def _materialize_c_peers(
+    claims: list[ArmClaim],
+    topics: dict[str, RegistryTopic],
+    categories: dict[str, str],
+) -> list[ArmRecord]:
+    """Arm (c) — short single-claim peers, flat, sharing one topic.
+
+    PRD's Option C.  Every peer of a cluster carries the SAME ``topic`` slug,
+    taken verbatim from E1's registry (PRD D4: one namespace — E2 invents no
+    slug of its own), and exactly one peer carries ``canonical: True``.
+
+    No ``parent_id``: flatness is the shape.  No ``kind`` either — arm (c)'s
+    peers are deliberately undifferentiated, which is precisely the property
+    arm (b) is being compared against.
+
+    The canonical here is the blind-authored INDEX claim, never a
+    concatenation of its siblings (PRD §3).  A rolled-up canonical would win
+    claim-recall trivially — every claim would literally be inside it — and
+    the experiment would end up measuring a concatenation rather than a peer
+    set.
+    """
+    records: list[ArmRecord] = []
+    for cluster_id, cluster_claims in _cluster_claims(claims).items():
+        topic = topics[cluster_id].topic
+        for claim in cluster_claims:
+            metadata: dict[str, Any] = {
+                'category': categories[claim.claim_id], 'topic': topic,
+            }
+            if claim.canonical:
+                # Bool identity, not truthiness: β's `invalid_canonical_type`
+                # rule rejects a truthy 1 as fatal.
+                metadata['canonical'] = True
+            records.append(ArmRecord(
+                record_id=_derive_record_id('c_peers', claim.claim_id),
+                content=claim.text,
+                metadata=metadata,
+                cluster_id=cluster_id,
+                claim_ids=[claim.claim_id],
+                role='canonical' if claim.canonical else 'peer',
+            ))
+    return records
+
+
+def _materialize_b_grouped(
+    claims: list[ArmClaim],
+    topics: dict[str, RegistryTopic],
+    categories: dict[str, str],
+) -> list[ArmRecord]:
+    """Arm (b) — one canonical per cluster plus ``parent_id`` children.
+
+    PRD's δ / Option B.  Same claim bodies as arm (c) — the two arms differ
+    only in how the claims are LINKED, which is what isolates the grouping
+    variable from an authoring-quality variable.
+
+    The canonical carries ``canonical: True`` and NO ``kind``: ``'canonical'``
+    is not a member of β's ``KIND_REGISTRY`` and would be a fatal
+    ``unknown_kind`` violation.  Canonicality is expressed by the
+    ``canonical`` key; ``kind`` says what a CHILD is (``amendment`` /
+    ``sighting``), and the two are not interchangeable.
+
+    Child ``parent_id`` values are derived from the canonical CLAIM id via
+    :func:`_derive_record_id`, never minted randomly, so the
+    fixture→arm mapping is reproducible and a rerun seeds identical
+    collections.
+    """
+    records: list[ArmRecord] = []
+    for cluster_id, cluster_claims in _cluster_claims(claims).items():
+        topic = topics[cluster_id].topic
+        canonical_claims = [c for c in cluster_claims if c.canonical]
+        if len(canonical_claims) != 1:
+            raise FixtureError(
+                f'cluster {cluster_id!r} has {len(canonical_claims)} canonical claims, '
+                f'expected exactly 1 — arm b_grouped has no parent to point at'
+            )
+        parent_id = _derive_record_id('b_grouped', canonical_claims[0].claim_id)
+
+        for claim in cluster_claims:
+            base = {'category': categories[claim.claim_id], 'topic': topic}
+            if claim.canonical:
+                metadata: dict[str, Any] = {**base, 'canonical': True}
+            else:
+                metadata = {**base, 'kind': claim.b_arm_role, 'parent_id': parent_id}
+            records.append(ArmRecord(
+                record_id=_derive_record_id('b_grouped', claim.claim_id),
+                content=claim.text,
+                metadata=metadata,
+                cluster_id=cluster_id,
+                claim_ids=[claim.claim_id],
+                role=claim.b_arm_role,
+            ))
+    return records
+
+
+def materialize_arm(
+    shape: str,
+    clusters: dict[str, CalibrationCluster],
+    claims: list[ArmClaim],
+    topics: dict[str, RegistryTopic],
+    distractors: list[Distractor],
+) -> list[ArmRecord]:
+    """Materialize the same knowledge into one of the three E2 storage shapes.
+
+    Returns the arm's own records followed by the shared distractor slab,
+    deterministically ordered so a rerun seeds an identical collection.
+
+    The three arms are held to claim-coverage parity — every blind-authored
+    claim is realizable in each of them — which is the mechanical floor
+    against the weakness the eval doc names for this very experiment: *"arm
+    quality reflects authoring skill — the experiment is gameable by
+    authoring one arm well and another lazily."*  Parity is deliberately NOT
+    extended to content length: arm (a)'s long originals versus arm (c)'s
+    short peers differ by construction, and that difference IS the D4
+    tokens-per-query metric.
+    """
+    if shape not in ARM_SHAPES:
+        raise ValueError(
+            f'unknown arm shape {shape!r} — E2 arbitrates between exactly '
+            f'{ARM_SHAPES}. Adding a shape means adding a column to the '
+            f'decision table gate η reads, not just a branch here.'
+        )
+
+    categories = _claim_categories(clusters, claims)
+    if shape == 'status_quo':
+        records = _materialize_status_quo(clusters, claims)
+    elif shape == 'c_peers':
+        records = _materialize_c_peers(claims, topics, categories)
+    else:
+        records = _materialize_b_grouped(claims, topics, categories)
+
+    return records + _distractor_records(distractors)
