@@ -972,6 +972,13 @@ _FP_CLEAR = '00112233445566778899aabbccddeeff'
 _FP_WRONG_CATEGORY = 'deadbeefdeadbeefdeadbeefdeadbeef'
 _FP_UNMATCHED = 'cafebabecafebabecafebabecafebabe'
 _FP_UNJUDGED_OPEN = '13579bdf02468ace13579bdf02468ace'
+# The non-alarm, non-no_alarm half of the M2 vocabulary.  Each one gets both a
+# linked and an unlinked case: the two answer different questions, and the
+# collapsed mapping used to give them the same badge.
+_FP_INSUFFICIENT_OPEN = '2468ace02468ace02468ace02468ace0'
+_FP_INSUFFICIENT = 'bdf13579bdf13579bdf13579bdf13579'
+_FP_GRANDFATHERED_OPEN = 'aabbccdd00112233aabbccdd00112233'
+_FP_GRANDFATHERED = '33221100ddccbbaa33221100ddccbbaa'
 
 # The escalation projection carried onto a metric row (and into
 # `unmatched_escalations`).  `created_at` is sourced from the queue record's
@@ -987,7 +994,13 @@ _JOIN_ESC_TIMESTAMP = '2026-07-30T03:15:00+00:00'
 
 
 def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
-    """One eval whose five metrics span every parity state alpha owns."""
+    """One eval whose metrics span every parity state alpha owns.
+
+    Covers the full ``(verdict class) x (linked?)`` matrix the payload can
+    reach from a single artifact tree: each of the four M2 verdict values with
+    and without a linked open escalation, plus the no-entry-at-all row.  The
+    storm states are ``_storm_tree``'s.
+    """
     root = tmp_path / 'memory-evals'
     esc_dir = tmp_path / 'escalations'
     esc_dir.mkdir(parents=True, exist_ok=True)
@@ -1001,6 +1014,10 @@ def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
             'clear-metric',
             'wrong-category',
             'unjudged-metric',
+            'insufficient-open',
+            'insufficient-metric',
+            'grandfathered-open',
+            'grandfathered-metric',
         )
     ])
     _write_limits(root, 'eval-a', run_stamp=_JOIN_RUN)
@@ -1010,6 +1027,22 @@ def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
         _verdict('eval-a', 'alarmed-unlinked', 'alarm', fingerprint=_FP_ALARMED_UNLINKED, run_stamp=_JOIN_RUN),
         _verdict('eval-a', 'clear-metric', 'no_alarm', fingerprint=_FP_CLEAR, run_stamp=_JOIN_RUN),
         _verdict('eval-a', 'wrong-category', 'alarm', fingerprint=_FP_WRONG_CATEGORY, run_stamp=_JOIN_RUN),
+        _verdict(
+            'eval-a', 'insufficient-open', 'insufficient_data',
+            fingerprint=_FP_INSUFFICIENT_OPEN, run_stamp=_JOIN_RUN,
+        ),
+        _verdict(
+            'eval-a', 'insufficient-metric', 'insufficient_data',
+            fingerprint=_FP_INSUFFICIENT, run_stamp=_JOIN_RUN,
+        ),
+        _verdict(
+            'eval-a', 'grandfathered-open', 'grandfathered',
+            fingerprint=_FP_GRANDFATHERED_OPEN, run_stamp=_JOIN_RUN,
+        ),
+        _verdict(
+            'eval-a', 'grandfathered-metric', 'grandfathered',
+            fingerprint=_FP_GRANDFATHERED, run_stamp=_JOIN_RUN,
+        ),
     ], run_stamp=_JOIN_RUN)
 
     _write_escalation(
@@ -1037,6 +1070,18 @@ def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
         dedupe_fingerprint=_FP_UNMATCHED,
         summary='an eval_regression nothing on disk explains',
         timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    # A still-open escalation on a metric the evaluator could NOT judge, and
+    # one on a metric it deliberately exempted.  Neither is a recovery.
+    _write_escalation(
+        esc_dir, 'esc-insufficient-open',
+        dedupe_fingerprint=_FP_INSUFFICIENT_OPEN,
+        summary='search-latency regressed', timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    _write_escalation(
+        esc_dir, 'esc-grandfathered-open',
+        dedupe_fingerprint=_FP_GRANDFATHERED_OPEN,
+        summary='topic-canonical-present regressed', timestamp=_JOIN_ESC_TIMESTAMP,
     )
     return root, esc_dir
 
@@ -1073,6 +1118,13 @@ class TestEscalationJoin:
         real, transient state — the watcher has not closed it yet.  Dropping
         the link would make the escalation look orphaned in exactly the window
         an operator is most likely to be looking at it.
+
+        ``recovered_open`` is reserved for THIS case and no other: the
+        escalation was filed on a prior alarm and the metric now reads
+        ``no_alarm``, so a recovery genuinely happened.  Every other verdict
+        class linked to an open escalation gets its own state — see the
+        ``insufficient_data``/``grandfathered``/``unjudged`` cases below —
+        because calling those a recovery asserts something that never occurred.
         """
         from dashboard.data.memory_evals import build_memory_evals
 
@@ -1083,6 +1135,70 @@ class TestEscalationJoin:
         assert row['verdict'] == 'no_alarm'
         assert row['parity'] == 'recovered_open'
         assert row['escalation']['id'] == 'esc-recovered-open'
+
+    def test_insufficient_data_with_an_open_escalation_is_not_a_recovery(
+        self, tmp_path: Path,
+    ) -> None:
+        """"We could not judge this" is not "this recovered".
+
+        ``insufficient_data`` means the evaluator lacked the samples to reach a
+        verdict at all.  Rendering a still-open escalation on such a metric as
+        ``recovered_open`` asserts a recovery that never happened — the alarm
+        is live and nothing has been shown to have improved.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'insufficient-open')
+
+        assert row['verdict'] == 'insufficient_data'
+        assert row['parity'] == 'insufficient_data_open'
+        assert row['escalation']['id'] == 'esc-insufficient-open'
+
+    def test_insufficient_data_without_a_link_is_not_clear(self, tmp_path: Path) -> None:
+        """An unjudgeable metric must not wear the healthy badge either."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'insufficient-metric')
+
+        assert row['verdict'] == 'insufficient_data'
+        assert row['parity'] == 'insufficient_data'
+        assert row['escalation'] is None
+
+    def test_grandfathered_with_an_open_escalation_is_not_a_recovery(
+        self, tmp_path: Path,
+    ) -> None:
+        """A standing exception with a live alarm is neither clear nor recovered."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'grandfathered-open')
+
+        assert row['verdict'] == 'grandfathered'
+        assert row['parity'] == 'grandfathered_open'
+        assert row['escalation']['id'] == 'esc-grandfathered-open'
+
+    def test_grandfathered_without_a_link_is_not_clear(self, tmp_path: Path) -> None:
+        """A known-bad measurement, deliberately exempted, is not a healthy one.
+
+        ``grandfathered`` is the ratchet's standing exception: the metric IS
+        failing and the program has chosen not to alarm on it yet.  Labelling
+        it ``clear`` calls that exception healthy, which erases the one signal
+        telling an operator the exception is still outstanding.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'grandfathered-metric')
+
+        assert row['verdict'] == 'grandfathered'
+        assert row['parity'] == 'grandfathered'
+        assert row['escalation'] is None
 
     def test_alarm_with_no_escalation_is_flagged_unlinked(self, tmp_path: Path) -> None:
         from dashboard.data.memory_evals import build_memory_evals
