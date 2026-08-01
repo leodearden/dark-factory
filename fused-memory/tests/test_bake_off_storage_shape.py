@@ -712,3 +712,312 @@ class TestMaterializationIsDeterministic:
         for shape in _mod().ARM_SHAPES:
             records = _arm(shape)
             assert len({r.record_id for r in records}) == len(records), shape
+
+
+# ===========================================================================
+# step-5 — apply_grouped_read (arm-local reference implementation of 3129)
+# ===========================================================================
+#
+# `server/grouped_read.py` DOES NOT EXIST: task 3129 is deferred behind gate
+# η, which depends on this task. A downstream task structurally cannot supply
+# an upstream premise, so the bake-off carries its own arm-local reference
+# implementation of PRD V2/D6 — which doubles as the executable specification
+# 3129 can port if the gate ratifies grouping.
+#
+# The two rules that are NOT negotiable:
+#
+#   D6 — a child hit must resolve UPWARD to its parent's grouped document.
+#        Without it a child's content becomes unreachable, which is the whole
+#        objection to δ/Option B.
+#   V2 — a `contested` child is NEVER suppressed. It survives as its own hit
+#        alongside the grouped document (the esc-5712 shape: a contested
+#        amendment folded invisibly into a canonical is how a disagreement
+#        gets silently resolved in favour of whoever wrote the canonical).
+#
+# All hit lists here are hand-built with exactly-known answers — no
+# embeddings, so every assertion is exact and tolerance-free.
+
+
+def _hit(record_id, *, parent_id=None, canonical=False, kind=None,
+         contested=False, content='body', claim_ids=(), topic='t'):
+    """One ranked hit, in the shape `apply_grouped_read` consumes."""
+    metadata: dict = {'category': 'procedural_knowledge', 'topic': topic}
+    if parent_id is not None:
+        metadata['parent_id'] = parent_id
+    if canonical:
+        metadata['canonical'] = True
+    if kind is not None:
+        metadata['kind'] = kind
+    return _mod().ArmRecord(
+        record_id=record_id,
+        content=content,
+        metadata=metadata,
+        cluster_id='c1',
+        claim_ids=list(claim_ids),
+        role='canonical' if canonical else (kind or 'peer'),
+    ), contested
+
+
+def _index(*pairs):
+    """Build (hits, records_by_id, contested_ids) from `_hit` pairs."""
+    records = [record for record, _ in pairs]
+    contested = {record.record_id for record, is_contested in pairs if is_contested}
+    return records, {r.record_id: r for r in records}, contested
+
+
+PARENT = '11111111-1111-4111-8111-111111111111'
+
+
+class TestGroupedReadUpwardResolution:
+    """D6: a child hit resolves upward — a child's content is never unreachable."""
+
+    def test_a_child_only_hit_returns_its_parents_grouped_document(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment',
+                        content='AMEND', claim_ids=['k2'])
+        records_by_id = {PARENT: parent, 'child-a': child}
+
+        grouped = mod.apply_grouped_read([child], records_by_id, contested_ids=set())
+
+        assert len(grouped) == 1
+        assert grouped[0].record_id == PARENT
+        # The child's content must be REACHABLE through the group, not lost.
+        assert 'AMEND' in grouped[0].content
+        assert 'CANON' in grouped[0].content
+        # And its claim must be credited to the group, or arm (b) would be
+        # unfairly penalised on claim-recall for grouping correctly.
+        assert set(grouped[0].claim_ids) == {'k1', 'k2'}
+
+    def test_two_children_of_one_parent_collapse_to_a_single_document(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        first, _ = _hit('child-a', parent_id=PARENT, kind='amendment', claim_ids=['k2'])
+        second, _ = _hit('child-b', parent_id=PARENT, kind='sighting', claim_ids=['k3'])
+        records_by_id = {PARENT: parent, 'child-a': first, 'child-b': second}
+
+        grouped = mod.apply_grouped_read(
+            [first, second], records_by_id, contested_ids=set()
+        )
+
+        assert len(grouped) == 1
+        assert set(grouped[0].claim_ids) == {'k1', 'k2', 'k3'}
+
+    def test_collapse_preserves_the_better_of_the_collapsed_ranks(self):
+        """The group must land where its BEST member ranked.
+
+        Demoting it to the worse rank would make grouping look worse than it
+        is at every k — an artifact of the transform, not of the shape.
+        """
+        mod = _mod()
+        other, _ = _hit('unrelated-1', content='X')
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        early, _ = _hit('child-a', parent_id=PARENT, kind='amendment')
+        late, _ = _hit('child-b', parent_id=PARENT, kind='sighting')
+        records_by_id = {
+            PARENT: parent, 'child-a': early, 'child-b': late, 'unrelated-1': other,
+        }
+
+        grouped = mod.apply_grouped_read(
+            [early, other, late], records_by_id, contested_ids=set()
+        )
+
+        assert [r.record_id for r in grouped] == [PARENT, 'unrelated-1']
+
+    def test_a_parent_hit_and_its_own_child_hit_do_not_duplicate_the_group(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment', claim_ids=['k2'])
+        records_by_id = {PARENT: parent, 'child-a': child}
+
+        grouped = mod.apply_grouped_read(
+            [parent, child], records_by_id, contested_ids=set()
+        )
+
+        assert [r.record_id for r in grouped] == [PARENT]
+        assert set(grouped[0].claim_ids) == {'k1', 'k2'}
+
+
+class TestGroupedReadDocumentShape:
+    """The grouped document is canonical body + amendment digests + a count."""
+
+    def test_document_carries_canonical_body_amendment_digests_and_a_sighting_count(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='THE CANONICAL BODY')
+        amend, _ = _hit('child-a', parent_id=PARENT, kind='amendment',
+                        content='THE AMENDMENT TEXT')
+        seen_one, _ = _hit('child-b', parent_id=PARENT, kind='sighting', content='S1')
+        seen_two, _ = _hit('child-c', parent_id=PARENT, kind='sighting', content='S2')
+        records_by_id = {
+            PARENT: parent, 'child-a': amend, 'child-b': seen_one, 'child-c': seen_two,
+        }
+
+        grouped = mod.apply_grouped_read(
+            [amend, seen_one, seen_two], records_by_id, contested_ids=set()
+        )
+
+        document = grouped[0].content
+        assert document.startswith('THE CANONICAL BODY')
+        assert 'THE AMENDMENT TEXT' in document
+        # Sightings are counted, not pasted — that IS the D4 cost claim
+        # grouping makes, so the transform has to actually make it.
+        assert 'S1' not in document and 'S2' not in document
+        assert '2' in document
+        assert grouped[0].role == 'grouped'
+
+    def test_grouped_document_keeps_the_parents_identity_and_topic(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', topic='alpha-topic')
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment', topic='alpha-topic')
+        records_by_id = {PARENT: parent, 'child-a': child}
+
+        grouped = mod.apply_grouped_read([child], records_by_id, contested_ids=set())
+
+        assert grouped[0].record_id == PARENT
+        assert grouped[0].metadata['topic'] == 'alpha-topic'
+        assert grouped[0].metadata['canonical'] is True
+
+
+class TestGroupedReadPassThrough:
+    """A hit with no parent link is untouched and stays in place."""
+
+    def test_parentless_hits_pass_through_unchanged_and_in_order(self):
+        mod = _mod()
+        first, _ = _hit('flat-1', content='A')
+        second, _ = _hit('flat-2', content='B')
+        third, _ = _hit('flat-3', content='C')
+        hits, records_by_id, contested = _index(
+            (first, False), (second, False), (third, False),
+        )
+
+        grouped = mod.apply_grouped_read(hits, records_by_id, contested_ids=contested)
+
+        assert grouped == hits  # identity, not merely equal-length
+
+    def test_an_empty_hit_list_is_returned_empty(self):
+        assert _mod().apply_grouped_read([], {}, contested_ids=set()) == []
+
+    def test_a_child_whose_parent_is_absent_from_the_index_survives(self):
+        """A dangling parent link must never delete the hit.
+
+        `parent_id` liveness is leaf δ's problem, not this transform's — and
+        dropping the hit would silently lose a real answer.
+        """
+        mod = _mod()
+        orphan, _ = _hit('child-a', parent_id=PARENT, kind='amendment', content='ORPHAN')
+
+        grouped = mod.apply_grouped_read(
+            [orphan], {'child-a': orphan}, contested_ids=set()
+        )
+
+        assert [r.record_id for r in grouped] == ['child-a']
+        assert grouped[0].content == 'ORPHAN'
+
+
+class TestGroupedReadNeverSuppressesContested:
+    """PRD V2, the esc-5712 shape: a contested child is NEVER folded away."""
+
+    def test_a_contested_child_stays_as_its_own_hit_beside_the_group(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        plain, _ = _hit('child-a', parent_id=PARENT, kind='amendment', content='PLAIN')
+        disputed, _ = _hit('child-b', parent_id=PARENT, kind='amendment',
+                           content='DISPUTED')
+        records_by_id = {PARENT: parent, 'child-a': plain, 'child-b': disputed}
+
+        grouped = mod.apply_grouped_read(
+            [plain, disputed], records_by_id, contested_ids={'child-b'},
+        )
+
+        ids = [r.record_id for r in grouped]
+        assert PARENT in ids
+        assert 'child-b' in ids, 'a contested child was suppressed into the group'
+        # It stays VISIBLY itself, not merely counted.
+        disputed_hit = next(r for r in grouped if r.record_id == 'child-b')
+        assert disputed_hit.content == 'DISPUTED'
+
+    def test_a_contested_childs_body_is_not_folded_into_the_group_document(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        disputed, _ = _hit('child-b', parent_id=PARENT, kind='amendment',
+                           content='DISPUTED')
+        records_by_id = {PARENT: parent, 'child-b': disputed}
+
+        grouped = mod.apply_grouped_read(
+            [disputed], records_by_id, contested_ids={'child-b'},
+        )
+
+        group = next((r for r in grouped if r.record_id == PARENT), None)
+        if group is not None:
+            assert 'DISPUTED' not in group.content
+
+    def test_a_contested_child_is_the_only_survivor_when_it_is_the_sole_hit(self):
+        """Even alone, it must not be replaced by its parent's document —
+        that would be exactly the silent resolution V2 forbids."""
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        disputed, _ = _hit('child-b', parent_id=PARENT, kind='amendment',
+                           content='DISPUTED')
+
+        grouped = mod.apply_grouped_read(
+            [disputed], {PARENT: parent, 'child-b': disputed}, contested_ids={'child-b'},
+        )
+
+        assert 'child-b' in [r.record_id for r in grouped]
+        assert any(r.content == 'DISPUTED' for r in grouped)
+
+
+class TestGroupedReadIsArmLocalAndPure:
+    """The suppression filter must not leak into MemoryService.search.
+
+    PRD V2 forbids it explicitly: at that seam it would break
+    `mem0_dedup.find_prior_memories`' post-filter and hide candidates from
+    the write guard — the exact failure the grouped read is supposed to
+    prevent, relocated one layer down.
+    """
+
+    def test_the_transform_itself_never_reaches_for_the_search_seam(self):
+        """Scoped to the FUNCTION's own source, not the whole file.
+
+        The module docstring legitimately discusses `MemoryService.search` —
+        it has to, since explaining why the transform is arm-local is the
+        point. What must stay clean is the transform's body.
+        """
+        import inspect  # noqa: PLC0415
+
+        source = inspect.getsource(_mod().apply_grouped_read)
+
+        assert 'MemoryService' not in source
+        assert 'memory_service' not in source
+        # Pure read-side transform: no store, no await, no I/O.
+        assert 'await' not in source
+        assert 'backend' not in source.lower()
+
+    def test_the_transform_does_not_mutate_its_inputs(self):
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment', claim_ids=['k2'])
+        records_by_id = {PARENT: parent, 'child-a': child}
+        before = (dict(parent.metadata), list(parent.claim_ids), parent.content)
+
+        mod.apply_grouped_read([child], records_by_id, contested_ids=set())
+
+        assert (dict(parent.metadata), list(parent.claim_ids), parent.content) == before
+        assert set(records_by_id) == {PARENT, 'child-a'}
+
+    def test_the_transform_is_synchronous_and_deterministic(self):
+        import inspect  # noqa: PLC0415
+
+        mod = _mod()
+        assert not inspect.iscoroutinefunction(mod.apply_grouped_read)
+
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        child, _ = _hit('child-a', parent_id=PARENT, kind='amendment')
+        records_by_id = {PARENT: parent, 'child-a': child}
+
+        runs = [
+            [r.record_id for r in mod.apply_grouped_read(
+                [child], records_by_id, contested_ids=set())]
+            for _ in range(3)
+        ]
+        assert runs[0] == runs[1] == runs[2]
