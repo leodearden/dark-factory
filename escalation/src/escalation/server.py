@@ -1520,12 +1520,12 @@ def create_server(
             do NOT read a first-tick ``'unknown'`` as a terminal failure.
 
           ``pollable`` is the boolean shorthand ``poll_by != 'branch'`` — i.e.
-          "this response carries a handle naming the in-flight merge".  Caller-
-          side doc updates (skills/unblock/SKILL.md step 7, skills/merge-queue/
-          SKILL.md §5, which still say to submit-then-poll and to merge_cancel
-          on the attached request_id unconditionally) are tracked by follow-up
-          ticket ``tkt_0RRWDD1N3YS9NQTZ8NNEGWHKT8`` — those files are outside
-          task 3148's lock set.
+          "this response carries a handle naming the in-flight merge".  Both
+          caller-side docs (skills/unblock/SKILL.md step 7, skills/merge-queue/
+          SKILL.md §5) consume this disclosure — picking the poll handle and
+          gating ``merge_cancel`` off ``poll_by``/``pollable`` rather than
+          assuming submit-then-poll-by-request_id and an unconditional
+          ``merge_cancel`` on the attached request_id.
         - Duplicate-in-verify reject (C3/D3): ``{error, code='duplicate_in_verify',
           existing_mr, existing_sha, verify_age_secs, hint='merge_cancel then
           resubmit'}``.  Returned when a *newer* SHA for the branch is submitted
