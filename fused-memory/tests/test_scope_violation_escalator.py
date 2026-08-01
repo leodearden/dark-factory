@@ -860,6 +860,77 @@ class TestBudgetMisconfigEscalation:
         )
 
 
+@pytest.mark.skipif(
+    not sve_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestRoutingOverrideEscalation:
+    """Task 3123: ``routing_override_reason`` is an AUDITED bypass.
+
+    When a caller supplies ``routing_override_reason`` to ``submit_task``, the
+    path-scope guards are skipped entirely — the task is created no matter what
+    paths it cites.  Before this task the ONLY record of that was a
+    ``logger.warning``, so a bypass was operationally indistinguishable from no
+    bypass at all.  ``report_routing_override`` files a ``scope_violation``
+    record on the BYPASS path (nothing was blocked) so the operator queue shows
+    the override, the caller's stated reason, and the paths the guard WOULD
+    have flagged.
+    """
+
+    @staticmethod
+    def _payloads(root):
+        """Return the escalation payloads written under *root* (sorted by id)."""
+        files = sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+        return [json.loads(f.read_text()) for f in files]
+
+    def test_writes_override_escalation_under_project_root(self, tmp_path):
+        esc = ScopeViolationEscalator()
+        reason = 'self-referential: this task quotes the tokens the guard matches'
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            candidate_title='Task about the path guard itself',
+            reason=reason,
+            matched_paths=('crates/widget.rs',),
+            suggested_project='reify',
+        )
+        assert esc_id is not None
+
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('*.json'))
+        assert len(files) == 1, f'expected one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+
+        assert payload['id'] == esc_id
+        assert payload['category'] == 'scope_violation'
+        assert payload['severity'] == 'info'
+        assert payload['level'] == 1
+        assert payload['agent_role'] == 'fused-memory/path-guard'
+
+        # Distinct anchor so override records are independently greppable from
+        # the rejection/advisory records that share the scope_violation category.
+        assert payload['task_id'] != 'task-path-guard'
+        assert payload['id'].startswith('esc-task-path-guard-override'), payload['id']
+
+        # suggested_action is rendered VERBATIM into agent briefings (task 3119).
+        # Nothing was blocked here, so it must never read as a resubmit order.
+        assert payload['suggested_action'] == 'review_override_justification'
+        assert not payload['suggested_action'].startswith('resubmit_')
+
+        assert 'ROUTING OVERRIDE' in payload['summary']
+        assert 'dark_factory' in payload['summary']
+
+        detail = payload['detail']
+        assert reason in detail, 'the caller-supplied reason must be recorded verbatim'
+        assert "filing_project_id='dark_factory'" in detail
+        assert str(tmp_path) in detail
+        assert 'crates/widget.rs' in detail
+        assert 'reify' in detail
+        # Prose must state plainly that nothing was blocked.
+        assert 'WAS created' in detail
+        assert 'no resubmission is needed' in detail
+
+
 class TestEscalationDisabled:
     def test_no_op_when_escalation_pkg_unavailable(self, tmp_path, monkeypatch):
         """When HAS_ESCALATION is False the escalator silently no-ops."""
