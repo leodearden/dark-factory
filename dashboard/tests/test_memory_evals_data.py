@@ -1979,7 +1979,7 @@ class TestCodeBugsAreNotArtifactDegradation:
         """
         from dashboard.data import memory_evals
 
-        assert memory_evals._ARTIFACT_ERRORS == (OSError, ValueError)
+        assert (OSError, ValueError) == memory_evals._ARTIFACT_ERRORS
 
     def test_a_bug_in_read_limits_is_an_internal_error(self, tmp_path: Path, monkeypatch) -> None:
         from dashboard.data import memory_evals as memory_evals_mod
