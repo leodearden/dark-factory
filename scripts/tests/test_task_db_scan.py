@@ -430,3 +430,136 @@ def test_run_scan_cli_prints_exactly_the_render_output(tmp_path, capsys):
 
     assert _cli(["--db", str(db), "--json"], lambda db_path: [], render=render) == 0
     assert capsys.readouterr().out == "custom body\nsecond line\n"
+
+
+# ---------------------------------------------------------------------------
+# Shared test fixtures (scripts/tests/conftest.py).
+#
+# Self-checks for the three fixtures that replace helpers previously copied
+# across the three sweep-script test files: _TASKS_SCHEMA (3 copies), the
+# fake-db builder (3 copies under two names and two return types) and the
+# project-root toucher (2 copies). A fixture used by ~30 tests deserves its
+# own direct coverage — otherwise a bug in it surfaces as a confusing failure
+# somewhere downstream rather than here.
+# ---------------------------------------------------------------------------
+
+_SCANNER_COLUMNS = (
+    "tag", "id", "title", "description", "details",
+    "test_strategy", "status", "metadata", "updated_at",
+)
+
+
+def test_tasks_table_schema_is_the_union_of_all_three_files_columns(tasks_table_schema):
+    """The schema is the SUPERSET, not the intersection.
+
+    audit_wiped_metadata_files' copy adds `priority TEXT`; the two scanners'
+    copies do not have it. A superset is inert for the scanners (neither
+    inserts nor selects priority, and scan_db uses an explicit column list)
+    while being required by audit — so one shared schema can serve all three
+    without either file losing a column it depends on.
+    """
+    for column in _SCANNER_COLUMNS:
+        assert column in tasks_table_schema, column
+    assert "priority" in tasks_table_schema
+    # It must be executable DDL, not just a string that mentions the names.
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(tasks_table_schema)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    finally:
+        conn.close()
+    assert cols == set(_SCANNER_COLUMNS) | {"priority"}
+
+
+def test_make_tasks_db_roundtrips_rows_through_a_plain_sqlite_read(make_tasks_db):
+    db_path = make_tasks_db([
+        {"id": 1, "tag": "master", "description": "first"},
+        {"id": 2, "tag": "master", "description": "second"},
+    ])
+
+    assert isinstance(db_path, Path)
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, description FROM tasks ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [(1, "first"), (2, "second")]
+
+
+def test_make_tasks_db_leaves_an_omitted_nullable_column_null(make_tasks_db):
+    db_path = make_tasks_db([{"id": 1}])
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT description, details, test_strategy, metadata FROM tasks"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == (None, None, None, None)
+
+
+def test_make_tasks_db_json_encodes_a_non_str_metadata_value(make_tasks_db):
+    """audit's copy does this today and its tests depend on it.
+
+    A str metadata value must still pass through VERBATIM, so a test can
+    insert deliberately malformed JSON to exercise the decoder's error path.
+    """
+    db_path = make_tasks_db([
+        {"id": 1, "metadata": {"files": ["a.py"]}},
+        {"id": 2, "metadata": "{not valid json"},
+        {"id": 3, "metadata": None},
+    ])
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = dict(conn.execute("SELECT id, metadata FROM tasks").fetchall())
+    finally:
+        conn.close()
+    assert json.loads(rows[1]) == {"files": ["a.py"]}
+    assert rows[2] == "{not valid json"
+    assert rows[3] is None
+
+
+def test_make_tasks_db_can_build_several_databases_by_name(make_tasks_db):
+    """Factory, not a plain fixture: existing multi-db tests (e.g. the report
+    grouping ones) build two databases inside a single test."""
+    first = make_tasks_db([{"id": 1}], name="a.db")
+    second = make_tasks_db([{"id": 2}], name="b.db")
+
+    assert first != second
+    assert first.exists() and second.exists()
+
+
+def test_make_tasks_db_accepts_an_explicit_directory(make_tasks_db, tmp_path):
+    """Needed so a caller can seed a db at a project-root-relative location
+    (``<root>/.taskmaster/tasks/``) rather than at the bare tmp_path."""
+    target = tmp_path / "proj" / ".taskmaster" / "tasks"
+    target.mkdir(parents=True)
+
+    db_path = make_tasks_db([{"id": 1}], directory=target)
+
+    assert db_path == target / "tasks.db"
+    assert db_path.exists()
+
+
+def test_project_root_with_tasks_db_is_discoverable(project_root_with_tasks_db, tmp_path):
+    root = tmp_path / "proj"
+
+    db_path = project_root_with_tasks_db(root)
+
+    assert db_path == root / ".taskmaster" / "tasks" / "tasks.db"
+    assert discover_db_paths(project_roots=[str(root)]) == [str(db_path)]
+
+
+def test_project_root_with_tasks_db_is_idempotent(project_root_with_tasks_db, tmp_path):
+    """Called twice on the same root it must not raise — one existing test
+    builds a root and then re-touches it."""
+    root = tmp_path / "proj"
+
+    first = project_root_with_tasks_db(root)
+    second = project_root_with_tasks_db(root)
+
+    assert first == second
