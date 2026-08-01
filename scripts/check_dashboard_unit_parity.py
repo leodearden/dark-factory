@@ -17,14 +17,27 @@ nothing reported that until this check existed.
 
 Exit codes
 ----------
-0 — parity (every compared directive agrees)
-1 — drift  (one or more compared directives disagree)
+0 — parity (every compared directive agrees, and at least one unit was
+    actually compared)
+1 — drift (one or more compared directives disagree) OR a committed unit
+    VANISHED (no committed copy found, so nothing could be verified for it)
 2 — installed unit absent (no installed copy found for one or more units)
 
 PRECEDENCE: drift (1) DOMINATES absence (2).  With three units a single run can
 hit both at once, and returning 2 there would let an unrelated uninstalled unit
 mask an actionable finding — ``setup-host.sh`` treats 2 as a benign "not
 installed on this host, skipping" and only 1 as something to act on.
+
+A run that compared ZERO units can NEVER report parity.  A vanished committed
+unit shares exit 1 with drift rather than minting a third code, for the same
+reason: the committed copy is this checker's source of truth, so its absence
+means the gate verified nothing — the opposite of the benign "not installed
+here" that 2 denotes, and ``setup-host.sh`` already branches on this 0/1/2
+vocabulary.  Before that was true, ``--repo-root`` naming a tree with no units
+compared nothing and still printed "parity — 3 unit(s) match", so a typo'd
+path, a renamed unit or a ``git mv`` of ``dashboard/*.service`` silently
+disarmed the whole check.  The success line therefore reports the number of
+units actually COMPARED, never the number selected.
 
 Usage
 -----
@@ -635,12 +648,14 @@ def main(argv: Sequence[str]) -> int:
     """Parse args and run the parity check.
 
     Returns:
-        0 — parity
-        1 — drift
+        0 — parity (and at least one unit was actually compared)
+        1 — drift, OR a committed unit vanished
         2 — one or more installed units absent
 
     Drift DOMINATES absence: a run that hits both returns 1.  An absent unit
-    is still reported in that case — dominated, not hidden.
+    is still reported in that case — dominated, not hidden.  A run that
+    compared ZERO units never reports parity: see the exit-code table in the
+    module docstring.
     """
     parser = argparse.ArgumentParser(
         description="Verify parity between the in-repo and installed dashboard units."
@@ -675,6 +690,10 @@ def main(argv: Sequence[str]) -> int:
 
     drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
     missing: list[pathlib.Path] = []
+    vanished: list[tuple[str, pathlib.Path]] = []
+    # Units that actually reached compare_unit. The success line reports THIS
+    # count, not len(selected): a report may only claim what it verified.
+    compared: list[str] = []
 
     for name in selected:
         spec = UNITS[name]
@@ -683,18 +702,15 @@ def main(argv: Sequence[str]) -> int:
 
         if not repo_path.is_file():
             # The committed unit is the source of truth; without it there is
-            # nothing to compare against. Report loudly rather than skipping
-            # silently — a vanished repo unit is itself a finding.
-            _log(
-                f"[skip] {name}: committed unit not found at {repo_path}",
-                stream=sys.stderr,
-            )
+            # nothing to compare against, so this unit was NOT checked.
+            vanished.append((name, repo_path))
             continue
 
         if not installed_path.is_file():
             missing.append(installed_path)
             continue
 
+        compared.append(name)
         for drift in compare_unit(
             spec,
             repo_path.read_text(encoding="utf-8"),
@@ -704,6 +720,24 @@ def main(argv: Sequence[str]) -> int:
 
     for path in missing:
         _log(f"[skip] installed unit not found: {path} (not installed on this host)")
+
+    if vanished:
+        # Deliberately worded apart from the drift block below. Both exit 1,
+        # but they send the operator to different places: a drift is a
+        # directive diff to propagate, whereas this is "the file I compare
+        # against is gone" — telling them to hunt for a diff would waste the
+        # trip.
+        _log(
+            f"[vanished] {len(vanished)} committed unit(s) not found — "
+            "nothing was verified for them:"
+        )
+        for name, repo_path in vanished:
+            _log(f"  {name}: expected committed copy at {repo_path}")
+        _log(
+            "[vanished] The committed unit is this checker's source of truth. "
+            "Check --repo-root, and whether the unit was renamed or moved "
+            "(the paths live in UNITS in this script)."
+        )
 
     if drifts:
         _log(f"[drift] {len(drifts)} directive(s) differ between repo and installed units:")
@@ -717,12 +751,23 @@ def main(argv: Sequence[str]) -> int:
             "scripts/setup-host.sh  (this checker is read-only by design — "
             "see the module docstring for why there is no --fix)"
         )
+
+    if drifts or vanished:
         return 1
 
     if missing:
         return 2
 
-    _log(f"[ok] parity — {len(selected)} unit(s) match their committed copies.")
+    if not compared:
+        # Belt and braces on the return-0 path ONLY: every path that compared
+        # nothing for a KNOWN reason has already returned above (1 for a
+        # vanished committed unit, 2 for "not installed on this host"), so
+        # reaching here means we compared nothing for no stated reason. A run
+        # that verified nothing must not report parity.
+        _log("[error] no units were compared — nothing was verified.")
+        return 1
+
+    _log(f"[ok] parity — {len(compared)} unit(s) match their committed copies.")
     return 0
 
 
