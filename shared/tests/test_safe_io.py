@@ -830,8 +830,19 @@ class TestAtomicWriteRaceSafety:
 # by hand next month — the pattern is short enough to look harmless, which is
 # exactly how the first ten accumulated (two of them carried a docstring
 # saying they were copied because "there is no atomic writer in shared/ to
-# reuse").  These tests are the fence: a NEW rename-into-place anywhere in the
-# three source trees fails loudly and points the author at this module.
+# reuse").  These tests are the fence: a NEW rename-into-place inside the
+# THREE TREES LISTED BELOW fails loudly and points the author at this module.
+#
+# SCOPE LIMIT — the fence is narrower than "the repo", and saying so matters
+# more than the fence looking complete.  ``_SRC_TREES`` omits ``fused-memory/
+# src`` and ``scripts/``, where six unmigrated hand-rolled writers already
+# live: curator_escalator.py:224, event_queue.py:536 and :833,
+# manifest_stamping.py:269, orchestrator-watchdog.py:854,
+# legibility/codebook.py:575 and legibility/census.py:602.  A new copy in
+# either of those trees passes this guard silently.  Extending the trees to
+# cover them — and relocating this cross-package guard out of ``shared/tests``,
+# where it currently reaches up into two sibling packages — is tracked as
+# follow-up ticket ``tkt_0RRXRQQ4MYPYZ2XSX459W29AZ6``.
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC_TREES = ('shared/src', 'orchestrator/src', 'escalation/src')

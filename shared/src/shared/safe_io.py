@@ -206,6 +206,16 @@ def atomic_write_text(
     ----------
     path:
         Destination file.  Accepts any ``os.PathLike`` or ``str``.
+
+        The argument is coerced with ``Path(path)``, so ANYTHING satisfying
+        ``os.PathLike[str]`` becomes a real filesystem path — and under
+        ``mkdir=True`` its parent chain is really created.  Callers must pass a
+        genuine path; tests must never pass a mock.  This helper cannot detect
+        one: ``unittest.mock.MagicMock`` supports ``__fspath__`` with a genuine
+        ``str`` default return, so a MagicMock is a *valid* ``PathLike`` whose
+        ``os.fspath()`` is a repr-derived string (``'MagicMock/mock.foo()/…'``)
+        indistinguishable at the type level from a legitimate relative path.
+        Passing one materialises that repr as a directory tree (task 3223).
     text:
         Complete contents to write.  The destination is replaced wholesale.
     encoding:
@@ -229,6 +239,11 @@ def atomic_write_text(
         When True, create ``path.parent`` (and any missing ancestors) before
         writing.  Default False, so a missing parent surfaces as
         ``FileNotFoundError`` rather than being silently conjured.
+
+        Creation is relative to the process CWD when *path* is relative, and
+        reaches exactly the destination's ancestor chain — no further.  Pair
+        this with the coercion note under *path*: ``mkdir=True`` is what turns
+        a bogus duck-typed path from a harmless no-op into a real tree on disk.
 
     Raises
     ------
