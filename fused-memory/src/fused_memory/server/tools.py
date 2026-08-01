@@ -63,7 +63,7 @@ from fused_memory.middleware.task_interceptor import (
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.citation_verifier import (
-    find_citation_occurrences,
+    find_live_citation_occurrences,
     is_concrete_memory_id,
     repoint_task_citations,
 )
@@ -1611,12 +1611,22 @@ def create_mcp_server(
     async def _scan_task_citations(
         project_root: str, memory_id: str
     ) -> list[dict[str, Any]]:
-        """Return one record per task whose metadata cites *memory_id*.
+        """Return one record per task whose metadata LIVE-cites *memory_id*.
 
         A read-only pre-pass over the same snapshot semantics
         ``repoint_task_citations`` uses, so the gate can decide whether a
         repoint is needed (and name the citers in a refusal) before committing
         to any write.
+
+        "Cites" is ``find_live_citation_occurrences``, which excludes the
+        ``x_memory_citation_tombstones`` ledger. That exclusion is load-bearing
+        here: a tombstone's ``superseded_memory_id`` names the deleted id BY
+        DESIGN, so counting it would make an already-repointed task look like an
+        outstanding citer forever — and the retry ``_CITATION_REPOINT_FAILED_HINT``
+        instructs the caller to perform would never terminate. The gate and
+        ``repoint_task_citations`` MUST agree on this definition: they read the
+        same snapshot, and a disagreement surfaces as a gate demanding a repoint
+        that the sweep then reports zero work for.
         """
         tasks_data = await task_interceptor.get_tasks(project_root)  # type: ignore[union-attr]
         tasks = (tasks_data or {}).get('tasks') or []
@@ -1626,7 +1636,7 @@ def create_mcp_server(
         for task in tasks:
             if not isinstance(task, dict):
                 continue
-            paths = find_citation_occurrences(task.get('metadata'), memory_id)
+            paths = find_live_citation_occurrences(task.get('metadata'), memory_id)
             if not paths:
                 continue
             status = task.get('status')
