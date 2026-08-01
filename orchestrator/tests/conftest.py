@@ -741,32 +741,14 @@ def _drain_async_mock_coroutines():
 
 @pytest.fixture
 def steward_worktree(tmp_path: Path) -> Path:
-    """Single-source the ``tmp_path``-rooted worktree dir for ``_make_steward`` helpers.
+    """Single-source the ``tmp_path``-rooted worktree dir for the ``_make_steward`` helpers.
 
-    Task 3366 (reviewer_comprehensive suggestion 1 on task 3087, category
-    "duplication"). Task 3087 made the two independent ``_make_steward(*,
-    worktree: Path)`` helpers (test_suggestion_triage.py, and
-    test_workflow_state_machine_boundary.py's own row-9 variant) take a
-    required keyword-only ``worktree`` param — the right fix for a temp-dir
-    leak — but every one of the 12 call sites across
-    test_suggestion_triage.py, test_block_disposition.py, and
-    test_workflow_state_machine_boundary.py then had to repeat the literal
-    ``worktree=tmp_path / 'wt'``. That literal was a copy-paste convention
-    with no single owner: a future caller could just as easily write
-    ``worktree=tmp_path`` (landing the meta-root at
-    ``tmp_path.parent/.task-meta/<numbered-root>``, i.e. outside the dir
-    pytest garbage-collects) with nothing to catch it.
-
-    Lives here (conftest.py) rather than in test_suggestion_triage.py because
-    conftest.py is the only location reachable by all three call-site files —
-    a module-level fixture in test_suggestion_triage.py would reach only its
-    own 9 sites, and importing it cross-module would collide with the
-    deliberate function-local-import convention documented at
-    test_workflow_state_machine_boundary.py:1225-1227.
-
-    Does NOT create the directory — ``_make_steward`` (or its callers) does
-    that, and the steward's pre-flight auto-escalates "Worktree missing" on a
-    path that is not a directory.
+    This single-sources the literal; it is a convention, not an enforced
+    invariant — a test can still build its own path and pass that instead.
+    Lives in conftest.py because that is the only module every call-site file
+    reaches without a cross-module import, which would collide with their
+    function-local-import convention.  Does NOT create the directory —
+    ``_make_steward`` mkdir's it.
     """
     return tmp_path / 'wt'
 
