@@ -42,6 +42,28 @@ RestartSec=5
 RestartSteps=4
 RestartMaxDelaySec=60
 
+# A clean SIGTERM stop exits 143, not 0: `uv run` propagates its child's signal
+# death as 128+15. Without this line systemd's default classification records
+# every graceful stop as "Failed with result exit-code" (status=143) — observed
+# 2026-07-30 22:23:53 BST on this unit after task 3306's bounded-drain change,
+# with six keep-alive clients attached. Left alone it compounds: each routine
+# restart plants a false failure until "failed" means nothing and a real crash
+# reads exactly like a deploy.
+#
+# Numeric, not SIGTERM: `uv run` translates the signal into an exit code before
+# systemd sees it, so the journal reports result=exit-code/status=143 and a
+# signal-name entry would not match what systemd actually observes.
+#
+# The trade: with 143 classified as success, Restart=on-failure no longer
+# re-fires on it. That is intended, and it does not weaken supervision — both
+# programmatic restart paths (scripts/restart-dashboard.sh:21,
+# scripts/dashboard-watchdog.py) issue `systemctl --user restart`, an explicit
+# stop for which systemd never consults Restart= at all. The residual case is
+# an out-of-band `kill -TERM`, which dark-factory-dashboard-watchdog.timer
+# covers by probing /api/health every 30s and restarting a dead dashboard
+# (arming the installed timer is task 3289's job, not this file's).
+SuccessExitStatus=143
+
 TimeoutStopSec=15
 
 # Logging goes to journalctl --user -u dark-factory-dashboard
