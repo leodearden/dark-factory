@@ -57,6 +57,7 @@ def _make_write_set(**overrides: Path) -> WriteSet:
         git_task_reflogs=Path('/main/.git/logs/refs/heads/task'),
         git_worktree_admin=Path('/main/.git/worktrees/wt'),
         uv_cache=Path('/home/.cache/uv'),
+        tree_sitter_cache=Path('/home/.cache/tree-sitter'),
         claude_fleet=Path('/home/.claude/fleet'),
         tmp=Path('/tmp'),
         dev=Path('/dev'),

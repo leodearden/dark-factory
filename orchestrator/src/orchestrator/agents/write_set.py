@@ -14,9 +14,12 @@ Contract (PRD Sec Contract) — derived per-invocation from the worktree path:
        ``logs/refs/heads/task/``, ``worktrees/<name>/``) derived by parsing
        ``<worktree>/.git``'s ``gitdir:`` line
   7. ``~/.cache/uv/``
-  8. ``~/.claude/fleet/`` (alpha1 FINAL-WRITABLE-LIST — see
+  8. ``~/.cache/tree-sitter/`` (task 3382) — the tree-sitter grammar-cache
+     SUBDIR specifically, never the ``~/.cache`` parent, which would hand
+     every sandboxed role write access to every other tool cache there
+  9. ``~/.claude/fleet/`` (alpha1 FINAL-WRITABLE-LIST — see
      ``plans/os-sandbox-claude-home-writer-audit.md``)
-  9-10. ``/tmp/``, ``/dev/``
+  10-11. ``/tmp/``, ``/dev/``
 
 Everything else is read-only. ``compute_write_set`` is a PURE derivation —
 no filesystem side effects (no makedirs); existence/creation remains the
@@ -47,6 +50,7 @@ class WriteSet:
     git_task_reflogs: Path
     git_worktree_admin: Path
     uv_cache: Path
+    tree_sitter_cache: Path
     claude_fleet: Path
     tmp: Path
     dev: Path
@@ -62,6 +66,7 @@ class WriteSet:
             self.git_task_reflogs,
             self.git_worktree_admin,
             self.uv_cache,
+            self.tree_sitter_cache,
             self.claude_fleet,
             self.tmp,
             self.dev,
@@ -155,6 +160,9 @@ def compute_write_set(worktree: Path, *, home: Path | None = None) -> WriteSet:
         git_task_reflogs=(main_git / 'logs' / 'refs' / 'heads' / 'task').resolve(),
         git_worktree_admin=admindir,
         uv_cache=(home / '.cache' / 'uv').resolve(),
+        # The tree-sitter grammar cache SUBDIR only — never the ~/.cache
+        # parent, which would grant every other tool cache living there.
+        tree_sitter_cache=(home / '.cache' / 'tree-sitter').resolve(),
         claude_fleet=(home / '.claude' / 'fleet').resolve(),
         tmp=Path('/tmp'),
         dev=Path('/dev'),
