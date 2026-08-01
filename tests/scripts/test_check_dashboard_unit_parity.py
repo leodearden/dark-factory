@@ -22,7 +22,10 @@ tests/scripts/test_check_fused_memory_unit_parity.py::_load_checker.
 """
 
 import importlib.util
+import os
 import pathlib
+import subprocess
+import sys
 import types
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
@@ -1077,3 +1080,142 @@ def test_main_reports_the_watchdog_pre_incident_drift(tmp_path: pathlib.Path, ca
         f"3308's whole-tick bound is missing from the installed copy: {out}"
     )
     assert _WATCHDOG_SERVICE in out
+
+
+# ---------------------------------------------------------------------------
+# CLI subprocess boundary  (step-15 / step-16)
+# ---------------------------------------------------------------------------
+
+
+def _run_checker(repo: pathlib.Path, installed: pathlib.Path, *extra: str):
+    """Invoke the checker as a real subprocess, as setup-host.sh does."""
+    return subprocess.run(
+        [
+            sys.executable,
+            str(CHECKER_PATH),
+            "--repo-root",
+            str(repo),
+            "--installed-dir",
+            str(installed),
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_checker_subprocess_exit_0_on_parity(tmp_path: pathlib.Path):
+    """The standalone CLI exits 0 on parity.
+
+    Asserts on real exit codes and real stdout rather than in-process return
+    values, because the subprocess IS the interface setup-host.sh and the
+    operator use. Mirrors test_parity_checker_callable_as_subprocess in the
+    fused-memory test module.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo)
+
+    result = _run_checker(repo, installed)
+
+    assert result.returncode == 0, (
+        f"Expected 0; got {result.returncode}.\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+
+
+def test_checker_subprocess_exit_1_on_the_measured_watchdog_drift(tmp_path: pathlib.Path):
+    """The real host drift, through the real CLI → exit 1, reported on STDOUT.
+
+    setup-host.sh branches on this exit code, and an operator reads this
+    stdout; both are asserted here rather than assumed.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo, omit=(_WATCHDOG_SERVICE,))
+    installed_watchdog = installed / _WATCHDOG_SERVICE
+    installed_watchdog.write_text(
+        "[Unit]\n"
+        "Description=Dashboard availability watchdog\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "ExecStart=/bin/sh -c 'curl -sf --max-time 5 "
+        "http://127.0.0.1:8080/healthz "
+        "|| systemctl --user restart dark-factory-dashboard.service'\n",
+        encoding="utf-8",
+    )
+
+    result = _run_checker(repo, installed)
+
+    assert result.returncode == 1, (
+        f"Expected 1; got {result.returncode}.\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+    assert "TimeoutStartSec" in result.stdout
+    assert _WATCHDOG_SERVICE in result.stdout
+    assert str(installed_watchdog) in result.stdout
+
+
+def test_checker_subprocess_exit_2_on_empty_installed_dir(tmp_path: pathlib.Path):
+    """No installed units at all → exit 2 (setup-host.sh's benign skip)."""
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    result = _run_checker(repo, empty)
+
+    assert result.returncode == 2, (
+        f"Expected 2; got {result.returncode}.\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+
+
+def test_checker_subprocess_runs_without_third_party_imports(tmp_path: pathlib.Path):
+    """The checker runs under a bare `python3` with an empty PYTHONPATH.
+
+    setup-host.sh invokes it as plain `python3`, on a host that may not have
+    the project venv active — a third-party import would make it die there
+    while passing in this suite's environment.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo)
+
+    result = subprocess.run(
+        [
+            "python3",
+            str(CHECKER_PATH),
+            "--repo-root",
+            str(repo),
+            "--installed-dir",
+            str(installed),
+        ],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ""},
+    )
+
+    assert result.returncode == 0, (
+        f"Bare python3 run failed ({result.returncode}).\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+
+
+def test_checker_subprocess_unit_flag_narrows_the_run(tmp_path: pathlib.Path):
+    """--unit works across the CLI boundary too."""
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    narrowed = _run_checker(repo, installed, "--unit", _WATCHDOG_TIMER)
+    assert narrowed.returncode == 0, narrowed.stdout
+
+    full = _run_checker(repo, installed)
+    assert full.returncode == 1, full.stdout
