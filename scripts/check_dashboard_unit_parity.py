@@ -86,6 +86,19 @@ are split by CLASS, because one rule cannot fit all of them:
   variable NAME, not to Environment= as a whole, so blessing the nine-root
   value does not also bless the variable disappearing.
 
+One unit has THREE sites, not two: ``setup-host.sh`` installs
+``dark-factory-dashboard.service`` by RENDERING
+``scripts/dashboard.service.template`` (``__REPO_ROOT__`` / ``__UV_PATH__``
+substitution), and only ``cp``s the two watchdog units verbatim — so the
+committed ``dashboard/dark-factory-dashboard.service`` this checker treats as
+truth is not the source of the copy it compares against.  The two repo-side
+files are held in lockstep by a staleness test in
+``tests/scripts/test_check_dashboard_unit_parity.py`` (see the comment on that
+registry entry for why ``repo_relpath`` was not simply retargeted at the
+template).  Editing one without the other would otherwise leave this checker
+reporting drift whose stated remediation — run ``setup-host.sh`` — reinstalls
+the same template and changes nothing.
+
 Design notes
 ------------
 - Stdlib-only (argparse, dataclasses, pathlib, re, sys) — runs under plain
@@ -559,6 +572,26 @@ def compare_unit(
 UNITS: dict[str, UnitSpec] = {
     "dark-factory-dashboard.service": UnitSpec(
         name="dark-factory-dashboard.service",
+        # THREE SITES, NOT TWO — read this before editing either file.
+        # setup-host.sh does not `cp` this unit the way it does the two
+        # watchdog units. It RENDERS the installed copy from
+        # scripts/dashboard.service.template (setup-host.sh:362-367,
+        # substituting __REPO_ROOT__ / __UV_PATH__), so the path below is NOT
+        # the source of the copy this checker compares against. Edit one of
+        # the two repo-side files and you must edit the other; they are held
+        # in lockstep by
+        # tests/scripts/test_check_dashboard_unit_parity.py::
+        # test_committed_dashboard_unit_agrees_with_the_installed_template,
+        # which fails the moment they diverge.
+        #
+        # WHY repo_relpath still points at the committed unit rather than at
+        # the template: every value-compared key here is a host-invariant
+        # literal, so pointing at the template would additionally require
+        # normalising __REPO_ROOT__/__UV_PATH__ before every comparison to
+        # keep present_only and the ExecStart-prefix territory honest — and it
+        # would leave dashboard/dark-factory-dashboard.service an unchecked
+        # orphan. Guarding the pair with the same staleness mechanism already
+        # used against key rot is the smaller change and closes the same hole.
         repo_relpath="dashboard/dark-factory-dashboard.service",
         compared=(
             # Restart policy — the task's named minimum coverage. All
