@@ -203,10 +203,13 @@ _PLAN_CREATOR_TOOLS = [
     # Architect task-rejection escape hatches.
     # report_blocking_dependency — depends on un-merged sibling task.
     # report_task_already_done — work is already on main (skip planning).
+    # report_ready_to_merge — work is complete on THIS BRANCH; only the merge
+    #   to main is missing (clean-FF + verify-passed + review-PASS).
     # report_unactionable_task — spec is broken, jump straight to L1.
     # report_false_premise — RED-test premise is false/unreachable (design_concern L1).
     'mcp__plan-tools__report_blocking_dependency',
     'mcp__plan-tools__report_task_already_done',
+    'mcp__plan-tools__report_ready_to_merge',
     'mcp__plan-tools__report_unactionable_task',
     'mcp__plan-tools__report_false_premise',
     # Authoring-time pre-satisfy (task 3033 / PRD §A1, substrate from task 3030).
@@ -346,13 +349,16 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    Based on what you find, choose ONE of the following exits. Do NOT call `create_plan` if any of the rejection paths apply.
 
    - **Work is already on main** (the file/symbol the task asks you to add is already present, typically because a sibling task direct-merged or a prior orchestrator run landed it): call `report_task_already_done(commit=<sha>, evidence="...")` and stop. Find the commit with `git log --all --oneline -- <path>` or by grepping recent merge commits. The orchestrator will verify the commit is on main and set this task to `done` with provenance.
+   - **Work is complete on THIS BRANCH but never landed on main (fast-forward + verify-passed + review-PASS)**: call `report_ready_to_merge(commit=<branch tip sha>, evidence="...")` and stop. This applies when main is an ancestor of the branch tip and the tip is NOT already contained in main (a clean fast-forward), verify already PASSED on this exact tip, and review already returned PASS or suggestions-only on this exact tree. Do NOT use `report_unactionable_task` for this case — that L1 costs a human ~100k tokens and vetoes the verified-green auto-merge reaper. Do NOT use `report_ready_to_merge` when work is genuinely missing, when verify/review never passed on this tip, or when the branch has diverged from main (needs a rebase/merge to resolve) — write a plan instead. If the work is already on MAIN, that is `report_task_already_done`, not this.
    - **A referenced file/symbol is missing AND a sibling task is expected to introduce it** (the task tree, briefing, or task description points to an un-merged sibling task as the source): call `report_blocking_dependency(depends_on_task_id=<sibling_task_id>, reason="...")` and stop. The orchestrator will register the Taskmaster dependency and re-queue this task once the named task lands.
    - **A referenced file/symbol is missing AND you can't identify a sibling task** (the artifact is just missing, no obvious owner): escalate via `escalate_blocker` with `category='missing_premise'`, naming the missing artifact and why the task assumed it existed.
    - **The task spec itself is unworkable** — premises are contradictory, the goal is incompatible with current main, or no valid plan exists as written: call `report_unactionable_task(reason="...", evidence="...")` and stop. Use this only when a human needs to rewrite or cancel the task. The orchestrator will jump straight to a level-1 escalation, bypassing the steward — for risks/concerns where a plan IS still possible, use `escalate_blocker` instead.
 
-   If you call `escalate_blocker` and will NOT subsequently call `create_plan`, you MUST also call `report_unactionable_task` (or `report_blocking_dependency` / `report_task_already_done` if either fits) so the orchestrator routes to a clean L1 instead of retrying you.
+   If you call `escalate_blocker` and will NOT subsequently call `create_plan`, you MUST also call `report_unactionable_task` (or `report_blocking_dependency` / `report_task_already_done` / `report_ready_to_merge` if one fits) so the orchestrator routes to a clean L1 instead of retrying you.
 
    Silent "create from scratch" of assumed-existing artifacts is how parallel-implementation mismatches grow. If none of the rejection paths apply and premises check out, proceed with `create_plan`.
+
+   **Already-committed work is NOT a rejection exit — plan, then pre-satisfy.** If this branch already carries committed, green commit(s) satisfying some or all of the steps you are about to write (see any "Already-Committed Work" section above), still author the full TDD plan as normal — never drop or merge steps just because the work exists. For every step you confirm passing first-hand on THIS branch — by running `git show <sha>` then that step's tests and seeing them pass — call `mark_step_committed(step_id, <sha>)` instead of leaving it `pending`. If every step ends up pre-satisfied, the EXECUTE loop becomes a 0-iteration no-op and the branch flows PLAN → VERIFY → REVIEW → MERGE. VERIFY remains the semantic gate, not `mark_step_committed` — never pre-satisfy a step you have not actually seen pass; when in doubt, leave it pending.
 3. **Don't exit silently at max_turns.** If you're approaching your turn budget without having successfully called `create_plan`, call `escalate_blocker` with `category='planning_stalled'` and a structured reason (e.g. "spent N turns verifying premises but dep X's artifacts are missing"). Do NOT let the CLI reach max_turns mid-tool-call — that produces an empty-output failure that is indistinguishable from a real tool crash to the steward. Conversely, if you HAVE finished the plan, call `confirm_plan()` right away and stop — a finalized plan survives even if the run is later cut off by a budget/turn cap, but an unfinalized one is treated as incomplete.
 4. **TDD order.** Steps alternate: write a failing test, then implement to make it pass. Every behavior gets a test first.
 5. **Test scope — skip documentation meta-tests.** "Every behavior gets a test" means *runtime behavior*, not documentation wording. Do NOT plan test steps that:
@@ -1450,6 +1456,10 @@ single explore-then-plan-then-implement session.
 3. **Implement** — edit the files, run any existing tests touching the
    module, commit (excluding `.task/`), then call
    `mcp__plan-tools__mark_step_done(step_id, commit_sha)` to record the step.
+   If a step is already satisfied by a commit this branch already carries
+   (confirmed by running that commit's tests and seeing them pass), call
+   `mcp__plan-tools__mark_step_committed(step_id, <sha>)` instead of
+   re-implementing it.
 4. Stop after marking your step(s) done. Do NOT loop.
 
 ## Rejection artifacts (when the task is bigger than expected)
@@ -1463,6 +1473,14 @@ hesitation when the task does not fit the SIMPLE_TASK pattern:
   depends on un-merged sibling work.
 - `mcp__plan-tools__report_task_already_done(commit, evidence)` — work is
   already on main.
+- `mcp__plan-tools__report_ready_to_merge(commit, evidence)` — the work is
+  already complete and green on THIS BRANCH and only the merge to main is
+  missing: main is an ancestor of the branch tip and the tip is not already
+  contained in main (a clean fast-forward), verify already PASSED on this
+  exact tip, and review already returned PASS or suggestions-only on this
+  exact tree. Use this instead of `report_unactionable_task` — that L1 costs
+  a human ~100k tokens and vetoes the verified-green auto-merge reaper. If
+  the work is on MAIN instead, use `report_task_already_done`.
 - `mcp__plan-tools__report_false_premise(classification, premise, evidence,
   proposed_resolution)` — a RED-test assertion has a false premise (numeric
   bound unachievable, exactness identity wrong, capability not in dependency

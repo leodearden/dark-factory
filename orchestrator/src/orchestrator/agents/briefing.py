@@ -361,7 +361,14 @@ to start over from nothing.
       replace it wholesale, then add steps as usual.
    c. **The task should not be planned at all** — use the rejection exits
       (`report_blocking_dependency` / `report_task_already_done` /
-      `report_unactionable_task`) exactly as in fresh planning.
+      `report_ready_to_merge` / `report_unactionable_task`) exactly as in
+      fresh planning.
+
+   If any existing or newly-added step is already satisfied by a commit this
+   branch carries — confirmed by running that commit's tests and seeing them
+   pass — call `mark_step_committed(step_id, <sha>)` for it instead of
+   leaving it `pending`; do NOT drop or merge steps just because the work
+   exists.
 3. If you produced a plan (paths a or b), call `confirm_plan()` as your FINAL
    action to mark it complete. Without it the plan stays incomplete and will
    not advance.
@@ -513,6 +520,14 @@ orchestrator will route to the full architect path on the next dispatch.
 
 If the task spec itself is broken or unworkable, call
 `mcp__plan-tools__report_unactionable_task(reason, evidence)` and stop.
+
+If instead the work is already complete and green on THIS BRANCH and only
+the merge to main is missing — a clean fast-forward (main is an ancestor of
+the branch tip and the tip is not already contained in main), verify already
+PASSED on this exact tip, and review already returned PASS or
+suggestions-only on this exact tree — call
+`mcp__plan-tools__report_ready_to_merge(commit, evidence)` instead of
+`report_unactionable_task` and stop.
 
 {files_section}
 """
