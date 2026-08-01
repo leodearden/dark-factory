@@ -385,3 +385,116 @@ class TestRunSegmentedSharedDeadline:
         assert [d['status'] for d in seg_dicts] == (
             ['passed', 'failed'] + ['not_run'] * 6
         )
+
+
+_PYTEST_RED = (
+    'collected 412 items\n'
+    '.......F\n'
+    'FAILED tests/test_scheduler.py::test_claims_are_exclusive - AssertionError\n'
+    '===== 1 failed, 411 passed in 88.20s ====='
+)
+
+
+class TestRunSegmentedRoster:
+    """The roster block: index/label/status for every segment, at the TOP.
+
+    This is what turns the triaging agent's job from "prove this unrelated red
+    is unrelated" into "read your own segment's line" — the human-time cost
+    esc-3062-2 is actually about. It leads the output so a reader hits it
+    first rather than after scrolling six subprojects of pytest chatter.
+
+    But ``_summarize_checks`` derives cause_hint and category by
+    PATTERN-SCANNING that same output, so a roster carrying tokens like
+    `FAILED` or `error:` would shadow the genuine failure line. The `#` prefix
+    plus a neutral status vocabulary keeps it inert to those scanners, and
+    that is pinned here rather than assumed.
+    """
+
+    @staticmethod
+    async def _mixed_run(tmp_path, red_output: str = 'segment blew up'):
+        """One red, one not_run, the rest passed — all three statuses present."""
+        clock = _Clock(cost_per_segment=5.0)
+        run_one = _RecordingRunOne(clock, results={2: (1, red_output, False)})
+        segments = _fleet_segments()
+        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+
+        # 8 segments at 5s each needs 40s; 36s leaves the last one unrun.
+        return await _run_segmented(
+            segments,
+            run_one=run_one,
+            worktree=tmp_path,
+            budget_secs=36.0,
+            now=clock,
+        )
+
+    @pytest.mark.asyncio
+    async def test_output_starts_with_a_hash_prefixed_roster_of_every_segment(self, tmp_path):
+        _rc, output, _timed_out, seg_dicts = await self._mixed_run(tmp_path)
+
+        lines = output.splitlines()
+        roster = [line for line in lines[: len(seg_dicts)]]
+        assert len(roster) == len(seg_dicts) == 8
+        for line in roster:
+            assert line.startswith('#'), f'roster line is not `#`-prefixed: {line!r}'
+        for entry, line in zip(seg_dicts, roster, strict=True):
+            assert f'{entry["index"]}/8' in line
+            assert entry['label'] in line
+        # The roster leads; per-segment output blocks come after it.
+        assert lines[len(seg_dicts)].startswith('=====') or lines[len(seg_dicts)] == ''
+
+    @pytest.mark.asyncio
+    async def test_roster_shows_all_three_statuses_distinctly(self, tmp_path):
+        _rc, output, _timed_out, seg_dicts = await self._mixed_run(tmp_path)
+
+        assert [d['status'] for d in seg_dicts] == (
+            ['passed'] * 2 + ['failed'] + ['passed'] * 4 + ['not_run']
+        )
+        roster = output.splitlines()[:8]
+        assert 'NOT RUN' in roster[7]
+        # A reader must be able to tell the red from the greens and from the
+        # one that never ran, without decoding rc numbers.
+        assert roster[2] != roster[0]
+        assert roster[7] != roster[2]
+        assert len({roster[0], roster[2], roster[7]}) == 3
+
+    @pytest.mark.asyncio
+    async def test_roster_is_inert_to_the_cause_hint_and_category_scanners(self, tmp_path):
+        """The SAME output with and without the roster must classify identically.
+
+        If the roster could move either answer, it would be shadowing the
+        genuine failing segment — turning a reporting improvement into a
+        diagnosis regression.
+        """
+        _rc, output, _timed_out, seg_dicts = await self._mixed_run(tmp_path, _PYTEST_RED)
+        from orchestrator.verify import _summarize_checks  # noqa: PLC0415
+
+        roster_lines = len(seg_dicts)
+        without_roster = '\n'.join(output.splitlines()[roster_lines:])
+        assert without_roster != output
+
+        def _classify(test_out: str):
+            passed, category, cause_hint, _summary = _summarize_checks(
+                1, test_out, False, 'uv run pytest tests/',
+                0, '', False, 'uv run ruff check src/',
+                0, '', False, 'npx pyright',
+            )
+            return passed, category, cause_hint
+
+        assert _classify(output) == _classify(without_roster)
+
+    @pytest.mark.asyncio
+    async def test_the_real_pytest_failure_line_surfaces_not_a_roster_line(self, tmp_path):
+        """The hint is the red segment's own output, not the report about it."""
+        _rc, output, _timed_out, _seg_dicts = await self._mixed_run(tmp_path, _PYTEST_RED)
+        from orchestrator.verify import _summarize_checks  # noqa: PLC0415
+
+        _passed, _category, cause_hint, _summary = _summarize_checks(
+            1, output, False, 'uv run pytest tests/',
+            0, '', False, 'uv run ruff check src/',
+            0, '', False, 'npx pyright',
+        )
+
+        assert cause_hint == (
+            'FAILED tests/test_scheduler.py::test_claims_are_exclusive - AssertionError'
+        )
+        assert not cause_hint.startswith('#')
