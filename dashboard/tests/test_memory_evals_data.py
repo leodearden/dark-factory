@@ -2160,13 +2160,22 @@ class TestStalenessAndDegradedStates:
         holds structurally.  Leaving the join open made that contract depend on
         auditing every field access inside the index for an unvalidated JSON
         type — which is how the unhashable-``status`` 500 got in.
+
+        The stub takes ``**_kwargs`` deliberately, and must keep doing so: the
+        caller passes ``skipped=`` now, and a stub that rejected it would raise
+        an arity ``TypeError`` instead of the ``PermissionError`` this test is
+        about.  ``TypeError`` is in ``_ARTIFACT_ERRORS``, so the test would
+        still go GREEN while silently no longer exercising the read boundary at
+        all.  The ``unreadable_escalation_file`` assertion below is the tell:
+        it distinguishes "the whole read failed" (this case) from "the reader
+        ran and skipped some files", which an arity failure could never reach.
         """
         from dashboard.data import memory_evals as memory_evals_mod
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _healthy_tree(tmp_path)
 
-        def _boom(_dir: Path) -> Any:
+        def _boom(_dir: Path, **_kwargs: Any) -> Any:
             raise PermissionError(13, 'Permission denied')
 
         monkeypatch.setattr(memory_evals_mod, 'load_queue_escalations', _boom)
@@ -2181,6 +2190,15 @@ class TestStalenessAndDegradedStates:
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'unreadable_escalations'
         assert payload['issues'][0]['path'] == str(esc_dir)
+        # The failure that was caught is the INJECTED one.  ``detail`` is
+        # ``str(exc)``, so this is what makes an arity ``TypeError`` (which
+        # ``_ARTIFACT_ERRORS`` would swallow, greening this test while
+        # exercising nothing) distinguishable from the read failure the test is
+        # actually about — see the stub's ``**_kwargs`` note above.
+        assert 'Permission denied' in payload['issues'][0]['detail']
+        # The whole read failed, so no per-file skip could have been collected:
+        # this is the plural "the join blew up" kind, never the singular one.
+        assert 'unreadable_escalation_file' not in {i['kind'] for i in payload['issues']}
         assert set(payload) == _PAYLOAD_KEYS
 
     def test_unreadable_queue_file_is_named_in_issues(self, tmp_path: Path) -> None:

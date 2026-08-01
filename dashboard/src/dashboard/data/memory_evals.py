@@ -550,8 +550,20 @@ def _index_escalations(
     Reuses :func:`dashboard.data.escalations.load_queue_escalations` (INV-5 —
     a call site, never a second reader).  Its existing contracts carry most of
     this join: a missing dir returns ``[]`` so the no-queue case needs no
-    guard, and unparseable files are skipped and logged so a corrupt
-    escalation cannot crash the join.
+    guard, and unparseable files are skipped so a corrupt escalation cannot
+    crash the join.  Those skips are also NAMED here
+    (``unreadable_escalation_file``, one issue per file) via the reader's
+    opt-in ``skipped`` accumulator.  That is the one discard this function
+    makes that it cannot see directly — it happens a frame down — and it is
+    the one that matters most: a corrupt file holding an open alarm is
+    precisely what makes ``unmatched_escalations`` non-exhaustive, and left
+    unnamed the parity view reports "nothing unexplained" in exactly the case
+    it exists to catch.  The issue's ``path`` is the FILE, unlike the
+    record-level issues below which name the queue dir: those describe records
+    inside a file that DID parse, so the dir is the most specific location
+    available, whereas here the reader knows exactly which file to go repair.
+    The kind is singular to stay separable from ``unreadable_escalations``
+    (plural), which means the whole join blew up.
 
     Openness is filtered EXPLICITLY on ``status``, not inferred from the fact
     that ``load_queue_escalations`` skips the archive subtree.  That inference
@@ -598,7 +610,23 @@ def _index_escalations(
     """
     index: dict[str, dict[str, Any]] = {}
     unfingerprinted: list[dict[str, Any]] = []
-    for record in load_queue_escalations(escalations_dir):
+    skipped: list[dict[str, Any]] = []
+    records = load_queue_escalations(escalations_dir, skipped=skipped)
+    # Named BEFORE the join loop, not after it: ``issues`` is the caller's list
+    # object, so entries appended here survive if a later failure inside the
+    # loop unwinds into ``build_memory_evals``'s ``_ARTIFACT_ERRORS`` handler.
+    # Emitting at the end would lose them in exactly the degraded case where
+    # they matter most.
+    for entry in skipped:
+        _issue(
+            issues, 'unreadable_escalation_file', path=entry['path'],
+            detail=(
+                f'escalation queue file could not be read ({entry["error"]}); an open '
+                'eval_regression escalation inside it is missing from this payload, so '
+                'unmatched_escalations is not exhaustive'
+            ),
+        )
+    for record in records:
         if not isinstance(record, dict):
             continue
         if record.get('category') != _EVAL_REGRESSION_CATEGORY:
