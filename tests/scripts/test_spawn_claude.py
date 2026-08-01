@@ -1128,6 +1128,77 @@ def test_load_scaled_grace_getloadavg_error_returns_base(
     assert _load_scaled_grace(3, cap_secs=30) == 3
 
 
+# ===========================================================================
+# Task 3451: _set_started_grace -- shared started-grace policy for the
+# "must NOT be flagged failed-to-start" test family
+# ===========================================================================
+# Third recurrence of a started-grace flake in this file (task 2367 bumped a
+# fixed 1s/2s -> 3s/8s; task 2733 added _load_scaled_grace above but missed
+# wiring test_normal_spawn_exit0_not_flagged to it, leaving it pinned at a
+# fixed "2" against a 90s production default -- skills/spawn/spawn-claude.sh:89).
+# _set_started_grace both computes the load-scaled grace via
+# _load_scaled_grace AND writes it into env["SPAWN_STARTED_GRACE_SECS"], so
+# the fix is deterministically unit-testable here -- assert the returned int
+# and the string that landed in env -- instead of requiring a forbidden
+# source-grepping meta-test to prove call sites were rewired.
+
+
+def test_set_started_grace_idle_host_returns_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idle host (load-per-core < 1) floors at _NOT_FLAGGED_GRACE_BASE_SECS,
+    and the returned int and the env string it writes must agree.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    env: dict[str, str] = {}
+    grace = _set_started_grace(env)
+
+    assert grace == _NOT_FLAGGED_GRACE_BASE_SECS
+    assert env["SPAWN_STARTED_GRACE_SECS"] == str(grace)
+
+
+def test_set_started_grace_scales_up_with_load_per_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loaded host (load-per-core 2.0) scales grace to
+    ceil(_NOT_FLAGGED_GRACE_BASE_SECS * 2.0), and the env string tracks the
+    returned int.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    env: dict[str, str] = {}
+    grace = _set_started_grace(env)
+
+    assert grace == math.ceil(_NOT_FLAGGED_GRACE_BASE_SECS * 2.0)
+    assert env["SPAWN_STARTED_GRACE_SECS"] == str(grace)
+
+
+def test_set_started_grace_pathological_load_clamps_below_production_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pathological load clamps at the cap (60s), which must stay strictly
+    below the 90s production default (skills/spawn/spawn-claude.sh:89) -- a
+    test pin above the production default would exercise an unreachable
+    configuration.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    env: dict[str, str] = {}
+    grace = _set_started_grace(env)
+
+    assert grace == 60
+    assert grace < 90, (
+        "started-grace cap must stay strictly below the 90s production "
+        "default (skills/spawn/spawn-claude.sh:89), or the pin would "
+        "exercise an unreachable configuration"
+    )
+    assert env["SPAWN_STARTED_GRACE_SECS"] == str(grace)
+
+
 def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     """A fresh transcript file must suppress the failed-to-start flag.
 
