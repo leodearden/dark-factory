@@ -262,3 +262,126 @@ class TestRunSegmentedRunsEverySegment:
         assert seg_dicts[0]['skip_reason'] is None
         assert timed_out is True
         assert rc == 124
+
+
+class TestRunSegmentedSharedDeadline:
+    """ONE wall-clock deadline across all segments, and the `not_run` encoding.
+
+    ``run_verification`` resolves a SINGLE timeout for the test leg today
+    (``_resolve_verify_timeout``), and that total wall-clock contract is
+    preserved exactly: each segment gets ``deadline - now()``, not a fresh full
+    budget. A per-segment full timeout would silently multiply the worst case
+    by the segment count and could wedge the merge queue.
+
+    This path is load-bearing, not theoretical. The committed config's own
+    measured table records five of seven segments already costing 1838.60s
+    (orchestrator alone 1366.23s), a hard lower bound because that run timed
+    out before dashboard started — so a real chain can exhaust even the raised
+    3600s ceiling mid-run.
+
+    A segment the deadline never reached is `not_run` with ``rc=None``: the
+    UNCONFLATABLE encoding. `rc=0` would read as a pass, which is precisely the
+    silent-fail-soft this whole task exists to remove.
+    """
+
+    @staticmethod
+    async def _exhaust_after_two(tmp_path):
+        """8 segments, a 10s budget, and 5s per segment — 2 run, 6 do not."""
+        clock = _Clock(cost_per_segment=5.0)
+        run_one = _RecordingRunOne(clock)
+        segments = _fleet_segments()
+        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+
+        rc, output, timed_out, seg_dicts = await _run_segmented(
+            segments,
+            run_one=run_one,
+            worktree=tmp_path,
+            budget_secs=10.0,
+            now=clock,
+        )
+        return run_one, rc, output, timed_out, seg_dicts
+
+    @pytest.mark.asyncio
+    async def test_no_subprocess_is_spawned_once_the_budget_is_gone(self, tmp_path):
+        """The deadline is a real stop, not a label applied after the fact."""
+        run_one, _rc, _output, _timed_out, seg_dicts = await self._exhaust_after_two(tmp_path)
+
+        assert len(run_one.calls) == 2
+        assert [d['status'] for d in seg_dicts] == ['passed'] * 2 + ['not_run'] * 6
+
+    @pytest.mark.asyncio
+    async def test_not_run_segments_carry_rc_none_and_a_skip_reason(self, tmp_path):
+        """`rc is None`, never 0 — the anti-conflation assertion.
+
+        A reader (human or agent) must be structurally unable to mistake a
+        segment that never ran for one that passed.
+        """
+        _run_one, _rc, _output, _timed_out, seg_dicts = await self._exhaust_after_two(tmp_path)
+
+        for entry in seg_dicts[2:]:
+            assert entry['status'] == 'not_run'
+            assert entry['rc'] is None
+            assert entry['rc'] != 0  # explicit: `not_run` is not a pass
+            assert entry['skip_reason']
+            assert entry['duration_secs'] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_a_green_so_far_run_with_unrun_segments_is_never_green(self, tmp_path):
+        """Every segment that ACTUALLY ran passed — and the verdict is still red.
+
+        Reporting 0 here would claim a fleet-wide pass on the strength of two
+        subprojects. ``timed_out=True`` additionally keeps the failure
+        classified as `infra_timeout` (retryable), exactly as a single-chain
+        timeout is today, so run_verification's retry/env-recovery machinery
+        needs no change.
+        """
+        _run_one, rc, _output, timed_out, seg_dicts = await self._exhaust_after_two(tmp_path)
+
+        assert all(d['status'] == 'passed' for d in seg_dicts[:2])
+        assert rc != 0
+        assert timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_each_executed_segment_gets_the_remaining_budget(self, tmp_path):
+        """`deadline - now()`, not a fresh `budget_secs` per segment."""
+        run_one, _rc, _output, _timed_out, _seg_dicts = await self._exhaust_after_two(tmp_path)
+
+        assert [call[2] for call in run_one.calls] == [10.0, 5.0]
+
+    @pytest.mark.asyncio
+    async def test_not_run_output_says_unknown_rather_than_pass(self, tmp_path):
+        """The output blob is what a triaging agent reads; it must not imply a pass."""
+        _run_one, _rc, output, _timed_out, seg_dicts = await self._exhaust_after_two(tmp_path)
+
+        assert 'NOT RUN' in output
+        for entry in seg_dicts[2:]:
+            assert entry['label'] in output
+        lowered = output.lower()
+        assert 'unknown' in lowered
+        assert entry['skip_reason'] in output
+
+    @pytest.mark.asyncio
+    async def test_a_red_segment_before_the_deadline_still_wins_the_rc(self, tmp_path):
+        """A real failure outranks the synthetic not-run rc.
+
+        The cause_hint a triaging agent needs is the genuine red, so a
+        budget-exhausted tail must not overwrite it.
+        """
+        clock = _Clock(cost_per_segment=5.0)
+        run_one = _RecordingRunOne(clock, results={1: (7, 'escalation red', False)})
+        segments = _fleet_segments()
+        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+
+        rc, _output, timed_out, seg_dicts = await _run_segmented(
+            segments,
+            run_one=run_one,
+            worktree=tmp_path,
+            budget_secs=10.0,
+            now=clock,
+        )
+
+        assert rc == 7
+        assert timed_out is True
+        assert [d['status'] for d in seg_dicts] == (
+            ['passed', 'failed'] + ['not_run'] * 6
+        )
