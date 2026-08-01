@@ -743,3 +743,105 @@ def test_no_client_side_alarm_derivation(
             'statistics — the eval runner computed the verdict and the '
             'dashboard displays it.'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9 test: escalation links, storm aggregate banner, unmatched list
+# ---------------------------------------------------------------------------
+
+
+def test_escalation_links_and_storm_aggregate_banner(
+    tab_memory_evals_jsx_body: str,
+) -> None:
+    """The escalation affordances must be real, built only from fields the
+    projection actually carries, and read the banner from the top-level block.
+    """
+    body = tab_memory_evals_jsx_body
+
+    # (a) a metric row carrying an escalation renders a link, guarded so a null
+    #     projection renders no dead control.
+    assert 'data-testid="memory-eval-escalation-link"' in body, (
+        'a metric row carrying `m.escalation` must render a '
+        'data-testid="memory-eval-escalation-link" control.'
+    )
+    assert 'escalation.id' in body, (
+        'the escalation control must reference `escalation.id`.'
+    )
+    assert 'escalation.summary' in body, (
+        'the escalation control must show `escalation.summary` — an opaque id '
+        'alone makes the operator click to find out what it is.'
+    )
+    assert re.search(r'm\.escalation\s*&&', body), (
+        'the escalation control must be guarded by `m.escalation &&` so a null '
+        'projection renders nothing rather than a dead control.'
+    )
+
+    # (b) built from `id` only — the projection has no `url` field.
+    assert not re.search(r'escalation\s*\.\s*url\b', body), (
+        'the escalation projection has exactly six keys — id, summary, '
+        'severity, level, created_at, dedupe_fingerprint. There is no `url`; '
+        'the UI constructs its own affordance from `id`.'
+    )
+
+    # (c) fingerprints are rendered whole, never parsed.
+    #     memory_evals.py:576-579 — the fingerprint is the producer's private
+    #     construction; the dashboard must not depend on its substructure.
+    for field in ('dedupe_fingerprint', 'fingerprint'):
+        for op in (r'\.split\(', r'\.slice\(', r'\.match\(', r'\.substring\('):
+            assert not re.search(rf'{field}\s*{op}', body), (
+                f'`{field}` must be rendered whole — never split/sliced/matched. '
+                'The fingerprint is the producer\'s private construction '
+                '(memory_evals.py:576-579); parsing its substructure here would '
+                'couple the dashboard to a format it does not own.'
+            )
+
+    # (d) the storm banner reads the TOP-LEVEL block, not an eval row's copy.
+    assert 'data-testid="memory-eval-storm-banner"' in body, (
+        'a data-testid="memory-eval-storm-banner" element must render when the '
+        'top-level storm_escape block is non-null.'
+    )
+    assert 'alarm_count' in body, (
+        'the storm banner must name `storm_escape.alarm_count` — how many '
+        'alarms were collapsed into the one aggregate.'
+    )
+    assert re.search(
+        r'(payload|MEDF\.MEMORY_EVALS|MEMORY_EVALS)\s*\.\s*storm_escape', body
+    ), (
+        'the storm banner must read the TOP-LEVEL MEMORY_EVALS.storm_escape '
+        '(memory_evals.py:958-964). The identical object repeated on each eval '
+        "row exists only to explain that row's missing link; electing an "
+        'arbitrary eval row to read the banner from would break on a root with '
+        'zero eval dirs.'
+    )
+
+    # (e) per-metric links are suppressed under storm.
+    assert re.search(
+        r"parity\s*===\s*'storm_collapsed'", body
+    ), (
+        "the metric row must branch on `parity === 'storm_collapsed'` and "
+        'render the suppression reason instead of a per-metric link — under '
+        'storm the individual escalations were deliberately collapsed into the '
+        'aggregate.'
+    )
+
+    # (f) unmatched_escalations BRANCHES on reason, with distinct wording.
+    assert 'unmatched_escalations' in body, (
+        'the `unmatched_escalations` list must be rendered.'
+    )
+    reasons = ('no_matching_verdict', 'storm_suppressed', 'no_fingerprint')
+    for reason in reasons:
+        assert f"'{reason}'" in body, (
+            f"the unmatched-escalations block must name the '{reason}' reason. "
+            'Collapsing the three into one undifferentiated "unexplained" list '
+            'would fire on escalations that are in fact fully explained and '
+            'train operators to ignore the one signal that catches a real '
+            'parity orphan (memory_evals.py:530-534).'
+        )
+    # Distinct wording, not three branches sharing one string.
+    wordings = re.findall(r"reason\s*===\s*'(\w+)'\s*\?\s*'([^']+)'", body)
+    if wordings:
+        texts = [w[1] for w in wordings]
+        assert len(set(texts)) == len(texts), (
+            'each unmatched-escalation reason must get DISTINCT wording; '
+            f'found duplicates in {texts}.'
+        )
