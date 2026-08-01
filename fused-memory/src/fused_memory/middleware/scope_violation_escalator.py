@@ -19,6 +19,19 @@ Since task 2206 (commit 0204e25fa5) the guard produces TWO outcomes, and
   hit with no files-level mismatch.  Nothing is blocked: the submission
   proceeds, carrying ``metadata.possible_scope_mismatch``.
 
+Since task 3123 a THIRD event is reported, by
+:meth:`ScopeViolationEscalator.report_routing_override`:
+
+* **ROUTING OVERRIDE bypass** — the caller supplied a non-blank
+  ``routing_override_reason``, so BOTH outcomes above were skipped
+  entirely.  Nothing is blocked and the task IS created; the record is
+  purely an audit trail.  It exists because a bypass with no
+  operator-visible record is indistinguishable from no bypass at all — the
+  parameter is caller-supplied over a public MCP surface, validated only as
+  "non-blank after stripping", and its only prior trace was a
+  ``logger.warning`` (which ``journalctl -p warning`` does NOT match, so it
+  was not a usable audit trail either).
+
 The distinction is load-bearing rather than cosmetic (task 3119): this
 escalation is read by operators and rendered into agent briefings, so an
 advisory described in rejection wording reports a rejection that never
@@ -128,6 +141,31 @@ _ADVISORY_SUGGESTED_ACTION: str = 'no_action_advisory_only'
 _ADVISORY_MODE_LABEL: str = 'advisory'
 _REJECTION_MODE_LABEL: str = 'rejection'
 
+# --- Routing-override audit record (task 3123) -----------------------------
+# Distinct anchor from _ANCHOR_TASK_ID so the resulting ids
+# (esc-task-path-guard-override-N) answer "how often is the bypass used?" with
+# a single grep, without having to filter the rejection/advisory records that
+# share the scope_violation category.
+_OVERRIDE_ANCHOR_TASK_ID: str = 'task-path-guard-override'
+
+# Nothing was blocked on the override path — the task exists.  Any
+# ``resubmit_to_<project>`` string here would be rendered verbatim into an
+# agent briefing (task 3119) and read as an order to redo landed work.
+_OVERRIDE_SUGGESTED_ACTION: str = 'review_override_justification'
+
+# Dedup discriminator for the override mode.  Same asymmetry rule as
+# _ADVISORY_FINGERPRINT_TOKEN: compute_content_fingerprint sorts and
+# \x1f-joins affected_ids before hashing, so adding a token to THIS mode alone
+# leaves the rejection and advisory digests byte-identical and keeps any of
+# their still-pending parents folding across this change.
+_OVERRIDE_FINGERPRINT_TOKEN: str = 'mode:routing_override'
+
+# ``summary`` is the one-line field every operator view and agent briefing
+# renders, and ``reason`` is unbounded caller-supplied free text arriving over
+# a public MCP surface.  Cap it there; ``detail`` keeps the full string, and
+# detail is the field the audit actually needs.
+_OVERRIDE_SUMMARY_REASON_MAX: int = 120
+
 # Budget-misconfig escalation constants — deliberately distinct from the
 # scope_violation family so operators can immediately tell these apart.
 _BUDGET_MISCONFIG_ANCHOR_TASK_ID: str = 'adjudicator-budget-defect'
@@ -144,7 +182,7 @@ _BUDGET_MISCONFIG_DEDUP_WINDOW_SECS: float = 300.0
 class ScopeViolationEscalator:
     """Escalation helper for path-scope guard events.
 
-    Handles two distinct categories:
+    Handles three distinct reported events across two categories:
 
     * **scope_violation** (:meth:`report_rejection`) — filed for BOTH
       task-creation outcomes the path-scope guard produces (module docstring has
@@ -154,6 +192,14 @@ class ScopeViolationEscalator:
       independently.  Disable via the ``scope_violation_dedupe_enabled=False``
       constructor escape hatch to restore legacy one-escalation-per-call
       behavior.
+    * **scope_violation / routing override** (:meth:`report_routing_override`)
+      — filed on the BYPASS path, where a caller-supplied
+      ``routing_override_reason`` skipped the guard outright.  NOTHING was
+      blocked and the task exists; this is an audit record, filed because a
+      bypass that leaves no operator-visible trace is indistinguishable from
+      no bypass at all.  Uses its own anchor task id so the ids are
+      independently greppable, and folds independently of the two
+      ``report_rejection`` modes.
     * **adjudicator_config_defect** (:meth:`report_budget_misconfig`) — filed
       when the path-scope adjudicator's LLM call returns ``error_max_budget_usd``
       with ``cost_usd > 0``, indicating the per-call budget is too low for the
@@ -406,6 +452,114 @@ class ScopeViolationEscalator:
             'scope_violation_escalator: queued %s (%s) for project %s '
             '(candidate=%r, suggested=%s)',
             esc_id, mode, project_id, candidate_title[:80], target,
+        )
+        return esc_id
+
+    def report_routing_override(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        candidate_title: str,
+        reason: str,
+        matched_paths: tuple[str, ...],
+        suggested_project: str | None,
+        suggested_root: str | None = None,
+    ) -> str | None:
+        """File a ``scope_violation`` AUDIT record for a routing-override bypass.
+
+        Unlike :meth:`report_rejection`, this fires on the BYPASS path: the
+        caller supplied a non-blank ``routing_override_reason``, so ALL of the
+        module taxonomy's outcomes were skipped, NOTHING was blocked, and the
+        task WAS created.  The record exists so that fact is visible somewhere
+        an operator actually reads — before task 3123 the only trace was a
+        ``logger.warning``, which made a bypass operationally
+        indistinguishable from no bypass at all.
+
+        *matched_paths* / *suggested_project* describe what the guard WOULD
+        have flagged, computed by the caller for reporting only; both may be
+        empty, and an override whose verdicts came back clean is deliberately
+        still recorded (it is the evidence that the parameter was reached for
+        unnecessarily).
+
+        Returns the escalation id when one was filed, ``None`` otherwise
+        (escalation package missing, queue write failed).  Never raises — the
+        submission it describes has already been allowed, so a queue failure
+        must not convert an allowed submission into an exception.
+        """
+        queue = self._queue_for(project_root)
+        if queue is None:
+            logger.debug(
+                'scope_violation_escalator: escalation package unavailable; '
+                'routing override of %r in project %r will not be escalated',
+                candidate_title[:80], project_id,
+            )
+            return None
+
+        reason = (reason or '').strip()
+        paths_str = ', '.join(matched_paths) or '<nothing>'
+
+        detail_lines = [
+            'routing_override=True',
+            f'routing_override_reason={reason!r}',
+            f'candidate_title={candidate_title!r}',
+            f'filing_project_id={project_id!r}',
+            f'filing_project_root={project_root!r}',
+            f'would_have_matched_paths={list(matched_paths)}',
+            f'would_have_suggested_project={suggested_project!r}',
+        ]
+        if suggested_root:
+            detail_lines.append(f'would_have_suggested_project_root={suggested_root!r}')
+        detail_lines.append('')
+        detail_lines.append(
+            'The path-scope guards were DELIBERATELY BYPASSED by a '
+            'caller-supplied routing_override_reason on this submission.  '
+            'Nothing was blocked: the task WAS created, no error was returned '
+            'to the caller, and no resubmission is needed.  The paths listed '
+            'above are what the guard WOULD have flagged had the override been '
+            'absent (an empty list means the guard would have allowed the '
+            'submission anyway).  The reason above is the CALLER\'S OWN '
+            'assertion — it is validated only as non-blank and is never '
+            'cross-checked against the registry or the claimed paths.  Review '
+            'is needed ONLY if that assertion looks wrong for this submission.',
+        )
+        detail = '\n'.join(detail_lines)
+
+        summary_reason = reason[:_OVERRIDE_SUMMARY_REASON_MAX]
+        if len(reason) > _OVERRIDE_SUMMARY_REASON_MAX:
+            summary_reason += '…'
+
+        try:
+            esc = Escalation(  # type: ignore[possibly-unbound]
+                id=queue.make_id(_OVERRIDE_ANCHOR_TASK_ID),
+                task_id=_OVERRIDE_ANCHOR_TASK_ID,
+                agent_role=_AGENT_ROLE,
+                # 'info' like the rest of the scope_violation family — this is
+                # an audit trail, not a page.  The legitimate self-referential
+                # filings this exists to record must not wake an operator.
+                severity='info',
+                category=_CATEGORY,
+                summary=(
+                    f'Path-guard ROUTING OVERRIDE used in {project_id}: '
+                    f'guards skipped (would have flagged: {paths_str})'
+                ),
+                detail=detail,
+                suggested_action=_OVERRIDE_SUGGESTED_ACTION,
+                level=1,
+            )
+            esc_id = queue.submit(esc)
+        except Exception:
+            logger.exception(
+                'scope_violation_escalator: failed to submit routing-override '
+                'escalation for project %s (candidate=%r)',
+                project_id, candidate_title[:80],
+            )
+            return None
+
+        logger.warning(
+            'scope_violation_escalator: queued routing-override audit %s for '
+            'project %s (candidate=%r, reason=%r, would_have_matched=%s)',
+            esc_id, project_id, candidate_title[:80], summary_reason, paths_str,
         )
         return esc_id
 
