@@ -17,7 +17,7 @@ under that string, so a tool that handshakes under someone else's name makes its
 own writes unattributable — which is the failure exactly when a human is trying
 to work out who touched a historical record.
 
-Both tests here run against a CONSTRUCTED CLIENT with ``_post`` stubbed out. No
+Every test here runs against a CONSTRUCTED CLIENT with ``_post`` stubbed out. No
 server is dialled, no socket is opened and no ``httpx.AsyncClient`` is built (see
 :func:`_record_handshake`), so this file costs nothing to run and cannot be made
 flaky by the state of a live server.
@@ -50,6 +50,19 @@ def _record_handshake(client: Any) -> list[dict]:
     Returning the raw JSON-RPC payloads makes the handshake itself observable,
     which is what lets the seam be asserted on behaviour rather than on source
     text.
+
+    DELIBERATELY A TWIN of the helper in
+    tests/scripts/test_repair_wiped_metadata_files.py rather than a shared
+    import: importing one test module from another couples their collection, and
+    a two-caller double does not belong in a conftest.py that ~20 unrelated
+    modules in this directory also load.
+
+    THE COPIES NEVER STRADDLE A SINGLE ASSERTION, which is what makes the
+    duplication safe rather than merely cheap. Each file's tests record only
+    through their own copy — the cross-client comparison over there
+    (``test_repair_handshake_is_the_parents_with_only_the_name_substituted``)
+    records BOTH clients through that file's copy — so the two drifting apart
+    cannot silently change what any test means.
     """
     posts: list[dict] = []
 
@@ -104,20 +117,29 @@ def test_initialize_defaults_to_migrate_metadata():
     assert posts[0]['params']['clientInfo']['name'] == 'migrate-metadata'
 
 
-def test_initialize_posts_the_two_step_handshake_unchanged():
-    """The rest of the handshake is NOT part of the seam and must not move.
+def test_initialize_posts_both_steps_of_the_mcp_handshake():
+    """A dropped ``notifications/initialized`` is a real defect. Pin the steps.
 
-    ``_client_name`` is the only thing a subclass may vary; everything else —
-    the ``initialize`` params and the ``notifications/initialized`` follow-up
-    that MCP requires before any ``tools/call`` is accepted — is fixed protocol.
-    Pinning it here means the seam's own tests cannot pass while the handshake
-    silently loses a step, and it gives the repair script's drift guard
-    (test_repair_wiped_metadata_files.py) a stated parent contract to compare
-    against rather than an implicit one.
+    MCP requires that second post before any ``tools/call`` is accepted. Lose it
+    and ``_initialize`` still returns cleanly — the failure surfaces later, as
+    every subsequent call being refused by a live server — so nothing else in
+    this file's stubbed, serverless setup would notice.
+
+    ONLY THE TWO METHOD NAMES ARE PINNED, deliberately. This does not assert the
+    ``protocolVersion``, the capabilities block or the ``clientInfo.version``:
+    those literals exist nowhere but the one implementation this file tests, so
+    restating them here cannot detect a defect — there is no second source of
+    truth for them to disagree with — while still going red on a legitimate
+    protocol bump. That is a pure change-detector: false positives, no true
+    positives. It is also the same objection that deleted 3329's source-scraping
+    guard at 57eb02b53f, one abstraction level up.
+
+    Drift between the parent and the repair client is guarded where it is
+    genuinely observable, by
+    ``test_repair_handshake_is_the_parents_with_only_the_name_substituted``,
+    which compares the two clients' RECORDED payloads against each other and
+    needs no literal from this file.
     """
     posts = _record_handshake(FusedMemoryClient('http://127.0.0.1:9'))
 
     assert [p['method'] for p in posts] == ['initialize', 'notifications/initialized']
-    assert posts[0]['params']['protocolVersion'] == '2024-11-05'
-    assert posts[0]['params']['capabilities'] == {}
-    assert posts[0]['params']['clientInfo']['version'] == '1.0'

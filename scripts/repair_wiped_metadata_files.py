@@ -881,22 +881,12 @@ def _make_client(server_url: str):
     class RepairFusedMemoryClient(FusedMemoryClient):
         """FusedMemoryClient with an attributable clientInfo.name.
 
-        ONE ATTRIBUTE, NO OVERRIDDEN METHODS. The handshake itself is
-        INHERITED, so a parent ``protocolVersion`` bump or a new capability
-        reaches this client automatically — there is no copy here to go stale.
-        (Until DF 3437 gave the parent its ``_client_name`` seam, changing that
-        one leaf meant restating the whole procedure; that clone is gone.)
+        ONE ATTRIBUTE, NO OVERRIDDEN METHODS — the handshake is INHERITED, so a
+        parent ``protocolVersion`` bump or a new capability reaches this client
+        automatically and there is no copy here to go stale. The name is
+        load-bearing, not cosmetic: see :data:`CLIENT_NAME`.
 
-        The name is load-bearing, not cosmetic — see :data:`CLIENT_NAME`.
-
-        Guarded by, in tests/scripts/test_repair_wiped_metadata_files.py:
-        ``test_repair_client_does_not_restate_the_parents_handshake`` (this
-        class inherits ``_initialize`` rather than owning a copy),
-        ``test_repair_handshake_is_the_parents_with_only_the_name_substituted``
-        (what reaches the wire is the parent's handshake, name aside), and
-        ``test_make_client_is_attributable_to_this_repair_not_the_migration``
-        (the constructed client reports THIS repair's name). All three assert
-        on constructed clients, never on source text.
+        Guarded in tests/scripts/test_repair_wiped_metadata_files.py.
         """
 
         _client_name = CLIENT_NAME

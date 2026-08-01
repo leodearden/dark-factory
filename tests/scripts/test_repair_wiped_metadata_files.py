@@ -1293,6 +1293,16 @@ def _record_handshake(client) -> list[dict]:
     import: importing one test module from another couples their collection, and
     a two-caller double does not belong in a conftest.py that 20 unrelated
     modules in this directory also load.
+
+    THE COPIES NEVER STRADDLE A SINGLE ASSERTION, which is what makes the
+    duplication safe rather than merely cheap. Every recording in this file goes
+    through THIS copy — including both sides of
+    ``test_repair_handshake_is_the_parents_with_only_the_name_substituted``,
+    which records the repair client and the parent client through the same
+    function and compares the results. So the two copies drifting apart cannot
+    silently change what any test here means; at worst one file's tests keep
+    passing while the other's recording is broken, which that file's own tests
+    would show.
     """
     posts: list[dict] = []
 
@@ -1319,6 +1329,14 @@ def test_repair_client_does_not_restate_the_parents_handshake():
 
     Asserted on ``type(client)``, i.e. on the class actually constructed by
     ``_make_client`` — not on a grep of the script that defines it.
+
+    IT IS A PROHIBITION ON ANY OVERRIDE, INCLUDING A LEGITIMATE ONE. The
+    behavioural guard below (payload equivalence) subsumes this one for accurate
+    clones and only fires once a clone has actually drifted; this one refuses
+    the copy up front. The cost is that a future override with a real reason —
+    a repair-specific header, an extra initialize param — goes red with no
+    defect present. The assertion message below says what to do about that, so
+    nobody reaches for the one bad way out of the pair.
     """
     from migrate_metadata_modules_to_files import (  # pyright: ignore[reportMissingImports]
         FusedMemoryClient,
@@ -1326,7 +1344,14 @@ def test_repair_client_does_not_restate_the_parents_handshake():
 
     client = _make_client("http://127.0.0.1:9")
 
-    assert type(client)._initialize is FusedMemoryClient._initialize
+    assert type(client)._initialize is FusedMemoryClient._initialize, (
+        "RepairFusedMemoryClient has its own _initialize again. If that is "
+        "deliberate and justified, DELETE THIS TEST in the same commit and say "
+        "why in the message — do NOT satisfy it by copying the parent's "
+        "handshake into the override, which is the exact silent-drift clone "
+        "task 3437 removed. The payload-equivalence test below stays either "
+        "way; it is what catches a clone that has drifted."
+    )
 
 
 def test_repair_handshake_is_the_parents_with_only_the_name_substituted():
