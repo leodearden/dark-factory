@@ -18,7 +18,10 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.delivered_checks import DeliveredChecksBlock
+from orchestrator.delivered_checks import (
+    DeliveredChecksBlock,
+    DeliveredChecksVerdict,
+)
 from orchestrator.harness import Harness, _pid_alive
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.warm_lane_pool import WarmLanePool
@@ -3506,12 +3509,18 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         """Stand-in for the shared helper that returns *block*.
 
         Faithful to the real helper in the one respect these rows assert on:
-        a ``reason='failed'`` decision emits its WARNING — naming the task,
-        the failed check, its pattern and the main SHA — on the CALLER-SUPPLIED
-        ``log``, never on the delivered_checks module logger. Task 2794's
-        caplog assertions therefore keep testing something real after the
-        retarget: they pass only if the harness hands its own module logger
-        through.
+        a ``reason='failed'`` decision emits its WARNING on the
+        CALLER-SUPPLIED ``log``, never on the delivered_checks module logger.
+
+        SCOPE OF WHAT THAT PROVES (amendment, reviewer suggestion 5): because
+        this stand-in composes the message itself, the caplog-content
+        assertions below pin only the WIRING — that whatever the helper logs
+        lands on the ``orchestrator.harness`` stream, i.e. that the harness
+        hands its own module logger through. They do NOT pin the real
+        helper's message CONTENT; substituting a different message here would
+        keep them green. Task 2794's operator-facing WARNING content contract
+        is pinned separately, against the REAL helper, in
+        ``TestStrandedArmRealHelperWarningContent`` below.
         """
         async def _impl(task_id, metadata, *, log, **kwargs):
             if block is not None and block.reason == 'failed':
@@ -3585,9 +3594,11 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         assert helper.await_args.kwargs['log'] is logging.getLogger(
             'orchestrator.harness',
         )
-        # ...and end-to-end: _gate emits on whatever `log` it was handed, so
-        # these caplog-content assertions (task 2794's, verbatim) pass ONLY
-        # if that logger is the harness one.
+        # ...and end-to-end through caplog: _gate emits on whatever `log` it
+        # was handed, so these reaching the 'orchestrator.harness' stream at
+        # all proves the harness passed its own module logger. This pins the
+        # WIRING only — the real helper's message CONTENT is pinned against
+        # the real helper in TestStrandedArmRealHelperWarningContent.
         assert tid in caplog.text
         assert 'cap-x' in caplog.text
         assert 'SomePattern' in caplog.text
@@ -3847,6 +3858,107 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         helper.assert_awaited_once()
         assert helper.await_args is not None
         assert helper.await_args.kwargs['enabled'] is False
+
+
+# ---------------------------------------------------------------------------
+# Amendment (reviewer suggestion 5) — task 2794's WARNING CONTENT contract,
+# pinned against the REAL shared helper.
+#
+# The matrix above patches `gate_mark_done_on_delivered_checks` with a
+# stand-in that composes its own message, so its caplog-content assertions
+# pin the log= WIRING and nothing more. The operator-facing content contract
+# 2794 actually established — a stranded-arm withholding names the task, the
+# failed check, its pattern and the main SHA at WARNING on
+# 'orchestrator.harness' — therefore needs one row that runs the real
+# decision end to end. The ONLY thing faked here is the low-level check
+# runner (`verify_delivered_checks_on_main`), so main-SHA plumbing, the
+# verdict collapse, the log= hand-off and the message itself are all real.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestStrandedArmRealHelperWarningContent:
+    _VERIFY_TARGET = 'orchestrator.delivered_checks.verify_delivered_checks_on_main'
+
+    async def test_failed_withholding_warns_with_the_2794_content(
+        self, harness: Harness, caplog,
+    ):
+        tid = '2794100'
+        sha = 'deadbeef' + 'e' * 32
+        main_sha = 'mr' * 20
+        failing = {
+            'name': 'cap-real', 'kind': 'grep', 'pattern': 'RealPattern',
+            'expect': 'present',
+        }
+        guard = TestReconcileOneStrandedDeliveredChecksGuard()
+        guard._on_main_in_progress(
+            harness, tid, sha=sha, main_sha=main_sha,
+            metadata={'delivered_checks': [failing]},
+        )
+
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=main_sha, failed_check=failing,
+        ))
+        # NOTE: `gate_mark_done_on_delivered_checks` is deliberately NOT
+        # patched — this exercises the real decision.
+        with patch(self._VERIFY_TARGET, verify), \
+                caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress()
+
+        # Behaviour is the matrix's row 2, reached through the real helper.
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        assert result == 1
+
+        # ...and the real WARNING carries task 2794's operator-facing content
+        # on the harness logger. Deleting or hollowing any of these four
+        # fields in the shared helper's message now fails HERE.
+        assert tid in caplog.text
+        assert 'cap-real' in caplog.text
+        assert 'RealPattern' in caplog.text
+        assert main_sha in caplog.text
+        # The `site` label the guard was adopted with — how an operator tells
+        # WHICH seam withheld — is part of the same message.
+        assert 'reconcile-stranded-found-on-main' in caplog.text
+        assert any(
+            r.levelno == logging.WARNING and r.name == 'orchestrator.harness'
+            for r in caplog.records
+        ), 'the withholding must be operator-visible at WARNING, on the harness logger'
+
+    async def test_all_delivered_stamps_without_a_warning(
+        self, harness: Harness, caplog,
+    ):
+        """The mirror row: a satisfied verdict through the REAL helper stamps
+        as today and emits NO delivered-checks WARNING, so the assertions
+        above cannot be passing off unrelated log noise."""
+        tid = '2794101'
+        sha = 'deadbeef' + 'f' * 32
+        main_sha = 'ms' * 20
+        check = {
+            'name': 'cap-real', 'kind': 'grep', 'pattern': 'RealPattern',
+            'expect': 'present',
+        }
+        guard = TestReconcileOneStrandedDeliveredChecksGuard()
+        guard._on_main_in_progress(
+            harness, tid, sha=sha, main_sha=main_sha,
+            metadata={'delivered_checks': [check]},
+        )
+
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=main_sha,
+        ))
+        with patch(self._VERIFY_TARGET, verify), \
+                caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
+        )
+        assert result == 1
+        assert 'cap-real' not in caplog.text
+        assert 'Delivered-checks guard' not in caplog.text
 
 
 # ===========================================================================
