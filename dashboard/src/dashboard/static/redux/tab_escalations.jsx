@@ -268,7 +268,7 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 
 // ── EscalationsTab ──
 
-function EscalationsTab({ projectFilter }) {
+function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   const escalations = DF.ESCALATIONS || { subsections: [], summary: { by_level: {}, by_status: {} } };
 
   // Filter subsections by project when projectFilter is active.
@@ -328,6 +328,27 @@ function EscalationsTab({ projectFilter }) {
 
   // Selected row for sidebar
   const [selected, setSelected] = uS(null);
+
+  // Cross-tab focus handoff (from the memory-eval escalation links in
+  // tab_memory_evals.jsx, lifted through app.jsx). Search every subsection for
+  // the row and open the existing detail sidebar with it.
+  //
+  // The focus is consumed UNCONDITIONALLY — including when no row matches,
+  // which happens when the escalation resolved between the poll that produced
+  // the link and the click. Leaving it set would reopen a stale drawer on every
+  // later visit to this tab; retrying silently would be worse.
+  uE(() => {
+    if (!focusId) return;
+    let found = null;
+    for (const sub of (escalations.subsections || [])) {
+      for (const row of (sub.escalations || [])) {
+        if (row.id === focusId) { found = row; break; }
+      }
+      if (found) break;
+    }
+    if (found) setSelected(found);
+    if (onFocusConsumed) onFocusConsumed();
+  }, [focusId]);
 
   // Global summary from top-level data
   const gs = escalations.summary || {};
