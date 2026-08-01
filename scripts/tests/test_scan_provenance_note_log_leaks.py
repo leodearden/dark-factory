@@ -26,6 +26,8 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+import _task_db_scan
+import scan_provenance_note_log_leaks
 from scan_provenance_note_log_leaks import (
     NoteLeakMatch,
     detect_log_leak,
@@ -466,3 +468,29 @@ class TestCli:
         assert '2902' in result.stdout
         assert 'corrupt.db' in result.stderr
         assert 'incomplete' in result.stderr
+
+
+class TestSharedPlumbingAdoption:
+    """Task 3286's finding is that a PARTIAL extraction defeats the point.
+
+    So "this scanner sources its plumbing from _task_db_scan" is itself a
+    behaviour worth pinning, and nothing else in this file can detect it: a
+    re-pasted private copy with a byte-identical body satisfies all 21 other
+    tests here. Asserted by object identity rather than a source-text grep or
+    a docstring match, because identity is a runtime fact about real objects
+    and a duplicated function cannot fake it.
+    """
+
+    def test_module_sources_its_discovery_and_json_from_the_shared_module(self):
+        assert (
+            scan_provenance_note_log_leaks.discover_db_paths
+            is _task_db_scan.discover_db_paths
+        )
+        assert scan_provenance_note_log_leaks.format_json is _task_db_scan.format_json
+
+    def test_the_private_discovery_copies_are_gone_not_merely_shadowed(self):
+        """Catches the halfway state where the shared import lands on top of a
+        still-present private copy: the module attribute reads correct while
+        the dead code sits underneath waiting to be re-wired."""
+        assert not hasattr(scan_provenance_note_log_leaks, '_DEFAULT_PROJECT_ROOTS')
+        assert not hasattr(scan_provenance_note_log_leaks, '_tasks_db_path')
