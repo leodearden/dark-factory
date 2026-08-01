@@ -487,6 +487,22 @@ async def judge_plan_quality(
     """
     if not is_scorable_plan(plan):
         floor = score_plan_structure(plan)
+        # LOUD, not a silent 0.0: reaching here means a caller did NOT gate,
+        # which is exactly how the reported cell was written. WARNING matches
+        # ``run_architect_eval``'s own no-scorable-plan log and the
+        # transport-refusal log below — an expected-but-notable degradation,
+        # not an error. It cannot double-log through the normal path because
+        # the runner's own ``is_scorable_plan`` gate short-circuits before the
+        # judge is ever awaited. The task id is read defensively (the idiom
+        # ``run_judge`` and the prompt builder below both use) so an
+        # anti-fabrication guard can never itself become a crash.
+        logger.warning(
+            f'Plan judge asked to score an UNJUDGEABLE artifact for '
+            f'{task.get("id", "unknown")}: the plan carries no steps '
+            f'(is_scorable_plan=False) — LLM judge SKIPPED, scored on the '
+            f'deterministic structural floor ({floor}). The caller did not '
+            f'gate; run_architect_eval does (task 3302/3303).'
+        )
         return PlanQualityVerdict(
             plan_quality=floor,
             per_criterion={},
