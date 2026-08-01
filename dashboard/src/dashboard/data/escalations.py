@@ -53,6 +53,18 @@ def load_queue_escalations(
     it in a log line only a human tailing stderr will ever see (INV-2,
     ``structured-facts-at-failure``).
 
+    An out-parameter is a deliberate divergence from the sibling readers in
+    this subsystem (``_index_escalations``, ``_read_limits``), which return a
+    tuple when they have a second result to report.  Tuple-return was the first
+    choice and was rejected because this function is not private to one caller:
+    ``build_escalation_queues`` calls it twice and wants none of this, and
+    widening the return type would have forced an unpacking edit at every site
+    to serve one.  A sibling ``load_queue_escalations_reporting`` wrapper would
+    keep the idiom uniform, but it buys that uniformity with a second public
+    name for one function and one opted-in caller — worse than one documented
+    exception.  Revisit if a second consumer ever needs the skips: at two, the
+    tuple-returning sibling starts paying for itself.
+
     Args:
         esc_dir: Path to the escalation queue root directory.
         skipped: Optional accumulator for the files this call dropped.  When a

@@ -229,8 +229,11 @@ class TestLoadQueueEscalations:
     def test_omitting_skipped_leaves_behaviour_unchanged(self, tmp_path, caplog):
         """The default path is byte-identical to today — the back-compat pin.
 
-        ``build_escalation_queues`` (escalations.py:198 and :208) does not opt
-        in, so for the escalation views the WARNING log stays the only signal.
+        Neither of the two ``build_escalation_queues`` call sites opts in, so
+        for the escalation views the WARNING log stays the only signal.  (Named
+        by function, not by line: a line-number citation in this file is stale
+        the moment anything above it moves — the diff that added this test
+        pushed those very calls down ~28 lines.)
         This asserts the un-opted-in call still returns only the valid record,
         still does not raise, and still logs — i.e. that the new keyword is
         additive and no existing caller had to change.

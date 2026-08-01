@@ -285,7 +285,8 @@ class TestConfigProperty:
         """The M1 artifact path is contract-fixed — no ``_runtime_data_dir`` indirection.
 
         ``QUEUE_DATA_DIR`` / ``RECONCILIATION_DATA_DIR`` relocate the *managed*
-        fused-memory runtime dirs (config.py:156) to an XDG-rooted path outside
+        fused-memory runtime dirs (``Config._runtime_data_dir``) to an
+        XDG-rooted path outside
         the watched tree.  The memory-eval artifacts are NOT among them: they
         are written relative to the repo at the path
         ``docs/prds/memory-eval-program.md`` §3 pins, so a relocation env var
@@ -2201,6 +2202,56 @@ class TestStalenessAndDegradedStates:
         assert 'unreadable_escalation_file' not in {i['kind'] for i in payload['issues']}
         assert set(payload) == _PAYLOAD_KEYS
 
+    def test_partial_skips_survive_a_reader_that_dies_mid_scan(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        """Skips recorded before the reader blew up are still named.
+
+        ``skipped`` is filled inside the reader but drained by the caller, so
+        the two are only atomic if the drain runs on the exception path too.
+        A reader that dies part-way through the scan — ``glob`` hitting a mode
+        change or an NFS hiccup, the case the ``_ARTIFACT_ERRORS`` wrapper
+        exists for — would otherwise take every skip it had already recorded
+        out with it, leaving only the coarse ``unreadable_escalations`` issue:
+        this change's own silent discard, reappearing one frame up in exactly
+        the degraded scenario it was written to close.
+
+        Both kinds are expected together and they say different things: the
+        plural one means the scan died, the singular ones name the files it had
+        already given up on before dying.
+        """
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        doomed = esc_dir / 'esc-half-read.json'
+
+        def _die_mid_scan(
+            _dir: Path, *, skipped: list[dict[str, Any]] | None = None, **_kwargs: Any,
+        ) -> Any:
+            # One file was read and skipped; the NEXT dir entry blew the scan up.
+            if skipped is not None:
+                skipped.append({'path': doomed, 'error': 'Expecting value: line 1 column 1'})
+            raise PermissionError(13, 'Permission denied')
+
+        monkeypatch.setattr(memory_evals_mod, 'load_queue_escalations', _die_mid_scan)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 2
+        per_file = [i for i in payload['issues'] if i['kind'] == 'unreadable_escalation_file']
+        coarse = [i for i in payload['issues'] if i['kind'] == 'unreadable_escalations']
+        assert len(per_file) == len(coarse) == 1
+        assert per_file[0]['path'] == str(doomed)
+        assert 'Expecting value' in per_file[0]['detail']
+        assert coarse[0]['path'] == str(esc_dir)
+        # The drain does not SWALLOW the reader's exception — it re-raises into
+        # the existing wrapper, which is what produces the coarse issue.
+        assert 'Permission denied' in coarse[0]['detail']
+        assert payload['evals'] != []
+        assert payload['unmatched_escalations'] == []
+        assert set(payload) == _PAYLOAD_KEYS
+
     def test_unreadable_queue_file_is_named_in_issues(self, tmp_path: Path) -> None:
         """The one discard that happens a frame DOWN is named too.
 
@@ -2229,7 +2280,19 @@ class TestStalenessAndDegradedStates:
         # name the dir because they describe records inside a file that DID
         # parse.  Here the reader knows exactly which file to go repair.
         assert issue['path'] == str(bad)
-        assert issue['detail']
+        # The underlying parse error reaches the PAYLOAD, not just the WARNING
+        # log — that is the whole point of the channel, and the operator needs
+        # it to tell bad JSON from a permissions problem from a directory.  A
+        # truthiness check would stay green if a regression dropped
+        # ``entry['error']`` from the f-string, so assert the text.
+        assert 'Expecting value' in issue['detail']
+        # ...and the claim about what was LOST stays conditional.  The file is
+        # unreadable, so its category and status are exactly what is unknown,
+        # and this queue is shared across every escalation category — the
+        # likeliest corrupt file is one this join would have filtered out
+        # anyway.  Asserting the loss as fact would put a falsehood in the
+        # payload of the view whose job is to never tell one.
+        assert 'if it held' in issue['detail']
         # The readable escalation still joins — one bad file degrades one
         # record, never the queue.
         assert [e['id'] for e in payload['unmatched_escalations']] == ['esc-good']
