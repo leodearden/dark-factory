@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -6991,6 +6992,39 @@ class TestWrapperPayloadHarness:
                 f'injected root {root!r} must survive alongside an inherited '
                 f'PYTHONPATH; got {out!r}'
             )
+
+    async def test_assert_submit_cli_invokable_reports_a_broken_interpreter(
+        self, tmp_path: Path,
+    ):
+        """A broken interpreter must be NAMED and its stderr QUOTED.
+
+        This is the legibility contract that was missing: when the submit CLI
+        is not invokable the suite previously degraded into
+        "exactly one L2 must be filed on failure, got 0", pointing the reader
+        at production filing logic while the real diagnosis sat unread in a
+        discarded pipe.  Deterministic in any environment — the stub stands in
+        for an interpreter that cannot run `-m escalation submit`.
+        """
+        stub = tmp_path / 'broken-python'
+        stub.write_text(
+            "#!/bin/sh\nprintf 'NO-ESCALATION-MODULE-3404\\n' >&2\nexit 1\n"
+        )
+        stub.chmod(0o755)
+
+        with pytest.raises(AssertionError) as excinfo:
+            _assert_submit_cli_invokable(str(stub))
+
+        message = str(excinfo.value)
+        assert str(stub) in message, (
+            f'the failing interpreter must be named in the message: {message!r}'
+        )
+        assert 'NO-ESCALATION-MODULE-3404' in message, (
+            f"the child's stderr must be quoted in the message: {message!r}"
+        )
+
+    async def test_assert_submit_cli_invokable_passes_for_the_real_interpreter(self):
+        """The interpreter running this suite must be able to reach the CLI."""
+        _assert_submit_cli_invokable(sys.executable)
 
 
 # ---------------------------------------------------------------------------
