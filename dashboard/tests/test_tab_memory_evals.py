@@ -919,3 +919,101 @@ def test_limits_provenance_rendered(tab_memory_evals_jsx_body: str) -> None:
             'Provenance is DISPLAYED, never used to re-derive a verdict '
             '(PRD section 8, G6/INV-5).'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-13 test: staleness wording, empty states, issues notice
+# ---------------------------------------------------------------------------
+
+
+def test_staleness_empty_states_and_issues_notice(
+    tab_memory_evals_jsx_body: str,
+) -> None:
+    """Staleness is a HINT, the two empty states are distinct, missing scalars
+    are em-dashes rather than zeros, and artifact issues are loudly visible.
+    """
+    body = tab_memory_evals_jsx_body
+
+    # (a) latest-run age renders, and the stale branch carries no alarm wording.
+    assert 'latest_run_age_seconds' in body, (
+        'the eval card must render `latest_run_age_seconds` beside '
+        '`latest_run_stamp` so the operator can see how old the run is.'
+    )
+    assert 'latest_run_stamp' in body, (
+        'the eval card must render `latest_run_stamp`.'
+    )
+    stale_branch = re.search(
+        r'ev\.stale\s*&&\s*\(([\s\S]{0,700}?)\n\s*\)\}', body
+    )
+    assert stale_branch is not None, (
+        '`ev.stale` must gate a visible hint badge.'
+    )
+    stale_text = stale_branch.group(1).lower()
+    for banned in ('alarm', 'escalation', 'error'):
+        assert banned not in stale_text, (
+            f"the stale branch uses the word {banned!r}. Staleness is DISPLAYED "
+            "here and alarmed on by the eval runner's own self-escalation "
+            '(PRD DD6/INV-5) — a second, divergent staleness alarm in the '
+            'dashboard is exactly what that split avoids. The 36h threshold is '
+            'deliberately absent from the payload so the UI cannot re-derive '
+            f'it either. Branch was:\n{stale_branch.group(1)}'
+        )
+
+    # (b) the two empty states are DISTINCT — absent root vs healthy-but-empty.
+    assert 'data-testid="memory-eval-empty"' in body, (
+        '`root_present === false` must render a '
+        'data-testid="memory-eval-empty" placeholder.'
+    )
+    assert re.search(r'root_present', body), (
+        'the section must branch on `root_present`.'
+    )
+    assert re.search(r'no eval artifacts yet', body, re.IGNORECASE), (
+        'the root-absent empty state must say no eval artifacts exist yet.'
+    )
+    assert re.search(r'no eval director(y|ies)', body, re.IGNORECASE), (
+        'root_present === true with zero evals is an empty-but-HEALTHY state '
+        '(memory_evals.py:972-974) and needs its own wording — folding it into '
+        'the root-absent message would report a working system as a broken one.'
+    )
+
+    # (c) missing scalars are em-dashes, never synthetic zeros.
+    assert '—' in body, (
+        'missing scalars must render the em-dash placeholder the Memory tab '
+        'already uses (tabs.jsx:589, :648-653).'
+    )
+    for field in ('current_value', 'value', 'n', 'denominator', 'alarm_count'):
+        assert not re.search(rf'\.\s*{field}\s*\|\|\s*0\b', body), (
+            f'`{field}` is defaulted with `|| 0`. A synthetic zero reads as a '
+            'measured zero — use the dash() helper so an absent measurement '
+            'looks absent.'
+        )
+
+    # (d) the issues notice is VISIBLE and lists the detail, not just a count.
+    assert 'data-testid="memory-eval-issues"' in body, (
+        'artifact issues must render a data-testid="memory-eval-issues" notice.'
+    )
+    assert re.search(r'issue_count\s*>\s*0', body), (
+        'the issues notice must be gated on `issue_count > 0`.'
+    )
+    issues_block = re.search(
+        r'data-testid="memory-eval-issues"([\s\S]{0,1600})', body
+    )
+    assert issues_block is not None
+    issues_text = issues_block.group(1)
+    for field in ('kind', 'eval_id', 'path', 'detail'):
+        assert re.search(rf'\.\s*{field}\b', issues_text), (
+            f"the issues notice must list each issue's `{field}` — a bare count "
+            'tells the operator something is wrong but not what, which is the '
+            'silent-degradation failure the notice exists to prevent '
+            '(INV-2/INV-4).'
+        )
+    assert not re.search(r'<details[^>]*>\s*<summary[^>]*>\s*\{?[^<]{0,40}issue', body, re.IGNORECASE), (
+        'the issues notice must be expanded by default — collapsing a '
+        'degraded-state notice reproduces the silent degradation it exists to '
+        'prevent (INV-2/INV-4, the 2658 parse_failures precedent).'
+    )
+
+    # (e) payload age is visible.
+    assert 'generated_at' in body, (
+        '`generated_at` must be rendered so the operator can see payload age.'
+    )
