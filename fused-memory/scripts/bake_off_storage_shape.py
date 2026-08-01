@@ -903,3 +903,108 @@ def apply_grouped_read(
     # is consumed once), so the order is total and the transform deterministic.
     resolved.sort(key=lambda pair: pair[0])
     return [record for _, record in resolved]
+
+
+# ---------------------------------------------------------------------------
+# Read-side transform: the topic anchor (arm-local reference for task 3111)
+# ---------------------------------------------------------------------------
+#
+# 3111's pin does not exist at ``MemoryService.search`` (zero ``topic`` hits
+# in that module) and is deferred behind gate η, so — as with the grouped
+# read — the reference implementation lives here.
+#
+# Because this is a READ-side transform, arm (d) of E2 (each shape ± the pin)
+# needs NO extra seeded collection: pin-on and pin-off run over identical
+# stored state, making the comparison an exactly-controlled A/B rather than
+# two corpora that could rank differently under ANN nondeterminism.
+
+
+def build_canonical_by_topic(records: list[ArmRecord]) -> dict[str, ArmRecord]:
+    """Index ``topic -> the topic's canonical record``.
+
+    In the live driver this is populated via ``Mem0Backend.scroll_by_metadata``
+    rather than a search: ``Mem0Backend.search`` exposes no arbitrary metadata
+    filter, so ``topic == T AND canonical is True`` is structurally not
+    expressible as a query.  Keeping the index construction pure means that
+    seam stays testable with no store attached.
+
+    A topic carrying two canonicals RAISES rather than picking a winner.
+    Per-(project, topic) canonical uniqueness is leaf ε's rule and cannot be
+    enforced from here, but silently choosing would make the pin's answer
+    depend on scroll order — non-deterministic between runs, and invisible in
+    the report.
+    """
+    index: dict[str, ArmRecord] = {}
+    for record in records:
+        topic = record.metadata.get('topic')
+        # Bool identity, matching β's `invalid_canonical_type` rule: a truthy
+        # 1 is a FATAL violation at the write boundary, so it must not be
+        # treated as canonical here either.
+        if topic is None or record.metadata.get('canonical') is not True:
+            continue
+        existing = index.get(topic)
+        if existing is not None:
+            raise ValueError(
+                f'topic {topic!r} has two canonical records '
+                f'({existing.record_id!r} and {record.record_id!r}). '
+                f'Per-(project, topic) canonical uniqueness is leaf ε\'s rule; '
+                f'picking one here would make the pin depend on scroll order.'
+            )
+        index[topic] = record
+    return index
+
+
+def apply_topic_anchor(
+    hits: list[ArmRecord],
+    canonical_by_topic: dict[str, ArmRecord],
+) -> list[ArmRecord]:
+    """Pin each present topic's canonical into the results (PRD D1).
+
+    The pin fires when any hit carries ``metadata['topic'] == T``, and adds
+    T's canonical if it is not already present.  It is **ADDITIVE, never
+    subtractive**: no hit is dropped, reordered relative to its peers, or
+    replaced.  A subtractive pin would hide precisely the candidates
+    ``mem0_dedup.find_prior_memories`` needs to see, converting a
+    discoverability feature into a write-guard regression.
+
+    Pinned canonicals are appended after the original ranking rather than
+    promoted to the front.  Appending is the conservative choice: it cannot
+    flatter the pin on any rank-based metric, so a measured improvement is
+    attributable to the canonical becoming *reachable at all* rather than to
+    the transform having hand-placed it high.
+
+    Returns the input list unchanged (same contents, same order) when nothing
+    is pinnable — the pin is not a rewrite.
+
+    Pure: never mutates *hits*, *canonical_by_topic*, or any record.
+    """
+    present_ids = {hit.record_id for hit in hits}
+    # dict-not-set: insertion order makes the pinned tail deterministic.
+    present_topics: dict[str, None] = {}
+    for hit in hits:
+        topic = hit.metadata.get('topic')
+        if topic is not None:
+            present_topics.setdefault(topic, None)
+
+    pinned: list[ArmRecord] = []
+    for topic in present_topics:
+        canonical = canonical_by_topic.get(topic)
+        if canonical is None:
+            continue
+        if canonical.metadata.get('canonical') is not True:
+            raise ValueError(
+                f'the record registered as canonical for topic {topic!r} '
+                f'({canonical.record_id!r}) does not carry canonical is True — '
+                f'β\'s invalid_canonical_type rule is bool identity, so a truthy '
+                f'value is a FATAL violation at the write boundary. Anchoring on '
+                f'it would report a discoverability win for a shape production '
+                f'cannot store.'
+            )
+        if canonical.record_id in present_ids:
+            continue  # already ranked — never duplicated
+        pinned.append(canonical)
+        present_ids.add(canonical.record_id)
+
+    if not pinned:
+        return hits
+    return [*hits, *pinned]
