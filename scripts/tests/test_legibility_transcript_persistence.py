@@ -379,21 +379,32 @@ _UNDERSCORE_MEMBER_DIR = "-home-leo-src-dark-factory--eval-worktrees-df-task-12-
 
 
 def _write_transcript_in_literal_dir(
-    projects_root: Path, encoded_dir: str, name: str, first_user_text: str
+    projects_root: Path,
+    encoded_dir: str,
+    name: str,
+    first_user_text: str,
+    *,
+    cwd: str | None = None,
 ) -> Path:
     """Write a transcript into an EXPLICITLY NAMED encoded dir.
 
     Sibling of :func:`_write_transcript` that takes the encoded dir name as a
     literal instead of deriving it via ``inventory.encode_cwd``, so the
     fixture cannot track a bug in the encoder it is meant to test.
+
+    When *cwd* is given it is recorded on the user line, the way a real
+    transcript carries its session's REAL cwd. That is the field
+    ``inventory.session_cwd`` reads, and the only evidence
+    ``mod.resolve_session_dir``'s degrade path will accept as confirmation
+    that an unexpectedly-named dir actually belongs to a cwd.
     """
     session_dir = projects_root / encoded_dir
     session_dir.mkdir(parents=True, exist_ok=True)
     path = session_dir / name
-    path.write_text(
-        json.dumps({"type": "user", "message": {"content": first_user_text}}) + "\n",
-        encoding="utf-8",
-    )
+    line: dict = {"type": "user", "message": {"content": first_user_text}}
+    if cwd is not None:
+        line["cwd"] = cwd
+    path.write_text(json.dumps(line) + "\n", encoding="utf-8")
     return path
 
 
