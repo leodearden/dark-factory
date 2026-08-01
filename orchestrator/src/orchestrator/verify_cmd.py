@@ -564,6 +564,68 @@ def has_unpreserved_chain_clauses(raw: str, tail: str) -> bool:
     return len(split_top_level_and(raw)) > 1
 
 
+def describe_dropped_clauses(
+    raw: str, retained: str, keyword: str,
+) -> tuple[tuple[str, ...], bool]:
+    """The clauses a gate REJECT dropped from *raw*, and whether they re-invoke the tool.
+
+    The companion to ``has_unpreserved_chain_clauses``, and DIAGNOSTIC-ONLY in
+    exactly the same sense: between them they supply the count, the text and
+    the classification for one log record (``verify_plan.log_dropped_chain_
+    clauses``) and feed no control-flow decision anywhere. Pure, so this module
+    stays logging-free.
+
+    *retained* is the CALLER'S truncation point — ``head[: idx + len(keyword)]``
+    — and must be a prefix of *raw*. Passing it in rather than re-deriving it
+    is deliberate: both scopers already compute that exact slice as the
+    argument to ``parse_config_command``, and re-deriving it here would fork
+    the truncation rule into a second place free to drift from the first.
+
+    The count is the top-level `&&` SEGMENT DELTA across *retained*, and both
+    halves of that are load-bearing:
+
+    * NOT ``len(split_top_level_and(raw)) - 1`` (the whole original's clause
+      count), which silently assumes the keyword sits in segment 0. Both of
+      this repo's root configs put it in segment 1 — ``cd fused-memory && npx
+      pyright ...``, ``cd shared && uv run pytest ...`` — so that form
+      over-reports by one for each of them;
+    * NOT a re-split of the dropped TEXT ``raw[len(retained):]`` either,
+      because *retained* normally ends MID-segment: for ``'uv run pytest
+      tests/ && python3 check.py tests'`` the remainder is ``' tests/ &&
+      python3 check.py tests'``, which re-splits to two — but the leftover
+      ``tests/`` is a truncated ARGUMENT of a retained clause, not a dropped
+      clause.
+
+    A 0 delta with a non-empty remainder falls back to reporting that
+    remainder as ONE clause, guarded on the remainder actually carrying a
+    chain operator. That is the non-`&&` chain — ``'ruff check src/ ||
+    python3 x.py'`` is a single top-level `&&` segment — which the segment
+    view cannot see at all, and where the record would otherwise read "dropped
+    0 trailing chain clause(s)" on a path reached only because
+    ``has_unpreserved_chain_clauses`` reported a real drop. The chain-operator
+    guard is what keeps a plain ``'ruff check src/'`` (remainder ``'src/'``,
+    an argument) reporting nothing dropped.
+
+    The bool is True when ANY dropped clause invokes *keyword*'s tool at an
+    argv-head position, i.e. the truncation is an intended SAME-TOOL FAN-OUT
+    rather than a SIBLING CHECK that will now never run. It reuses the gate's
+    own ``_segment_invokes_tool``, so the record's notion of "the same tool
+    again" is by construction identical to the notion condition 7 decided the
+    REJECT with — rather than a parallel rule free to disagree with it. Its
+    ``ValueError -> True`` carries over too: an undecodable clause is reported
+    as the quiet fan-out case rather than as a sibling-check claim that may be
+    false.
+    """
+    segments = split_top_level_and(raw)
+    retained_segments = split_top_level_and(retained)
+    dropped = tuple(s.strip() for s in segments[len(retained_segments) :] if s.strip())
+    if not dropped and raw.startswith(retained):
+        remainder = raw[len(retained) :].strip()
+        if remainder and has_unpreserved_chain_clauses(remainder, ''):
+            dropped = (remainder,)
+    return dropped, any(_segment_invokes_tool(clause, keyword) for clause in dropped)
+
+
 def parse_config_command(raw: str) -> VerifyCmd:
     """Parse a config-level command string into a VerifyCmd.
 

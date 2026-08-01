@@ -193,7 +193,8 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     idx = head.find(keyword)
     if idx == -1:
         return cmd
-    parsed = parse_config_command(head[: idx + len(keyword)])
+    retained = head[: idx + len(keyword)]
+    parsed = parse_config_command(retained)
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
     # Sited AFTER both bail-outs on purpose: each of them returns *cmd* — the
@@ -202,22 +203,30 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     # path below actually discards them. A record that does not correspond to
     # a real drop is the same failure mode this log exists to avoid.
     #
-    # DEBUG for an intended same-tool fan-out truncation, not the WARNING the
-    # reverse-dependency widening's no-op uses further down this module: the
-    # root `type_check_command` hits it on every fallback verify, and a
-    # WARNING there would be steady noise that trains operators to ignore the
-    # record. The PYTEST slot is the exception and reads at INFO: there the
-    # dropped clause is a SIBLING CHECK that will now never run, which is the
-    # possible-false-GREEN direction — strictly worse than the missing junit
-    # report `_with_junitxml_str` already reports at INFO, so it is reported
-    # at the same level and in the same shape.
+    # The LEVEL follows what was actually dropped, not which slot is running.
+    # A dropped clause that re-invokes the tool at an argv head is an intended
+    # same-tool fan-out -> DEBUG, not the WARNING the reverse-dependency
+    # widening's no-op uses further down this module: BOTH root configs are
+    # that case and hit it on every fallback verify, so a louder level would be
+    # steady noise that trains operators to ignore the record. A dropped clause
+    # that does NOT invoke the tool is a sibling check that will now never run
+    # -> INFO, the possible-false-GREEN direction, the same level
+    # `_with_junitxml_str` uses for the missing junit report.
+    #
+    # Keying that on `keyword == 'pytest'` instead — the first spelling of this
+    # record — got it backwards on the live config: this repo's root
+    # `test_command` is a pure pytest fan-out with no sibling checker anywhere,
+    # and was reported at INFO as a dropped sibling check on every fallback
+    # verify that scopes it.
     #
     # The record itself is `verify_plan`'s, emitted onto THIS module's logger.
     # Sharing the one implementation is what makes the two scopers' records
     # read alike structurally rather than by hand-mirroring — the same
     # argument that put the tail-preservation policy in one shared gate.
+    # `retained` is the truncation point, so the clauses past it are exactly
+    # the ones this call discards — which is what makes the count right.
     if has_unpreserved_chain_clauses(cmd, tail):
-        verify_plan.log_dropped_chain_clauses(logger, cmd, keyword)
+        verify_plan.log_dropped_chain_clauses(logger, cmd, keyword, retained)
     rendered = render(strip_cwd(scope_to(parsed, files)))
     return f'{rendered} {tail}' if tail else rendered
 

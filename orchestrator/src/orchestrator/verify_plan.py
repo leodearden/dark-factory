@@ -20,12 +20,12 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
+    describe_dropped_clauses,
     has_unpreserved_chain_clauses,
     parse_config_command,
     render,
     scope_to,
     split_chain_tail,
-    split_top_level_and,
     strip_cwd,
 )
 
@@ -274,7 +274,9 @@ class VerifyPlan:
         }
 
 
-def log_dropped_chain_clauses(log: logging.Logger, raw: str, keyword: str) -> None:
+def log_dropped_chain_clauses(
+    log: logging.Logger, raw: str, keyword: str, retained: str,
+) -> None:
     """Report onto *log* the trailing chain clauses a gate REJECT discarded from *raw*.
 
     Shared by BOTH scopers — ``_scope_prefix_to_keyword`` below and
@@ -291,30 +293,54 @@ def log_dropped_chain_clauses(log: logging.Logger, raw: str, keyword: str) -> No
     scopers' bail-outs return the whole original, chain and all, so a record
     emitted before them would name clauses that in fact still run.
 
-    LEVEL is split by slot. The ordinary case is an intended SAME-TOOL FAN-OUT
-    truncation — the root ``type_check_command`` hits it on every fallback
-    verify — so it is DEBUG rather than the WARNING the reverse-dependency
-    widening's no-op uses, which at that frequency would just train operators
-    to ignore the record. The PYTEST slot is the exception and reads at INFO:
-    ``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``, so what gets dropped
-    there is a SIBLING CHECK that will now never run. That is the
-    possible-false-GREEN direction — the bug class the tail-preservation gate
-    exists to close — and therefore strictly worse than the missing junit
-    report ``verify._with_junitxml_str`` already reports at INFO, whose shape
-    this record mirrors.
+    *retained* is the caller's truncation point (``head[: idx + len(keyword)]``
+    — each caller already computes it, as the argument to
+    ``parse_config_command``) and must be a prefix of *raw*. The clause COUNT
+    is the top-level `&&` SEGMENT DELTA across it, NOT
+    ``len(split_top_level_and(raw)) - 1``: that earlier form counted every
+    clause in the whole original, which is right only when the keyword sits in
+    segment 0, and every ``cd X && <tool>`` config in this repo puts it in
+    segment 1. Measured, it over-reported the root ``type_check_command`` as 5
+    dropped clauses when 4 were dropped, and the root ``test_command`` as 15
+    when 14 were.
+
+    LEVEL and wording are decided by WHAT WAS DROPPED, via
+    ``describe_dropped_clauses``, not by which slot is running. If any dropped
+    clause re-invokes the tool at an argv-head position the truncation is an
+    intended SAME-TOOL FAN-OUT -> DEBUG, not the WARNING the reverse-dependency
+    widening's no-op uses: BOTH root configs are this case and hit it on every
+    fallback verify, so a louder level would be steady noise that trains
+    operators to ignore the record. If no dropped clause invokes the tool it is
+    a genuine SIBLING CHECK that will now never run -> INFO, the
+    possible-false-GREEN direction, matching the level
+    ``verify._with_junitxml_str`` uses for the missing junit report, whose
+    shape this record mirrors.
+
+    That replaces an earlier rule keyed on ``keyword == 'pytest'``, which
+    conflated which slot is running with what kind of chain got truncated.
+    They come apart in both directions on real configs: this repo's root
+    ``test_command`` is a pure pytest FAN-OUT with no sibling checker anywhere
+    (so the keyword rule reported the highest-frequency pytest-slot record in
+    the repo at INFO, claiming a dropped sibling check that does not exist),
+    while a ``cd``-rejected pyright chain ending in ``python3
+    scripts/check_pyright_config.py src`` is a genuine sibling check the
+    keyword rule buried at DEBUG under fan-out prose.
     """
-    pytest_slot = keyword == 'pytest'
+    dropped, fan_out = describe_dropped_clauses(raw, retained, keyword)
     log.log(
-        logging.INFO if pytest_slot else logging.DEBUG,
+        logging.DEBUG if fan_out else logging.INFO,
         'scope-to-keyword %r dropped %d trailing chain clause(s) from %r '
         '(gate rejected tail preservation) — %s',
         keyword,
-        len(split_top_level_and(raw)) - 1,
+        len(dropped),
         raw,
-        'a sibling check chained onto the test command will NOT run for this '
-        'verify'
-        if pytest_slot
-        else 'an intended same-tool fan-out truncation',
+        'an intended same-tool fan-out truncation'
+        if fan_out
+        # "this command", not "the test command": the sibling case is no
+        # longer pytest-specific now that the classification comes from the
+        # dropped clauses rather than from the keyword.
+        else 'a sibling check chained onto this command will NOT run for this '
+        'verify',
         # Attribute the record to the CALLING scoper, not to this shared
         # helper — otherwise every record, from either scoper, points at the
         # same line here and the file/line is useless for telling them apart.
@@ -398,7 +424,8 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     idx = head.find(keyword)
     if idx == -1:
         return unscoped
-    prefix_parsed = parse_config_command(head[: idx + len(keyword)])
+    retained = head[: idx + len(keyword)]
+    prefix_parsed = parse_config_command(retained)
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
         return unscoped
     # Sited AFTER both bail-outs on purpose — each returns *unscoped*, i.e.
@@ -406,8 +433,11 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     # record would name clauses that in fact still run. Only the rewriting
     # path below actually discards them. Same record and same level policy as
     # verify._scope_to_keyword's, because it is literally the same call.
+    #
+    # `retained` is what makes the reported count right: it is the truncation
+    # point, so the clauses past it are exactly the ones this call discards.
     if has_unpreserved_chain_clauses(raw, tail):
-        log_dropped_chain_clauses(logger, raw, keyword)
+        log_dropped_chain_clauses(logger, raw, keyword, retained)
     scoped = strip_cwd(scope_to(prefix_parsed, files))
     if not tail:
         return scoped
