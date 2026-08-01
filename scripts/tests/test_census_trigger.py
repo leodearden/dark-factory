@@ -871,7 +871,8 @@ def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
         last_census_report="plans/confusion-census-prior.md",
         last_census_done_count=500,
     )
-    fetcher = lambda: {"statuses": _done_statuses(550)}  # delta 50 < 120
+    def fetcher():  # delta 50 < 120
+        return {"statuses": _done_statuses(550)}
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
 
@@ -886,7 +887,8 @@ def test_decide_for_project_row3_day7_130_landed_fires(tmp_path):
         last_census_report="plans/confusion-census-prior.md",
         last_census_done_count=500,
     )
-    fetcher = lambda: {"statuses": _done_statuses(630)}  # delta 130 >= 120
+    def fetcher():  # delta 130 >= 120
+        return {"statuses": _done_statuses(630)}
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
 

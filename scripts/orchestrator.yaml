@@ -1,6 +1,10 @@
 # Scripts orchestrator configuration
-# Scopes verification to tests/scripts/ — the Python test suite for this module.
-# Bash scripts (verify-migration.sh, migrate.sh, etc.) are not linted here.
+#
+# Two different trees are in play here, and the distinction is load-bearing:
+# test_command runs the tests/scripts/ suite (see the note below), while
+# lint_command lints this directory, scripts/. Bash scripts
+# (verify-migration.sh, migrate.sh, etc.) are not linted by either — ruff only
+# reads .py.
 #
 # Pin --project shared: tests/scripts/ lives at the repo root and is not itself a
 # workspace member, so a bare `uv run pytest` resolves against the workspace-ROOT
@@ -11,3 +15,110 @@
 # worktree root and the tests/scripts/ path still resolves. Mirrors the other
 # subprojects' --project <member> convention.
 test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
+
+# COVERAGE GAP in the command above, recorded rather than left invisible
+# (task 3445, follow-up 3460). This command targets tests/scripts/, but this
+# directory has 40 test modules of its own under scripts/tests/, and NO
+# full-suite command anywhere targets them: the repo-root fleet chain also ends
+# in `pytest tests/scripts/`. FILE_SCOPED pytest does narrow correctly when a
+# scripts/tests/ file is touched (verified: it renders `pytest
+# scripts/tests/<file>.py`), so those tests are not wholly ungated — but under
+# FULL_SUITE and merge-role merge_verify_breadth=full, scripts/tests/ never
+# runs. Note this also corrects tests/scripts/orchestrator.yaml's comment,
+# which asserts "scripts/ has no tests of its own". Distinct from the
+# duplicate-run COST that file already records for the byte-identical
+# test_command; fixing 3460 would resolve both.
+
+# LINT IS DECLARED DELIBERATELY (task 3445).
+#
+# Omitting lint_command would NOT leave ruff running as some fallback — it
+# DELETES the gate, silently and green. verify_plan._derive_module_runs emits
+# an explicit ScopeKind.SKIPPED PlannedRun with cmd=None for a falsy
+# lint_command; verify._executed_module_configs_from_plan renders that SKIPPED
+# slot back to None; verify._run_or_skip_timed turns a None command into a
+# CheckRun.skipped that is VACUOUSLY PASSING at rc=0.
+#
+# Those are SYMBOL citations, deliberately not file:line. This block first
+# shipped with line pins adapted from tests/scripts/orchestrator.yaml's own
+# (334-363 / 4892) and every one of them was already stale at HEAD — the
+# cited verify.py line for _executed_module_configs_from_plan had drifted
+# ~125 lines onto an unrelated statement. The rot was compounding by being
+# copied forward. Symbols are greppable; keep it that way when editing.
+# Until this line existed, every diff confined to scripts/ cleared the LINT
+# check without ruff ever running — 71 tracked .py files, including operator
+# tooling and the scripts/legibility/ monitors, gated by nothing. The
+# repo-root lint_command does not cover them either: it targets only
+# shared/escalation/fused-memory/orchestrator/dashboard. This is the same gap
+# task 3350 closed for tests/scripts/, against whose comment block scripts/
+# was measured. Guarded by tests/scripts/test_scripts_module_config.py.
+#
+# MEASUREMENT: at base main 434ca89025, `uv run --project shared ruff check
+# scripts/` returned exactly 3 findings — 2x E731 lambda-assignment in
+# scripts/tests/test_census_trigger.py, 1x F401 unused `import stat` in
+# scripts/tests/test_enable_laptop_persistent_worktree.py. All three were
+# FIXED in the same commit that added this line, rather than the command
+# being weakened with an exclude or a narrowed target (task 3350's precedent).
+# Fix-and-declare must stay atomic: verify.run_full_verification asyncio-gathers
+# over ALL module_configs.values(), not just those a diff touches, and
+# the repo root sets merge_verify_breadth: "full" — so a red lint_command here
+# blocks every merge, review checkpoint and main-tip sweep repo-wide, on
+# branches with no defect.
+#
+# --project shared for the same PATH reason the root yaml's own comment gives:
+# ruff is not on PATH at the worktree root, only inside a member venv;
+# verify.py's _FALLBACK_UV_PROJECT = 'shared' encodes the same pairing. No
+# --directory, so cwd stays at the worktree root and scripts/ resolves.
+#
+# RULE-SET SURPRISE, recorded so it is not rediscovered (follow-up 3457).
+# --project shared selects the ENVIRONMENT ruff runs from; it does NOT make
+# shared's ruff config apply to files outside shared/. There is no [tool.ruff]
+# table in the repo-root pyproject.toml and no ruff.toml anywhere in the repo,
+# and ruff resolves config hierarchically per file, SKIPPING a pyproject.toml
+# with no [tool.ruff] section. So files under scripts/ are checked against
+# ruff's BUILT-IN defaults (E4/E7/E9 + F), not the members'
+# select = ["E","F","UP","B","SIM","I"]. Verified with `ruff check
+# --show-settings`: a scripts/ file enables E401/E402/E7xx/E9/F only, while a
+# shared/ file additionally enables the B/SIM/UP/I families. tests/scripts/ is
+# in the identical position, so this command inherits exactly the same rule set
+# as its sibling — consistent, but weaker than a workspace member's. Widening
+# it would retroactively change tests/scripts/ gating and surface an unmeasured
+# finding set there, which is outside this task's locks.
+lint_command: "uv run --project shared ruff check scripts/"
+
+# TYPE IS DELIBERATELY NOT DECLARED YET — the gap is measured, not overlooked
+# (task 3445; follow-up 3456 carries the burn-down).
+#
+# The same vacuous-pass mechanism described above applies to
+# type_check_command — verify_plan._derive_module_runs emits the identical
+# reasoned SKIPPED for a falsy type_check_command a few lines below the lint
+# one — so TYPE currently passes at rc=0 for every scripts/-confined diff
+# without pyright running. That is a real, open gap. It is stated here rather
+# than left as a silent absence.
+#
+# It was not closed in the same task because the debt is roughly 50x task
+# 3350's 4-fix precedent: `npx pyright scripts/` returns 206 errors across 14
+# files (162 in scripts/tests/test_legibility_census.py alone; 20 in non-test
+# production scripts, genuine str|None / Optional-narrowing defects).
+#
+# The obvious "it is only unresolved imports" hypothesis was TESTED AND
+# DISPROVED — do not repeat the experiment blind. 9 of the errors are
+# reportMissingImports for census/codebook/coder/digest/inventory, flat
+# modules that scripts/tests/conftest.py puts on sys.path at runtime and
+# pyright cannot see. Adding "scripts" + "scripts/legibility" to the root
+# pyproject.toml [tool.pyright] extraPaths made it WORSE, not better:
+# 206 -> 395 errors (test_legibility_census.py alone 162 -> 350), because
+# resolving the imports lets pyright check against the real signatures and
+# surfaces a much larger latent mismatch surface. The experiment was reverted.
+# Plan against 395, not 206.
+#
+# Declaring `type_check_command: "npx pyright scripts/"` before that tree is
+# clean is not a transiently-red gate, it is a fleet-wide outage — see the
+# run_full_verification / merge_verify_breadth reasoning above. The burn-down
+# and the declaration must land in one atomic commit.
+
+# verify_command_timeout_secs is deliberately left UNSET here, which means this
+# module inherits the repo-root whole-fleet ceiling (3600s) for each of its
+# checks — the same class of gap tests/scripts/ closed with its measured 600s
+# budget. Sizing it honestly needs multi-run measurement of the verbatim
+# FULL_SUITE command forms on this oversubscribed host, which task 3445 did not
+# perform; recorded here rather than guessed. Follow-up 3458.
