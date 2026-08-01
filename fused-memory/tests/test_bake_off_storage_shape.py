@@ -624,7 +624,6 @@ class TestCategoryIsPreservedAcrossArms:
                 assert record.metadata.get('category'), (shape, record.record_id)
 
     def test_a_claims_category_matches_its_source_record_in_arm_a(self):
-        mod = _mod()
         claims = {c.claim_id: c for c in _committed_inputs()['claims']}
         status_quo = {r.record_id: r for r in _knowledge(_arm('status_quo'))}
 
