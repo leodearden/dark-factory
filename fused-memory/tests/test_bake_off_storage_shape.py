@@ -113,7 +113,7 @@ class TestLoadCalibrationClusters:
         path = tmp_path / 'broken.jsonl'
         path.write_text('{"memory_id": "a", "cluster_id": "a", "label": "canonical"}\nnot json\n')
 
-        with pytest.raises(ValueError, match=r':2:'):
+        with pytest.raises(_mod().FixtureError, match=r':2:'):
             _mod().load_calibration_clusters(path)
 
     def test_cluster_without_a_canonical_is_named_loudly(self, tmp_path):
@@ -281,8 +281,31 @@ class TestDefaultFixturePaths:
         assert mod.DEFAULT_ALPHA_FIXTURE_PATH == ALPHA_FIXTURE_PATH
         assert mod.DEFAULT_REGISTRY_PATH == REGISTRY_PATH
 
-    def test_no_worktree_path_is_baked_into_the_module(self):
-        # The lesson test_calibrate_write_triage.py:1267 pins: a path
-        # resolved at author time would break the moment the script runs
-        # from another checkout.
-        assert '.worktrees' not in str(_mod().DEFAULT_ARM_CLAIMS_PATH)
+    def test_paths_are_derived_from___file___not_baked_in(self):
+        """The lesson test_calibrate_write_triage.py:1267 pins.
+
+        A path resolved at AUTHOR time breaks the moment the script runs
+        from another checkout — and because this task is itself authored
+        inside `.worktrees/3199`, a baked-in literal would be invisible to
+        any test that merely inspects the resolved value (it would look
+        perfectly plausible). So assert on the SOURCE: no absolute path
+        literal anywhere, and every default is a child of the package root
+        the module derived from its own ``__file__``.
+        """
+        mod = _mod()
+        source = SCRIPT_PATH.read_text()
+
+        assert '/home/' not in source
+        assert '.worktrees' not in source
+
+        package_root = Path(mod.__file__).resolve().parent.parent
+        for default in (
+            mod.DEFAULT_ARM_CLAIMS_PATH,
+            mod.DEFAULT_QUERY_SET_PATH,
+            mod.DEFAULT_DISTRACTOR_SLAB_PATH,
+            mod.DEFAULT_ALPHA_FIXTURE_PATH,
+            mod.DEFAULT_REGISTRY_PATH,
+        ):
+            assert default.is_absolute()
+            assert default.is_relative_to(package_root)
+            assert default.exists()
