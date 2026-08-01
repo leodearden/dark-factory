@@ -853,6 +853,71 @@ class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
         assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
         assert 'orchestrator/tests/test_other.py' in run.cmd.targets
 
+    # -- the operator-facing record of WHY the run widened -------------------
+
+    def test_mixed_diff_reason_names_the_production_trigger(self):
+        """(e) VerifyResult.plan is the operator-facing record of WHY a scope
+        decision was made, and this codebase already names the trigger in its
+        widening reasons (``pytest: conftest touched ({conftest_trigger})``).
+        The mixed case must do the same — and must NOT claim the diff was
+        "source-only", which is factually false about a diff that touched
+        tests."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert 'orchestrator/src/orchestrator/some_module.py' in run.reason
+        assert 'source-only' not in run.reason.lower()
+
+    def test_mixed_diff_reason_states_touched_tests_did_not_narrow_it(self):
+        """(f) An operator reading the plan must be able to tell WHY a suite
+        ran full despite the diff touching tests — otherwise the widened run
+        looks like a scoper bug. The reason records that the co-committed
+        collectable test file(s) did not narrow it, alongside the existing
+        role and coverage-boundary signposts."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        reason = run.reason.lower()
+        assert 'narrow' in reason
+        assert 'task' in reason
+        assert 'not run' in reason
+
+    def test_source_only_reason_is_unchanged(self):
+        """(g) The λ golden is provably untouched by task 3294: a source-ONLY
+        diff at role='task' still carries the pre-existing reason string
+        BYTE-IDENTICALLY, so any future change there is a real regression
+        rather than expected churn from this task."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            SOURCE_ONLY_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.reason == (
+            'pytest: source-only diff — owning-module full suite (task role); '
+            'sibling modules NOT run'
+        )
+
 
 # ---------------------------------------------------------------------------
 # derive_verify_plan: merge role + merge_verify_breadth fork (λ, task 2589 step-5: RED)
