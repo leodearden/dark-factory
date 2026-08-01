@@ -560,8 +560,10 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
         'the section must use at least one charts.jsx primitive '
         '(Sparkline / StepSpark / StatTile / LineChart).'
     )
-    for lib in ('d3', 'chart.js', 'recharts', 'plotly'):
-        assert lib not in body.lower(), (
+    # Word-boundary matched, not bare substring: a plain `'d3' in body` fires on
+    # any prose mentioning "PRD DD3", which is a false positive, not a library.
+    for lib in (r'd3', r'chart\.js', r'recharts', r'plotly'):
+        assert not re.search(rf'\b{lib}\b', body, re.IGNORECASE), (
             f"tab_memory_evals.jsx references '{lib}' — the PRD and the task "
             'both forbid a new chart library; use charts.jsx primitives only.'
         )
