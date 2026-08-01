@@ -50,7 +50,17 @@ const EXPECTED_DF_DATA_KEYS = [
   'PERFORMANCE', 'MEMORY_STATUS', 'MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN',
   'RECON_STATE', 'MERGE_QUEUE', 'COSTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT',
   'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS', 'SCHEDULER',
+  'MEMORY_EVALS',
 ];
+
+// Number of rows in endpointsFor() (data.js:16-34). Several tests below assert
+// that a cycle touched EVERY endpoint — "all of them" is the actual claim, and
+// a literal is the only way to state it without deriving the expectation from
+// the same map under test. Bump this whenever endpointsFor gains or loses a
+// row; it is deliberately one constant rather than a literal repeated per
+// test, because scattered copies is what went stale when the memory-evals
+// endpoint was added.
+const EXPECTED_ENDPOINT_COUNT = 14;
 
 // Loads data.js fresh against a shimmed browser-ish global. Installs
 // `globalThis.window` (a bare object recording dispatched events) and a
@@ -320,7 +330,11 @@ test('production fallbacks: refreshDFData with no explicit state/deps uses globa
   const firstCycle = api.refreshDFData(undefined, { jitterMaxMs: 0 });
   await drain();
 
-  assert.equal(fetchCalls.length, 13, 'the default fetchImpl fallback must reach globalThis.fetch for all 13 endpoints');
+  assert.equal(
+    fetchCalls.length,
+    EXPECTED_ENDPOINT_COUNT,
+    `the default fetchImpl fallback must reach globalThis.fetch for all ${EXPECTED_ENDPOINT_COUNT} endpoints`,
+  );
   for (const { init } of fetchCalls) {
     assert.equal(init.credentials, 'same-origin', 'the default fetchImpl fallback must still pass credentials: same-origin');
   }
@@ -328,13 +342,13 @@ test('production fallbacks: refreshDFData with no explicit state/deps uses globa
   // Second cycle, fired while the first is still held open, ALSO with no
   // explicit `state`: if the o.state || DF_POLL_STATE fallback were broken
   // or DF_POLL_STATE were shadowed/undefined, this would see fresh
-  // (non-in-flight) state and re-fetch all 13 endpoints again.
+  // (non-in-flight) state and re-fetch every endpoint again.
   const secondCycle = api.refreshDFData(undefined, { jitterMaxMs: 0 });
   await drain();
   assert.equal(
     fetchCalls.length,
-    13,
-    'a second cycle sharing the DF_POLL_STATE singleton must skip all 13 still-in-flight endpoints, not re-fetch them',
+    EXPECTED_ENDPOINT_COUNT,
+    'a second cycle sharing the DF_POLL_STATE singleton must skip every still-in-flight endpoint, not re-fetch them',
   );
 
   releaseAll();
@@ -348,17 +362,21 @@ test('production fallbacks: refreshDFData with no explicit state/deps uses globa
 // poll interval, so an unguarded loader stacks ~36 concurrent requests for
 // that one endpoint by the time it finally answers. This drives four tick
 // fires while memory-graphs is held open and asserts it never exceeds 1
-// concurrent fetch, while the other 12 endpoints are completely unaffected
+// concurrent fetch, while every other endpoint is completely unaffected
 // (proving the guard is per-endpoint, not whole-cycle — a whole-cycle guard
-// would starve all 13 endpoints on any single slow one).
+// would starve all of them on any single slow one).
 // ---------------------------------------------------------------------------
 
-test('per-endpoint in-flight guard: a slow endpoint never exceeds concurrency 1, and does not block the other 12 endpoints (regression)', async () => {
+test('per-endpoint in-flight guard: a slow endpoint never exceeds concurrency 1, and does not block the other endpoints (regression)', async () => {
   const { fetchImpl, maxConcurrent, callCount, releaseSlow } = makeConcurrencyFetch(SLOW_ENDPOINT_PATH);
   const { api } = loadDataJs({ fetchStub: fetchImpl });
 
   const allPaths = Object.keys(api.endpointsFor('24h')).map(url => pollKey(url));
-  assert.equal(allPaths.length, 13, 'expected 13 endpoints (sanity check on the endpointsFor fixture)');
+  assert.equal(
+    allPaths.length,
+    EXPECTED_ENDPOINT_COUNT,
+    `expected ${EXPECTED_ENDPOINT_COUNT} endpoints (sanity check on the endpointsFor fixture)`,
+  );
   assert.ok(allPaths.includes(SLOW_ENDPOINT_PATH), 'fixture must include the memory-graphs endpoint');
   const fastPaths = allPaths.filter(p => p !== SLOW_ENDPOINT_PATH);
 
@@ -740,8 +758,8 @@ test('error backoff: refreshDFData(win) (chip change) bypasses backoff only for 
 });
 
 // ---------------------------------------------------------------------------
-// Jitter — spreads the 13 endpoint fetches across part of the 3s interval
-// instead of every tick firing all 13 at once (task 185's lesson: 13
+// Jitter — spreads the endpoint fetches across part of the 3s interval
+// instead of every tick firing all of them at once (task 185's lesson: 13
 // simultaneous requests hammering a single aiosqlite worker thread). Driven
 // by a recording `sleep` dep (captures every requested delay, resolves
 // immediately unless a test deliberately holds it open) and a deterministic
@@ -757,7 +775,7 @@ test('error backoff: refreshDFData(win) (chip change) bypasses backoff only for 
 const EXPECTED_JITTER_MAX_MS = 1500;
 const EXPECTED_POLL_INTERVAL_MS = 3000;
 
-test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and the 13 delays are not all identical', async () => {
+test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and the delays are not all identical', async () => {
   // Sanity check on the fixture itself: the jitter cap must stay below the
   // poll interval, so a jittered start can never structurally slip past the
   // next tick.
@@ -774,10 +792,10 @@ test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and
   const deps = {
     fetchImpl,
     now: () => 0,
-    // 13 distinct fractions in [0, 1) — deterministic, and spread enough
-    // that flooring against JITTER_MAX_MS cannot coincidentally collapse
-    // them all to the same integer delay.
-    random: () => (callIndex++ % 13) / 13,
+    // One distinct fraction in [0, 1) per endpoint — deterministic, and
+    // spread enough that flooring against JITTER_MAX_MS cannot
+    // coincidentally collapse them all to the same integer delay.
+    random: () => (callIndex++ % EXPECTED_ENDPOINT_COUNT) / EXPECTED_ENDPOINT_COUNT,
     sleep: ms => { sleepCalls.push(ms); return Promise.resolve(); },
   };
 
@@ -786,7 +804,11 @@ test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and
   // exercises data.js's own internal default rather than a test override.
   await api.refreshDFData(undefined, { state: api.createPollState(), deps });
 
-  assert.equal(sleepCalls.length, 13, 'every one of the 13 endpoints must await a jitter sleep');
+  assert.equal(
+    sleepCalls.length,
+    EXPECTED_ENDPOINT_COUNT,
+    `every one of the ${EXPECTED_ENDPOINT_COUNT} endpoints must await a jitter sleep`,
+  );
   for (const ms of sleepCalls) {
     assert.ok(
       ms >= 0 && ms < EXPECTED_JITTER_MAX_MS,
@@ -795,7 +817,7 @@ test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and
   }
   assert.ok(
     new Set(sleepCalls).size > 1,
-    'the 13 jitter delays must not all be identical — the fan-out must be genuinely spread',
+    'the jitter delays must not all be identical — the fan-out must be genuinely spread',
   );
 });
 
@@ -975,7 +997,7 @@ test('preserved behaviour: df-data-refresh dispatches exactly once per cycle, in
   const deps = { fetchImpl: alwaysFail, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
   const opts = { state, deps, jitterMaxMs: 0 };
 
-  // Cycle 1: every one of the 13 endpoints fails and backs off.
+  // Cycle 1: every endpoint fails and backs off.
   await api.refreshDFData(undefined, opts);
   assert.equal(countDfEvents(), 1, 'cycle 1 (all endpoints failing) must still dispatch exactly one df-data-refresh event');
 
