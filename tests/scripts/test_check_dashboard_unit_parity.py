@@ -863,6 +863,90 @@ def test_repo_units_are_at_parity_with_themselves():
 
 
 # ---------------------------------------------------------------------------
+# Third-site staleness: the templated dashboard unit  (step-21 / step-22)
+# ---------------------------------------------------------------------------
+#
+# setup-host.sh does NOT cp dark-factory-dashboard.service into
+# ~/.config/systemd/user/. It RENDERS it from scripts/dashboard.service.template
+# (scripts/setup-host.sh:362-367, substituting __REPO_ROOT__ and __UV_PATH__),
+# and only cp's the two watchdog units verbatim. So the registry's repo_relpath
+# for this one unit names a file that is NOT the source of the copy being
+# checked: a third site that must agree, which is exactly the shape the
+# checker's own docstring argues against.
+#
+# Measured 2026-08-01: the two are byte-identical after templating. Nothing
+# kept them so until this test. The concrete failure it closes: bump
+# TimeoutStopSec in the TEMPLATE alone, and the checker reports DRIFT against
+# the installed copy while its remediation line tells the operator to run
+# setup-host.sh -- which reinstalls that same template and changes nothing. An
+# always-red gate whose remediation cannot converge is how gates get switched
+# off, taking the accidental drift they exist to catch with them.
+#
+# Repo-side reads only, so this stays portable and stays green on a host whose
+# installed units are drifted.
+
+# Deliberately NOT this host's real paths: the comparison must not depend on
+# where the repo happens to live, and using foreign values proves it.
+_TEMPLATE_REPO_ROOT = "/srv/dark-factory"
+_TEMPLATE_UV_PATH = "/opt/uv/bin/uv"
+
+
+def _render_dashboard_template() -> str:
+    """Render the dashboard unit template the way setup-host.sh does."""
+    text = (REPO_ROOT / "scripts" / "dashboard.service.template").read_text(
+        encoding="utf-8"
+    )
+    return text.replace("__REPO_ROOT__", _TEMPLATE_REPO_ROOT).replace(
+        "__UV_PATH__", _TEMPLATE_UV_PATH
+    )
+
+
+def test_committed_dashboard_unit_agrees_with_the_installed_template():
+    """The file that actually ships and the file the checker treats as truth agree.
+
+    Uses the REAL registry spec, never a hand-rolled one — a hand-rolled spec
+    would drift from what the checker actually compares, which is the same rot
+    one level down.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+    committed = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+
+    drifts = mod.compare_unit(spec, committed, _render_dashboard_template())
+
+    assert drifts == [], (
+        "dashboard/dark-factory-dashboard.service and "
+        "scripts/dashboard.service.template have diverged. setup-host.sh "
+        "installs the TEMPLATE, so the checker would compare the installed "
+        "copy against a file that is not its source — reporting drift whose "
+        f"remediation (run setup-host.sh) cannot fix it. Drifts: {drifts}"
+    )
+
+
+def test_template_staleness_guard_has_teeth():
+    """The same comparison DOES fire on a real divergence.
+
+    Without this, the test above could pass while comparing nothing — the
+    exact failure the key-registry staleness test exists to prevent one level
+    down.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+    committed = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+    rendered = _render_dashboard_template()
+
+    assert "TimeoutStopSec=15" in rendered, (
+        "Mutation target moved; re-point this guard at a live compared "
+        "directive or it silently stops proving anything."
+    )
+    mutated = rendered.replace("TimeoutStopSec=15", "TimeoutStopSec=45")
+
+    drifts = mod.compare_unit(spec, committed, mutated)
+
+    assert [d.key for d in drifts] == ["TimeoutStopSec"], drifts
+
+
+# ---------------------------------------------------------------------------
 # main(argv) exit codes and the report  (step-13 / step-14)
 # ---------------------------------------------------------------------------
 #
