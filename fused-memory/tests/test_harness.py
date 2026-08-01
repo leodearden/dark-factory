@@ -3040,13 +3040,10 @@ async def test_no_auto_unhalt_when_disabled(
     # Positive witness for the halt-SKIP branch — see _halt_skip_event.
     skipped = _halt_skip_event(harness)
 
-    with (
-        patch.object(
-            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
-        ) as rfc_mock,
-        contextlib.suppress(TimeoutError),
-    ):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+    with patch.object(
+        harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+    ) as rfc_mock:
+        await _drive_run_loop_until(harness, skipped)
 
     # FIRST, ahead of the absence assertions: proves auto_resume_pending was
     # actually evaluated and returned False, turning 'unhalt was not awaited'
@@ -3087,13 +3084,10 @@ async def test_no_auto_unhalt_before_cooldown_expiry(
     # Positive witness for the halt-SKIP branch — see _halt_skip_event.
     skipped = _halt_skip_event(harness)
 
-    with (
-        patch.object(
-            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
-        ) as rfc_mock,
-        contextlib.suppress(TimeoutError),
-    ):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+    with patch.object(
+        harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+    ) as rfc_mock:
+        await _drive_run_loop_until(harness, skipped)
 
     # FIRST, ahead of the absence assertions: proves cooldown_expired was
     # actually evaluated and returned False, turning 'unhalt was not awaited'
