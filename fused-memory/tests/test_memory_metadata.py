@@ -277,7 +277,9 @@ class TestKeyLayers:
         assert frozenset({
             'category',    # memory_service.py:2193 (add_memory), :2542 (add_system_record)
             'recon_pool',  # _apply_cycle_summary_metadata_tagging (memory_service.py:389)
-            'run_id',      # _apply_cycle_summary_metadata_tagging (memory_service.py:389)
+            # NOTE: `run_id` is stamped by that same helper, but mem0 also owns
+            # it, so it is classified under MEM0_MANAGED_METADATA_KEYS only —
+            # see test_layers_are_pairwise_disjoint.
             'planned',     # NOT a write-seam stamp — a server-owned search-result
                            # annotation (memory_service.py:1932, :2921, read back at
                            # :2962). Included so a round-tripped search result
@@ -319,11 +321,13 @@ class TestKeyLayers:
         assert measured[key] >= 1000
 
     def test_layers_are_pairwise_disjoint(self):
-        """No key may be classified twice.
+        """No key may be classified twice -- all SIX pairs, not just the
+        blessed-vs-rest three.
 
-        `run_id` is the live trap: it is server-stamped AND measures 4,518
-        occurrences, so it is exactly the key that would otherwise land in
-        both the blessed tier and the server-stamped tier.
+        `run_id` is the live trap: it is server-stamped (memory_service.py:389)
+        AND mem0-managed AND measures 4,518 occurrences, so it is the one key
+        that would otherwise land in three tiers at once.  It is classified
+        under the mem0-managed layer only.
         """
         from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
         from fused_memory.memory_metadata import (
@@ -332,10 +336,21 @@ class TestKeyLayers:
             SERVER_STAMPED_KEYS,
         )
 
-        assert not (BLESSED_METADATA_KEYS & RESERVED_VOCABULARY_KEYS)
-        assert not (BLESSED_METADATA_KEYS & MEM0_MANAGED_METADATA_KEYS)
-        assert not (BLESSED_METADATA_KEYS & SERVER_STAMPED_KEYS)
-        assert 'run_id' not in BLESSED_METADATA_KEYS
+        layers = {
+            'blessed': BLESSED_METADATA_KEYS,
+            'reserved': RESERVED_VOCABULARY_KEYS,
+            'mem0_managed': MEM0_MANAGED_METADATA_KEYS,
+            'server_stamped': SERVER_STAMPED_KEYS,
+        }
+        names = sorted(layers)
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                overlap = layers[a] & layers[b]
+                assert not overlap, f'{a} & {b} overlap on {sorted(overlap)}'
+
+        # The trap, pinned explicitly: run_id lives in exactly one layer.
+        owners = [n for n, keys in layers.items() if 'run_id' in keys]
+        assert owners == ['mem0_managed']
 
     def test_classify_unknown_keys_returns_only_genuinely_unknown(self):
         from fused_memory.memory_metadata import classify_unknown_keys

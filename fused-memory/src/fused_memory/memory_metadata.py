@@ -526,13 +526,15 @@ KIND_REGISTRY: frozenset[str] = frozenset({
 # Four deliberately DISJOINT layers.  A key classified twice would make the
 # census line ambiguous about who owns it, so
 # ``tests/test_memory_metadata.py::TestKeyLayers`` asserts pairwise
-# disjointness.  ``run_id`` is the live trap: it is server-stamped AND
-# measures 4,518 live occurrences, so it is exactly the key that would
-# otherwise land in both the server-stamped and blessed tiers.
+# disjointness across all six pairs.  ``run_id`` is the live trap: it is
+# server-stamped AND mem0-managed AND measures 4,518 live occurrences, so it
+# is the one key that would otherwise land in three tiers at once.  It is
+# classified under the mem0-managed layer only (see below) -- that layer is
+# the one with an external owner, so it wins the tie.
 # ---------------------------------------------------------------------------
 
 #: Keys this server stamps onto metadata itself.  They are NOT all stamped at
-#: the same layer, and a reviewer must not read these as four write-seam
+#: the same layer, and a reviewer must not read these as three write-seam
 #: stamps:
 #:
 #: * ``category``   -- stamped at the write seam:
@@ -540,16 +542,23 @@ KIND_REGISTRY: frozenset[str] = frozenset({
 #:                     ``:2542`` (``add_system_record``).
 #: * ``recon_pool`` -- stamped inside ``_apply_cycle_summary_metadata_tagging``
 #:                     (``memory_service.py:389``), cycle-summary writes only.
-#: * ``run_id``     -- stamped by the same helper (``memory_service.py:389``).
 #: * ``planned``    -- NOT a write-seam stamp at all.  It is a server-owned
 #:                     SEARCH-RESULT annotation (``memory_service.py:1932``,
 #:                     ``:2921``, read back at ``:2962``).  It is listed here
 #:                     so that a round-tripped search result re-written as
 #:                     metadata does not census-warn on the server's own field.
+#:
+#: DELIBERATELY ABSENT: ``run_id``.  It *is* server-stamped, by the same
+#: ``_apply_cycle_summary_metadata_tagging`` helper (``memory_service.py:389``)
+#: as ``recon_pool`` -- but mem0 also owns and re-derives it, so it is already
+#: carried by :data:`MEM0_MANAGED_METADATA_KEYS`
+#: (``backends/mem0_client.py:35``).  Listing it in both sets would break the
+#: disjointness invariant above and leave the census line ambiguous about who
+#: owns the key.  Classification is unaffected either way --
+#: :data:`_KNOWN_METADATA_KEYS` is a union -- so the single-home rule decides.
 SERVER_STAMPED_KEYS: frozenset[str] = frozenset({
     'category',
     'recon_pool',
-    'run_id',
     'planned',
 })
 
