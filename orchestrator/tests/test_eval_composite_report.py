@@ -1340,6 +1340,132 @@ class TestNoPlanCellsAreCounted:
         assert cells[header.index('pq_no_plan')] == '0'
 
 
+class TestPlanRateIsTheReliabilityColumn:
+    """``plan_rate`` — how OFTEN a config emitted a plan at all (task 3379).
+
+    The 2026-07-27 architect campaign's own verdict
+    (``plans/eval-architect-effort-verdict-2026-07-27.md``) found that what
+    actually separates the candidates is not how WELL they plan but how often
+    they plan at all — and the operator had to hand-compute that figure from the
+    per-cell result JSONs because no report surface exposed it. Task 3302
+    collected the counts (``plan_quality_no_plan`` beside the admitted θ pool);
+    this is the derived ratio over them.
+    """
+
+    @staticmethod
+    def _one_no_plan_among_three():
+        """3 admitted architect cells, ONE of which produced no plan.
+
+        Deliberately the shape of ``TestNoPlanCellsAreCounted.
+        _one_no_plan_among_two`` — same config, same costs — so the two
+        reliability figures this task adds are read over a dataset whose
+        no-plan/θ accounting is already pinned by that class.
+        """
+        return [
+            _arch('p1', 'arch-mixed', 1, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 2, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+        ]
+
+    @staticmethod
+    def _one_tainted_one_no_plan_one_planned():
+        """One cell of each kind: REFUSED, admitted-but-planless, planned."""
+        return [
+            # Refused at the transport layer: never asked, so never answered.
+            _arch('p1', 'arch-both', 1, plan_steps=0, plan_quality=None,
+                  cost_usd=0.0, duration_ms=0, cap_tainted=True),
+            # Healthy architect, stepless artifact: asked, answered nothing.
+            _arch('p1', 'arch-both', 2, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000),
+            # Healthy architect, real plan.
+            _arch('p1', 'arch-both', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+        ]
+
+    def test_the_rate_is_planned_over_admitted(self):
+        from orchestrator.evals.report import build_composite_report
+
+        row = build_composite_report(self._one_no_plan_among_three())['configs'][0]
+
+        # The denominator travels WITH the rate on the row, so the figure is
+        # verifiable from the row alone rather than by re-deriving it from a
+        # different surface (the module's report-a-rate-beside-its-n norm).
+        assert row['plan_quality_n'] == 3
+        # Hand-computed: (3 admitted - 1 no-plan) / 3 admitted.
+        assert row['plan_rate'] == pytest.approx(0.6667, abs=1e-4)
+
+    def test_a_cap_tainted_cell_leaves_BOTH_numerator_and_denominator(self):
+        """THE DENOMINATOR PIN: the rate is over what was actually MEASURED.
+
+        A cap-tainted cell is a transport refusal — we never got to ask the
+        model — so it is neither a cell that planned nor a cell that failed to
+        plan. Counting it in the denominator (i.e. ranging over ``trials``)
+        would report a candidate as LESS RELIABLE for a question it never got
+        to answer, purely because it happened to be scheduled inside a session-
+        cap window: precisely the schedule-attributable penalty tasks 3118 and
+        3099 spent two rounds removing, reintroduced on the surface
+        ``select_survivors`` ranks on. It also matches the campaign this
+        automates — ``plans/eval-architect-effort-verdict-2026-07-27.md``
+        computes its planRate over 19 fixtures, dropping the 3 cap-contaminated
+        ones from the denominator, not over all 22.
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        row = build_composite_report(
+            self._one_tainted_one_no_plan_one_planned()
+        )['configs'][0]
+
+        assert row['plan_quality_n'] == 2
+        assert row['plan_rate'] == pytest.approx(0.5, abs=1e-9)
+        # NOT 1/3 — the refused cell is not a failure to plan.
+        assert row['plan_rate'] != pytest.approx(1 / 3, abs=1e-4)
+        # …and the narrowed denominator is never silent: the sample is still
+        # reported honestly by the columns that exist to report it.
+        assert row['plan_quality_cap_excluded'] == 1
+        assert row['trials'] == 3
+
+    def test_an_all_planning_config_reports_one_never_absent(self):
+        """A rate that only appears when it FIRES cannot be read.
+
+        The control for the column being a always-present ratio rather than a
+        marker: a blank here would read as "not applicable".
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        assert row['plan_quality_n'] == 3
+        assert row['plan_rate'] == pytest.approx(1.0, abs=1e-9)
+
+    def test_a_workflow_config_reports_None_never_zero_and_never_one(self):
+        """An EMPTY admitted pool is ``None`` — the failure mode is two-sided.
+
+        A fabricated ``0.0`` would slander a config that never ran an architect
+        cell ("it never planned"); a fabricated ``1.0`` would flatter it ("it
+        always planned"). Only ``None`` says the true thing: we measured
+        nothing (``_mean_plan_quality`` / ``_optional_float_cell`` precedent).
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('w1', 'impl-only', tr, quality=0.8, cost_usd=5.0,
+                     duration_ms=900000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        assert row['plan_quality_n'] == 0
+        assert row['plan_rate'] is None
+
+
 class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     """The floor DISCARDS a persisted LLM-judge score — loudly, or not at all.
 
