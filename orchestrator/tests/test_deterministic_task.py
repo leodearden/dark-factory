@@ -1658,11 +1658,13 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
       via ``python -m uv`` (uv is not an importable Python module).
     - Failure policy: a missing ``uv`` binary (``FileNotFoundError``) is a
       legitimate environment gap and is skipped. A mis-wired ``--project``
-      dir, a uv that runs and returns non-zero, or a uv that hangs past
-      ``timeout=30`` (all ``subprocess.SubprocessError``) fail loudly via
-      ``pytest.fail`` carrying the computed path/returncode/stderr — none
-      of those are skips, since masking a failing validator as SKIPPED
-      would silently drop real coverage.
+      dir, a uv that runs and returns non-zero, a uv that hangs past
+      ``timeout=30`` (all ``subprocess.SubprocessError``), or stdout that
+      fails to parse as JSON (e.g. a uv warning printed ahead of the
+      result) all fail loudly via ``pytest.fail`` carrying the computed
+      path/returncode/stderr/stdout — none of those are skips, since
+      masking a failing validator as SKIPPED would silently drop real
+      coverage.
     """
     try:
         from fused_memory.middleware.deterministic_task_guard import (  # type: ignore[reportMissingImports]
@@ -1699,7 +1701,6 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
                 timeout=30,
                 stderr=subprocess.PIPE,
             )
-            return json.loads(out.strip()) if out.strip() != 'null' else None
         except FileNotFoundError as exc:
             pytest.skip(f'uv binary not available, cannot run fused_memory fallback: {exc}')
         except subprocess.SubprocessError as exc:
@@ -1709,6 +1710,20 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
                 f'  error:      {type(exc).__name__}: {exc}\n'
                 f'  returncode: {getattr(exc, "returncode", None)}\n'
                 f'  stderr:     {getattr(exc, "stderr", None)}\n'
+                f'  --project:  {fm_project}'
+            )
+
+        stripped = out.strip()
+        if stripped == 'null':
+            return None
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            pytest.fail(
+                'fused_memory uv fallback produced unparseable stdout — not '
+                'skipping (a failing validator must not be masked as SKIPPED).\n'
+                f'  error:      {exc}\n'
+                f'  stdout:     {out!r}\n'
                 f'  --project:  {fm_project}'
             )
     else:
@@ -1996,6 +2011,42 @@ class TestValidateUvFallback:
                 },
                 project_root=str(tmp_path),
             )
+
+    def test_uv_non_json_stdout_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Stdout that doesn't parse as JSON must fail loudly, not crash uninformatively.
+
+        Realistic uv behaviour: a warning or resolver line can precede the
+        printed JSON result on stdout (e.g. ``warning: VIRTUAL_ENV=... does
+        not match``). Without this guard that surfaces as a bare
+        json.JSONDecodeError with no --project path, no stdout, and no
+        indication the uv fallback was even in play.
+        """
+        def _stub(argv, **kwargs):
+            return (
+                'warning: VIRTUAL_ENV=/x does not match project environment\n'
+                '{"error": "sentinel-err"}'
+            )
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
+        message = str(excinfo.value)
+        assert not isinstance(excinfo.value, pytest.skip.Exception)
+        assert 'warning: VIRTUAL_ENV' in message, (
+            f'Expected the unparseable stdout in the failure message, got: {message!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
