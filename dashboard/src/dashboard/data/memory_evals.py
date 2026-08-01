@@ -24,6 +24,16 @@ recorded in the payload's structured ``issues`` list — named, with its
 here raises: a degraded tree yields a degraded payload, never a 500.  Staleness
 is *displayed*, never alarmed on; this module files no escalations.
 
+That never-raises contract is delivered by ONE named boundary, in
+``build_memory_evals``, and not by broad per-artifact catches.  Each artifact
+reader catches only ``_ARTIFACT_ERRORS`` — what reading and parsing a file off
+disk can raise — and degrades one row.  Everything else is a bug in this
+module, and a bug is reported AS a bug: ``internal_error``, naming the
+exception type, with the traceback in the dashboard log.  The distinction is
+the point.  A broad catch around a whole reader reported a typo here to the
+operator as ``unreadable_limits``, sending them to inspect an artifact that
+was perfectly fine, and left no traceback to fix the real fault from.
+
 Concretely, every artifact reader here distinguishes THREE disposal paths and
 names two of them: the file is absent (``missing_*``, and only where absence is
 meaningful — a tree where no eval has ever run is healthy, not degraded), it
@@ -59,6 +69,17 @@ and a live alarm must never be absent from both.  The openness test is positive
 (``status`` is ``pending``) rather than a blocklist of closed states, so a
 status vocabulary that grows a new terminal state fails toward "not shown as
 open" rather than toward a closed alarm rendered as live.
+
+The derived ``parity`` badge answers to the same rule.  A verdict outside the
+closed M2 set has no badge, so it is NAMED (``unknown_verdict``) instead of
+falling through to the healthy one — the third instance of the idiom, beside
+``unknown_kind`` and ``unknown_escalation_status``.  For the same reason no
+verdict class borrows another's label: ``clear`` means "judged, and not
+alarming", so an unjudged, an unjudgeable (``insufficient_data``) and a
+deliberately-exempted (``grandfathered``) metric each get their own state
+rather than all three reading as healthy.  The raw ``verdict`` string is still
+passed through the payload unmapped in every case: the reader names the value
+it cannot render, it never rewrites it.
 
 **Same-host file reads (DD1).**  The dashboard and the eval runner share a
 filesystem; there is no RPC in this path.
@@ -106,6 +127,52 @@ _TREND_RUN_CAP = 90
 # reject at emit time and are passed through verbatim here.
 _KNOWN_KINDS = frozenset({'tripwire', 'proportion', 'count', 'scalar'})
 
+# The closed M2 verdict vocabulary.  Like ``_KNOWN_KINDS`` this is a RENDERING
+# vocabulary — one badge per state — and NOT a translation table: the raw
+# ``verdict`` string is still passed through the payload unmapped, and this set
+# is consulted only to decide which parity badge the row earns.  A verdict
+# outside it has no badge, so it is named (``unknown_verdict``) rather than
+# folded into the healthy label.  Keeping the set closed is what makes the
+# pass-through sound: without it, the parity vocabulary would be unbounded and
+# the UI would have no single set to switch on — which is the whole reason
+# parity is derived here rather than re-derived in the frontend.
+_KNOWN_VERDICTS = frozenset({'alarm', 'no_alarm', 'insufficient_data', 'grandfathered'})
+
+# The closed parity vocabulary — every value ``_parity`` can emit, plus the
+# ``storm_collapsed`` state ``_build_eval`` short-circuits to.  PUBLIC on
+# purpose: it is the single source of truth the dashboard tab (task 3216) and
+# the parity gate (task 3217) should assert against, rather than each
+# hardcoding a subset that rots silently the moment a state is added here.
+#
+# Written out as a literal rather than computed from ``_KNOWN_VERDICTS`` by
+# string concatenation, so the vocabulary stays readable and greppable; the
+# reachability test in ``TestParityVocabularyIsClosedAndExported`` is what
+# keeps the literal and the builder's actual outputs in agreement.
+#
+# Note the deliberate naming asymmetry: for an ``alarm`` the UNLINKED state is
+# the notable one (a filed alarm with no escalation is the parity violation),
+# so it carries the distinguishing name; for every other class the LINKED state
+# is the notable one, so that is the one suffixed ``_open``.  Every name that
+# predates the per-class split was preserved verbatim — ``recovered_open`` and
+# ``clear`` were NARROWED to the ``no_alarm`` verdict rather than renamed —
+# because an in-flight consumer already branches on them and a rename would
+# have left those branches silently dead.
+PARITY_STATES: frozenset[str] = frozenset({
+    'alarmed_open',
+    'alarmed_unlinked',
+    'recovered_open',
+    'clear',
+    'insufficient_data',
+    'insufficient_data_open',
+    'grandfathered',
+    'grandfathered_open',
+    'unjudged',
+    'unjudged_open',
+    'unknown_verdict',
+    'unknown_verdict_open',
+    'storm_collapsed',
+})
+
 # An eval whose newest run is older than this is DISPLAYED as stale.  It is
 # never alarmed on: the runner-failure tripwire belongs to the eval program,
 # and this module files nothing.  36h gives a nightly cadence one full missed
@@ -116,10 +183,23 @@ _STALE_AFTER_SECONDS = 36 * 3600.0
 # is chronological order).
 _RUN_STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 
-# Everything a malformed artifact can plausibly raise on the way through
-# ``json.loads`` + dict access.  Caught narrowly at each artifact boundary so
-# one bad file degrades one row, never the whole payload.
-_ARTIFACT_ERRORS = (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError)
+# What READING AND PARSING one artifact off disk can raise — nothing more.
+# Caught around the ``_load_json`` call itself at each artifact boundary, so one
+# bad file degrades one row and never the whole payload.
+#
+# Deliberately narrow.  ``json.JSONDecodeError`` is omitted because it IS a
+# ``ValueError`` subclass, and ``TypeError``/``AttributeError`` are omitted
+# because they are what a CODE BUG raises, not what a bad file raises: catching
+# them here reported a typo in this module to the operator as
+# ``unreadable_limits``, sending them to inspect a file that was perfectly
+# fine.  Anything outside this tuple is a bug, and is caught once at the
+# outermost boundary in ``build_memory_evals`` and named as one.
+_ARTIFACT_ERRORS = (OSError, ValueError)
+
+# Issue kinds that mean the walk did not COMPLETE, as opposed to completing
+# over a degraded tree.  See :func:`root_scan_succeeded`, which is the only
+# reader: a payload carrying one of these is not pinned for the TTL window.
+_UNCACHEABLE_ISSUE_KINDS = frozenset({'unreadable_root', 'internal_error'})
 
 # The limits artifact carries a great deal more than this — ``alarms``,
 # ``alarmed_metric_count``, ``grandfather_set``, ``snapshotted_metric_ids`` and
@@ -187,9 +267,9 @@ def _read_limits(
     ``verdicts-current.json`` is the sole verdict source.
 
     All three disposal paths are NAMED: absent (beside runs) is
-    ``missing_limits``, a parse failure is ``unreadable_limits`` (recorded by
-    the caller's handler), and an artifact that parses but is not an object is
-    ``malformed_limits``.  Without that third path a present-but-wrong-type
+    ``missing_limits``, a parse failure is ``unreadable_limits`` (recorded
+    here, at the read boundary), and an artifact that parses but is not an
+    object is ``malformed_limits``.  Without that third path a present-but-wrong-type
     artifact produced no signal at all, since the absent-file issue does not
     fire for a file that exists.
 
@@ -215,10 +295,19 @@ def _read_limits(
             )
         return None, {}
 
-    body = _load_json(path)
+    # Scoped to the read+parse itself, exactly as ``_build_eval`` already does
+    # for each metrics run.  Wrapping the WHOLE function instead (as the caller
+    # used to) meant a code bug anywhere below was reported as an unreadable
+    # artifact.
+    try:
+        body = _load_json(path)
+    except _ARTIFACT_ERRORS as exc:
+        _issue(issues, 'unreadable_limits', eval_id=eval_dir.name, path=path, detail=str(exc))
+        return None, {}
+
     if not isinstance(body, dict):
         # Valid JSON of the wrong shape — `_load_json` does not raise, so the
-        # caller's `unreadable_limits` handler never fires, and the file EXISTS
+        # `unreadable_limits` handler above never fires, and the file EXISTS
         # so `missing_limits` above did not fire either.  Discarding it
         # silently would lose the alpha/baseline/grandfather-hash provenance
         # with no signal anywhere.  Carries an `eval_id`: unlike the
@@ -355,7 +444,7 @@ def _read_verdicts(
     divergence would silently mislabel an alarm.
 
     Every disposal path is NAMED: absent is ``missing_verdicts``, a parse
-    failure is ``unreadable_verdicts`` (recorded by the caller's handler), a
+    failure is ``unreadable_verdicts`` (recorded here, at the read boundary), a
     body that parses but is not an object — or is an object whose ``entries``
     is absent or not a list — is ``malformed_verdicts``, an individual
     non-object element is ``malformed_verdict_entry``, and elements that ARE
@@ -402,10 +491,19 @@ def _read_verdicts(
             _issue(issues, 'missing_verdicts', path=path, detail=detail)
         return {}, None
 
-    body = _load_json(path)
+    # Scoped to the read+parse itself; see ``_read_limits`` for why the
+    # whole-function wrapper this replaces was wrong.
+    try:
+        body = _load_json(path)
+    except _ARTIFACT_ERRORS as exc:
+        # An unreadable verdicts artifact must never read as "nothing
+        # alarmed" — every verdict stays absent and the failure is named.
+        _issue(issues, 'unreadable_verdicts', path=path, detail=str(exc))
+        return {}, None
+
     if not isinstance(body, dict):
         # Valid JSON of the wrong shape: `_load_json` does not raise, so the
-        # caller's `unreadable_verdicts` handler never fires.  Discarding it
+        # `unreadable_verdicts` handler above never fires.  Discarding it
         # silently here would make a broken verdicts file read exactly like a
         # healthy no-alarm tree.  `eval_id` is omitted because this artifact is
         # root-scoped, matching `missing_verdicts` above.
@@ -704,16 +802,73 @@ def _index_escalations(
     return index, unfingerprinted
 
 
-def _parity(verdict: Any, escalation: dict[str, Any] | None) -> str:
+def _verdict_class(verdict: Any) -> str:
+    """Bucket a raw verdict value into the closed rendering vocabulary.
+
+    Returns one of ``alarm``, ``no_alarm``, ``insufficient_data``,
+    ``grandfathered``, ``unjudged`` (the value was absent) or
+    ``unknown_verdict`` (the value is present but outside the M2 vocabulary,
+    including a value that is not a string at all).
+
+    ``isinstance`` FIRST, exactly as the metric-kind loop does: ``verdict`` is
+    an unvalidated JSON value, so an unhashable one (``[]``, ``{}``) would make
+    ``in _KNOWN_VERDICTS`` raise ``TypeError``.
+    """
+    if verdict is None:
+        return 'unjudged'
+    if isinstance(verdict, str) and verdict in _KNOWN_VERDICTS:
+        return verdict
+    return 'unknown_verdict'
+
+
+def _parity(verdict_class: str, escalation: dict[str, Any] | None) -> str:
     """The derived display state for one metric row.
 
-    A pure ``(verdict, linked?)`` lookup — not a statistic.  Deriving it once
-    here keeps the UI from re-deriving badge state out of three separate
-    fields, which is where the two sides would drift apart.
+    A pure, TOTAL ``(verdict class, linked?)`` lookup — not a statistic.
+    Deriving it once here keeps the UI from re-deriving badge state out of
+    three separate fields, which is where the two sides would drift apart.
+    The full closed output vocabulary is :data:`PARITY_STATES`.
+
+    Every verdict class gets its OWN pair of states rather than being collapsed
+    into ``recovered_open``/``clear``.  The collapsed mapping made three
+    distinct facts render as one:
+
+    * ``insufficient_data`` — the evaluator lacked the samples to judge at all.
+      With a live escalation that is not a recovery; nothing was shown to have
+      improved.
+    * ``grandfathered`` — a known-bad measurement the ratchet deliberately
+      exempts.  It is an outstanding exception, not a healthy metric.
+    * an ABSENT verdict — nothing judged this metric.  ``clear`` means "judged,
+      and not alarming", which is a materially stronger claim.
+
+    Lending any of them the healthy label is the module's own stated failure
+    mode: fail toward "visibly unrenderable", never toward the healthy label.
+
+    The naming asymmetry is deliberate and load-bearing.  For an ``alarm`` the
+    UNLINKED state is the notable one — a filed alarm with no escalation behind
+    it is the parity violation — so it is the one that gets the distinguishing
+    name (``alarmed_unlinked``).  For every other class the LINKED state is the
+    notable one, so that is the one carrying the ``_open`` suffix.
+
+    Every pre-existing name is preserved verbatim; the change is purely
+    additive for existing consumers.  ``recovered_open`` and ``clear`` are
+    NARROWED to the ``no_alarm`` verdict, which only makes them truer:
+    ``recovered_open`` now means an escalation filed on a prior alarm with the
+    metric reading ``no_alarm`` today, which IS a recovery.
+
+    Reachability of ``unjudged_open``, which is not obvious: the row-level join
+    only runs when the verdict ENTRY carries a fingerprint (see
+    ``_build_eval``), so a metric with NO entry at all can never link.  The
+    linked variant is reached only by an entry that has a ``fingerprint`` and
+    no ``verdict`` field — exactly the case that used to claim a recovery that
+    never happened.  The function stays total over both axes anyway, so no
+    future call site can fall into an unhandled corner.
     """
-    if verdict == 'alarm':
+    if verdict_class == 'alarm':
         return 'alarmed_open' if escalation else 'alarmed_unlinked'
-    return 'recovered_open' if escalation else 'clear'
+    if verdict_class == 'no_alarm':
+        return 'recovered_open' if escalation else 'clear'
+    return f'{verdict_class}_open' if escalation else verdict_class
 
 
 def _build_eval(
@@ -809,16 +964,11 @@ def _build_eval(
                 metric_ids.append(metric_id)
 
     latest_run_stamp = run_stamps[-1] if run_stamps else None
-    try:
-        limits, limits_by_metric = _read_limits(
-            eval_dir, latest_run_stamp, issues, has_runs=bool(all_paths),
-        )
-    except _ARTIFACT_ERRORS as exc:
-        _issue(
-            issues, 'unreadable_limits', eval_id=eval_id,
-            path=eval_dir / 'limits-current.json', detail=str(exc),
-        )
-        limits, limits_by_metric = None, {}
+    # ``_read_limits`` owns its own read boundary and degrades to ``(None, {})``
+    # in place, so there is nothing for the caller to catch.
+    limits, limits_by_metric = _read_limits(
+        eval_dir, latest_run_stamp, issues, has_runs=bool(all_paths),
+    )
 
     # Staleness is DISPLAYED, never alarmed on.  An unparseable stamp degrades
     # the age to None (and says so) rather than raising or guessing a date.
@@ -930,6 +1080,33 @@ def _build_eval(
                 storm_suppressed.add(fingerprint)
         escalation = _escalation_projection(matched) if matched is not None else None
 
+        # Classified ONCE and reused for both the parity badge and the
+        # unrenderable-value check below, so the membership rule lives in
+        # exactly one place.
+        verdict = judged.get('verdict')
+        verdict_class = _verdict_class(verdict)
+        if verdict_class == 'unknown_verdict':
+            # A verdict outside the closed M2 set has no badge, so it is named
+            # rather than folded into the healthy label — the same standing as
+            # ``unknown_kind`` (no chart primitive) and
+            # ``unknown_escalation_status`` (unclassifiable).  An ABSENT
+            # verdict is deliberately NOT named: "nothing judged this metric"
+            # is a legitimate state the payload already models as ``unjudged``
+            # parity, and at the artifact level as
+            # ``missing_verdicts``/``orphan_verdict``.
+            #
+            # ``eval_dir.parent`` IS the memory-evals root, which is where
+            # ``_read_verdicts`` locates the sole verdicts artifact — this
+            # value came out of that file, not out of the eval's own dir.
+            _issue(
+                issues, 'unknown_verdict', eval_id=eval_id,
+                path=eval_dir.parent / 'verdicts-current.json',
+                detail=(
+                    f'metric {metric_id!r} has verdict {verdict!r}, which is outside the '
+                    'M2 vocabulary and has no parity badge'
+                ),
+            )
+
         metrics.append({
             'metric_id': metric_id,
             'kind': kind,
@@ -955,8 +1132,8 @@ def _build_eval(
             'escalation': escalation,
             'parity': (
                 'storm_collapsed'
-                if storm is not None and judged.get('verdict') == 'alarm'
-                else _parity(judged.get('verdict'), escalation)
+                if storm is not None and verdict == 'alarm'
+                else _parity(verdict_class, escalation)
             ),
         })
 
@@ -1000,11 +1177,91 @@ def build_memory_evals(
 
     Returns:
         The ``MEMORY_EVALS`` payload body.  Never raises.
+
+    The never-raises contract is delivered by ONE named boundary here rather
+    than by broad per-artifact catches.  Each artifact reader below catches
+    only ``_ARTIFACT_ERRORS`` — what reading and parsing a file can raise — and
+    degrades one row.  Anything else is a bug in this module, and is caught
+    here, logged WITH its traceback, and reported as ``internal_error`` rather
+    than disguised as a broken artifact.  So a bug still cannot 500 the
+    dashboard poll, and it also cannot send an operator to inspect a file that
+    was never at fault.
     """
     resolved_now = resolve_now(now)
-
     issues: list[dict[str, Any]] = []
-    payload: dict[str, Any] = {
+    payload = _empty_payload(resolved_now, issues)
+
+    try:
+        _build_payload(payload, memory_evals_dir, escalations_dir, issues, resolved_now)
+    except Exception as exc:  # noqa: BLE001 - the never-500 boundary; named, not swallowed
+        # Logged with the traceback: the payload names the bug for the
+        # operator, the log carries what whoever fixes it actually needs.
+        # Without this half, honouring the never-500 contract would mean a bug
+        # that degrades the dashboard indefinitely with nothing to debug from.
+        logger.exception('memory-evals payload build failed for %s', memory_evals_dir)
+        _issue(
+            issues, 'internal_error', path=memory_evals_dir,
+            detail=(
+                f'{type(exc).__name__}: {exc} — this is a dashboard bug, not a broken '
+                'artifact; see the dashboard log for the traceback'
+            ),
+        )
+
+    payload['issue_count'] = len(issues)
+    return payload
+
+
+def root_scan_succeeded(payload: dict[str, Any]) -> bool:
+    """Did this scan actually reach the artifact tree?
+
+    The cacheability predicate for the route's TTL cache
+    (``cache_ok=root_scan_succeeded``).  False for the payloads produced
+    WITHOUT a completed walk:
+
+    * ``root_present`` is falsy — :meth:`Path.is_dir` said no and
+      :func:`_build_payload` returned before enumerating.
+    * an ``unreadable_root`` issue is present — the root exists but
+      :meth:`Path.iterdir` raised, so again nothing was walked.
+    * an ``internal_error`` issue is present — a bug aborted the build, so the
+      payload is missing rows for a reason that has nothing to do with the
+      tree.
+
+    The first two are O(1) to recompute — one ``stat``, or one
+    immediately-raising ``iterdir`` — so re-deriving them on every poll costs
+    nothing and there is no expensive walk behind them to stampede onto.
+    Caching them, by contrast, pins a "there is no data here" view for the
+    full TTL window past the moment the tree appears: a volume finishing its
+    mount, a mode being fixed, the first eval run landing.
+
+    ``internal_error`` is not free to recompute, and declining it is still
+    right: unlike the ordinary-but-incomplete states
+    :func:`~dashboard.data.escalation_analytics.archive_scan_succeeded`
+    deliberately keeps cacheable, a bug is never a steady state — it is an
+    emergency with no known trigger — so the walk it costs is bounded by how
+    long the bug lives, and pinning a payload that is blank for reasons the
+    operator cannot see or fix is the worse trade.
+
+    A degraded ROW is deliberately still cacheable.  An unreadable metrics
+    run, an unknown metric kind or an orphan verdict all mean the scan reached
+    the tree and did its work; re-running it would rediscover the same
+    degradation at the cost of the full walk this cache exists to prevent.
+    The predicate keys on named issue KINDS, never on ``issue_count``.
+
+    Reads every field through ``.get`` because it runs inside the cache write
+    path: a partially-built payload must degrade to "don't cache" rather than
+    raise where a raise would surface as a 500 on the dashboard poll.
+    """
+    if not payload.get('root_present'):
+        return False
+    return not any(
+        issue.get('kind') in _UNCACHEABLE_ISSUE_KINDS
+        for issue in payload.get('issues') or ()
+    )
+
+
+def _empty_payload(resolved_now: datetime, issues: list[dict[str, Any]]) -> dict[str, Any]:
+    """The payload skeleton, with every key present on every return path."""
+    return {
         'generated_at': resolved_now.isoformat(),
         'root_present': True,
         # Run-scoped across the WHOLE program, so it is carried here rather than
@@ -1020,36 +1277,49 @@ def build_memory_evals(
         'unmatched_escalations': [],
     }
 
+
+def _build_payload(
+    payload: dict[str, Any],
+    memory_evals_dir: Path,
+    escalations_dir: Path,
+    issues: list[dict[str, Any]],
+    resolved_now: datetime,
+) -> None:
+    """Fill *payload* in place from the artifact tree.
+
+    Mutates rather than returns so that a bug escaping to
+    ``build_memory_evals``' guard still yields whatever this got as far as
+    setting — a partially-filled payload is more honest than a blank one.
+    ``issue_count`` is deliberately NOT maintained here; the caller sets it
+    once, on both the clean and the guarded path.
+    """
     # "No eval has ever run" is a legitimate pre-deployment state, not a
     # degradation — an explicit empty-but-healthy payload with NO issue.
     # Flagging it would train operators to ignore the issues list.
     if not memory_evals_dir.is_dir():
         payload['root_present'] = False
-        return payload
+        return
 
     try:
         eval_dirs = sorted(p for p in memory_evals_dir.iterdir() if p.is_dir())
-    except _ARTIFACT_ERRORS as exc:
+    except OSError as exc:
         # ``is_dir()`` above already answered, but the walk itself can still
         # fail — a mode change between the two, or an NFS/permission hiccup.
         # Every other artifact boundary here is guarded; leaving this one open
         # turned a degraded tree into a 500 on the dashboard poll.  The root IS
         # present, so that is what the payload says: it is the enumeration that
         # failed, and the failure is named rather than mistaken for an empty root.
+        #
+        # ``OSError`` alone, not ``_ARTIFACT_ERRORS``: ``Path.iterdir`` is the
+        # only thing that can raise here, and ``Path.is_dir()`` swallows
+        # ``OSError`` and returns False rather than raising.  Nothing is being
+        # parsed, so there is no ``ValueError`` path to catch.
         _issue(issues, 'unreadable_root', path=memory_evals_dir, detail=str(exc))
-        payload['issue_count'] = len(issues)
-        return payload
+        return
 
-    try:
-        verdict_index, storm = _read_verdicts(memory_evals_dir, eval_dirs, issues)
-    except _ARTIFACT_ERRORS as exc:
-        # An unreadable verdicts artifact must never read as "nothing
-        # alarmed" — every verdict stays absent and the failure is named.
-        _issue(
-            issues, 'unreadable_verdicts',
-            path=memory_evals_dir / 'verdicts-current.json', detail=str(exc),
-        )
-        verdict_index, storm = {}, None
+    # ``_read_verdicts`` owns its own read boundary and degrades to ``({}, None)``
+    # in place, so there is nothing for this caller to catch.
+    verdict_index, storm = _read_verdicts(memory_evals_dir, eval_dirs, issues)
 
     try:
         escalation_index, unfingerprinted = _index_escalations(escalations_dir, issues)
@@ -1062,6 +1332,14 @@ def build_memory_evals(
         # handed, which is not a property a reader can keep by inspection.
         # Losing the join is a real degradation — rows render unlinked — so it
         # is named rather than read as "nothing is escalated".
+        #
+        # Narrowed to ``_ARTIFACT_ERRORS`` alongside the others.  This site was
+        # made deliberately broad to stop an unhashable ``status`` 500ing, but
+        # that value is now handled at source by the ``isinstance(status, str)``
+        # guard in ``_index_escalations``, so the broad tuple is no longer what
+        # protects it.  Anything else of that shape now reaches the outermost
+        # guard and is named ``internal_error`` — strictly better than being
+        # mislabelled as an unreadable escalation queue.
         _issue(
             issues, 'unreadable_escalations',
             path=escalations_dir, detail=str(exc),
@@ -1094,13 +1372,28 @@ def build_memory_evals(
         }
     payload['storm_escape'] = storm_block
 
-    payload['evals'] = [
-        _build_eval(
-            d, issues, verdict_index, consumed, escalation_index,
-            linked_fingerprints, storm_suppressed, storm_block, resolved_now,
-        )
-        for d in eval_dirs
-    ]
+    # Per-eval bug boundary, not one comprehension.  Artifact errors are
+    # already handled inside ``_build_eval``, so anything escaping it is a bug
+    # — and as a single comprehension a bug on the fifth of ten dirs discarded
+    # the other nine, leaving a present-but-empty root that reads as "no evals
+    # have run".  Per-eval it costs that one row and names which one.
+    evals: list[dict[str, Any]] = []
+    for eval_dir in eval_dirs:
+        try:
+            evals.append(_build_eval(
+                eval_dir, issues, verdict_index, consumed, escalation_index,
+                linked_fingerprints, storm_suppressed, storm_block, resolved_now,
+            ))
+        except Exception as exc:  # noqa: BLE001 - per-eval half of the never-500 boundary
+            logger.exception('memory-evals eval build failed for %s', eval_dir)
+            _issue(
+                issues, 'internal_error', eval_id=eval_dir.name, path=eval_dir,
+                detail=(
+                    f'{type(exc).__name__}: {exc} — this is a dashboard bug, not a broken '
+                    'artifact; see the dashboard log for the traceback'
+                ),
+            )
+    payload['evals'] = evals
 
     # The reverse direction: an open eval_regression escalation that no metric
     # row links.  Surfaced rather than dropped, so parity can be checked both
@@ -1133,6 +1426,3 @@ def build_memory_evals(
             path=memory_evals_dir / 'verdicts-current.json',
             detail=f'verdict for metric {metric_id!r} matches no metric row in eval {eval_id!r}',
         )
-
-    payload['issue_count'] = len(issues)
-    return payload
