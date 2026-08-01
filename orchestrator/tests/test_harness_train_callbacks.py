@@ -843,12 +843,23 @@ class TestTrainCallbacksDeliveredChecksGuard:
         self, closure: str,
     ) -> None:
         """The bare-worker construction `build_train_callback_factory(sched)`
-        must keep working with zero added I/O."""
+        must keep working with zero added I/O.
+
+        `git_ops` is deliberately a REAL (mock) handle here so that
+        `config is None` is the ONLY thing that can produce inertness.
+        Passing `git_ops=None` as well would make this test pass off the
+        `git_ops is None` arm instead, and deleting the `config is None`
+        check outright would not fail it — the contract this test is named
+        after would go untested. The `git_ops is None` degradation has its
+        own test below.
+        """
         from orchestrator.harness import build_train_callback_factory
 
         sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
         guard = AsyncMock(return_value=_tc_block('failed'))
-        cbs = build_train_callback_factory(sched)(_TC_TRAIN)
+        cbs = build_train_callback_factory(sched, git_ops)(_TC_TRAIN)
 
         with patch(_TC_GATE_TARGET, guard), \
                 patch('orchestrator.harness.MergeProvenance'):
@@ -857,6 +868,7 @@ class TestTrainCallbacksDeliveredChecksGuard:
         guard.assert_not_awaited()
         sched.get_task.assert_not_called()
         sched.mark_done.assert_awaited_once()
+        sched.set_task_status.assert_not_called()
 
     async def test_kill_switch_is_forwarded_not_short_circuited(
         self, closure: str, tmp_path: Path,
@@ -907,6 +919,11 @@ class TestTrainCallbacksDeliveredChecksGuard:
         assert guard.await_args.kwargs['check_timeout_secs'] == 7.5
         assert guard.await_args.kwargs['enabled'] is True
         assert guard.await_args.kwargs['site'] == _TC_SITES[closure]
+        # The factory's git_ops HANDLE, not merely a truthy sentinel:
+        # without it the guard cannot resolve a main SHA and every
+        # check-carrying member collapses to `main_sha_unresolved`, i.e.
+        # every train flip withheld forever.
+        assert guard.await_args.kwargs['git_ops'] is git_ops
 
     # --- fail-safe: unknown metadata / an errored guard never stamp -------
 
@@ -980,7 +997,13 @@ class TestTrainCallbacksDeliveredChecksGuard:
 
         guard.assert_not_awaited()
         sched.mark_done.assert_awaited_once()
-        assert 'git_ops' in caplog.text, 'the degradation must not be silent'
+        # Assert the SPECIFIC line this arm emits, not the bare token
+        # 'git_ops': the pre-3057 B3 lane-release DEBUG line
+        # ('factory built without git_ops (missing wiring?)') also fires on
+        # this same logger, so a bare-token assertion passes even with the
+        # guard's own degradation line deleted.
+        assert 'delivered-checks guard inert' in caplog.text, \
+            'the degradation must not be silent'
 
     # --- ordering: the existence probe still wins -------------------------
 

@@ -1156,6 +1156,13 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
         assert kwargs['enabled'] is True
         assert guard.await_args.args[0] == f.wf.task_id
         assert basis in kwargs['site']
+        # The git_ops HANDLE, not merely a truthy sentinel: without it the
+        # guard cannot resolve a main SHA and every check-carrying task
+        # collapses to `main_sha_unresolved`, i.e. a fleet-wide silent
+        # disarm-into-wedge in which EVERY recovery stamp is withheld
+        # forever. Pinning identity here is what makes
+        # `git_ops=self.git_ops` -> `git_ops=None` a failing mutation.
+        assert kwargs['git_ops'] is f.wf.git_ops
 
     # --- ordering: the MP-2 structural guard still fires FIRST -------------
 

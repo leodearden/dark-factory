@@ -939,3 +939,85 @@ class TestReconcileLandedRowDeliveredChecksGuard:
 
         assert report['delivered_checks_withheld'] == 0
         assert report['marked_done'] == 1
+
+
+@pytest.mark.asyncio
+class TestWrappersForwardDeliveredChecksParamsToTheRow:
+    """The two public wrappers must forward all three delivered-checks params
+    VERBATIM to :func:`reconcile_landed_row`.
+
+    The harness -> wrapper hop is pinned in
+    ``test_harness_landed_dispatch_gate_wiring.py``; this class pins the
+    wrapper -> row hop, which is the other half of the chain. Without it,
+    dropping ``delivered_checks_enabled=delivered_checks_enabled`` from either
+    call site is a silent mutation: ``delivered_checks.enabled=false`` would be
+    ignored for seam 8, directly contradicting the single-sourced kill-switch
+    contract these functions' docstrings assert.
+
+    ``reconcile_landed_row`` is patched rather than exercised so this pins the
+    CALL, not the downstream behaviour (which the class above already covers).
+    """
+
+    _ARMED = {
+        'project_root': '/tmp/proj',
+        'check_timeout_secs': 7.5,
+        'delivered_checks_enabled': False,
+    }
+
+    async def test_reconcile_landed_task_forwards_all_three(
+        self, tmp_path: Path,
+    ) -> None:
+        outbox, git_ops, scheduler, _row = _mq_row_fixture(tmp_path)
+        row_fn = AsyncMock(return_value='marked_done')
+
+        with patch('orchestrator.merge_queue.reconcile_landed_row', row_fn):
+            gated = await reconcile_landed_task(
+                'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+                **self._ARMED,
+            )
+
+        assert gated is True
+        assert row_fn.await_args is not None
+        kwargs = row_fn.await_args.kwargs
+        assert kwargs['project_root'] == '/tmp/proj'
+        assert kwargs['check_timeout_secs'] == 7.5
+        assert kwargs['delivered_checks_enabled'] is False
+
+    async def test_reconcile_landed_outbox_forwards_all_three(
+        self, tmp_path: Path,
+    ) -> None:
+        outbox, git_ops, scheduler, _row = _mq_row_fixture(tmp_path)
+        row_fn = AsyncMock(return_value='marked_done')
+
+        with patch('orchestrator.merge_queue.reconcile_landed_row', row_fn):
+            report = await reconcile_landed_outbox(
+                outbox, git_ops, scheduler, **self._ARMED,
+            )
+
+        assert report['marked_done'] == 1
+        assert row_fn.await_args is not None
+        kwargs = row_fn.await_args.kwargs
+        assert kwargs['project_root'] == '/tmp/proj'
+        assert kwargs['check_timeout_secs'] == 7.5
+        assert kwargs['delivered_checks_enabled'] is False
+
+    async def test_unarmed_defaults_stay_byte_identical(
+        self, tmp_path: Path,
+    ) -> None:
+        """Every pre-3057 caller passes none of the three; the wrappers must
+        still forward the unarmed defaults rather than omitting them, so the
+        row function's own ``None`` guard is the single arming decision."""
+        outbox, git_ops, scheduler, _row = _mq_row_fixture(tmp_path)
+        row_fn = AsyncMock(return_value='marked_done')
+
+        with patch('orchestrator.merge_queue.reconcile_landed_row', row_fn):
+            await reconcile_landed_task(
+                'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+            )
+            await reconcile_landed_outbox(outbox, git_ops, scheduler)
+
+        assert row_fn.await_count == 2
+        for call in row_fn.await_args_list:
+            assert call.kwargs['project_root'] is None
+            assert call.kwargs['check_timeout_secs'] is None
+            assert call.kwargs['delivered_checks_enabled'] is True

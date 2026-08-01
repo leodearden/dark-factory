@@ -1078,6 +1078,12 @@ class TestAlreadyLandedGateDeliveredChecksGuard:
         assert kwargs['check_timeout_secs'] == 11.0
         assert kwargs['enabled'] is True
         assert kwargs['site'] == _ARM_REASON[arm]
+        # The git_ops HANDLE, not merely a truthy sentinel: without it the
+        # guard cannot resolve a main SHA and every check-carrying task
+        # collapses to `main_sha_unresolved`, i.e. a fleet-wide silent
+        # disarm-into-wedge. Pinning identity here is what makes
+        # `git_ops=self.git_ops` -> `git_ops=None` a failing mutation.
+        assert kwargs['git_ops'] is h.git_ops
 
     # --- row 2: all_delivered -> byte-identical stamp ----------------------
 
