@@ -494,6 +494,11 @@ def _derive_module_runs(
     test_data_trigger = next((f for f, k in kinds.items() if k is FileKind.TEST_DATA), None)
     structural_trigger = next((f for f, k in kinds.items() if k is FileKind.STRUCTURAL), None)
     collectable_tests = [f for f, k in kinds.items() if k is FileKind.COLLECTABLE_TEST]
+    # Task 3294: SOURCE ∪ STRUCTURAL, never SOURCE alone — see the *role*
+    # paragraph in this function's docstring for why the union is load-bearing.
+    production_touched = any(
+        k in (FileKind.SOURCE, FileKind.STRUCTURAL) for k in kinds.values()
+    )
 
     runs: list[PlannedRun] = []
 
@@ -552,19 +557,19 @@ def _derive_module_runs(
                 mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
                 f'pytest: test-data module touched ({test_data_trigger}) — full suite required',
             ))
+        elif role == 'task' and production_touched:
+            test_cmd = parse_config_command(mc.test_command)
+            runs.append(PlannedRun(
+                mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
+                'pytest: source-only diff — owning-module full suite (task role); '
+                'sibling modules NOT run',
+            ))
         elif collectable_tests:
             test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
             runs.append(PlannedRun(
                 mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
                 scoped_targets=tuple(collectable_tests),
-            ))
-        elif role == 'task':
-            test_cmd = parse_config_command(mc.test_command)
-            runs.append(PlannedRun(
-                mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
-                'pytest: source-only diff — owning-module full suite (task role); '
-                'sibling modules NOT run',
             ))
         else:
             runs.append(PlannedRun(

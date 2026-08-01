@@ -252,9 +252,16 @@ class TestModuleConfigPlanAuthority:
         by_tool = {run.cmd.tool: run for run in expected_plan.runs if run.cmd is not None}
 
         pytest_run = by_tool[ToolKind.PYTEST]
-        assert pytest_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        # Task 3294: this MIXED shape (production file + co-committed test)
+        # full-suites pytest at role='task', so this now pins the FULL_SUITE
+        # arm of the plan→ModuleConfig mapping. The expectation is the
+        # VERBATIM configured command, not render(cmd): a FULL_SUITE slot is
+        # rendered by _executed_module_configs_from_plan as `getattr(mc, attr)`,
+        # while render() normalises `--directory` into a leading `cd` — so the
+        # render-based form would fail on a correct mapping.
+        assert pytest_run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
         assert pytest_run.cmd is not None
-        assert executed_mc.test_command == render(pytest_run.cmd)
+        assert executed_mc.test_command == module_configs[0].test_command
 
         ruff_run = by_tool[ToolKind.RUFF]
         assert ruff_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED

@@ -2201,6 +2201,14 @@ class TestPlanRecordScopedTargets:
         pyright records the full touched-.py list (``scoped``); pytest
         records only the collectable tests — the two legitimately DIFFER, so
         one shared field per run, not one per plan, is the right shape.
+
+        Task 3294 migrated the ROLE this is exercised at: at role='task' a
+        mixed diff now widens pytest to FULL_SUITE, and a widened slot
+        records NO scoped_targets (it narrowed to nothing), so the differing
+        pair is pinned at role='merge' — where the legacy FILE_SCOPED shape
+        is preserved byte-identically (PRD R4). The task-role half below
+        pins the complementary record: pyright still narrows, pytest does
+        not, and the widened slot's scoped_targets is empty.
         """
         source_file = 'orchestrator/src/orchestrator/some_module.py'
         test_file = 'orchestrator/tests/test_x.py'
@@ -2211,22 +2219,40 @@ class TestPlanRecordScopedTargets:
             ),
             test_command='uv run pytest tests/ --timeout=300',
         )
-        plan = derive_verify_plan(
-            [source_file, test_file], [mc], None, fake_worktree_reader,
+
+        # -- role='merge': both slots FILE_SCOPED, and their records differ. --
+        merge_plan = derive_verify_plan(
+            [source_file, test_file], [mc], None, fake_worktree_reader, role='merge',
         )
 
-        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
-        assert pyright_run is not None
-        assert pyright_run.scope_kind is ScopeKind.FILE_SCOPED
-        assert set(pyright_run.scoped_targets) == {source_file, test_file}
+        merge_pyright = _run_for(merge_plan, 'orchestrator', 'pyright:')
+        assert merge_pyright is not None
+        assert merge_pyright.scope_kind is ScopeKind.FILE_SCOPED
+        assert set(merge_pyright.scoped_targets) == {source_file, test_file}
 
-        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
-        assert pytest_run is not None
-        assert pytest_run.scope_kind is ScopeKind.FILE_SCOPED
-        assert pytest_run.scoped_targets == (test_file,)
+        merge_pytest = _run_for(merge_plan, 'orchestrator', 'pytest:')
+        assert merge_pytest is not None
+        assert merge_pytest.scope_kind is ScopeKind.FILE_SCOPED
+        assert merge_pytest.scoped_targets == (test_file,)
 
         # The two slots' records legitimately differ — the point of the assertion.
-        assert set(pyright_run.scoped_targets) != set(pytest_run.scoped_targets)
+        assert set(merge_pyright.scoped_targets) != set(merge_pytest.scoped_targets)
+
+        # -- role='task': pyright still narrows; the widened pytest slot
+        # records nothing, because it narrowed to nothing (task 3294). --
+        task_plan = derive_verify_plan(
+            [source_file, test_file], [mc], None, fake_worktree_reader, role='task',
+        )
+
+        task_pyright = _run_for(task_plan, 'orchestrator', 'pyright:')
+        assert task_pyright is not None
+        assert task_pyright.scope_kind is ScopeKind.FILE_SCOPED
+        assert set(task_pyright.scoped_targets) == {source_file, test_file}
+
+        task_pytest = _run_for(task_plan, 'orchestrator', 'pytest:')
+        assert task_pytest is not None
+        assert task_pytest.scope_kind is ScopeKind.FULL_SUITE
+        assert task_pytest.scoped_targets == ()
 
     def test_full_suite_and_skipped_runs_record_no_scoped_targets(self):
         """The negative half of the invariant: empty is CORRECT, and meaningful.
