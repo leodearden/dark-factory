@@ -36,6 +36,9 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.stages import (
+    task_knowledge_sync as task_knowledge_sync_module,
+)
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _prune_task_count_snapshots,
@@ -1627,6 +1630,102 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
             if call.kwargs.get('filters') == {'kind': TASK_COUNT_SNAPSHOT_KIND}
         ]
         assert snapshot_calls == []
+
+
+# ---------------------------------------------------------------------------
+# TaskKnowledgeSync.run() wiring — the freshness stat is emitted under the
+# shared module constant, never a hardcoded literal (task 3045 step-1/2)
+# ---------------------------------------------------------------------------
+
+
+class TestSnapshotWrittenStatKeyIsConstantDriven:
+    """run() must emit the freshness stat under SNAPSHOT_WRITTEN_STAT_KEY.
+
+    Rename-hazard guard (task 3045). The producer and the sole reader
+    (``extract_snapshot_written``) live in different modules: the reader
+    resolves the key via the shared constant, so if the producer hardcodes
+    the string literal instead, a rename of the constant reaches the reader
+    but NOT the producer. Nothing would go red — the harness cadence check
+    at ``harness._maybe_escalate_stale_task_count_snapshot`` would simply
+    read ``None`` (inconclusive) forever and the
+    ``recon_stale_task_count_snapshot`` escalation would go silently dead
+    rather than loudly wrong.
+
+    Rebinding the constant on the *producer's* module namespace is what
+    proves the coupling: it only takes effect if the producer looks the
+    name up at call time. ``raising=True`` (the default) additionally pins
+    that the producer imports the constant at all.
+
+    Mirrors TestRunRecordsTaskCountSnapshotWrittenStat's harness above:
+    super().run() executes for real via a patched run_stage_via_cli while
+    the module-level freshness helper is patched directly.
+    """
+
+    SENTINEL_KEY = '__sentinel_written_key__'
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        # count==1 short-circuits the unrelated stage2-summary verify/repair/
+        # reconstruct chain so this test stays isolated to the stat key.
+        memory_service.count_memories_by_metadata.return_value = 1
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.search.return_value = []
+        memory_service.add_memory.return_value = {'memory_ids': []}
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        return {
+            'memory_service': memory_service,
+            'taskmaster': taskmaster,
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _fake_cli_result(self):
+        return MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1, tokens_used=0, cost_usd=0.0,
+            model='test-model', error=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stat_is_emitted_under_the_rebound_constant(
+        self, mock_deps, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            task_knowledge_sync_module,
+            'SNAPSHOT_WRITTEN_STAT_KEY',
+            self.SENTINEL_KEY,
+        )
+
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('dark_factory', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_task_count_snapshot_written',
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-snap-constant-driven',
+            )
+
+        assert report.stats[self.SENTINEL_KEY] == 1
+        # The real spelling must NOT also appear — that would mean the
+        # producer still carries a hardcoded literal alongside the constant.
+        assert 'task_count_snapshot_written' not in report.stats
 
 
 # ---------------------------------------------------------------------------
