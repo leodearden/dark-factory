@@ -163,14 +163,16 @@ code a wrapper reads. See :func:`coverage_status`.
 That vocabulary is only closed if a damaged file lands INSIDE it. The archive
 is fire-and-forget runtime state written by the running fleet, so a unit
 killed mid-write or a file read while still compressing leaves a partially
-written ``.gz`` — and raw gzip signals its three corruption shapes with three
-different exception types, only one of which is an ``OSError`` (bad magic ->
-``gzip.BadGzipFile``, truncated -> ``EOFError``, corrupt body ->
-``zlib.error``). Both readers now normalize all three to ``OSError``
-preserving the original message, so every shape lands in the counted
-``parse_failures`` path — ``degraded`` if other files read, ``total_failure``
-if none did — instead of aborting the run with a traceback and an exit code
-outside this table.
+written ``.gz``, and a flipped byte in stored data damages an intact one — and
+an unreadable transcript surfaces as FOUR different exception types, only one
+of which is an ``OSError``: bad magic -> ``gzip.BadGzipFile``, truncated ->
+``EOFError``, corrupt body -> ``zlib.error``, and a non-UTF-8 byte ->
+``UnicodeDecodeError`` (a ``ValueError``, reachable on a plain ``.jsonl`` as
+well, since both readers open under strict ``encoding='utf-8'``). Both readers
+now normalize all four to ``OSError`` preserving the original message, so
+every shape lands in the counted ``parse_failures`` path — ``degraded`` if
+other files read, ``total_failure`` if none did — instead of aborting the run
+with a traceback and an exit code outside this table.
 
 Usage::
 
@@ -633,14 +635,14 @@ def scan_archive(
     every fire-and-forget writer eventually produces — does not inflate it
     into a false alarm.
 
-    All THREE gzip corruption shapes reach that ``except OSError`` — bad
-    magic, a truncated stream, and a corrupt body — because the reader
-    normalizes them there. The handler is deliberately NOT widened here to
-    also catch ``EOFError``/``zlib.error``: the normalization belongs at the
-    single reader seam, and a second answer to "which exceptions mean an
-    unreadable file" at each call site is exactly what INV-5 forbids. The
-    original message survives normalization, so the disclosed
-    ``parse_failures`` example still says which shape it was.
+    All FOUR unreadable-file shapes reach that ``except OSError`` — bad magic,
+    a truncated stream, a corrupt body, and a non-UTF-8 byte — because the
+    reader normalizes them there. The handler is deliberately NOT widened here
+    to also catch ``EOFError``/``zlib.error``/``UnicodeDecodeError``: the
+    normalization belongs at the single reader seam, and a second answer to
+    "which exceptions mean an unreadable file" at each call site is exactly
+    what INV-5 forbids. The original message survives normalization, so the
+    disclosed ``parse_failures`` example still says which shape it was.
 
     A missing *root* is not an error here; it is zero transcripts found, which
     :func:`coverage_status` turns into ``no_input``.
@@ -695,9 +697,10 @@ def scan_transcript(
     The coverage mapping is shape-identical, so ``coverage_status``,
     ``render_report`` and ``write_corpus`` are shared verbatim between modes.
     An unreadable file is accounted for the same way — ``total_failure`` and
-    its non-zero exit, not a traceback — for every gzip corruption shape,
-    since ``load_transcript`` normalizes the truncated and corrupt-body cases
-    to ``OSError`` exactly as its streaming sibling does. That agreement is
+    its non-zero exit, not a traceback — for every corruption shape, since
+    ``load_transcript`` normalizes the truncated, corrupt-body and
+    undecodable-byte cases to ``OSError`` exactly as its streaming sibling
+    does, and to the same message. That agreement is
     what lets an operator reach for either mode on a damaged archive and get
     the same verdict; it is asserted directly, not assumed
     (``test_legibility_digest.TestLoadTranscriptCorruptionShapes``).

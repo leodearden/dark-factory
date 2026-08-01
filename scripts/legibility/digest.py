@@ -54,17 +54,23 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     instead of aborting its walk.
 
     Making the ``OSError`` half true takes explicit normalization, because
-    gzip signals its three corruption shapes with three DIFFERENT exception
-    types — only the first of which is already an ``OSError``::
+    an unreadable file surfaces as FOUR different exception types — only the
+    first of which is already an ``OSError``::
 
-        bad magic         -> gzip.BadGzipFile   (an OSError subclass)
-        truncated stream  -> EOFError           (not an OSError)
-        corrupt body      -> zlib.error         (not an OSError)
+        bad magic         -> gzip.BadGzipFile     (an OSError subclass)
+        truncated stream  -> EOFError             (not an OSError)
+        corrupt body      -> zlib.error           (not an OSError)
+        undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
 
-    The last two are what a killed unit leaves behind, and archived fleet
-    transcripts are live runtime state, so both are expected shapes. They
-    are re-raised as ``OSError`` preserving the original message, so a
-    caller can still tell a half-written transcript from a corrupted one.
+    The last three are what a killed unit or a flipped stored byte leaves
+    behind, and archived fleet transcripts are live runtime state, so all
+    three are expected shapes. The decode shape is additionally reachable on
+    a PLAIN ``.jsonl`` path, since both branches open under strict
+    ``encoding='utf-8'``, and being a ``ValueError`` it escapes an
+    ``except OSError`` handler regardless of how the gzip shapes are treated.
+    All are re-raised as ``OSError`` preserving the original message, so a
+    caller can still tell a half-written transcript from a corrupted one from
+    an undecodable one.
     ``inventory.iter_json_lines`` — the streaming sibling cited above —
     normalizes identically and to the same message, so the two readers are
     interchangeable at this boundary as well as at the parse contract;
@@ -80,8 +86,8 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
         # Wrap only the read/decompress iteration — decompression happens
         # lazily HERE, per chunk, not at open() — leaving the JSONDecodeError
         # skip inside the loop so the file-level vs line-level split above is
-        # preserved. Deliberately not `except Exception`: normalize two known
-        # decompression failures, don't swallow anything else.
+        # preserved. Deliberately not `except Exception`: normalize three
+        # known unreadable-file failures, don't swallow anything else.
         try:
             for line in f:
                 line = line.strip()
@@ -93,6 +99,12 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
                     continue
         except (EOFError, zlib.error) as exc:
             raise OSError(f'corrupt or truncated gzip stream: {exc}') from exc
+        except UnicodeDecodeError as exc:
+            # Own clause rather than a third tuple member: reachable on plain
+            # `.jsonl` too, so a "gzip stream" label would misdirect. Message
+            # matches inventory.iter_json_lines byte-for-byte, keeping the two
+            # readers interchangeable at this boundary.
+            raise OSError(f'undecodable transcript bytes: {exc}') from exc
     return records
 
 

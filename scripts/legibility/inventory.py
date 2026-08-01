@@ -130,24 +130,38 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     count with truncated trailing lines.
 
     Making that ``OSError`` promise true takes explicit normalization,
-    because gzip signals its three corruption shapes with three DIFFERENT
-    exception types — only the first of which is already an ``OSError``::
+    because an unreadable file surfaces as FOUR different exception types —
+    only the first of which is already an ``OSError``::
 
-        bad magic         -> gzip.BadGzipFile   (an OSError subclass)
-        truncated stream  -> EOFError           (not an OSError)
-        corrupt body      -> zlib.error         (not an OSError)
+        bad magic         -> gzip.BadGzipFile     (an OSError subclass)
+        truncated stream  -> EOFError             (not an OSError)
+        corrupt body      -> zlib.error           (not an OSError)
+        undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
 
-    The last two are exactly what a fire-and-forget writer produces when a
-    unit is killed mid-write or a file is read while still being compressed,
-    and the archived fleet transcripts this reader walks are live runtime
-    state — so both are expected shapes, not theoretical ones. Left
-    un-normalized they escape every consumer's degrade path and abort a
-    whole-archive walk over one bad file. This reader therefore re-raises
-    them as ``OSError`` (preserving the original message, so a coverage
-    report can still tell a half-written transcript from a corrupted one),
-    which is the single contract ``sampling``, ``check_transcript_persistence``
-    and the cross-package ``memory_eval_transcript_corpus`` extractor all
-    already code against with ``except OSError``.
+    The last three are exactly what a fire-and-forget writer produces when a
+    unit is killed mid-write, a file is read while still being compressed, or
+    a stored byte flips; the archived fleet transcripts this reader walks are
+    live runtime state, so all three are expected shapes, not theoretical
+    ones. The decode shape is the odd one out in two ways worth stating: it
+    is the only shape reachable on a PLAIN ``.jsonl`` path as well as a
+    ``.gz`` one (both are opened under strict ``encoding='utf-8'``), and it
+    arrives as a ``ValueError`` subclass, so an ``except OSError``-only
+    handler misses it however the gzip shapes are handled. Left
+    un-normalized any of them escapes every consumer's degrade path and
+    aborts a whole-archive walk over one bad file. This reader therefore
+    re-raises all of them as ``OSError`` (preserving the original message, so
+    a coverage report can still tell a half-written transcript from a
+    corrupted one from an undecodable one), which is the single contract
+    ``sampling``, ``check_transcript_persistence`` and the cross-package
+    ``memory_eval_transcript_corpus`` extractor all already code against with
+    ``except OSError``.
+
+    Note the decode shape is normalized at the FILE level, not degraded at
+    the line level: a bad byte aborts the underlying text-IO read, so there
+    is no well-formed "rest of the file" left to keep yielding. Counting the
+    file once as unreadable is the honest report; silently substituting
+    replacement characters would let corrupt bytes enter the corpus as
+    plausible-looking data.
     """
     if str(path).endswith('.gz'):
         f = gzip.open(path, 'rt', encoding='utf-8')
@@ -158,7 +172,7 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
         # happens lazily HERE, per chunk, not at open() — while the
         # JSONDecodeError skip stays inside the loop, so the file-level vs
         # line-level split above is preserved. Deliberately not `except
-        # Exception`: the point is to normalize two known decompression
+        # Exception`: the point is to normalize three known unreadable-file
         # failures, not to swallow errors from the caller's consumption of
         # this generator.
         try:
@@ -174,6 +188,13 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
                     yield record
         except (EOFError, zlib.error) as exc:
             raise OSError(f'corrupt or truncated gzip stream: {exc}') from exc
+        except UnicodeDecodeError as exc:
+            # Separate clause, not a third member of the tuple above: this
+            # shape is reachable on a plain `.jsonl` path too, so labelling
+            # it a "gzip stream" failure would misdirect an operator reading
+            # the disclosed reason. The original message (byte and offset) is
+            # preserved either way.
+            raise OSError(f'undecodable transcript bytes: {exc}') from exc
 
 
 _iter_json_lines = iter_json_lines

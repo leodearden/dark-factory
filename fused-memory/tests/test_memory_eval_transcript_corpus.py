@@ -625,6 +625,25 @@ def _write_corrupt_body(root: Path, rel: str) -> Path:
     raise AssertionError('no single-byte flip produced a zlib.error body')
 
 
+def _write_undecodable(root: Path, rel: str) -> Path:
+    """A structurally VALID gz whose payload is not valid UTF-8.
+
+    A fourth shape, and the one the helpers above structurally cannot reach:
+    they damage the gzip CONTAINER, and the ``_write_corrupt_body`` probe
+    decompresses in binary mode, so none of them exercises the text layer.
+    This file decompresses cleanly and fails one level up, where the readers'
+    ``encoding='utf-8'`` wrapper meets byte 0xFF — ``UnicodeDecodeError``,
+    a ``ValueError`` subclass, so it escapes ``except OSError`` unless the
+    readers normalize it too. A flipped byte in stored archive data or a
+    ``.jsonl`` half-written by a killed unit produces it.
+    """
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(gzip.compress(
+        b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xfe"}\n'))
+    return path
+
+
 class TestScanArchive:
     """Walk an archive tree, extract, and account for what could not be read.
 
@@ -1277,13 +1296,19 @@ class TestSingleTranscriptMode:
 # step-27 — a PARTIALLY-WRITTEN archived transcript is counted, not fatal
 #
 # The `except OSError` handlers in this script are only as good as the
-# contract the readers keep. Measured, raw gzip signals its three corruption
-# shapes with three different types, and only bad magic is already an
-# OSError:
+# contract the readers keep. Measured, an unreadable archived transcript
+# arrives as FOUR different types, and only bad magic is already an OSError:
 #
-#     bad magic         -> gzip.BadGzipFile   (an OSError subclass)
-#     truncated stream  -> EOFError           (not an OSError)
-#     corrupt body      -> zlib.error         (not an OSError)
+#     bad magic         -> gzip.BadGzipFile     (an OSError subclass)
+#     truncated stream  -> EOFError             (not an OSError)
+#     corrupt body      -> zlib.error           (not an OSError)
+#     undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
+#
+# The last is the one that survives a fix aimed only at the gzip layer: the
+# container decompresses fine and the fault is at the readers' strict
+# `encoding='utf-8'` text wrapper, so it is reachable on a plain `.jsonl`
+# too, and being a ValueError it escapes `except OSError` however the three
+# gzip shapes are handled.
 #
 # Before the readers normalized them, ONE truncated file among the live
 # archive's ~2814 aborted the entire run with a traceback: no corpus, no
@@ -1304,21 +1329,31 @@ class TestPartiallyWrittenTranscriptsAreCounted:
     GOOD_REL = '5150/-enc-a/good-session.jsonl.gz'
     TRUNCATED_REL = '5150/-enc-a/truncated-session.jsonl.gz'
     CORRUPT_BODY_REL = '5151/-enc-b/corrupt-body-session.jsonl.gz'
+    UNDECODABLE_REL = '5152/-enc-c/undecodable-session.jsonl.gz'
 
-    def _one_bad_one_good(self, tmp_path: Path) -> Path:
-        root = tmp_path / 'archive'
+    def _good(self, root: Path) -> Path:
         _write_transcript(root, self.GOOD_REL, [
             _briefing('claude-task-5150-implementer'),
             _tool_use('toolu_ok', 'the search that must survive'),
             _tool_result('toolu_ok', {'results': [_result('mem-1', 0.87)]}),
         ])
+        return root
+
+    def _one_bad_one_good(self, tmp_path: Path) -> Path:
+        root = self._good(tmp_path / 'archive')
         _write_truncated(root, self.TRUNCATED_REL)
+        return root
+
+    def _one_undecodable_one_good(self, tmp_path: Path) -> Path:
+        root = self._good(tmp_path / 'undecodable-archive')
+        _write_undecodable(root, self.UNDECODABLE_REL)
         return root
 
     def _all_bad(self, tmp_path: Path) -> Path:
         root = tmp_path / 'all-bad-archive'
         _write_truncated(root, self.TRUNCATED_REL)
         _write_corrupt_body(root, self.CORRUPT_BODY_REL)
+        _write_undecodable(root, self.UNDECODABLE_REL)
         return root
 
     # -- (a) partial corruption: degraded, and the run survives -------------
@@ -1352,7 +1387,7 @@ class TestPartiallyWrittenTranscriptsAreCounted:
 
         assert code == 3
         assert coverage['status'] == 'total_failure'
-        assert coverage['parse_failures']['count'] == 2
+        assert coverage['parse_failures']['count'] == 3
         assert records == []
 
     def test_every_file_unreadable_report_says_so_in_words(self, tmp_path):
@@ -1365,18 +1400,47 @@ class TestPartiallyWrittenTranscriptsAreCounted:
 
     # -- (c) both shapes reach the counted path, distinguishably ------------
 
-    def test_the_two_corruption_shapes_report_different_reasons(self, tmp_path):
-        # Both are normalized to OSError so one handler catches them, but the
+    def test_the_three_corruption_shapes_report_different_reasons(self, tmp_path):
+        # All are normalized to OSError so one handler catches them, but the
         # disclosed reason must still say WHICH — an operator triaging the
-        # archive writer needs to tell a half-written file from a damaged one.
+        # archive writer needs to tell a half-written file from a damaged one
+        # from one whose bytes are not text, since those are three different
+        # things to go and fix.
         _, coverage, _, _ = _run_cli(self._all_bad(tmp_path), tmp_path / 'out')
 
         reasons = {ex['transcript']: ex['reason'] for ex in
                    coverage['parse_failures']['examples']}
-        assert set(reasons) == {self.TRUNCATED_REL, self.CORRUPT_BODY_REL}
-        assert reasons[self.TRUNCATED_REL] != reasons[self.CORRUPT_BODY_REL]
+        assert set(reasons) == {
+            self.TRUNCATED_REL, self.CORRUPT_BODY_REL, self.UNDECODABLE_REL}
+        assert len(set(reasons.values())) == 3
         assert 'end-of-stream' in reasons[self.TRUNCATED_REL]
         assert 'decompressing' in reasons[self.CORRUPT_BODY_REL]
+        assert '0xff' in reasons[self.UNDECODABLE_REL].lower()
+
+    # -- (b2) the decode shape, on its own, at the archive boundary ---------
+
+    def test_one_undecodable_file_does_not_cost_the_others(self, tmp_path):
+        # The regression this class exists to prevent, for the shape that was
+        # still leaking: UnicodeDecodeError is a ValueError, not an OSError,
+        # so before the readers normalized it a single non-UTF-8 byte anywhere
+        # in the ~2814-file live archive aborted scan_archive with a traceback
+        # — no corpus, no coverage.json, no report, and an exit status outside
+        # the documented ok/degraded/no_input/total_failure vocabulary. That
+        # is precisely the "silently broken extractor masquerading as a clean
+        # result" failure the module's contract forbids, so it is pinned at
+        # the CLI boundary and not only at the reader.
+        code, coverage, records, report = _run_cli(
+            self._one_undecodable_one_good(tmp_path), tmp_path / 'out')
+
+        assert code == 0
+        assert coverage['status'] == 'degraded'
+        assert [r['query'] for r in records] == ['the search that must survive']
+        assert coverage['transcripts_found'] == 2
+        assert coverage['transcripts_read'] == 1
+        assert coverage['parse_failures']['count'] == 1
+        assert [ex['transcript'] for ex in
+                coverage['parse_failures']['examples']] == [self.UNDECODABLE_REL]
+        assert self.UNDECODABLE_REL in report
 
     # -- (d) the other reader, via --transcript ----------------------------
 
