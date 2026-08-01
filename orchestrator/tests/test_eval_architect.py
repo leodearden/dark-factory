@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -838,6 +839,57 @@ class TestJudgePlanQualityRefusesAnUnjudgeableArtifact:
 
         mock_invoke.assert_awaited()
         assert verdict.plan_quality == 0.95
+
+    # -- the refusal is LOUD, never a silent floor -------------------------
+    #
+    # When this guard fires it means a caller did NOT gate — the precise
+    # situation that produced the reported artifact. Per the repo's
+    # loud-over-silent / structured-facts-at-failure invariant
+    # (docs/legibility/design-invariants.md) that must leave a trace, rather
+    # than a bare 0.0 indistinguishable from a judge that genuinely scored zero.
+
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    async def test_the_refusal_is_logged(self, plan, caplog):
+        from orchestrator.evals.judge import judge_plan_quality, score_plan_structure
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_confident_judge_result()),
+        ):
+            await judge_plan_quality(plan, 'diff', _judge_task())
+
+        records = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.evals.judge' and r.levelno >= logging.WARNING
+        ]
+        assert len(records) == 1
+        message = records[0].getMessage()
+        # Assert on SUBSTANCE, not exact prose: a wording-brittle pin would fail
+        # on any future rephrase without indicating a behaviour change.
+        assert 'df_task_2605' in message            # WHICH cell to go look at
+        assert str(score_plan_structure(plan)) in message   # what was substituted
+        # The LLM was never consulted — distinguishing this record from a judge
+        # that answered and happened to say 0.0.
+        assert 'skip' in message.lower()
+
+    async def test_a_judged_plan_logs_no_refusal_warning(self, caplog):
+        # The paired control that keeps the signal rare and meaningful: the
+        # normal path must not be made noisy, or the warning stops meaning
+        # "a caller did not gate".
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_confident_judge_result()),
+        ):
+            await judge_plan_quality(_well_formed_plan(), 'diff', _judge_task())
+
+        assert [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.evals.judge' and r.levelno >= logging.WARNING
+        ] == []
 
 
 # ---------------------------------------------------------------------------
