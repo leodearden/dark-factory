@@ -20,6 +20,7 @@ def _row(
     composite: float | None,
     *,
     plan_quality: float | None = None,
+    plan_rate: float | None = None,
 ) -> dict[str, Any]:
     """A minimal build_composite_report ``configs`` row (the fields ranking reads).
 
@@ -27,12 +28,18 @@ def _row(
     PLAN-ONLY architect row, ``None`` on a workflow row that never invoked the
     plan judge (task 3099). ``composite`` is ``None`` for a config whose every
     trial was unmeasurable.
+
+    ``plan_rate`` (task 3379) is the same shape one axis down: the fraction of
+    a PLAN-ONLY config's admitted cells that emitted a plan at all, ``None``
+    for a workflow row with no plan-only cell — added here exactly as 3099
+    added ``plan_quality``, so the ranking tests stay hermetic pure-dict ones.
     """
     return {
         'config': config,
         'role_under_test': role,
         'composite': composite,
         'plan_quality': plan_quality,
+        'plan_rate': plan_rate,
     }
 
 
@@ -213,6 +220,118 @@ class TestSelectSurvivors:
             _row('zeta', 'implementer', 0.90),
             _row('alpha', 'implementer', 0.90),
             _row('mid', 'implementer', 0.50),
+        ])
+
+        # Descending composite, then ascending config name — unchanged.
+        assert select_survivors(report, top_k=3, roles=['implementer']) == {
+            'implementer': ['alpha', 'zeta', 'mid'],
+        }
+
+    # -- task 3379: reliability breaks a tie the alphabet used to decide -----
+
+    def test_tied_quality_ranks_by_descending_plan_rate(self):
+        """THE TIE-BREAK, and the tie is REAL rather than contrived.
+
+        Task 3302 folds every no-plan zero into BOTH ``plan_quality`` (floored
+        to 0.0 and kept in the mean) and ``composite`` (hard-gated by
+        ``blend_composite(no_plan=True)``) — so one cell at 0.0 beside one at
+        1.0 produces exactly the same mean as two cells at 0.5, while the two
+        configs differ sharply in how often they plan at all. Both primary axes
+        tie, and today the tie falls through to the alphabet: the very defect
+        ``select_survivors``' own docstring records
+        (``architect-fable-high`` "was 'selected' for sorting first, not for
+        planning best"). Its stated principle — the alphabet is demoted below
+        every axis that carries signal — makes ``plan_rate`` the axis that
+        should decide here.
+        """
+        from orchestrator.evals.report import select_survivors
+
+        report = _report([
+            # Alphabetically FIRST, and the LESS reliable of the two.
+            _row('arch-aaa', 'architect', 0.50, plan_quality=0.50,
+                 plan_rate=0.74),
+            _row('arch-zzz', 'architect', 0.50, plan_quality=0.50,
+                 plan_rate=0.95),
+        ])
+
+        assert select_survivors(report, top_k=1, roles=['architect']) == {
+            'architect': ['arch-zzz'],
+        }
+        assert select_survivors(report, top_k=2, roles=['architect']) == {
+            'architect': ['arch-zzz', 'arch-aaa'],
+        }
+
+    def test_unmeasured_plan_rate_ranks_last_never_first(self):
+        """``plan_rate=None`` is "we measured nothing" on this axis too.
+
+        The same None-last rule steps 1 and 3 apply to ``composite`` /
+        ``plan_quality``: a bare ``or 0.0`` would make an unmeasured row TIE a
+        config that genuinely never planned, and a bare ``or 1.0`` would let it
+        win outright.
+        """
+        from orchestrator.evals.report import select_survivors
+
+        report = _report([
+            _row('arch-aaa', 'architect', 0.50, plan_quality=0.50,
+                 plan_rate=None),
+            _row('arch-zzz', 'architect', 0.50, plan_quality=0.50,
+                 plan_rate=0.10),
+        ])
+
+        assert select_survivors(report, top_k=1, roles=['architect']) == {
+            'architect': ['arch-zzz'],
+        }
+        # Ranked last, never dropped.
+        assert select_survivors(report, top_k=2, roles=['architect']) == {
+            'architect': ['arch-zzz', 'arch-aaa'],
+        }
+
+    def test_plan_rate_never_outranks_plan_quality(self):
+        """It is a TIE-BREAK, not a primary axis — no double-counting.
+
+        A no-plan cell is ALREADY paid for twice: once in ``plan_quality``
+        (floored to 0.0, kept in the mean) and once in ``composite`` (hard-gated
+        to 0.0). Promoting reliability above them would charge a candidate a
+        third time for the same failing cells, so a strictly better planner must
+        still win despite a worse plan_rate.
+        """
+        from orchestrator.evals.report import select_survivors
+
+        report = _report([
+            _row('arch-reliable', 'architect', 0.50, plan_quality=0.40,
+                 plan_rate=1.00),
+            _row('arch-better', 'architect', 0.50, plan_quality=0.90,
+                 plan_rate=0.50),
+        ])
+
+        assert select_survivors(report, top_k=1, roles=['architect']) == {
+            'architect': ['arch-better'],
+        }
+
+    def test_plan_rate_never_outranks_composite(self):
+        """…and likewise below the primary axis."""
+        from orchestrator.evals.report import select_survivors
+
+        report = _report([
+            _row('arch-reliable', 'architect', 0.50, plan_quality=0.90,
+                 plan_rate=1.00),
+            _row('arch-better', 'architect', 0.94, plan_quality=0.40,
+                 plan_rate=0.50),
+        ])
+
+        assert select_survivors(report, top_k=1, roles=['architect']) == {
+            'architect': ['arch-better'],
+        }
+
+    def test_workflow_rows_are_inert_under_the_new_axis(self):
+        """Regression: an implementer row carries no plan_rate, so the added
+        axis changes nothing about today's workflow ordering."""
+        from orchestrator.evals.report import select_survivors
+
+        report = _report([
+            _row('zeta', 'implementer', 0.90, plan_rate=None),
+            _row('alpha', 'implementer', 0.90, plan_rate=None),
+            _row('mid', 'implementer', 0.50, plan_rate=None),
         ])
 
         # Descending composite, then ascending config name — unchanged.
