@@ -239,6 +239,22 @@ def _wedged_agent_result():
     )
 
 
+def _flushed_server_error_result(status: int = 529):
+    """The 2026-07-29 incident shape: the watchdog SIGTERM-killed a wedged CLI
+    and the CLI flushed its result JSON on the way out with api_error_status
+    set, so ``timed_out`` and a 5xx status are BOTH true. Mirrors
+    shared/tests/test_server_error.py:61-77 (``_incident_result``), which is the
+    source of truth for what a flushed 5xx looks like.
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=False, output='', subtype='error_empty_output',
+        timed_out=True, transcript_turns=0, duration_ms=127_000,
+        api_error_status=status,
+    )
+
+
 def _cli_local_error_result(marker: str):
     """A local CLI/usage fault — explicitly NOT a cap (the reify-3604 fix)."""
     from shared.cli_invoke import AgentResult
@@ -474,6 +490,57 @@ class TestDetectInvocationError:
         assert marker.partition(':')[0] == 'api_error'
         assert '429' in marker
         assert 'server_error' not in marker
+
+    # -- timed-out-but-actually-5xx: the shape 3314 regressed to None -------
+
+    def test_timed_out_flushed_5xx_is_attributed_as_a_server_error_not_dropped(self):
+        # The headline regression case: a watchdog-SIGTERM-flushed result
+        # carrying BOTH timed_out=True and a 5xx api_error_status. Before
+        # 3314's ServerError tier existed this classified ZeroOutputWedge and
+        # was marked; afterwards it fell through to None until this task.
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_flushed_server_error_result(529))
+        assert marker is not None
+        assert marker.partition(':')[0] == 'server_error'
+        assert '529' in marker
+
+    def test_timed_out_flushed_5xx_outranks_the_wedge_tier(self):
+        # A SIGTERM-flushed 5xx is a PROVIDER outage, not a local wedge; the
+        # upstream ServerError tier exists precisely because ranking the
+        # wedge first discarded the 5xx evidence, so the eval marker must not
+        # re-flatten it. Mirrors test_body_less_429_outranks_the_wedge_tier.
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_flushed_server_error_result(529))
+        assert marker is not None
+        assert 'wedge' not in marker.lower()
+
+    def test_plain_wedge_without_api_error_status_is_still_a_wedge(self):
+        # The converse guard: stops the new arm from swallowing the genuine
+        # local-wedge signal when there is no api_error_status at all.
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_wedged_agent_result())
+        assert marker is not None
+        assert marker.partition(':')[0] == 'wedge'
+        assert 'server_error' not in marker
+
+    def test_near_cap_is_still_not_an_invocation_error_after_the_5xx_arm(self):
+        # NearCap is deliberately unattributed (a warning that did not refuse
+        # this invocation). Pinned again here because the task description
+        # wrongly lists it as attributed, and a future reader must not "fix"
+        # it into a marker.
+        from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        near = AgentResult(
+            success=False,
+            output="You're close to your usage limit for this session",
+            cost_usd=0.9, duration_ms=30_000, turns=6,
+        )
+        assert detect_invocation_error(near) is None
 
 
 # ---------------------------------------------------------------------------
