@@ -10991,3 +10991,212 @@ class TestDeleteMemoryChildRefusal:
         assert excinfo.value.truncated is True
         assert 'at least' in str(excinfo.value)
         service.mem0.delete.assert_not_awaited()
+
+
+
+
+class _DMGraph:
+    """A minimal parent→children Mem0 double for cascade tests.
+
+    Models the one relationship the gate reads (`metadata.parent_id`) plus
+    the effect a delete has on it, so cascade ORDER and TERMINATION are
+    exercised against state that actually changes — a static mock would let
+    an unbounded loop or a parent-first delete pass.
+    """
+
+    def __init__(self, edges, *, page_size=None):
+        #: parent id -> ids of records whose metadata.parent_id is that id
+        self.edges = {k: list(v) for k, v in edges.items()}
+        self.deleted = []
+        self.page_size = page_size
+
+    async def count(self, scope, filters):
+        return len(self.edges.get(filters['parent_id'], []))
+
+    async def scroll(self, scope, filters, limit):
+        rows = self.edges.get(filters['parent_id'], [])
+        bound = min(limit, self.page_size) if self.page_size else limit
+        return [{'id': r, 'metadata': {}} for r in rows[:bound]]
+
+    async def delete(self, memory_id, scope):
+        self.deleted.append(memory_id)
+        # A deleted record is nobody's child any more.
+        for kids in self.edges.values():
+            if memory_id in kids:
+                kids.remove(memory_id)
+        return {'message': 'deleted'}
+
+    def install(self, svc):
+        svc.mem0.count_by_metadata = AsyncMock(side_effect=self.count)
+        svc.mem0.scroll_by_metadata = AsyncMock(side_effect=self.scroll)
+        svc.mem0.delete = AsyncMock(side_effect=self.delete)
+        return self
+
+
+class TestDeleteMemoryCascade:
+    """`cascade=True` — the explicit opt-in (task 3197, leaf δ)."""
+
+    @pytest.mark.asyncio
+    async def test_cascade_deletes_children_and_parent(self, service):
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert sorted(graph.deleted) == sorted([_DM_CHILD_A, _DM_CHILD_B, _DM_PARENT])
+
+    @pytest.mark.asyncio
+    async def test_children_are_deleted_strictly_before_the_parent(self, service):
+        """THE load-bearing ordering assertion, not decoration.
+
+        Parent-first would re-open precisely the orphan window this task
+        closes: a crash between the parent's delete and the children's
+        leaves live children whose parent_id points at a dead uuid — still
+        recognised as children, still suppressed from grouped search,
+        content unreachable while remaining in Qdrant. Children-first fails
+        safe: the surviving state is "parent alive, some children gone",
+        which the refusal gate still protects and an operator can retry.
+        """
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted[-1] == _DM_PARENT
+        assert graph.deleted.index(_DM_CHILD_A) < graph.deleted.index(_DM_PARENT)
+        assert graph.deleted.index(_DM_CHILD_B) < graph.deleted.index(_DM_PARENT)
+
+    @pytest.mark.asyncio
+    async def test_every_child_gets_its_own_journal_row(self, service):
+        """Re-entering the SAME guarded delete per child is what buys this.
+
+        A second, unguarded `mem0.delete` loop would have deleted the same
+        records while producing one row for the parent only — the PRD's
+        "children deleted too, journalled" signal, silently absent.
+        """
+        journal = _mm_install_journal(service)
+        _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        rows = {
+            call.kwargs['params']['memory_id']: call.kwargs
+            for call in journal.log_write_op.call_args_list
+        }
+        assert set(rows) == {_DM_CHILD_A, _DM_CHILD_B, _DM_PARENT}
+        for row in rows.values():
+            assert row['operation'] == 'delete_memory'
+            json.dumps(row['params'])  # rows are persisted as JSON
+        for child in (_DM_CHILD_A, _DM_CHILD_B):
+            assert rows[child]['params']['cascade'] is True
+            # The row must say WHOSE cascade took this record; without it a
+            # cascaded delete is indistinguishable from a direct one.
+            assert rows[child]['params']['cascade_parent_id'] == _DM_PARENT
+        parent_row = rows[_DM_PARENT]
+        assert sorted(parent_row['result_summary']['cascaded_child_ids']) == sorted(
+            [_DM_CHILD_A, _DM_CHILD_B]
+        )
+
+    @pytest.mark.asyncio
+    async def test_self_parent_terminates_and_deletes_once(self, service):
+        """A record whose own parent_id points at itself.
+
+        Without a visited set this recurses until RecursionError; with a
+        naive post-cascade count it would refuse forever, because the record
+        is its own surviving child right up until it is deleted.
+        """
+        graph = _DMGraph({_DM_PARENT: [_DM_PARENT]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [_DM_PARENT]
+
+    @pytest.mark.asyncio
+    async def test_parent_cycle_terminates_and_deletes_each_once(self, service):
+        graph = _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A], _DM_CHILD_A: [_DM_PARENT]}
+        ).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [_DM_CHILD_A, _DM_PARENT]
+
+    @pytest.mark.asyncio
+    async def test_fan_out_beyond_one_scroll_page(self, service):
+        """The listing is bounded; the CASCADE must not be.
+
+        Stopping at one page would delete the parent while later-page
+        children survived — a silent orphan produced by the very operation
+        meant to prevent one.
+        """
+        kids = [f'child-{i}' for i in range(5)]
+        graph = _DMGraph({_DM_PARENT: kids}, page_size=2).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert sorted(graph.deleted) == sorted([*kids, _DM_PARENT])
+        assert graph.deleted[-1] == _DM_PARENT
+
+    @pytest.mark.asyncio
+    async def test_partial_cascade_refuses_the_parent(self, service):
+        """Corroborate AFTER acting.
+
+        A child that survives the cascade — one that raced in, or a delete
+        that did not take — must stop the parent's deletion. Without this
+        re-read the operation reports success while leaving an orphan, which
+        is the exact silent partial-failure class INV-3 exists to close.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
+
+        async def delete_then_a_new_child_appears(memory_id, scope):
+            result = await graph.delete(memory_id, scope)
+            if memory_id == _DM_CHILD_A:
+                graph.edges[_DM_PARENT].append('late-arriving-child')
+            return result
+
+        service.mem0.delete = AsyncMock(side_effect=delete_then_a_new_child_appears)
+
+        with pytest.raises(ParentHasChildrenError) as excinfo:
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+            )
+
+        assert excinfo.value.child_ids == ['late-arriving-child']
+        assert _DM_PARENT not in graph.deleted
+
+    @pytest.mark.asyncio
+    async def test_cascade_on_a_childless_entry_is_a_plain_delete(self, service):
+        graph = _DMGraph({}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [_DM_PARENT]
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cascade_defaults_to_false(self, service):
+        """The destructive path is opt-IN. A caller that never heard of this
+        contract gets the refusal, not a silent recursive delete."""
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
+
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+        assert graph.deleted == []
