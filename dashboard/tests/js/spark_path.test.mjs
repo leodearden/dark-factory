@@ -39,14 +39,14 @@ import { createRequire } from 'node:module';
 
 import sp from '../../src/dashboard/static/redux/spark_path.js';
 
-const { isPlottable, sparkScale } = sp;
+const { isPlottable, sparkScale, sparkPaths } = sp;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 
 // The surface known at this point in the build-out. Deliberately NOT asserted
-// as exhaustive here — sparkPaths/stepPaths land in later steps and the
-// exhaustive-surface pin lives with them.
-const KNOWN_FUNCTION_NAMES = ['isPlottable', 'sparkScale'];
+// as exhaustive here — stepPaths lands in a later step and the
+// exhaustive-surface pin lives with it.
+const KNOWN_FUNCTION_NAMES = ['isPlottable', 'sparkScale', 'sparkPaths'];
 
 // Float tolerance for any y that is not exactly representable. The x
 // coordinates and the extrema below are all exact at these inputs (width=100
@@ -58,6 +58,60 @@ function assertClose(actual, expected, message) {
     Math.abs(actual - expected) < EPS,
     `${message} (expected ~${expected}, got ${actual})`,
   );
+}
+
+// ── Path-string readers ────────────────────────────────────────────────────
+// Both builders emit space-joined tokens of the form `M<x>,<y>` / `L<x>,<y>` /
+// `Z`, so tokenising on whitespace is exact rather than a loose regex scrape.
+
+function pathTokens(d) {
+  return d.split(/\s+/).filter(Boolean);
+}
+
+function coords(d) {
+  return pathTokens(d)
+    .filter(t => t[0] === 'M' || t[0] === 'L')
+    .map(t => t.slice(1).split(',').map(Number));
+}
+
+function countCommand(d, letter) {
+  return pathTokens(d).filter(t => t[0] === letter).length;
+}
+
+function xs(d) {
+  return coords(d).map(([x]) => x);
+}
+
+function ys(d) {
+  return coords(d).map(([, y]) => y);
+}
+
+// ── Frozen snapshots of the PRE-EXTRACTION charts.jsx arithmetic ───────────
+// Transcribed verbatim from charts.jsx:44-54 (Sparkline) and :68-92
+// (StepSpark) as they stood before task 3436. These are deliberately FROZEN
+// COPIES, not a live mirror of charts.jsx — charts.jsx no longer contains this
+// code at all (test_charts_null_samples.py asserts its absence). Their only
+// job is to answer, permanently and by exact string comparison, the question
+// reviewers and operators actually care about: "did this refactor quietly move
+// every existing chart?" Identical arithmetic produces identical doubles
+// produces identical strings, so the comparison needs no float tolerance.
+//
+// Valid for HOLE-FREE inputs only — fed a hole, these reproduce the very bug
+// being fixed.
+
+function legacySparklinePaths(values, width, height) {
+  const max = Math.max(...values, 1);
+  const min = Math.min(...values, 0);
+  const range = max - min || 1;
+  const stepX = width / Math.max(values.length - 1, 1);
+  const points = values.map((v, i) => {
+    const x = i * stepX;
+    const y = height - ((v - min) / range) * height;
+    return [x, y];
+  });
+  const linePath = points.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ');
+  const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
+  return { line: linePath, area: areaPath };
 }
 
 // ---------------------------------------------------------------------------
@@ -258,4 +312,152 @@ test('sparkScale: an empty or missing series yields the seed-only scale', () => 
     assert.equal(s.range, 1);
     assert.deepEqual(s.points, [], 'no input samples means no points');
   }
+});
+
+// ---------------------------------------------------------------------------
+// sparkPaths — the smooth (Sparkline) builder.
+//
+// Widths/lengths are chosen so stepX divides exactly (100/2 = 50, 100/4 = 25)
+// and the last point lands exactly on x=width, which makes the exact-string
+// equivalence assertions float-safe.
+// ---------------------------------------------------------------------------
+
+test('sparkPaths: the frozen legacy snapshot really is the pre-fix output', () => {
+  // Guards the guard. If legacySparklinePaths were mistranscribed, the
+  // equivalence tests below would compare the new code against a fiction and
+  // pass while every chart silently moved. Pinning one literal proves the
+  // snapshot emits genuine pre-fix strings.
+  assert.equal(
+    legacySparklinePaths([1, 2, 3], 100, 28).line,
+    'M0,18.666666666666668 L50,9.333333333333336 L100,0',
+  );
+});
+
+test('sparkPaths: hole-free output is byte-identical to the pre-fix code', () => {
+  // The risk that actually matters: this change touches the render path of six
+  // tabs, so "behaviour-preserving for existing data" must be an assertion,
+  // not a claim. Note the per-subpath area close collapses to the legacy
+  // full-width `L100,28 L0,28 Z` for a single full-width run — x_last is
+  // exactly width and x_first is exactly 0 — so the generalisation is provably
+  // not a restyle.
+  for (const values of [[1, 2, 3], [1, 2, 3, 4, 5], [0, 0, 0], [-4, 2, -1]]) {
+    const expected = legacySparklinePaths(values, 100, 28);
+    const actual = sparkPaths(values, 100, 28);
+    assert.equal(actual.line, expected.line, `line drifted for ${JSON.stringify(values)}`);
+    assert.equal(actual.area, expected.area, `area drifted for ${JSON.stringify(values)}`);
+  }
+});
+
+test('sparkPaths: a hole starts a new subpath and no segment crosses it', () => {
+  const { line } = sparkPaths([1, 2, null, 4, 5], 100, 28);
+
+  assert.equal(countCommand(line, 'M'), 2, 'the hole must split the line into two subpaths');
+  assert.equal(
+    coords(line)[2][0],
+    75,
+    'the second subpath starts at the index-3 position (75), NOT compacted to 50',
+  );
+  assert.ok(
+    !xs(line).includes(50),
+    `nothing may be drawn at the hole's own x — got ${line}`,
+  );
+  assert.deepEqual(xs(line), [0, 25, 75, 100], 'surviving samples keep their original x');
+});
+
+test('sparkPaths: a null is never plotted as a zero-value point', () => {
+  // THE HEADLINE DEFECT. Pre-fix, the middle sample of this series landed
+  // exactly on the value-0 baseline (y = height) and was joined to both
+  // neighbours — a proportion series sitting at ~0.95 rendering as a plunge to
+  // the floor and back, indistinguishable from a measured collapse.
+  const values = [0.95, null, 0.96];
+  const { line } = sparkPaths(values, 100, 28);
+  const s = sparkScale(values, 100, 28);
+  const baselineY = 28 - ((0 - s.min) / s.range) * 28;
+
+  assert.equal(baselineY, 28, 'sanity: value 0 sits at the chart floor for this scale');
+  for (const y of ys(line)) {
+    assert.notEqual(y, baselineY, `a hole was drawn at the value-0 baseline: ${line}`);
+  }
+  assert.equal(coords(line).length, 2, 'only the two real samples are plotted');
+});
+
+test('sparkPaths: with a negative minimum the fabricated point would land mid-chart', () => {
+  // Same defect, different disguise: here min is -4, so the pre-fix null
+  // coerced to 0 plotted MID-chart rather than at the floor — a hole rendering
+  // as a plausible-looking real measurement.
+  const { line } = sparkPaths([-4, null, -2], 100, 28);
+
+  assert.equal(coords(line).length, 2, 'only the two real samples are plotted');
+  assert.ok(!xs(line).includes(50), `nothing may be drawn at the hole's x — got ${line}`);
+  assert.deepEqual(xs(line), [0, 100]);
+});
+
+test('sparkPaths: undefined and NaN holes behave exactly like null', () => {
+  // Pre-fix these were far WORSE than null: they poisoned the extrema to NaN
+  // and produced an all-NaN path (`MNaN,NaN LNaN,NaN ...`) that rendered
+  // nothing at all.
+  const reference = sparkPaths([1, 2, null, 4, 5], 100, 28);
+
+  for (const hole of [undefined, NaN]) {
+    const actual = sparkPaths([1, 2, hole, 4, 5], 100, 28);
+    assert.equal(actual.line, reference.line, `${String(hole)} must break like null`);
+    assert.equal(actual.area, reference.area, `${String(hole)} must break like null`);
+    for (const n of coords(actual.line).flat()) {
+      assert.ok(Number.isFinite(n), `every coordinate must be finite — got ${actual.line}`);
+    }
+  }
+});
+
+test('sparkPaths: leading and trailing holes do not shift the x-axis', () => {
+  const leading = sparkPaths([null, 2, 3], 100, 28);
+  assert.equal(countCommand(leading.line, 'M'), 1, 'one contiguous run');
+  assert.equal(coords(leading.line)[0][0], 50, 'the run starts at its own index, not at x=0');
+  assert.deepEqual(xs(leading.line), [50, 100]);
+
+  const trailing = sparkPaths([1, 2, null], 100, 28);
+  assert.equal(countCommand(trailing.line, 'M'), 1, 'one contiguous run');
+  assert.deepEqual(xs(trailing.line), [0, 50], 'the run ends at its own index, not at x=100');
+});
+
+test('sparkPaths: an isolated sample is a visible dot, not a vanished one', () => {
+  // A subpath containing only a moveto renders NOTHING in SVG — charts.jsx
+  // already documented that trap for the single-data-point case. Once holes
+  // split the line, every interior island would hit it, trading one
+  // invisible-data bug for another. A zero-length segment renders as a dot
+  // under Sparkline's existing strokeLinecap="round", so no markup change is
+  // needed.
+  const { line, area } = sparkPaths([null, 7, null], 100, 28);
+
+  assert.equal(line, 'M50,0 L50,0', 'a lone sample emits a zero-length segment at its own x');
+  assert.equal(area, '', 'a single point has no area — a zero-width sliver is meaningless');
+});
+
+test('sparkPaths: area closes per subpath, never spanning a hole', () => {
+  const { area } = sparkPaths([1, 2, null, 4, 5], 100, 28);
+
+  assert.equal(countCommand(area, 'M'), 2, 'one closed shape per run');
+  assert.equal(countCommand(area, 'Z'), 2, 'each run closes on itself');
+  // Each run closes at its OWN first/last x (25/0 and 100/75), so no fill is
+  // painted across the slot with no measurement.
+  assert.equal(area, 'M0,22.4 L25,16.799999999999997 L25,28 L0,28 Z M75,5.599999999999998 L100,0 L100,28 L75,28 Z');
+});
+
+test('sparkPaths: an all-hole or empty series draws nothing at all', () => {
+  // Pre-fix, [null, null, null] produced max=1/min=0 from the seeds and three
+  // real points at y=height — a fully synthetic flat line along the chart
+  // floor. Returning empty strings (rather than throwing) leaves the
+  // decline-to-render decision at the call site, where the component can skip
+  // the <svg> entirely.
+  for (const values of [[null, null, null], [undefined, NaN], [], null, undefined]) {
+    const { line, area } = sparkPaths(values, 100, 28);
+    assert.equal(line, '', `expected no line for ${JSON.stringify(values) ?? String(values)}`);
+    assert.equal(area, '', `expected no area for ${JSON.stringify(values) ?? String(values)}`);
+  }
+});
+
+test('sparkPaths: does not mutate its input array', () => {
+  const values = [1, null, 3, null, 5];
+  const before = values.slice();
+  sparkPaths(values, 100, 28);
+  assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
 });
