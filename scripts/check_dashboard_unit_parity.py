@@ -714,6 +714,16 @@ UNITS: dict[str, UnitSpec] = {
             ("Service", "Type"),
             ("Service", "Restart"),
             ("Service", "RestartSec"),
+            # RestartSteps must be compared alongside the cap, not left out of
+            # the allowlist: systemd silently DISCARDS RestartMaxDelaySec= on
+            # any unit that does not also set RestartSteps= (it logs "Service
+            # has RestartMaxDelaySec= but no RestartSteps= setting. Ignoring."
+            # once at load and nowhere else).  An installed copy predating the
+            # RestartSteps= line therefore matches on every other key here
+            # while its backoff cap is inert, restarting every RestartSec
+            # forever.  Comparing the cap without comparing the directive that
+            # makes the cap effective reports parity on exactly that host.
+            ("Service", "RestartSteps"),
             ("Service", "RestartMaxDelaySec"),
             # 15 is sized against uvicorn's own 8s drain bound (see the unit's
             # comment); a drifted value silently re-opens the SIGKILL window

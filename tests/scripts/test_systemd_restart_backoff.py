@@ -90,9 +90,24 @@ def discover_units_declaring_a_restart_cap() -> list[str]:
     failure mode test_orchestrator_service_glob_covers_all_known_units exists
     to prevent for the sibling glob, except a subprocess can fail in more ways
     than a glob can.
+
+    ``tests/`` is excluded from the pathspec, and that exclusion is not
+    cosmetic.  Unit-parity suites embed whole systemd units as column-0
+    triple-quoted fixture strings, so ``^RestartMaxDelaySec=`` matches the test
+    MODULE — measured: tests/scripts/test_check_fused_memory_unit_parity.py was
+    swept as a 13th "unit".  Sweeping a .py file is wrong in both directions.
+    It passed only by accident, because restart_directive is last-occurrence-
+    wins across the whole file and happened to splice a cap out of the NEGATIVE
+    fixture (which deliberately models the defect) together with RestartSteps=
+    out of an unrelated POSITIVE one — so the fixture written to violate the
+    invariant was reported as satisfying it.  And the moment a fixture ordering
+    changed, or a `RestartSteps=0` negative case was appended, the sweep would
+    fail pointing an operator at a Python test file as though it were a
+    misconfigured unit.  Fixtures are the parity suites' own business; this
+    sweep's subject is committed units.
     """
     proc = subprocess.run(
-        ["git", "grep", "-lE", "^RestartMaxDelaySec=", "--", "."],
+        ["git", "grep", "-lE", "^RestartMaxDelaySec=", "--", ".", ":!tests/"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -110,6 +125,17 @@ def discover_units_declaring_a_restart_cap() -> list[str]:
     return sorted(p for p in paths if p not in _HISTORICAL_RECORD_EXCLUSIONS)
 
 
+# Filename shapes a systemd unit definition is allowed to take in this repo.
+# Used to police what discovery drags IN, not what it must contain — see
+# test_discovery_sweeps_only_systemd_units.
+_UNIT_FILE_SUFFIXES = (
+    ".service",
+    ".service.template",
+    ".example-systemd-config",
+    ".md",  # a fenced ini block inside a reference doc
+)
+
+
 def test_discovery_covers_every_known_unit() -> None:
     """Coverage guard: discovery must be non-empty and cover every known unit.
 
@@ -117,11 +143,54 @@ def test_discovery_covers_every_known_unit() -> None:
     broken discovery shrinks the sweep to zero cases, and a zero-case
     parametrize collects no tests and reports no failure — masking the very
     defect the sweep exists to catch.
+
+    This half is deliberately ONE-SIDED — it checks only for MISSING paths.
+    Asserting `discovered == _EXPECTED_SWEPT_PATHS` would defeat the whole
+    point of content-based discovery: a genuinely new unit declaring a cap is
+    supposed to be picked up automatically, and an equality assertion would
+    turn that success into a test failure demanding the constant be edited.
+    The opposite risk — an EXTRA path that is not a unit at all — is covered by
+    test_discovery_sweeps_only_systemd_units instead, which constrains extras
+    by SHAPE rather than by enumeration.
     """
     discovered = set(discover_units_declaring_a_restart_cap())
     assert discovered, "discovery found no files declaring RestartMaxDelaySec="
     missing = _EXPECTED_SWEPT_PATHS - discovered
     assert not missing, f"discovery is missing known units declaring a cap: {missing}"
+
+
+def test_discovery_sweeps_only_systemd_units() -> None:
+    """The other half of the coverage guard: extras must still be UNITS.
+
+    test_discovery_covers_every_known_unit can only see paths that went
+    missing; an extra path is invisible to a `_EXPECTED - discovered` check.
+    That asymmetry is not theoretical — this sweep shipped briefly with
+    tests/scripts/test_check_fused_memory_unit_parity.py in it, because that
+    module embeds systemd units as column-0 fixture strings, and the guard
+    written to detect discovery drift could not see the drift.
+
+    Constraining extras by SHAPE keeps the auto-coverage property intact (a new
+    .service file is swept the day it lands, with no constant to update) while
+    refusing anything that is not a unit definition.  A Python module, a JSON
+    fixture or a shell script matching this directive means discovery has
+    escaped its subject, and the failure names the path rather than misreporting
+    it as a misconfigured unit several assertions later.
+    """
+    discovered = discover_units_declaring_a_restart_cap()
+    strays = [
+        p
+        for p in discovered
+        if not p.endswith(_UNIT_FILE_SUFFIXES) or p.startswith("tests/")
+    ]
+    assert not strays, (
+        f"discovery swept files that are not systemd unit definitions: {strays}. "
+        "Something other than a unit declares RestartMaxDelaySec= at column 0 — "
+        "most likely a test fixture embedding a unit as a triple-quoted string. "
+        "Such a file must be excluded from the pathspec, not checked: the "
+        "invariant reads the LAST occurrence of each directive file-wide, so on "
+        "a multi-fixture module it splices values from unrelated fixtures "
+        "together and reports a nonsense verdict about a file that is not a unit."
+    )
 
 
 def test_historical_record_exclusions_are_live() -> None:
