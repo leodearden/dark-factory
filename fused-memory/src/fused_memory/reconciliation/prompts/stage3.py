@@ -9,6 +9,10 @@ from fused_memory.reconciliation.prompts import (
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
+from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    SNAPSHOT_PRUNED_STAT_KEY,
+    SNAPSHOT_WRITTEN_STAT_KEY,
+)
 
 STAGE3_SYSTEM_PROMPT = f"""\
 You are an Integrity Check agent operating in sleep mode. Your role is to verify consistency \
@@ -114,6 +118,26 @@ at the source keeps Stage 2 load clean.
 
 If you observe a task-count snapshot edge for any of these projects that appears \
 stale or missing, **skip the finding entirely**.
+
+## Snapshot Stats Are Mem0-Only (task-3045)
+
+Stage 2's `{SNAPSHOT_WRITTEN_STAT_KEY}` and `{SNAPSHOT_PRUNED_STAT_KEY}` stats \
+count operations on **Mem0 `observations_and_summaries` records ONLY**. They make \
+no claim whatsoever about Graphiti.
+
+Per Snapshot Discipline, task-count and task-status snapshots are **NEVER** \
+persisted as Graphiti `temporal_facts` edges — for **ANY** project, blocked or \
+not (recurring count churn would cause entity proliferation).
+
+Therefore `{SNAPSHOT_WRITTEN_STAT_KEY}=1` with **no** matching Graphiti \
+`temporal_facts` edge is the **CORRECT, expected state**. Do NOT report it as a \
+rejected write, a missing edge, a memory gap, or any other discrepancy — and do \
+NOT treat it as a stats-vs-reality mismatch when cross-referencing stage report \
+stats against MCP Actions.
+
+Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
+exception list on this evidence. That contradicts Snapshot Discipline and is the \
+wrong fix.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 
