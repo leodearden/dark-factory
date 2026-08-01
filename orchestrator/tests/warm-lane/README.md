@@ -219,7 +219,7 @@ sole pin on that behaviour.
 The driver's `test_bash_suite_passes` applies the same predicate reify's own
 runner (`tests/infra/run_all_ambient_isolation_lib.sh`) does: **exit 0 AND a
 `Results: N passed, 0 failed` line AND `N` at or above a per-suite floor**
-(`ASSERT_FLOORS`). Exit status alone cannot tell "all 837 asserts ran and
+(`ASSERT_FLOORS`). Exit status alone cannot tell "all 865 asserts ran and
 passed" from "a block skipped and the rest passed", and leaf **κ** deletes
 reify's originals on the strength of these items being green — so the weaker
 predicate would have been the single weak link in that chain.
@@ -317,37 +317,80 @@ and the total.
 For reference, the whole orchestrator suite with these included is ~253s for
 ~13,100 tests.
 
-## PRD §11 q4 — decided: the default suite
+## PRD §11 q4 — re-decided: the offline lane (the escape is taken)
 
-**The ported tests run in dark-factory's DEFAULT `orchestrator` suite**, not in
-a separate opt-in bucket. No test-runner config change was needed:
-`orchestrator/orchestrator.yaml`'s `test_command` is
-`pytest tests/ ... --timeout=300`, a directory argument that already recurses.
+**The ported tests run POST-MERGE on `git.offline_lane_commands`, off the verify
+hot path** (task 3349, 2026-08-01). Two coupled config edits, and they never
+move independently:
 
-A `warm_lane_bash` marker **is** registered in `orchestrator/pyproject.toml`,
-for on-demand selection/deselection (`-m warm_lane_bash`,
-`-m 'not warm_lane_bash'`). It is deliberately **not** added to `addopts` as
-`-m 'not warm_lane_bash'`.
+| | edit point | value |
+|---|---|---|
+| (a) | `orchestrator/pyproject.toml` → `[tool.pytest.ini_options] addopts` | `-m 'not warm_lane_bash'` |
+| (b) | `dark-factory-orchestrator.yaml` → `git.offline_lane_commands` | `name: warm-lane-bash`, `command: "pytest -m warm_lane_bash"`, `cwd: "orchestrator"`, `fix_task_priority: "high"` |
 
-Rationale: PRD leaf **γ** changes `warm-lane-gc.sh`'s core reclaimability
-predicate and needs this coverage *actually running* on its verify leg, and leaf
-**κ** deletes reify's originals on the strength of this suite being green. A
-marker-deselected bucket (the `shared` / `fused-memory` / `cockpit`
-`-m 'not integration'` precedent) would give the appearance of coverage without
-the fact of it. The measured cost above is bounded and, in the table, revisable
-on evidence rather than guesswork.
+`fix_task_priority` is `high` (the `qdrant-integration` entry alongside it is
+`medium`) because leaf **κ** deletes reify's originals on this suite's green: a
+red here must not sit in a low-priority queue.
 
-**Documented escape, not taken now:** if the recorded wall-clock later proves
-prohibitive, the sanctioned route is `git.offline_lane_commands` in
-`dark-factory-orchestrator.yaml`, which runs a marker-selected bucket
-post-merge, off the verify hot path.
+**The coupling is enforced, not merely documented.**
+`orchestrator/tests/test_warm_lane_bash_bucket_placement.py` asserts the
+biconditional — deselected from the hot path **iff** carried by the lane — so
+landing (a) without (b), which would be silent *zero* coverage, cannot survive a
+verify. A fourth test in that module takes the lane entry's `command` and `cwd`
+verbatim from the loaded config and actually executes a `--collect-only`,
+because a `LaneCommand` whose cwd or venv does not resolve in the
+`_offline-deep` worktree would file green forever while running nothing. That
+module is deliberately **not** marked `warm_lane_bash`, so it keeps running on
+the hot path and cannot deselect itself along with the thing it guards.
 
-**This escape is now the next lever, and the timeout bump was not a substitute
-for it.** The 300/360 → 900/960 re-calibration bought headroom against a
-*measured* fleet-load dilation; it did not make the bucket cheaper, and the
-whole `warm_lane_bash` group is serialised on one xdist worker by design (see
-`xdist_group` below), so its cost is additive on the verify hot path. A future
-bump is the wrong answer — if these figures climb again, take the escape.
+The `warm_lane_bash` marker stays registered and on-demand selectable
+(`-m warm_lane_bash`), which is exactly how the lane re-selects it: a CLI `-m`
+overrides the `addopts` `-m`, last wins. This is the shipped `integration`
+precedent used verbatim — `fused-memory/pyproject.toml` carries
+`-m 'not integration'` while the `qdrant-integration` lane entry re-selects it —
+so no new mechanism is introduced.
+
+**Superseded history (α2, task 3073 — the decision of record for α2 through γ):**
+the ported tests ran in the DEFAULT `orchestrator` suite, with the marker
+registered but deliberately *not* in `addopts`. The rationale was that leaf **γ**
+changes `warm-lane-gc.sh`'s core reclaimability predicate and needed this
+coverage *actually running* on its verify leg, and that a marker-deselected
+bucket would give the appearance of coverage without the fact of it.
+
+**Why that no longer holds.** Half of it is *consumed*: γ **is** task 3075, and
+it has landed, with its verify green and this coverage in place — a
+justification whose condition has been discharged cannot keep justifying the
+placement. The other half inverted on cost. The whole `warm_lane_bash` group is
+serialised onto one xdist worker by design (see `xdist_group` below), so its
+cost is fully additive to the verify critical path and gains nothing from
+`-n auto`. Re-measured for this decision: **289.58s for the 12 items at loadavg
+128.72 (1-min, 32 cores), 2026-08-01** — **6.2x** the 47s module baseline
+recorded above, and consistent with the ~7.6x/~14.7x dilation table at loadavg
+124. All of these are **load-qualified figures** and none may be quoted as an
+unloaded one. The bucket was green at that load (12 passed, no flakes, no
+timeouts): this is a cost decision, not a flakiness one.
+
+**The lever has now been pulled, and the timeout bump was not a substitute for
+it.** The 300/360 → 900/960 re-calibration bought headroom against a *measured*
+fleet-load dilation; it did not make the bucket cheaper. That pair is
+**retained unchanged** and still governs the bucket wherever it runs, including
+on the offline lane. A further bump remains the wrong answer.
+
+**What the relocation costs, stated plainly.** Coverage moves post-merge, so a
+regression no longer blocks a merge. It surfaces instead through the lane's
+existing red path — confirm re-run (the flake filter) → node-id extraction →
+`compute_failing_test_set_fingerprint` → dedup'd autofiled fix task at `high` →
+L0 INFO escalation → staged L2 promotion — within one advance. Coverage is
+*moved*, not lost, but it is strictly weaker than a pre-merge gate, and two
+obligations follow:
+
+- PRD leaves **δ**, **δ2** and **ε** still change warm-lane behaviour and no
+  longer get this coverage for free. Each must run `-m warm_lane_bash`
+  explicitly on its own verify leg.
+- Leaf **ζ**'s recorded go/no-go must read the offline lane's green record
+  before **κ** deletes reify's originals. PRD §9 already specifies ζ's
+  deliverable as "a recorded go/no-go with the log evidence", which the lane's
+  record satisfies.
 
 Each item carries `@pytest.mark.timeout(960)` with an inner subprocess timeout
 of 900s (raised from 360/300 on 2026-07-30 — rationale and arithmetic on

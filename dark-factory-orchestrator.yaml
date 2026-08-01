@@ -341,6 +341,50 @@ git:
       command: "pytest -m integration"
       cwd: "fused-memory"
       fix_task_priority: "medium"
+    # PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the ported warm-lane bash
+    # bucket moves OFF the verify hot path and onto this lane — the escape
+    # plans/warm-lane-infra-repatriation-prd.md documented for exactly this
+    # case. Two grounds, both recorded in orchestrator/tests/warm-lane/README.md:
+    #   (1) Half the original justification is CONSUMED. q4's first reason was
+    #       that leaf γ changes warm-lane-gc.sh's core predicate and needed this
+    #       coverage on its verify leg. γ IS task 3075 — it has LANDED, with its
+    #       verify green and this coverage in place.
+    #   (2) The surviving cost ground inverted. Measured 289.58s for the 12
+    #       items at loadavg 128.72 (1-min, 32 cores) on 2026-08-01 — 6.2x the
+    #       README's 47s module baseline. A LOAD-QUALIFIED figure, never to be
+    #       quoted as an unloaded one. ``xdist_group('warm_lane_bash')`` pins
+    #       all 12 items to ONE worker by design, so the cost is fully additive
+    #       to the verify critical path and gains nothing from ``-n auto``.
+    #
+    # COUPLING — the two edits below NEVER move independently:
+    #   (a) orchestrator/pyproject.toml addopts  -m 'not warm_lane_bash'
+    #   (b) this entry                           -m warm_lane_bash
+    # Landing (a) without (b) is silent ZERO coverage — the "appearance of
+    # coverage without the fact of it" q4 originally refused, and leaf κ deletes
+    # reify's originals on the strength of this suite being green.
+    # orchestrator/tests/test_warm_lane_bash_bucket_placement.py asserts the
+    # biconditional and is deliberately NOT marked warm_lane_bash, so it keeps
+    # running on the hot path and cannot deselect itself.
+    #
+    # A CLI ``-m`` overrides the pyproject ``-m`` (last wins) — the same
+    # mechanism the qdrant-integration entry above already relies on. The
+    # confirm re-run adds ``-p no:xdist -o addopts=`` (_serial_pytest_str),
+    # which clears addopts but leaves this CLI ``-m`` intact, so the red-path
+    # confirmation still selects exactly this bucket.
+    #
+    # RELOAD ASYMMETRY: offline_lane_commands IS green-tier hot-reloadable
+    # (RELOADABLE_FIELDS, orchestrator/src/orchestrator/config.py) — unlike
+    # offline_lane_enabled above, this entry takes effect via
+    # mcp__escalation__reload_config with NO restart. The paired addopts change
+    # lands with the merge and needs no reload at all.
+    #
+    # fix_task_priority is "high" (vs qdrant's "medium"): leaf κ deletes reify's
+    # originals on this suite's green, so a red here must not sit in a
+    # low-priority queue.
+    - name: warm-lane-bash
+      command: "pytest -m warm_lane_bash"
+      cwd: "orchestrator"
+      fix_task_priority: "high"
 
 # Variable-depth speculative verify placement (task 2359) — ACTIVATE the deep
 # probe (operator decision, 2026-07-19). probe_fraction=0.5: half of second-slot
