@@ -73,9 +73,9 @@ reify does not (the `.lane-state` record format, whose `state` values are the
 `LaneState` enum in `orchestrator/src/orchestrator/lane_lifecycle.py`; and
 `PROTECTED_PREFIXES` in `orchestrator/src/orchestrator/git_ops.py`). Its
 lane-state half was lifted out of `warm-lane-audit.sh`'s private reader — see
-Delta 4; its protected-prefix half still has no in-tree consumer (leaf γ wired
-the lane-state half only — see Delta 5 for the measured reason and Delta 6 for
-what γ did land).
+Delta 4; its protected-prefix half is consumed by `warm-lane-gc.sh`'s
+`PROTECT_GLOB` default — see Delta 9 (task 3292 closed the drift leaf γ had
+deferred; Delta 6 records what γ did land).
 
 ### Why these ten
 
@@ -240,29 +240,23 @@ changes, both structural:
    synthetic mount, plus a single-definition-site guard: the record-scalar `sed`
    idiom now appears exactly **once** across `*.sh` in this directory.
 
-**`warm-lane-gc.sh` is deliberately untouched by leaf β.** Its hand-maintained
-`PROTECT_GLOB` default still carries the comment admitting it mirrors
-dark-factory's `PROTECTED_PREFIXES` across a repo boundary. β ships what
+**`warm-lane-gc.sh` was deliberately untouched by leaf β**, whose
+hand-maintained `PROTECT_GLOB` default carried a comment admitting it mirrored
+dark-factory's `PROTECTED_PREFIXES` across a repo boundary. β shipped what
 replaces it — `lane_protect_glob` and the machine-checked
-`LANE_PROTECT_GLOB_FALLBACK` — but **leaf γ** owns that file and does the
-rewire, so editing it here would collide with γ's scope for no gain. Note β's
-renderer excludes the bands a pool sweep OWNS (`_lane-`, `_spec-`): handing
-those to gc as *protected* would make it skip every lane in both passes and stop
-reclaim outright.
+`LANE_PROTECT_GLOB_FALLBACK` — leaving the rewire to the leaf that owns that
+file. Note β's renderer excludes the bands a pool sweep OWNS (`_lane-`,
+`_spec-`): handing those to gc as *protected* would make it skip every lane in
+both passes and stop reclaim outright.
 
-**`lane_protect_glob` therefore has NO in-tree consumer yet.** It and
-`LANE_PROTECT_GLOB_FALLBACK` ship ahead of the caller that uses them; today only
-`orchestrator/tests/test_lane_state_lib.py` exercises them. `warm-lane-audit.sh`
-sources the lib but uses only its lane-state half. Two consequences for whoever
-picks up γ, neither of them validated in situ here:
+**That rewire has landed (task 3292) — see Delta 9.** The paragraphs below are
+kept as the record of why it was deferred through two leaves rather than
+overlooked, because the deferral was measured; the resolution is appended to it.
 
-- The `glob="$(lane_protect_glob …)" || glob="$LANE_PROTECT_GLOB_FALLBACK"`
-  contract is a *contract*, not an observed behaviour — no shipped caller
-  exercises the `||` yet.
 - Whatever names the deployment's interactive band must reach the bridge in
-  `REIFY_WARM_LANE_IACT_PREFIX` (below). `warm-lane-gc.sh`'s current
-  hand-maintained default hardcodes `_iact-*`, and also omits `.lane-state` and
-  `.task-meta` — the live INV-5 drift this leaf exists to make un-writable.
+  `REIFY_WARM_LANE_IACT_PREFIX` (below). `warm-lane-gc.sh`'s hand-maintained
+  default hardcoded `_iact-*`, and also omitted `.lane-state` and `.task-meta` —
+  the live INV-5 drift leaf β exists to make un-writable.
 
   **γ did NOT delete that default** (task 3075; this claim previously read
   "persists until γ deletes that default" and is corrected here rather than
@@ -270,10 +264,10 @@ picks up γ, neither of them validated in situ here:
 
   - The rendered glob
     `_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_iact-*`
-    is behaviourally **indistinguishable** from gc.sh's current default under
-    any black-box test: `_merge-verify` is already covered by `_merge-*`, and
-    `.lane-state`/`.task-meta` are dot-prefixed while gc.sh's candidate loop is
-    `"$WORKTREES_DIR"/*/` with no `shopt -s dotglob` anywhere. The sole
+    is behaviourally **indistinguishable** from gc.sh's then-current default
+    under any black-box test: `_merge-verify` is already covered by `_merge-*`,
+    and `.lane-state`/`.task-meta` are dot-prefixed while gc.sh's candidate loop
+    is `"$WORKTREES_DIR"/*/` with no `shopt -s dotglob` anywhere. The sole
     observable payoff is honouring `REIFY_WARM_LANE_IACT_PREFIX`.
   - Measured on this host 2026-07-30, the python bridge costs 1.05s / 4.45s /
     3.48s across three consecutive runs. Negligible against a 25-40 minute
@@ -281,10 +275,33 @@ picks up γ, neither of them validated in situ here:
     the gc bash suite invokes reclaim roughly 30 times — it would materially
     degrade the very suite γ's core change depends on for verification.
 
-  The wiring wants a memoization or an opt-out designed alongside it, so it is
+  The wiring wanted a memoization or an opt-out designed alongside it, so it was
   filed as a follow-up rather than bundled onto the leaf that closes
-  esc-5334-6. Until it lands, `lane_protect_glob` remains a shipped function
-  with no in-tree consumer.
+  esc-5334-6.
+
+  **Resolution (task 3292).** That indistinguishability analysis is what made
+  the wiring cheap to land safely: because the rendered glob is a strict
+  superset of the old literal that no black-box test can tell apart, the test
+  suites could pin the static `LANE_PROTECT_GLOB_FALLBACK` through gc.sh's own
+  already-documented `REIFY_WARM_LANE_GC_PROTECT_GLOB` knob — which the
+  `[ -n "$PROTECT_GLOB" ] ||` default short-circuits *before* the bridge runs —
+  and provably not move a single existing assert. Only the handful of blocks
+  that assert what the DEFAULT protects opt back out, via a named
+  `run_helper_live_default`. So the mitigation is the *existing* knob, not a new
+  one: neither of the two options the follow-up anticipated was taken.
+  In-process memoization was rejected as measurably inapplicable (every one of
+  the ~32 gc-suite invocations is a fresh `bash "$SCRIPT"` process, so there is
+  no process to memoize within), and a cross-process on-disk cache was rejected
+  on principle — a stale cached glob is precisely the silent
+  `PROTECT_GLOB`-vs-`PROTECTED_PREFIXES` drift this leaf exists to make
+  un-writable, and its failure mode is the severe direction.
+
+  The observable payoff is delivered and pinned in both directions (Block X-band
+  in `orchestrator/tests/warm-lane/test_warm_lane_gc.sh`: with
+  `REIFY_WARM_LANE_IACT_PREFIX=_myiact-`, a `_myiact-` worktree survives and a
+  stock `_iact-` one no longer does). The `||` fallback is no longer a contract
+  either — Block X-degrade exercises it in situ. Re-measured wall-clock for the
+  affected suites is in `orchestrator/tests/warm-lane/README.md`.
 
 ### Delta 5 — `lib_lane_state.sh` reads the deployment's interactive band
 
@@ -322,6 +339,12 @@ Two robustness properties of the same bridge, pinned by the same test class:
   attributable `[warn]` and returns non-zero. This narrows the wrong-root hazard
   to *another dark-factory checkout at the same depth*; it does not eliminate
   it, and that residue is the one case the fail-loud contract cannot detect.
+
+Both halves now have a shipped consumer: `warm-lane-gc.sh`'s `PROTECT_GLOB`
+default (Delta 9). The band override is pinned end-to-end by Block X-band, and
+the root probe above is what Block X-degrade uses to reach the degrade branch
+hermetically — it relocates a copy of gc.sh so the resolved root is `/`, which
+carries no witness.
 
 ### Delta 6 — `warm-lane-gc.sh` decides Pass-1 reclaim from the lane record
 
@@ -722,6 +745,70 @@ genuinely missing `lib_portable.sh` — an incomplete deployment, or a
 hand-assembled project-override copy under `<project_root>/scripts/`. That is
 what makes this a **taxonomy** fix rather than a bug fix, and why it was filed
 low priority.
+
+### Delta 9 — `warm-lane-gc.sh` renders its `PROTECT_GLOB` default from the registry
+
+**`warm-lane-gc.sh` diverges from reify a third time** (after Deltas 3, 6 and
+7). Added by **task 3292**, closing the drift Delta 5 named and leaf γ deferred.
+A different *class* from the two before it: Delta 6 gave gc.sh a new
+dark-factory-owned *input*, and Delta 7 changed path arithmetic, but this
+replaces a reify-sourced **default value** with a dark-factory-native
+**resolution**. Recorded because this file's purpose is that every gc.sh
+divergence from reify stays enumerated, and a value that is now *computed* per
+deployment is not diffable against reify's literal at all.
+
+**The defect.** The default protect set was a hand-copied literal whose own
+comment admitted it mirrored `PROTECTED_PREFIXES` across a repo boundary — an
+INV-5 lockstep duplication whose failure mode is silent: a band added to the
+registry that nobody mirrors becomes a live managed worktree Pass 2 will
+`git worktree remove --force`. It had already drifted (it omitted `.lane-state`
+and `.task-meta`, and hardcoded `_iact-*` for a config-driven band).
+
+**The fix.**
+
+```
+[ -n "$PROTECT_GLOB" ] || \
+    PROTECT_GLOB="$(lane_protect_glob _lane- _spec-)" || \
+    PROTECT_GLOB="$LANE_PROTECT_GLOB_FALLBACK"
+```
+
+No new `source` line: Delta 6 already added `lib_lane_state.sh` behind the
+fail-loud `exit 2` guard. Four properties, none of them cosmetic:
+
+- **`_lane- _spec-` are the bands this sweep OWNS** and must never come back
+  protected — that would make gc skip every lane in both passes, so a python3
+  outage would FREEZE reclaim instead of degrading it, re-creating the
+  2026-07-10 ENOSPC accretion outage (`PROTECT_GLOB_OWNED_POOL_BANDS`).
+- **The `||` is load-bearing.** gc.sh runs `set -euo pipefail` and
+  `lane_protect_glob` fails loud with a non-zero return, so without the fallback
+  a failed render would abort a timer-driven reclaim sweep. With it, the cost is
+  one visible `[warn]` and a degrade to the machine-checked static backstop —
+  never an empty glob, which downstream would read as "nothing is protected".
+- **An explicit `--protect-glob` / `REIFY_WARM_LANE_GC_PROTECT_GLOB` still wins
+  and short-circuits the render before it runs.** `--help` therefore still costs
+  nothing (measured 0.03s, against 0.95s for a render), which is what keeps
+  `orchestrator/tests/test_warm_lane_scripts_shipped.py` cheap.
+- **The replacement comment does not restate the rendered contents.** That would
+  re-create the same mirror one layer up. The three other doc sites that carried
+  the literal (file header, `_usage()`, the env-knob list) moved with it,
+  described by what the set *is*.
+
+**`warm-lane-gc-sweep.sh` is deliberately NOT wired, and this is a verified
+finding rather than an open question.** Re-confirmed by reading its whole arg
+parser and its terminal `exec "$GC_SCRIPT" "${args[@]}"`, where `args` is
+`(reclaim --mount "$MOUNT")` plus an optional `--disk-pressure`: it carries no
+protect glob of its own, has no `--protect-glob` flag, and never had one — the
+only `protect` tokens in the file are comments explaining why a *wrapper-side*
+guard was removed in favour of the per-lane one in the primitive. It therefore
+inherits gc.sh's resolution transitively and the wiring reaches it with zero
+changes. Adding a render there would double the cost on the one production path
+that runs from a systemd timer, for no behaviour change. `lib_lane_state.sh`'s
+header previously named it as an intended caller; that has been corrected.
+
+**Pinned by** Block X in `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` —
+X-band for the payoff (`REIFY_WARM_LANE_IACT_PREFIX` moves which band is
+protected, asserted in both directions) and X-degrade for the `||`. Suite
+wall-clock and the test-side cost mitigation: `orchestrator/tests/warm-lane/README.md`.
 
 ## Sibling-seed defaults, and who resolves them
 
