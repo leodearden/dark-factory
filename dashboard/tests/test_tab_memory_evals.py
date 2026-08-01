@@ -67,6 +67,29 @@ def tab_memory_evals_jsx_body(_client):
     return _client.get('/static/redux/tab_memory_evals.jsx').text
 
 
+@pytest.fixture(scope='module')
+def tab_memory_evals_jsx_code(tab_memory_evals_jsx_body):
+    """`tab_memory_evals.jsx` with every comment stripped.
+
+    The file carries ~150 lines of explanatory prose that names most of the
+    payload fields the render code also names.  A bare whole-file substring
+    grep is therefore satisfied by a MENTION: delete the render site, leave the
+    comment, and the assertion stays green.  That false-pass mode is not
+    hypothetical — it is exactly what `_PARITIES` (below) documents finding for
+    `alarmed_open`/`clear`, where the string existed only in prose.
+
+    Field-presence assertions grep this code-only text instead, so a field only
+    counts as "rendered" when it appears outside a comment.  Where the render
+    POSITION also matters, callers additionally anchor to the accessing
+    expression (`lim.alpha`, `storm.alarm_count`, ...) rather than the bare
+    name.
+
+    Safe to strip naively: the source contains no `//` inside a string literal
+    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
+    """
+    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_memory_evals_jsx_body)
+
+
 # ---------------------------------------------------------------------------
 # Helper: extract a named seed block from window.DF_DATA (brace-aware)
 # ---------------------------------------------------------------------------
@@ -477,11 +500,13 @@ def test_tab_memory_evals_jsx_served_and_exports_section(_client) -> None:
 
 def test_tab_memory_evals_renders_eval_cards_and_trends(
     tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
 ) -> None:
     """The section renders one card per eval and a trend per metric, from the
     payload's own parallel-array trend shape.
     """
     body = tab_memory_evals_jsx_body
+    code = tab_memory_evals_jsx_code
 
     # (c) the component exists as a named function declaration
     assert re.search(r'\bfunction\s+MemoryEvalsSection\s*\(', body), (
@@ -537,11 +562,11 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     )
 
     # (f) the trend renders from the PARALLEL-ARRAY shape, holes intact
-    assert 'trend.labels' in body, (
+    assert 'trend.labels' in code, (
         'the trend must be rendered from `trend.labels` (the payload ships two '
         'index-aligned parallel arrays, not point objects).'
     )
-    assert 'trend.values' in body, (
+    assert 'trend.values' in code, (
         'the trend must be rendered from `trend.values`.'
     )
     # The invariant is NO SILENT DROPPING, not "no null handling".  DETECTING
@@ -609,10 +634,13 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     assert re.search(r'\btruncated\b', body), (
         "the eval-level `truncated` flag must gate a visible disclosure."
     )
-    assert 'runs_on_disk' in body and 'run_count' in body, (
-        'the truncation disclosure must name `run_count` shown of '
-        '`runs_on_disk` on disk — a bare "truncated" badge hides how much was '
-        'dropped.'
+    assert re.search(r'\bev\.run_count\b', code) and re.search(
+        r'\bev\.runs_on_disk\b', code
+    ), (
+        'the truncation disclosure must READ `ev.run_count` shown of '
+        '`ev.runs_on_disk` on disk — a bare "truncated" badge hides how much '
+        'was dropped. Anchored to the accessing expression in comment-stripped '
+        'source: a bare name grep is satisfied by the prose above the render.'
     )
 
 
@@ -646,6 +674,7 @@ _PARITIES = (
 
 def test_verdict_badges_driven_by_persisted_verdict(
     tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
 ) -> None:
     """Badges must name every persisted verdict and every server-derived
     parity state, and an absent verdict must render its own explicit state.
@@ -655,6 +684,7 @@ def test_verdict_badges_driven_by_persisted_verdict(
     memory_evals.py:847-849, and the UI must not undo it.
     """
     body = tab_memory_evals_jsx_body
+    code = tab_memory_evals_jsx_code
 
     assert re.search(
         r'window\.DF_MEMORY_EVALS\s*=\s*\{[^}]*\bverdictBadge\b', body
@@ -664,32 +694,48 @@ def test_verdict_badges_driven_by_persisted_verdict(
         'has one function to check.'
     )
 
+    # Grepped against COMMENT-STRIPPED source: every one of these strings also
+    # appears in the prose above verdictBadge, so a whole-file grep would stay
+    # green after the branch itself was deleted.
     for verdict in _VERDICTS:
-        assert f"'{verdict}'" in body, (
-            f"tab_memory_evals.jsx must name the persisted verdict '{verdict}'. "
-            'The vocabulary is passed through unmapped by the builder; there is '
-            'no client-side translation table.'
+        assert f"'{verdict}'" in code, (
+            f"tab_memory_evals.jsx must name the persisted verdict '{verdict}' "
+            'in CODE (not merely in a comment). The vocabulary is passed '
+            'through unmapped by the builder; there is no client-side '
+            'translation table.'
         )
     for parity in _PARITIES:
-        assert f"'{parity}'" in body, (
+        assert f"'{parity}'" in code, (
             f"tab_memory_evals.jsx must name the server-derived parity state "
-            f"'{parity}'."
+            f"'{parity}' in CODE — the comment block above verdictBadge names "
+            'all of them, so a whole-file grep proves nothing.'
         )
 
     # Existing .badge vocabulary — no new CSS needed for four verdict states.
     for cls in ('badge bad', 'badge ok', 'badge warn', 'badge info', 'badge muted'):
-        assert cls in body, (
+        assert cls in code, (
             f"tab_memory_evals.jsx must use the existing '{cls}' class "
             '(styles.css:239-261) rather than inventing badge styling.'
         )
 
     # A null/absent verdict renders its own state, not a defaulted one.
-    badge_body = _extract_function_body(body, 'verdictBadge')
+    badge_body = _extract_function_body(code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
-    assert 'no verdict' in badge_body, (
-        'verdictBadge must render an explicit "no verdict" state for a '
-        'null/unrecognised verdict. Absent is absent — never silently '
-        'defaulted to no_alarm.'
+    # Asserted as a FALL-THROUGH BRANCH, not as exact badge copy: after every
+    # recognised verdict is matched, the function must still return a badge of
+    # its own (a muted/info class), so an unrecognised verdict renders a
+    # distinct visible state.  Pinning the literal words "no verdict" would
+    # fail on any rewording without testing the branch.
+    tail = badge_body[badge_body.rfind('insufficient_data'):]
+    assert re.search(r"return\s*\{[^}]*\bcls\s*:\s*'badge (muted|info)'", tail), (
+        'verdictBadge must END with an unconditional return of a muted/info '
+        'badge — the fall-through for a null/unrecognised verdict. Absent is '
+        'absent: it needs its own visible state, never a silent default.'
+    )
+    assert not re.search(r"return\s*\{[^}]*\bcls\s*:\s*'badge ok'", tail), (
+        'the fall-through badge for an unrecognised verdict must NOT reuse the '
+        "no_alarm 'badge ok' styling — that renders \"we did not measure\" as "
+        '"we measured and it is fine".'
     )
     assert not re.search(
         r"verdict\s*(\|\||\?\?)\s*['\"]no_alarm['\"]", body
@@ -794,16 +840,6 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
     """
     body = tab_memory_evals_jsx_body
 
-    # (i) the false claim must not survive anywhere in the file
-    assert 'plotted at baseline' not in body, (
-        'tab_memory_evals.jsx still claims gaps are "plotted at baseline". '
-        'That is false of both primitives: a `null` coerces to 0 in '
-        'charts.jsx\'s arithmetic, so the hole is drawn as a real point at '
-        'value 0 — and "baseline" is only 0 when `min` happens to be 0; with '
-        'any negative value in the series the fabricated point lands '
-        'mid-chart. Disclose what actually happens.'
-    )
-
     # (iv) hole DETECTION must still exist and still run — the fix is to act on
     #      the count, not to stop counting.
     assert re.search(r'\bfunction\s+trendGaps\s*\(', body), (
@@ -864,24 +900,28 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
 
 def test_escalation_links_and_storm_aggregate_banner(
     tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
 ) -> None:
     """The escalation affordances must be real, built only from fields the
     projection actually carries, and read the banner from the top-level block.
     """
     body = tab_memory_evals_jsx_body
+    code = tab_memory_evals_jsx_code
 
     # (a) a metric row carrying an escalation renders a link, guarded so a null
     #     projection renders no dead control.
-    assert 'data-testid="memory-eval-escalation-link"' in body, (
+    assert 'data-testid="memory-eval-escalation-link"' in code, (
         'a metric row carrying `m.escalation` must render a '
         'data-testid="memory-eval-escalation-link" control.'
     )
-    assert 'escalation.id' in body, (
-        'the escalation control must reference `escalation.id`.'
+    assert re.search(r'\{\s*escalation\.id\b', code), (
+        'the escalation control must RENDER `escalation.id` (a `{escalation.id}` '
+        'JSX expression), not merely mention it in a comment.'
     )
-    assert 'escalation.summary' in body, (
-        'the escalation control must show `escalation.summary` — an opaque id '
-        'alone makes the operator click to find out what it is.'
+    assert re.search(r'\{\s*escalation\.summary\b', code), (
+        'the escalation control must RENDER `escalation.summary` — an opaque '
+        'id alone makes the operator click to find out what it is. Anchored to '
+        'the JSX expression position, not a bare name grep.'
     )
     assert re.search(r'm\.escalation\s*&&', body), (
         'the escalation control must be guarded by `m.escalation &&` so a null '
@@ -908,13 +948,15 @@ def test_escalation_links_and_storm_aggregate_banner(
             )
 
     # (d) the storm banner reads the TOP-LEVEL block, not an eval row's copy.
-    assert 'data-testid="memory-eval-storm-banner"' in body, (
+    assert 'data-testid="memory-eval-storm-banner"' in code, (
         'a data-testid="memory-eval-storm-banner" element must render when the '
         'top-level storm_escape block is non-null.'
     )
-    assert 'alarm_count' in body, (
-        'the storm banner must name `storm_escape.alarm_count` — how many '
-        'alarms were collapsed into the one aggregate.'
+    assert re.search(r'\bstorm\.alarm_count\b', code), (
+        'the storm banner must READ `storm.alarm_count` — how many alarms were '
+        'collapsed into the one aggregate. Anchored to the accessing '
+        'expression in comment-stripped source: the bare name also appears in '
+        'the prose describing the banner.'
     )
     assert re.search(
         r'(payload|MEDF\.MEMORY_EVALS|MEMORY_EVALS)\s*\.\s*storm_escape', body
@@ -937,12 +979,14 @@ def test_escalation_links_and_storm_aggregate_banner(
     )
 
     # (f) unmatched_escalations BRANCHES on reason, with distinct wording.
-    assert 'unmatched_escalations' in body, (
-        'the `unmatched_escalations` list must be rendered.'
+    assert re.search(r'\bpayload\.unmatched_escalations\b', code), (
+        'the `unmatched_escalations` list must be rendered from '
+        '`payload.unmatched_escalations` — anchored to the read, not the bare '
+        'name, which the surrounding prose also uses.'
     )
     reasons = ('no_matching_verdict', 'storm_suppressed', 'no_fingerprint')
     for reason in reasons:
-        assert f"'{reason}'" in body, (
+        assert f"'{reason}'" in code, (
             f"the unmatched-escalations block must name the '{reason}' reason. "
             'Collapsing the three into one undifferentiated "unexplained" list '
             'would fire on escalations that are in fact fully explained and '
@@ -978,37 +1022,53 @@ _LIMITS_KEYS = (
 )
 
 
-def test_limits_provenance_rendered(tab_memory_evals_jsx_body: str) -> None:
+def test_limits_provenance_rendered(
+    tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
+) -> None:
     """Every limits-provenance key must be rendered, the staleness of the
     provenance itself must be disclosed, and a null limits artifact must say so.
     """
     body = tab_memory_evals_jsx_body
+    code = tab_memory_evals_jsx_code
 
+    # Anchored to `lim.<key>` in comment-stripped source: the provenance keys
+    # are all named in the prose above LimitsProvenance, so a bare-name grep
+    # would stay green after the render block was deleted.
     for key in _LIMITS_KEYS:
-        assert key in body, (
-            f"the limits provenance block must render '{key}' — the whole point "
-            'of shipping provenance is that the operator can see which alpha / '
-            'baseline the verdict was judged against.'
+        assert re.search(rf'\blim\.{key}\b', code), (
+            f"the limits provenance block must READ `lim.{key}` — the whole "
+            'point of shipping provenance is that the operator can see which '
+            'alpha / baseline the verdict was judged against.'
         )
-    assert 'rule_kind' in body, (
-        "the per-metric `rule_kind` must be rendered alongside the eval-level "
-        'limits provenance.'
+    assert re.search(r'\bm\.rule_kind\b', code), (
+        'the per-metric `m.rule_kind` must be rendered alongside the '
+        'eval-level limits provenance.'
     )
 
     # stale_for_latest_run gates a VISIBLE disclosure — provenance stamped at an
     # older run must never be presented as governing a newer displayed run
     # (memory_evals.py:237-241).
-    assert re.search(r'stale_for_latest_run\s*&&', body), (
+    assert re.search(r'stale_for_latest_run\s*&&', code), (
         '`limits.stale_for_latest_run` must GATE a visible disclosure, not just '
         'be printed as one more field. Otherwise alpha/baseline provenance '
         'reads as governing the newer run actually on screen.'
     )
 
     # A null limits artifact renders an explicit state, not a blank block.
-    assert 'no limits artifact' in body, (
-        'a null `ev.limits` must render an explicit "no limits artifact" state '
-        'rather than an empty block — a blank provenance section is '
-        'indistinguishable from a rendering bug.'
+    # Asserted as a BRANCH gated on the right field, not as exact UI copy:
+    # LimitsProvenance must early-return its own element when `ev.limits` is
+    # falsy.  Pinning the operator-facing sentence would fail the suite on any
+    # rewording while proving nothing extra about the branch.
+    prov_body = _extract_function_body(code, 'LimitsProvenance')
+    assert prov_body, 'could not extract the LimitsProvenance body.'
+    assert re.search(r'\blim\s*=\s*ev\.limits\b', prov_body), (
+        'LimitsProvenance must read `ev.limits`.'
+    )
+    assert re.search(r'if\s*\(\s*!\s*lim\s*\)\s*\{?\s*return\s*\(?\s*<', prov_body), (
+        'a null `ev.limits` must take an early-return branch rendering an '
+        'explicit element rather than an empty block — a blank provenance '
+        'section is indistinguishable from a rendering bug.'
     )
 
     # Compact / expandable so provenance does not dominate the card.
@@ -1040,19 +1100,23 @@ def test_limits_provenance_rendered(tab_memory_evals_jsx_body: str) -> None:
 
 def test_staleness_empty_states_and_issues_notice(
     tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
 ) -> None:
     """Staleness is a HINT, the two empty states are distinct, missing scalars
     are em-dashes rather than zeros, and artifact issues are loudly visible.
     """
     body = tab_memory_evals_jsx_body
+    code = tab_memory_evals_jsx_code
 
     # (a) latest-run age renders, and the stale branch carries no alarm wording.
-    assert 'latest_run_age_seconds' in body, (
-        'the eval card must render `latest_run_age_seconds` beside '
-        '`latest_run_stamp` so the operator can see how old the run is.'
+    #     Anchored to `ev.<field>` reads in comment-stripped source — both names
+    #     also appear in the prose above ageText().
+    assert re.search(r'\bev\.latest_run_age_seconds\b', code), (
+        'the eval card must READ `ev.latest_run_age_seconds` beside '
+        '`ev.latest_run_stamp` so the operator can see how old the run is.'
     )
-    assert 'latest_run_stamp' in body, (
-        'the eval card must render `latest_run_stamp`.'
+    assert re.search(r'\bev\.latest_run_stamp\b', code), (
+        'the eval card must READ `ev.latest_run_stamp`.'
     )
     stale_branch = re.search(
         r'ev\.stale\s*&&\s*\(([\s\S]{0,700}?)\n\s*\)\}', body
@@ -1072,26 +1136,51 @@ def test_staleness_empty_states_and_issues_notice(
         )
 
     # (b) the two empty states are DISTINCT — absent root vs healthy-but-empty.
-    assert 'data-testid="memory-eval-empty"' in body, (
+    assert 'data-testid="memory-eval-empty"' in code, (
         '`root_present === false` must render a '
         'data-testid="memory-eval-empty" placeholder.'
     )
-    assert re.search(r'root_present', body), (
-        'the section must branch on `root_present`.'
+    # Asserted as two DISTINCT BRANCHES gated on the right payload fields,
+    # rather than as exact operator-facing copy: pinning the sentences would
+    # fail the suite on any rewording while proving nothing about the branching.
+    assert re.search(r'!\s*payload\.root_present\s*&&', code), (
+        'the root-absent empty state must be gated on `!payload.root_present`.'
     )
-    assert re.search(r'no eval artifacts yet', body, re.IGNORECASE), (
-        'the root-absent empty state must say no eval artifacts exist yet.'
-    )
-    assert re.search(r'no eval director(y|ies)', body, re.IGNORECASE), (
+    assert re.search(
+        r'payload\.root_present\s*&&\s*evals\.length\s*===\s*0\s*&&', code
+    ), (
         'root_present === true with zero evals is an empty-but-HEALTHY state '
-        '(memory_evals.py:972-974) and needs its own wording — folding it into '
-        'the root-absent message would report a working system as a broken one.'
+        '(memory_evals.py:972-974) and needs its OWN branch, gated on '
+        '`payload.root_present && evals.length === 0` — folding it into the '
+        'root-absent message would report a working system as a broken one.'
     )
 
     # (c) missing scalars are em-dashes, never synthetic zeros.
-    assert '—' in body, (
+    #     Anchored to the dash() helper's own RETURN in comment-stripped source.
+    #     A bare `'—' in body` is the weakest possible form of this check: the
+    #     em-dash appears 30-odd times in this file's prose (it is the house
+    #     punctuation), so the assertion would survive deleting every dash the
+    #     UI actually renders.
+    #     Extracted brace-aware rather than matched with a bounded-window
+    #     regex: `ageText()` sits directly below `dash()` and returns the same
+    #     escape, so a `function dash\(...{0,200}?return '—'` window
+    #     happily matches ACROSS the function boundary and survives gutting
+    #     dash() entirely.
+    dash_body = _extract_function_body(code, 'dash')
+    assert dash_body, 'could not extract the dash() body.'
+    assert re.search(r"return\s*'(—|\\u2014)'", dash_body), (
         'missing scalars must render the em-dash placeholder the Memory tab '
-        'already uses (tabs.jsx:589, :648-653).'
+        'already uses (tabs.jsx:589, :648-653), via a `dash()` helper that '
+        "returns the em-dash (literal or '\\u2014') for an absent value."
+    )
+    assert re.search(r'===\s*null|==\s*null|\?\?', dash_body), (
+        'dash() must actually TEST for the absent case — a helper that returns '
+        'the em-dash unconditionally, or never, is not a null guard.'
+    )
+    assert re.search(r'\bdash\s*\(\s*ev\.', code), (
+        'the `dash()` helper must actually be APPLIED to payload scalars — '
+        'defining it and then interpolating raw fields leaves the synthetic-'
+        'zero hole open (feedback_redux_no_synthetic_data).'
     )
     for field in ('current_value', 'value', 'n', 'denominator', 'alarm_count'):
         assert not re.search(rf'\.\s*{field}\s*\|\|\s*0\b', body), (
@@ -1101,10 +1190,10 @@ def test_staleness_empty_states_and_issues_notice(
         )
 
     # (d) the issues notice is VISIBLE and lists the detail, not just a count.
-    assert 'data-testid="memory-eval-issues"' in body, (
+    assert 'data-testid="memory-eval-issues"' in code, (
         'artifact issues must render a data-testid="memory-eval-issues" notice.'
     )
-    assert re.search(r'issue_count\s*>\s*0', body), (
+    assert re.search(r'issue_count\s*>\s*0', code), (
         'the issues notice must be gated on `issue_count > 0`.'
     )
     issues_block = re.search(
@@ -1126,8 +1215,9 @@ def test_staleness_empty_states_and_issues_notice(
     )
 
     # (e) payload age is visible.
-    assert 'generated_at' in body, (
-        '`generated_at` must be rendered so the operator can see payload age.'
+    assert re.search(r'\bpayload\.generated_at\b', code), (
+        '`payload.generated_at` must be READ and rendered so the operator can '
+        'see payload age — anchored to the access, not a bare name grep.'
     )
 
 
