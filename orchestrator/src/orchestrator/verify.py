@@ -2790,6 +2790,16 @@ class CheckRun:
     timed_out: bool
     started_at: 'str | None'
     duration_secs: float
+    # Per-segment execution facts when this check ran as a SEGMENTED `&&`
+    # chain (task 3338 / esc-3062-2); ``None`` when it did not. LAST field so
+    # every pre-3338 positional construction site stays valid. A plain
+    # JSON-native ``list[dict]`` rather than a nested dataclass, for the same
+    # reason the rest of this schema is flat: ``to_dict()``'s output is written
+    # straight into JSON, so anything needing its own serialisation step is a
+    # second place for the shape to drift. ``[]`` would mean "segmented but
+    # with no segments" — an impossible state ``split_and_chain_segments``'
+    # fewer-than-2 refusal already prevents.
+    segments: 'list[dict] | None' = None
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -2807,14 +2817,21 @@ class CheckRun:
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
         ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
-        (all take ``list[dict]``) — the exact 7-key shape previously hand-built
-        inline in ``run_verification`` (label/cmd/rc/output/timed_out/
-        started_at/duration_secs).
+        (all take ``list[dict]``) — the exact 8-key shape (label/cmd/rc/output/
+        timed_out/started_at/duration_secs/segments), 7 of which were
+        previously hand-built inline in ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
         ``None`` serialises as ``''``, matching the pre-refactor
         ``test_started_at or ''`` pattern so downstream JSON consumers see
         the same shape as before.
+
+        ``segments`` (task 3338) is emitted UNCONDITIONALLY, as ``None`` on an
+        unsegmented run, and passed through verbatim. A conditionally-present
+        key would leave a consumer unable to distinguish "this build predates
+        segments" from "this run was not segmented" — reintroducing an
+        absent-vs-null ambiguity in the very schema whose job is to make
+        skipped-vs-passed unambiguous.
         """
         return {
             'label': self.label,
@@ -2824,6 +2841,7 @@ class CheckRun:
             'timed_out': self.timed_out,
             'started_at': self.started_at or '',
             'duration_secs': self.duration_secs,
+            'segments': self.segments,
         }
 
 
