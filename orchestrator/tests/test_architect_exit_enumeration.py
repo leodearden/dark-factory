@@ -1,48 +1,17 @@
 """Architect/SIMPLE_TASK prompt enumeration of the α/β exit surfaces (task 3034).
 
-PRD: ``plans/architect-already-complete-exits.md`` §ζ ("Update the architect
-prompt/skill exit enumeration to teach: use ``mark_step_committed`` for
-already-committed-green steps (skip implement); use ``report_ready_to_merge``
-for the merge-landing desync (not ``report_unactionable``)").
+PRD: ``plans/architect-already-complete-exits.md`` §ζ.
 
-α (task 3030) landed ``mark_step_committed`` end-to-end, INCLUDING the
-``_PLAN_CREATOR_TOOLS`` grant (see
-``test_architect_all_committed_plan.py::TestArchitectCanReachMarkStepCommitted``).
-β (task 3031) landed ``report_ready_to_merge`` end-to-end EXCEPT the allowlist
-grant — the tool existed on the plan-tools MCP server but no role could reach
-it. ζ's job is twofold:
+After the step-9 review fix, covers: the ``_PLAN_CREATOR_TOOLS`` grant of
+``mcp__plan-tools__report_ready_to_merge`` to ARCHITECT/SIMPLE_TASK (enforced
+by ``agents/invoke.py:979-985``, which builds the backend allowlist from
+``allowed_tools`` — an ungranted tool is unreachable regardless of prompt
+text); the dead-grant check; and bare tool-name-presence anchors for
+``report_ready_to_merge`` / ``mark_step_committed`` on the two roles.py
+system prompts and the two ``BriefingAssembler`` dispatch prompts.
 
-  1. Grant ``mcp__plan-tools__report_ready_to_merge`` to ARCHITECT and
-     SIMPLE_TASK via ``_PLAN_CREATOR_TOOLS`` (roles.py) — otherwise the prose
-     below would teach an exit the agent cannot structurally call.
-  2. Teach BOTH new surfaces in the prompt bodies that enumerate exits:
-     ``ARCHITECT.system_prompt`` (rule-2 exit list + the pre-satisfy note),
-     ``SIMPLE_TASK.system_prompt`` (the "## Rejection artifacts" list), and
-     the two ``BriefingAssembler`` dispatch-time prompts that carry their own
-     rejection-exit enumerations (``build_plan_completion_prompt``,
-     ``build_simple_task_prompt``).
-
-Covered surfaces:
-
-  - ``ARCHITECT.allowed_tools`` / ``SIMPLE_TASK.allowed_tools`` grant
-    ``mcp__plan-tools__report_ready_to_merge`` (and IMPLEMENTER/DEBUGGER
-    deliberately do NOT) — roles.py
-  - The granted name resolves to an actually-registered plan-tools MCP tool
-    (the dead-grant check) — mcp/plan_tools.py
-  - ``ARCHITECT.system_prompt`` enumerates both ``report_ready_to_merge`` and
-    ``mark_step_committed`` with a discriminating when-to-use keyword each —
-    roles.py
-  - ``SIMPLE_TASK.system_prompt`` enumerates both — roles.py
-  - ``BriefingAssembler.build_plan_completion_prompt`` and
-    ``build_simple_task_prompt`` enumerate ``report_ready_to_merge`` (and the
-    former also teaches ``mark_step_committed`` for the partial-plan-resume
-    case) — briefing.py
-
-Assertions here are deliberately COMPACT — tool-name presence plus one
-discriminating keyword per surface, not sentence-wording pins — mirroring the
-existing prompt-anchor convention (``test_roles_staging_command.py``,
-``test_roles_background_warning.py``) and this task's own design decision to
-avoid freezing prose a later prompt-tuning pass would need to touch anyway.
+Prose-window/keyword assertions were deliberately removed in review (design
+decision 4) — do not reintroduce them.
 """
 
 from __future__ import annotations
@@ -53,15 +22,7 @@ import pytest
 
 from orchestrator.artifacts import TaskArtifacts
 
-# ---------------------------------------------------------------------------
-# step-1 RED: allowlist reachability for report_ready_to_merge
-# ---------------------------------------------------------------------------
-#
-# allowed_tools is the ENFORCED tool surface — agents/invoke.py:979-985 builds
-# the backend `--tools` allowlist from it (and loudly drops specs it cannot
-# express), so a tool absent from allowed_tools is structurally unreachable no
-# matter what the prompt says. See the identical rationale in
-# test_architect_all_committed_plan.py::TestArchitectCanReachMarkStepCommitted.
+# allowed_tools is enforced (agents/invoke.py:979-985 builds the backend allowlist from it).
 
 _REPORT_READY_TO_MERGE = 'mcp__plan-tools__report_ready_to_merge'
 
@@ -155,14 +116,7 @@ class TestArchitectPromptEnumeratesNewExits:
         assert 'mark_step_committed' in ARCHITECT.system_prompt
 
 
-# ---------------------------------------------------------------------------
-# step-5 RED: SIMPLE_TASK.system_prompt enumerates both new exits
-# ---------------------------------------------------------------------------
-#
-# workflow.py:4465 routes .task/ready_to_merge.json on the simple-task path
-# with the identical handler as the architect path, so a simple-task agent
-# hitting a merge-landing desync has the same correct exit available and must
-# be taught it.
+# workflow.py:4465 routes .task/ready_to_merge.json on the simple-task path too (same handler).
 
 
 class TestSimpleTaskPromptEnumeratesNewExits:
@@ -177,18 +131,7 @@ class TestSimpleTaskPromptEnumeratesNewExits:
         assert 'mark_step_committed' in SIMPLE_TASK.system_prompt
 
 
-# ---------------------------------------------------------------------------
-# step-7 RED: BriefingAssembler dispatch-time prompts enumerate both new exits
-# ---------------------------------------------------------------------------
-#
-# Separate from the roles.py system_prompt strings covered above: these are
-# the dispatch-time briefings TaskWorkflow actually sends for the
-# partial-plan-resume path (build_plan_completion_prompt) and the SIMPLE_TASK
-# path (build_simple_task_prompt). Fixture shape mirrors test_briefing.py's
-# `briefing` fixture (BriefingAssembler over a tmp_path project_root);
-# `context=''` bypasses the real fused-memory search call, matching the
-# convention used throughout test_briefing.py for methods that accept a
-# `context` override.
+# Dispatch-time briefings, separate from roles.py system_prompt; fixture mirrors test_briefing.py.
 
 
 @pytest.fixture
