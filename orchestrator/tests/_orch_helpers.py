@@ -98,6 +98,38 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # test_merge_queue_invariant_integration_gate.py).
 MERGE_RESULT_TIMEOUT = 45
 
+# task 3307: generous synchronization-barrier ceiling for the workflow
+# CancellationScope tests (test_workflow_cancellation.py).  These barriers
+# wait for REAL work — git worktree creation, artifact writes, stubbed
+# agent round-trips — to reach a known point; they assert nothing about
+# cancellation latency, so a slow-but-correct host must never fail them.
+# Measured on a 32-core host at load avg ~100: the same two tests span
+# 0.26s-3.09s green and were observed failing at exactly 5.01s (the
+# retired inline 5.0s literal), i.e. a >=19x wall-clock tail — which is
+# why 5.0s was inside the distribution rather than above it.  45s is 16x
+# the worst green observation and matches the value already established
+# for this exact shape (task 2350's `wait_for(<event>.wait(), timeout=45.0)`
+# in test_merge_queue_concurrent_verify.py, and MERGE_RESULT_TIMEOUT above).
+# Never-narrow: only replaces literals <=15 in test_workflow_cancellation.py.
+# Any class using it MUST also carry @pytest.mark.timeout(180) — two of
+# these barriers exceed the 60s pyproject default, which pytest-timeout's
+# thread method answers by os._exit()ing the xdist worker.
+CANCEL_SCOPE_BARRIER_TIMEOUT = 45
+
+# task 3307 (reviewer follow-up): small ceiling for the two PURE in-memory
+# CancellationScope barriers in TestCancellationScopeHardCancel — asyncio
+# Task cancellation + on_terminal recording only, no git worktree, no
+# artifact writes, no agent round-trip.  Pairing those with the much larger
+# CANCEL_SCOPE_BARRIER_TIMEOUT above bought no green-path benefit (they
+# resolve in microseconds) while making a genuine CancellationScope
+# regression there take 45s — or up to 180s under a paired
+# @pytest.mark.timeout — to report red instead of pytest's 60s default.
+# Kept above the retired 5.0s literal (never-narrow) for headroom against
+# scheduler jitter under host oversubscription, without borrowing the
+# I/O-sized budget above.  Do NOT use this for a test that drives a real
+# TaskWorkflow — use CANCEL_SCOPE_BARRIER_TIMEOUT for those.
+CANCEL_SCOPE_PURE_UNIT_TIMEOUT = 10
+
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
 _BASEMODEL_PROPS: frozenset[str] = frozenset(
