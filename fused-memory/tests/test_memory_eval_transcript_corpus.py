@@ -25,6 +25,8 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_transcript_corpus.py'
 FIXTURE_ARCHIVE = Path(__file__).parent / 'fixtures' / 'transcript_corpus'
 
@@ -1262,20 +1264,66 @@ class TestSingleTranscriptMode:
         # THE reuse assertion: load_transcript (slurp) and iter_json_lines
         # (stream) feed ONE core, so for the same file they must agree
         # exactly. Any divergence means a second parser has appeared.
+        #
+        # This used to exclude the five path-derived fields, because
+        # --transcript mode passed only `path.name` to parse_archive_path and
+        # so reported them all null. That exclusion hid a real defect
+        # (reviewer_comprehensive/correctness): the debug mode's provenance
+        # was not merely absent, it was WRONG for a subagent transcript, which
+        # came out labelled is_subagent=False. Now that
+        # archive_relative_slice recovers the slice, the two modes must agree
+        # on EVERY field — and the comparison is the whole record.
         _, _, via_slurp = self._cli(FIXTURE_MAIN, tmp_path / 'single')
         _, _, scan_records, _ = _run_cli(FIXTURE_ARCHIVE, tmp_path / 'scan')
         rel = FIXTURE_MAIN.relative_to(FIXTURE_ARCHIVE).as_posix()
         via_scan = [r for r in scan_records if r['transcript'] == rel]
 
-        # Everything the CORE derives must be identical. Only the fields that
-        # come from the archive path itself may differ, since single-file mode
-        # has no archive root to be relative to.
-        from_path = {'transcript', 'task_id', 'session_id', 'is_subagent', 'subagent_id'}
-        def extracted(records):
-            return [{k: v for k, v in r.items() if k not in from_path} for r in records]
-
-        assert extracted(via_slurp) == extracted(via_scan)
+        assert via_slurp == via_scan
         assert len(via_slurp) == 2
+
+    def test_a_subagent_transcript_is_not_reported_as_a_main_session(self, tmp_path):
+        # The specific wrong answer the old `path.name` slice produced. A
+        # subagent transcript mined through the debug path claimed
+        # is_subagent=False with a null subagent_id — confidently wrong, and
+        # exactly what an operator comparing modes would trust.
+        subagent = (
+            FIXTURE_ARCHIVE / '4242' / '-home-leo-src-dark-factory--worktrees-4242'
+            / '11111111-2222-3333-4444-555555555555' / 'subagents'
+            / 'agent-abc123def4567890.jsonl.gz'
+        )
+        _, coverage, records = self._cli(subagent, tmp_path / 'single')
+
+        assert records, 'the fixture subagent transcript holds a search'
+        for record in records:
+            assert record['is_subagent'] is True
+            assert record['subagent_id'] == 'agent-abc123def4567890'
+            assert record['task_id'] == '4242'
+            assert record['session_id'] == '11111111-2222-3333-4444-555555555555'
+        # The guard at the tasks_scanned line is now reachable, where before
+        # task_id was structurally always None and the branch was dead code.
+        assert coverage['tasks_scanned'] == 1
+
+    def test_a_transcript_outside_an_archive_recovers_nothing(self, tmp_path):
+        # The other half of the contract: recovering nothing is correct for a
+        # file that is genuinely not in an archive tree. Inventing provenance
+        # from whatever directories happen to be above it would be worse than
+        # the null it replaces.
+        loose = tmp_path / 'scratch' / 'somewhere' / 'session.jsonl.gz'
+        loose.parent.mkdir(parents=True)
+        with gzip.open(loose, 'wt', encoding='utf-8') as f:
+            f.write(json.dumps(_briefing('claude-task-9001-implementer')) + '\n')
+            f.write(json.dumps(_tool_use('toolu_loose', 'a loose search')) + '\n')
+
+        _, coverage, records = self._cli(loose, tmp_path / 'out')
+
+        assert [r['task_id'] for r in records] == [None]
+        assert records[0]['session_id'] is None
+        assert records[0]['is_subagent'] is False
+        assert records[0]['transcript'] == 'session.jsonl.gz'
+        assert coverage['tasks_scanned'] == 0
+        # The caller identity read from the briefing is unaffected — it comes
+        # from the record bodies, not the path.
+        assert records[0]['caller']['task_id'] == '9001'
 
     def test_unreadable_file_is_total_failure_not_a_traceback(self, tmp_path):
         bad = tmp_path / 'broken.jsonl.gz'
@@ -1480,3 +1528,294 @@ class TestPartiallyWrittenTranscriptsAreCounted:
         assert corrupt_code != empty_code
         assert corrupt_code != 0
         assert empty_code != 0
+
+
+# ===========================================================================
+# Amendment pass — the gaps a code review found after verification passed.
+# ===========================================================================
+
+
+class TestArchiveRelativeSlice:
+    """``--transcript`` recovers the archive-relative tail of an absolute path.
+
+    The unit half of the correctness fix pinned end-to-end in
+    ``TestSingleTranscriptMode``. Operators hand this mode a path from their
+    shell — usually absolute, so the archive root is still on the front. The
+    scan path has already stripped that prefix; this is what lets the debug
+    path arrive at the same string, and therefore at the same provenance.
+    """
+
+    ENC = '-home-leo-src-dark-factory'
+
+    def test_recovers_a_main_session_slice_from_an_absolute_path(self):
+        absolute = f'/home/leo/src/df/data/orchestrator/agent-transcripts/3214/{self.ENC}/sess.jsonl.gz'
+
+        assert _mod.archive_relative_slice(absolute) == f'3214/{self.ENC}/sess.jsonl.gz'
+
+    def test_recovers_a_subagent_slice(self):
+        absolute = (
+            f'/var/archive/3214/{self.ENC}/sess/subagents/agent-ab12.jsonl.gz'
+        )
+
+        assert _mod.archive_relative_slice(absolute) == (
+            f'3214/{self.ENC}/sess/subagents/agent-ab12.jsonl.gz'
+        )
+
+    def test_an_already_relative_slice_is_returned_unchanged(self):
+        rel = f'3214/{self.ENC}/sess.jsonl.gz'
+
+        assert _mod.archive_relative_slice(rel) == rel
+
+    def test_a_non_numeric_task_id_still_matches(self):
+        # Measured on the live archive: 4 of the 409 task dirs are
+        # `df_task_12`-style eval-run ids, not numbers. A digits-only guard on
+        # the task component would silently drop them.
+        rel = f'df_task_12/{self.ENC}/sess.jsonl.gz'
+
+        assert _mod.archive_relative_slice(rel) == rel
+
+    def test_an_arbitrary_three_component_path_is_not_relabelled(self):
+        # The guard that keeps this recovery honest. Without the encoded-cwd
+        # check, ANY path with three trailing components would be read as an
+        # archive slice and its grandparent directory reported as a task id —
+        # a confidently wrong answer, which is worse than the null it would
+        # replace.
+        assert _mod.archive_relative_slice('/tmp/pytest-42/scratch/sess.jsonl.gz') == (
+            'sess.jsonl.gz'
+        )
+
+    def test_a_subagents_dir_without_an_encoded_cwd_is_not_relabelled(self):
+        assert _mod.archive_relative_slice(
+            '/tmp/a/b/c/subagents/agent-ab12.jsonl.gz'
+        ) == 'agent-ab12.jsonl.gz'
+
+    def test_a_bare_file_name_is_returned_as_is(self):
+        assert _mod.archive_relative_slice('sess.jsonl.gz') == 'sess.jsonl.gz'
+
+    def test_the_recovered_slice_round_trips_through_parse_archive_path(self):
+        # The property that makes the whole fix work: what this returns is
+        # exactly what the scan path would have passed, so both modes reach
+        # parse_archive_path with the same string.
+        absolute = f'/var/archive/3214/{self.ENC}/sess/subagents/agent-ab12.jsonl.gz'
+
+        parsed = _mod.parse_archive_path(_mod.archive_relative_slice(absolute))
+
+        assert parsed == {
+            'task_id': '3214',
+            'session_id': 'sess',
+            'is_subagent': True,
+            'subagent_id': 'agent-ab12',
+        }
+
+
+class TestStampIsValidated:
+    """An operator-supplied ``--stamp`` gets the shared shape check.
+
+    All three artifact names carry the stamp, and every declared consumer
+    (leaf eta, the E3/E8 runners) picks a run by ordering those filenames as
+    strings. A stamp of the wrong shape sorts outside the chronological
+    sequence, so ``--stamp latest`` would make a window loader select the
+    wrong run with nothing to signal it. ``shared.memory_eval_metrics`` treats
+    a caller-supplied override as the one thing it must validate; this script
+    was re-implementing the stamp-to-path step without that check
+    (reviewer_comprehensive/robustness).
+    """
+
+    def _archive(self, tmp_path: Path) -> Path:
+        root = tmp_path / 'archive'
+        _write_transcript(root, f'7000/-enc/{"s" * 4}.jsonl.gz', [
+            _briefing('claude-task-7000-implementer'),
+            _tool_use('toolu_a', 'a search'),
+            _tool_result('toolu_a', {'results': [_result('mem-1', 0.9)]}),
+        ])
+        return root
+
+    def test_a_valid_stamp_is_accepted(self, tmp_path):
+        code = _mod.main([
+            '--archive-root', str(self._archive(tmp_path)),
+            '--out-root', str(tmp_path / 'out'), '--stamp', STAMP,
+        ])
+
+        assert code == 0
+        assert (tmp_path / 'out' / _mod.EVAL_ID / f'corpus-{STAMP}.jsonl').exists()
+
+    def test_a_malformed_stamp_exits_with_the_documented_code(self, tmp_path, capsys):
+        code = _mod.main([
+            '--archive-root', str(self._archive(tmp_path)),
+            '--out-root', str(tmp_path / 'out'), '--stamp', 'latest',
+        ])
+
+        assert code == _mod.EXIT_BAD_STAMP
+        # The rejected value and the reason both reach stderr, so an operator
+        # sees which string was refused rather than only a numeric code.
+        stderr = capsys.readouterr().err
+        assert 'latest' in stderr
+        assert '--stamp' in stderr
+
+    def test_a_malformed_stamp_writes_nothing(self, tmp_path):
+        # Rejected BEFORE any path is built, so a bad run leaves no
+        # half-named artifact and no eval directory to mislead a later reader.
+        out_root = tmp_path / 'out'
+
+        _mod.main([
+            '--archive-root', str(self._archive(tmp_path)),
+            '--out-root', str(out_root), '--stamp', 'latest',
+        ])
+
+        assert not (out_root / _mod.EVAL_ID).exists()
+
+    def test_a_malformed_env_stamp_is_a_code_not_a_traceback(self, tmp_path, monkeypatch):
+        # The other route an operator-supplied string enters by. run_stamp()
+        # raises MetricSchemaError for it, which escaped main() as exit 1 —
+        # outside this module's documented vocabulary entirely.
+        monkeypatch.setenv(_mod.RUN_STAMP_ENV_VAR, 'not-a-stamp')
+
+        code = _mod.main([
+            '--archive-root', str(self._archive(tmp_path)),
+            '--out-root', str(tmp_path / 'out'),
+        ])
+
+        assert code == _mod.EXIT_BAD_STAMP
+
+    def test_write_corpus_rejects_the_override_directly(self, tmp_path):
+        from shared.memory_eval_metrics import MetricSchemaError
+
+        with pytest.raises(MetricSchemaError):
+            _mod.write_corpus([], _mod._new_coverage(), tmp_path, stamp='2026-07-31')
+
+    def test_the_bad_stamp_code_is_outside_the_status_table(self):
+        # Deliberately not a fifth status: the four describe how much of an
+        # archive a completed run covered, and a rejected stamp means no run
+        # happened at all. Folding it into total_failure would assert
+        # transcripts were found and none could be read.
+        assert _mod.EXIT_BAD_STAMP not in _mod.EXIT_CODES.values()
+
+
+class TestDefaultArchiveRoot:
+    """The path a bare production invocation takes, and its own worst case.
+
+    ``default_archive_root``'s docstring argues that getting this wrong is
+    this script's worst failure mode — every worktree run of a correct script
+    would report ``no_input``, which trains operators to read exit 2 as normal
+    and hollows out the signal the script exists to create. It had no test
+    (reviewer_comprehensive/test-coverage).
+    """
+
+    def _scope_module(self, monkeypatch, resolver):
+        module = types.ModuleType('fused_memory.models.scope')
+        module.resolve_main_checkout = resolver  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, 'fused_memory.models.scope', module)
+
+    def test_resolves_against_the_main_checkout(self, tmp_path, monkeypatch):
+        self._scope_module(monkeypatch, lambda _start: str(tmp_path / 'main'))
+
+        assert _mod.default_archive_root() == (
+            tmp_path / 'main' / 'data' / 'orchestrator' / 'agent-transcripts'
+        )
+
+    def test_falls_back_to_the_repo_root_when_resolution_fails(self, monkeypatch):
+        # resolve_main_checkout raises ValueError outside a git working tree
+        # or when git is unavailable (a hermetic temp-dir test, say). The
+        # fallback still canonicalizes rather than raising.
+        def _boom(_start):
+            raise ValueError('not a git working tree')
+
+        self._scope_module(monkeypatch, _boom)
+
+        assert _mod.default_archive_root() == (
+            Path(_mod._REPO_ROOT).resolve() / _mod.ARCHIVE_RELPATH
+        )
+
+    def test_it_is_the_default_main_uses(self, tmp_path, monkeypatch):
+        # Wiring, not just the helper: with no --archive-root, main() must
+        # actually scan what default_archive_root returns.
+        archive = tmp_path / 'main' / _mod.ARCHIVE_RELPATH
+        _write_transcript(archive, '8100/-enc/sess.jsonl.gz', [
+            _briefing('claude-task-8100-implementer'),
+            _tool_use('toolu_d', 'found via the default root'),
+            _tool_result('toolu_d', {'results': [_result('mem-9', 0.5)]}),
+        ])
+        self._scope_module(monkeypatch, lambda _start: str(tmp_path / 'main'))
+
+        code = _mod.main(['--out-root', str(tmp_path / 'out'), '--stamp', STAMP])
+
+        corpus = (tmp_path / 'out' / _mod.EVAL_ID / f'corpus-{STAMP}.jsonl')
+        records = [json.loads(line) for line in corpus.read_text().splitlines()]
+        assert code == 0
+        assert [r['query'] for r in records] == ['found via the default root']
+
+    def test_an_absent_default_root_is_no_input_not_a_crash(self, tmp_path, monkeypatch):
+        # The measured worktree case: a worktree has no data/ dir at all, so
+        # the default resolves to a non-existent path. That must land in
+        # no_input / exit 2 — loudly and by name — rather than in a silent
+        # empty corpus or a traceback.
+        self._scope_module(monkeypatch, lambda _start: str(tmp_path / 'no-such-checkout'))
+
+        code = _mod.main(['--out-root', str(tmp_path / 'out'), '--stamp', STAMP])
+
+        coverage = json.loads(
+            (tmp_path / 'out' / _mod.EVAL_ID / f'coverage-{STAMP}.json').read_text())
+        assert code == _mod.EXIT_CODES['no_input'] == 2
+        assert coverage['status'] == 'no_input'
+
+
+class TestFlagWiring:
+    """``--tool-name`` and ``--max-failure-examples`` through ``main()``.
+
+    Both were only ever exercised via the ``scan_archive(...)`` keyword
+    arguments, so a typo in ``dest=``/``action='append'`` or in the
+    ``frozenset(args.tool_names) if args.tool_names else SEARCH_TOOL_NAMES``
+    fallback would have shipped green (reviewer_comprehensive/test-coverage).
+    """
+
+    LEGACY = 'legacy__memory_search'
+
+    def _archive(self, tmp_path: Path) -> Path:
+        root = tmp_path / 'archive'
+        _write_transcript(root, '8200/-enc/sess.jsonl.gz', [
+            _briefing('claude-task-8200-implementer'),
+            _tool_use('toolu_new', 'current name'),
+            _tool_result('toolu_new', {'results': [_result('mem-1', 0.9)]}),
+            _tool_use('toolu_old', 'historical name', name=self.LEGACY),
+            _tool_result('toolu_old', {'results': [_result('mem-2', 0.8)]}),
+        ])
+        return root
+
+    def test_default_matches_only_the_current_tool_name(self, tmp_path):
+        _, _, records, _ = _run_cli(self._archive(tmp_path), tmp_path / 'out')
+
+        assert [r['query'] for r in records] == ['current name']
+
+    def test_tool_name_flag_selects_a_historical_name(self, tmp_path):
+        # The archive spans months of tool-name history; the flag exists so a
+        # rename is minable without editing the script.
+        _, _, records, _ = _run_cli(
+            self._archive(tmp_path), tmp_path / 'out', '--tool-name', self.LEGACY)
+
+        assert [r['query'] for r in records] == ['historical name']
+        assert [r['tool_name'] for r in records] == [self.LEGACY]
+
+    def test_tool_name_flag_is_repeatable(self, tmp_path):
+        _, _, records, _ = _run_cli(
+            self._archive(tmp_path), tmp_path / 'out',
+            '--tool-name', self.LEGACY, '--tool-name', SEARCH)
+
+        assert sorted(r['query'] for r in records) == ['current name', 'historical name']
+
+    def test_max_failure_examples_flag_caps_the_disclosed_list(self, tmp_path):
+        root = tmp_path / 'archive'
+        for i in range(3):
+            path = root / '8300' / '-enc' / f'bad-{i}.jsonl.gz'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'not gzip at all\n')
+
+        _, coverage, _, report = _run_cli(
+            root, tmp_path / 'out', '--max-failure-examples', '1')
+
+        # The COUNT is never capped — only the example list is, and the
+        # truncation discloses itself in both the mapping and the report.
+        assert coverage['parse_failures']['count'] == 3
+        assert len(coverage['parse_failures']['examples']) == 1
+        assert coverage['parse_failures']['examples_truncated'] is True
+        assert coverage['parse_failures']['examples_omitted'] == 2
+        assert 'more' in report

@@ -89,8 +89,12 @@ holding::
 
 Field provenance, and why each is where it is:
 
-- ``transcript`` is archive-RELATIVE (in ``--transcript`` mode, the bare
-  file name), so the corpus stays portable across machines and checkouts.
+- ``transcript`` is archive-RELATIVE, so the corpus stays portable across
+  machines and checkouts. ``--transcript`` mode recovers that same relative
+  slice from the absolute path it is given (``archive_relative_slice``),
+  falling back to the bare file name only for a transcript that is genuinely
+  not in an archive tree — so the two modes emit identical records for the
+  same file rather than differing on provenance.
 - ``task_id`` / ``session_id`` / ``is_subagent`` / ``subagent_id`` come from
   the archive PATH alone. Records do carry ``isSidechain`` / ``agentId`` /
   ``gitBranch`` hints, but those describe what the agent was doing rather
@@ -220,7 +224,27 @@ if _SCRIPTS_ROOT.exists() and str(_SCRIPTS_ROOT) not in sys.path:
 # situation, same idiom, as escalation/'s imports of orchestrator.*.
 from legibility.digest import load_transcript  # type: ignore[reportMissingImports]  # noqa: E402
 from legibility.inventory import iter_json_lines  # type: ignore[reportMissingImports]  # noqa: E402
-from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR  # noqa: E402
+from shared.memory_eval_metrics import (  # noqa: E402
+    RUN_STAMP_ENV_VAR,
+    MetricSchemaError,
+    metrics_artifact_path,
+    report_artifact_path,
+    run_stamp,
+)
+from shared.memory_eval_metrics import (  # noqa: E402
+    _validate_stamp as validate_stamp,  # noqa: PLC2701
+)
+
+# `_validate_stamp` is imported across a package boundary under an underscore,
+# which normally means "find another way". The alternatives here are worse:
+# re-deriving the stamp regex would be a SECOND definition of a shape that
+# module documents as the one thing it must validate (an override "is going
+# into a filename the window loader will order and cut by string comparison"),
+# and not validating at all is the defect this fixes. The public
+# `run_stamp()`/`write_metric_series(stamp=)` entry points both route through
+# it; this script needs the check WITHOUT their side effects, since it stamps
+# three artifacts of its own. Promoting it to that module's `__all__` is a
+# one-line change filed as a follow-up — outside this task's locked modules.
 
 # INV-5 / D9: TWO existing readers, ONE core, ZERO new parsers. The scan path
 # streams via iter_json_lines (memory-bounded across thousands of multi-MB gz
@@ -297,6 +321,60 @@ def parse_archive_path(rel_path: str | Path) -> dict[str, Any]:
         parsed['is_subagent'] = True
         parsed['subagent_id'] = _strip_transcript_suffix(parts[4])
     return parsed
+
+
+def _is_encoded_cwd(part: str) -> bool:
+    """Does *part* look like ``transcript_archive``'s encoded-cwd directory?
+
+    ``encode_cwd`` maps ``/`` to ``-``, so an absolute working directory
+    always encodes to a leading ``-``. Measured across the live archive's 499
+    distinct level-2 directories: ALL 499 start with ``-``.
+
+    This is the discriminator :func:`archive_relative_slice` needs and the
+    task-id component cannot supply — task dirs are usually numeric but not
+    always (the live archive holds ``df_task_12``-style ids from eval runs),
+    so "is it a number" would both over- and under-match.
+    """
+    return part.startswith('-')
+
+
+def archive_relative_slice(path: str | Path) -> str:
+    """The archive-relative tail of *path*, or its bare name if it has none.
+
+    ``--transcript`` mode is handed a path from the operator's shell — usually
+    absolute, and therefore carrying the archive root as a prefix that the
+    scan path has already stripped. Passing it to :func:`parse_archive_path`
+    whole yields the wrong task id (some ancestor directory name); passing
+    only ``path.name`` yields a single component, which parses to task_id
+    ``None`` and drags session/subagent identity to null with it.
+
+    So recover the slice: if the tail matches one of the two layouts
+    ``shared.transcript_archive`` writes, return exactly those 3 (or 5)
+    components; otherwise return the bare file name, which parses to the
+    all-null provenance that is the honest answer for a transcript sitting
+    outside any archive tree.
+
+    WHY this matters beyond tidiness: ``--transcript`` is the documented
+    operator DEBUG path, so its output is read side by side with the scan
+    path's. Without this, a subagent transcript mined here reported
+    ``is_subagent: false`` and a null task — a confidently wrong answer, and
+    the exact kind an operator comparing two modes would trust
+    (reviewer_comprehensive/correctness, task 3214 amendment pass).
+
+    The layout is matched, never assumed: the encoded-cwd component must
+    actually look like one (:func:`_is_encoded_cwd`), so an arbitrary
+    ``a/b/c.jsonl`` under some temp dir is NOT silently relabelled with
+    ``a`` as its task id. Recovering nothing is correct there; inventing
+    provenance is not.
+    """
+    parts = Path(path).parts
+    # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+    if len(parts) >= 5 and parts[-2] == 'subagents' and _is_encoded_cwd(parts[-4]):
+        return Path(*parts[-5:]).as_posix()
+    # <task_id>/<enc-cwd>/<session_id>.jsonl.gz
+    if len(parts) >= 3 and _is_encoded_cwd(parts[-2]):
+        return Path(*parts[-3:]).as_posix()
+    return Path(path).name
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +798,7 @@ def scan_transcript(
     path = Path(path)
     coverage = _new_coverage()
     coverage['transcripts_found'] = 1
-    rel = path.name
+    rel = archive_relative_slice(path)
     provenance = parse_archive_path(rel)
     if provenance['task_id'] is not None:
         coverage['tasks_scanned'] = 1
@@ -756,6 +834,22 @@ wrapper reads the exit code and never opens the artifact. ``degraded`` is 0
 deliberately: a partial failure that is fully disclosed (a count plus a
 bounded, self-disclosing example list) still yields a usable corpus, while a
 wholesale failure does not.
+"""
+
+EXIT_BAD_STAMP = 4
+"""A malformed ``--stamp`` / ``$MEMORY_EVAL_RUN_STAMP``: no run, no artifacts.
+
+Deliberately OUTSIDE :data:`EXIT_CODES` rather than a fifth status. Those four
+describe how much of an archive a completed run covered; this one says the run
+never started, so no coverage exists to describe. Folding it into
+``total_failure`` would claim transcripts were found and none could be read —
+a specific, false statement about the archive.
+
+It exists at all because the alternative is a traceback: a malformed stamp
+raises ``MetricSchemaError`` out of the stamp validator, and an uncaught one
+exits 1, which is not in this module's documented vocabulary. The same
+argument that makes a corrupt transcript land inside the status table makes a
+bad stamp land inside the exit-code table.
 """
 
 
@@ -880,6 +974,15 @@ def write_corpus(
     Stamping goes through the shared ``run_stamp``/``RUN_STAMP_ENV_VAR``, so
     one logical memory-eval run correlates across leaves.
 
+    An explicit *stamp* gets the SAME shape check ``run_stamp`` applies to its
+    env-var route, because overriding is precisely how a caller would
+    otherwise sidestep the validated field. All three artifact names carry the
+    stamp, and every declared consumer (leaf η, the E3/E8 runners) picks a run
+    by ordering those filenames as strings — so ``--stamp latest`` would sort
+    outside the chronological sequence and silently select the wrong run. A
+    malformed stamp raises ``MetricSchemaError`` here, BEFORE any path is
+    built or any directory created, so a rejected run leaves nothing behind.
+
     The layout is delegated, never restated: ``report_artifact_path`` already
     produces ``<root>/<eval_id>/report-<STAMP>.txt``, so it is called
     verbatim, and the two artifacts with no helper are placed in the directory
@@ -895,13 +998,7 @@ def write_corpus(
     concurrent reader, and copying ``memory_eval_metrics._atomic_write_text``
     (itself already a documented copy) would create a third copy of it.
     """
-    from shared.memory_eval_metrics import (  # noqa: PLC0415
-        metrics_artifact_path,
-        report_artifact_path,
-        run_stamp,
-    )
-
-    stamp = stamp or run_stamp()
+    stamp = validate_stamp(stamp, what='--stamp') if stamp else run_stamp()
     report_path = report_artifact_path(out_root, EVAL_ID, stamp)
     directory = metrics_artifact_path(out_root, EVAL_ID, 'ignored').parent
     directory.mkdir(parents=True, exist_ok=True)
@@ -986,7 +1083,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--stamp',
         default=None,
-        help=f'Run stamp; defaults to ${RUN_STAMP_ENV_VAR} or the current UTC time.',
+        help=f'Run stamp; defaults to ${RUN_STAMP_ENV_VAR} or the current UTC '
+             'time. Must be a YYYYmmddTHHMMSSZ stamp — artifact names are '
+             f'ordered by string comparison. A malformed one exits '
+             f'{EXIT_BAD_STAMP} and writes nothing.',
     )
     parser.add_argument(
         '--max-failure-examples',
@@ -1025,7 +1125,17 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     stamp_status(coverage)
-    _, _, report_path = write_corpus(records, coverage, args.out_root, stamp=args.stamp)
+    try:
+        _, _, report_path = write_corpus(
+            records, coverage, args.out_root, stamp=args.stamp
+        )
+    except MetricSchemaError as exc:
+        # The one failure that is a USAGE error rather than a coverage
+        # outcome. Caught here so it reads as a message plus a documented
+        # code, not a traceback plus exit 1 — the scan is already done and
+        # discarded either way, since the stamp names all three artifacts.
+        print(f'error: {exc}', file=sys.stderr)
+        return EXIT_BAD_STAMP
     report = render_report(coverage)
     print(report, end='')
     print(f'report: {report_path}')
