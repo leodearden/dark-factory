@@ -434,7 +434,7 @@ PLAN_QUALITY_SCHEMA = {
 
 
 async def judge_plan_quality(
-    plan: dict,
+    plan: dict | None,
     reference_diff: str,
     task: dict,
     rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
@@ -450,6 +450,33 @@ async def judge_plan_quality(
     semantic judge scores the SAME named structural signals
     :func:`score_plan_structure` weights deterministically.
 
+    THE ANTI-FABRICATION FLOOR APPLIES UNIFORMLY, WHICHEVER SCORING PATH RUNS
+    (task 3303). An artifact that is not :func:`is_scorable_plan` carries
+    nothing to judge, so this function refuses it up front — before a prompt is
+    built, before ``invoke_agent`` — and returns the deterministic floor
+    instead. The guard is the SAME predicate :func:`score_plan_structure`
+    short-circuits on and ``run_architect_eval`` gates on, so the three cannot
+    drift; and the refusal's score is DERIVED by calling
+    :func:`score_plan_structure` rather than hardcoding ``0.0``, so a future
+    change to the floor's semantics carries this path with it structurally
+    rather than by convention. Without it, this instrument's coherence rested
+    entirely on its ONE caller remembering to gate, and any second caller (a
+    backfill/re-scoring script, a new eval path, ``prompt_opt``, a resume wave)
+    silently re-opened the reported defect: the 2026-07-29 corpus cell
+    ``reify_task_12__architect-opus-high__52c66767.json`` records
+    ``plan_steps=0`` alongside ``plan_quality=0.31`` — a value the floor cannot
+    even express (its outputs are multiples of ``0.125``), so it can only have
+    come from an ungated judge scoring an empty artifact.
+
+    That refusal is ``plan_quality=0.0``-not-``None`` DELIBERATELY: ``None``
+    means "no judgement available, degrade to the floor" (parse failure /
+    transport refusal), whereas here the judgement is definite and no infra
+    failure occurred. ``invocation_error`` stays ``None`` for the same reason —
+    nothing was refused at the transport layer. Keeping the two apart preserves
+    the content-failure / infra-failure distinction tasks 3118 and 3302 turn on:
+    a stepless plan from a healthy architect is a real reliability signal worth
+    ``0.0``, never a cap-tainted exclusion.
+
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
     sentinel :func:`run_architect_eval` degrades on), never a crash. When the
     judge's OWN invocation was refused at the transport layer (a 429 cap hit /
@@ -458,6 +485,17 @@ async def judge_plan_quality(
     still degrades to the deterministic structural floor, which remains a
     legitimate content-derived score whenever a real plan exists.
     """
+    if not is_scorable_plan(plan):
+        floor = score_plan_structure(plan)
+        return PlanQualityVerdict(
+            plan_quality=floor,
+            per_criterion={},
+            reasoning=(
+                'plan carries no steps — not a judgeable artifact; scored on '
+                f'the deterministic structural floor ({floor})'
+            ),
+        )
+
     task_name = task.get('name', task.get('id', 'unknown'))
     task_desc = task.get('task_definition', {}).get('description', '')
 
