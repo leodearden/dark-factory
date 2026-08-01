@@ -49,6 +49,17 @@ def service(mock_config):
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    # REQUIRED SETUP, not decoration (task 3198, leaf ε) — do not delete.
+    # `svc.mem0` is a bare MagicMock, so the canonical-uniqueness re-check at
+    # `_apply_memory_metadata_validation` would hit
+    # `await svc.mem0.count_by_metadata(...)` → `TypeError: object MagicMock
+    # can't be used in 'await' expression`, breaking already-green tests that
+    # merely write `canonical: True` (e.g.
+    # TestMemoryMetadataValidationAtSeam::test_valid_metadata_round_trips_to_the_backend).
+    # `0` / `[]` mean "no incumbent", the correct default for every
+    # pre-existing test; `_mm_set_canonical_incumbent` flips them per-test.
+    svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
 
     # Mock durable queue
     svc.durable_queue = MagicMock()
@@ -8929,6 +8940,28 @@ def _mm_install_journal(svc):
     journal = AsyncMock()
     svc.set_write_journal(journal)
     return journal
+
+
+def _mm_set_canonical_incumbent(svc, incumbent_id, *, topic='some-topic', count=1):
+    """Make *svc* report an existing canonical record and return it.
+
+    REQUIRED SETUP for every canonical-uniqueness case, not decoration — do
+    not delete it.  The shared ``service`` fixture stubs
+    ``mem0.count_by_metadata``/``scroll_by_metadata`` to ``0``/``[]``, i.e.
+    "no incumbent", which is the right default for every OTHER test but makes
+    the uniqueness branch UNREACHABLE.  Without this flip a
+    ``pytest.raises(CanonicalUniquenessViolation)`` case would fail, and an
+    ``assert_not_called()`` case would pass for the wrong reason — proving
+    nothing about the re-check while looking like it did.
+
+    *count* is settable independently of the scroll result so the count/scroll
+    race (count says 1, scroll comes back empty) can be staged explicitly.
+    """
+    record = {'id': incumbent_id, 'created_at': '2026-01-01T00:00:00Z',
+              'metadata': {'topic': topic, 'canonical': True}}
+    svc.mem0.count_by_metadata = AsyncMock(return_value=count)
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[record])
+    return record
 
 
 def _mm_configure_project_root(svc, root):
