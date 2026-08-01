@@ -910,7 +910,7 @@ def test_repo_units_are_at_parity_with_themselves():
 
 
 # ---------------------------------------------------------------------------
-# Third-site staleness: the templated dashboard unit  (step-21 / step-22)
+# Third-site lockstep: the templated dashboard unit
 # ---------------------------------------------------------------------------
 #
 # setup-host.sh does NOT cp dark-factory-dashboard.service into
@@ -918,80 +918,21 @@ def test_repo_units_are_at_parity_with_themselves():
 # (scripts/setup-host.sh:362-367, substituting __REPO_ROOT__ and __UV_PATH__),
 # and only cp's the two watchdog units verbatim. So the registry's repo_relpath
 # for this one unit names a file that is NOT the source of the copy being
-# checked: a third site that must agree, which is exactly the shape the
-# checker's own docstring argues against.
+# checked: a third site that must agree.
 #
-# Measured 2026-08-01: the two are byte-identical after templating. Nothing
-# kept them so until this test. The concrete failure it closes: bump
-# TimeoutStopSec in the TEMPLATE alone, and the checker reports DRIFT against
-# the installed copy while its remediation line tells the operator to run
-# setup-host.sh -- which reinstalls that same template and changes nothing. An
-# always-red gate whose remediation cannot converge is how gates get switched
-# off, taking the accidental drift they exist to catch with them.
+# That pair is ALREADY guarded, and more strongly than anything this module
+# could add:
 #
-# Repo-side reads only, so this stays portable and stays green on a host whose
-# installed units are drifted.
-
-# Deliberately NOT this host's real paths: the comparison must not depend on
-# where the repo happens to live, and using foreign values proves it.
-_TEMPLATE_REPO_ROOT = "/srv/dark-factory"
-_TEMPLATE_UV_PATH = "/opt/uv/bin/uv"
-
-
-def _render_dashboard_template() -> str:
-    """Render the dashboard unit template the way setup-host.sh does."""
-    text = (REPO_ROOT / "scripts" / "dashboard.service.template").read_text(
-        encoding="utf-8"
-    )
-    return text.replace("__REPO_ROOT__", _TEMPLATE_REPO_ROOT).replace(
-        "__UV_PATH__", _TEMPLATE_UV_PATH
-    )
-
-
-def test_committed_dashboard_unit_agrees_with_the_installed_template():
-    """The file that actually ships and the file the checker treats as truth agree.
-
-    Uses the REAL registry spec, never a hand-rolled one — a hand-rolled spec
-    would drift from what the checker actually compares, which is the same rot
-    one level down.
-    """
-    mod = _load_checker()
-    spec = mod.UNITS[_DASHBOARD_SERVICE]
-    committed = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
-
-    drifts = mod.compare_unit(spec, committed, _render_dashboard_template())
-
-    assert drifts == [], (
-        "dashboard/dark-factory-dashboard.service and "
-        "scripts/dashboard.service.template have diverged. setup-host.sh "
-        "installs the TEMPLATE, so the checker would compare the installed "
-        "copy against a file that is not its source — reporting drift whose "
-        f"remediation (run setup-host.sh) cannot fix it. Drifts: {drifts}"
-    )
-
-
-def test_template_staleness_guard_has_teeth():
-    """The same comparison DOES fire on a real divergence.
-
-    Without this, the test above could pass while comparing nothing — the
-    exact failure the key-registry staleness test exists to prevent one level
-    down.
-    """
-    mod = _load_checker()
-    spec = mod.UNITS[_DASHBOARD_SERVICE]
-    committed = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
-    rendered = _render_dashboard_template()
-
-    assert "TimeoutStopSec=15" in rendered, (
-        "Mutation target moved; re-point this guard at a live compared "
-        "directive or it silently stops proving anything."
-    )
-    mutated = rendered.replace("TimeoutStopSec=15", "TimeoutStopSec=45")
-
-    drifts = mod.compare_unit(spec, committed, mutated)
-
-    assert [d.key for d in drifts] == ["TimeoutStopSec"], drifts
-
+#     tests/scripts/test_dashboard_service_template.py::
+#         test_template_renders_to_hardcoded_file
+#
+# renders the template with setup-host.sh's own substitutions and asserts
+# BYTE-FOR-BYTE equality with dashboard/dark-factory-dashboard.service. A
+# registry-scoped version of that check would compare only the curated keys, so
+# it would MISS a divergence in any directive nobody thought to register --
+# strictly weaker, and a second guard on the same invariant that fails second.
+# The checker's module docstring and its UNITS entry both point at the
+# byte-for-byte test instead.
 
 # ---------------------------------------------------------------------------
 # Override mechanisms: the unit file is not necessarily what takes effect
@@ -1456,10 +1397,20 @@ def test_main_no_committed_units_is_not_parity(tmp_path: pathlib.Path, capsys):
 def test_main_success_line_counts_only_units_actually_compared(
     tmp_path: pathlib.Path, capsys
 ):
-    """COUNT HONESTY: the report names what was compared, not what was selected.
+    """COUNT HONESTY: the success line names what was compared, not what was selected.
 
-    Asserted in BOTH directions — otherwise deleting the count entirely would
-    satisfy the negative half while telling the operator even less.
+    Only the positive direction is asserted, and deliberately so. The obvious
+    negative half — unlink a committed unit, then assert the count is no longer
+    three — is VACUOUS: that run takes the `vanished` path and returns 1
+    without ever reaching the success line, so "3 unit(s)" is absent for a
+    reason having nothing to do with counting. What the partial run actually
+    prints is asserted by test_main_names_the_vanished_committed_unit below.
+
+    On the success path `len(compared) == len(selected)` always holds: a
+    vanished committed unit returns 1 and an absent installed unit returns 2,
+    both before the success line. The count is therefore honest by
+    construction here, and this test pins the line that reports it rather than
+    a divergence no input can produce.
     """
     mod = _load_checker()
     repo = _fake_repo(tmp_path, mod)
@@ -1471,14 +1422,29 @@ def test_main_success_line_counts_only_units_actually_compared(
         f"With all three compared, the count must say so. Got:\n{full_out}"
     )
 
-    (repo / mod.UNITS[_WATCHDOG_TIMER].repo_relpath).unlink()
-
-    mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
-    partial_out = capsys.readouterr().out
-
-    assert "3 unit(s)" not in partial_out, (
-        "Only two units could be compared; claiming three overstates what the "
-        f"gate verified. Got:\n{partial_out}"
+    # The count tracks the run, not a constant: restricting to one unit must
+    # say one. This is the assertion the vacuous negative half was reaching
+    # for, on a path that actually reaches the success line.
+    assert (
+        mod.main(
+            [
+                "--repo-root",
+                str(repo),
+                "--installed-dir",
+                str(installed),
+                "--unit",
+                _WATCHDOG_TIMER,
+            ]
+        )
+        == 0
+    )
+    single_out = capsys.readouterr().out
+    assert "1 unit(s)" in single_out, (
+        f"One unit was compared; the line must say one. Got:\n{single_out}"
+    )
+    assert "3 unit(s)" not in single_out, (
+        "Claiming three when one was compared overstates what the gate "
+        f"verified. Got:\n{single_out}"
     )
 
 
@@ -1505,6 +1471,11 @@ def test_main_names_the_vanished_committed_unit(tmp_path: pathlib.Path, capsys):
     assert "directive(s) differ" not in out, (
         "Nothing drifted — the two other units are at parity. Reporting a "
         f"directive diff would misdirect the operator. Got:\n{out}"
+    )
+    assert "[ok] parity" not in out, (
+        "The other two units DID match, but the run could not verify the "
+        "third, so no parity line may be printed at all — a partial success "
+        f"line is what let a zero-unit run report '3 unit(s) match'. Got:\n{out}"
     )
 
 
