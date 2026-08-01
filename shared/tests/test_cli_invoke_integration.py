@@ -1,7 +1,9 @@
 """Integration tests: exercise ``claude --resume`` against the real CLI.
 
 These tests invoke the real Claude CLI with haiku to minimize cost (~$0.002/call).
-They require at least one OAuth token in env; cross-account tests need two.
+They require at least one OAuth token in env (`CLAUDE_OAUTH_TOKEN_[BCDEF]`) for
+the `_need_one_account` tests, and two for `_need_two_accounts`. A full run of
+TestCrossAccountResume takes ~6 min of wall clock and costs real money.
 
 **Mechanism.** A Claude CLI session is a LOCAL JSONL transcript at
 ``<config_dir>/projects/<cwd-slug>/<session_id>.jsonl`` — not a server-side,
@@ -15,11 +17,20 @@ NOT necessarily under ``~/.claude``.  Production's reachability guard lives in
 its cap-hit resume branch, which is the single source of truth for what has and
 has not been established about cross-account resume.
 
-**The ``-m integration`` marker is mandatory.** ``shared/pyproject.toml`` sets
-``addopts = "-m 'not integration'"``, so without it every test in this module is
-silently deselected and the run looks green while having executed nothing.
+**DESELECTED BY DEFAULT, and the ``-m integration`` marker is mandatory to run
+them.** The marker is registered + deselected (``addopts = "-m 'not
+integration'"``) in BOTH ``shared/pyproject.toml`` and (as of task 3444) the
+ROOT ``pyproject.toml``. pytest reads only ONE [tool.pytest.ini_options] -- the
+rootdir's inifile -- and never merges the two, so mirroring at the root is what
+keeps a repo-root-bound run (a bare ``pytest`` from the repo root, ``-c
+pyproject.toml``, or any arg set spanning two subprojects) from spending live
+CLI budget here. No ordinary run, from any directory, collects these; without
+``-m integration`` every test in this module is silently deselected and the run
+looks green while having executed nothing.
 
-Run explicitly:  uv run pytest tests/test_cli_invoke_integration.py -xvs -m integration
+Run explicitly, from the repo root:
+    uv run --project shared --directory shared \\
+        pytest tests/test_cli_invoke_integration.py -xvs -m integration
 """
 
 from __future__ import annotations
