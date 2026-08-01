@@ -228,6 +228,15 @@ class UnitSpec:
     # (section, key) pairs whose VALUES must agree. Host-INVARIANT literals
     # only — anything carrying a host path belongs on present_only.
     compared: tuple[tuple[str, str], ...] = ()
+    # (section, key) pairs whose PRESENCE must agree but whose values cannot
+    # be compared. ExecStart, WorkingDirectory and Documentation all embed
+    # absolute host paths (/home/leo/.local/bin/uv, the repo root), so
+    # value-comparing them would report drift on every machine that is not
+    # this one — a gate that fires unconditionally is a gate that gets
+    # switched off. Their MEANINGFUL content is still reached, just not by
+    # string equality: exec_start_flags compares the uvicorn flags inside
+    # ExecStart individually, ignoring the host-specific prefix.
+    present_only: tuple[tuple[str, str], ...] = ()
 
 
 def _render(values: list[str] | None) -> str:
@@ -254,6 +263,10 @@ def compare_unit(
     The full values LIST is compared, not just the first value, so a repeated
     directive that gained or lost an occurrence is caught — systemd applies
     every occurrence, so the checker must see every occurrence.
+
+    ``spec.present_only`` keys are checked for PRESENCE only: a drift is
+    emitted when one copy declares the directive and the other does not, never
+    on a value difference.  See UnitSpec.present_only for why.
     """
     repo = parse_unit_directives(repo_text)
     installed = parse_unit_directives(installed_text)
@@ -278,6 +291,26 @@ def compare_unit(
                 repo_value=_render(repo_values),
                 installed_value=_render(installed_values),
                 reason=reason,
+            )
+        )
+
+    for section, key in spec.present_only:
+        repo_present = key in repo.get(section, {})
+        installed_present = key in installed.get(section, {})
+        if repo_present == installed_present:
+            continue
+        drifts.append(
+            Drift(
+                unit=spec.name,
+                section=section,
+                key=key,
+                repo_value=_render(repo.get(section, {}).get(key)),
+                installed_value=_render(installed.get(section, {}).get(key)),
+                reason=(
+                    "required directive absent from the installed copy"
+                    if repo_present
+                    else "required directive absent from the repo copy"
+                ),
             )
         )
 
