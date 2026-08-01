@@ -8,7 +8,7 @@ action each cycle.  The write depends entirely on the Stage-2 LLM
 structural guarantee.  This module provides the pure, dependency-free
 building blocks for two structural guards:
 
-1. A Stage-2 freshness stat (``report.stats['task_count_snapshot_written']``)
+1. A Stage-2 freshness stat (``report.stats['task_count_snapshot_mem0_written']``)
    computed deterministically in Python from the run-window timestamp of
    existing ``kind='task_count_snapshot'`` Mem0 records — see
    :func:`extract_snapshot_written` and the ``_verify_task_count_snapshot_written``
@@ -33,6 +33,19 @@ Structural template: mirrors :mod:`fused_memory.reconciliation.stage1_stall_dete
 per-task) and journal-backed (not Mem0-marker-backed) — see design_decisions
 in plan.json for task 2278.
 
+Task 3045 renamed the two persistence-claim-shaped stat keys to carry a
+``mem0_`` infix (``task_count_snapshot_mem0_written`` /
+``task_count_snapshot_mem0_pruned``). Every ``task_count_snapshot*`` stat
+here describes operations on **Mem0 ``observations_and_summaries`` records
+only**: per the Snapshot Discipline policy (``prompts/stage1.py``) a
+task-count snapshot is NEVER persisted as a Graphiti ``temporal_facts``
+edge, for ANY project, so the absence of such an edge is never evidence of
+a failed or rejected write. The former un-namespaced spellings were dumped
+verbatim into Stage 3's payload and the judge prompt, where both read them
+as Graphiti persistence claims and filed a false discrepancy. See
+:data:`LEGACY_SNAPSHOT_WRITTEN_STAT_KEY` for the read-only back-compat
+alias.
+
 This module has zero imports from ``stages/`` or ``harness`` — it is pure and
 side-effect-free so both can import from it without a dependency cycle.
 """
@@ -42,13 +55,38 @@ from __future__ import annotations
 TASK_COUNT_SNAPSHOT_KIND: str = 'task_count_snapshot'
 """Mem0 metadata ``kind`` tag identifying a task-count snapshot observation."""
 
-SNAPSHOT_WRITTEN_STAT_KEY: str = 'task_count_snapshot_written'
+SNAPSHOT_WRITTEN_STAT_KEY: str = 'task_count_snapshot_mem0_written'
 """Key under Stage 2's ``report.stats`` recording this cycle's freshness check.
 
 Value is ``1`` when a fresh snapshot was confirmed within the run window,
 ``0`` when confirmed absent, and the key is omitted entirely when the check
 was inconclusive (unknown run window or a transient query failure) — see
 :func:`extract_snapshot_written`.
+
+Counts **Mem0 ``observations_and_summaries`` records only** (task 3045).
+Per the Snapshot Discipline policy (``prompts/stage1.py``), no Graphiti
+``temporal_facts`` edge is ever written or even attempted for a task-count
+snapshot — for ANY project, blocked or not — so the absence of such an edge
+is never evidence of a failed or rejected write. The ``mem0_`` infix exists
+because this key is dumped verbatim into Stage 3's payload and the judge
+prompt (``json.dumps(report.stats)`` in ``_format_report``); under the
+former un-namespaced spelling ``task_count_snapshot_written`` both readers
+parsed it as a Graphiti persistence claim, looked for the (correctly
+absent) edge, and filed a false "rejected write" discrepancy.
+"""
+
+LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: str = 'task_count_snapshot_written'
+"""READ-ONLY back-compat alias for :data:`SNAPSHOT_WRITTEN_STAT_KEY` — task 3045.
+
+The pre-rename spelling. **No producer ever emits this key**; it exists
+solely so :func:`extract_snapshot_written` can still read ``stage_reports``
+blobs persisted by cycles that ran before the rename (see that function's
+docstring for why the harness's miss-streak recomputation depends on it).
+
+:data:`SNAPSHOT_PRUNED_STAT_KEY` deliberately gets no legacy twin: it is
+write-only observability with no reader anywhere in the tree (not in
+``_COMPUTED_STAT_KEYS``, not in ``journal.get_stats()``, no ``.get(...)``
+call site), so an alias for it would be dead code.
 """
 
 SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY: str = 'task_count_snapshot_prune_enumerated'
@@ -72,11 +110,18 @@ below — populated only when the prune is actually reached this cycle; read
 via ``report.stats.get(...)``, never direct indexing.
 """
 
-SNAPSHOT_PRUNED_STAT_KEY: str = 'task_count_snapshot_pruned'
+SNAPSHOT_PRUNED_STAT_KEY: str = 'task_count_snapshot_mem0_pruned'
 """Key under Stage 2's ``report.stats`` recording how many
 ``kind='task_count_snapshot'`` Mem0 records ``_prune_task_count_snapshots``
 successfully deleted this cycle (excludes per-item delete failures; equal to
 the function's own ``int`` return value) — task 2646.
+
+Counts deletions of **Mem0 ``observations_and_summaries`` records only**
+(``mem0_`` infix added by task 3045, for the same reason as
+:data:`SNAPSHOT_WRITTEN_STAT_KEY`). Per Snapshot Discipline
+(``prompts/stage1.py``) no Graphiti ``temporal_facts`` edge is ever written
+for a task-count snapshot, so there is likewise no Graphiti edge for this
+prune to delete and the absence of one is never evidence of a failed prune.
 
 Conditional presence: see the note after :data:`SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY`
 below — populated only when the prune is actually reached this cycle; read
@@ -157,7 +202,7 @@ def extract_snapshot_written(stage_report: object) -> bool | None:
     a journal-reconstructed ``_error`` entry or test double), or ``None``.
 
     Returns:
-        ``True`` when ``stats['task_count_snapshot_written'] == 1``,
+        ``True`` when ``stats['task_count_snapshot_mem0_written'] == 1``,
         ``False`` when ``== 0``, and ``None`` when the report is ``None``,
         the ``stats`` dict is absent, or the key itself is absent —
         "unknown", never miscounted as a confirmed miss.

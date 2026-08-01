@@ -146,11 +146,11 @@ class TestExtractSnapshotWritten:
     """
 
     def test_stats_1_is_true_on_stage_report(self):
-        report = _stage_report({'task_count_snapshot_written': 1})
+        report = _stage_report({SNAPSHOT_WRITTEN_STAT_KEY: 1})
         assert extract_snapshot_written(report) is True
 
     def test_stats_0_is_false_on_stage_report(self):
-        report = _stage_report({'task_count_snapshot_written': 0})
+        report = _stage_report({SNAPSHOT_WRITTEN_STAT_KEY: 0})
         assert extract_snapshot_written(report) is False
 
     def test_missing_key_is_none_on_stage_report(self):
@@ -158,11 +158,11 @@ class TestExtractSnapshotWritten:
         assert extract_snapshot_written(report) is None
 
     def test_stats_1_is_true_on_raw_dict(self):
-        report = {'stats': {'task_count_snapshot_written': 1}}
+        report = {'stats': {SNAPSHOT_WRITTEN_STAT_KEY: 1}}
         assert extract_snapshot_written(report) is True
 
     def test_stats_0_is_false_on_raw_dict(self):
-        report = {'stats': {'task_count_snapshot_written': 0}}
+        report = {'stats': {SNAPSHOT_WRITTEN_STAT_KEY: 0}}
         assert extract_snapshot_written(report) is False
 
     def test_missing_key_is_none_on_raw_dict(self):
@@ -687,7 +687,7 @@ class TestPruneSnapshotStats:
         assert result == 3
         assert observed == {
             'task_count_snapshot_prune_enumerated': 3,
-            'task_count_snapshot_pruned': 3,
+            SNAPSHOT_PRUNED_STAT_KEY: 3,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -712,7 +712,7 @@ class TestPruneSnapshotStats:
         assert result == 2
         assert observed == {
             'task_count_snapshot_prune_enumerated': 3,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -735,7 +735,7 @@ class TestPruneSnapshotStats:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 0,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -759,7 +759,7 @@ class TestPruneSnapshotStats:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -790,7 +790,7 @@ class TestPruneSnapshotStats:
         assert result == 2
         assert observed == {
             'task_count_snapshot_prune_enumerated': 2,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 1,
         }
@@ -815,7 +815,7 @@ class TestPruneSnapshotStats:
         assert result == 2
         assert observed == {
             'task_count_snapshot_prune_enumerated': 2,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -863,7 +863,7 @@ class TestPruneSilentEmptyGuard:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 0,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -890,7 +890,7 @@ class TestPruneSilentEmptyGuard:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 0,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -912,7 +912,7 @@ class TestPruneSilentEmptyGuard:
         assert result == 0
         assert observed == {
             'task_count_snapshot_prune_enumerated': 0,
-            'task_count_snapshot_pruned': 0,
+            SNAPSHOT_PRUNED_STAT_KEY: 0,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -938,7 +938,7 @@ class TestPruneSilentEmptyGuard:
         assert result == 2
         assert observed == {
             'task_count_snapshot_prune_enumerated': 2,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -1443,7 +1443,7 @@ class TestWriteThreadsPruneStats:
         assert result is True
         assert observed == {
             'task_count_snapshot_prune_enumerated': 2,
-            'task_count_snapshot_pruned': 2,
+            SNAPSHOT_PRUNED_STAT_KEY: 2,
             'task_count_snapshot_prune_enumeration_ok': 1,
             'task_count_snapshot_prune_truncated': 0,
         }
@@ -1466,7 +1466,7 @@ class TestWriteThreadsPruneStats:
 
 
 # ---------------------------------------------------------------------------
-# TaskKnowledgeSync.run() wiring — report.stats['task_count_snapshot_written']
+# TaskKnowledgeSync.run() wiring — report.stats[SNAPSHOT_WRITTEN_STAT_KEY]
 # ---------------------------------------------------------------------------
 
 
@@ -1533,17 +1533,17 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
     @pytest.mark.asyncio
     async def test_helper_true_sets_stat_to_1(self, mock_deps):
         report = await self._run_with_snapshot_check(mock_deps, True, 'run-snap-true')
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
 
     @pytest.mark.asyncio
     async def test_helper_false_sets_stat_to_0(self, mock_deps):
         report = await self._run_with_snapshot_check(mock_deps, False, 'run-snap-false')
-        assert report.stats['task_count_snapshot_written'] == 0
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 0
 
     @pytest.mark.asyncio
     async def test_helper_none_omits_stat_key(self, mock_deps):
         report = await self._run_with_snapshot_check(mock_deps, None, 'run-snap-none')
-        assert 'task_count_snapshot_written' not in report.stats
+        assert SNAPSHOT_WRITTEN_STAT_KEY not in report.stats
 
     @pytest.mark.asyncio
     async def test_run_window_start_is_forwarded_to_verify_helper(self, mock_deps):
@@ -1604,7 +1604,7 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
                 prior_reports=[], run_id='run-window-fwd',
             )
 
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
         snapshot_calls = [
             call for call in get_memories.await_args_list
             if call.kwargs.get('filters') == {'kind': TASK_COUNT_SNAPSHOT_KIND}
@@ -1642,7 +1642,7 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
                 prior_reports=[], run_id='run-window-none',
             )
 
-        assert 'task_count_snapshot_written' not in report.stats
+        assert SNAPSHOT_WRITTEN_STAT_KEY not in report.stats
         snapshot_calls = [
             call for call in get_memories.await_args_list
             if call.kwargs.get('filters') == {'kind': TASK_COUNT_SNAPSHOT_KIND}
@@ -1743,7 +1743,7 @@ class TestSnapshotWrittenStatKeyIsConstantDriven:
         assert report.stats[self.SENTINEL_KEY] == 1
         # The real spelling must NOT also appear — that would mean the
         # producer still carries a hardcoded literal alongside the constant.
-        assert 'task_count_snapshot_written' not in report.stats
+        assert SNAPSHOT_WRITTEN_STAT_KEY not in report.stats
 
 
 # ---------------------------------------------------------------------------
@@ -1819,7 +1819,7 @@ class TestRunDeterministicSnapshotWrite:
                 prior_reports=[], run_id='run-det-write',
             )
 
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
         mock_write.assert_awaited_once()
         mock_verify.assert_not_awaited()
 
@@ -1862,7 +1862,7 @@ class TestRunDeterministicSnapshotWrite:
                 prior_reports=[], run_id='run-det-write-fallback',
             )
 
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
         mock_write.assert_awaited_once()
         mock_verify.assert_awaited_once()
 
@@ -1898,7 +1898,7 @@ class TestRunDeterministicSnapshotWrite:
                 prior_reports=[], run_id='run-det-blocked',
             )
 
-        assert report.stats['task_count_snapshot_written'] == 0
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 0
         mock_write.assert_not_awaited()
         mock_verify.assert_awaited_once()
 
@@ -1994,7 +1994,7 @@ class TestRunSurfacesPruneObservability:
             )
 
         assert report.stats['task_count_snapshot_prune_enumerated'] == 2
-        assert report.stats['task_count_snapshot_pruned'] == 2
+        assert report.stats[SNAPSHOT_PRUNED_STAT_KEY] == 2
         assert report.stats['task_count_snapshot_prune_enumeration_ok'] == 1
         mock_deps['memory_service'].add_memory.assert_awaited_once()
 
@@ -2080,7 +2080,7 @@ class TestRunSurfacesPruneObservability:
         mis-read the empty page as a CONFIRMED miss (False), spuriously
         growing the harness's consecutive-miss streak
         (_maybe_escalate_stale_task_count_snapshot). report.stats must
-        instead leave 'task_count_snapshot_written' absent (inconclusive)."""
+        instead leave SNAPSHOT_WRITTEN_STAT_KEY absent (inconclusive)."""
 
         def _get_memories_by_metadata(*, project_id, filters, **kwargs):
             if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
@@ -2114,7 +2114,7 @@ class TestRunSurfacesPruneObservability:
                 prior_reports=[], run_id='run-prune-live-timeout-no-verify',
             )
 
-        assert 'task_count_snapshot_written' not in report.stats
+        assert SNAPSHOT_WRITTEN_STAT_KEY not in report.stats
         mock_verify.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2150,4 +2150,4 @@ class TestRunSurfacesPruneObservability:
             )
 
         mock_verify.assert_awaited_once()
-        assert report.stats['task_count_snapshot_written'] == 1
+        assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1

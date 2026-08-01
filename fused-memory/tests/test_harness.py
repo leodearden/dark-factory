@@ -25,6 +25,9 @@ from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    SNAPSHOT_WRITTEN_STAT_KEY,
+)
 
 
 def _scope(project_id: str, project_root: str) -> ProjectScope:
@@ -13351,7 +13354,7 @@ def _snapshot_stage_reports(stat: int | None) -> dict:
     """
     if stat is None:
         return {}
-    return {'task_knowledge_sync': {'stats': {'task_count_snapshot_written': stat}}}
+    return {'task_knowledge_sync': {'stats': {SNAPSHOT_WRITTEN_STAT_KEY: stat}}}
 
 
 def _make_current_run(run_id: str, stat: int | None) -> ReconciliationRun:
