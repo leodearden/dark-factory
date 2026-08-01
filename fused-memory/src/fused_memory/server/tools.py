@@ -1349,10 +1349,25 @@ def create_mcp_server(
     _CITATION_REPOINT_HINT = (
         'retry with replacement_memory_id=<the surviving entry\'s full 36-char '
         'UUID>; the cited tasks will be repointed to it before the delete runs. '
-        'A search(query=...) instruction is NOT an acceptable replacement value '
-        '— re-deriving at read time resolves back to the superseded duplicates '
-        'this consolidation is collapsing. Terminal (done/cancelled) citers are '
-        'reported, never rewritten.'
+        'It must be an EXISTING entry that still resolves in the store, and it '
+        'must not be the id being deleted — copy it from the search result '
+        'rather than reconstructing it. A search(query=...) instruction is NOT '
+        'an acceptable replacement value — re-deriving at read time resolves '
+        'back to the superseded duplicates this consolidation is collapsing. '
+        'Terminal (done/cancelled) citers are reported, never rewritten.'
+    )
+    _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
+        'replacement_memory_id is well-formed but resolves to nothing, so '
+        'repointing to it would rewrite every live citation to address a '
+        'memory that does not exist — the dangling pointers this gate '
+        'prevents, merely relocated. Re-read the surviving entry\'s id from '
+        'the search/consolidation result and retry with that exact value.'
+    )
+    _CITATION_REPLACEMENT_CHECK_FAILED_HINT = (
+        'the surviving entry could not be resolved, so "exists" cannot be '
+        'distinguished from "does not exist". This delete is irreversible, so '
+        'it is refused rather than risked; retry once the memory store is '
+        'reachable.'
     )
     _CITATION_SCAN_FAILED_HINT = (
         'the task DB could not be read, so an unknown citation state cannot be '
@@ -1467,6 +1482,20 @@ def create_mcp_server(
         This handler is the one seam that is both strictly before the
         irreversible destruction and where the surviving id is knowable.
 
+        ``replacement_memory_id`` must clear three preconditions, all of them
+        AFTER the no-live-citers early-out so an uncited delete pays nothing:
+        it must be a concrete 36-char UUID (not prose —
+        ``CitationReplacementInvalid``), it must not be the id being deleted
+        (a self-substitution that reports success while every citation still
+        addresses the destroyed entry — ``CitationReplacementInvalid``), and it
+        must RESOLVE in the store (``CitationReplacementNotFound``; a raised
+        lookup fails closed as ``CitationReplacementCheckFailed``). Shape alone
+        is not enough: ``is_concrete_memory_id`` rules out prose and claims
+        nothing about existence, so a hallucinated-but-well-formed id would
+        otherwise rewrite every live citer to address nothing and THEN land the
+        irreversible delete — the incident's dangling pointers, merely
+        relocated.
+
         Fails CLOSED. If the task-DB read raises, the delete is REJECTED rather
         than allowed. This diverges from ``_premature_completion_block``'s
         fail-open posture on purpose, and the distinction is the cost of being
@@ -1516,6 +1545,14 @@ def create_mcp_server(
             # Nothing live points at this id, so the delete cannot dangle one.
             return None, None
 
+        # Every rejection below names the citers, so the caller is never left to
+        # re-derive the enumeration by hand — the step that found 3 of 8 in the
+        # incident.
+        citing_tasks = [
+            {'task_id': c['task_id'], 'status': c['status'], 'paths': c['paths']}
+            for c in live_citers
+        ]
+
         if replacement_memory_id is None:
             return {
                 'error': (
@@ -1525,10 +1562,7 @@ def create_mcp_server(
                 ),
                 'error_type': 'CitationRepointRequired',
                 'memory_id': memory_id,
-                'citing_tasks': [
-                    {'task_id': c['task_id'], 'status': c['status'], 'paths': c['paths']}
-                    for c in live_citers
-                ],
+                'citing_tasks': citing_tasks,
                 'hint': _CITATION_REPOINT_HINT,
             }, None
 
@@ -1547,11 +1581,84 @@ def create_mcp_server(
                 'error_type': 'CitationReplacementInvalid',
                 'memory_id': memory_id,
                 'replacement_memory_id': replacement_memory_id,
-                'citing_tasks': [
-                    {'task_id': c['task_id'], 'status': c['status'], 'paths': c['paths']}
-                    for c in live_citers
-                ],
+                'citing_tasks': citing_tasks,
                 'hint': _CITATION_REPOINT_HINT,
+            }, None
+
+        # Shape is necessary but not sufficient: is_concrete_memory_id rules out
+        # PROSE and claims nothing about what the id addresses. Two further
+        # preconditions, both deliberately AFTER the no-live-citers early-out so
+        # an uncited delete pays nothing for them.
+        #
+        # (1) SELF-REPOINT. Rewriting the doomed id to itself is a
+        # self-substitution that still reports count > 0 and zero failures, so
+        # the gate would declare a successful repoint while every citation still
+        # addressed the entry this call is about to destroy.
+        if replacement_memory_id == memory_id:
+            return {
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id!r} is the '
+                    'same id being deleted, so repointing to itself would leave '
+                    f'{len(live_citers)} live task(s) citing a destroyed entry '
+                    'while reporting a successful repoint.'
+                ),
+                'error_type': 'CitationReplacementInvalid',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'hint': _CITATION_REPOINT_HINT,
+            }, None
+
+        # (2) EXISTENCE. A hallucinated/typo'd id is root cause (1) named in
+        # verify_cited_memories' own docstring, and here it is worse than a bad
+        # citation: it would rewrite every live citer to address nothing and
+        # THEN land the irreversible delete. get_memory_by_id is the same
+        # Mem0/Qdrant point read verify_cited_memories uses, and the gate's
+        # store == 'mem0' scoping already matches its Mem0-only contract.
+        try:
+            replacement_record = await memory_service.get_memory_by_id(
+                project_id, replacement_memory_id,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            # Fail closed, exactly as the scan does: 'unknown' must not be read
+            # as 'resolves' immediately before an irreversible delete.
+            logger.warning(
+                'citation gate: replacement lookup failed for %s; failing closed',
+                replacement_memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    f'Could not determine whether replacement_memory_id '
+                    f'{replacement_memory_id} exists; refusing an irreversible '
+                    'delete rather than repointing to a possibly-absent entry.'
+                ),
+                'error_type': 'CitationReplacementCheckFailed',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'check_error': str(exc),
+                'check_error_type': type(exc).__name__,
+                'hint': _CITATION_REPLACEMENT_CHECK_FAILED_HINT,
+            }, None
+
+        if not replacement_record:
+            # Distinct from ...Invalid on purpose: the caller must be able to
+            # tell a wrong-but-well-formed id from a malformed value.
+            return {
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id} does not '
+                    f'resolve, so repointing the {len(live_citers)} live '
+                    f'citation(s) of {memory_id} to it would strand them on a '
+                    'memory that does not exist.'
+                ),
+                'error_type': 'CitationReplacementNotFound',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'hint': _CITATION_REPLACEMENT_NOT_FOUND_HINT,
             }, None
 
         # Repoint BEFORE the delete. The caller falls through to
