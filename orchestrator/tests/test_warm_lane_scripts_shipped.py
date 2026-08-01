@@ -181,6 +181,92 @@ class TestSiblingLibsTravelledWithTheScripts:
         )
 
 
+class TestAuditFailsLoudOnAMissingLibPortable:
+    """A ``warm-lane-audit.sh`` copy with no ``lib_portable.sh`` exits 2, not 1.
+
+    The taxonomy this pins is the one ``warm-lane-gc.sh`` and README.md already
+    state: exit **2** is usage/WIRING — "nothing about the invocation could have
+    avoided it and no retry will fix it; the deployment is incomplete" — while
+    exit **1** is a RUNTIME error, the code an operator or timer triages by
+    hunting for a data problem.  A sibling lib that did not travel is squarely
+    the former, which is why ``lib_live_refs.sh`` (reify task 5572) and
+    ``lib_lane_state.sh`` (task 3074) are both behind explicit ``[ ! -f ]``
+    guards that ``exit 2``.
+
+    ``lib_portable.sh`` was the odd one out.  Measured on this branch's base,
+    5828d94734: the shipped ``warm-lane-audit.sh`` copied ALONE into an empty
+    directory and run with ``--help`` exited **1** with bash's own bare-``source``
+    failure, ``warm-lane-audit.sh: line 155: <cwd>/lib_portable.sh: No such file
+    or directory`` — the wrong code, and attributed to bash rather than to the
+    script.  README.md "Delta 8" (task 3370) records the fix; this case is what
+    pins it.
+
+    The ordering assertion is the second half of the contract.  The guard is
+    placed FIRST, above the ``lib_portable.sh`` source and therefore above the
+    ``lib_lane_state.sh`` guard, so a copy carrying NEITHER sibling reports
+    ``lib_portable.sh`` — the same rule ``warm-lane-gc.sh`` applies to
+    ``lib_live_refs.sh`` before ``lib_lane_state.sh``.  Asserting the lane-state
+    message is ABSENT makes that position a contract rather than an accident of
+    line order.
+    """
+
+    def test_a_copy_with_neither_sibling_exits_2_naming_lib_portable(
+        self, tmp_path: Path,
+    ) -> None:
+        staged_dir = tmp_path / 'incomplete-deploy'
+        staged_dir.mkdir()
+        staged = staged_dir / 'warm-lane-audit.sh'
+        staged.write_bytes((WARM_LANE_SCRIPT_DIR / 'warm-lane-audit.sh').read_bytes())
+        staged.chmod(0o755)
+
+        # Assert the fixture before asserting on it: if either sibling were
+        # quietly present the guards would never fire and every assertion below
+        # would pass for the wrong reason.
+        for lib in ('lib_portable.sh', 'lib_lane_state.sh'):
+            assert not (staged_dir / lib).exists(), (
+                f'fixture is not an incomplete deployment: {lib} is present in '
+                f'{staged_dir}, so this case would pass vacuously'
+            )
+
+        proc = subprocess.run(
+            [_BASH, str(staged), '--help'],
+            cwd=str(staged_dir),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_sanitized_env(),
+        )
+        combined = proc.stdout + proc.stderr
+
+        # --help normally exits 0, so a 2 additionally proves the guard fires
+        # BEFORE argv is parsed (the note warm-lane-gc.sh's Block A9 makes).
+        assert proc.returncode == TestSiblingLibsTravelledWithTheScripts.WIRING_EXIT, (
+            'an absent lib_portable.sh must be the wiring sentinel exit '
+            f'{TestSiblingLibsTravelledWithTheScripts.WIRING_EXIT}, not a runtime '
+            f'failure; rc={proc.returncode} stderr={proc.stderr!r}'
+        )
+        # Split around the message's U+2014 em dash so the pin does not depend
+        # on that codepoint surviving an editor.
+        assert 'warm-lane-audit.sh: ERROR' in proc.stderr, (
+            'the failure must be attributed to the SCRIPT, not to bash; '
+            f'stderr={proc.stderr!r}'
+        )
+        assert 'scripts/lib_portable.sh not found next to warm-lane-audit.sh' in proc.stderr, (
+            f'the fail-loud message must name the missing sibling; {proc.stderr!r}'
+        )
+        assert 'lib_portable.sh: No such file' not in combined, (
+            "bash's own bare-`source` failure shape is still reachable — the "
+            f'guard is missing or sits AFTER the source.\noutput:\n{combined}'
+        )
+        # THE ORDERING PIN: neither sibling is present, so the FIRST guard must
+        # be the one that speaks (warm-lane-gc.sh:305-307's rule).
+        assert 'lib_lane_state.sh not found next to' not in proc.stderr, (
+            'a copy carrying NEITHER sibling reported lib_lane_state.sh first — '
+            'the lib_portable.sh guard must be ordered FIRST, above the source '
+            f'it protects.\nstderr:\n{proc.stderr}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # provision-warm-lane-fs.sh: repo-root parity at the new nesting depth
 # ---------------------------------------------------------------------------
