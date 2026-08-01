@@ -123,19 +123,23 @@ function plottableRuns(points) {
 
 // ── Close one run of line commands into a filled area subpath ──────────────
 // Drops to the baseline under the run's own last x, tracks back to its own
-// first x, and closes. A run of one point contributes NO area: a zero-width
-// sliver is meaningless, and the pre-fix single-point behaviour (a full-width
-// triangle) was itself fabricated.
+// first x, and closes. Takes the points actually DRAWN (which for a lone
+// sample is a zero-length segment, and for a single-sample step series is the
+// full-width tick).
+//
+// A run spanning zero horizontal distance contributes NO area: the fill would
+// be an invisible zero-width sliver, and the pre-fix single-point behaviour —
+// a full-width triangle under one sample — was itself fabricated.
 //
 // For a hole-free full-width run, x_last is exactly `width` and x_first is
 // exactly 0, so this reproduces the pre-fix
 // `${linePath} L${width},${height} L0,${height} Z` close character-for-
 // character. The per-subpath form is a strict generalisation, not a restyle —
 // spark_path.test.mjs pins that by exact string equality.
-function closeRunArea(run, lineCommands, height) {
-  if (run.length < 2) return null;
-  const firstX = run[0][0];
-  const lastX = run[run.length - 1][0];
+function closeRunArea(drawn, lineCommands, height) {
+  const firstX = drawn[0][0];
+  const lastX = drawn[drawn.length - 1][0];
+  if (lastX === firstX) return null;
   return `${lineCommands} L${lastX},${height} L${firstX},${height} Z`;
 }
 
@@ -163,7 +167,69 @@ function sparkPaths(values, width, height) {
       .join(' ');
 
     lines.push(lineCommands);
-    const areaCommands = closeRunArea(run, lineCommands, height);
+    const areaCommands = closeRunArea(drawn, lineCommands, height);
+    if (areaCommands !== null) areas.push(areaCommands);
+  }
+
+  return { line: lines.join(' '), area: areas.join(' ') };
+}
+
+// ── Step path builder (charts.jsx's `StepSpark`) ───────────────────────────
+// Horizontal-then-vertical edges, no diagonals, so discrete state transitions
+// read as sharp steps. Same run-splitting and per-subpath area rules as
+// sparkPaths; only the within-run edge construction differs.
+//
+// A hole matters MORE here than in the smooth builder: a horizontal edge held
+// at the pre-hole y would assert the value PERSISTED through the missing slot,
+// and then drop vertically to the fabricated zero — two fabrications per hole
+// rather than one.
+function stepPaths(values, width, height) {
+  const series = values || [];
+  const { points } = sparkScale(series, width, height);
+  const lines = [];
+  const areas = [];
+
+  for (const run of plottableRuns(points)) {
+    let drawn;
+    let lineCommands;
+
+    if (run.length === 1) {
+      // A run of one has no step edge to build, so it is drawn as a single
+      // horizontal segment rather than routed through the edge loop below
+      // (which emits a horizontal AND a vertical command per point, and would
+      // duplicate the `L` here). The pre-extraction code likewise handled its
+      // single-data-point case before the edge loop.
+      const [x, y] = run[0];
+
+      // Whole series is ONE sample -> keep the documented full-width
+      // horizontal tick verbatim (pre-extraction charts.jsx:80-84); without it
+      // the path holds only a Move command and renders nothing. No hole is
+      // involved, so nothing is asserted about an unmeasured slot.
+      //
+      // Otherwise this is an ISOLATED sample flanked by holes -> a zero-length
+      // segment at its own x, rendering as a visible square under StepSpark's
+      // existing strokeLinecap="square". Deliberately NOT extended one step
+      // wide: a step held across a known-missing slot would assert the value
+      // persisted there, which is the synthetic-data class this module exists
+      // to remove.
+      const endX = series.length === 1 ? width : x;
+
+      drawn = [run[0], [endX, y]];
+      lineCommands = `M${x},${y} L${endX},${y}`;
+    } else {
+      const parts = [`M${run[0][0]},${run[0][1]}`];
+      for (let i = 1; i < run.length; i++) {
+        // Horizontal segment to the new x, keeping the old y...
+        parts.push(`L${run[i][0]},${run[i - 1][1]}`);
+        // ...then the vertical segment to the new y. Sharp step edges.
+        parts.push(`L${run[i][0]},${run[i][1]}`);
+      }
+      drawn = run;
+      lineCommands = parts.join(' ');
+    }
+
+    lines.push(lineCommands);
+    const areaCommands = closeRunArea(drawn, lineCommands, height);
     if (areaCommands !== null) areas.push(areaCommands);
   }
 
@@ -175,7 +241,7 @@ function sparkPaths(values, width, height) {
 // dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
 // leave window.DF_SPARK_PATH undefined and break charts.jsx's top-level
 // destructure of it, blanking nearly every tab.
-const SPARK_PATH_API = { isPlottable, sparkScale, sparkPaths };
+const SPARK_PATH_API = { isPlottable, sparkScale, sparkPaths, stepPaths };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = SPARK_PATH_API;
