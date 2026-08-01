@@ -25,6 +25,32 @@ rejected in the producing runner (M1: "malformed metric rejected at emit time,
 not read time"), because by the time the dashboard reads the artifact there is
 nobody left to tell. Readers, by contrast, just ``json.load`` — so extra fields
 a future schema version adds never break them.
+
+**The null convention — one rule, every memory-eval artifact.**
+
+    Omit a ``None``-valued OPTIONAL field;
+    always emit a REQUIRED field, even when its value is null.
+
+This is THE statement of the rule; the limits writer, the fixtures README and
+the tests point here rather than restating it, because a convention whose whole
+job is to stop two artifacts drifting apart must not itself exist in three
+copies. It binds this module's ``metrics-*.json`` and
+``shared.memory_eval_limits``' ``limits-current.json`` alike: they land under
+one artifact root and are read by the same dashboard-shaped reader, so a
+consumer needing ``.get`` for one and ``[...]`` for the other would be reading
+two conventions, with the split invisible until it ``KeyError``s on the one it
+guessed wrong. Absence therefore means "does not apply here" — ``denominator``
+on a non-proportion metric, ``item_key`` on a whole-metric alarm — never "the
+value happened to be null".
+
+The second half is not an exception to the first: it is the half
+``exclude_none`` alone cannot express. A required-AND-nullable field
+(``LimitsArtifact.alpha`` is the only one today) is what distinguishes "the
+producer forgot this field" from "nothing in this run was alarm-eligible", and
+collapsing those two is the silent degradation this repo's loud-over-silent norm
+forbids. Both writers render the resulting payload through
+:func:`canonical_json_text`, so the byte-level half of the convention is one
+code path rather than a habit each module keeps locally.
 """
 
 from __future__ import annotations
@@ -32,12 +58,20 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 __all__ = [
     'RUN_STAMP_ENV_VAR',
@@ -49,6 +83,7 @@ __all__ = [
     'MetricSchemaError',
     'MetricSeries',
     'TripwireItem',
+    'canonical_json_text',
     'load_metric_series',
     'load_series_window',
     'metrics_artifact_path',
@@ -79,6 +114,23 @@ trailing baseline window by sorting filenames, the same string-comparison
 convention ``canary.load_window_rows`` uses.
 """
 
+_STAMP_PATTERN = re.compile(r'[0-9]{8}T[0-9]{6}Z')
+"""The rendered shape of :data:`_STAMP_FORMAT` — ENFORCED, not assumed.
+
+The equivalence above is load-bearing in two places, the ``sorted()`` that finds
+the trailing window and the ``<`` that cuts the current run out of it, and it
+holds only for a fixed-width, zero-padded, single-timezone rendering.
+``'2026-07-04T03:15:00Z'`` is a perfectly reasonable-looking stamp that sorts
+BEFORE every ``2026…`` one, so a caller who supplies it gets an empty or
+contaminated baseline window and no error at all — a declared invariant nothing
+checks is exactly the silent degradation this module argues against everywhere
+else. So it is checked at each boundary a stamp can enter from: the schema
+field, the env override, the write-time override and the window cutoff.
+
+``[0-9]`` rather than ``\\d``: ``\\d`` also matches non-ASCII digits, which
+render as a plausible stamp and sort nowhere near their ASCII equivalents.
+"""
+
 _WHOLE_NUMBER_TOL = 1e-9
 """Relative slack when asking "is this float a whole number?".
 
@@ -97,6 +149,28 @@ class MetricSchemaError(ValueError):
     underlying ``pydantic.ValidationError`` is always chained as ``__cause__``,
     so the field-level detail is never lost.
     """
+
+
+def _validate_stamp(stamp: str, *, what: str) -> str:
+    """Return *stamp* if it matches :data:`_STAMP_PATTERN`, else raise.
+
+    Raises :class:`MetricSchemaError` — the module's one error type — so a
+    malformed stamp reads the same to a caller wherever it entered from, and so
+    a runner still catches a single exception without importing pydantic. Inside
+    the schema's field validator that surfaces as the usual
+    ``MetricSchemaError`` via :func:`_coerce_series`, because it is a
+    ``ValueError`` and pydantic wraps it like any other.
+    """
+    if _STAMP_PATTERN.fullmatch(stamp) is None:
+        raise MetricSchemaError(
+            f'{what} {stamp!r} is not a {_STAMP_FORMAT} run stamp (expected '
+            f'/{_STAMP_PATTERN.pattern}/, e.g. 20260704T031500Z). Artifact filenames '
+            'carry the stamp and every window operation orders and cuts runs by '
+            'comparing those filenames as strings, so a differently-shaped stamp '
+            'sorts into the wrong place — an empty or a contaminated baseline, with '
+            'nothing to signal which.'
+        )
+    return stamp
 
 
 def _is_whole(value: float) -> bool:
@@ -259,6 +333,17 @@ class MetricSeries(BaseModel):
     corpus: Corpus
     metrics: list[Metric]
 
+    @field_validator('run_stamp')
+    @classmethod
+    def _check_stamp_shape(cls, value: str) -> str:
+        # The series' own stamp becomes its filename, and the whole baseline
+        # window is ordered and cut by comparing those filenames as strings
+        # (see _STAMP_PATTERN). Checking the shape here rather than only at the
+        # write call makes it a property of the schema, so an artifact that
+        # sorts into the wrong place cannot be constructed, written OR read
+        # back — one rule instead of a guard per entry point.
+        return _validate_stamp(value, what='run_stamp')
+
     @model_validator(mode='after')
     def _check_unique_metric_ids(self) -> MetricSeries:
         # Uniqueness can only be checked with the whole list in view. It is
@@ -352,10 +437,15 @@ def run_stamp(*, env_var: str = RUN_STAMP_ENV_VAR) -> str:
 
     Honours *env_var* first (see :data:`RUN_STAMP_ENV_VAR`), else the current
     UTC time in :data:`_STAMP_FORMAT`.
+
+    An override that is not a :data:`_STAMP_PATTERN` stamp raises
+    :class:`MetricSchemaError` here, at the one place an operator-supplied
+    string enters the module, rather than becoming a filename that sorts wrong
+    for the rest of the programme.
     """
     override = os.environ.get(env_var)
     if override:
-        return override
+        return _validate_stamp(override, what=f'${env_var}')
     return datetime.now(UTC).strftime(_STAMP_FORMAT)
 
 
@@ -374,15 +464,35 @@ def report_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
     return Path(root) / eval_id / f'report-{stamp}.txt'
 
 
+def canonical_json_text(payload: object) -> str:
+    """Render *payload* as canonical memory-eval artifact text.
+
+    ``indent=2, sort_keys=True, ensure_ascii=False`` plus a trailing newline, so
+    two runs that concluded the same thing produce byte-identical files and a
+    real change diffs cleanly.
+
+    Shared with :func:`shared.memory_eval_limits.serialize_limits_artifact`
+    rather than hand-repeated there. The whole point of the null convention
+    above is that the two artifacts under one root do not drift; a second copy
+    of these four arguments would be a place they could drift at the byte level
+    while every doc still said they agreed.
+
+    This function only renders what it is handed — WHICH keys a payload carries
+    is the null convention, applied by each writer against its own model.
+    """
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+
+
 def serialize_metric_series(series: MetricSeries) -> str:
     """Render *series* as the canonical artifact text.
 
-    ``sort_keys=True`` plus a trailing newline so two identical runs produce
-    byte-identical files and a real change diffs cleanly; ``exclude_none`` so an
-    unused optional field is absent rather than an explicit ``null``.
+    ``exclude_none`` alone implements the module docstring's null convention
+    here: every nullable field on :class:`Metric`/:class:`MetricSeries` carries
+    a ``None`` default, i.e. all of them are optional, so M1 has no
+    required-nullable field needing the always-emit half. (M2 has exactly one —
+    see :func:`shared.memory_eval_limits.serialize_limits_artifact`.)
     """
-    payload = series.model_dump(mode='json', exclude_none=True)
-    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+    return canonical_json_text(series.model_dump(mode='json', exclude_none=True))
 
 
 def render_report(series: MetricSeries) -> str:
@@ -454,10 +564,16 @@ def write_metric_series(
     half-artifact for the evaluator to trip over later.
 
     *stamp* defaults to the series' own ``run_stamp``, so the filename and the
-    payload agree unless a caller deliberately overrides it.
+    payload agree unless a caller deliberately overrides it. An override gets
+    the same shape check the schema applies to ``run_stamp`` — it is going into
+    a filename the window loader will order and cut by string comparison, and
+    overriding is precisely how a caller sidesteps the validated field.
     """
     model = _coerce_series(series)
-    effective_stamp = stamp if stamp is not None else model.run_stamp
+    if stamp is None:
+        effective_stamp = model.run_stamp  # already shape-checked by the schema
+    else:
+        effective_stamp = _validate_stamp(stamp, what='stamp override')
     metrics_path = metrics_artifact_path(root, model.eval_id, effective_stamp)
     report_path = report_artifact_path(root, model.eval_id, effective_stamp)
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -485,17 +601,56 @@ def load_series_window(
     eval_id: str,
     *,
     limit: int,
+    before_stamp: str | None,
 ) -> list[MetricSeries]:
-    """The trailing *limit* runs for *eval_id*, oldest first.
+    """The trailing *limit* runs for *eval_id* stamped before *before_stamp*, oldest first.
 
     Sorted by filename, which is chronological because the stamp is zero-padded
     UTC (see :data:`_STAMP_FORMAT`). A missing eval directory yields an empty
     window rather than raising — "this eval has never run" is a legitimate state
     the evaluator handles as ``insufficient_data``, not an error. A file that
     exists but does not parse still raises (see :func:`load_metric_series`).
+
+    *before_stamp* keeps the current run out of its own baseline. The natural
+    runner ordering is write-then-evaluate, so by the time this is called the
+    current run's ``metrics-<STAMP>.json`` is already on disk; pooling it drags
+    ``p0``/``lam`` toward the observed value and DAMPS the very regression the
+    M2 rules (b)/(c) exist to catch — the worse the run, the more it moves the
+    bar it is measured against. The filter is a strict ``<``, so an artifact
+    stamped LATER is dropped too: a concurrent runner, a re-run with a pinned
+    stamp, or clock skew are the same contamination class, and a "baseline"
+    holding a future run is no more a baseline than one holding the present.
+
+    It is keyword-only and REQUIRED but nullable — no default. ``None`` means
+    "there is no current run to exclude" (a dashboard or analysis read over the
+    whole history), a deliberate choice rather than an omission; a ``None``
+    default would silently reinstate the self-pooling for every caller who does
+    the natural thing.
+
+    The exclusion runs BEFORE the ``[-limit:]`` slice, so asking for *limit*
+    runs yields *limit* runs. Filtering after slicing would return a window one
+    short and quietly shrink the evidence base with nothing to signal it.
+
+    A *before_stamp* that is not a :data:`_STAMP_PATTERN` stamp raises
+    :class:`MetricSchemaError` rather than cutting the window somewhere
+    arbitrary: the cutoff is a string comparison, so a differently-shaped stamp
+    does not fail, it just silently selects the wrong runs.
     """
+    # Before the missing-directory short-circuit, so a malformed cutoff is
+    # refused whether or not the eval happens to have run yet — otherwise the
+    # first run of a new eval would swallow the bad argument and only the
+    # second would report it.
+    if before_stamp is not None:
+        _validate_stamp(before_stamp, what='before_stamp')
     eval_dir = Path(root) / eval_id
     if not eval_dir.is_dir():
         return []
     paths = sorted(eval_dir.glob('metrics-*.json'))
+    if before_stamp is not None:
+        # Compare rendered filenames rather than re-parsing the stamp: the
+        # zero-padded-UTC invariant this function already relies on to order the
+        # window (see _STAMP_FORMAT) is the same fact that orders the cutoff, so
+        # there is one way to order runs here, not two.
+        cutoff = metrics_artifact_path(root, eval_id, before_stamp).name
+        paths = [p for p in paths if p.name < cutoff]
     return [load_metric_series(p) for p in paths[-limit:]] if limit > 0 else []

@@ -65,7 +65,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from shared.memory_eval_metrics import Metric, MetricDirection, MetricSeries
+from shared.memory_eval_metrics import (
+    Metric,
+    MetricDirection,
+    MetricSeries,
+    canonical_json_text,
+)
 
 __all__ = [
     'Alarm',
@@ -91,6 +96,7 @@ __all__ = [
     'load_limits_artifact',
     'poisson_two_sided_p',
     'scoped_grandfather_key',
+    'serialize_limits_artifact',
     'write_limits_artifact',
 ]
 
@@ -1296,20 +1302,65 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def _artifact_payload(artifact: LimitsArtifact) -> dict[str, object]:
+    """Dump *artifact* under the null convention, applied to M2's one hard case.
+
+    The rule itself is stated once, in the
+    :mod:`shared.memory_eval_metrics` module docstring, and is not restated
+    here. What is M2-specific is that this is the artifact family's ONLY
+    required-nullable field: :attr:`LimitsArtifact.alpha`'s ABSENCE means "the
+    producer forgot the field", its ``null`` means "nothing in this run was
+    alarm-eligible", and a bare ``exclude_none=True`` collapses those two —
+    concretely, it drops ``alpha`` from an all-scalar run and makes
+    :func:`load_limits_artifact` raise :class:`LimitsSchemaError` on a file this
+    writer itself just emitted.
+
+    The always-emit set is DERIVED from ``model_fields`` rather than hardcoded
+    to ``alpha``, so a required-nullable field added to :class:`LimitsArtifact`
+    later is covered without anyone remembering to.
+
+    That derivation covers the TOP-LEVEL model only. The nested
+    :class:`_VerdictRecord`/:class:`_AlarmRecord` payloads, which
+    ``exclude_none`` also prunes, need no fix-up because no field on either is
+    both required and nullable — and that is not an assumption: it is pinned by
+    ``TestNullSerializationConvention::test_no_nested_record_field_is_both_required_and_nullable``,
+    so adding one fails loudly at test time instead of being silently truncated
+    out of every artifact.
+    """
+    payload = artifact.model_dump(mode='json', exclude_none=True)
+    for name, field in type(artifact).model_fields.items():
+        if field.is_required() and name not in payload:
+            payload[name] = None
+    return payload
+
+
+def serialize_limits_artifact(result: EvaluationResult) -> str:
+    """Render *result* as the canonical ``limits-current.json`` text.
+
+    The pure half of :func:`write_limits_artifact`, mirroring
+    :func:`shared.memory_eval_metrics.serialize_metric_series` so the two
+    memory-eval artifacts have the same serialize/write split — and so anything
+    wanting the canonical bytes (a test asserting payload shape, a consumer
+    diffing what a run WOULD emit) has an entry point that does not evaluate a
+    series onto disk to look at it.
+
+    Which KEYS appear is :func:`_artifact_payload`'s job; the byte-level
+    rendering is :func:`~shared.memory_eval_metrics.canonical_json_text`, shared
+    with the metrics writer rather than repeated here.
+    """
+    return canonical_json_text(_artifact_payload(_artifact_from_result(result)))
+
+
 def write_limits_artifact(result: EvaluationResult, path: str | Path) -> Path:
     """Persist *result* to *path* atomically, returning the path written.
 
-    ``sort_keys=True`` and a trailing newline so two runs that concluded the
-    same thing produce the same bytes — a committed artifact should diff to
-    nothing when nothing changed, which is what makes a real change legible.
+    A thin disk wrapper around :func:`serialize_limits_artifact` — the bytes are
+    that function's contract, this one adds only the parent directory and the
+    atomic replace.
     """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    artifact = _artifact_from_result(result)
-    text = json.dumps(
-        artifact.model_dump(mode='json'), indent=2, sort_keys=True, ensure_ascii=False
-    )
-    _atomic_write_text(target, text + '\n')
+    _atomic_write_text(target, serialize_limits_artifact(result))
     return target
 
 

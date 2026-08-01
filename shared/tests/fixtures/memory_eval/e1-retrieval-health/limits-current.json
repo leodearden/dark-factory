@@ -6,7 +6,6 @@
       "baseline": 0.8,
       "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s). p=1.84e-06 < alpha=0.00278, below baseline (lower_is_worse).",
       "direction": "lower_is_worse",
-      "item_key": null,
       "metric_id": "canonical-in-top-5",
       "p_value": 1.8424481488582588e-06,
       "rule_kind": "proportion",
@@ -17,20 +16,16 @@
       "baseline": 5.0,
       "detail": "20 event(s) over n=30 against an expected 5 (0.166667/unit pooled over 3 run(s), exposure 90). p=3.45e-07 < alpha=0.00278, above baseline (higher_is_worse).",
       "direction": "higher_is_worse",
-      "item_key": null,
       "metric_id": "dangling-pointers",
       "p_value": 3.452135820914455e-07,
       "rule_kind": "count",
       "value": 20.0
     },
     {
-      "alpha": null,
       "baseline": 2.0,
       "detail": "Item 't-worktree-lifecycle' newly fails and is not grandfathered.",
-      "direction": null,
       "item_key": "t-worktree-lifecycle",
       "metric_id": "topic-canonical-present",
-      "p_value": null,
       "rule_kind": "tripwire",
       "value": 2.0
     }
@@ -64,7 +59,6 @@
           "baseline": 0.8,
           "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s). p=1.84e-06 < alpha=0.00278, below baseline (lower_is_worse).",
           "direction": "lower_is_worse",
-          "item_key": null,
           "metric_id": "canonical-in-top-5",
           "p_value": 1.8424481488582588e-06,
           "rule_kind": "proportion",
@@ -94,7 +88,6 @@
           "baseline": 5.0,
           "detail": "20 event(s) over n=30 against an expected 5 (0.166667/unit pooled over 3 run(s), exposure 90). p=3.45e-07 < alpha=0.00278, above baseline (higher_is_worse).",
           "direction": "higher_is_worse",
-          "item_key": null,
           "metric_id": "dangling-pointers",
           "p_value": 3.452135820914455e-07,
           "rule_kind": "count",
@@ -138,39 +131,29 @@
     {
       "alarms": [
         {
-          "alpha": null,
           "baseline": 2.0,
           "detail": "Item 't-worktree-lifecycle' newly fails and is not grandfathered.",
-          "direction": null,
           "item_key": "t-worktree-lifecycle",
           "metric_id": "topic-canonical-present",
-          "p_value": null,
           "rule_kind": "tripwire",
           "value": 2.0
         }
       ],
-      "alpha": null,
       "baseline": 2.0,
       "baseline_run_stamps": [],
       "detail": "2 failing, 2 grandfathered, 1 new; 1 fixed and released.",
-      "direction": null,
       "metric_id": "topic-canonical-present",
       "n": 8,
-      "p_value": null,
       "rule_kind": "tripwire",
       "status": "alarm",
       "value": 2.0
     },
     {
       "alarms": [],
-      "alpha": null,
-      "baseline": null,
       "baseline_run_stamps": [],
       "detail": "Scalar: reported for trend, no alarm rule attached (M2).",
-      "direction": null,
       "metric_id": "search-latency-p50-ms",
       "n": 30,
-      "p_value": null,
       "rule_kind": "scalar",
       "status": "ok",
       "value": 44.0

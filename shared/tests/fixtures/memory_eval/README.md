@@ -149,10 +149,30 @@ dashboard would), and by regenerating it and asserting byte-identity. The first
 pins the published contract; the second stops the committed bytes drifting from
 what the writer emits.
 
-The `metrics-*.json` series files are hand-authored, but in the writer's exact
-canonical serialization: `json.dumps(..., indent=2, sort_keys=True,
-ensure_ascii=False)` plus a trailing newline, with `None`-valued optional
-fields omitted. `test_memory_eval_boundary.py` asserts byte-identity by
+### The null convention — one rule, both artifacts
+
+**Stated in one place: the `shared.memory_eval_metrics` module docstring.**
+Read it there. Restating it here would make the convention that exists to stop
+two artifacts drifting apart into three copies of prose that can themselves
+drift — so this section only says what it means *for these fixtures*:
+
+- Both writers render through `shared.memory_eval_metrics.canonical_json_text`
+  (`indent=2, sort_keys=True, ensure_ascii=False` + trailing newline), so any
+  exemplar you author or regenerate must be in exactly that form.
+- A field that does not apply is **absent**, not `null` — e.g. `item_key` on a
+  whole-metric alarm, `denominator` on a non-proportion metric. Read them with
+  `.get`, never `[...]`.
+- The one field that *is* emitted as an explicit `null` is
+  `limits-current.json`'s top-level `alpha`, on a run with nothing
+  alarm-eligible. That is the convention's always-emit half, not an exception
+  to it.
+
+Pinned by `TestNullSerializationConvention` in `test_memory_eval_limits.py`,
+which checks the rule field-by-field at every level the writer emits (artifact,
+verdicts, alarms) rather than only for the fields named above.
+
+The `metrics-*.json` series files are hand-authored, but in that exact
+canonical serialization. `test_memory_eval_boundary.py` asserts byte-identity by
 re-emitting each parsed exemplar through `write_metric_series`, so any drift
 fails CI rather than silently diverging from what the runners actually produce.
 
