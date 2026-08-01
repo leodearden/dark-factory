@@ -360,6 +360,13 @@ class TestCapabilityManifestDoc:
         assert 'task label must be non-empty' in str(exc_info.value)
 
 
+#: The one committed exemplar sidecar TestLoader validates directly, and the
+#: anchor TestManifestCorpusDiscovery asserts is present in the full corpus
+#: sweep — hoisted once (code-review amendment, task 3362) so a rename of
+#: this PRD or its sidecar breaks exactly one place instead of two.
+_EXEMPLAR_SIDECAR_REL = 'plans/capability-delivered-checks-prd.capability-manifest.yaml'
+
+
 class TestLoader:
     _VALID_YAML = """\
 prd: plans/example-prd.md
@@ -442,10 +449,7 @@ tasks:
         # CI fixture: this PRD's own committed exemplar sidecar (PRD
         # §Contract signal for task α — "this PRD's own committed exemplar
         # sidecar parses and validates in a CI test").
-        repo_root = Path(__file__).resolve().parents[2]
-        sidecar_path = (
-            repo_root / 'plans' / 'capability-delivered-checks-prd.capability-manifest.yaml'
-        )
+        sidecar_path = REPO_ROOT / _EXEMPLAR_SIDECAR_REL
         doc = load_capability_manifest(sidecar_path)
         assert doc.prd == 'plans/capability-delivered-checks-prd.md'
         assert doc.schema_version == 1
@@ -506,50 +510,43 @@ class TestManifestCorpusDiscovery:
         monkeypatch.setattr(subprocess, 'run', _raise)
         assert discover_manifests(tmp_path) is None
 
-    def test_every_path_ends_with_the_manifest_suffix_and_exists(self):
+    def test_every_path_is_a_valid_sidecar_not_nested_in_worktrees(self):
+        # The three properties that are real assertions on discover_manifests()'s
+        # behavior, folded into one test (code-review amendment, task 3362:
+        # the individual is_absolute() and sorted-with-no-duplicates cases
+        # dropped as guaranteed by construction — repo_root / rel with an
+        # absolute repo_root; sorted(set(...)) — three lines inside
+        # discover_manifests itself, so they can't fail without a rewrite
+        # that would also break this test and added no regression signal of
+        # their own).
         paths = discover_manifests()
         assert paths is not None
         for path in paths:
-            assert path.name.endswith('.capability-manifest.yaml')
+            assert path.name.endswith(MANIFEST_SUFFIX)
             assert path.exists()
-
-    def test_every_path_is_absolute(self):
-        paths = discover_manifests()
-        assert paths is not None
-        for path in paths:
-            assert path.is_absolute()
-
-    def test_paths_are_sorted_with_no_duplicates(self):
-        paths = discover_manifests()
-        assert paths is not None
-        assert paths == sorted(paths)
-        assert len(paths) == len(set(paths))
-
-    def test_no_path_is_under_worktrees(self):
-        # Load-bearing anti-rglob assertion — see class docstring. Checked
-        # relative to REPO_ROOT, not as an absolute-path substring: when this
-        # suite itself runs from inside a worktree, REPO_ROOT (this file's
-        # own parents[2]) legitimately resolves to .../.worktrees/<n>, so the
-        # absolute path always contains that segment. What must never happen
-        # is a *nested* .worktrees segment relative to REPO_ROOT — that would
-        # mean discovery walked into another task's checkout.
-        paths = discover_manifests()
-        assert paths is not None
-        for path in paths:
+            # Load-bearing anti-rglob assertion — see class docstring. Checked
+            # relative to REPO_ROOT, not as an absolute-path substring: when
+            # this suite itself runs from inside a worktree, REPO_ROOT (this
+            # file's own parents[2]) legitimately resolves to
+            # .../.worktrees/<n>, so the absolute path always contains that
+            # segment. What must never happen is a *nested* .worktrees
+            # segment relative to REPO_ROOT — that would mean discovery
+            # walked into another task's checkout.
             assert '.worktrees' not in path.relative_to(REPO_ROOT).parts
 
     def test_known_stable_anchor_is_present(self):
+        # Shares _EXEMPLAR_SIDECAR_REL with
+        # TestLoader.test_committed_exemplar_sidecar_validates (code-review
+        # amendment, task 3362) so a rename of that PRD/sidecar breaks
+        # exactly one place instead of two independently-hardcoded ones.
+        # Deliberately does NOT also assert that both docs/prds/ and plans/
+        # are represented (a dropped sibling test) — that pinned a corpus
+        # fact (today's directory layout), not a discover_manifests()
+        # invariant, and would go red on a harmless doc reorganization.
         paths = discover_manifests()
         assert paths is not None
-        names = {path.name for path in paths}
-        assert 'capability-delivered-checks-prd.capability-manifest.yaml' in names
-
-    def test_both_known_directories_are_represented(self):
-        paths = discover_manifests()
-        assert paths is not None
-        rels = [str(path.relative_to(REPO_ROOT)) for path in paths]
-        assert any(rel.startswith('docs/prds/') for rel in rels)
-        assert any(rel.startswith('plans/') for rel in rels)
+        rels = {str(path.relative_to(REPO_ROOT)) for path in paths}
+        assert _EXEMPLAR_SIDECAR_REL in rels
 
 
 class TestCheckManifest:
@@ -729,8 +726,10 @@ class TestCheckedInManifestCorpus:
            file and the offending `verdcit` key, exactly as check_manifest's
            docstring promises.
         3. Reverted the sidecar (`git checkout --`) and reran: full class
-           green again (re-verified after the code-review amendment below
-           that dropped the third, tautological parametrization).
+           green again, all 30 files (150 tests across the whole module —
+           re-measured after the code-review amendments, task 3362, that
+           dropped the third, tautological parametrization and trimmed
+           TestManifestCorpusDiscovery).
 
     Does NOT assert delivered_check `script:` targets exist on disk —
     deliberately out of scope (n=1 in the corpus at planning time, and it
