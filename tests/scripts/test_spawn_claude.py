@@ -1243,10 +1243,13 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     Proves the transcript detector is load-bearing. Uses a DETACHING launcher
     (custom-term, routing through resolve_detached's launch_rc==0 branch --
     the incident path) whose fake claude writes a transcript file under
-    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps well past
-    the shrunk started-grace before exiting and letting $inner write the
-    sentinel. <enc> mirrors session_registry.transcript_path_for_cwd's
-    encoding: cwd with every '/' and '.' replaced by '-'.
+    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps a fixed 8s
+    before exiting and letting $inner write the sentinel -- so the
+    transcript evidence is available from t~0, long before the sentinel can
+    possibly exist, and _started_watchdog (which polls continuously and
+    returns on first evidence) observes only the transcript. <enc> mirrors
+    session_registry.transcript_path_for_cwd's encoding: cwd with every '/'
+    and '.' replaced by '-'.
 
     Grace is load-adaptive via _set_started_grace (task 3451), which shares
     one policy across all three must-not-be-flagged sites in this file.
@@ -1275,8 +1278,9 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
 
     # Fake claude: write the transcript file immediately (mirroring a real
     # Claude Code session creating ~/.claude/projects/<enc>/*.jsonl the moment
-    # it starts), then outlast the shrunk started-grace before exiting -- so
-    # only the transcript probe (not the sentinel) can suppress the flag.
+    # it starts), then sleep a fixed 8s before exiting -- the transcript
+    # lands at t~0, long before the sentinel can exist, so only the
+    # transcript probe (not the sentinel) can suppress the flag.
     claude = bin_dir / "claude"
     claude.write_text(
         "#!/usr/bin/env bash\n"
@@ -1324,8 +1328,9 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     evidence (the only positive signal available on this path).
 
     Uses a FOREGROUND launcher (xterm) whose fake claude writes no transcript
-    at all under $CLAUDE_PROJECTS_DIR, but stays alive (sleeping) well past
-    the shrunk started-grace before exiting. Since xterm's fake terminal
+    at all under $CLAUDE_PROJECTS_DIR, but stays alive (sleeping) for a fixed
+    6s before exiting -- so the watchdog observes it as a live descendant
+    long before it exits, regardless of grace. Since xterm's fake terminal
     `exec`s into the payload bash (see _FOREGROUND_TERM_SCRIPT), claude runs
     as a direct descendant of spawn-claude.sh's own $$ -- unlike a detached
     launcher (setsid + background job, reparented once the launcher process
@@ -1351,8 +1356,8 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     bin_dir = _make_bin_dir(tmp_path)
     _write_foreground_terminal(bin_dir, "xterm")
 
-    # Fake claude: writes NO transcript anywhere, just outlasts the shrunk
-    # started-grace before exiting -- so only _claude_descendant_alive (not
+    # Fake claude: writes NO transcript anywhere, just stays alive (sleeping)
+    # for a fixed 6s before exiting -- so only _claude_descendant_alive (not
     # the transcript probe) can suppress the flag.
     claude = bin_dir / "claude"
     claude.write_text("#!/usr/bin/env bash\nsleep 6\nexit 0\n")
