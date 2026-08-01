@@ -976,6 +976,74 @@ class TestDeterministicInvariants:
         assert 'human_curator_gate' in message, message
         assert 'before_done' in message, message
 
+    @pytest.mark.parametrize('marker', ['true', 'True', 1, ['x'], {'a': 1}])
+    def test_truthy_but_not_true_curator_marker_still_rejected(self, marker):
+        """Plain truthiness, not ``is True`` — this is a SAFETY gate.
+
+        Do NOT "simplify" this back to an ``is True`` check. The false
+        NEGATIVE is the expensive direction here: a hand-edited or
+        JSON-round-tripped ``'true'`` that slips past the write boundary lands
+        a record the runner's own guard structurally CANNOT protect, because
+        on the act-then-ask path the marker is never read at all — reproducing
+        the task-3181 phantom-done this line of work exists to close. A
+        truthy-but-not-``True`` value is precisely what a misauthoring LLM or
+        operator produces.
+
+        This deliberately mirrors
+        ``orchestrator.deterministic_runner._is_human_curator_gate``, which
+        uses plain ``bool()`` truthiness as a documented divergence from
+        ``_is_operational_llm_gate``'s ``is True``. Two divergent postures for
+        the same key across the write boundary and the runtime guard would be
+        strictly worse than either posture consistently applied.
+        """
+        with pytest.raises(ValidationError):
+            TaskMetadata(
+                task_kind='deterministic',
+                before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+                always_escalates=True,
+                human_curator_gate=marker,  # type: ignore[call-arg]
+            )
+
+    # ---- Accepted neighbours: the validator's blast radius is exactly the
+    # contradiction and nothing wider. Every shape below exists on the live
+    # task store today, so a regression here would break real writes.
+
+    def test_curator_gate_on_a_real_pure_gate_accepted(self):
+        # deterministic + no before_done + always_escalates=True + marker.
+        # Tasks 3063 / 3181 / 3234's shape — the whole point of the marker.
+        TaskMetadata(
+            task_kind='deterministic',
+            always_escalates=True,
+            human_curator_gate=True,  # type: ignore[call-arg]
+        )
+
+    def test_curator_gate_on_a_normal_task_accepted(self):
+        # task 3053's shape: the marker is inert on a non-deterministic task,
+        # but recorded-and-preserved rather than rejected.
+        TaskMetadata(
+            task_kind='normal',
+            human_curator_gate=True,  # type: ignore[call-arg]
+        )
+
+    @pytest.mark.parametrize('falsy', [False, None, 0, '', []])
+    def test_falsy_curator_marker_with_before_done_accepted(self, falsy):
+        # An explicitly-CLEARED marker must not block a legitimate deploy
+        # write — only a set one contradicts before_done.
+        TaskMetadata(
+            task_kind='deterministic',
+            before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+            always_escalates=False,
+            human_curator_gate=falsy,  # type: ignore[call-arg]
+        )
+
+    def test_before_done_without_the_marker_accepted(self):
+        # The 33 existing deploy rows: before_done with no marker at all.
+        TaskMetadata(
+            task_kind='deterministic',
+            before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+            always_escalates=False,
+        )
+
 
 class _DeployStateStub(BaseModel):
     """Throwaway sub-model standing in for a future W10 registrant."""
