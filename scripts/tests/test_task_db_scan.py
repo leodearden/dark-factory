@@ -14,6 +14,27 @@ that previously lived duplicated across test_scan_task_toolcall_leaks.py,
 test_scan_provenance_note_log_leaks.py and test_audit_wiped_metadata_files.py.
 Those files keep their own copies as the untouched regression gate for the
 extraction; this file pins the shared implementation directly.
+
+COVERAGE CAVEAT — this file is NOT executed by any verify chain.
+Every chain runs ``tests/scripts/`` (scripts/orchestrator.yaml:13,
+tests/scripts/orchestrator.yaml:47, and the root
+dark-factory-orchestrator.yaml:41 fleet command), which is a DIFFERENT
+directory from the ``scripts/tests/`` this file lives in — the near-identical
+names are the trap. So run it explicitly:
+
+    uv run --project shared pytest scripts/tests/test_task_db_scan.py -q
+
+The gap is pre-existing (44 files already sat here before task 3336) and was
+out of that task's scope to fix — it holds no lock on any orchestrator.yaml.
+It is recorded rather than assumed away: ticket tkt_0RRZ2N8MTQ8GCC4VVGTJ1PMDKB
+proposes either adding ``scripts/tests/`` to the chains or relocating these
+suites to ``tests/scripts/`` (whose conftest.py already puts ``scripts/`` on
+sys.path, so ``import _task_db_scan`` would resolve there unchanged — but see
+this module's IMPORT-RESOLUTION CONTRACT: the tests may move, the module
+may not). Until then the only gated signal touching _task_db_scan.py is
+indirect: tests/scripts/test_repair_wiped_metadata_files.py imports
+audit_wiped_metadata_files, which imports this module, so a hard ImportError
+surfaces there but a behavioural regression does not.
 """
 from __future__ import annotations
 
@@ -402,6 +423,69 @@ def test_run_scan_cli_exits_1_when_the_scan_finds_a_match(tmp_path, capsys):
 
     assert _cli(["--db", str(db)], lambda db_path: [_match(db_path=db_path)]) == 1
     assert capsys.readouterr().out.strip() == "rendered:1"
+
+
+def test_run_scan_cli_exits_0_when_every_db_is_unreadable(tmp_path, capsys):
+    """PINS A KNOWN GAP, not a desirable behaviour.
+
+    Every resolved database failing to open still exits 0 — indistinguishable
+    by exit code from a genuinely clean sweep, with only the stderr warnings
+    to tell them apart. That is pre-existing (verified: the pre-extraction
+    main() on 2e85a165df built the same `unreadable` list and never consulted
+    it either) and is deliberately preserved by this pure-extraction task
+    rather than silently changed inside a refactor.
+
+    Ticket tkt_0RRZ2KVR9ATP756VRBK0RAT5MA proposes returning 3 here, mirroring
+    audit_wiped_metadata_files.py's exit-3 semantics for the same condition.
+    This test exists so that flip is a deliberate, visible edit instead of an
+    unnoticed one — if you are here to make it 3, change the assertion.
+    """
+    db = tmp_path / "a.db"
+    db.write_text("")
+
+    def scan(db_path):
+        raise sqlite3.Error("file is not a database")
+
+    assert _cli(["--db", str(db)], scan) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "rendered:0"  # reads exactly like a clean sweep
+    assert "results below are incomplete" in captured.err  # only stderr disagrees
+
+
+def test_run_scan_cli_exits_0_when_some_dbs_unreadable_and_rest_clean(tmp_path, capsys):
+    """Partial failure keeps the sweep going and reports on what WAS readable.
+
+    Unlike the all-unreadable case above, exit 0 here is correct-as-designed:
+    at least one database was genuinely scanned and found clean.
+    """
+    good = tmp_path / "good.db"
+    bad = tmp_path / "bad.db"
+    good.write_text("")
+    bad.write_text("")
+
+    def scan(db_path):
+        if db_path == str(bad):
+            raise sqlite3.Error("file is not a database")
+        return []
+
+    assert _cli(["--db", str(good), "--db", str(bad)], scan) == 0
+    assert "results below are incomplete" in capsys.readouterr().err
+
+
+def test_run_scan_cli_still_exits_1_when_a_readable_db_matches_despite_failures(tmp_path):
+    """A match found in a readable database is not masked by a sibling failure."""
+    good = tmp_path / "good.db"
+    bad = tmp_path / "bad.db"
+    good.write_text("")
+    bad.write_text("")
+
+    def scan(db_path):
+        if db_path == str(bad):
+            raise sqlite3.Error("file is not a database")
+        return [_match(db_path=db_path)]
+
+    assert _cli(["--db", str(good), "--db", str(bad)], scan) == 1
 
 
 def test_run_scan_cli_prints_exactly_the_render_output(tmp_path, capsys):

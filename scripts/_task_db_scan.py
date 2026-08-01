@@ -245,6 +245,10 @@ def run_scan_cli(
     be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS /
     the dark-factory default.
 
+    Note that 0 also covers "every resolved database was unreadable" — see the
+    KNOWN GAP comment at the ``_unreadable`` discard below before relying on
+    this exit code in cron/CI.
+
     *render* receives the collected matches and the parsed Namespace and
     returns the exact text to print — that is where each scanner's
     JSON-vs-report choice and its own truncation flag live.
@@ -256,6 +260,23 @@ def run_scan_cli(
         print(NO_DB_RESOLVED_MESSAGE, file=sys.stderr)
         return 2
 
+    # KNOWN GAP, PRE-EXISTING — deliberately preserved by this extraction.
+    # `unreadable` is dropped, so when EVERY resolved database fails to open
+    # the scanner still exits 0, indistinguishable from a genuinely clean
+    # sweep (the stderr warnings are the only signal). That reads as a
+    # no-silent-fail-soft violation against
+    # docs/legibility/design-invariants.md — the very rule cited in this
+    # module's docstring as why audit_wiped_metadata_files.py keeps a distinct
+    # exit 3 for the same condition.
+    #
+    # NOT fixed here on purpose: task 3336 is a pure extraction whose
+    # contract is "no behaviour change", checkable by diffing these bodies
+    # against the pre-extraction copies. Verified the base branch behaved
+    # identically (2e85a165df:scripts/scan_task_toolcall_leaks.py built the
+    # same `unreadable` list and likewise never consulted it), so changing
+    # the exit code here would be a silent behaviour change smuggled into a
+    # refactor. Filed instead as ticket tkt_0RRZ2KVR9ATP756VRBK0RAT5MA, which
+    # proposes returning 3 and lists the tests that pin the status quo.
     matches, _unreadable = sweep_databases(db_paths, scan_fn)
 
     print(render(matches, args))
