@@ -601,6 +601,14 @@ class TestDeriveVerifyPlanTaskRoleFloor:
     instead; role='merge' (and the fallback branch, out of scope here) keep
     the legacy SKIPPED shape (R4 — pinned by the merge+scoped counterparts
     added alongside the migrated goldens in TestDeriveVerifyPlanModulePath).
+
+    Task 3294 widened WHEN the floor fires: it now sits ABOVE the
+    collectable-test branch, so at role='task' ANY touched SOURCE/STRUCTURAL
+    file under the prefix full-suites the owning module — a test-tree-ONLY
+    diff is what keeps FILE_SCOPED selection, not "no test file was touched".
+    The cases in this class are all production-file diffs, so every outcome
+    below is unchanged by 3294; the mixed case it DID change is pinned next
+    door in TestDeriveVerifyPlanTaskRoleFloorMixedDiff.
     """
 
     def test_source_only_diff_full_suites_pytest_at_task_role(self):
@@ -624,9 +632,14 @@ class TestDeriveVerifyPlanTaskRoleFloor:
         assert 'not run' in run.reason.lower()
 
     def test_touched_test_only_diff_stays_file_scoped_at_task_role(self):
-        """(b) A real collectable test file keeps FILE_SCOPED selection — the
-        floor only fires on the pytest else-branch (no touched test file),
-        never overriding the existing collectable-test selection."""
+        """(b) A test-tree-ONLY diff keeps FILE_SCOPED selection.
+
+        The floor is PRODUCTION-triggered, not blanket: it fires whenever a
+        SOURCE/STRUCTURAL file is touched under the prefix, and this diff has
+        none. (Pre-3294 the floor sat below the collectable-test branch and
+        this outcome followed from "a test file was touched" instead — same
+        assertion, different reason. The distinction is what
+        TestDeriveVerifyPlanTaskRoleFloorMixedDiff exists to pin.)"""
         mc = ModuleConfig(
             prefix='shared',
             test_command='uv run --directory shared pytest tests/',
@@ -2211,6 +2224,14 @@ class TestPlanRecordScopedTargets:
     path (_scope_prefix_to_keyword) produces for EVERY subproject — each
     one's lint_command chains a sibling checker. The scoping itself was and
     remains correct; only the machine-readable record was lost.
+
+    The field's contract is "non-empty EXACTLY for FILE_SCOPED", so task
+    3294's widening moved a slot rather than changing the contract: a mixed
+    diff's pytest slot is FULL_SUITE at role='task' and therefore records
+    NOTHING (it narrowed to nothing), while the same slot is still
+    FILE_SCOPED-with-a-record at role='merge'. The parametrised sweep
+    (test_module_path_scoped_targets_nonempty_exactly_for_file_scoped_runs)
+    is what pins the contract itself across both.
     """
 
     def test_chained_lint_records_scoped_targets(self):

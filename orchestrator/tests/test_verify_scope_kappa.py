@@ -209,7 +209,16 @@ class TestModuleConfigPlanAuthority:
 
     @pytest.mark.asyncio
     async def test_executed_commands_are_driven_by_the_plan(self, tmp_path: Path):
-        """A touched test file + a plain source file under one registered module."""
+        """A touched test file + a plain source file under one registered module.
+
+        Since task 3294 this MIXED shape full-suites pytest at the default
+        role='task' (any touched SOURCE/STRUCTURAL file under the prefix runs
+        the owning module's whole test_command), so this pins the FULL_SUITE
+        arm of the plan→ModuleConfig mapping alongside lint/pyright's
+        FILE_SCOPED arms. The class's contract — executed == planned, with no
+        hand-mirrored decision tree in between — is unchanged; only which arm
+        the pytest slot exercises moved.
+        """
         (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
         (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
         (tmp_path / 'mymod' / 'helpers.py').write_text('def helper():\n    return 1\n')
