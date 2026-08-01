@@ -3108,16 +3108,12 @@ async def test_auto_unhalt_seeds_grace_and_rehalt_reescalates(
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    with (
-        patch.object(
-            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
-        ),
-        contextlib.suppress(TimeoutError),
+    with patch.object(
+        harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
     ):
-        # 1.0s (vs the sibling tests' 0.5s) gives the driven loop extra headroom
-        # to reach the auto-unhalt branch under parallel-suite load, so a timing
-        # miss can't masquerade as a grace/sentinel regression.
-        await asyncio.wait_for(harness.run_loop(), timeout=1.0)
+        # Driven until the auto-unhalt branch has actually captured grace, so a
+        # timing miss is impossible by construction rather than by budget tuning.
+        await _drive_run_loop_until(harness, unhalted)
 
     # Precondition: the auto-unhalt branch actually fired (distinguishes a real
     # grace/sentinel regression below from a mere timing miss reaching the branch).
