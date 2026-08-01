@@ -104,6 +104,7 @@ Either encodes host state rather than checker behaviour.
 import argparse
 import dataclasses
 import pathlib
+import re
 import sys
 from typing import Sequence
 
@@ -296,6 +297,11 @@ class UnitSpec:
     # the branch entirely, which is right for the two watchdog units — they
     # declare no Environment= at all.
     environment_section: str | None = None
+    # Bare uvicorn flag names (no leading '--') compared INSIDE [Service]
+    # ExecStart. This is how a presence-only ExecStart still gets its
+    # meaningful content checked: the host-specific `uv` path and repo-root
+    # prefix are ignored, while a stale --timeout-graceful-shutdown is not.
+    exec_start_flags: tuple[str, ...] = ()
 
 
 def _render(values: list[str] | None) -> str:
@@ -305,6 +311,74 @@ def _render(values: list[str] | None) -> str:
     if len(values) == 1:
         return values[0]
     return " | ".join(values)
+
+
+def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str | None:
+    """Return the argument of ``--<flag>`` in ExecStart, or None if absent.
+
+    Reads the ALREADY-JOINED ExecStart value out of a parsed section — never
+    the raw file text.  That scoping is load-bearing, and the hazard is real
+    rather than hypothetical: both dashboard units discuss ``--timeout-keep-alive``
+    and ``--timeout-graceful-shutdown`` in the explanatory comment block
+    directly above ExecStart.  A whole-file regex would therefore keep
+    reporting a value after the flag had actually been deleted from the
+    command — reporting parity on a unit that lost the very flag being
+    checked.  Comments are already gone from the parse, so the correct
+    behaviour is inherited for free.
+
+    Both click spellings are accepted (``--flag value`` and ``--flag=value``):
+    uvicorn's parser treats them identically, so rejecting one would report a
+    reformatted-but-correct command as a missing flag.
+
+    Returns the RAW token, not an int (unlike ``_uvicorn_int_flag`` in
+    tests/scripts/test_dashboard_service_template.py, whose idiom this
+    borrows), so non-numeric flags like ``--host 127.0.0.1`` work too.
+    """
+    values = service_directives.get("ExecStart")
+    if not values:
+        return None
+    command = " ".join(values)
+    match = re.search(rf"--{re.escape(flag)}[=\s]+(\S+)", command)
+    return match.group(1) if match else None
+
+
+def _compare_exec_start_flags(
+    spec: UnitSpec,
+    repo: dict[str, dict[str, list[str]]],
+    installed: dict[str, dict[str, list[str]]],
+) -> list[Drift]:
+    """Compare each of ``spec.exec_start_flags`` inside [Service] ExecStart."""
+    drifts: list[Drift] = []
+    repo_service = repo.get("Service", {})
+    installed_service = installed.get("Service", {})
+
+    for flag in spec.exec_start_flags:
+        repo_value = _exec_start_flag(repo_service, flag)
+        installed_value = _exec_start_flag(installed_service, flag)
+        if repo_value == installed_value:
+            continue
+        if repo_value is None:
+            reason = f"--{flag} present on the installed command, absent from the repo command"
+        elif installed_value is None:
+            reason = f"--{flag} present on the repo command, absent from the installed command"
+        else:
+            reason = f"--{flag} argument differs between the repo and installed commands"
+        drifts.append(
+            Drift(
+                unit=spec.name,
+                section="Service",
+                # Keyed by FLAG, not by 'ExecStart': the command is long and
+                # mostly host-specific, so naming the whole directive would
+                # send the operator back to a manual diff to find the token
+                # that actually moved.
+                key=f"ExecStart --{flag}",
+                repo_value=repo_value if repo_value is not None else _ABSENT,
+                installed_value=installed_value if installed_value is not None else _ABSENT,
+                reason=reason,
+            )
+        )
+
+    return drifts
 
 
 def _environment_map(
@@ -447,6 +521,7 @@ def compare_unit(
             )
         )
 
+    drifts.extend(_compare_exec_start_flags(spec, repo, installed))
     drifts.extend(_compare_environment(spec, repo, installed))
 
     return drifts
