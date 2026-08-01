@@ -80,6 +80,15 @@ def service(mock_config):
     # Default read payload carries BOTH mem0-owned keys and custom provenance
     # keys, so the preservation assertions have something to preserve.
     svc.mem0.get_point_by_id = AsyncMock(return_value=dict(DEFAULT_POINT_PAYLOAD))
+    # Deterministic metadata read surface (task 3197). delete_memory's child
+    # gate awaits count_by_metadata on every mem0 delete; without an
+    # AsyncMock here every pre-existing delete test would hit a bare
+    # non-awaitable MagicMock and fail with a confusing TypeError. The
+    # CHILDLESS defaults (0 / []) model the live corpus leaf α measured:
+    # `metadata.parent_id` has zero footprint, so no existing record has
+    # children. Child cases override both per-test.
+    svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
 
     # Mock durable queue
     svc.durable_queue = MagicMock()
@@ -10789,3 +10798,196 @@ class TestParentIdLivenessAtSeam:
 
         _mm_backend_mock(service, entry_point).assert_awaited_once()
         assert 'parent_id_liveness_unavailable' in _mm_census_codes(caplog)
+
+
+# --- delete_memory parent-lifecycle gate (task 3197, leaf δ) ---------------
+#
+# PRD V3: "no operation may silently orphan a child or dangle a pointer it
+# could have seen." The gate is UNCONDITIONAL — deliberately not behind
+# `memory_metadata.enforce`, unlike the V1 shape checks — because it is a
+# lifecycle safety gate, not a vocabulary check, and behind a default-off
+# flag the orphan hole would stay open exactly as long as the flag stayed
+# off.
+
+_DM_PARENT = 'parent-mem-1'
+_DM_CHILD_A = 'child-mem-a'
+_DM_CHILD_B = 'child-mem-b'
+
+
+def _dm_children(svc, child_ids, *, count=None):
+    """Report *child_ids* as children of whatever is being deleted.
+
+    *count* defaults to ``len(child_ids)``; pass it explicitly to model a
+    count/scroll DISAGREEMENT (a bounded scroll, or a concurrent write
+    between the two reads).
+    """
+    svc.mem0.count_by_metadata = AsyncMock(
+        return_value=len(child_ids) if count is None else count
+    )
+    svc.mem0.scroll_by_metadata = AsyncMock(
+        return_value=[{'id': cid, 'metadata': {}} for cid in child_ids]
+    )
+
+
+def _dm_event_buffer(svc):
+    buffer = MagicMock()
+    buffer.push = AsyncMock()
+    svc._event_buffer = buffer
+    return buffer
+
+
+def _dm_deleted_ids(svc):
+    """Ids passed to the mem0 backend delete, in call order."""
+    return [call.args[0] for call in svc.mem0.delete.call_args_list]
+
+
+class TestDeleteMemoryChildRefusal:
+    """`delete_memory` refuses to orphan children (task 3197, leaf δ)."""
+
+    @pytest.mark.asyncio
+    async def test_refuses_and_names_every_child(self, service):
+        """The refusal is the task's user-observable signal.
+
+        An agent that trips it at the MCP wire receives only
+        `{'error': str(e), 'error_type': ...}`, so the ids have to be in
+        the message, not merely on the exception object.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        _dm_children(service, [_DM_CHILD_A, _DM_CHILD_B])
+
+        with pytest.raises(ParentHasChildrenError) as excinfo:
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+
+        assert excinfo.value.child_ids == [_DM_CHILD_A, _DM_CHILD_B]
+        text = str(excinfo.value)
+        assert _DM_CHILD_A in text
+        assert _DM_CHILD_B in text
+
+    @pytest.mark.asyncio
+    async def test_refusal_leaves_no_delete_no_journal_row_no_event(self, service):
+        """A refused delete must leave no trace claiming a deletion happened.
+
+        The gate therefore runs BEFORE the backend call, before
+        `log_write_op` and before the `memory_deleted` event — a journal row
+        or a reconciliation event for a delete that never happened would
+        make downstream recon act on a record that is still there.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        _dm_children(service, [_DM_CHILD_A])
+
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+
+        service.mem0.delete.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_child_lookup_filter_and_project_scope(self, service):
+        """The gate asks exactly one question, in the delete's own project."""
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        _dm_children(service, [_DM_CHILD_A])
+
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='dark_factory'
+            )
+
+        scope, filters = service.mem0.count_by_metadata.call_args.args[:2]
+        assert filters == {'parent_id': _DM_PARENT}
+        assert scope.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_childless_delete_is_unchanged_and_costs_one_count(self, service):
+        """The common path pays one exact count and ZERO scrolls.
+
+        `delete_memory` has six in-repo recon callers including bulk pool
+        GC, so paying a full payload scroll per delete would be a real cost
+        for a listing nobody reads when there is nothing to list.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        result = await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test'
+        )
+
+        assert result['status'] == 'deleted'
+        assert _dm_deleted_ids(service) == [_DM_PARENT]
+        journal.log_write_op.assert_awaited_once()
+        buffer.push.assert_awaited_once()
+        service.mem0.count_by_metadata.assert_awaited_once()
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_delete_pays_no_child_lookup(self, service):
+        """`parent_id` is a Mem0 payload key — a Graphiti edge has none.
+
+        Charging the graphiti arm a Qdrant count for a relationship that
+        cannot exist there would be pure overhead.
+        """
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        await service.delete_memory(
+            memory_id='edge-uuid-123', store='graphiti', project_id='test'
+        )
+
+        service.mem0.count_by_metadata.assert_not_awaited()
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_is_re_read_live_on_every_delete(self, service):
+        """INV-3: corroborate against the store, never against cached state.
+
+        A child can be written between two deletes, so a gate that trusted
+        a remembered "childless" answer would be checking history.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test'
+        )
+        assert service.mem0.count_by_metadata.await_count == 1
+
+        _dm_children(service, [_DM_CHILD_A])
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+        assert service.mem0.count_by_metadata.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_scroll_shortfall_still_refuses_and_marks_truncated(self, service):
+        """A disagreement between the two reads is never downgraded.
+
+        If the scroll returns fewer ids than the live count — a bounded
+        scroll or a concurrent write — reporting "no children" would be the
+        exact silent orphan this gate exists to prevent, and reporting an
+        exhaustive-looking list would understate it.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        _dm_children(service, [_DM_CHILD_A], count=5)
+
+        with pytest.raises(ParentHasChildrenError) as excinfo:
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+
+        assert excinfo.value.truncated is True
+        assert 'at least' in str(excinfo.value)
+        service.mem0.delete.assert_not_awaited()
