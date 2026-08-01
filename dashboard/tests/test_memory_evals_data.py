@@ -31,6 +31,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import MagicMock
 
 from dashboard.config import DashboardConfig
 
@@ -3139,6 +3140,107 @@ def _route_tree(tmp_path: Path) -> DashboardConfig:
     return config
 
 
+def _payload(**overrides: Any) -> dict[str, Any]:
+    """A healthy builder-shaped payload, overridable one key at a time.
+
+    Shaped as ``build_memory_evals`` returns it (``_PAYLOAD_KEYS`` exactly), so
+    a stub standing in for the builder cannot pass the route something the
+    route's own ``shape_memory_evals(**result)`` call would reject.
+    """
+    payload: dict[str, Any] = {
+        'generated_at': '2026-07-06T03:15:00+00:00',
+        'root_present': True,
+        'storm_escape': None,
+        'evals': [],
+        'issues': [],
+        'issue_count': 0,
+        'unmatched_escalations': [],
+    }
+    payload.update(overrides)
+    payload['issue_count'] = len(payload['issues'])
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# a scan that never reached the tree must not be pinned for the TTL window
+# ---------------------------------------------------------------------------
+
+
+class TestRootScanCacheability:
+    """``root_scan_succeeded`` — "did this scan actually reach the tree?"
+
+    The TTL cache in front of this route exists because the artifact walk is
+    expensive.  That reasoning does not extend to the two payloads produced
+    WITHOUT walking anything: an absent root returns immediately from
+    ``is_dir()``, and an unwalkable one raises immediately from ``iterdir()``.
+    Both are O(1) to recompute, so retrying them on every poll costs nothing
+    and there is no thundering herd to protect — while caching them pins a
+    "there is no data" view of a tree that may exist by the next poll (a mount
+    landing, a mode being fixed) for the full TTL window.
+
+    The predicate is deliberately narrow.  A degraded ROW — an unreadable
+    metrics run, an unknown kind, an orphan verdict — stays cacheable: the scan
+    DID reach the tree, re-running it would return the same degradation, and
+    that re-run is the expensive walk this cache is here to prevent.
+    """
+
+    def test_healthy_payload_is_cacheable(self) -> None:
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        assert root_scan_succeeded(_payload()) is True
+
+    def test_absent_root_is_not_cacheable(self) -> None:
+        """``root_present: False`` — ``is_dir()`` said no, so nothing was walked."""
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        assert root_scan_succeeded(_payload(root_present=False)) is False
+
+    def test_unreadable_root_is_not_cacheable(self) -> None:
+        """The root IS present but the enumeration raised — also nothing walked."""
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        payload = _payload(issues=[{
+            'kind': 'unreadable_root',
+            'path': '/tmp/memory-evals',
+            'detail': '[Errno 13] Permission denied',
+        }])
+
+        assert payload['root_present'] is True
+        assert root_scan_succeeded(payload) is False
+
+    def test_a_degraded_row_stays_cacheable(self) -> None:
+        """Row-level degradation is not a failed scan — the walk happened.
+
+        This is the load-bearing half.  Keying the cache on "any issue at all"
+        would make a single permanently-corrupt metrics file defeat the cache
+        forever, re-running the full walk on every poll to rediscover a
+        degradation that re-scanning cannot fix.
+        """
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        payload = _payload(issues=[
+            {'kind': 'unreadable_metrics', 'path': '/tmp/m.json', 'detail': 'x'},
+            {'kind': 'unknown_kind', 'path': '/tmp/m.json', 'detail': 'y'},
+            {'kind': 'orphan_verdict', 'path': '/tmp/v.json', 'detail': 'z'},
+        ])
+
+        assert payload['issue_count'] == 3
+        assert root_scan_succeeded(payload) is True
+
+    def test_a_partial_payload_cannot_raise_inside_the_predicate(self) -> None:
+        """It runs inside the cache write path, where raising would 500 the poll.
+
+        ``build_memory_evals`` returns every key on every path, so this is
+        defence rather than a live case — but a predicate that trusts that
+        invariant turns any future violation of it into a crash at the least
+        debuggable point in the request.
+        """
+        from dashboard.data.memory_evals import root_scan_succeeded
+
+        assert root_scan_succeeded({}) is False
+        assert root_scan_succeeded({'root_present': True}) is True
+
+
 class TestMemoryEvalsEndpoint:
     """``GET /api/v2/dashboard/memory-evals`` end-to-end through the real route.
 
@@ -3300,6 +3402,109 @@ class TestMemoryEvalsEndpoint:
         after = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
 
         assert after['evals'][0]['run_stamps'][-1] == '20260706T031500Z'
+
+    def test_a_healthy_scan_is_still_served_from_cache(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """Gating the cache must not disable it — the ordinary payload still caches.
+
+        ``test_ttl_cache_single_flights_the_scan`` above proves this over the
+        real disk; this proves it at the builder boundary, so a ``cache_ok``
+        predicate that accidentally rejected everything would fail HERE with a
+        call count rather than silently turning every dashboard poll into a
+        full artifact walk.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _memory_evals_cache_clear()
+        # SYNC, not AsyncMock: the route calls the builder through
+        # asyncio.to_thread, which hands it a plain callable.
+        build = MagicMock(return_value=_payload())
+        monkeypatch.setattr(app_module, 'build_memory_evals', build)
+
+        assert client.get(_ROUTE_URL).status_code == 200
+        assert client.get(_ROUTE_URL).status_code == 200
+
+        assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
+
+    def test_an_absent_root_is_not_pinned_for_the_ttl(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """``root_present: False`` is re-checked every poll.
+
+        A root that does not exist yet is the pre-deployment state AND the
+        transient one (an unmounted volume, a tree being created).  Caching it
+        means the dashboard keeps reporting "no evals have ever run" for a full
+        TTL window after the tree lands.  Re-checking costs one ``is_dir()``.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _memory_evals_cache_clear()
+        build = MagicMock(return_value=_payload(root_present=False))
+        monkeypatch.setattr(app_module, 'build_memory_evals', build)
+
+        r1 = client.get(_ROUTE_URL)
+        r2 = client.get(_ROUTE_URL)
+
+        assert r1.status_code == r2.status_code == 200
+        assert r2.json()['MEMORY_EVALS']['root_present'] is False
+        assert build.call_count == 2, f'expected 2 build calls, got {build.call_count}'
+
+    def test_an_unreadable_root_is_not_pinned_for_the_ttl(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """The other never-walked payload: present, but the enumeration raised.
+
+        Distinct from the absent case because ``root_present`` stays True — the
+        signal is the ``unreadable_root`` issue, which is why the predicate
+        reads both and not just the flag.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _memory_evals_cache_clear()
+        build = MagicMock(return_value=_payload(issues=[{
+            'kind': 'unreadable_root',
+            'path': str(tmp_path),
+            'detail': '[Errno 13] Permission denied',
+        }]))
+        monkeypatch.setattr(app_module, 'build_memory_evals', build)
+
+        r1 = client.get(_ROUTE_URL)
+        r2 = client.get(_ROUTE_URL)
+
+        assert r1.status_code == r2.status_code == 200
+        assert build.call_count == 2, f'expected 2 build calls, got {build.call_count}'
+
+    def test_a_degraded_row_is_still_cached(
+        self, client, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """A corrupt metrics file must not defeat the cache in front of the walk.
+
+        The failure this pins is a perf cliff, not a wrong answer: gate the
+        cache on ``issue_count`` instead of on the root and one permanently
+        broken artifact re-runs the full scan on every poll, forever.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _memory_evals_cache_clear()
+        build = MagicMock(return_value=_payload(issues=[
+            {'kind': 'unreadable_metrics', 'path': str(tmp_path), 'detail': 'boom'},
+        ]))
+        monkeypatch.setattr(app_module, 'build_memory_evals', build)
+
+        assert client.get(_ROUTE_URL).status_code == 200
+        r2 = client.get(_ROUTE_URL)
+
+        assert r2.json()['MEMORY_EVALS']['issue_count'] == 1
+        assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
 
     def test_cache_clear_hook_is_exported(self) -> None:
         """The test hook is part of the module's published surface, like the analytics one."""
