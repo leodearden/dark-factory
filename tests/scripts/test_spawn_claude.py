@@ -1296,13 +1296,16 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     sentinel. <enc> mirrors session_registry.transcript_path_for_cwd's
     encoding: cwd with every '/' and '.' replaced by '-'.
 
-    Grace is load-adaptive (task 2733): SPAWN_STARTED_GRACE_SECS is
-    _load_scaled_grace(3), not a fixed 3s. Under merge-verify xdist
-    contention the fake launcher->claude->transcript startup chain can take
-    longer than any fixed margin -- this is the SECOND recurrence of this
-    exact flake (task 2367 already bumped the fixed value 1s/2s -> 3s/8s six
-    days before this one). Load-per-core headroom tracks the actual
-    contention instead of chasing a moving target with another fixed bump.
+    Grace is load-adaptive via _set_started_grace (task 3451), which shares
+    one policy across all three must-not-be-flagged sites in this file.
+    Originally task 2733's bare _load_scaled_grace(3) -- but a base of 3s
+    was ALSO below the measured 4.71s worst-case happy-path chain latency
+    (load-per-core 6.6), leaving residual exposure at low-but-nonzero load.
+    Under merge-verify xdist contention the fake launcher->claude->transcript
+    startup chain can take longer than any fixed margin -- this is the THIRD
+    recurrence of this exact flake (task 2367 already bumped the fixed value
+    1s/2s -> 3s/8s six days before task 2733's fix, which task 3451 now
+    supersedes here).
 
     The fake-claude sleep stays FIXED at 8s, decoupled from the now-larger
     grace: the only validity requirement is that the exit sentinel lands
@@ -1336,8 +1339,7 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     _write_detaching_terminal(bin_dir, "custom-term", pidfile)
 
     env = _base_env(bin_dir, "custom-term")
-    grace = _load_scaled_grace(3)
-    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
+    grace = _set_started_grace(env)
 
     result = _run_spawn(env, tmp_path, timeout=grace + 8 + 6)
 
@@ -1377,10 +1379,12 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     launcher (setsid + background job, reparented once the launcher process
     exits), where this probe is correctly always empty.
 
-    Grace is load-adaptive (task 2733) like
-    test_transcript_appearance_suppresses_flag: SPAWN_STARTED_GRACE_SECS is
-    _load_scaled_grace(2), not a fixed 2s, so the margin tracks host
-    contention instead of chasing a moving target with another fixed bump.
+    Grace is load-adaptive via _set_started_grace (task 3451), the same
+    policy as test_transcript_appearance_suppresses_flag. Originally task
+    2733's bare _load_scaled_grace(2) -- but a base of 2s was ALSO below
+    the measured 4.71s worst-case happy-path chain latency (load-per-core
+    6.6), leaving residual exposure at low-but-nonzero load. All three
+    must-not-be-flagged sites in this file now share one policy.
 
     The fake-claude sleep stays FIXED at 6s, decoupled from the now-larger
     grace: the only validity requirement is that the exit sentinel lands
@@ -1403,8 +1407,7 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     claude.chmod(0o755)
 
     env = _base_env(bin_dir, "xterm")
-    grace = _load_scaled_grace(2)
-    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
+    grace = _set_started_grace(env)
 
     result = _run_spawn(env, tmp_path, timeout=grace + 6 + 6)
 
