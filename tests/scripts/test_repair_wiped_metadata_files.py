@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sqlite3
 import subprocess
 import sys
@@ -67,6 +66,7 @@ from repair_wiped_metadata_files import (  # pyright: ignore[reportMissingImport
     SKIP_LOCK_CHARTER,
     SKIP_LOCK_LEVEL_FIDELITY,
     RepairOutcome,
+    _make_client,
     RepairResult,
     build_repair_payload,
     classify_live_task,
@@ -1234,46 +1234,28 @@ def test_main_exit_3_when_every_resolved_root_is_unreadable(tmp_path):
     assert "not a clean result" in result.stderr
 
 
-_MIGRATE_SCRIPT = Path(__file__).parent.parent.parent / "scripts" / "migrate_metadata_modules_to_files.py"
+def test_make_client_is_attributable_to_this_repair_not_the_migration():
+    """THE PROPERTY THE OVERRIDE EXISTS FOR: an attributable clientInfo.name.
 
+    It is load-bearing, not cosmetic. fused-memory derives a write's
+    ``agent_id`` from ``clientInfo.name``, so a client that keeps the parent's
+    ``'migrate-metadata'`` files these repair writes under the MIGRATION's
+    identity and the 36 backfills stop being traceable to task 3329.
 
-def _protocol_versions(path: Path) -> set[str]:
-    return set(
-        re.findall(r"""protocolVersion["']\s*:\s*["']([^"']+)["']""", path.read_text())
-    )
+    Asserted on the CONSTRUCTED CLIENT, not on anyone's source text. That
+    matters for more than style: this test must survive DF 3437, which gives
+    the parent a ``getattr(self, '_client_name', ...)`` seam and DELETES
+    RepairFusedMemoryClient._initialize entirely. The ``_client_name``
+    attribute is what carries the name through that change, so reading it here
+    is exactly the invariant that should outlive the clone.
 
-
-def test_repair_client_handshake_has_not_drifted_from_its_parent():
-    """A DRIFT GUARD FOR A KNOWING CLONE.
-
-    RepairFusedMemoryClient._initialize restates its parent's whole handshake —
-    both JSON-RPC posts, the protocolVersion, the capabilities block — solely to
-    change clientInfo.name, because the parent bakes that name into the middle
-    of the procedure. scripts/migrate_metadata_modules_to_files.py is outside
-    task 3329's lock scope, so the parent cannot be given a
-    ``getattr(self, '_client_name', ...)`` seam here; the ``_client_name``
-    attribute is set on the subclass ready for that change, and the override
-    can be deleted the day it lands.
-
-    Until then this is what stops the clone drifting silently: bump the
-    parent's protocolVersion and the repair client would keep handshaking with
-    the stale one, with nothing in the repo noticing. Asserted on the source
-    text rather than by importing the client, so the check costs no httpx
-    import and no server.
+    ``_make_client`` only constructs — no connection is opened until a call is
+    issued — so this costs no server and no network.
     """
-    parent = _protocol_versions(_MIGRATE_SCRIPT)
-    child = _protocol_versions(Path(_SCRIPT))
+    client = _make_client("http://127.0.0.1:9")
 
-    assert len(parent) == 1, f"ambiguous parent protocolVersion: {parent}"
-    assert len(child) == 1, f"ambiguous repair protocolVersion: {child}"
-    assert parent == child, (
-        "the repair client's handshake has drifted from FusedMemoryClient's: "
-        f"parent={parent}, repair={child}"
-    )
-    # The one thing the override is FOR: an attributable clientInfo.name, so
-    # these repair writes are not filed under the migration's agent_id.
-    assert CLIENT_NAME not in _MIGRATE_SCRIPT.read_text()
-    assert "'migrate-metadata'" in _MIGRATE_SCRIPT.read_text()
+    assert client._client_name == CLIENT_NAME
+    assert client._client_name != "migrate-metadata"
 
 
 def test_main_project_root_is_repeatable(tmp_path):

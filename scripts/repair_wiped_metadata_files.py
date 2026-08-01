@@ -887,12 +887,20 @@ def _make_client(server_url: str):
 
         :attr:`_client_name` is the seam that retires it. ``scripts/`` is
         outside this task's lock scope, so the parent cannot be edited here;
-        when it next comes into scope, change its ``_initialize`` to read
-        ``getattr(self, '_client_name', 'migrate-metadata')`` and DELETE this
-        override entirely — the attribute alone will then do the job. Until
-        then ``test_repair_client_handshake_has_not_drifted_from_its_parent``
-        fails the moment the two bodies disagree, so the drift is caught by CI
-        rather than shipped.
+        DF 3437 owns that change — give the parent's ``_initialize`` a
+        ``getattr(self, '_client_name', 'migrate-metadata')`` read and DELETE
+        this override entirely, since the attribute alone then does the job.
+
+        THE DRIFT IS NOT GUARDED BY A TEST, DELIBERATELY. A guard would have to
+        compare this body against the parent's source text, and the parent is a
+        file this task does not own — so it would break on an unrelated rename
+        with no defect present, and it would fail the moment DF 3437 landed,
+        i.e. exactly when the clone was correctly removed. The clone is
+        recorded here instead, with its deletion condition, and
+        ``test_make_client_is_attributable_to_this_repair_not_the_migration``
+        pins the one thing that must hold either way: the constructed client
+        reports THIS repair's name, not the migration's. That test is written
+        against the attribute, so it survives DF 3437 unchanged.
         """
 
         _client_name = CLIENT_NAME
