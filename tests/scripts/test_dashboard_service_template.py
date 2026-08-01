@@ -988,3 +988,174 @@ def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
         + "\nEach such line is a directive systemd parsed, warned about, and then "
         "discarded — the unit does not do what its text says it does."
     )
+
+
+# ---------------------------------------------------------------------------
+# Clean-stop exit-code classification
+#
+# `uv run` propagates its child's signal death as a numeric exit code, so a
+# perfectly graceful SIGTERM stop surfaces to systemd as exit 143 (128+15).
+# Under systemd's default classification that is a FAILURE: the journal records
+# "Failed with result exit-code" (status=143) and the unit is left in a failed
+# state for a stop that was clean, expected and successful — observed
+# 2026-07-30 22:23:53 BST on the bounded-drain unit from task 3306, with six
+# keep-alive clients attached.  The cost is diagnostic, and compounding: every
+# routine restart plants a false failure, so the failed state stops meaning
+# anything and a real crash reads exactly like a deploy.
+#
+# Note there is no systemd-analyze corroboration in this section, unlike the
+# restart-backoff one above.  A missing SuccessExitStatus= is a perfectly VALID
+# configuration, not a misconfiguration, so systemd emits nothing about it — the
+# file-content invariant is the only signal available.
+# ---------------------------------------------------------------------------
+
+
+def _success_exit_statuses(path: pathlib.Path) -> set[str]:
+    """Return every exit status *path* declares as success, as a flat token set.
+
+    Two systemd behaviours are load-bearing here and neither is optional:
+
+    1. A single directive accepts a SPACE-SEPARATED LIST
+       (``SuccessExitStatus=143 SIGPIPE``), so each value is split.
+    2. Repeated directives ACCUMULATE rather than override, so every match is
+       collected — ``re.findall``, not ``re.search``.
+
+    A ``re.search(...).group(1)`` parser would satisfy neither: it would read a
+    unit that correctly declares ``SuccessExitStatus=SIGPIPE`` on one line and
+    ``SuccessExitStatus=143`` on another as missing 143, sending a future author
+    to "fix" a unit that is already right.  Same failure mode _timeout_stop_sec
+    guards against, where a valid ``15s`` must not be misdiagnosed as absent.
+
+    The ``^`` anchor also keeps this reading DIRECTIVES, not prose: both real
+    unit files discuss this directive by name in the comment above it, and a
+    commented-out mention must never be counted as a live declaration.
+    """
+    values = re.findall(
+        r"^SuccessExitStatus=(.*)$",
+        path.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    return {token for value in values for token in value.split()}
+
+
+def _assert_clean_sigterm_is_success(path: pathlib.Path) -> None:
+    """Assert *path* classifies a clean SIGTERM stop (exit 143) as success."""
+    statuses = _success_exit_statuses(path)
+    assert statuses, (
+        f"{path} declares no SuccessExitStatus= at all, so systemd applies its "
+        "default classification and records every clean stop as a failure. "
+        "`uv run` propagates its child's SIGTERM death as exit code 143 "
+        "(128+15), which the journal reports as 'Failed with result exit-code' "
+        "(status=143) — observed 2026-07-30 22:23:53 BST on the bounded-drain "
+        "unit from task 3306. Declare SuccessExitStatus=143."
+    )
+    assert "143" in statuses, (
+        f"{path} declares SuccessExitStatus={sorted(statuses)}, which does not "
+        "include 143 — the status this unit actually exits with on a graceful "
+        "stop. `uv run` translates its child's SIGTERM death into exit 143 "
+        "(128+15), so a stop that was clean and expected is still recorded as "
+        "'Failed with result exit-code'. Declaring some OTHER status successful "
+        "does not fix the exit this unit really produces."
+    )
+
+    # Context for the trade being made, not an independent property: 143 being
+    # "success" is precisely what stops Restart=on-failure re-firing on it, so a
+    # reader of this assertion should be able to see the restart policy it
+    # interacts with rather than having to go find it.
+    restart = _restart_directive(path, "Restart")
+    assert restart is not None, (
+        f"{path} declares SuccessExitStatus but no Restart= policy. "
+        "SuccessExitStatus= reclassifies exactly the exits Restart=on-failure "
+        "reacts to, so the two belong together; without a restart policy the "
+        "directive only relabels the recorded result and this assertion is "
+        "pinning an interaction that is not there."
+    )
+
+
+def test_success_exit_status_parser_handles_systemd_spellings(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_success_exit_statuses must handle every spelling systemd itself accepts.
+
+    Per the module convention, the helper earns its own negatives so it cannot
+    silently no-op, and each case pins its own failure mode with ``match=``
+    rather than a bare ``pytest.raises(AssertionError)`` that any assertion in
+    the chain would satisfy.
+
+    The good cases matter as much as the bad ones here: a parser too strict to
+    read a valid unit would send a future author to "fix" something already
+    correct, which is the more expensive error of the two.
+    """
+    # Bad: no directive at all — the pre-fix state.
+    absent = _write_restart_unit(
+        tmp_path / "absent.service", "Restart=on-failure\nRestartSec=5"
+    )
+    assert _success_exit_statuses(absent) == set()
+    with pytest.raises(AssertionError, match="declares no SuccessExitStatus"):
+        _assert_clean_sigterm_is_success(absent)
+
+    # Bad: named only in a comment.  Not hypothetical — the real unit files
+    # carry an explanatory comment naming this directive directly above it, so a
+    # parser that dropped the ^ anchor would report those files as compliant
+    # while the live directive had been deleted.  Same trap
+    # test_uvicorn_flag_lookup_is_scoped_to_exec_start guards for the flags.
+    commented = _write_restart_unit(
+        tmp_path / "commented.service",
+        "# SuccessExitStatus=143 because `uv run` exits 143 on SIGTERM\n"
+        "Restart=on-failure\nRestartSec=5",
+    )
+    assert _success_exit_statuses(commented) == set(), (
+        "a commented-out mention was counted as a live declaration"
+    )
+    with pytest.raises(AssertionError, match="declares no SuccessExitStatus"):
+        _assert_clean_sigterm_is_success(commented)
+
+    # Bad: present, but not the status this unit actually exits with.  Guards
+    # against a helper that merely checks the directive exists.
+    wrong = _write_restart_unit(
+        tmp_path / "wrong.service", "Restart=on-failure\nSuccessExitStatus=75"
+    )
+    with pytest.raises(AssertionError, match="does not include 143"):
+        _assert_clean_sigterm_is_success(wrong)
+
+    # Bad: the right status but no restart policy to interact with.
+    no_restart = _write_restart_unit(
+        tmp_path / "no_restart.service", "SuccessExitStatus=143"
+    )
+    with pytest.raises(AssertionError, match="no Restart= policy"):
+        _assert_clean_sigterm_is_success(no_restart)
+
+    # Good: the plain form — must not raise.
+    plain = _write_restart_unit(
+        tmp_path / "plain.service", "Restart=on-failure\nSuccessExitStatus=143"
+    )
+    _assert_clean_sigterm_is_success(plain)
+
+    # Good: space-separated list on ONE line.  Pins the whitespace split — a
+    # whole-value parser would compare the string "143 SIGPIPE" against "143".
+    listed = _write_restart_unit(
+        tmp_path / "listed.service", "Restart=on-failure\nSuccessExitStatus=143 SIGPIPE"
+    )
+    assert _success_exit_statuses(listed) == {"143", "SIGPIPE"}
+    _assert_clean_sigterm_is_success(listed)
+
+    # Good: split across REPEATED directives, which systemd accumulates.  Pins
+    # the findall — a single re.search would read only the SIGPIPE line and
+    # declare this correctly-configured unit broken.
+    repeated = _write_restart_unit(
+        tmp_path / "repeated.service",
+        "Restart=on-failure\nSuccessExitStatus=SIGPIPE\nSuccessExitStatus=143",
+    )
+    assert _success_exit_statuses(repeated) == {"143", "SIGPIPE"}
+    _assert_clean_sigterm_is_success(repeated)
+
+
+def test_clean_sigterm_stop_is_not_recorded_as_a_unit_failure() -> None:
+    """Both unit files must classify exit 143 as a successful stop.
+
+    Without it every ordinary `systemctl restart` leaves a "Failed with result
+    exit-code" entry in the journal for a shutdown that worked exactly as
+    designed, so a genuinely failed unit is indistinguishable from a routine one.
+    """
+    for path in (TEMPLATE, HARDCODED):
+        _assert_clean_sigterm_is_success(path)
