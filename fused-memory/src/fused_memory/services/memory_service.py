@@ -459,6 +459,17 @@ async def _apply_memory_metadata_validation(
     ``parent_liveness_violation`` is ``fatal=True``, warn mode censuses and
     proceeds while ``enforce`` rejects, both through the same arms below.
 
+    A lookup that FAILS is a different fact from a parent that is gone, and
+    gets its own code (``parent_id_liveness_unavailable``).
+    ``Mem0Backend.get_point_by_id`` propagates a Qdrant read-timeout rather
+    than collapsing it into ``None`` precisely to preserve that
+    distinction; folding both into ``dead_parent_id`` would discard it here
+    and tell an operator a live parent is dead.  That code is fatal too, so
+    ``enforce`` fails CLOSED on it — INV-3 read literally: an actor that
+    cannot corroborate must not act.  The blast radius of failing closed is
+    confined to writes that actually carry ``parent_id``, a population leaf
+    α measured at zero live records, and only while ``enforce`` is on.
+
     ``parent_lookup`` is REQUIRED and takes no ``None`` default.  A
     defaultable resolver would let a future third write path construct this
     helper without one and silently skip liveness — reintroducing the exact
@@ -496,12 +507,29 @@ async def _apply_memory_metadata_validation(
     # same key, so any parent_id-keyed violation means the id is malformed
     # and no store could resolve it in that spelling.
     if 'parent_id' in meta and not any(v.key == 'parent_id' for v in violations):
-        parent = await parent_lookup(project_id, meta['parent_id'])
-        if parent is None:
+        try:
+            parent = await parent_lookup(project_id, meta['parent_id'])
+        except Exception as exc:
+            # `Exception`, never `BaseException`: CancelledError,
+            # KeyboardInterrupt and SystemExit must keep propagating, per
+            # the repo's cancellation convention.
+            #
+            # The exception TYPE is logged so the raw backend cause is
+            # degraded, not discarded — the census code says only "could
+            # not be checked", and an operator debugging a burst of
+            # `parent_id_liveness_unavailable` needs something to correlate
+            # against.
+            logger.warning(
+                'memory_metadata: parent_id liveness lookup failed for '
+                'project_id=%r parent_id=%r: %s: %s',
+                project_id, meta['parent_id'], type(exc).__name__, exc,
+            )
+            liveness_code = PARENT_ID_UNAVAILABLE_CODE
+        else:
+            liveness_code = None if parent is not None else PARENT_ID_DEAD_CODE
+        if liveness_code is not None:
             violations.append(
-                parent_liveness_violation(
-                    meta['parent_id'], code=PARENT_ID_DEAD_CODE
-                )
+                parent_liveness_violation(meta['parent_id'], code=liveness_code)
             )
 
     if not violations:
