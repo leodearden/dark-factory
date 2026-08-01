@@ -10556,3 +10556,121 @@ class TestMemoryMetadataValidationAtSeam:
         service.config.memory_metadata.enforce = True
         with pytest.raises(MemoryMetadataValidationError):
             await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
+
+
+class TestParentIdLivenessAtSeam:
+    """Write-time `metadata.parent_id` LIVENESS (task 3197, leaf δ).
+
+    Leaf β pinned `validate_memory_metadata` as pure-by-construction — it
+    takes a dict and structurally cannot reach a store — and reserved
+    liveness for this leaf "at the seam". So the lookup lives in
+    `_apply_memory_metadata_validation`, and every case runs against BOTH
+    entry points: D8/§2 pin enforcement at the SERVICE seam precisely so
+    `add_system_record` cannot bypass it.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_live_parent_resolves_in_the_writes_own_project(
+        self, service, entry_point
+    ):
+        """One lookup, keyed by the WRITE's project_id.
+
+        Same-project scoping is structural, not a filter: `Scope` selects a
+        per-project Qdrant collection, so passing the write's own project_id
+        is what makes "same-project" true. A parent living in another
+        project's collection must not satisfy this check.
+        """
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value=dict(DEFAULT_POINT_PAYLOAD)
+        )
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'parent_id': _MM_UUID},
+            project_id='dark_factory',
+        )
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        service.mem0.get_point_by_id.assert_awaited_once()
+        args, _ = service.mem0.get_point_by_id.call_args
+        assert args[0] == _MM_UUID
+        assert args[1].project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_dead_parent_rejects_under_enforce_before_any_backend_call(
+        self, service, entry_point
+    ):
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        journal = _mm_install_journal(service)
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        assert 'dead_parent_id' in {v.code for v in excinfo.value.violations}
+        _mm_backend_mock(service, entry_point).assert_not_called()
+        # Rejection ordering: no write-ahead intent may be journalled for a
+        # write that never happened.
+        journal.log_mem0_intent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_dead_parent_censuses_and_proceeds_in_warn_mode(
+        self, service, entry_point, caplog
+    ):
+        """Warn mode never blocks a write — it produces the data that makes a
+        later `enforce` flip informed rather than blind."""
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'dead_parent_id' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_no_parent_id_costs_no_round_trip(self, service, entry_point):
+        """The common write path pays nothing.
+
+        `parent_id` is absent from essentially every live record (leaf α
+        measured it at zero corpus footprint), so a lookup on every write
+        would be pure overhead on the hot path.
+        """
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value=dict(DEFAULT_POINT_PAYLOAD)
+        )
+
+        await _mm_write(service, entry_point, metadata={'topic': 'a-good-slug'})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        service.mem0.get_point_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_shape_invalid_parent_id_never_reaches_the_store(
+        self, service, entry_point, caplog
+    ):
+        """Liveness fires only AFTER the shape check passes.
+
+        No store could resolve 'not-a-uuid', so spending a round-trip on it
+        would be waste — and censusing `dead_parent_id` for it would blame
+        the wrong rule.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value=dict(DEFAULT_POINT_PAYLOAD)
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': 'not-a-uuid'})
+
+        service.mem0.get_point_by_id.assert_not_awaited()
+        codes = _mm_census_codes(caplog)
+        assert 'invalid_parent_id_shape' in codes
+        assert 'dead_parent_id' not in codes
+        assert 'parent_id_liveness_unavailable' not in codes
