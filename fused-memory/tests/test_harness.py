@@ -2881,11 +2881,8 @@ async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_me
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    with (
-        patch.object(harness, 'run_full_cycle', side_effect=fake_rfc),
-        contextlib.suppress(TimeoutError),
-    ):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.5)
+    with patch.object(harness, 'run_full_cycle', side_effect=fake_rfc):
+        await _drive_run_loop_until(harness, consumed)
 
     harness.journal.decrement_unhalt_grace.assert_awaited()
     assert harness.judge.unhalt_grace_remaining('test-project') == 1
