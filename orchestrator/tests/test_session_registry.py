@@ -492,11 +492,19 @@ def test_encode_cwd_maps_all_three_characters() -> None:
     )
 
 
-def test_transcript_path_for_cwd_delegates_to_encode_cwd() -> None:
-    # The two can never drift apart: the path form is exactly the prefix plus
-    # the bare encoding, over a cwd exercising all three characters.
-    cwd = '/home/leo/src/dark-factory/.eval-worktrees/df_task_12/run-5383f6a8'
-    assert sr.transcript_path_for_cwd(cwd) == f'~/.claude/projects/{sr.encode_cwd(cwd)}'
+def test_transcript_path_for_cwd_is_prefix_plus_encoding() -> None:
+    # Pins the '~/.claude/projects/' prefix AND the encoding together over a
+    # cwd exercising all three characters, as a hard-coded literal.
+    #
+    # Asserting `== f'~/.claude/projects/{sr.encode_cwd(cwd)}'` instead would
+    # be a character-for-character restatement of the one-line implementation
+    # — it could not fail while the implementation keeps that shape, so it
+    # would pin nothing. That is the same self-consistency trap task 3272
+    # calls out for fixtures built with the encoder under test.
+    assert (
+        sr.transcript_path_for_cwd('/home/leo/src/dark-factory/.eval-worktrees/df_task_12')
+        == '~/.claude/projects/-home-leo-src-dark-factory--eval-worktrees-df-task-12'
+    )
 
 
 # ---------------------------------------------------------------------------
