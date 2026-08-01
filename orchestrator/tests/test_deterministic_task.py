@@ -1836,6 +1836,41 @@ class TestValidateUvFallback:
 
         assert result == {'error': 'sentinel-err'}
 
+    def test_missing_fused_memory_project_dir_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A mis-wired repo root (no fused-memory/ subdir) must fail loudly.
+
+        A wrong --project path must never be laundered into a skip by
+        whatever uv happens to report. Simulates a regressed _REPO_ROOT by
+        pointing it at an empty tmp_path, and stubs subprocess.check_output
+        to raise what real uv reports against a nonexistent --project dir.
+        """
+        def _stub(argv, **kwargs):
+            raise subprocess.CalledProcessError(
+                2, argv, output='', stderr='error: No `pyproject.toml` found'
+            )
+
+        _force_uv_fallback(monkeypatch, _stub)
+        monkeypatch.setattr(sys.modules[__name__], '_REPO_ROOT', tmp_path)
+
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
+        assert not isinstance(excinfo.value, pytest.skip.Exception)
+        assert str(tmp_path / 'fused-memory') in str(excinfo.value), (
+            f'Expected the missing project dir in the failure message, got: '
+            f'{excinfo.value!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Reaper scaffolding (step-14)
