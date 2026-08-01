@@ -1418,10 +1418,17 @@ async def invoke_with_cap_retry(
                     # default ~/.claude would be wrong for any caller under an
                     # isolated CLAUDE_CONFIG_DIR), so the veto is scoped to "we
                     # have a directory and the transcript is provably not in it".
+                    #
+                    # resume_or_fresh carries the REASON, not just the verdict:
+                    # it is interpolated into both cap-hit warnings below, so a
+                    # fresh retry that dropped context is distinguishable in the
+                    # logs from one that never had a session to keep.  The
+                    # 'resuming'/'fresh' prefix stays first so existing log
+                    # greps keep matching.
                     if not result.session_id:
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         await _rebuild_fresh_prompt()
-                        resume_or_fresh = 'fresh'
+                        resume_or_fresh = 'fresh (no session_id)'
                     elif config_dir is not None and not transcript_exists(
                         config_dir.path, result.session_id
                     ):
@@ -1432,11 +1439,19 @@ async def invoke_with_cap_retry(
                         )
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         await _rebuild_fresh_prompt()
-                        resume_or_fresh = 'fresh'
+                        resume_or_fresh = 'fresh (transcript unreachable)'
                     else:
                         invoke_kwargs['resume_session_id'] = result.session_id
                         invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
-                        resume_or_fresh = 'resuming'
+                        # Distinguish a VERIFIED resume from an unverified one:
+                        # with no config_dir the transcript was never checked,
+                        # so claiming 'transcript present' would be a false
+                        # statement in the log.
+                        resume_or_fresh = (
+                            'resuming (transcript unchecked — no config dir)'
+                            if config_dir is None
+                            else 'resuming (transcript present)'
+                        )
 
                     if acct_name:
                         logger.warning(
