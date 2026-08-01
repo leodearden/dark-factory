@@ -309,9 +309,15 @@ class LaneLifecycle:
         ``encoding`` is passed as the process's preferred encoding because the
         old body used a bare ``os.fdopen(fd, 'w')``, which is locale-dependent.
         That is a latent bug — JSON written under a non-UTF-8 locale — but
-        changing it is out of scope for a consolidation, so it is preserved
-        verbatim and stated here at the call site rather than hidden in the
-        shared helper's default. Tracked as separate follow-up work.
+        changing it is out of scope for a consolidation (the task explicitly
+        forbids silently changing per-site encoding while consolidating), so it
+        is preserved verbatim and stated here at the call site rather than
+        hidden in the shared helper's default.
+
+        Tracked as ticket ``tkt_0RRXRPD1EW9KP7JE2RDB0YXFWX``. That is a TICKET
+        id, not a task id — the curator resolves tickets to tasks
+        asynchronously, so do not search ``tasks.json`` for it and conclude it
+        is fake.
         """
         safe_io.atomic_write_text(
             self._record_path(lane),
