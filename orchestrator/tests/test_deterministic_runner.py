@@ -6913,6 +6913,48 @@ class TestWrapperPayloadHarness:
             f'harness must return the child combined stdout/stderr, got {out!r}'
         )
 
+    async def test_run_wrapper_payload_injects_repo_src_roots_into_child_pythonpath(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The child must get the same import roots conftest.py grants in-process.
+
+        The wrapper's on-failure branch is `sys.executable -m escalation
+        submit` — a FRESH interpreter that inherits none of root conftest.py's
+        sys.path surgery, only site-packages plus cwd.  In a venv whose
+        site-packages lacks the `escalation` editable install that branch
+        cannot import the package at all, so the harness hands the child the
+        three repo src roots explicitly.
+        """
+        repo_root = Path(__file__).parent.parent.parent
+        roots = [
+            str(repo_root / 'escalation' / 'src'),
+            str(repo_root / 'shared' / 'src'),
+            str(repo_root / 'orchestrator' / 'src'),
+        ]
+        payload = 'printf \'%s\' "$PYTHONPATH"'
+
+        # Clear any ambient value so this is a real RED, not a coincidence.
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        rc, out = await _run_wrapper_payload(payload)
+        assert rc == 0, f'probe payload must exit 0, got {rc!r} (output: {out!r})'
+        for root in roots:
+            assert root in out, (
+                f'child PYTHONPATH must carry the repo src root {root!r}; got {out!r}'
+            )
+
+        # An inherited PYTHONPATH must be preserved, never clobbered.
+        monkeypatch.setenv('PYTHONPATH', '/tmp/df-3404-sentinel')
+        rc, out = await _run_wrapper_payload(payload)
+        assert rc == 0, f'probe payload must exit 0, got {rc!r} (output: {out!r})'
+        assert '/tmp/df-3404-sentinel' in out, (
+            f'an inherited PYTHONPATH must be preserved, not dropped; got {out!r}'
+        )
+        for root in roots:
+            assert root in out, (
+                f'injected root {root!r} must survive alongside an inherited '
+                f'PYTHONPATH; got {out!r}'
+            )
+
 
 # ---------------------------------------------------------------------------
 # Task 2105: _default_schedule_detached_restart must consume before_done.cwd
