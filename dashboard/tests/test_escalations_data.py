@@ -234,6 +234,7 @@ class TestLoadQueueEscalations:
         by function, not by line: a line-number citation in this file is stale
         the moment anything above it moves — the diff that added this test
         pushed those very calls down ~28 lines.)
+
         This asserts the un-opted-in call still returns only the valid record,
         still does not raise, and still logs — i.e. that the new keyword is
         additive and no existing caller had to change.
