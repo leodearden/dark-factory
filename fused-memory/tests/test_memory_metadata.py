@@ -232,10 +232,10 @@ class TestKeyLayers:
     def test_mem0_managed_keys_are_the_expected_nine(self):
         from fused_memory.backends import mem0_client
 
-        assert mem0_client.MEM0_MANAGED_METADATA_KEYS == frozenset({
+        assert frozenset({
             'data', 'hash', 'created_at', 'updated_at',
             'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
-        })
+        }) == mem0_client.MEM0_MANAGED_METADATA_KEYS
 
     def test_mem0_managed_keys_is_one_object_not_a_copy(self):
         """INV-5 / PRD D12: `backends/mem0_client.py` is the decided home.
@@ -243,8 +243,8 @@ class TestKeyLayers:
         Identity, not equality — two equal frozensets in two modules is
         exactly the duplication D12 exists to prevent.
         """
-        from fused_memory.backends import mem0_client
         from fused_memory import memory_metadata as mm
+        from fused_memory.backends import mem0_client
 
         assert mm.MEM0_MANAGED_METADATA_KEYS is mem0_client.MEM0_MANAGED_METADATA_KEYS
 
@@ -257,6 +257,7 @@ class TestKeyLayers:
         """
         import importlib.util
         import sys
+
         from fused_memory.backends import mem0_client
 
         script_path = Path(__file__).parent.parent / 'scripts' / 'tag_cgl_eta_rehome_scope.py'
@@ -273,7 +274,7 @@ class TestKeyLayers:
     def test_server_stamped_keys(self):
         from fused_memory.memory_metadata import SERVER_STAMPED_KEYS
 
-        assert SERVER_STAMPED_KEYS == frozenset({
+        assert frozenset({
             'category',    # memory_service.py:2193 (add_memory), :2542 (add_system_record)
             'recon_pool',  # _apply_cycle_summary_metadata_tagging (memory_service.py:389)
             'run_id',      # _apply_cycle_summary_metadata_tagging (memory_service.py:389)
@@ -282,14 +283,14 @@ class TestKeyLayers:
                            # :2962). Included so a round-tripped search result
                            # re-written as metadata does not census-warn on the
                            # server's own field.
-        })
+        }) == SERVER_STAMPED_KEYS
 
     def test_reserved_vocabulary_keys(self):
         from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS
 
-        assert RESERVED_VOCABULARY_KEYS == frozenset({
+        assert frozenset({
             'topic', 'canonical', 'kind', 'parent_id', 'supersedes',
-        })
+        }) == RESERVED_VOCABULARY_KEYS
 
     @pytest.mark.parametrize(
         ('key', 'census_count'),

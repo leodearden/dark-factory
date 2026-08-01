@@ -33,7 +33,10 @@ class TestCensusLine:
     one domain over.
     """
 
-    def _emit(self, violations, *, project_id='dark_factory', agent_id='claude-x'):
+    def _emit(self, violations, *, project_id: str = 'dark_factory',
+              agent_id: str | None = 'claude-x'):
+        # `agent_id: str | None` mirrors emit_schema_warnings' own signature —
+        # the absent-agent_id placeholder case below passes None deliberately.
         from fused_memory.services.memory_metadata_census import emit_schema_warnings
 
         emit_schema_warnings(violations, project_id=project_id, agent_id=agent_id)

@@ -1554,7 +1554,11 @@ class TestMemoryMetadataConfig:
         """
         assert self._cls().model_config.get('extra') == 'forbid'
         with pytest.raises(ValidationError):
-            self._cls()(enfroce=True)
+            # Splatted rather than written as a literal keyword: the typo is
+            # the POINT of the test, and pyright rejects a misspelled keyword
+            # statically, which would fail the type gate before the runtime
+            # assertion could ever run.
+            self._cls()(**{'enfroce': True})
 
     @pytest.mark.parametrize('bad', [0, -1, -50])
     def test_storm_threshold_rejects_non_positive(self, bad):
@@ -1567,8 +1571,12 @@ class TestMemoryMetadataConfig:
             self._cls()(unknown_key_storm_window_seconds=bad)
 
     def test_round_trips_from_a_config_dict(self):
-        cfg = FusedMemoryConfig(
-            **{'memory_metadata': {'enforce': True, 'enforce_kind_registry': True}}
+        # `model_validate` rather than a splatted `__init__`: this is how a
+        # loaded config.yaml actually reaches the model, and a splat makes
+        # pyright widen every sibling field's type to the dict's value type,
+        # producing a type error per section of FusedMemoryConfig.
+        cfg = FusedMemoryConfig.model_validate(
+            {'memory_metadata': {'enforce': True, 'enforce_kind_registry': True}}
         )
         assert cfg.memory_metadata.enforce is True
         assert cfg.memory_metadata.enforce_kind_registry is True

@@ -230,7 +230,6 @@ from fused_memory.backends.mem0_client import (  # noqa: E402
     MEM0_MANAGED_METADATA_KEYS as _MEM0_MANAGED_METADATA_KEYS,
 )
 
-
 # ---------------------------------------------------------------------------
 # Live shell: apply_tags
 # ---------------------------------------------------------------------------

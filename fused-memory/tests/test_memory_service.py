@@ -8931,6 +8931,27 @@ def _mm_install_journal(svc):
     return journal
 
 
+def _mm_configure_project_root(svc, root):
+    """Give *svc* a ``taskmaster.project_root`` and return it.
+
+    REQUIRED SETUP for the storm cases, not decoration — do not delete it.
+    The shared ``mock_config`` fixture (``tests/conftest.py:184``) leaves
+    ``taskmaster=None``, so ``_memory_metadata_project_root()`` returns ``''``
+    and ``_apply_memory_metadata_validation`` takes its documented
+    "no project queue to file into — census only, do not escalate" branch.
+    Without this install the storm escape is UNREACHABLE under the fixture:
+    the crossing case never reaches the filer at all, and the no-crossing
+    case would pass for the wrong reason while looking like it proved the
+    detector gate.
+
+    Nothing is ever written to *root* — both storm tests patch the filer.
+    """
+    from fused_memory.config.schema import TaskmasterConfig
+
+    svc.config.taskmaster = TaskmasterConfig(project_root=str(root))
+    return str(root)
+
+
 async def _mm_write(svc, entry_point, *, metadata, category='observations_and_summaries',
                     project_id='dark_factory', agent_id='claude-task-3195'):
     """Drive one write through either seam.
@@ -9178,13 +9199,14 @@ class TestMemoryMetadataValidationAtSeam:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
     async def test_storm_crossing_files_one_escalation_naming_the_writer(
-        self, service, entry_point
+        self, service, entry_point, tmp_path
     ):
         """The INV-4 escape: a drifting writer is heard, not logged into oblivion."""
+        root = _mm_configure_project_root(service, tmp_path)
         filed = []
 
         def _fake_filer(project_root, *, project_id, agent_id, keys):
-            filed.append((project_id, agent_id, list(keys)))
+            filed.append((project_root, project_id, agent_id, list(keys)))
             return 'esc-memory-metadata-unknown-key-storm-1'
 
         crossing = MagicMock()
@@ -9199,14 +9221,22 @@ class TestMemoryMetadataValidationAtSeam:
             )
 
         assert len(filed) == 1
-        project_id, agent_id, keys = filed[0]
+        project_root, project_id, agent_id, keys = filed[0]
+        # Asserted, not ignored: the filer resolves the escalation QUEUE from
+        # this path, so a seam that passed the wrong root (or '') would file
+        # into the wrong project — or nowhere — while every other assertion
+        # here still passed.
+        assert project_root == root
         assert project_id == 'dark_factory'
         assert agent_id == 'claude-drifter'
         assert keys == ['drifting_key']
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
-    async def test_no_storm_no_escalation(self, service, entry_point):
+    async def test_no_storm_no_escalation(self, service, entry_point, tmp_path):
+        # Configured root, so this pins the DETECTOR gate rather than passing
+        # vacuously on the unconfigured-project_root branch (see the helper).
+        _mm_configure_project_root(service, tmp_path)
         with patch.object(memory_service, 'file_unknown_key_storm_escalation') as filer:
             await _mm_write(service, entry_point, metadata={'drifting_key': 1})
         filer.assert_not_called()
