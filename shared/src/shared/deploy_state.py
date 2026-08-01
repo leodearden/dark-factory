@@ -23,9 +23,9 @@ interceptor import chain performs the registration.
 
 (The former rationale — avoiding a collision with
 ``shared/tests/test_task_metadata.py``'s stub registrations — no longer
-applies: task 3352 moved those tests onto test-owned ``_stub`` keys, and their
-autouse fixture now deliberately pre-installs a foreign sentinel under
-``'deploy_state'`` so any future test that registers this production key fails
+applies: task 3352 moved those tests onto test-owned ``_stub`` keys, and that
+file's autouse fixture now asserts in teardown that every key a test registers
+ends in ``_stub``, so any future test that registers this production key fails
 immediately rather than only in a cross-package pytest co-run.)
 """
 
