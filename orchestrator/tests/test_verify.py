@@ -5515,6 +5515,52 @@ class TestRunScopedVerificationForwardsWorktreeToFallback:
         )
 
 
+class TestRunScopedVerificationOptsFallbackIntoSegmentedTest:
+    """The fallback branch asks `run_verification` to SEGMENT its test chain (task 3338).
+
+    Segmentation is opt-in and default-OFF: making `run_verification` segment
+    any chain it is handed would silently change the global tail, the
+    cargo-scoped path, `merge_queue._run_unscoped_typechecks` and every
+    module_configs run — a wide, unrequested change in a function dozens of
+    tests stub. The reported defect (esc-3062-2) is the FALLBACK path, so only
+    this call site opts in.
+
+    The flag goes on the `run_verification` call, NOT on
+    `_build_fallback_config`'s: the NOTE at that call site records (and
+    `TestRunScopedVerificationForwardsWorktreeToFallback` enforces) that its
+    test double is a fixed `(task_files, config=None, worktree=None)` fake with
+    no `**kwargs` catch-all, so any new keyword there breaks task 2344's test.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fallback_branch_passes_segment_chained_test_true(self, tmp_path: Path) -> None:
+        (tmp_path / 'shared').mkdir()
+        (tmp_path / 'shared' / 'thing.py').write_text('x = 1\n')
+
+        fallback = ModuleConfig(
+            prefix='__fallback__',
+            test_command='cd shared && uv run pytest tests/ && uv run pytest tests/scripts/',
+            lint_command=None,
+            type_check_command=None,
+        )
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        run_verification_double = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify._build_fallback_config', return_value=fallback), \
+             patch('orchestrator.verify.run_verification', new=run_verification_double):
+            await run_scoped_verification(
+                tmp_path,
+                OrchestratorConfig(project_root=tmp_path),
+                [],
+                task_files=['shared/thing.py'],
+                role='task',
+            )
+
+        assert run_verification_double.await_count == 1
+        assert run_verification_double.await_args.kwargs.get('segment_chained_test') is True
+
+
 class TestBuildFallbackConfigDataModule:
     """``_build_fallback_config`` must not pass non-test data modules to pytest.
 

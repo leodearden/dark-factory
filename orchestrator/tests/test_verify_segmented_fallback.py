@@ -499,3 +499,146 @@ class TestRunSegmentedRoster:
             'FAILED tests/test_scheduler.py::test_claims_are_exclusive - AssertionError'
         )
         assert not cause_hint.startswith('#')
+
+
+class TestRunVerificationSegmentChainedTestWiring:
+    """`run_verification`'s opt-in flag — default OFF, byte-identical to today.
+
+    Making run_verification segment any chain it is handed would silently
+    change the global tail, the cargo-scoped path,
+    `merge_queue._run_unscoped_typechecks` and every module_configs run — a
+    wide, unrequested change in a function dozens of tests stub. The reported
+    defect is the FALLBACK path, so the flag defaults False and only that call
+    site passes True (step-14 / test_verify.py).
+    """
+
+    @staticmethod
+    def _fallback_config(test_command: str):
+        from orchestrator.config import ModuleConfig  # noqa: PLC0415
+
+        return ModuleConfig(
+            prefix='__fallback__',
+            test_command=test_command,
+            lint_command='uv run ruff check src/',
+            type_check_command='npx pyright',
+        )
+
+    @staticmethod
+    async def _run(tmp_path, test_command: str, **kwargs):
+        """Drive run_verification with _run_cmd stubbed; return (result, calls)."""
+        from unittest.mock import patch  # noqa: PLC0415
+
+        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+        from orchestrator.verify import run_verification  # noqa: PLC0415
+
+        (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
+        calls: list[dict] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
+            calls.append({'cmd': cmd, 'cwd': cwd, 'timeout': timeout, 'log_path': log_path})
+            return 0, 'ok', False
+
+        config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False)
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path,
+                config,
+                TestRunVerificationSegmentChainedTestWiring._fallback_config(test_command),
+                attempt_id=1,
+                max_retries=0,
+                **kwargs,
+            )
+        return result, calls
+
+    @pytest.mark.asyncio
+    async def test_default_off_issues_exactly_one_run_cmd_for_the_whole_chain(self, tmp_path):
+        """Every non-fallback caller keeps today's behaviour, byte for byte."""
+        result, calls = await self._run(tmp_path, _FLEET_TEST_COMMAND)
+
+        test_calls = [c for c in calls if 'pytest' in c['cmd']]
+        assert len(test_calls) == 1
+        assert test_calls[0]['cmd'] == _FLEET_TEST_COMMAND
+        assert result.passed is True
+
+    @pytest.mark.asyncio
+    async def test_flag_on_issues_one_run_cmd_per_segment_in_its_own_cwd(self, tmp_path):
+        _result, calls = await self._run(
+            tmp_path, _FLEET_TEST_COMMAND, segment_chained_test=True,
+        )
+        segments = _fleet_segments()
+
+        test_calls = [c for c in calls if 'pytest' in c['cmd']]
+        assert len(test_calls) == 8
+        assert [c['cmd'] for c in test_calls] == [s.command for s in segments]
+        assert [c['cwd'] for c in test_calls] == [tmp_path / s.cwd_rel for s in segments]
+
+    @pytest.mark.asyncio
+    async def test_check_run_keeps_the_original_chain_as_cmd_and_carries_segments(self, tmp_path):
+        """Persisted-log compatibility: CheckRun.cmd is still the WHOLE chain.
+
+        It feeds _persist_attempt_logs/_build_summary_payload/_summarize_checks,
+        so preserving it keeps every persisted artifact and every failure
+        classification identical. The per-segment facts ride alongside it on
+        the new `segments` field instead of replacing it.
+        """
+        from unittest.mock import patch  # noqa: PLC0415
+
+        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+        from orchestrator.verify import run_verification  # noqa: PLC0415
+
+        (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path,
+                OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False),
+                self._fallback_config(_FLEET_TEST_COMMAND),
+                attempt_id=1,
+                max_retries=0,
+                segment_chained_test=True,
+            )
+        runs = result.runs or []
+        test_run = next(r for r in runs if r['label'] == 'test')
+        assert test_run['cmd'] == _FLEET_TEST_COMMAND
+        assert test_run['segments'] is not None
+        assert len(test_run['segments']) == 8
+        assert [s['status'] for s in test_run['segments']] == ['passed'] * 8
+
+    @pytest.mark.asyncio
+    async def test_each_segment_streams_to_its_own_log_path(self, tmp_path):
+        """Two segments share cwd `.`, so index-suffixed labels are load-bearing."""
+        _result, calls = await self._run(
+            tmp_path, _FLEET_TEST_COMMAND, segment_chained_test=True,
+        )
+
+        test_paths = [c['log_path'] for c in calls if 'pytest' in c['cmd']]
+        assert len(test_paths) == 8
+        assert all(p is not None for p in test_paths)
+        assert len(set(test_paths)) == 8
+        for path, segment in zip(test_paths, _fleet_segments(), strict=True):
+            assert path.name == f'attempt-1.__fallback__.test.{segment.label}.log'
+
+    @pytest.mark.asyncio
+    async def test_a_refused_chain_falls_back_to_one_unsegmented_run(self, tmp_path):
+        """REFUSE => byte-identical to today, with `segments is None` saying so."""
+        opaque = 'uv run pytest tests/ --timeout=300 || true'
+        result, calls = await self._run(tmp_path, opaque, segment_chained_test=True)
+
+        test_calls = [c for c in calls if 'pytest' in c['cmd']]
+        assert len(test_calls) == 1
+        assert test_calls[0]['cmd'] == opaque
+        test_run = next(r for r in (result.runs or []) if r['label'] == 'test')
+        assert test_run['segments'] is None
+
+    @pytest.mark.asyncio
+    async def test_lint_and_type_legs_are_untouched_by_the_flag(self, tmp_path):
+        """Only the test leg is wired; the others stay one call each."""
+        _result, calls = await self._run(
+            tmp_path, _FLEET_TEST_COMMAND, segment_chained_test=True,
+        )
+
+        assert len([c for c in calls if 'ruff check' in c['cmd']]) == 1
+        assert len([c for c in calls if 'pyright' in c['cmd']]) == 1
