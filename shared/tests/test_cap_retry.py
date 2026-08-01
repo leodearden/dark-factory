@@ -13,6 +13,7 @@ import logging
 import re
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
@@ -28,6 +29,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
 )
+from shared.config_dir import TaskConfigDir
 from shared.invocation_outcome import (
     OK,
     AuthFailed,
@@ -670,6 +672,153 @@ class TestCapRetryResume:
         assert new_sid != 'sess-orig', 'session_id must be regenerated, not reused'
         # Must be a valid UUID (str(uuid.uuid4()) round-trips through UUID()).
         assert str(uuid.UUID(new_sid)) == new_sid
+
+
+# ===================================================================
+# TestCapRetryTranscriptReachability
+# ===================================================================
+
+
+def _write_transcript(base: Path, session_id: str, slug: str = 'myproject') -> Path:
+    """Materialise ``<base>/projects/<slug>/<session_id>.jsonl``.
+
+    Mirrors the fixture idiom in ``test_cli_invoke.py::TestReadTranscriptRecords``
+    — the layout ``_resolve_transcript_path`` globs for.
+    """
+    slug_dir = base / 'projects' / slug
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    transcript = slug_dir / f'{session_id}.jsonl'
+    transcript.write_text(json.dumps({'type': 'user', 'content': 'hi'}) + '\n')
+    return transcript
+
+
+@pytest.mark.asyncio
+class TestCapRetryTranscriptReachability:
+    """The cap-hit resume branch must only resume a session it can REACH.
+
+    Claude CLI sessions are local JSONL transcripts at
+    ``<config_dir>/projects/*/<session_id>.jsonl`` — not server-side objects —
+    so ``--resume`` replays that file.  Resuming a session whose transcript is
+    not on disk yields an effectively EMPTY session: the agent restarts with
+    CAP_HIT_RESUME_PROMPT ("continue where you left off") and no context to
+    continue from, losing work silently.  These tests pin that the branch
+    checks reachability instead of assuming it.
+    """
+
+    async def test_unreachable_transcript_falls_back_to_fresh(self, tmp_path):
+        """config_dir given but NO transcript on disk -> fresh, not a blind resume."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reach-missing', base_dir=tmp_path)
+        # Deliberately write NO transcript: projects/ stays absent.
+        assert not (config_dir.path / 'projects').exists()
+
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        rebuild = AsyncMock(return_value='FRESH REBUILT PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir,
+                prompt='do stuff', rebuild_prompt=rebuild,
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert 'resume_session_id' not in second.kwargs, (
+            'must NOT resume a session whose transcript is not on disk'
+        )
+        # The fresh path must rebuild the prompt — CAP_HIT_RESUME_PROMPT is
+        # meaningless to a brand-new session with no history to continue.
+        rebuild.assert_awaited_once_with(True)
+        assert second.kwargs.get('prompt') == 'FRESH REBUILT PROMPT'
+
+    async def test_unreachable_transcript_without_rebuild_uses_original_prompt(self, tmp_path):
+        """No rebuild_prompt hook -> fresh retry replays the ORIGINAL prompt."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reach-missing-norebuild', base_dir=tmp_path)
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir, prompt='do stuff',
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert 'resume_session_id' not in second.kwargs
+        assert second.kwargs.get('prompt') == 'do stuff'
+
+    async def test_reachable_transcript_still_resumes(self, tmp_path):
+        """Regression pin: transcript ON disk -> resume exactly as before.
+
+        Proves the guard does not over-fire and silently disable cross-account
+        session resume on the happy path.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reach-present', base_dir=tmp_path)
+        _write_transcript(config_dir.path, 'sess-42')
+
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir,
+                prompt='do stuff', rebuild_prompt=rebuild,
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') == 'sess-42'
+        assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+        rebuild.assert_not_awaited()
+
+    async def test_no_config_dir_resumes_unconditionally(self):
+        """Regression pin: config_dir=None -> resume as today.
+
+        Without a concrete config dir there is no correct directory to glob:
+        the process default ``~/.claude`` would be wrong for any caller running
+        under an isolated CLAUDE_CONFIG_DIR.  Scoping the veto to "we have a
+        directory and the transcript is provably not in it" keeps the new
+        failure mode strictly narrower than the bug it fixes.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='do stuff')
+
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') == 'sess-42'
+        assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
 
 # ===================================================================
