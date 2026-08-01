@@ -69,6 +69,7 @@ Either encodes host state rather than checker behaviour.
 """
 
 import argparse
+import dataclasses
 import pathlib
 import sys
 from typing import Sequence
@@ -181,6 +182,106 @@ def parse_unit_directives(text: str) -> dict[str, dict[str, list[str]]]:
             continue
         sections[current].setdefault(key.strip(), []).append(value.strip())
     return sections
+
+
+# ---------------------------------------------------------------------------
+# Drift records and unit specs
+# ---------------------------------------------------------------------------
+
+# Rendered in place of a value on whichever side does not declare the
+# directive at all.  Deliberately not '' or None: it appears verbatim in the
+# operator's report, where "<absent>" reads unambiguously and an empty string
+# would look like a directive set to nothing.
+_ABSENT = "<absent>"
+
+
+@dataclasses.dataclass(frozen=True)
+class Drift:
+    """One disagreement between the repo copy and the installed copy."""
+
+    unit: str
+    section: str
+    key: str
+    repo_value: str
+    installed_value: str
+    reason: str
+
+
+@dataclasses.dataclass(frozen=True)
+class UnitSpec:
+    """What to compare for one unit, and where its repo copy lives.
+
+    Expected VALUES are never stated here — they are read from the committed
+    repo unit at run time.  Only the KEY registry is curated.  Restating the
+    values (the way the fused-memory precedent's REQUIRED_SERVICE_DIRECTIVES
+    does) would create a THIRD site that must agree with the repo unit and the
+    installed unit — reintroducing, in the tool built to close it, exactly the
+    lockstep duplication this check exists to catch.  Worse, it would defeat
+    the purpose: when a future change edits TimeoutStopSec in the repo unit, a
+    stale literal would keep passing against the OLD value on both sides, and
+    the change would again fail to reach the running system with nothing
+    reporting it.
+    """
+
+    name: str
+    repo_relpath: str
+    # (section, key) pairs whose VALUES must agree. Host-INVARIANT literals
+    # only — anything carrying a host path belongs on present_only.
+    compared: tuple[tuple[str, str], ...] = ()
+
+
+def _render(values: list[str] | None) -> str:
+    """Render a directive's values for a Drift record / the report."""
+    if not values:
+        return _ABSENT
+    if len(values) == 1:
+        return values[0]
+    return " | ".join(values)
+
+
+def compare_unit(
+    spec: UnitSpec,
+    repo_text: str,
+    installed_text: str,
+) -> list[Drift]:
+    """Return every drift between the repo and installed copies of *spec*.
+
+    Comparison is SYMMETRIC over the curated key set: a compared directive the
+    installed copy declares and the repo copy does not is drift just as much
+    as the reverse.  A missing key is treated as ``_ABSENT`` on its side, so
+    both asymmetric cases fall out of the same equality test.
+
+    The full values LIST is compared, not just the first value, so a repeated
+    directive that gained or lost an occurrence is caught — systemd applies
+    every occurrence, so the checker must see every occurrence.
+    """
+    repo = parse_unit_directives(repo_text)
+    installed = parse_unit_directives(installed_text)
+    drifts: list[Drift] = []
+
+    for section, key in spec.compared:
+        repo_values = repo.get(section, {}).get(key)
+        installed_values = installed.get(section, {}).get(key)
+        if repo_values == installed_values:
+            continue
+        if repo_values is None:
+            reason = "declared in the installed copy, absent from the repo copy"
+        elif installed_values is None:
+            reason = "declared in the repo copy, absent from the installed copy"
+        else:
+            reason = "value differs between the repo copy and the installed copy"
+        drifts.append(
+            Drift(
+                unit=spec.name,
+                section=section,
+                key=key,
+                repo_value=_render(repo_values),
+                installed_value=_render(installed_values),
+                reason=reason,
+            )
+        )
+
+    return drifts
 
 
 # ---------------------------------------------------------------------------
