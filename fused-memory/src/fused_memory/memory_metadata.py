@@ -43,11 +43,24 @@ decided home for that set, and INV-5 forbids a second copy.  The name is
 re-exported here (bound to the *same object*) so callers classifying keys
 have one import site.
 
-The observability half of V1 — the census log line, the unknown-key storm
-detector and the escalation filer — deliberately lives in
-:mod:`fused_memory.services.memory_metadata_census`, not here, so this
-module stays a cheap, dependency-light vocabulary import for leaf ι's
-prompt-pinning tests and the drift test.
+That single home has a MEASURED COST, stated here rather than left for a
+consumer to discover: ``backends/mem0_client.py`` does ``from mem0 import
+AsyncMemory`` and ``from fused_memory.config.schema import
+FusedMemoryConfig`` at module scope, so importing this registry transitively
+pulls in the mem0 SDK and the pydantic-settings config model.  This module
+is therefore **not import-cheap**, and an out-of-process consumer that
+cannot install ``mem0`` cannot import it at all.  Making the import
+genuinely light would mean re-homing the set into a leaf module — a change
+to a home decided by task 3055 §6 / PRD D12 and still awaited by task 3088,
+so it is deliberately NOT made unilaterally here.
+
+What the split from :mod:`fused_memory.services.memory_metadata_census`
+*does* buy — and the reason the observability half (census log line, storm
+detector, escalation filer) lives there rather than here — is narrower than
+"cheap import" but real: this module carries **no process-lifetime mutable
+state, no queue writer, and no dependency on the optional ``escalation``
+package**, so leaf ι's prompt-pinning tests and the drift test import a
+pure vocabulary rather than a running subsystem.
 """
 
 from __future__ import annotations

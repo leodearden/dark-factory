@@ -411,11 +411,14 @@ class MemoryMetadataConfig(BaseModel):
             'global: a storm is a DRIFTING WRITER, and a global counter would '
             'fire on healthy fleet traffic given the 1,627-key baseline while '
             'never identifying the culprit. Calibrated from leaf α\'s census '
-            '— the entire sub-1000-count key tail amounts to only a few '
-            'thousand occurrences across the whole corpus lifetime, so 50 '
-            'from one writer in 5 minutes is orders of magnitude above any '
-            'legitimate rate. Restart-only: read once when MemoryService '
-            'builds the detector.'
+            '(plans/memory-metadata-census-report.json, grand_total.keys.'
+            'entries, excluding the mem0-managed / server-stamped / reserved '
+            '/ blessed layers and x_ keys): the unknown tail is 1,604 '
+            'distinct keys totalling 17,261 occurrences across the whole '
+            'corpus lifetime, and its BUSIEST single key totals 545. Since '
+            'this threshold is keyed per-writer-per-window, 50 from one '
+            'writer in 5 minutes is far above any legitimate rate. '
+            'Restart-only: read once when MemoryService builds the detector.'
         ),
     )
     unknown_key_storm_window_seconds: int = Field(

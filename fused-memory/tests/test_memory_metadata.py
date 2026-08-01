@@ -92,9 +92,22 @@ class TestTopicSlug:
         assert not TOPIC_SLUG_RE.match(value), f'{value!r} must be rejected ({why})'
 
     def test_rejects_over_length_slug(self):
-        """The cap is enforced by length, not by the regex itself."""
+        """The cap is enforced by length, not by the regex itself.
+
+        Both halves of that sentence are asserted. The regex ACCEPTS the
+        over-length value (so the cap is not redundant with it), and the
+        validator still rejects it (so the cap is actually applied). An
+        earlier version of this test asserted only
+        ``len(over) > TOPIC_SLUG_MAX_LEN`` — a tautology about a string the
+        test had just constructed, which would have kept passing if the
+        ``len(topic) > TOPIC_SLUG_MAX_LEN`` clause were deleted outright.
+        """
+        from fused_memory.memory_metadata import validate_memory_metadata
+
         over = 'a' * (TOPIC_SLUG_MAX_LEN + 1)
-        assert len(over) > TOPIC_SLUG_MAX_LEN
+        assert TOPIC_SLUG_RE.match(over), 'the regex alone must NOT reject it'
+        violations = validate_memory_metadata({'topic': over}, enforce_kind_registry=False)
+        assert {v.code for v in violations} == {'invalid_topic_slug'}
 
     def test_max_len_is_100(self):
         # Basis (measured against plans/memory-metadata-census-report.json
