@@ -11,7 +11,7 @@ import os
 import re
 import time
 import uuid as uuid_mod
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -26,7 +26,11 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
 from fused_memory.memory_metadata import (
+    PARENT_ID_DEAD_CODE,
+    PARENT_ID_UNAVAILABLE_CODE,
     MemoryMetadataValidationError,
+    ParentHasChildrenError,
+    parent_liveness_violation,
     validate_memory_metadata,
 )
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
@@ -411,6 +415,7 @@ async def _apply_memory_metadata_validation(
     config: MemoryMetadataConfig,
     storm_detector: UnknownKeyStormDetector,
     project_root: str,
+    parent_lookup: Callable[[str, str], Awaitable[dict | None]],
 ) -> None:
     """Validate the Mem0 metadata vocabulary at the write boundary, in place.
 
@@ -424,14 +429,40 @@ async def _apply_memory_metadata_validation(
     is a second write path that a tools-layer validator would leak past.
     Two call sites with drifting behaviour would reopen that hole.
 
-    Discharges three obligations:
+    Discharges four obligations:
 
     1. **Normalize + shape-check** via ``validate_memory_metadata`` (the only
        in-place mutation is ``supersedes`` scalar→list, PRD D2).
-    2. **Census** every violation, fatal or not, so warn-mode leaves a trace.
-    3. **Reject** — but ONLY when ``enforce`` is on AND at least one
+    2. **Resolve ``parent_id`` LIVENESS** (task 3197, leaf δ) — see below.
+    3. **Census** every violation, fatal or not, so warn-mode leaves a trace.
+    4. **Reject** — but ONLY when ``enforce`` is on AND at least one
        violation is fatal.  Unknown keys are never fatal, so flipping
        ``enforce`` cannot turn the 1,627-key long tail into an outage.
+
+    LIVENESS IS HERE, NOT IN THE REGISTRY, on purpose.  Leaf β made
+    ``validate_memory_metadata`` a pure synchronous function taking only a
+    dict, so it structurally *cannot* perform a store lookup — a boundary
+    its docstring states explicitly so a later leaf "cannot accidentally
+    grow a second implementation of it in here (INV-5)".  This helper is
+    the nearest layer that can reach a store, and it is already the SINGLE
+    shared home for both write paths, so putting liveness here gets
+    ``add_system_record`` covered by construction.  Only the CODES and the
+    message wording stay in the registry, behind
+    :func:`~fused_memory.memory_metadata.parent_liveness_violation`, so the
+    rule still has exactly one normative home.
+
+    The lookup fires only when ``parent_id`` is PRESENT *and* already
+    shape-valid: the common write path (no ``parent_id`` at all — leaf α
+    measured zero live records carrying one) pays no round-trip, and an id
+    no store could resolve is never spent on.  Liveness ADDS a violation
+    rather than opening a second rejection path: because
+    ``parent_liveness_violation`` is ``fatal=True``, warn mode censuses and
+    proceeds while ``enforce`` rejects, both through the same arms below.
+
+    ``parent_lookup`` is REQUIRED and takes no ``None`` default.  A
+    defaultable resolver would let a future third write path construct this
+    helper without one and silently skip liveness — reintroducing the exact
+    silent-orphan class leaf δ exists to close, and doing it invisibly.
 
     The enforce flags are read PER CALL off the shared config object rather
     than captured, so a config edit takes effect on the next write.
@@ -459,6 +490,20 @@ async def _apply_memory_metadata_validation(
     violations = validate_memory_metadata(
         meta, enforce_kind_registry=config.enforce_kind_registry
     )
+
+    # parent_id LIVENESS (leaf δ). Gated on the SHAPE check having passed —
+    # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
+    # same key, so any parent_id-keyed violation means the id is malformed
+    # and no store could resolve it in that spelling.
+    if 'parent_id' in meta and not any(v.key == 'parent_id' for v in violations):
+        parent = await parent_lookup(project_id, meta['parent_id'])
+        if parent is None:
+            violations.append(
+                parent_liveness_violation(
+                    meta['parent_id'], code=PARENT_ID_DEAD_CODE
+                )
+            )
+
     if not violations:
         return
 
@@ -2387,6 +2432,7 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            parent_lookup=self.get_memory_by_id,
         )
 
         write_graphiti = (
@@ -2753,6 +2799,7 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            parent_lookup=self.get_memory_by_id,
         )
 
         mem0_result = None
