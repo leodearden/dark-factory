@@ -352,6 +352,45 @@ class TestExtractSnapshotEdgeTaskIds:
         )
         assert result == set()
 
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 2885 is no longer in blocked status',
+            'Task 2885 was previously in blocked status',
+            'Task 2885 was briefly in blocked status, then merged',
+            'Task 142 is not in blocked status',
+            'Task 5 was never in blocked status',
+            'Task 5 is formerly in pending status',
+        ],
+    )
+    def test_status_phrase_gap_does_not_absorb_negation_or_past_exit(self, fact):
+        """Negated / past-exit phrasings -> set().
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). The phrase form's open-class gap used to
+        absorb 'not'/'no longer'/'previously'/'briefly', which invert the
+        assertion rather than padding it, so all of these yielded an id.
+        Each is a permanently-true HISTORICAL fact — and a
+        blocked->unblocked transition is exactly the event that writes such
+        an edge, the same transition class the task-2885 repro is about, so
+        this is common phrasing here rather than exotic.
+
+        Note the asymmetry this closes: the individual form's closed-class
+        connective already refused the same semantics for free ('Task 2885
+        is no longer blocked' -> set()), because these tokens were never in
+        _ADVERB_ALT. Only the permissive phrase path lost that protection.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    def test_status_phrase_still_matches_non_negated_qualifiers(self):
+        """'Task 5 remains in blocked status' -> {5}.
+
+        The negation guard excludes a specific closed list, not qualifiers
+        generally — an ordinary gap word like 'remains' must still pass, or
+        the guard would have cost recall rather than only precision.
+        """
+        assert extract_snapshot_edge_task_ids('Task 5 remains in blocked status') == {5}
+
     def test_status_phrase_excludes_following_head_noun(self):
         """'Task 142 is tracked in the pending status report' -> set().
 

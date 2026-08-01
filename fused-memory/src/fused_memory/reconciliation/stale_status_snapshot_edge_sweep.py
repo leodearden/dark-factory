@@ -140,6 +140,19 @@ _COPULA_ALT = r'(?:is|are|was|were|remains?)'
 # re-admit the very readings the two arms exist to exclude.
 _ADVERB_ALT = r'(?:(?:currently|still|now|already)\s+)*'
 
+# Tokens SNAPSHOT_STATUS_PHRASE_RE's open-class gap may not absorb, because
+# each inverts the assertion instead of merely padding it: negation ('is not
+# in blocked status') and past-exit qualifiers ('is no longer / was
+# previously / was briefly in blocked status'). Written as a negative
+# lookahead applied per gap word. The individual form needs no equivalent —
+# its connective is closed-class, so these tokens simply are not in
+# _ADVERB_ALT and never matched in the first place. See residual (2) on
+# SNAPSHOT_STATUS_PHRASE_RE.
+_GAP_EXCLUDED_ALT = (
+    r'(?!(?:not|no|longer|never|previously|formerly|once|briefly|'
+    r'until|after|before)\b)'
+)
+
 # The union of both marker classes. Derived from the two constants above
 # rather than hand-written, so the gate (SNAPSHOT_STATUS_RE) and the
 # anchored matchers can never drift apart again — before task 3042 they were
@@ -234,7 +247,22 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
 #     preposition/subordinator such as 'due'/'under'/'since'). 'status
 #     report' is common phrasing in this repo's memory corpus, so this was
 #     worth closing rather than merely documenting.
-# (2) A gap-internal NOMINAL that is the real subject of the phrase:
+# (2) NEGATION / PAST-EXIT qualifiers absorbed by the gap, which invert
+#     the assertion outright: 'Task N is no longer in blocked status',
+#     'was previously in blocked status', 'is not in blocked status',
+#     'was briefly in blocked status, then merged'. Each is a
+#     permanently-true HISTORICAL fact — precisely the blocked->unblocked
+#     transition that writes such an edge in the first place, i.e. the same
+#     transition class the task-2885 repro is about, so not exotic
+#     phrasing. This is now EXCLUDED via _GAP_EXCLUDED_ALT below.
+#     Worth noting the asymmetry that made this phrase-form-only: the
+#     individual form's closed-class connective already refuses the same
+#     semantics for free ('Task N is no longer blocked' -> set()), because
+#     'not'/'no'/'longer'/'never' were never in _ADVERB_ALT. An open-class
+#     gap forfeits that protection, which is the standing cost of the
+#     permissive path. (amendment, reviewer_comprehensive
+#     correctness-precision finding, task 3042)
+# (3) A gap-internal NOMINAL that is the real subject of the phrase:
 #     'Task 5 depends on work in blocked status' — the WORK is blocked, not
 #     task 5. This still yields {5} and is NOT fixed here: distinguishing it
 #     needs to know that 'work' is the subject, which is beyond lexical
@@ -243,7 +271,9 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
 #     Widening the gap beyond {0,3} words would make this strictly worse.
 SNAPSHOT_STATUS_PHRASE_RE: re.Pattern[str] = re.compile(
     TASK_REF_RE.pattern
-    + r'(?:\s+\w+){0,3}?\s+in\s+(?:an?\s+|the\s+)?'
+    # the gap is open-class BUT may not absorb negation or past-exit
+    # qualifiers — those invert the assertion (see residual (3) above)
+    + r'(?:\s+' + _GAP_EXCLUDED_ALT + r'\w+){0,3}?\s+in\s+(?:an?\s+|the\s+)?'
     + _STATUS_MARKER_ALT + r'\s+status\b'
     # the span must END the noun phrase — else 'status' is a modifier of a
     # following head noun ('status report'), not the phrase head
