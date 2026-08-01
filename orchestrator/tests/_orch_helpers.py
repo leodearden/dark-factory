@@ -116,6 +116,20 @@ MERGE_RESULT_TIMEOUT = 45
 # thread method answers by os._exit()ing the xdist worker.
 CANCEL_SCOPE_BARRIER_TIMEOUT = 45
 
+# task 3307 (reviewer follow-up): small ceiling for the two PURE in-memory
+# CancellationScope barriers in TestCancellationScopeHardCancel — asyncio
+# Task cancellation + on_terminal recording only, no git worktree, no
+# artifact writes, no agent round-trip.  Pairing those with the much larger
+# CANCEL_SCOPE_BARRIER_TIMEOUT above bought no green-path benefit (they
+# resolve in microseconds) while making a genuine CancellationScope
+# regression there take 45s — or up to 180s under a paired
+# @pytest.mark.timeout — to report red instead of pytest's 60s default.
+# Kept above the retired 5.0s literal (never-narrow) for headroom against
+# scheduler jitter under host oversubscription, without borrowing the
+# I/O-sized budget above.  Do NOT use this for a test that drives a real
+# TaskWorkflow — use CANCEL_SCOPE_BARRIER_TIMEOUT for those.
+CANCEL_SCOPE_PURE_UNIT_TIMEOUT = 10
+
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
 _BASEMODEL_PROPS: frozenset[str] = frozenset(
