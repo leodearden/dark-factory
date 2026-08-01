@@ -31,9 +31,15 @@ ExecStart=/home/leo/.local/bin/uv run --project dashboard \
 # Cost/burndown aggregation roots (comma-separated). Standalone default: this repo only — additional project roots are LOCAL settings, added to the installed unit, not committed here. Keep spaces out of the value; systemd treats unquoted spaces as assignment separators.
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory
 
-# Restart policy: always restart on failure, back off up to 60s
+# Restart policy: always restart on failure, back off up to 60s.
+# RestartSteps is load-bearing here, not decorative. Without it systemd logs
+# "Service has RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." at
+# unit load and discards the cap entirely, so the backoff this comment claims
+# never happens and a crash-looping dashboard retries every 5s forever.
+# With it: backoff 5s -> 60s over 4 steps.
 Restart=on-failure
 RestartSec=5
+RestartSteps=4
 RestartMaxDelaySec=60
 
 TimeoutStopSec=15
