@@ -566,6 +566,13 @@ class TestRunVerificationSegmentChainedTestWiring:
                 config,
                 TestRunVerificationSegmentChainedTestWiring._fallback_config(test_command),
                 attempt_id=1,
+                # task_id is load-bearing, not decoration: run_verification
+                # persists the runs dict only when attempt_id AND task_id are
+                # both set (the task path's `elif attempt_id is not None and
+                # task_id is not None`), so omitting it leaves `spy_persist`
+                # never called and the capture seam silently empty — on a
+                # green run as much as a red one.
+                task_id='3338',
                 max_retries=0,
                 **kwargs,
             )
