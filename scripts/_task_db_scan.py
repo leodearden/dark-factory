@@ -36,8 +36,17 @@ test at once. (In-process pytest resolution is separately handled by
 """
 from __future__ import annotations
 
+import argparse
+import json
 import os
+import sqlite3
+import sys
 from pathlib import Path
+from typing import Any, Callable, NamedTuple, Sequence
+
+# ---------------------------------------------------------------------------
+# Tier 1 — tasks.db discovery (adopted by all three sweep scripts).
+# ---------------------------------------------------------------------------
 
 # Multi-project discovery fallback, mirroring
 # scripts/migrate_metadata_modules_to_files.py's DEFAULT_ROOTS.
@@ -119,3 +128,136 @@ def discover_db_paths(
         ]
 
     return [path for path in candidates if os.path.exists(path)]
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — leak-scanner CLI plumbing (the two leak scanners only).
+#
+# audit_wiped_metadata_files.py deliberately does NOT adopt this tier: its
+# main() carries a fourth exit code (3 = roots resolved but every one failed
+# to audit, kept distinct from 0 per docs/legibility/design-invariants.md's
+# no-silent-fail-soft rule), a --min-fidelity filter, object-shaped rather
+# than array-shaped JSON, and a different no-roots message.
+# ---------------------------------------------------------------------------
+
+# The exit-2 signal, emitted verbatim by both leak scanners.
+NO_DB_RESOLVED_MESSAGE = (
+    "no tasks.db resolvable (checked --db / --project-root / "
+    "DASHBOARD_KNOWN_PROJECT_ROOTS / the dark-factory default)"
+)
+
+
+def format_json(matches: Sequence[NamedTuple]) -> str:
+    """Render *matches* as a JSON array, carrying the FULL untruncated field."""
+    return json.dumps([m._asdict() for m in matches])
+
+
+def truncate(text: str, max_len: int) -> str:
+    """Cap *text* at *max_len* characters, marking elision with ``...``.
+
+    A string at or below the limit is returned unchanged (no ellipsis), so a
+    report line is only ever marked as truncated when it actually was.
+    """
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+    return text
+
+
+def group_matches_by_db(matches: Sequence[Any]) -> dict[str, list[Any]]:
+    """Group *matches* by their ``db_path`` field for a per-database report.
+
+    Keys iterate in sorted order (a report's db sections are stable regardless
+    of scan order); within a key, matches keep their original scan order.
+    """
+    by_db: dict[str, list[Any]] = {}
+    for m in matches:
+        by_db.setdefault(m.db_path, []).append(m)
+    return {db_path: by_db[db_path] for db_path in sorted(by_db)}
+
+
+def add_db_discovery_args(parser: argparse.ArgumentParser, *, json_help: str) -> None:
+    """Add the shared ``--db`` / ``--project-root`` / ``--json`` arguments.
+
+    ``--json``'s help is a parameter because the two scanners name different
+    payloads ("fragments" vs "leak lines"); the other two are byte-identical
+    between them.
+    """
+    parser.add_argument(
+        "--db", dest="dbs", action="append",
+        help="Explicit tasks.db path to scan. May be repeated.",
+    )
+    parser.add_argument(
+        "--project-root", dest="project_roots", action="append",
+        help=(
+            "Project root to scan (maps to <root>/.taskmaster/tasks/tasks.db). "
+            "May be repeated."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help=json_help)
+
+
+def sweep_databases(
+    db_paths: Sequence[str],
+    scan_fn: Callable[[str], list[Any]],
+) -> tuple[list[Any], list[str]]:
+    """Run *scan_fn* over every path in *db_paths*, returning (matches, unreadable).
+
+    A single unreadable database (e.g. a stale/corrupt file, or a transient
+    "database is locked"/"file is not a database" condition) does not abort the
+    sweep: it is logged to stderr and skipped so every other resolvable
+    database is still scanned and reported. Only ``sqlite3.Error`` is caught —
+    any other exception propagates, so a real bug in *scan_fn* surfaces instead
+    of being silently downgraded to "unreadable database".
+
+    Writes the per-database warnings during the loop and the aggregate
+    "results below are incomplete" warning after it, so a caller printing its
+    report afterwards keeps the warnings above the results.
+    """
+    matches: list[Any] = []
+    unreadable: list[str] = []
+    for db_path in db_paths:
+        try:
+            matches.extend(scan_fn(db_path))
+        except sqlite3.Error as exc:
+            print(f"warning: skipping unreadable database {db_path}: {exc}", file=sys.stderr)
+            unreadable.append(db_path)
+
+    if unreadable:
+        print(
+            f"warning: {len(unreadable)} database(s) skipped due to read errors "
+            "(see warnings above); results below are incomplete",
+            file=sys.stderr,
+        )
+
+    return matches, unreadable
+
+
+def run_scan_cli(
+    argv: list[str] | None,
+    *,
+    parser: argparse.ArgumentParser,
+    scan_fn: Callable[[str], list[Any]],
+    render: Callable[[list[Any], argparse.Namespace], str],
+) -> int:
+    """Shared leak-scanner ``main()`` body.
+
+    Exit codes: 0 = clean, 1 = at least one match found, 2 = no tasks.db could
+    be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS /
+    the dark-factory default.
+
+    *render* receives the collected matches and the parsed Namespace and
+    returns the exact text to print — that is where each scanner's
+    JSON-vs-report choice and its own truncation flag live.
+    """
+    args = parser.parse_args(argv)
+
+    db_paths = discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
+    if not db_paths:
+        print(NO_DB_RESOLVED_MESSAGE, file=sys.stderr)
+        return 2
+
+    matches, _unreadable = sweep_databases(db_paths, scan_fn)
+
+    print(render(matches, args))
+
+    return 1 if matches else 0
