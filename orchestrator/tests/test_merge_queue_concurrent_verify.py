@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import dataclasses
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -170,6 +171,62 @@ def _mock_verify_result(passed: bool) -> VerifyResult:
         summary='ok' if passed else 'fail',
         category='' if passed else 'test_failure',
     )
+
+
+def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
+    """Return a MagicMock(spec=VerifyResult) seeded from a REAL VerifyResult's
+    field defaults, with **overrides layered on top (task 3477).
+
+    Why not a bare ``MagicMock(passed=..., summary=..., ...)``: an
+    unconfigured attribute READ on a bare MagicMock auto-vivifies a truthy
+    child Mock rather than returning a real default. Every one of this
+    file's inline VerifyResult-shaped doubles omitted ``cause_hint``, so
+    merge_disposition.py's ``_extract_failing_tests_and_candidate_files``
+    (:218-221) joins ``verify_result.cause_hint`` and
+    ``verify_result.test_output`` via ``str.join`` — which raised
+    ``TypeError: sequence item 0: expected str instance, MagicMock found``
+    on every FAILING double. ``classify_merge_failure_disposition``
+    (:710-719) swallows that into a silent fail-open (WARNING +
+    INDETERMINATE), so the affected tests only APPEARED to exercise
+    disposition classification.
+
+    Why ``spec=VerifyResult``: it makes a future unknown-attribute READ
+    fail loudly (``AttributeError``) instead of auto-vivifying — the
+    root-cause fix, not just a ``cause_hint=''`` patch for today's one
+    known field. Seeding from ``dataclasses.fields(VerifyResult)`` (rather
+    than a hardcoded attr list) means a field added to VerifyResult in
+    future is picked up automatically, so this factory does not itself
+    drift out of sync the way the file's inline doubles did.
+
+    Why this stays a MagicMock and not a real VerifyResult instance: a real
+    dataclass would also make ``.failure_report()`` return a real string
+    instead of a Mock. merge_queue.py:703's ``isinstance(s, str)`` filter
+    currently discards the Mock; a real string would pass through and
+    append a ``## Test Failures`` block to the rendered ``reason`` at
+    merge_queue.py:3020/3041/3078 — assertion churn well beyond this
+    factory's fidelity-only scope. Seeding a MagicMock from real defaults
+    confines the behaviour delta to exactly the fields callers read.
+
+    Deliberately does NOT special-case a ``verify_skipped`` kwarg: that
+    field lives on MergeOutcome (merge_types.py:945), not VerifyResult, and
+    is never read off a VerifyResult anywhere in src/ — callers migrating
+    off the old inline doubles should simply drop it rather than pass it
+    through **overrides.
+    """
+    real = VerifyResult(
+        passed=passed,
+        test_output='ok' if passed else 'FAILED',
+        lint_output='',
+        type_output='',
+        summary='ok' if passed else 'fail',
+        category='' if passed else 'test_failure',
+    )
+    fake = MagicMock(spec=VerifyResult)
+    for f in dataclasses.fields(VerifyResult):
+        setattr(fake, f.name, getattr(real, f.name))
+    for key, value in overrides.items():
+        setattr(fake, key, value)
+    return fake
 
 
 def _mock_verify_pass() -> AsyncMock:
