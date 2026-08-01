@@ -761,3 +761,145 @@ def materialize_arm(
         records = _materialize_b_grouped(claims, topics, categories)
 
     return records + _distractor_records(distractors)
+
+
+# ---------------------------------------------------------------------------
+# Read-side transform: the grouped read (arm-local reference for task 3129)
+# ---------------------------------------------------------------------------
+#
+# ``server/grouped_read.py`` does not exist — 3129 is deferred behind gate η,
+# which depends on THIS task, so the premise cannot be supplied from
+# downstream.  What follows is the arm-local reference implementation of
+# PRD V2/D6, and doubles as their executable specification.
+#
+# It is a PURE post-ranking transform over an already-fetched hit list: no
+# store, no await, no config.  That is not a stylistic choice.  PRD V2
+# explicitly forbids this suppression filter from living at
+# ``MemoryService.search``, where it would break
+# ``mem0_dedup.find_prior_memories``' post-filter and hide candidates from
+# the write guard — i.e. it would relocate the very failure grouping exists
+# to prevent one layer further down, where it is harder to see.
+
+#: Role marking a synthesised grouped document (never a stored record).
+GROUPED_ROLE = 'grouped'
+
+
+def _render_grouped_document(
+    canonical: ArmRecord,
+    amendments: list[ArmRecord],
+    sighting_count: int,
+) -> str:
+    """Canonical body, then amendment digests, then a sighting COUNT.
+
+    Sightings are counted rather than pasted because that is precisely the
+    cost claim grouping makes (PRD D4): a grouped read is supposed to be
+    cheaper than N peers, and it can only be cheaper if the repetitive
+    "seen it again" entries collapse to a number.  Pasting them would make
+    the tokens-per-query metric measure a concatenation and quietly hand
+    arm (b) a loss it did not earn.
+    """
+    parts = [canonical.content]
+    for amendment in amendments:
+        parts.append(f'[amendment] {amendment.content}')
+    if sighting_count:
+        parts.append(f'[sightings: {sighting_count}]')
+    return '\n'.join(parts)
+
+
+def apply_grouped_read(
+    hits: list[ArmRecord],
+    records_by_id: dict[str, ArmRecord],
+    *,
+    contested_ids: set[str],
+) -> list[ArmRecord]:
+    """Resolve child hits upward into their parents' grouped documents.
+
+    PRD **D6 (mandatory)**: a child hit resolves UPWARD, so a child's content
+    is never unreachable — that unreachability is the whole objection to
+    δ/Option B, and a grouped read that did not fix it would be arbitrating
+    a strawman.  Every claim the collapsed children realized is credited to
+    the group, or arm (b) would lose claim-recall precisely *for grouping
+    correctly*.
+
+    PRD **V2**: a ``contested`` child is NEVER suppressed.  It survives as
+    its own hit alongside the grouped document and its body is kept out of
+    that document.  This is the esc-5712 shape: a contested amendment folded
+    invisibly into a canonical is how a disagreement gets silently resolved
+    in favour of whoever wrote the canonical.
+
+    Ranking: a group lands at the BEST rank among its collapsed members.
+    Demoting it to the worst would make grouping look worse at every k as an
+    artifact of this transform rather than of the storage shape.
+
+    A hit with no ``parent_id`` passes through unchanged and in place.  A
+    child whose parent is missing from *records_by_id* also passes through
+    unchanged: ``parent_id`` liveness is leaf δ's concern, and dropping the
+    hit here would silently delete a real answer.
+
+    Pure — never mutates *hits*, *records_by_id* or any record in them.
+    """
+    # Which parents are being formed, and at what rank each first appeared.
+    group_members: dict[str, list[ArmRecord]] = {}
+    group_rank: dict[str, int] = {}
+    output: list[tuple[int, ArmRecord]] = []
+
+    for rank, hit in enumerate(hits):
+        parent_id = hit.metadata.get('parent_id')
+
+        # V2: contested children never fold. Emitted as themselves, and
+        # deliberately NOT registered as group members, so their body cannot
+        # reach the grouped document either.
+        if parent_id is not None and hit.record_id in contested_ids:
+            output.append((rank, hit))
+            continue
+
+        if parent_id is None or parent_id not in records_by_id:
+            # Parentless, or a dangling link: pass through in place.
+            output.append((rank, hit))
+            continue
+
+        if parent_id not in group_members:
+            group_members[parent_id] = []
+            group_rank[parent_id] = rank
+        group_members[parent_id].append(hit)
+
+    # A parent that was ITSELF a hit becomes the anchor of its own group
+    # rather than a second, duplicate entry.
+    resolved: list[tuple[int, ArmRecord]] = []
+    for rank, hit in output:
+        if hit.record_id in group_members:
+            group_rank[hit.record_id] = min(group_rank[hit.record_id], rank)
+            continue
+        resolved.append((rank, hit))
+
+    for parent_id, members in group_members.items():
+        canonical = records_by_id[parent_id]
+        amendments = [m for m in members if m.metadata.get('kind') == 'amendment']
+        sightings = [m for m in members if m.metadata.get('kind') == 'sighting']
+        others = [
+            m for m in members
+            if m.metadata.get('kind') not in ('amendment', 'sighting')
+        ]
+
+        claim_ids = list(canonical.claim_ids)
+        for member in members:
+            for claim_id in member.claim_ids:
+                if claim_id not in claim_ids:
+                    claim_ids.append(claim_id)
+
+        resolved.append((group_rank[parent_id], ArmRecord(
+            record_id=canonical.record_id,
+            content=_render_grouped_document(
+                canonical, amendments + others, len(sightings),
+            ),
+            # A fresh dict: the stored canonical's metadata is never mutated.
+            metadata=dict(canonical.metadata),
+            cluster_id=canonical.cluster_id,
+            claim_ids=claim_ids,
+            role=GROUPED_ROLE,
+        )))
+
+    # Stable sort on the original rank: equal ranks are impossible (each rank
+    # is consumed once), so the order is total and the transform deterministic.
+    resolved.sort(key=lambda pair: pair[0])
+    return [record for _, record in resolved]
