@@ -326,3 +326,121 @@ def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
             '(feedback_redux_no_synthetic_data). Seed block was: '
             f'{seed_block}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-3 test: index.html registers tab_memory_evals.jsx in the right position
+# ---------------------------------------------------------------------------
+
+
+_TAB_MEMEVALS_PREFIX = '/static/redux/tab_memory_evals.jsx'
+
+_LOAD_ORDER_NOTE = (
+    'tab_memory_evals.jsx exports window.DF_MEMORY_EVALS, which tabs.jsx '
+    'destructures at MODULE TOP LEVEL — exactly as tab_scheduler.jsx:15 '
+    'destructures window.DF_SCHED_HEATMAP. A later tag would leave the global '
+    'undefined at tabs.jsx evaluation time, throwing and blanking EVERY tab '
+    'defined in that file. This is the opposite direction from '
+    'tab_escalations.jsx, which loads AFTER tabs.jsx because it additively '
+    'mutates the window.DF_TABS object tabs.jsx creates.'
+)
+
+
+def test_index_html_registers_tab_memory_evals_load_order(
+    index_html_body: str,
+) -> None:
+    """index.html must load tab_memory_evals.jsx after its dependencies and
+    BEFORE tabs.jsx, as a classic synchronous text/babel script.
+
+    All /static/redux/* tags are classic sync scripts, so document order IS
+    execution order — which is why the no-defer / no-async / no-type=module
+    guard runs before every position comparison.
+    """
+    # (a) the tag exists and is a classic synchronous text/babel script
+    found = _find_script_position(index_html_body, _TAB_MEMEVALS_PREFIX)
+    assert found is not None, (
+        f'No <script src="{_TAB_MEMEVALS_PREFIX}..."> tag in index.html. '
+        f'{_LOAD_ORDER_NOTE}'
+    )
+    _pos, attrs = found
+    assert 'defer' not in attrs, (
+        'tab_memory_evals.jsx must not carry defer — document order would no '
+        'longer imply execution order and tabs.jsx could evaluate first.'
+    )
+    assert 'async' not in attrs, (
+        'tab_memory_evals.jsx must not carry async — document order would no '
+        'longer imply execution order and tabs.jsx could evaluate first.'
+    )
+    assert (attrs.get('type') or '').lower() == 'text/babel', (
+        'tab_memory_evals.jsx contains JSX, so its <script> tag must be '
+        f'type="text/babel"; got type={attrs.get("type")!r}. Note type="module" '
+        'would additionally be deferred by default, breaking load order.'
+    )
+
+    # (b) after its dependencies: data.js (DF_DATA seed), charts.jsx
+    #     (DF_CHARTS primitives + PALETTE), shell.jsx.
+    for dep_prefix, dep_label, why in [
+        (
+            '/static/redux/data.js',
+            'data.js',
+            'tab_memory_evals.jsx reads window.DF_DATA, seeded by data.js.',
+        ),
+        (
+            '/static/redux/charts.jsx',
+            'charts.jsx',
+            'tab_memory_evals.jsx destructures Sparkline/StepSpark/StatTile/'
+            'PALETTE off window.DF_CHARTS at module top level.',
+        ),
+        (
+            '/static/redux/shell.jsx',
+            'shell.jsx',
+            'tab_memory_evals.jsx uses window.DF_SHELL formatting helpers.',
+        ),
+    ]:
+        _assert_script_loads_before(
+            index_html_body,
+            dep_prefix,
+            _TAB_MEMEVALS_PREFIX,
+            dep_label,
+            'tab_memory_evals.jsx',
+            why,
+        )
+
+    # (c) THE load-bearing assertion — before tabs.jsx.
+    _assert_script_loads_before(
+        index_html_body,
+        _TAB_MEMEVALS_PREFIX,
+        '/static/redux/tabs.jsx',
+        'tab_memory_evals.jsx',
+        'tabs.jsx',
+        _LOAD_ORDER_NOTE,
+    )
+
+    # (d) transitively therefore before app.jsx, which destructures DF_TABS last.
+    _assert_script_loads_before(
+        index_html_body,
+        _TAB_MEMEVALS_PREFIX,
+        '/static/redux/app.jsx',
+        'tab_memory_evals.jsx',
+        'app.jsx',
+        'app.jsx renders MemoryTab, which renders MemoryEvalsSection.',
+    )
+
+    # (e) one uniform cache-buster across every /static/redux/* asset,
+    #     including the styles.css <link> — mirrors the guards in
+    #     test_index_html.py:593 (floor 37) and test_tab_escalations.py:487.
+    versions = set(
+        re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)
+    )
+    assert len(versions) == 1, (
+        f'index.html has mixed /static/redux/?v= cache-buster versions: '
+        f'{sorted(versions)} — bump all of them uniformly, the stylesheet '
+        '<link> included.'
+    )
+    v = int(next(iter(versions)))
+    assert v >= 38, (
+        f'index.html cache-buster version is {v}, expected >= 38 (proves the '
+        'uniform bump for the memory-evals section actually reaches '
+        'already-open browsers; the previous floor, 37, proved task 3332\'s '
+        '`const API` collision fix).'
+    )
