@@ -3037,6 +3037,9 @@ async def test_no_auto_unhalt_when_disabled(
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
+    # Positive witness for the halt-SKIP branch — see _halt_skip_event.
+    skipped = _halt_skip_event(harness)
+
     with (
         patch.object(
             harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
@@ -3045,6 +3048,13 @@ async def test_no_auto_unhalt_when_disabled(
     ):
         await asyncio.wait_for(harness.run_loop(), timeout=0.3)
 
+    # FIRST, ahead of the absence assertions: proves auto_resume_pending was
+    # actually evaluated and returned False, turning 'unhalt was not awaited'
+    # from 'we never got there' into 'we got there and correctly declined'.
+    assert skipped.is_set(), (
+        'halt-skip branch never reached — the assertions below would pass '
+        'vacuously'
+    )
     unhalt_spy.assert_not_awaited()
     rfc_mock.assert_not_awaited()
     assert harness.judge.is_halted('test-project')  # still halted
@@ -3074,6 +3084,9 @@ async def test_no_auto_unhalt_before_cooldown_expiry(
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
+    # Positive witness for the halt-SKIP branch — see _halt_skip_event.
+    skipped = _halt_skip_event(harness)
+
     with (
         patch.object(
             harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
@@ -3082,6 +3095,13 @@ async def test_no_auto_unhalt_before_cooldown_expiry(
     ):
         await asyncio.wait_for(harness.run_loop(), timeout=0.3)
 
+    # FIRST, ahead of the absence assertions: proves cooldown_expired was
+    # actually evaluated and returned False, turning 'unhalt was not awaited'
+    # from 'we never got there' into 'we got there and correctly declined'.
+    assert skipped.is_set(), (
+        'halt-skip branch never reached — the assertions below would pass '
+        'vacuously'
+    )
     unhalt_spy.assert_not_awaited()
     rfc_mock.assert_not_awaited()
     assert harness.judge.is_halted('test-project')
