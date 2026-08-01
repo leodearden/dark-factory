@@ -1656,6 +1656,133 @@ class TestCostPerUsablePlan:
         assert row['cost_per_plan'] is None
 
 
+class TestTheReliabilityColumnsAreRendered:
+    """Both figures must reach the surfaces an OPERATOR reads.
+
+    ``format_composite_table`` is what ``select_survivors`` ranks on and what a
+    human compares candidates with; a figure that exists only in the row JSON
+    leaves the 2026-07-27 operator exactly where they started — recomputing it
+    by hand from the per-cell result JSONs.
+    """
+
+    def test_the_composite_table_renders_both_new_columns(self):
+        from orchestrator.evals.report import (
+            _COMPOSITE_COLUMNS,
+            build_composite_report,
+            format_composite_table,
+        )
+
+        # Pin the column tuple FIRST, so a reorder fails here rather than
+        # silently re-aiming the cell assertions below (the idiom
+        # TestNoPlanCellsAreCounted established). The pre-existing pins must
+        # still hold: plan_rate is INSERTED after them, not in place of them.
+        assert _COMPOSITE_COLUMNS[4] == 'pq_excluded'
+        assert _COMPOSITE_COLUMNS[5] == 'pq_no_plan'
+        assert _COMPOSITE_COLUMNS[6] == 'plan_rate'
+        # $/plan reads beside the plain cost it corrects, not across the table.
+        assert (
+            _COMPOSITE_COLUMNS[_COMPOSITE_COLUMNS.index('cost_usd') + 1]
+            == 'cost_per_plan'
+        )
+
+        out = format_composite_table(build_composite_report(
+            TestCostPerUsablePlan._three_at_30c_one_planless()
+        ))
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-mixed')
+
+        assert cells[header.index('plan_rate')] == '0.6667'
+        assert cells[header.index('cost_per_plan')] == '0.4500'
+        # …and it reads as dearer than the $0.30/cell it would look like from
+        # the cost column alone.
+        assert cells[header.index('cost_usd')] == '0.3000'
+
+    def test_a_workflow_row_renders_dashes_in_both(self):
+        """Never ``0.0000`` and never ``1.0000``: a cell that measured nothing
+        must not read as one that scored zero — nor, here, as a perfect one."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            format_composite_table,
+        )
+
+        results = [
+            _mresult('w1', 'impl-only', tr, quality=0.8, cost_usd=5.0,
+                     duration_ms=900000)
+            for tr in (1, 2, 3)
+        ]
+        out = format_composite_table(build_composite_report(results))
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'impl-only')
+
+        assert cells[header.index('plan_rate')] == '-'
+        assert cells[header.index('cost_per_plan')] == '-'
+
+    def test_an_all_planning_config_renders_a_full_rate(self):
+        """The control: a rate that only appears when it FIRES cannot be read,
+        so the column is present-and-1.0000, not blank."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            format_composite_table,
+        )
+
+        results = [
+            _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.30, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        out = format_composite_table(build_composite_report(results))
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-real')
+
+        assert cells[header.index('plan_rate')] == '1.0000'
+        # Every cell planned, so $/plan IS the per-cell cost.
+        assert cells[header.index('cost_per_plan')] == '0.3000'
+
+    def test_the_theta_mean_table_renders_the_rate(self):
+        """On the θ surface too, beside the n / cap_excluded / no_plan it was
+        computed over — the module's report-a-figure-with-its-sample norm."""
+        from orchestrator.evals.report import (
+            _PLAN_QUALITY_MEAN_COLUMNS,
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        assert 'plan_rate' in _PLAN_QUALITY_MEAN_COLUMNS
+        out = format_plan_quality_table(build_plan_quality_report(
+            TestPlanRateIsTheReliabilityColumn._one_no_plan_among_three()
+        ))
+        header = _table_row_cells(
+            out, 'config_name', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        cells = _table_row_cells(
+            out, 'arch-mixed', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+
+        assert cells[header.index('plan_rate')] == '0.6667'
+        # The sample it was computed over stays legible beside it.
+        assert cells[header.index('n')] == '3'
+        assert cells[header.index('no_plan')] == '1'
+
+    def test_rendering_is_byte_deterministic(self):
+        """The widened tuples must not cost the surface its byte-stability."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+            format_composite_table,
+            format_plan_quality_table,
+        )
+
+        results = TestCostPerUsablePlan._three_at_30c_one_planless()
+        composite = build_composite_report(results)
+        theta = build_plan_quality_report(results)
+
+        assert format_composite_table(composite) == format_composite_table(composite)
+        assert (
+            format_plan_quality_table(theta) == format_plan_quality_table(theta)
+        )
+
+
 class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     """The floor DISCARDS a persisted LLM-judge score — loudly, or not at all.
 
