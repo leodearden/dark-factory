@@ -62,6 +62,16 @@ Design decisions (captured in plan.json):
   and same remedy as task 2824's transitive-verb caveat on
   ``task_filter.PRESENT_TENSE_COMPLETION_RE``. (amendment,
   reviewer_comprehensive precision finding, task 3042)
+- EVERY extraction path anchors its marker adjacently to whatever the
+  marker describes; no path may rest on the whole-fact gate alone. The
+  gate only decides whether a fact is worth considering at all — it
+  matches a marker ANYWHERE in the fact, so it can never be the thing
+  separating a status snapshot from a historical fact. The aggregate
+  list path was left resting on the gate and had to be re-anchored once
+  'blocked' widened it (LIST_INTRODUCER_RE). Any future marker added to
+  ``_STATUS_MARKER_ALT`` must be checked against every path, not just
+  the individual form. (amendment, reviewer_comprehensive precision
+  finding, task 3042)
 - Two anchoring paths with an explicit precision contract: closed-class
   connective only (copula / article — NOT the preposition 'in', which
   would let the marker bind to a noun the task is merely located in) for
@@ -125,6 +135,14 @@ _TRANSITIVE_MARKER_ALT = r'(?:blocked)'
 # arms of INDIVIDUAL_SNAPSHOT_RE — optional for the adjective arm, mandatory
 # for the transitive-capable arm.
 _COPULA_ALT = r'(?:is|are|was|were|remains?)'
+
+# Closed-class adverbs permitted between the copula and the marker, so
+# 'Task 5 is currently blocked' / 'is still blocked' match as readily as
+# 'Task 5 is blocked'. Mirrors the '(?:been|already|now|fully)\s+' slot in
+# task_filter.PRESENT_TENSE_COMPLETION_RE. Deliberately an explicit
+# closed-class list rather than a '\w+' gap: an open-class gap here would
+# re-admit the very readings the two arms exist to exclude.
+_ADVERB_ALT = r'(?:(?:currently|still|now|already)\s+)*'
 
 # The union of both marker classes. Derived from the two constants above
 # rather than hand-written, so the gate (SNAPSHOT_STATUS_RE) and the
@@ -220,10 +238,12 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     TASK_REF_RE.pattern
     + r'(?:'
     # adjective arm — optional copula (task 2613 behaviour, unchanged)
-    + r'\s*' + _COPULA_ALT + r'?\s*(?:an?\s+)?' + _ADJECTIVE_MARKER_ALT
+    + r'\s*' + _COPULA_ALT + r'?\s*' + _ADVERB_ALT + r'(?:an?\s+)?'
+    + _ADJECTIVE_MARKER_ALT
     + r'|'
     # transitive-capable arm — copula or article is MANDATORY
-    + r'\s+(?:' + _COPULA_ALT + r'\s+(?:an?\s+)?|an?\s+)' + _TRANSITIVE_MARKER_ALT
+    + r'\s+(?:' + _COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:an?\s+)?|an?\s+)'
+    + _TRANSITIVE_MARKER_ALT
     + r')\b',
     re.IGNORECASE,
 )
@@ -249,12 +269,45 @@ SNAPSHOT_STATUS_PHRASE_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# Detects the start of an aggregate list segment: '...tasks [' or
-# '...tasks are [' or '...tasks:' or '...tasks are:'. The 'open' group
-# records which delimiter opened the segment ('[' vs ':') so
+# Detects the start of an aggregate list segment: '<marker> tasks [' or
+# '<marker> tasks are [' or '<marker> tasks:' or '<marker> tasks are:'. The
+# 'open' group records which delimiter opened the segment ('[' vs ':') so
 # _list_segment can decide how to find the segment's end.
+#
+# NOTE (amendment, reviewer_comprehensive correctness-precision finding,
+# task 3042): this used to be a bare r'\btasks?\b...' with no marker of its
+# own, leaving the whole aggregate path anchored to nothing but the
+# whole-fact gate (SNAPSHOT_STATUS_RE). Widening that gate with 'blocked'
+# therefore routed straight around the transitive-verb hardening built into
+# INDIVIDUAL_SNAPSHOT_RE: 'Task 5 blocked these tasks: 142, 148' and 'Task 5
+# blocked the merge of tasks [142, 148]' both yielded {142, 148} (each
+# returned set() before 'blocked' joined the gate, so the gate was the only
+# thing holding them back). Those are permanently-true historical facts, so
+# the sweep would retire them the moment 142 or 148 went terminal — the
+# over-selection direction the module docstring forbids.
+#
+# The marker is now required IMMEDIATELY before the list noun, which is the
+# same anchoring principle the individual and phrase forms already use:
+# adjacency to the thing being described, not mere co-occurrence somewhere
+# in the fact. 'The active pending tasks are [...]', 'active/in-progress
+# tasks: ...' and 'Blocked tasks: ...' all still match; the two facts above
+# no longer do, because the intervening open-class words ('these', 'the
+# merge of') break adjacency.
+#
+# Residual (deliberate, both in the fail-safe direction):
+# - Under-selection: a genuine aggregate whose marker is not adjacent to the
+#   list noun (e.g. 'the tasks in the merge queue are [142, 148] and remain
+#   blocked') is no longer extracted. Consistent with this module's stated
+#   preference — under-selection self-heals next cycle or is caught by
+#   Stage 2, over-selection wrongly retires true facts.
+# - Ambiguity: the exact adjacency 'Task 5 blocked tasks: 142, 148' (no
+#   intervening word) still matches, and is genuinely ambiguous between the
+#   transitive-verb reading and the status-list reading 'Blocked tasks:
+#   [...]' — a shape the sweep must keep. Requiring adjacency narrows the
+#   hazard to that one collision rather than every '... blocked ... tasks:'
+#   fact.
 LIST_INTRODUCER_RE: re.Pattern[str] = re.compile(
-    r'\btasks?\b\s*(?:are|is|were)?\s*(?P<open>[:\[])',
+    r'\b' + _STATUS_MARKER_ALT + r'\s+tasks?\b\s*(?:are|is|were)?\s*(?P<open>[:\[])',
     re.IGNORECASE,
 )
 
@@ -317,10 +370,14 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
          marker, but only when the marker is immediately followed by the
          literal noun 'status' — the token that makes the span an
          explicit status assertion rather than an incidental mention.
-      4. Aggregate form: for each detected list segment ('tasks are
-         [...]' / 'tasks: ...'), strip COUNT_QUANTITY_RE spans from that
-         segment only (so an embedded count phrase doesn't contribute a
-         spurious id) and collect its bare digit tokens.
+      4. Aggregate form: for each detected list segment ('<marker> tasks
+         are [...]' / '<marker> tasks: ...'), strip COUNT_QUANTITY_RE
+         spans from that segment only (so an embedded count phrase doesn't
+         contribute a spurious id) and collect its bare digit tokens. The
+         status marker must sit immediately before the list noun — the
+         same adjacency anchoring the individual and phrase forms use, so
+         this path is not left riding on the whole-fact gate alone (see
+         LIST_INTRODUCER_RE).
 
     Pure: no I/O, no side effects.
     """

@@ -264,12 +264,47 @@ class TestExtractSnapshotEdgeTaskIds:
         assert extract_snapshot_edge_task_ids(fact) == set()
 
     @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 5 blocked these tasks: 142, 148',
+            'Task 5 blocked the merge of tasks [142, 148]',
+            'Task 5 blocked the release for tasks: 142, 148',
+        ],
+    )
+    def test_aggregate_path_not_reachable_by_bare_transitive_verb(self, fact):
+        """'Task 5 blocked <words> tasks: 142, 148' -> set().
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). The aggregate list path used to be anchored to
+        nothing but the whole-fact gate (SNAPSHOT_STATUS_RE), so widening
+        that gate with 'blocked' routed straight around the transitive-verb
+        hardening added to INDIVIDUAL_SNAPSHOT_RE — these facts yielded
+        {142, 148} even though the individual form correctly refused the
+        same bare-verb reading. Each returned set() before 'blocked' joined
+        the gate, so the gate was the only thing holding them back.
+
+        These are permanently-true historical facts; the sweep would have
+        retired them the moment 142 or 148 reached a terminal status.
+        LIST_INTRODUCER_RE now requires the marker immediately before the
+        list noun, so the intervening open-class words ('these', 'the merge
+        of', 'the release for') break adjacency.
+
+        Distinct from test_blocked_as_bare_transitive_verb_excluded, which
+        covers the individual form only — none of its cases carry a list
+        introducer, so it never exercised this path.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
         ('fact', 'expected'),
         [
             ('Task 2885 is blocked.', {2885}),
             ('Task 2885 was blocked', {2885}),
             ('Task 2885 remains blocked', {2885}),
             ('Task 2885 is a blocked task', {2885}),
+            ('Task 2885 is currently blocked', {2885}),
+            ('Task 2885 is still blocked', {2885}),
+            ('Task 5 is currently active', {5}),
         ],
     )
     def test_blocked_in_copula_form_still_selected(self, fact, expected):
