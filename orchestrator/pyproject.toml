@@ -108,14 +108,28 @@ timeout_method = "thread"
 # re-collects the full suite and re-dies → restart/re-collect/re-die loop that
 # hangs the whole suite at ~98%. Disabling restarts degrades a worker death to
 # a single clean per-test failure instead of a suite-wide hang.
-addopts = "-n auto --dist loadgroup --max-worker-restart=0"
+# ``-m 'not warm_lane_bash'`` deselects the ported warm-lane bash bucket from
+# the default suite — PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the
+# documented escape is taken and the bucket now runs post-merge on
+# ``git.offline_lane_commands`` (the ``warm-lane-bash`` entry in
+# dark-factory-orchestrator.yaml). Measured 289.58s serialised onto one xdist
+# worker at loadavg 128.72 on 32 cores — 6.2x the README's 47s module baseline,
+# and fully additive to the verify critical path since ``xdist_group`` pins all
+# 12 items to a single worker. Deselecting HERE rather than in
+# orchestrator.yaml's test_command follows the shipped ``integration``
+# precedent (shared/pyproject.toml, fused-memory/pyproject.toml): test_command
+# is a bare directory-arg pytest with no ``-m`` of its own, so this one edit
+# point covers merge-verify AND a bare local ``pytest`` with no risk of the two
+# spellings drifting apart. COUPLED to the lane entry — see the marker note
+# below and test_warm_lane_bash_bucket_placement.py.
+addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m 'not warm_lane_bash'"
 markers = [
     "exercise_dry_run_unblock: allow workflow._mark_blocked to spawn the real run_dry_run_unblock hook (fire-and-forget Claude CLI). Default: autouse no-op installed in conftest.py.",
     "mocks_dry_run_unblock: opt the class into an AsyncMock(return_value=None) patch of orchestrator.workflow.run_dry_run_unblock so BLOCKED-driving e2e tests do not invoke the real fire-and-forget hook. Default in test_workflow_e2e.py: a fail-fast stub that records calls and asserts in teardown.",
     "guard_self_test: marks a test class as a self-test of _dry_run_unblock_e2e_guard; suppresses the fixture's teardown assertion so deliberate stub invocations inside pytest.raises do not produce a false-positive failure.",
     "exercise_merge_verify: opt a test OUT of the autouse `_mock_merge_queue_verification` patch so its post-merge verify gate runs the REAL orchestrator.merge_queue.run_scoped_verification (e.g. cargo) instead of the passed=True stub. Default: autouse mock installed in conftest.py.",
     "real_verify_admission: opt a test OUT of the autouse `_neutralize_verify_admission` patch so it exercises the REAL orchestrator.verify admission wiring (nice-prefix wrap + shared.verify_admission.acquire_task_slot) instead of the force-inactive stub. Default: autouse neutralize installed in conftest.py (task 2390).",
-    "warm_lane_bash: marks the pytest items in test_warm_lane_bash_suite.py that shell out to the ported warm-lane bash tests under tests/warm-lane/ (task 3073, PRD leaf α2). Registered for ON-DEMAND selection/deselection only (`-m warm_lane_bash` / `-m 'not warm_lane_bash'`); deliberately NOT deselected in addopts, because PRD leaf γ changes warm-lane-gc.sh's core predicate and needs this coverage actually running on its verify leg, and leaf κ deletes reify's originals on the strength of this suite being green. See orchestrator/tests/warm-lane/README.md.",
+    "warm_lane_bash: marks the pytest items in test_warm_lane_bash_suite.py that shell out to the ported warm-lane bash tests under tests/warm-lane/ (task 3073, PRD leaf α2). DESELECTED from the default suite in addopts and re-selected post-merge by the `warm-lane-bash` LaneCommand in dark-factory-orchestrator.yaml — PRD §11 q4 re-decided (task 3349, 2026-08-01) to take the escape the PRD itself documented. Two grounds: leaf γ (task 3075) has LANDED with this coverage green on its verify leg, consuming half the original justification; and the surviving cost ground inverted — measured 289.58s at loadavg 128.72 on 32 cores, 6.2x the README's 47s module baseline. Still selectable on demand with `-m warm_lane_bash`, which is exactly how the lane re-selects it (a CLI -m overrides the addopts -m, last wins). PRD leaves δ/δ2/ε, which still change warm-lane behaviour, must run `-m warm_lane_bash` explicitly on their own verify legs. The addopts deselection and the lane entry are COUPLED and never move independently — pinned by test_warm_lane_bash_bucket_placement.py. See orchestrator/tests/warm-lane/README.md.",
 ]
 
 [dependency-groups]
