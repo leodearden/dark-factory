@@ -2222,3 +2222,37 @@ class TestStage3PromptNamesMem0SnapshotStats:
         from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
         assert SNAPSHOT_PRUNED_STAT_KEY in STAGE3_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Judge prompt coupling — same guidance, same drift guard (task 3045,
+# amendment round: architecture-coherence finding)
+# ---------------------------------------------------------------------------
+
+
+class TestJudgePromptNamesMem0SnapshotStats:
+    """JUDGE_SYSTEM_PROMPT must name the stat keys the judge actually receives.
+
+    Same contract and same rationale as TestStage3PromptNamesMem0SnapshotStats
+    above, for the OTHER reader of Stage 2's stats: judge.py puts report.stats
+    in the judge prompt, and JUDGE_SYSTEM_PROMPT explicitly instructs the model
+    to "cross-reference stage report stats against MCP Actions to verify
+    consistency" -- which is the instruction that manufactures the false
+    positive this task exists to kill. Renaming the keys without telling the
+    judge the invariant leaves it free to read
+    ``task_count_snapshot_mem0_written=1`` with no matching Graphiti edge as a
+    stats-vs-reality mismatch.
+
+    PRESENCE-ONLY, keyed off the imported constants -- no assertion about
+    wording, ordering, or what the prompt must NOT say.
+    """
+
+    def test_prompt_names_the_written_stat_key(self):
+        from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
+
+        assert SNAPSHOT_WRITTEN_STAT_KEY in JUDGE_SYSTEM_PROMPT
+
+    def test_prompt_names_the_pruned_stat_key(self):
+        from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
+
+        assert SNAPSHOT_PRUNED_STAT_KEY in JUDGE_SYSTEM_PROMPT
