@@ -1008,6 +1008,13 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
     term.chmod(0o755)
 
     env = _base_env(bin_dir, "custom-term")
+    # Task 3451 audit: deliberately NOT routed through _set_started_grace.
+    # This test asserts the flag MUST fire, and its launcher exits 0
+    # without ever running the payload, so no evidence (sentinel,
+    # transcript, or claude descendant) can EVER appear -- the watchdog
+    # fires regardless of grace, and the verdict is load-insensitive. The
+    # short pin only bounds how long the test waits for that inevitable
+    # flag; _set_started_grace would merely make it slower.
     env["SPAWN_STARTED_GRACE_SECS"] = "2"
 
     proc = subprocess.Popen(
@@ -1468,6 +1475,14 @@ def test_foreground_launcher_failure_prefers_127_over_started_grace_race(
 
     env = _base_env(bin_dir, "xterm")
     env["SPAWN_LAUNCH_GRACE_SECS"] = "5"
+    # Task 3451 audit: deliberately NOT routed through _set_started_grace.
+    # Here the SHORT grace IS the premise -- it must stay well below the
+    # SPAWN_LAUNCH_GRACE_SECS="5" set on the line above, and load-scaling a
+    # base of 1 (via _set_started_grace or _load_scaled_grace) could exceed
+    # 5 under contention, inverting the exact 127-vs-144 ordering this test
+    # exists to pin. This is the opposite family from _set_started_grace's
+    # must-not-fire tests: here the flag firing fast is fine, so long as
+    # resolve_foreground's 127 verdict still wins the race.
     env["SPAWN_STARTED_GRACE_SECS"] = "1"
 
     result = _run_spawn(env, tmp_path, timeout=20)
