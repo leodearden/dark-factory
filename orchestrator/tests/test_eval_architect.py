@@ -253,6 +253,20 @@ def _cli_local_error_result(marker: str):
     )
 
 
+def _server_error_result(status: int = 529):
+    """A fast, zero-cost server-side (5xx) refusal — the provider was degraded,
+    the model never answered. Deliberately NOT timed out and carrying no cap
+    body, so the ONLY route to a marker is classify_invocation's ServerError
+    tier (shared/src/shared/invocation_outcome.py:523).
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=False, output='', cost_usd=0.0,
+        duration_ms=1100, turns=0, subtype='error', api_error_status=status,
+    )
+
+
 class TestDetectInvocationError:
     def test_none_result_is_not_an_invocation_error(self):
         from orchestrator.evals.metrics import detect_invocation_error
@@ -408,6 +422,58 @@ class TestDetectInvocationError:
         # consulted and no claude cap prefix matches, so it is not an infra
         # refusal at all.
         assert detect_invocation_error(codex_capped) is None
+
+    # -- 5xx (ServerError) attribution --------------------------------------
+
+    def test_server_error_5xx_yields_server_error_marker(self):
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_server_error_result(529))
+        assert isinstance(marker, str)
+        # report._taint_cause (report.py:1194-1216) reduces the stage-prefixed
+        # marker to this first colon-delimited token as the report's by-cause
+        # exclusion key (accumulated at report.py:1313) — the prefix is a
+        # behavioural contract, not cosmetics, hence the exact-token assert
+        # rather than a loose `in`.
+        assert marker.partition(':')[0] == 'server_error'
+        assert '529' in marker
+
+    @pytest.mark.parametrize('status', [500, 502, 503, 529, 599])
+    def test_every_5xx_status_in_the_band_is_attributed(self, status: int):
+        # Mirrors the band shared/tests/test_server_error.py::TestIsServerErrorStatus
+        # pins, so the eval layer cannot drift into a 529-only special case.
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_server_error_result(status))
+        assert isinstance(marker, str)
+        assert marker.partition(':')[0] == 'server_error'
+        assert str(status) in marker
+
+    def test_bodied_429_is_still_a_cap_hit_not_a_server_error(self):
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_cap_agent_result())
+        assert marker is not None
+        assert marker.partition(':')[0] == 'cap_hit'
+        assert 'server_error' not in marker
+
+    def test_body_less_429_is_still_api_error_not_a_server_error(self):
+        # 429 is below the 5xx band, so it must keep reaching the cap tier /
+        # raw-429 fallback (metrics.py:328-329) unchanged, never drifting into
+        # the new server_error bucket.
+        from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        bare = AgentResult(
+            success=False, output='', cost_usd=0.0, duration_ms=800,
+            turns=0, api_error_status=429,
+        )
+        marker = detect_invocation_error(bare)
+        assert marker is not None
+        assert marker.partition(':')[0] == 'api_error'
+        assert '429' in marker
+        assert 'server_error' not in marker
 
 
 # ---------------------------------------------------------------------------
