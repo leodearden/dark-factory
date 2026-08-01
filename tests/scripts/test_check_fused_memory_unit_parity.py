@@ -258,10 +258,6 @@ def test_find_drift_detects_missing_restart_steps():
 
     The fixture below is exactly the pre-fix shape: a cap declared with a floor
     and no steps to interpolate over.
-
-    RED until REQUIRED_SERVICE_DIRECTIVES includes RestartSteps=4 — today the
-    checker does not know the directive exists, so find_drift reports it
-    nowhere.
     """
     mod = _load_checker()
     drift = mod.find_drift(_MISSING_RESTART_STEPS_UNIT)
