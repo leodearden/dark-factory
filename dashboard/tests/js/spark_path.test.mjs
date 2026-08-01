@@ -39,14 +39,14 @@ import { createRequire } from 'node:module';
 
 import sp from '../../src/dashboard/static/redux/spark_path.js';
 
-const { isPlottable, sparkScale, sparkPaths } = sp;
+const { isPlottable, sparkScale, sparkPaths, stepPaths } = sp;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 
-// The surface known at this point in the build-out. Deliberately NOT asserted
-// as exhaustive here — stepPaths lands in a later step and the
-// exhaustive-surface pin lives with it.
-const KNOWN_FUNCTION_NAMES = ['isPlottable', 'sparkScale', 'sparkPaths'];
+// The module's complete public surface. Asserted EXHAUSTIVELY below: the
+// run-splitting and area-closing helpers are deliberately module-private, and
+// an accidental export would quietly widen the contract charts.jsx depends on.
+const EXPECTED_FUNCTION_NAMES = ['isPlottable', 'sparkPaths', 'sparkScale', 'stepPaths'];
 
 // Float tolerance for any y that is not exactly representable. The x
 // coordinates and the extrema below are all exact at these inputs (width=100
@@ -122,12 +122,41 @@ function legacySparklinePaths(values, width, height) {
   return { line: linePath, area: areaPath };
 }
 
+function legacyStepPaths(values, width, height) {
+  const max = Math.max(...values, 1);
+  const min = Math.min(...values, 0);
+  const range = max - min || 1;
+  const stepX = width / Math.max(values.length - 1, 1);
+  const points = values.map((v, i) => {
+    const x = i * stepX;
+    const y = height - ((v - min) / range) * height;
+    return [x, y];
+  });
+  const parts = [`M${points[0][0]},${points[0][1]}`];
+  if (points.length === 1) {
+    parts.push(`L${width},${points[0][1]}`);
+  }
+  for (let i = 1; i < points.length; i++) {
+    parts.push(`L${points[i][0]},${points[i - 1][1]}`);
+    parts.push(`L${points[i][0]},${points[i][1]}`);
+  }
+  const linePath = parts.join(' ');
+  const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
+  return { line: linePath, area: areaPath };
+}
+
 // ---------------------------------------------------------------------------
 // Module surface and dual export
 // ---------------------------------------------------------------------------
 
-test('default-imported module exposes the spark-path functions', () => {
-  for (const name of KNOWN_FUNCTION_NAMES) {
+test('default-imported module exposes exactly the spark-path functions', () => {
+  assert.deepEqual(
+    Object.keys(sp).sort(),
+    EXPECTED_FUNCTION_NAMES.slice().sort(),
+    'the public surface must be exactly these four — the run-splitting and ' +
+      'area-closing helpers stay module-private',
+  );
+  for (const name of EXPECTED_FUNCTION_NAMES) {
     assert.equal(typeof sp[name], 'function', `sp.${name} should be a function`);
   }
 });
@@ -153,10 +182,20 @@ test('module also assigns window.DF_SPARK_PATH (browser dual-export)', () => {
 
     assert.ok(globalThis.window.DF_SPARK_PATH, 'window.DF_SPARK_PATH was not set');
 
+    // The fresh require() and the top-level import() produce two distinct API
+    // object instances (separate module executions), so compare structurally
+    // — same set of exported names, each a function — rather than asserting
+    // reference/deep equality against the ESM-imported `sp`.
+    assert.deepEqual(
+      Object.keys(globalThis.window.DF_SPARK_PATH).sort(),
+      EXPECTED_FUNCTION_NAMES.slice().sort(),
+    );
+    assert.deepEqual(Object.keys(required).sort(), EXPECTED_FUNCTION_NAMES.slice().sort());
+
     // charts.jsx destructures this global at module top level, so every name
     // it reaches for must be present on the browser export path specifically —
     // not merely on the CommonJS one.
-    for (const name of KNOWN_FUNCTION_NAMES) {
+    for (const name of EXPECTED_FUNCTION_NAMES) {
       assert.equal(
         typeof globalThis.window.DF_SPARK_PATH[name],
         'function',
@@ -478,5 +517,124 @@ test('sparkPaths: does not mutate its input array', () => {
   const values = [1, null, 3, null, 5];
   const before = values.slice();
   sparkPaths(values, 100, 28);
+  assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
+});
+
+// ---------------------------------------------------------------------------
+// stepPaths — the step (StepSpark) builder: horizontal-then-vertical edges, no
+// diagonals, so discrete state transitions read as sharp steps.
+// ---------------------------------------------------------------------------
+
+test('stepPaths: the frozen legacy snapshot really is the pre-fix output', () => {
+  assert.equal(
+    legacyStepPaths([1, 2, 3], 100, 28).line,
+    'M0,18.666666666666668 L50,18.666666666666668 L50,9.333333333333336 ' +
+      'L100,9.333333333333336 L100,0',
+  );
+  assert.equal(legacyStepPaths([7], 100, 28).line, 'M0,0 L100,0');
+});
+
+test('stepPaths: hole-free output is byte-identical to the pre-fix code', () => {
+  for (const values of [[1, 2, 3], [1, 2, 3, 4, 5], [0, 0, 0], [-4, 2, -1]]) {
+    const expected = legacyStepPaths(values, 100, 28);
+    const actual = stepPaths(values, 100, 28);
+    assert.equal(actual.line, expected.line, `line drifted for ${JSON.stringify(values)}`);
+    assert.equal(actual.area, expected.area, `area drifted for ${JSON.stringify(values)}`);
+  }
+});
+
+test('stepPaths: the single-sample full-width tick is preserved verbatim', () => {
+  // Pre-existing documented behaviour with no hole involved (charts.jsx:80-84):
+  // a lone sample would otherwise be a bare moveto and render nothing, so it
+  // is drawn as a full-width horizontal tick. Reproduced exactly, area
+  // included, because it is a genuine 2-point run.
+  const actual = stepPaths([7], 100, 28);
+  assert.equal(actual.line, 'M0,0 L100,0');
+  assert.equal(actual.line, legacyStepPaths([7], 100, 28).line);
+  assert.equal(actual.area, legacyStepPaths([7], 100, 28).area);
+});
+
+test('stepPaths: a hole breaks the step and no horizontal carries across it', () => {
+  // The step builder makes this defect worse than the smooth one: a horizontal
+  // edge at the pre-hole y would assert the value PERSISTED through the
+  // missing slot, then drop vertically to the fabricated zero.
+  const { line } = stepPaths([1, 2, null, 4, 5], 100, 28);
+
+  assert.equal(countCommand(line, 'M'), 2, 'the hole must split the step into two subpaths');
+  assert.equal(coords(line)[3][0], 75, 'the second subpath starts at the index-3 position');
+  assert.ok(!xs(line).includes(50), `nothing may be drawn at the hole's x — got ${line}`);
+  assert.equal(
+    line,
+    'M0,22.4 L25,22.4 L25,16.799999999999997 ' +
+      'M75,5.599999999999998 L100,5.599999999999998 L100,0',
+  );
+});
+
+test('stepPaths: a null is not stepped down to as a zero', () => {
+  // Pre-fix this drew a square-cornered plunge to the chart floor and back —
+  // a flat series reading as a total, measured collapse.
+  const values = [3, null, 3];
+  const { line } = stepPaths(values, 100, 28);
+  const s = sparkScale(values, 100, 28);
+  const baselineY = 28 - ((0 - s.min) / s.range) * 28;
+
+  assert.equal(baselineY, 28, 'sanity: value 0 sits at the chart floor for this scale');
+  for (const y of ys(line)) {
+    assert.notEqual(y, baselineY, `a hole was stepped to at the value-0 baseline: ${line}`);
+  }
+  assert.equal(distinctCoords(line).length, 2, 'only the two real samples are plotted');
+});
+
+test('stepPaths: an isolated sample is not held across the neighbouring holes', () => {
+  // A zero-length segment, rendering as a visible square under StepSpark's
+  // existing strokeLinecap="square" — and deliberately NOT a one-step-wide
+  // tick. Extending a step into a known-missing slot would assert the value
+  // persisted there, which is exactly the synthetic-data class this fix
+  // removes.
+  const { line, area } = stepPaths([null, 7, null], 100, 28);
+
+  assert.equal(line, 'M50,0 L50,0');
+  assert.ok(!xs(line).includes(0), 'the step must not reach back into the leading hole');
+  assert.ok(!xs(line).includes(100), 'the step must not reach into the trailing hole');
+  assert.equal(area, '', 'a zero-length run has no area');
+});
+
+test('stepPaths: undefined and NaN holes behave exactly like null', () => {
+  const reference = stepPaths([1, 2, null, 4, 5], 100, 28);
+
+  for (const hole of [undefined, NaN]) {
+    const actual = stepPaths([1, 2, hole, 4, 5], 100, 28);
+    assert.equal(actual.line, reference.line, `${String(hole)} must break like null`);
+    assert.equal(actual.area, reference.area, `${String(hole)} must break like null`);
+    for (const n of coords(actual.line).flat()) {
+      assert.ok(Number.isFinite(n), `every coordinate must be finite — got ${actual.line}`);
+    }
+  }
+});
+
+test('stepPaths: area closes per subpath, never spanning a hole', () => {
+  const { area } = stepPaths([1, 2, null, 4, 5], 100, 28);
+
+  assert.equal(countCommand(area, 'M'), 2, 'one closed shape per run');
+  assert.equal(countCommand(area, 'Z'), 2, 'each run closes on itself');
+  assert.equal(
+    area,
+    'M0,22.4 L25,22.4 L25,16.799999999999997 L25,28 L0,28 Z ' +
+      'M75,5.599999999999998 L100,5.599999999999998 L100,0 L100,28 L75,28 Z',
+  );
+});
+
+test('stepPaths: an all-hole or empty series draws nothing at all', () => {
+  for (const values of [[null, null, null], [undefined, NaN], [null], [], null, undefined]) {
+    const { line, area } = stepPaths(values, 100, 28);
+    assert.equal(line, '', `expected no line for ${JSON.stringify(values) ?? String(values)}`);
+    assert.equal(area, '', `expected no area for ${JSON.stringify(values) ?? String(values)}`);
+  }
+});
+
+test('stepPaths: does not mutate its input array', () => {
+  const values = [1, null, 3, null, 5];
+  const before = values.slice();
+  stepPaths(values, 100, 28);
   assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
 });
