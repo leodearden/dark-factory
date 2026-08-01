@@ -223,6 +223,76 @@ def find_citation_occurrences(metadata: Any, memory_id: str) -> list[str]:
     return paths
 
 
+def find_live_citation_occurrences(metadata: Any, memory_id: str) -> list[str]:
+    """Like :func:`find_citation_occurrences`, minus the tombstone ledger.
+
+    ``X_CITATION_TOMBSTONE_KEY`` records are **provenance, never live
+    pointers**. A tombstone's ``superseded_memory_id`` names the deleted id BY
+    DESIGN — that is the whole reason the record exists — so counting it as a
+    citation makes an already-repointed task look like an outstanding citer on
+    every subsequent pass, and the damage compounds on exactly the retry path
+    the delete-side guard advertises as idempotent: the next pass would rewrite
+    ``superseded_memory_id`` to the survivor (destroying the forwarding
+    provenance), append a second record whose ``paths`` names ledger internals
+    rather than any real citation, and inflate ``stage1_citations_repointed``
+    — unbounded on every further retry.
+
+    The exclusion lives HERE, in a caller-facing wrapper, rather than inside
+    :func:`find_citation_occurrences`: that function is a deliberately generic
+    mechanical scanner, and its "the dead id survives ONLY in the labelled
+    provenance slot" assertion is how the tombstone contract is proven. This
+    wrapper is what "cites" means for the sweep and the gate — both must agree
+    on it, or the gate demands a repoint the sweep then reports zero work for.
+    """
+    if not isinstance(metadata, dict):
+        return find_citation_occurrences(metadata, memory_id)
+    return find_citation_occurrences(
+        {k: v for k, v in metadata.items() if k != X_CITATION_TOMBSTONE_KEY},
+        memory_id,
+    )
+
+
+def repoint_tombstone_chain(
+    tombstones: Any,
+    old_id: str,
+    new_id: str,
+) -> list[dict[str, Any]]:
+    """Forward each existing record's stale DESTINATION, and nothing else.
+
+    A prior record forwarding ``A -> old_id`` would, left verbatim, park a
+    dangling pointer in a field literally named ``replacement_memory_id`` — the
+    exact harm this module prevents, merely relocated. So that slot is
+    transitively repointed to ``new_id`` and the chain stays resolvable.
+
+    Every other field is copied byte-identical. ``superseded_memory_id`` in
+    particular MUST keep naming a dead id: rewriting it (as a wholesale
+    ``repoint_metadata`` pass over the ledger would) turns a ``old_id ->
+    new_id`` record into a self-referential ``new_id -> new_id`` one and
+    destroys the only provenance the repoint left behind.
+
+    Pure: neither the list nor its records are mutated. Non-list input yields
+    ``[]``, so a malformed/absent ledger degrades to "no prior records" rather
+    than raising mid-sweep.
+    """
+    if not isinstance(tombstones, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for record in tombstones:
+        if not isinstance(record, dict):
+            # Preserve whatever is there rather than dropping it — this ledger
+            # is provenance, and silently discarding an unrecognised record
+            # would be the silent-fail this module exists to prevent.
+            out.append(record)
+            continue
+        if record.get('replacement_memory_id') == old_id:
+            forwarded = dict(record)
+            forwarded['replacement_memory_id'] = new_id
+            out.append(forwarded)
+        else:
+            out.append(dict(record))
+    return out
+
+
 def repoint_metadata(
     metadata: Any,
     old_id: str,
@@ -358,6 +428,30 @@ async def repoint_task_citations(
     covered — the four tasks the incident's manual pass missed were pending,
     i.e. still dispatchable, i.e. the ones that mattered.
 
+    **A tombstone is provenance, never a live pointer.** "Cites" is defined by
+    :func:`find_live_citation_occurrences`, which excludes
+    ``X_CITATION_TOMBSTONE_KEY``, and the rewrite runs over the same
+    tombstone-free view. Two invariants follow:
+
+    - the ledger can neither trigger a write nor be counted in
+      ``stage1_citations_repointed`` — a record's ``superseded_memory_id``
+      names the deleted id by design, so scanning it would make every
+      already-repointed task an eternal citer;
+    - a retry after a partial failure is therefore genuinely idempotent:
+      already-repointed tasks issue NO write at all, so the ledger cannot grow
+      and ``superseded_memory_id`` cannot decay into a ``new -> new``
+      self-reference.
+
+    Existing records are carried forward by :func:`repoint_tombstone_chain`,
+    which forwards only a stale ``replacement_memory_id`` destination.
+
+    Deliberate residual: a task carrying ONLY a stale tombstone destination
+    (``replacement_memory_id == memory_id``) and no live citation is not a
+    citer, so this sweep does not repair it. That is a provenance-chain
+    degradation, not a live dispatch pointer — nothing reads it to decide what
+    to do — and widening the citer definition to cover it would put a write
+    back on the no-live-citer path and destroy the idempotency above.
+
     **Merge is shallow last-write-wins** (``tools.py:4982-5002``): supplied
     keys overwrite wholesale and omitted keys are preserved. So the payload
     carries WHOLE top-level key values — repointing ``memory_hints.queries[0]``
@@ -408,10 +502,12 @@ async def repoint_task_citations(
             continue
         stats['stage1_citation_tasks_scanned'] += 1
         metadata = task.get('metadata')
-        paths = find_citation_occurrences(metadata, memory_id)
+        # LIVE occurrences only: the tombstone ledger names dead ids by design,
+        # so scanning it would make an already-repointed task a citer forever.
+        paths = find_live_citation_occurrences(metadata, memory_id)
         if not paths or not isinstance(metadata, dict):
-            # find_citation_occurrences only reports paths for a dict blob, so
-            # the isinstance is redundant at runtime — it is the narrowing the
+            # find_live_citation_occurrences only reports paths for a dict blob,
+            # so the isinstance is redundant at runtime — it is the narrowing the
             # rewrite below needs to be provably safe rather than incidentally so.
             continue
 
@@ -426,7 +522,16 @@ async def repoint_task_citations(
             continue
 
         try:
-            repointed, count = repoint_metadata(metadata, memory_id, replacement_id)
+            # Rewrite the LIVE half of the blob only. Running repoint_metadata
+            # over the ledger too would clobber every superseded_memory_id —
+            # the one field whose job is to name a dead id — and would inflate
+            # `count` with internal bookkeeping rather than real citations.
+            live_view = {
+                key: value
+                for key, value in metadata.items()
+                if key != X_CITATION_TOMBSTONE_KEY
+            }
+            repointed, count = repoint_metadata(live_view, memory_id, replacement_id)
             tombstone = build_citation_tombstone(
                 superseded_id=memory_id,
                 replacement_id=replacement_id,
@@ -434,17 +539,20 @@ async def repoint_task_citations(
                 run_id=run_id,
             )
             # Existing tombstones must be resent: merge overwrites the key
-            # wholesale, so omitting them would drop prior provenance. They are
-            # taken from the REPOINTED blob, not the original, deliberately: a
-            # prior record forwarding to the id being deleted would otherwise
-            # park a dangling pointer in a field literally named
-            # replacement_memory_id — the exact harm this sweep prevents,
-            # merely relocated. Transitively repointing it keeps the chain
-            # resolvable, and the record appended just below preserves the hop
-            # that collapse discarded. Only superseded_memory_id slots (which
-            # are meant to name dead ids) still mention the deleted entry.
-            existing = repointed.get(X_CITATION_TOMBSTONE_KEY)
-            tombstones = list(existing) if isinstance(existing, list) else []
+            # wholesale, so omitting them would drop prior provenance. Each is
+            # forwarded through repoint_tombstone_chain, which repoints ONLY a
+            # stale replacement_memory_id destination — a prior record
+            # forwarding to the id being deleted would otherwise park a
+            # dangling pointer in a field literally named
+            # replacement_memory_id, the exact harm this sweep prevents merely
+            # relocated. superseded_memory_id, paths and run_id are preserved
+            # byte-identical, so the appended record below is the only place
+            # the collapsed hop is recorded and the ledger cannot grow on a
+            # retry (a fully-repointed task is not a citer at all, so it never
+            # reaches this branch).
+            tombstones = repoint_tombstone_chain(
+                metadata.get(X_CITATION_TOMBSTONE_KEY), memory_id, replacement_id,
+            )
             tombstones.append(tombstone)
 
             # Send ONLY the top-level keys that actually changed, each as a
@@ -453,7 +561,7 @@ async def repoint_task_citations(
             changed_top_level = {
                 key: value
                 for key, value in repointed.items()
-                if key != X_CITATION_TOMBSTONE_KEY and value != metadata.get(key)
+                if value != metadata.get(key)
             }
             changed_top_level[X_CITATION_TOMBSTONE_KEY] = tombstones
 
