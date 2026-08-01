@@ -4060,42 +4060,68 @@ def test_main_reap_decisions_refuses_unknown_queue_even_when_reaper_passes_the_s
     assert listed['dec-unknown-selfmatch'] == sr.DecisionState.OPEN
 
 
-class TestDelegatesToSharedAtomicWriter:
-    """``_atomic_write_text`` delegates to ``shared.safe_io.atomic_write_text``.
+class TestAtomicWriteSemantics:
+    """``_atomic_write_text``'s on-disk semantics, pinned WITHOUT a delegation seam.
 
-    Task 3223 consolidated the repo's tmp+rename writers into ``shared.safe_io``.
-    These pin that this site's semantics survived the move — in particular the
-    LOCALE-dependent encoding, which the inlined ``os.fdopen(fd, 'w')`` produced
-    and which this task deliberately preserves rather than silently upgrading
-    to utf-8.
+    Task 3223 consolidated the repo's tmp+rename writers into
+    ``shared.safe_io.atomic_write_text``, but this module is the deliberate
+    exception: it is stdlib-only so ``skills/spawn/spawn-claude.sh`` can run it
+    with no venv (see ``TestStdlibOnlySelfContainment`` below and
+    ``_ALLOWED_RENAMERS`` in ``shared/tests/test_safe_io.py``).
+
+    So these assert the OBSERVABLE result on disk rather than that a particular
+    helper was called. That is the more durable pin anyway: it holds whether
+    the body is inlined or delegated, and it does not go stale the next time
+    the implementation choice is revisited.
     """
 
-    def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
-        """One delegated call carrying mkdir=True, 0600, locale encoding, no fsync."""
-        import locale
+    def test_writes_0600_and_leaves_no_temp_residue(self, tmp_path):
+        """The record is created 0600 (mkstemp's mode), with no tmp left behind."""
+        target = tmp_path / 'record.json'
 
-        import shared.safe_io as _safe_io
-
-        calls = []
-        monkeypatch.setattr(
-            _safe_io,
-            'atomic_write_text',
-            lambda path, text, **kwargs: calls.append((path, text, kwargs)),
-        )
-
-        target = tmp_path / 'nested' / 'record.json'
         sr._atomic_write_text(target, '{"a": 1}')
 
-        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
-        path, text, kwargs = calls[0]
-        assert Path(path) == target
-        assert text == '{"a": 1}'
-        assert kwargs.get('mkdir') is True, 'this site created its parent dir'
-        assert kwargs.get('mode') == 0o600, 'mkstemp created 0600; must not widen'
-        assert not kwargs.get('fsync'), 'this site never fsynced'
-        assert kwargs.get('encoding') == locale.getpreferredencoding(False), (
-            'locale-dependent encoding must be PRESERVED, not upgraded to utf-8'
+        assert target.read_text() == '{"a": 1}'
+        assert target.stat().st_mode & 0o777 == 0o600, (
+            'session records hold session state and must stay owner-only'
         )
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_creates_missing_parent_dirs(self, tmp_path):
+        """The parent chain is created rather than surfacing FileNotFoundError."""
+        target = tmp_path / 'nested' / 'deeper' / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+
+        assert target.read_text() == '{"a": 1}'
+
+    def test_overwrites_atomically_leaving_no_residue(self, tmp_path):
+        """A rewrite replaces the contents wholesale and leaves no tmp file."""
+        target = tmp_path / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+        sr._atomic_write_text(target, '{"b": 2}')
+
+        assert target.read_text() == '{"b": 2}'
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_failed_write_leaves_original_intact_and_no_residue(
+        self, tmp_path, monkeypatch
+    ):
+        """On a mid-write failure the original survives and the tmp is cleaned up."""
+        target = tmp_path / 'record.json'
+        sr._atomic_write_text(target, '{"original": true}')
+
+        def _boom(*_args, **_kwargs):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(sr.os, 'replace', _boom)
+
+        with pytest.raises(OSError, match='disk full'):
+            sr._atomic_write_text(target, '{"replacement": true}')
+
+        assert target.read_text() == '{"original": true}'
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
 
     def test_write_record_creates_missing_nested_dir_and_round_trips(self, tmp_path):
         """End-to-end: write_record into a non-existent nested root still works."""

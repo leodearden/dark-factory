@@ -856,6 +856,14 @@ _ALLOWED_RENAMERS = {
         'THE consolidated implementation — the one blessed home for this pattern.',
     ('shared/src/shared/safe_io.py', 'load_json_or_warn'):
         'Quarantine rename of a corrupt file (<name>.corrupt); not a write path.',
+    ('orchestrator/src/orchestrator/session_registry.py', '_atomic_write_text'):
+        'DELIBERATE EXCEPTION to task 3223, not an oversight. The module is '
+        'invoked by absolute path from skills/spawn/spawn-claude.sh under an '
+        'interpreter with no venv/install/workspace packages, so its docstring '
+        "declares it stdlib-only; a module-scope `from shared import safe_io` "
+        'made it unimportable there (ModuleNotFoundError) and silently broke '
+        'the spawn hook. Pinned by test_session_registry.py::'
+        'TestStdlibOnlySelfContainment. Do not "finish" this migration.',
     ('orchestrator/src/orchestrator/session_hooks.py', '_run_install'):
         'Out of task 3223 enumerated scope; left alone deliberately.',
     ('orchestrator/src/orchestrator/verify_cancel.py', 'write_pgid_file'):
@@ -1066,6 +1074,12 @@ class TestNoRegrownAtomicWriters:
             if relpath == 'shared/src/shared/safe_io.py':
                 continue  # the blessed implementation lives here
             for node in ast.walk(ast.parse(source)):
+                if (relpath, node.__dict__.get('name')) in _ALLOWED_RENAMERS:
+                    # Same documented exceptions as the sibling guard above.
+                    # session_registry in particular MUST keep an inlined body:
+                    # it is stdlib-only so spawn-claude.sh can run it with no
+                    # venv, and importing shared makes it unimportable there.
+                    continue
                 if (
                     isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
                     and node.name in ('_atomic_write_text', 'atomic_write_text')
