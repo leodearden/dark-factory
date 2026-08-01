@@ -6435,24 +6435,11 @@ class TestDedupFlagsLedgerMarkerPath:
     ):
         """A 60-flag batch writes a ledger marker for EVERY flag and touches no Mem0.
 
-        Behavioral replacement (task 3351) for the deleted
-        ``inspect.getsource(fd.dedup_flags)`` scan that banned the source tokens
-        ``confirmation_disabled``, ``consecutive_confirmation_misses`` and ``limit=50``.
-        That scan asserted on source TEXT, so it was brittle (any comment or docstring in
-        dedup_flags mentioning a banned token tripped it) and incomplete (a circuit
-        breaker spelled with different local names, or a bounded search issued as
-        ``limit=LIMIT``/``limit = 50``, kept it green).
-
-        The two runtime properties it was standing in for are asserted here directly:
-
-        1. **No per-invocation circuit breaker.**  The retired Mem0 compensation chain
-           disabled itself partway through a batch after N confirmation misses.  Nothing
-           may silently stop marker writes mid-batch: all 60 markers must exist, and the
-           missing task_ids are reported rather than a bare count, so a partial write is
-           diagnosable at a glance.
-        2. **No bounded Mem0 reclamation search.**  60 deliberately exceeds the old
-           ``limit=50`` reclamation bound, so a reappearing bounded search would have to
-           either drop flags past 50 or issue Mem0 I/O — both observable here.
+        Two runtime properties, both observable in this one batch: nothing may silently
+        stop marker writes partway through (the retired per-invocation confirmation-miss
+        circuit breaker), and no bounded Mem0 reclamation search may reappear — the batch
+        size deliberately exceeds the retired 50-item reclamation bound, so such a search
+        would have to either drop flags past 50 or issue Mem0 I/O.
 
         The sibling ``test_recurring_marker_path_never_touches_mem0_search_or_delete``
         covers the same no-Mem0-I/O property across recurring cycles of ONE signature;
@@ -6537,9 +6524,9 @@ class TestModuleSurfaceCompensationsRemoved:
     - retired module constants (``_CONFIRMATION_MISS_THRESHOLD``,
       ``_CONFIRM_RETRY_DELAY_SECS``) — the surviving hasattr tests in this class
     - the task-2312 ``completion_marker_self_deleted`` annotation, formerly
-      required by a source scan — asserted on real returned flags at seven
-      call sites across ``TestIsCompletionFlag`` (four, one of them negative)
-      and ``TestDedupFlagsLedgerMarkerPath`` (three)
+      required by a source scan — asserted on real returned flags in
+      ``TestIsCompletionFlag`` (including a negative case) and
+      ``TestDedupFlagsLedgerMarkerPath``
     """
 
     def test_confirm_marker_persisted_removed(self):

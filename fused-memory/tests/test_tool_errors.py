@@ -282,8 +282,12 @@ def test_registered_tool_handlers_have_no_hand_copied_cancellation_guards():
     sweeper should not re-litigate it:
 
     (i)   The needle is an EXACT CODE CONSTRUCT, not prose.  Unlike the removed
-          scans — whose needles a comment or docstring rewrite could trip — no
-          amount of documentation editing can produce a false positive here.
+          scans — whose needles a comment or docstring rewrite could trip —
+          ordinary documentation edits ELSEWHERE IN THE MODULE cannot produce a
+          false positive here: getsource returns only the handler's own source.
+          The one way to trip it without hand-copying the guard is for a handler
+          to reproduce that exact line verbatim inside its own body, comments or
+          docstring, which is a far narrower exposure than a module text scan.
     (ii)  It is scoped per tool.fn through the functools.wraps __wrapped__ chain,
           not a module text scan, so it cannot be tripped by unrelated code
           elsewhere in the module.

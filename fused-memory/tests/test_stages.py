@@ -2878,47 +2878,38 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
     async def test_assemble_payload_does_not_re_slice_an_oversized_done_tasks_tree(
         self, mock_deps, watermark
     ):
-        r"""assemble_payload must render EVERY done task it is handed — no second truncation.
+        """assemble_payload must render EVERY done task it is handed — no second truncation.
 
-        This asserts on RENDERED OUTPUT (the '### Recently Completed Tasks' section of the
-        assembled payload), **not on source text**.  It replaces an
-        ``inspect.getsource(TaskKnowledgeSync.assemble_payload)`` +
-        ``re.search(r'done_tasks\[.*:.*\]', source)`` tripwire that was both:
+        Asserts on RENDERED OUTPUT (the '### Recently Completed Tasks' section), not on
+        source text.  The tree is deliberately OVERSIZED
+        (``MAX_DONE_TASKS_RETAINED + 5`` — a state ``filter_task_tree`` can never produce)
+        and injected through the ``stage.filtered_task_tree`` seam that ``assemble_payload``
+        honours ahead of its ``filter_task_tree`` fallback, because the sibling
+        ``test_stage_does_not_apply_second_slice_on_done_tasks`` sits exactly at the cap
+        where a re-introduced ``done_tasks[:30]`` passes all 30 through and stays green.
 
-        - *brittle* — the needle was prose-reachable: a comment or docstring inside
-          ``assemble_payload`` merely mentioning ``done_tasks[...]`` tripped it even though
-          nothing sliced; and
-        - *incomplete* — it matched only literal subscript slices, so ``itertools.islice``,
-          ``heapq.nlargest`` or any computed-bound truncation kept it green.
-
-        Observing what actually reaches the payload catches all of those.  Precedent for
-        swapping a source scan for a behavioral guard: commit da8e5a4c96 and
-        ``TestReconPoolMapIsImportFreeLeaf`` in test_mem0_tombstone.py.
-
-        Why a *separate* test from the sibling
-        ``test_stage_does_not_apply_second_slice_on_done_tasks``: that one feeds exactly
-        ``MAX_DONE_TASKS_RETAINED`` done tasks, so a re-introduced ``done_tasks[:30]``
-        passes all 30 through unchanged and stays green.  Here the tree is deliberately
-        OVERSIZED (``MAX_DONE_TASKS_RETAINED + 5``) — a state ``filter_task_tree`` can never
-        produce, but reachable by injecting a ``FilteredTaskTree`` directly (the same
-        external-construction seam ``TestInvariantAfterTask643`` uses), which
-        ``assemble_payload`` honours ahead of its ``filter_task_tree`` fallback.  Any second
-        truncation is therefore directly observable as missing task ids.
+        The size of ``done_tasks`` is the ONLY deliberate anomaly: every other field of the
+        injected tree is populated consistently with it.
         """
         n_done = MAX_DONE_TASKS_RETAINED + 5
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='test_project', project_root='/tmp/test_project'
         )
-        # done_count == len(done_tasks) so _check_filtered_tree_invariant stays quiet;
-        # the only anomaly under test is the size of the tree, not its internal consistency.
+        done_tasks = [self._make_task(i, 'done') for i in range(1, n_done + 1)]
+        # done_count == len(done_tasks) keeps _check_filtered_tree_invariant quiet;
+        # all_done_tasks (read by the since-boundary completion-memory audit) and
+        # max_task_id are populated to match, so the oversized done_tasks list is the
+        # only way this tree differs from a filter_task_tree output.
         stage.filtered_task_tree = FilteredTaskTree(
             active_tasks=[],
-            done_tasks=[self._make_task(i, 'done') for i in range(1, n_done + 1)],
+            done_tasks=done_tasks,
+            all_done_tasks=list(done_tasks),
             done_count=n_done,
             cancelled_tasks=[],
             cancelled_count=0,
             other_count=0,
             total_count=n_done,
+            max_task_id=n_done,
         )
 
         payload = await stage.assemble_payload([], watermark, [])
