@@ -49,6 +49,12 @@ docstring-code-format = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Default per-test wall-clock cap (pytest-timeout, already a dev dependency).
+# Task 3431 / esc-3216-2: without this, an intermittently-wedged teardown
+# (observed: sqlite3.OperationalError "attempt to write a readonly database"
+# retried unboundedly in aiosqlite teardown) hangs the entire suite with no
+# output instead of failing loud with a traceback.
+timeout = 180
 
 [dependency-groups]
 dev = [
