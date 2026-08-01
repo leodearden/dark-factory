@@ -1021,3 +1021,240 @@ class TestGroupedReadIsArmLocalAndPure:
             for _ in range(3)
         ]
         assert runs[0] == runs[1] == runs[2]
+
+
+# ===========================================================================
+# step-7 — apply_topic_anchor (arm-local reference implementation of 3111)
+# ===========================================================================
+#
+# The topic-anchored pin does not exist in `MemoryService.search` either:
+# `memory_service.py` has zero `topic` hits, and 3111 is likewise deferred
+# behind gate η. Same reasoning as the grouped read — the bake-off carries
+# its own reference implementation, which doubles as 3111's executable spec.
+#
+# PRD D1: the pin selects `topic == T AND canonical is True` and is
+# **ADDITIVE**, never subtractive. That word is load-bearing. A subtractive
+# pin — one that dropped non-canonical same-topic hits to make room — would
+# hide exactly the candidates `mem0_dedup.find_prior_memories` needs to see,
+# turning a discoverability feature into a write-guard regression.
+#
+# Because the pin is a READ-side transform, arm (d) (each shape ± pin) needs
+# no extra seeded collection: pin-on vs pin-off is an exactly-controlled A/B
+# over identical stored state, which is the only way it answers its actual
+# question ("whether 3111's pin is needed under each shape").
+
+
+def _anchor_hit(record_id, *, topic=None, canonical=None, content='body'):
+    """A hit for the pin tests. `canonical` is passed through VERBATIM so a
+    truthy-but-not-True value can be exercised."""
+    metadata: dict = {'category': 'procedural_knowledge'}
+    if topic is not None:
+        metadata['topic'] = topic
+    if canonical is not None:
+        metadata['canonical'] = canonical
+    return _mod().ArmRecord(
+        record_id=record_id,
+        content=content,
+        metadata=metadata,
+        cluster_id='c1',
+        claim_ids=[],
+        role='peer',
+    )
+
+
+class TestTopicAnchorIsAdditive:
+    """PRD D1: the pin ADDS the topic's canonical; it never removes a hit."""
+
+    def test_canonical_is_pinned_in_when_absent_from_the_raw_ranking(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        member = _anchor_hit('peer-1', topic='alpha')
+        other = _anchor_hit('noise-1')
+
+        pinned = mod.apply_topic_anchor(
+            [member, other], canonical_by_topic={'alpha': canonical},
+        )
+
+        ids = [r.record_id for r in pinned]
+        assert 'canon-a' in ids
+        # Additive: nothing was displaced to make room.
+        assert 'peer-1' in ids and 'noise-1' in ids
+        assert len(pinned) == 3
+
+    def test_the_relative_order_of_the_original_hits_is_unchanged(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        hits = [
+            _anchor_hit('peer-1', topic='alpha'),
+            _anchor_hit('noise-1'),
+            _anchor_hit('peer-2', topic='alpha'),
+        ]
+
+        pinned = mod.apply_topic_anchor(hits, canonical_by_topic={'alpha': canonical})
+
+        original_order = [r.record_id for r in pinned if r.record_id != 'canon-a']
+        assert original_order == ['peer-1', 'noise-1', 'peer-2']
+
+    def test_an_already_present_canonical_is_not_duplicated(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+
+        pinned = mod.apply_topic_anchor(
+            [_anchor_hit('peer-1', topic='alpha'), canonical],
+            canonical_by_topic={'alpha': canonical},
+        )
+
+        assert [r.record_id for r in pinned].count('canon-a') == 1
+        assert len(pinned) == 2
+
+    def test_two_topics_in_one_hit_set_both_get_their_canonical_pinned(self):
+        mod = _mod()
+        alpha_canon = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        beta_canon = _anchor_hit('canon-b', topic='beta', canonical=True)
+
+        pinned = mod.apply_topic_anchor(
+            [_anchor_hit('peer-1', topic='alpha'), _anchor_hit('peer-2', topic='beta')],
+            canonical_by_topic={'alpha': alpha_canon, 'beta': beta_canon},
+        )
+
+        ids = [r.record_id for r in pinned]
+        assert 'canon-a' in ids and 'canon-b' in ids
+        assert len(pinned) == 4
+
+
+class TestTopicAnchorIdentityCases:
+    """The pin fires only when a same-topic hit is actually present."""
+
+    def test_a_hit_set_with_no_topic_metadata_is_returned_unchanged(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        hits = [_anchor_hit('noise-1'), _anchor_hit('noise-2')]
+
+        pinned = mod.apply_topic_anchor(hits, canonical_by_topic={'alpha': canonical})
+
+        assert pinned == hits  # identity — the pin is not a rewrite
+
+    def test_a_topic_with_no_registered_canonical_pins_nothing(self):
+        mod = _mod()
+
+        hits = [_anchor_hit('peer-1', topic='orphan-topic')]
+        pinned = mod.apply_topic_anchor(hits, canonical_by_topic={})
+
+        assert pinned == hits
+
+    def test_an_empty_hit_list_stays_empty(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+
+        assert mod.apply_topic_anchor([], canonical_by_topic={'alpha': canonical}) == []
+
+
+class TestTopicAnchorCanonicalIsBoolIdentity:
+    """`canonical` is matched by `is True`, mirroring β's rule.
+
+    β's `invalid_canonical_type` treats a truthy `1` as a FATAL violation, so
+    a pin that accepted it would anchor on records the write boundary would
+    have rejected — and E2 would report a discoverability win for a shape
+    production cannot store.
+    """
+
+    def test_a_truthy_one_is_not_accepted_as_canonical(self):
+        mod = _mod()
+        impostor = _anchor_hit('impostor', topic='alpha', canonical=1)
+
+        with pytest.raises(ValueError, match='canonical'):
+            mod.apply_topic_anchor(
+                [_anchor_hit('peer-1', topic='alpha')],
+                canonical_by_topic={'alpha': impostor},
+            )
+
+    def test_a_real_bool_true_is_accepted(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+
+        pinned = mod.apply_topic_anchor(
+            [_anchor_hit('peer-1', topic='alpha')],
+            canonical_by_topic={'alpha': canonical},
+        )
+
+        assert 'canon-a' in [r.record_id for r in pinned]
+
+
+class TestBuildCanonicalByTopic:
+    """The index the live driver populates via `scroll_by_metadata`.
+
+    `Mem0Backend.search` exposes NO arbitrary metadata filter, so the pin's
+    canonical lookup cannot be a search — it has to be a scroll. Building the
+    index as a pure function over already-fetched records keeps that seam
+    testable without a store.
+    """
+
+    def test_indexes_exactly_the_canonical_records_by_topic(self):
+        mod = _mod()
+        records = list(_arm('c_peers'))
+
+        index = mod.build_canonical_by_topic(records)
+
+        assert len(index) == 20
+        for topic, record in index.items():
+            assert record.metadata['topic'] == topic
+            assert record.metadata['canonical'] is True
+
+    def test_a_second_canonical_for_one_topic_is_rejected_by_name(self):
+        """Per-(project, topic) canonical uniqueness is leaf ε's rule.
+
+        This transform cannot enforce it globally, but it must not silently
+        pick a winner — that would make the pin's answer depend on scroll
+        order, i.e. non-deterministic between runs.
+        """
+        mod = _mod()
+        first = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        second = _anchor_hit('canon-b', topic='alpha', canonical=True)
+
+        with pytest.raises(ValueError, match='alpha'):
+            mod.build_canonical_by_topic([first, second])
+
+    def test_records_without_a_topic_or_canonical_flag_are_ignored(self):
+        mod = _mod()
+        index = mod.build_canonical_by_topic([
+            _anchor_hit('noise-1'),
+            _anchor_hit('peer-1', topic='alpha'),
+            _anchor_hit('untopicked-canon', canonical=True),
+        ])
+
+        assert index == {}
+
+    def test_the_index_is_deterministic_across_input_orderings(self):
+        mod = _mod()
+        records = list(_arm('c_peers'))
+
+        forward = mod.build_canonical_by_topic(records)
+        backward = mod.build_canonical_by_topic(list(reversed(records)))
+
+        assert {t: r.record_id for t, r in forward.items()} == {
+            t: r.record_id for t, r in backward.items()
+        }
+
+
+class TestTopicAnchorIsArmLocalAndPure:
+    """Same discipline as the grouped read — 3111's pin stays out of the seam."""
+
+    def test_the_transform_itself_never_reaches_for_the_search_seam(self):
+        import inspect  # noqa: PLC0415
+
+        source = inspect.getsource(_mod().apply_topic_anchor)
+
+        assert 'MemoryService' not in source
+        assert 'memory_service' not in source
+        assert 'await' not in source
+
+    def test_the_transform_does_not_mutate_its_inputs(self):
+        mod = _mod()
+        canonical = _anchor_hit('canon-a', topic='alpha', canonical=True)
+        hits = [_anchor_hit('peer-1', topic='alpha')]
+        before = [(r.record_id, dict(r.metadata)) for r in hits]
+
+        mod.apply_topic_anchor(hits, canonical_by_topic={'alpha': canonical})
+
+        assert [(r.record_id, dict(r.metadata)) for r in hits] == before
+        assert len(hits) == 1  # not appended to in place
