@@ -2193,9 +2193,13 @@ class TestFormatCompositeTable:
             format_composite_table,
         )
 
-        assert _COMPOSITE_COLUMNS[6] == 'cost_usd'
-        assert _COMPOSITE_COLUMNS[8] == 'latency_secs'
-        assert _COMPOSITE_COLUMNS[9] == 'ci95_composite'
+        # Shifted right by task 3379, which inserted `plan_rate` at 6 and
+        # `cost_per_plan` after `cost_usd`. The pins are what MADE that shift
+        # visible instead of silently re-aiming the cell assertions below at
+        # the new columns.
+        assert _COMPOSITE_COLUMNS[7] == 'cost_usd'
+        assert _COMPOSITE_COLUMNS[10] == 'latency_secs'
+        assert _COMPOSITE_COLUMNS[11] == 'ci95_composite'
         out = format_composite_table(self._arch_report())
         cells = self._row(out, 'arch-dark')
         # composite and quality are both None → '-'. "We measured nothing" must
@@ -2207,9 +2211,9 @@ class TestFormatCompositeTable:
         # config that never ran the cheapest and fastest row on the screen), nor
         # the CI95 cell, which used to render '[0.0000, 0.0000]' right beside the
         # composite '-' (reviewer: correctness).
-        assert cells[6] == '-'
-        assert cells[8] == '-'
-        assert cells[9] == '-'
+        assert cells[7] == '-'
+        assert cells[10] == '-'
+        assert cells[11] == '-'
 
     def test_cap_window_is_not_rendered_as_a_cost_advantage(self):
         """arch-mixed's measured cell is arch-good's price; only its plan quality
@@ -2219,8 +2223,10 @@ class TestFormatCompositeTable:
         out = format_composite_table(self._arch_report())
         mixed = self._row(out, 'arch-mixed')
         good = self._row(out, 'arch-good')
-        assert mixed[6] == good[6] == '0.3000'
-        assert mixed[8] == good[8] == '60.00'
+        # cost_usd / latency_secs, at the indices the sibling test pins (shifted
+        # right by task 3379's plan_rate / cost_per_plan insertion).
+        assert mixed[7] == good[7] == '0.3000'
+        assert mixed[10] == good[10] == '60.00'
 
     def test_operator_can_rank_architects_from_the_table_alone(self):
         """The acceptance assertion for the reported defect.

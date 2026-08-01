@@ -1311,7 +1311,8 @@ _PLAN_QUALITY_COLUMNS = (
     'invocation_error',
 )
 _PLAN_QUALITY_MEAN_COLUMNS = (
-    'config_name', 'n', 'cap_excluded', 'no_plan', 'mean_plan_quality',
+    'config_name', 'n', 'cap_excluded', 'no_plan', 'plan_rate',
+    'mean_plan_quality',
 )
 # The plan_quality cell of a cap-tainted row. Deliberately NOT a number and NOT
 # the bare '-' null sentinel (which already means "not an architect run"): a
@@ -1518,6 +1519,13 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
             'n': str(c['n']),
             'cap_excluded': str(c['cap_excluded']),
             'no_plan': str(c['no_plan']),
+            # The same '-'-when-None rule the mean beside it uses: a config
+            # whose every cell was refused has no rate, and a fabricated 0.0
+            # would assert a reliability failure we never observed (task 3379).
+            'plan_rate': (
+                '-' if c.get('plan_rate') is None
+                else f'{float(c["plan_rate"]):.4f}'
+            ),
             'mean_plan_quality': (
                 '-' if c['mean_plan_quality'] is None
                 else f'{float(c["mean_plan_quality"]):.4f}'
@@ -1614,12 +1622,24 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 # FLOORED — are otherwise indistinguishable here, and a column of
 # ``plan_quality 0.0000`` would read as "these candidates all planned badly"
 # when it means "these candidates produced no plan at all".
+#
+# ``plan_rate`` / ``cost_per_plan`` (task 3379) are the DERIVED pair over those
+# counts, and belong here for the same reason. ``plan_rate`` is the RELIABILITY
+# discriminator: the 2026-07-27 verdict found that what actually separates the
+# candidates is how often they emit a plan AT ALL, not how well they plan when
+# they do — a comparison an operator could not make from a table of counts
+# without dividing by the right denominator by hand. ``cost_per_plan`` is that
+# axis priced, and unmasks a cheap candidate's ILLUSORY cost advantage: fable
+# read $3.456/fixture beside the opus-max incumbent but $4.731 per usable plan,
+# i.e. no cheaper at all while failing to plan 5x as often. Both are on THIS
+# table because it is the surface ``select_survivors`` ranks on and the one an
+# operator reads to choose between candidates.
 # ---------------------------------------------------------------------------
 
 _COMPOSITE_COLUMNS = (
     'config', 'composite', 'quality', 'plan_quality', 'pq_excluded',
-    'pq_no_plan', 'cost_usd', 'cost_source', 'latency_secs', 'ci95_composite',
-    'trials', 'fixtures',
+    'pq_no_plan', 'plan_rate', 'cost_usd', 'cost_per_plan', 'cost_source',
+    'latency_secs', 'ci95_composite', 'trials', 'fixtures',
 )
 _PRICE_TABLE_COLUMNS = ('config', 'role', 'input_per_1m', 'output_per_1m')
 
@@ -1702,9 +1722,24 @@ def format_composite_table(report: dict[str, Any]) -> str:
     an operator cannot tell a config that planned badly from one that did not
     plan at all. Two causes, two treatments, two counts, neither silent.
 
-    ``composite`` / ``quality`` / ``plan_quality`` all render ``-`` when the row
-    measured nothing (:func:`_optional_float_cell`): "we measured nothing" must
-    never read as "it scored nothing".
+    ``plan_rate`` (task 3379) is the RELIABILITY column beside those two counts:
+    the fraction of that config's ADMITTED architect cells that emitted a plan
+    at all. The 2026-07-27 verdict found that what separates the candidates is
+    how OFTEN they plan rather than how well, so this is the discriminator an
+    operator most needs — and it renders the same number as the ``plan_rate`` in
+    the ``plan_quality by config:`` block beneath (:func:`_plan_rate` is
+    shared). ``cost_per_plan`` is that axis PRICED: the admitted cells' full
+    spend, including what the planless ones burned, over only the cells that
+    produced a plan. It sits immediately after ``cost_usd`` because it exists to
+    correct it — a candidate reading cheap per fixture can be no cheaper per
+    USABLE plan (the doc's fable row: $3.456/fixture, $4.731/plan), and the two
+    numbers only make that point side by side.
+
+    ``composite`` / ``quality`` / ``plan_quality`` / ``plan_rate`` /
+    ``cost_per_plan`` all render ``-`` when the row measured nothing
+    (:func:`_optional_float_cell`): "we measured nothing" must never read as "it
+    scored nothing" — nor, for a rate, as the perfect 1.0000 a fabricated
+    "planned every time" would show.
     """
     configs = sorted(report.get('configs', []), key=lambda r: str(r.get('config', '')))
 
@@ -1716,7 +1751,9 @@ def format_composite_table(report: dict[str, Any]) -> str:
             'plan_quality': _optional_float_cell(r.get('plan_quality')),
             'pq_excluded': str(int(r.get('plan_quality_cap_excluded', 0) or 0)),
             'pq_no_plan': str(int(r.get('plan_quality_no_plan', 0) or 0)),
+            'plan_rate': _optional_float_cell(r.get('plan_rate')),
             'cost_usd': _optional_float_cell(r.get('cost_usd', 0.0)),
+            'cost_per_plan': _optional_float_cell(r.get('cost_per_plan')),
             'cost_source': str(r.get('cost_source', '')),
             'latency_secs': _optional_float_cell(
                 r.get('latency_secs', 0.0), precision=2,
