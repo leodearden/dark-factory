@@ -142,7 +142,6 @@ async def test_enqueue_persists_to_buffer(queue, real_buffer):
 @pytest.mark.xdist_group('event_queue_enqueue_timing')
 async def test_enqueue_returns_immediately(queue):
     """enqueue is synchronous and non-blocking."""
-    import time
     # Pre-create events so model construction doesn't inflate the timing.
     events = [_make_event() for _ in range(100)]
     t0 = time.perf_counter()
