@@ -329,11 +329,73 @@ class TestExtractSnapshotEdgeTaskIds:
         assert result == {9}
 
     def test_status_phrase_does_not_cross_comma(self):
-        """'Task 5 landed, then 9 shipped in active branch' -> set()."""
+        """'Task 5 landed, work is in blocked status' -> set().
+
+        The comma must be the ONLY thing preventing the match, else this
+        test cannot fail for the reason it names.
+
+        (amendment, reviewer_comprehensive test-quality suggestion, task
+        3042.) The previous fact here — 'Task 5 landed, then 9 shipped in
+        active branch' — returned set() for three reasons unrelated to the
+        comma: bare '9' is not a TASK_REF_RE reference, 'active branch' is
+        not followed by the literal noun 'status' so the phrase form could
+        not fire at all, and the gap from 'Task 5' would need 4+ words. It
+        would still have passed had the gap been changed to absorb commas
+        — dead coverage for the invariant it advertised.
+
+        This fact discriminates: 'landed', 'work', 'is' is exactly 3 gap
+        words followed by ' in blocked status', so it would yield {5} if
+        the gap could absorb the comma, and set() only because it cannot.
+        """
         result = extract_snapshot_edge_task_ids(
-            'Task 5 landed, then 9 shipped in active branch'
+            'Task 5 landed, work is in blocked status'
         )
         assert result == set()
+
+    def test_status_phrase_excludes_following_head_noun(self):
+        """'Task 142 is tracked in the pending status report' -> set().
+
+        Here 'status' modifies the head noun 'report' — it is a pending
+        status REPORT, not a pending task — so the span is not a status
+        assertion about task 142. This is the same 'binds to a noun'
+        failure that got 'in'/'the' reverted from INDIVIDUAL_SNAPSHOT_RE,
+        reaching the phrase form by a different route.
+
+        SNAPSHOT_STATUS_PHRASE_RE's trailing lookahead requires the
+        marker+status span to END its noun phrase (punctuation, end of
+        string, or a preposition/subordinator), which excludes it.
+        'status report' is common phrasing in this repo's memory corpus,
+        so this is not hypothetical. (amendment, reviewer_comprehensive
+        suggestion, task 3042)
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 142 is tracked in the pending status report'
+        )
+        assert result == set()
+
+    def test_status_phrase_gap_internal_subject_is_known_over_selection(self):
+        """'Task 5 depends on work in blocked status' -> {5}.
+
+        DOCUMENTED KNOWN BEHAVIOUR, not an endorsement: the WORK is
+        blocked, not task 5, so this is an over-selection the phrase form
+        does not catch. The gap ('depends on work') contains the real
+        subject of the 'in blocked status' phrase, and distinguishing that
+        requires knowing 'work' is a nominal subject — beyond lexical
+        matching at this altitude.
+
+        Pinned as a test so the residual stays visible rather than being
+        claimed away by a comment (the previous comment asserted the
+        status-noun requirement cost NO precision, which was an
+        overstatement). If a future change fixes this, update the
+        assertion to set() — a failure here is a signal to re-read
+        SNAPSHOT_STATUS_PHRASE_RE's residual notes, not necessarily a
+        regression. (amendment, reviewer_comprehensive suggestion, task
+        3042)
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 5 depends on work in blocked status'
+        )
+        assert result == {5}
 
     @pytest.mark.parametrize(
         'fact',

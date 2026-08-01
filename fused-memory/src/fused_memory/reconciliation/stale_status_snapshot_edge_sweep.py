@@ -82,6 +82,15 @@ Design decisions (captured in plan.json):
   keeps 'Task N is in the active branch' / 'is in the pending merge
   queue' out while still reaching 'Task N is in a blocked status ...'.
   (amendment, task 3042)
+- The status-noun requirement narrows binding ambiguity but does not
+  eliminate it, and the code must not claim otherwise. Two shapes were
+  identified: a following head noun ('...in the pending status report' —
+  a status REPORT), now excluded by requiring the span to end its noun
+  phrase; and a gap-internal nominal subject ('Task 5 depends on work in
+  blocked status' — the WORK is blocked), which still binds and is
+  pinned by a documented-behaviour test rather than claimed away. See
+  SNAPSHOT_STATUS_PHRASE_RE. (amendment, reviewer_comprehensive
+  suggestion, task 3042)
 - 'blocked' is deliberately NOT added to ``INACTIVE_TASK_STATUSES`` — that
   frozenset stays ``{done, cancelled}`` — which is what preserves
   invalidate-only-on-positively-terminal (a genuinely-still-blocked task is
@@ -110,24 +119,11 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 # Status markers this sweep treats as non-terminal snapshot assertions,
-# split by part of speech.
-#
-# Transitive-verb caveat (amendment, reviewer_comprehensive
-# correctness-precision finding, task 3042 — the same hazard task 2824
-# documented on task_filter.PRESENT_TENSE_COMPLETION_RE, and solved the same
-# way). 'active'/'pending'/'in progress' are adjectives only: the bare
-# adjacency 'Task 5 pending' can only be read as a status assertion about
-# task 5, so INDIVIDUAL_SNAPSHOT_RE may match them with an OPTIONAL copula.
-# 'blocked' is different — it is also a common transitive past-tense verb,
-# so under an optional copula the bare-verb reading binds and 'Task 5
-# blocked the merge queue' wrongly yields {5}. Those are permanently-true
-# historical facts, not status snapshots; retiring them once task 5 goes
-# done is the over-selection direction this module's docstring forbids.
-# Hence 'blocked' is reachable from INDIVIDUAL_SNAPSHOT_RE only through a
-# MANDATORY copula/article connective ('Task 5 is blocked', 'Task 5 is a
-# blocked task'), never as a bare verb. This trades a little under-firing
-# for many fewer false positives, matching the fail-safe direction stated
-# in the module docstring.
+# split by part of speech. 'active'/'pending'/'in progress' are adjectives
+# only; 'blocked' is ALSO a common transitive verb and so is matched only in
+# copula/article form — see the transitive-verb caveat in the module
+# docstring (task 3042), which mirrors task 2824's on
+# task_filter.PRESENT_TENSE_COMPLETION_RE.
 _ADJECTIVE_MARKER_ALT = r'(?:active|pending|in[-\s]?progress)'
 _TRANSITIVE_MARKER_ALT = r'(?:blocked)'
 
@@ -187,53 +183,21 @@ COUNT_QUANTITY_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# NOTE (amendment, reviewer_comprehensive correctness-precision finding, task
-# 2613): the individual form used to extract a task id via TASK_REF_RE
-# anywhere in the fact as long as SNAPSHOT_STATUS_RE matched ANYWHERE else in
-# the same fact — so 'Task 142 landed on the active branch' (the BRANCH is
-# active, not task 142) wrongly yielded {142}. INDIVIDUAL_SNAPSHOT_RE anchors
-# the status marker directly to its own task reference: 'task N' (or '#N' /
-# 'df N') optionally followed by a copula ('is'/'are'/'was'/'were') and/or an
-# article ('a'/'an'), then the status marker itself — with nothing else (e.g.
-# an intervening verb like 'landed') allowed in between. Built directly from
-# TASK_REF_RE.pattern (not a hand-copied duplicate) so the two stay in sync
-# if the shared task-reference grammar ever changes.
+# Anchors the status marker directly to its own task reference, so an
+# incidental status word elsewhere in the fact is never attributed to it
+# ('Task 142 landed on the active branch' -> set()). Built from
+# TASK_REF_RE.pattern rather than a hand-copied duplicate so the two stay in
+# sync if the shared task-reference grammar changes.
 #
-# NOTE (amendment, task 3042): two further changes on top of the above.
-# (a) 'blocked' is a non-terminal snapshot status (a blocked task has not
-#     reached a terminal outcome), and its prior absence from
-#     _STATUS_MARKER_ALT made every blocked-worded edge invisible to this
-#     sweep regardless of the referenced task's real status: the gate
-#     (SNAPSHOT_STATUS_RE) short-circuits before the INACTIVE_TASK_STATUSES
-#     cross-reference in select_stale_status_snapshot_edges ever runs.
-# (b) The connective here is DELIBERATELY still the task-2613 closed-class
-#     form — copula and/or 'a'/'an' only. An earlier revision of this task
-#     also admitted the preposition 'in' and the article 'the' here, to
-#     reach the repro fact 'Task N is in a blocked status ...'. That was
-#     reverted (amendment, reviewer_comprehensive correctness-precision
-#     finding, task 3042): 'in'/'the' turn the connective into a full
-#     prepositional noun phrase, so the marker binds to a NOUN the task is
-#     merely located in rather than to the task's status — empirically
-#     'Task 5 is in the active branch', 'Task 7 is in the pending merge
-#     queue', 'Task 5 is in a blocked directory' and 'Task 5 is the pending
-#     review owner' all wrongly yielded an id. That is the over-selection
-#     direction the module docstring forbids (a fact like 'Task 142 is in
-#     the active sprint retrospective' stays true forever, yet the sweep
-#     would retire it once 142 went done). The repro facts are reached
-#     instead by SNAPSHOT_STATUS_PHRASE_RE below, whose 'in' path requires
-#     the literal noun 'status' after the marker.
-# (c) The precision invariant task 2613 established is therefore unchanged:
-#     ONLY closed-class function words (copula / article) may sit between
-#     the reference and the marker — never an open-class verb or noun, and
-#     never a preposition introducing a noun phrase. So 'Task 142 landed on
-#     the blocked branch' still yields set().
-# (d) Two arms, split by the marker's part of speech (see the
-#     transitive-verb caveat on _TRANSITIVE_MARKER_ALT above). The
-#     adjective arm keeps the task-2613 OPTIONAL copula, so the verb-less
-#     'Task 5 pending' still matches. The transitive-capable arm
-#     ('blocked') requires a MANDATORY copula or article, so 'Task 5 is
-#     blocked' matches while the bare-verb 'Task 5 blocked the merge
-#     queue' does not.
+# Two arms, split by the marker's part of speech: the adjective arm takes an
+# OPTIONAL copula (so verb-less 'Task 5 pending' matches), the
+# transitive-capable arm requires a MANDATORY copula/article (so 'Task 5 is
+# blocked' matches but the bare verb 'Task 5 blocked the merge queue' does
+# not). Only closed-class function words — copula, adverb, article — may sit
+# between reference and marker; notably NOT the preposition 'in', which would
+# bind the marker to a following noun. Full rationale for all of this,
+# including the reverted 'in'/'the' widening, lives in the module docstring
+# (tasks 2613 / 3042) — do not restate it here.
 INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     TASK_REF_RE.pattern
     + r'(?:'
@@ -248,24 +212,43 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# NOTE (new regex, task 3042): SNAPSHOT_STATUS_PHRASE_RE admits a second,
-# more permissive anchoring path that INDIVIDUAL_SNAPSHOT_RE deliberately
-# refuses: an open-class gap of up to 3 words between the task reference
-# and the preposition 'in' (e.g. 'is deliberately parked in ...', where
-# 'deliberately parked' is a verb phrase, not a closed-class connective).
-# This gap is admitted ONLY when the marker is immediately followed by the
-# literal noun 'status' — that noun is what turns the span into an
-# explicit status assertion about the referenced task rather than an
-# incidental mention, so the open-class gap costs no precision (preserves
-# the task-2613/3042 precision invariant documented on INDIVIDUAL_SNAPSHOT_RE
-# above). The gap is lazy (``{0,3}?``) and bounded, and — because '.', ',',
-# ';' are not ``\w`` and the gap's own leading ``\s+`` cannot absorb them —
-# it can never cross a clause boundary: 'Task 5 is done. Task 9 is in
-# blocked status' anchors only to task 9, never dragging in task 5.
+# The permissive path: an open-class gap of up to 3 words between the task
+# reference and the preposition 'in' (e.g. 'is deliberately parked in ...'),
+# admitted ONLY when the marker is immediately followed by the literal noun
+# 'status'. The gap is lazy ({0,3}?) and bounded, and cannot cross a clause
+# boundary — '.', ',' and ';' are not \w and the gap's leading \s+ cannot
+# absorb them — so 'Task 5 is done. Task 9 is in blocked status' anchors
+# only to task 9.
+#
+# PRECISION RESIDUAL (amendment, reviewer_comprehensive suggestion, task
+# 3042). An earlier version of this comment claimed the 'status' noun meant
+# the open-class gap "costs no precision". That was an overstatement, and a
+# future maintainer would have relied on it. The status-noun requirement
+# removes most but not all binding ambiguity; two shapes still bind wrongly:
+#
+# (1) A following HEAD NOUN, where 'status' is a modifier rather than the
+#     phrase head: 'Task 142 is tracked in the pending status report' — a
+#     pending status REPORT, not a pending task. This one IS now excluded,
+#     by requiring the marker+status span to end the noun phrase (the
+#     trailing lookahead below: end of string, punctuation, or a
+#     preposition/subordinator such as 'due'/'under'/'since'). 'status
+#     report' is common phrasing in this repo's memory corpus, so this was
+#     worth closing rather than merely documenting.
+# (2) A gap-internal NOMINAL that is the real subject of the phrase:
+#     'Task 5 depends on work in blocked status' — the WORK is blocked, not
+#     task 5. This still yields {5} and is NOT fixed here: distinguishing it
+#     needs to know that 'work' is the subject, which is beyond lexical
+#     matching at this altitude. Documented as known behaviour (with a test
+#     pinning it) rather than claimed away, so the trade-off stays visible.
+#     Widening the gap beyond {0,3} words would make this strictly worse.
 SNAPSHOT_STATUS_PHRASE_RE: re.Pattern[str] = re.compile(
     TASK_REF_RE.pattern
     + r'(?:\s+\w+){0,3}?\s+in\s+(?:an?\s+|the\s+)?'
-    + _STATUS_MARKER_ALT + r'\s+status\b',
+    + _STATUS_MARKER_ALT + r'\s+status\b'
+    # the span must END the noun phrase — else 'status' is a modifier of a
+    # following head noun ('status report'), not the phrase head
+    + r'(?=\s*[.,;:!?)\]]|\s*$|\s+(?:due|under|pending|since|because|'
+    + r'awaiting|after|before|while|until|per|as|with|for|on|from|and|or)\b)',
     re.IGNORECASE,
 )
 
