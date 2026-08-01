@@ -414,8 +414,12 @@ task belongs to the submitting project.
 
 Since task 3123 the bypass is **audited, not silent**: every use files a
 `scope_violation` escalation (id prefix `esc-task-path-guard-override`) into
-the filing project's queue, recording your reason verbatim, the project you
-filed into, and the paths that would have been flagged. It fires even when
+the filing project's queue, recording your reason, the project you filed
+into, and the paths that would have been flagged. (Both are rendered into
+operator views and agent briefings, so both are bounded: a runaway reason is
+clipped with an explicit marker naming the length it dropped, and a long path
+list is elided in the one-line summary while the detail keeps every entry.
+Nothing of a normally-sized justification is lost.) It fires even when
 the guard would have allowed the submission anyway — an override that turned
 out unnecessary is exactly the signal worth having. Repeating one identical
 justification folds into a single record rather than flooding the queue, so

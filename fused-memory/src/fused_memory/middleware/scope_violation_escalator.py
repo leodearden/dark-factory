@@ -148,9 +148,23 @@ _REJECTION_MODE_LABEL: str = 'rejection'
 # share the scope_violation category.
 _OVERRIDE_ANCHOR_TASK_ID: str = 'task-path-guard-override'
 
-# Nothing was blocked on the override path — the task exists.  Any
-# ``resubmit_to_<project>`` string here would be rendered verbatim into an
-# agent briefing (task 3119) and read as an order to redo landed work.
+# Nothing was blocked on the override path.  Any ``resubmit_to_<project>``
+# string here would be rendered verbatim into an agent briefing (task 3119)
+# and read as an order to redo landed work.
+#
+# KNOWN CONSUMER GAP, and this string does NOT close it: escalation-watcher-auto
+# has a single unconditional ``scope_violation`` recipe (update_task on
+# metadata.modules, then resolve_issue(action='resume')), and its SKILL.md
+# explicitly says not to branch on suggested_action.  Every record in this
+# family is filed under a SYNTHETIC anchor task_id rather than a real task, so
+# that recipe's update_task targets a task that does not exist and the resume
+# no-ops.  The shape pre-dates task 3123 — the rejection and advisory records
+# under _ANCHOR_TASK_ID have always had it — but the override record fires
+# UNCONDITIONALLY, so the volume is materially higher.  The fix belongs in
+# skills/escalation-watcher-auto/SKILL.md (an audit-only branch keyed on the
+# esc-task-path-guard id prefix), not here: re-gating the producer would undo
+# the census this record exists to be.  Filed as follow-up ticket
+# tkt_0RRYVFP6S8SXJ3TDEH4W5AYK83.
 _OVERRIDE_SUGGESTED_ACTION: str = 'review_override_justification'
 
 # Dedup discriminator for the override mode.  TWO composition points, both
