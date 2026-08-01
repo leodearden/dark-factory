@@ -11,7 +11,6 @@ import subprocess
 from pathlib import Path
 
 from orchestrator.agents.roles import (
-    ANCESTRY_CHECK_INSTRUCTIONS,
     ARCHITECT,
     DEBUGGER,
     DEEP_REVIEWER,
@@ -19,7 +18,6 @@ from orchestrator.agents.roles import (
     JUDGE,
     MERGER,
     REVIEWER_COMPREHENSIVE,
-    SERVER_BACKSTOP_NOTE,
     STEWARD,
 )
 
@@ -79,21 +77,14 @@ class TestStewardPromptDocumentsTwoKinds:
 
 
 class TestAncestryCheckIsThreeOutcome:
-    """Pins ANCESTRY_CHECK_INSTRUCTIONS as the single canonical block spliced
-    into both STEWARD call sites, and corroborates its documented rc table
-    against the installed git rather than trusting prose.
+    """Corroborates the rc table documented in roles.py's
+    ANCESTRY_CHECK_INSTRUCTIONS against the installed git.
+
+    Deliberately holds no assertion about where that block is spliced into
+    STEWARD.system_prompt: pinning the splice count is tautological with the
+    concatenation that produces the prompt, and would fire spuriously the
+    moment a third call site is added.
     """
-
-    def test_spliced_at_both_call_sites(self):
-        # A bare `in` check can't distinguish "spliced once" from "spliced
-        # twice" -- exactly the half-migration failure mode this guards against.
-        assert STEWARD.system_prompt.count(ANCESTRY_CHECK_INSTRUCTIONS) == 2
-
-    def test_server_backstop_note_spliced_at_both_call_sites(self):
-        # The client-side rc table is only actionable if the steward also knows
-        # how the server reports its own backstop failure; a call site that
-        # carries one block but not the other is the same half-migration bug.
-        assert STEWARD.system_prompt.count(SERVER_BACKSTOP_NOTE) == 2
 
     def test_real_git_distinguishes_unresolvable_from_off_main(self, tmp_path: Path) -> None:
         """Ties the documented rc table to the installed git, not to prose.

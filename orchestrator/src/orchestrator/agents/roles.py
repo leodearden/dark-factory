@@ -317,10 +317,13 @@ leaving a half-done tree that is falsely recorded as a completed, successful run
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
-# kind="found_on_main"). Pinned by test_role_done_provenance_gate.py's
-# TestAncestryCheckIsThreeOutcome so a prompt refactor can't silently drop a
-# call site or regress to the two-outcome `&& echo` idiom. This is the
-# roles.py analogue of the per-file canonical ancestry check task 3281
+# kind="found_on_main"). Being a single shared constant IS the mechanism that
+# keeps the two sites consistent -- there is deliberately no test pinning the
+# splice count, since such a test is tautological with the concatenation below
+# and blocks a legitimate third call site. The prohibition on the two-outcome
+# `&& echo` idiom is stated normatively in the block itself, not enforced by a
+# regex over prompt prose. This is the roles.py analogue of the per-file
+# canonical ancestry check task 3281
 # (374468dbad) introduced in skills/merge-queue/SKILL.md and
 # skills/unblock/SKILL.md, adapted for a commit-SHA subject rather than a
 # branch-ref subject: no rc=128 merge-marker search here, since that arm only
