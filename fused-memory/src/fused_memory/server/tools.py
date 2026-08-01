@@ -2944,10 +2944,20 @@ def create_mcp_server(
             replacement_memory_id: The SURVIVING entry's full 36-char UUID, when
                 this delete supersedes one duplicate in favour of another.
                 Required for a consolidation delete whose id is still cited by a
-                live task. Must be a concrete UUID — a ``search(query=...)``
-                instruction is rejected, because re-deriving at read time
-                resolves back to the superseded entries consolidation was
-                collapsing.
+                live task. Three requirements, each checked mechanically:
+                (1) it must be a concrete UUID — a ``search(query=...)``
+                instruction is rejected (``CitationReplacementInvalid``),
+                because re-deriving at read time resolves back to the
+                superseded entries consolidation was collapsing;
+                (2) it must RESOLVE in the store — a well-formed but nonexistent
+                id is refused (``CitationReplacementNotFound``) rather than
+                written into every citation, which would strand them exactly as
+                the delete itself would;
+                (3) it must not be the id being deleted
+                (``CitationReplacementInvalid``) — a self-repoint reports
+                success while every citation still addresses the destroyed
+                entry. Copy the value from the search/consolidation result
+                rather than reconstructing it.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)

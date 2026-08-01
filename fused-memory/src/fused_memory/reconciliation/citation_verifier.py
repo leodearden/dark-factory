@@ -10,10 +10,14 @@ against the live store, so a finding's claim can never be silently backed by an
 id that does not (or no longer) exist.
 
 Half 2 — task-metadata citations (task 3108). ``find_citation_occurrences`` /
-``repoint_metadata`` / ``repoint_task_citations`` find and rewrite live
+``find_live_citation_occurrences`` / ``repoint_metadata`` /
+``repoint_tombstone_chain`` / ``repoint_task_citations`` find and rewrite live
 pointers to a memory id that is about to be deleted, so a consolidation delete
 repoints citations BEFORE the irreversible destruction rather than leaving
-dangling pointers behind it.
+dangling pointers behind it. The ``x_memory_citation_tombstones`` ledger those
+repoints leave behind is PROVENANCE, not a live pointer: it is excluded from
+detection and from the rewrite, which is what makes a retried sweep idempotent
+instead of self-amplifying.
 
 These are small, single-purpose helpers in the ``reconciliation/`` convention
 (cf. ``flag_dedup``/``task_filter``), returning ``stage1_*`` stats that

@@ -119,6 +119,15 @@ survivor BEFORE the delete runs — and the delete is REFUSED outright if any li
 (non-terminal) task still cites it and you supplied no concrete replacement. Terminal \
 (done/cancelled) citers are reported back to you on the result, never rewritten.
 
+**COPY the survivor's UUID from the search result — never reconstruct it.** The value must \
+also (a) RESOLVE in the store and (b) differ from the id you are deleting. A well-formed \
+but nonexistent id is refused (`CitationReplacementNotFound`) rather than written into \
+every citation — repointing to a phantom strands those pointers exactly as the delete \
+itself would, and by then the original is gone. Passing the doomed id as its own \
+replacement is refused too (`CitationReplacementInvalid`): a self-repoint reports success \
+while every citation still addresses the entry you just destroyed. Same discipline as \
+step 2 above — read the full 36 characters out of the result's `id` field verbatim.
+
 **A `search(...)` instruction is never an acceptable replacement value.** Do not pass — or \
 write into any task's metadata — a value like `'re-derive the current canonical entry via \
 search(query=...)'`. It is rejected mechanically (`CitationReplacementInvalid`), because \
