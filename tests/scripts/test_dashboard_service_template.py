@@ -13,6 +13,8 @@ See also:
 
 import pathlib
 import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -761,3 +763,228 @@ def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
             f"in {path}. A keep-alive idle window longer than the stop timeout "
             "would be incoherent with the drain bound."
         )
+
+
+# ---------------------------------------------------------------------------
+# Restart backoff
+#
+# RestartMaxDelaySec= is silently INERT unless RestartSteps= accompanies it.
+# systemd parses the cap, logs "Service has RestartMaxDelaySec= but no
+# RestartSteps= setting. Ignoring." at load time, and then discards it — so the
+# interpolated 5s -> 60s backoff the unit's own comment advertises never
+# happens and every restart waits exactly RestartSec, forever.  Nothing in the
+# unit's text reveals this; the only signal is a load-time warning nobody reads.
+#
+# The invariant below is RELATIONAL and CONDITIONAL, mirroring
+# _assert_drain_bounded above: the defect is the missing PAIRING, not the
+# absence of either directive on its own.  RestartSteps= alone is meaningless
+# and RestartMaxDelaySec= alone is thrown away, while a unit that deliberately
+# declares no cap is not in violation of anything.
+# ---------------------------------------------------------------------------
+
+
+def _restart_directive(path: pathlib.Path, name: str) -> str | None:
+    r"""Return the value of the ``<name>=`` directive in *path*, or None if absent.
+
+    Mirrors the opaque-token-then-parse style of _timeout_stop_sec: the value is
+    captured as ``(.*)`` and interpreted by the caller, so a valid-but-unexpected
+    spelling (``RestartMaxDelaySec=60s``, ``RestartSec=1min``) is reported as the
+    present directive it is rather than misdiagnosed as a missing line.  Matching
+    ``(\d+)`` here would read ``RestartMaxDelaySec=60s`` as no cap at all and
+    skip the pairing invariant silently — the worst possible failure for a guard
+    whose entire job is to notice a directive that is being ignored.
+    """
+    match = re.search(
+        rf"^{re.escape(name)}=(.*)$",
+        path.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    return match.group(1).strip() if match is not None else None
+
+
+def _assert_restart_backoff_effective(path: pathlib.Path) -> None:
+    """Assert *path*'s restart backoff actually engages, given that it declares a cap.
+
+    Conditional on RestartMaxDelaySec= being present: a unit that asks for no
+    backoff cap violates nothing.  But once the cap is written down, systemd
+    needs RestartSteps= to interpolate between RestartSec and that cap; without
+    it the cap is parsed, warned about, and dropped.
+    """
+    cap = _restart_directive(path, "RestartMaxDelaySec")
+    if cap is None:
+        return
+
+    steps = _restart_directive(path, "RestartSteps")
+    assert steps is not None, (
+        f"{path} declares RestartMaxDelaySec={cap} but no RestartSteps=. "
+        "systemd logs 'Service has RestartMaxDelaySec= but no RestartSteps= "
+        "setting. Ignoring.' at unit load and then drops the cap entirely, so "
+        "the backoff this unit advertises never engages — every restart waits "
+        "exactly RestartSec and the delay never grows. Add RestartSteps= to "
+        "make the cap effective; scripts/jcodemunch-watcher.service.template "
+        "already carries this fix for the identical restart shape."
+    )
+    assert steps.isdigit(), (
+        f"could not parse RestartSteps={steps!r} in {path} as an integer; "
+        "systemd accepts only a plain unsigned integer here."
+    )
+    assert int(steps) >= 1, (
+        f"RestartSteps={steps} in {path} produces no backoff curve at all: with "
+        "zero steps there is nothing to interpolate between RestartSec and "
+        f"RestartMaxDelaySec={cap}, leaving the cap as inert as if it had been "
+        "omitted. Use at least 1 step."
+    )
+
+    floor = _restart_directive(path, "RestartSec")
+    assert floor is not None, (
+        f"{path} declares RestartMaxDelaySec={cap} and RestartSteps={steps} but "
+        "no RestartSec=. The curve is interpolated FROM RestartSec TO "
+        "RestartMaxDelaySec, so without an explicit floor the unit silently "
+        "starts from systemd's 100ms default and the backoff that runs is not "
+        "the one the file describes."
+    )
+
+
+def _write_restart_unit(path: pathlib.Path, body: str) -> pathlib.Path:
+    """Write a minimal synthetic unit carrying only a [Service] restart stanza.
+
+    _write_synthetic_unit above is shaped for the ExecStart/TimeoutStopSec drain
+    tests and would have to be contorted through its *preamble* argument to
+    express a restart stanza, so the restart guards get their own one-line
+    builder rather than bending a fixture that means something else.
+    """
+    path.write_text(f"[Service]\n{body}\n", encoding="utf-8")
+    return path
+
+
+def test_restart_backoff_guard_rejects_ineffective_units(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_assert_restart_backoff_effective must fire on every inert-cap spelling.
+
+    Same convention as test_drain_bound_guard_rejects_unbounded_units above: an
+    assertion helper earns its own negatives so it cannot silently no-op, and
+    every case pins its own failure mode with ``match=``.  A bare
+    ``pytest.raises(AssertionError)`` is satisfied by ANY assertion firing
+    anywhere in the chain, so the distinct bad cases below — absent steps / zero
+    steps / absent floor — would all still "pass" while tripping one shared
+    branch, which is exactly the confusion they exist to rule out.
+    """
+    # Bad: the pre-fix state — a cap declared with nothing to interpolate over.
+    no_steps = _write_restart_unit(
+        tmp_path / "no_steps.service",
+        "Restart=on-failure\nRestartSec=5\nRestartMaxDelaySec=60",
+    )
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(no_steps)
+
+    # Bad: present but zero — a zero-step curve is no backoff at all, so mere
+    # presence of the directive is not the property being asserted.
+    zero_steps = _write_restart_unit(
+        tmp_path / "zero_steps.service",
+        "Restart=on-failure\nRestartSec=5\nRestartSteps=0\nRestartMaxDelaySec=60",
+    )
+    with pytest.raises(AssertionError, match="produces no backoff curve"):
+        _assert_restart_backoff_effective(zero_steps)
+
+    # Bad: cap and steps, but no floor to interpolate up FROM.
+    no_floor = _write_restart_unit(
+        tmp_path / "no_floor.service",
+        "Restart=on-failure\nRestartSteps=4\nRestartMaxDelaySec=60",
+    )
+    with pytest.raises(AssertionError, match="no RestartSec="):
+        _assert_restart_backoff_effective(no_floor)
+
+    # Good: the full curve — must not raise (guards against over-tightening).
+    good = _write_restart_unit(
+        tmp_path / "good.service",
+        "Restart=on-failure\nRestartSec=5\nRestartSteps=4\nRestartMaxDelaySec=60",
+    )
+    _assert_restart_backoff_effective(good)
+
+    # Good: no cap declared at all — the invariant is conditional on the cap
+    # being declared, not a blanket requirement that every unit implement
+    # backoff.  Pins that a later author cannot tighten it into an
+    # unconditional "RestartSteps= must be present".
+    no_cap = _write_restart_unit(
+        tmp_path / "no_cap.service", "Restart=on-failure\nRestartSec=5"
+    )
+    _assert_restart_backoff_effective(no_cap)
+
+    # Good: a suffixed spec is still a declared cap.  This is why
+    # _restart_directive captures the value opaquely — a (\d+) parse would read
+    # `60s` as an absent directive and skip the invariant without a word.
+    suffixed = _write_restart_unit(
+        tmp_path / "suffixed.service",
+        "Restart=on-failure\nRestartSec=5s\nRestartSteps=4\nRestartMaxDelaySec=60s",
+    )
+    _assert_restart_backoff_effective(suffixed)
+    assert _restart_directive(suffixed, "RestartMaxDelaySec") == "60s"
+
+    # ...and the inert form of that same spelling must STILL be caught, so the
+    # opaque capture above bought precision, not laxity.
+    suffixed_no_steps = _write_restart_unit(
+        tmp_path / "suffixed_no_steps.service",
+        "Restart=on-failure\nRestartSec=5s\nRestartMaxDelaySec=60s",
+    )
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(suffixed_no_steps)
+
+
+def test_restart_backoff_is_effective_in_both_unit_files() -> None:
+    """Both unit files must pair RestartMaxDelaySec= with a usable RestartSteps=.
+
+    Without the pairing systemd discards the cap at load time, so a dashboard
+    stuck in a crash loop retries every 5s indefinitely instead of backing off
+    toward 60s — the unit's comment claims a backoff that the unit does not do.
+    """
+    for path in (TEMPLATE, HARDCODED):
+        _assert_restart_backoff_effective(path)
+
+
+@pytest.mark.skipif(
+    shutil.which("systemd-analyze") is None,
+    reason=(
+        "systemd-analyze is not installed; the file-content invariants above are "
+        "the primary guard and this module requires no systemd runtime"
+    ),
+)
+def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
+    """systemd itself must not report discarding any directive in the unit.
+
+    Confirmatory corroboration of the file-content invariant above, deliberately
+    skippable so the module keeps the "no systemd runtime is required" contract
+    stated in its docstring.
+
+    Three details here are load-bearing, each verified by measurement rather
+    than assumed (2026-08-01, systemd 255.4):
+
+    1. stderr is captured, not just stdout.  The warning goes to stderr while
+       stdout is empty, so a stdout-only assertion would be a silent no-op that
+       passes forever regardless of the unit's contents.
+    2. The assertion is on the WARNING TEXT, never on ``returncode``.
+       ``systemd-analyze verify`` exits 1 when the ExecStart binary does not
+       exist ("Command /... is not executable"), and this unit bakes in
+       /home/leo/.local/bin/uv — so a returncode check would fail on any other
+       host for a reason entirely unrelated to this invariant.
+    3. It runs against HARDCODED only.  The raw template cannot be verified at
+       all: its ``__REPO_ROOT__`` sentinel trips a fatal "WorkingDirectory= path
+       is not absolute" error.  test_template_renders_to_hardcoded_file already
+       asserts the two files are byte-identical modulo the sentinels, so the
+       property carries across without verifying the same bytes twice.
+    """
+    result = subprocess.run(
+        ["systemd-analyze", "verify", str(HARDCODED)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    combined = f"{result.stdout}{result.stderr}"
+    ignored = [line for line in combined.splitlines() if "Ignoring." in line]
+    assert not ignored, (
+        f"systemd-analyze verify reports directives it is IGNORING in {HARDCODED}:\n"
+        + "\n".join(f"  {line}" for line in ignored)
+        + "\nEach such line is a directive systemd parsed, warned about, and then "
+        "discarded — the unit does not do what its text says it does."
+    )
