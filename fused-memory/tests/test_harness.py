@@ -2924,8 +2924,32 @@ async def test_auto_unhalt_resumes_after_cooldown_expiry(
         datetime.now(UTC) - timedelta(hours=1)  # expired
     )
     # Spy on unhalt while preserving real behaviour (clears halt, seeds grace).
-    unhalt_spy = AsyncMock(side_effect=harness.judge.unhalt)
+    # Each witness Event is set in a finally AFTER the real callee returns, so
+    # the state the assertions read (is_halted cleared, inside real unhalt) is
+    # already committed when the drive below cancels the loop.
+    unhalted = asyncio.Event()
+    real_unhalt = harness.judge.unhalt
+
+    async def _signal_unhalt(*a, **k):
+        try:
+            return await real_unhalt(*a, **k)
+        finally:
+            unhalted.set()
+
+    # *a capture does not disturb unhalt_spy.await_args, which the mock records
+    # independently of the side_effect's signature.
+    unhalt_spy = AsyncMock(side_effect=_signal_unhalt)
     harness.judge.unhalt = unhalt_spy
+
+    # Wrap (never edit) the shared _fake_completed_cycle — sites 4/5/6 reuse it
+    # and two of them assert rfc_mock.assert_not_awaited().
+    cycled = asyncio.Event()
+
+    async def _signal_cycle(*a, **k):
+        try:
+            return await _fake_completed_cycle(*a, **k)
+        finally:
+            cycled.set()
 
     for _ in range(3):
         await event_buffer.push(_make_event())
