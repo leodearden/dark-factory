@@ -196,6 +196,11 @@ _RUN_STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 # outermost boundary in ``build_memory_evals`` and named as one.
 _ARTIFACT_ERRORS = (OSError, ValueError)
 
+# Issue kinds that mean the walk did not COMPLETE, as opposed to completing
+# over a degraded tree.  See :func:`root_scan_succeeded`, which is the only
+# reader: a payload carrying one of these is not pinned for the TTL window.
+_UNCACHEABLE_ISSUE_KINDS = frozenset({'unreadable_root', 'internal_error'})
+
 # The limits artifact carries a great deal more than this — ``alarms``,
 # ``alarmed_metric_count``, ``grandfather_set``, ``snapshotted_metric_ids`` and
 # its own embedded ``verdicts[]``.  Only this whitelist is surfaced, and it is
@@ -262,9 +267,9 @@ def _read_limits(
     ``verdicts-current.json`` is the sole verdict source.
 
     All three disposal paths are NAMED: absent (beside runs) is
-    ``missing_limits``, a parse failure is ``unreadable_limits`` (recorded by
-    the caller's handler), and an artifact that parses but is not an object is
-    ``malformed_limits``.  Without that third path a present-but-wrong-type
+    ``missing_limits``, a parse failure is ``unreadable_limits`` (recorded
+    here, at the read boundary), and an artifact that parses but is not an
+    object is ``malformed_limits``.  Without that third path a present-but-wrong-type
     artifact produced no signal at all, since the absent-file issue does not
     fire for a file that exists.
 
@@ -439,7 +444,7 @@ def _read_verdicts(
     divergence would silently mislabel an alarm.
 
     Every disposal path is NAMED: absent is ``missing_verdicts``, a parse
-    failure is ``unreadable_verdicts`` (recorded by the caller's handler), a
+    failure is ``unreadable_verdicts`` (recorded here, at the read boundary), a
     body that parses but is not an object — or is an object whose ``entries``
     is absent or not a list — is ``malformed_verdicts``, an individual
     non-object element is ``malformed_verdict_entry``, and elements that ARE
@@ -1210,26 +1215,37 @@ def root_scan_succeeded(payload: dict[str, Any]) -> bool:
     """Did this scan actually reach the artifact tree?
 
     The cacheability predicate for the route's TTL cache
-    (``cache_ok=root_scan_succeeded``).  False for exactly the two payloads
-    produced WITHOUT walking anything:
+    (``cache_ok=root_scan_succeeded``).  False for the payloads produced
+    WITHOUT a completed walk:
 
     * ``root_present`` is falsy — :meth:`Path.is_dir` said no and
       :func:`_build_payload` returned before enumerating.
     * an ``unreadable_root`` issue is present — the root exists but
       :meth:`Path.iterdir` raised, so again nothing was walked.
+    * an ``internal_error`` issue is present — a bug aborted the build, so the
+      payload is missing rows for a reason that has nothing to do with the
+      tree.
 
-    Both are O(1) to recompute — one ``stat``, or one immediately-raising
-    ``iterdir`` — so re-deriving them on every poll costs nothing and there is
-    no expensive walk behind them to stampede onto.  Caching them, by
-    contrast, pins a "there is no data here" view for the full TTL window past
-    the moment the tree appears: a volume finishing its mount, a mode being
-    fixed, the first eval run landing.
+    The first two are O(1) to recompute — one ``stat``, or one
+    immediately-raising ``iterdir`` — so re-deriving them on every poll costs
+    nothing and there is no expensive walk behind them to stampede onto.
+    Caching them, by contrast, pins a "there is no data here" view for the
+    full TTL window past the moment the tree appears: a volume finishing its
+    mount, a mode being fixed, the first eval run landing.
+
+    ``internal_error`` is not free to recompute, and declining it is still
+    right: unlike the ordinary-but-incomplete states
+    :func:`~dashboard.data.escalation_analytics.archive_scan_succeeded`
+    deliberately keeps cacheable, a bug is never a steady state — it is an
+    emergency with no known trigger — so the walk it costs is bounded by how
+    long the bug lives, and pinning a payload that is blank for reasons the
+    operator cannot see or fix is the worse trade.
 
     A degraded ROW is deliberately still cacheable.  An unreadable metrics
     run, an unknown metric kind or an orphan verdict all mean the scan reached
     the tree and did its work; re-running it would rediscover the same
     degradation at the cost of the full walk this cache exists to prevent.
-    The predicate keys on the ROOT, never on ``issue_count``.
+    The predicate keys on named issue KINDS, never on ``issue_count``.
 
     Reads every field through ``.get`` because it runs inside the cache write
     path: a partially-built payload must degrade to "don't cache" rather than
@@ -1238,7 +1254,7 @@ def root_scan_succeeded(payload: dict[str, Any]) -> bool:
     if not payload.get('root_present'):
         return False
     return not any(
-        issue.get('kind') == 'unreadable_root'
+        issue.get('kind') in _UNCACHEABLE_ISSUE_KINDS
         for issue in payload.get('issues') or ()
     )
 
@@ -1356,13 +1372,28 @@ def _build_payload(
         }
     payload['storm_escape'] = storm_block
 
-    payload['evals'] = [
-        _build_eval(
-            d, issues, verdict_index, consumed, escalation_index,
-            linked_fingerprints, storm_suppressed, storm_block, resolved_now,
-        )
-        for d in eval_dirs
-    ]
+    # Per-eval bug boundary, not one comprehension.  Artifact errors are
+    # already handled inside ``_build_eval``, so anything escaping it is a bug
+    # — and as a single comprehension a bug on the fifth of ten dirs discarded
+    # the other nine, leaving a present-but-empty root that reads as "no evals
+    # have run".  Per-eval it costs that one row and names which one.
+    evals: list[dict[str, Any]] = []
+    for eval_dir in eval_dirs:
+        try:
+            evals.append(_build_eval(
+                eval_dir, issues, verdict_index, consumed, escalation_index,
+                linked_fingerprints, storm_suppressed, storm_block, resolved_now,
+            ))
+        except Exception as exc:  # noqa: BLE001 - per-eval half of the never-500 boundary
+            logger.exception('memory-evals eval build failed for %s', eval_dir)
+            _issue(
+                issues, 'internal_error', eval_id=eval_dir.name, path=eval_dir,
+                detail=(
+                    f'{type(exc).__name__}: {exc} — this is a dashboard bug, not a broken '
+                    'artifact; see the dashboard log for the traceback'
+                ),
+            )
+    payload['evals'] = evals
 
     # The reverse direction: an open eval_regression escalation that no metric
     # row links.  Surfaced rather than dropped, so parity can be checked both

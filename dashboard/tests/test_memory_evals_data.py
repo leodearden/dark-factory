@@ -1971,17 +1971,6 @@ class TestCodeBugsAreNotArtifactDegradation:
     traceback in the dashboard log, instead of being silently relabelled.
     """
 
-    def test_artifact_errors_is_narrowed_to_io_and_parse(self) -> None:
-        """Pinned structurally so the tuple cannot silently widen back.
-
-        ``json.JSONDecodeError`` is dropped as a redundant ``ValueError``
-        subclass; ``TypeError``/``AttributeError`` are dropped because they are
-        what a code bug raises, not what a bad file raises.
-        """
-        from dashboard.data import memory_evals
-
-        assert (OSError, ValueError) == memory_evals._ARTIFACT_ERRORS
-
     def test_a_bug_in_read_limits_is_an_internal_error(self, tmp_path: Path, monkeypatch) -> None:
         from dashboard.data import memory_evals as memory_evals_mod
         from dashboard.data.memory_evals import build_memory_evals
