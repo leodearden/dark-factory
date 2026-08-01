@@ -27,6 +27,42 @@ MAIN_CWD = '/home/leo/src/dark-factory'
 WORKTREE_CWD = '/home/leo/src/dark-factory/.worktrees/2573'
 COCKPIT_CWD = '/home/leo/src/dark-factory-cockpit'
 
+# OBSERVED, not guessed (task 3272). Every right-hand side below is a real
+# directory name read off a live ``~/.claude/projects`` tree, or a cwd
+# confirmed against one. The rule was derived empirically from 738
+# (encoded-dir, decoded-cwd) pairs sampled from that tree: the only
+# substitutions observed were ``.`` -> ``-``, ``/`` -> ``-`` and
+# ``_`` -> ``-``, and the only non-alphanumeric characters appearing in ANY
+# sampled cwd were ``- . / _`` — so the three-character rule is complete
+# over the observed domain (it reproduces all 738 pairs; the former
+# two-character ``/``+``.`` rule mismatched 492 of them).
+#
+# These are STRING LITERALS on purpose. They must never be produced by
+# calling ``encode_cwd`` (or any mirror of it): a fixture built with the
+# function under test moves in lockstep with a bug in that function and can
+# never detect it, which is exactly why the missing ``_`` rule survived a
+# fully green suite. See TestEncoderLockstep below.
+REAL_ENCODED_DIR_PAIRS: tuple[tuple[str, str], ...] = (
+    (MAIN_CWD, '-home-leo-src-dark-factory'),
+    (WORKTREE_CWD, '-home-leo-src-dark-factory--worktrees-2573'),
+    (
+        '/home/leo/src/dark-factory/.eval-worktrees/df_task_12/run-5383f6a8',
+        '-home-leo-src-dark-factory--eval-worktrees-df-task-12-run-5383f6a8',
+    ),
+    (
+        '/home/leo/src/reify/.claude/worktrees/printer-design-v01',
+        '-home-leo-src-reify--claude-worktrees-printer-design-v01',
+    ),
+    # Pins CASE PRESERVATION: the encoder does NOT lowercase. This dir name
+    # exists on disk with its capitals intact, ruling out a case-folding step.
+    ('/opt/Auto-Claude/resources/backend', '-opt-Auto-Claude-resources-backend'),
+    (
+        '/home/leo/src/warm-lanes/worktrees/_lane-39',
+        '-home-leo-src-warm-lanes-worktrees--lane-39',
+    ),
+    ('/media/leo/data_lv_1/leo/reify-build', '-media-leo-data-lv-1-leo-reify-build'),
+)
+
 
 class TestEncodeCwd:
     def test_plain_path(self):
@@ -35,6 +71,23 @@ class TestEncodeCwd:
     def test_worktrees_child_maps_slash_and_dot(self):
         # Both '/' and '.' -> '-', mirroring transcript_path_for_cwd exactly.
         assert mod.encode_cwd(WORKTREE_CWD) == '-home-leo-src-dark-factory--worktrees-2573'
+
+    def test_underscore_maps_to_dash(self):
+        # The character the mirror used to miss (task 3272). Two thirds of the
+        # real project dirs sampled contain an underscore.
+        assert mod.encode_cwd('/media/leo/data_lv_1/leo/reify-build') == (
+            '-media-leo-data-lv-1-leo-reify-build'
+        )
+
+    def test_round_trips_real_on_disk_dir_names(self):
+        """Every encoding matches a dir name observed on a live ~/.claude/projects tree.
+
+        Table-driven over REAL_ENCODED_DIR_PAIRS, whose expected values are
+        hard-coded literals rather than encoder output — the only kind of
+        assertion that can catch an encoder which is self-consistently wrong.
+        """
+        for cwd, expected_dir in REAL_ENCODED_DIR_PAIRS:
+            assert mod.encode_cwd(cwd) == expected_dir, cwd
 
     def test_cockpit_sibling_shares_literal_prefix(self):
         # This is exactly why a raw string-prefix match over-includes: the
