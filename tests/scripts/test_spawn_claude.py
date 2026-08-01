@@ -1224,6 +1224,50 @@ def test_set_started_grace_pathological_load_clamps_below_production_default(
     assert env["SPAWN_STARTED_GRACE_SECS"] == str(grace)
 
 
+def test_set_started_grace_floor_clears_measured_happy_path_latency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The must-not-be-flagged grace floor must clear the parent script's
+    own startup chain -- not just be a low fixed number.
+
+    MEASURED, not guessed: on this host (nproc 32, /proc/loadavg 212 =>
+    load-per-core 6.6) three runs of the normal fast spawn shape (delay=0,
+    grace=2, foreground xterm, fake claude exiting 0) took 2.13s / 3.10s /
+    4.71s wall -- the whole observed range sits ABOVE the old 2s pin, which
+    is the complete explanation of the reported flake in
+    test_normal_spawn_exit0_not_flagged (registry status intermittently
+    failed-to-start instead of exited). A floor of 8s clears the 4.71s
+    worst case with 1.7x margin, BEFORE load scaling multiplies on top.
+
+    Uses an IDLE host (load-per-core < 1) so _load_scaled_grace returns the
+    bare base unchanged -- load scaling cannot mask a too-small floor here.
+
+    Also asserts the floor strictly exceeds _base_env's own
+    SPAWN_LAUNCH_GRACE_SECS (:300): the structural defect was that the
+    started-grace was tied to the launcher's own grace window, so the
+    watchdog could fire while the launcher was still legitimately within
+    its own grace.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    env: dict[str, str] = {}
+    grace = _set_started_grace(env)
+
+    assert grace >= 8, (
+        "must-not-be-flagged started-grace floor must clear the measured "
+        f"worst-case happy-path spawn latency (4.71s at load-per-core 6.6); got {grace}"
+    )
+
+    launch_grace = int(_base_env(tmp_path, "xterm")["SPAWN_LAUNCH_GRACE_SECS"])
+    assert grace > launch_grace, (
+        "the must-not-be-flagged started-grace floor must strictly exceed "
+        "the launcher's own SPAWN_LAUNCH_GRACE_SECS (_base_env, :300) -- "
+        "the structural defect was tying the started-grace to the "
+        f"launcher's grace window; floor={grace}, launch_grace={launch_grace}"
+    )
+
+
 def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     """A fresh transcript file must suppress the failed-to-start flag.
 
