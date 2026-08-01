@@ -1674,7 +1674,7 @@ class TestParityVocabularyIsClosedAndExported:
     def test_the_module_exports_the_vocabulary(self) -> None:
         from dashboard.data import memory_evals
 
-        assert memory_evals.PARITY_STATES == set(_PARITY_VALUES)
+        assert set(_PARITY_VALUES) == memory_evals.PARITY_STATES
 
     def test_the_literal_and_the_builder_agree(self, tmp_path: Path) -> None:
         """Every state the builder emits is a member, and every member is reachable.

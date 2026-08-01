@@ -128,6 +128,41 @@ _KNOWN_KINDS = frozenset({'tripwire', 'proportion', 'count', 'scalar'})
 # parity is derived here rather than re-derived in the frontend.
 _KNOWN_VERDICTS = frozenset({'alarm', 'no_alarm', 'insufficient_data', 'grandfathered'})
 
+# The closed parity vocabulary — every value ``_parity`` can emit, plus the
+# ``storm_collapsed`` state ``_build_eval`` short-circuits to.  PUBLIC on
+# purpose: it is the single source of truth the dashboard tab (task 3216) and
+# the parity gate (task 3217) should assert against, rather than each
+# hardcoding a subset that rots silently the moment a state is added here.
+#
+# Written out as a literal rather than computed from ``_KNOWN_VERDICTS`` by
+# string concatenation, so the vocabulary stays readable and greppable; the
+# reachability test in ``TestParityVocabularyIsClosedAndExported`` is what
+# keeps the literal and the builder's actual outputs in agreement.
+#
+# Note the deliberate naming asymmetry: for an ``alarm`` the UNLINKED state is
+# the notable one (a filed alarm with no escalation is the parity violation),
+# so it carries the distinguishing name; for every other class the LINKED state
+# is the notable one, so that is the one suffixed ``_open``.  Every name that
+# predates the per-class split was preserved verbatim — ``recovered_open`` and
+# ``clear`` were NARROWED to the ``no_alarm`` verdict rather than renamed —
+# because an in-flight consumer already branches on them and a rename would
+# have left those branches silently dead.
+PARITY_STATES: frozenset[str] = frozenset({
+    'alarmed_open',
+    'alarmed_unlinked',
+    'recovered_open',
+    'clear',
+    'insufficient_data',
+    'insufficient_data_open',
+    'grandfathered',
+    'grandfathered_open',
+    'unjudged',
+    'unjudged_open',
+    'unknown_verdict',
+    'unknown_verdict_open',
+    'storm_collapsed',
+})
+
 # An eval whose newest run is older than this is DISPLAYED as stale.  It is
 # never alarmed on: the runner-failure tripwire belongs to the eval program,
 # and this module files nothing.  36h gives a nightly cadence one full missed
