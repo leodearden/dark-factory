@@ -271,7 +271,6 @@ class TestFixtureCrossValidation:
 
 class TestDefaultFixturePaths:
     """Default paths are package-relative — never a per-task worktree path."""
-
     def test_defaults_point_at_the_committed_fixtures(self):
         mod = _mod()
 
@@ -309,3 +308,362 @@ class TestDefaultFixturePaths:
             assert default.is_absolute()
             assert default.is_relative_to(package_root)
             assert default.exists()
+
+
+# ===========================================================================
+# step-3 — arm materialization
+# ===========================================================================
+#
+# `materialize_arm` turns the SAME knowledge into the three storage shapes
+# E2 arbitrates between (eval-design §5 E2 / PRD D9):
+#
+#   status_quo — the α corpus exactly as it actually existed: long original
+#                records, no vocabulary metadata at all.
+#   c_peers    — short single-claim peers, flat, all sharing a `topic`, with
+#                exactly one carrying `canonical: True` (PRD's Option C).
+#   b_grouped  — one canonical plus `parent_id` children (PRD's δ/Option B).
+#
+# Every arm additionally carries the IDENTICAL frozen distractor slab, which
+# is what makes the comparison controlled: the eval doc's contamination
+# result says distractors are what actually move retrieval.
+#
+# All pure — no network, no Qdrant, no embedder.
+
+
+@functools.cache
+def _committed_inputs() -> dict:
+    """The four committed fixtures, loaded once for the whole module."""
+    mod = _mod()
+    return {
+        'clusters': mod.load_calibration_clusters(ALPHA_FIXTURE_PATH),
+        'topics': mod.load_registry_topics(REGISTRY_PATH),
+        'claims': mod.load_arm_claims(ARM_CLAIMS_PATH),
+        'distractors': mod.load_distractor_slab(DISTRACTOR_SLAB_PATH),
+    }
+
+
+@functools.cache
+def _arm(shape: str) -> tuple:
+    """Materialize `shape` from the committed fixtures (cached, immutable view)."""
+    return tuple(_mod().materialize_arm(shape, **_committed_inputs()))
+
+
+def _knowledge(records) -> list:
+    """Just the arm's own records — the distractor slab filtered out."""
+    return [r for r in records if r.role != 'distractor']
+
+
+def _distractors(records) -> list:
+    return [r for r in records if r.role == 'distractor']
+
+
+class TestArmShapesBand:
+    """The arm set is pinned by EQUALITY, so a shape cannot be added silently.
+
+    E2's whole claim is that it compared *these three* shapes; a fourth
+    appearing without the report growing a column would make the decision
+    table quietly incomplete.
+    """
+
+    def test_arm_shapes_are_exactly_the_three_e2_arms(self):
+        assert _mod().ARM_SHAPES == ('status_quo', 'c_peers', 'b_grouped')
+
+    def test_unknown_shape_is_rejected_by_name(self):
+        mod = _mod()
+
+        with pytest.raises(ValueError, match='hybrid'):
+            mod.materialize_arm('hybrid', **_committed_inputs())
+
+
+class TestMaterializeStatusQuoArm:
+    """Arm (a): the corpus as it actually existed — long originals, no vocabulary."""
+
+    def test_emits_every_alpha_record_verbatim(self):
+        records = _knowledge(_arm('status_quo'))
+        clusters = _committed_inputs()['clusters']
+
+        originals = {r['memory_id']: r for c in clusters.values() for r in c.members}
+        assert len(records) == 104
+        assert {r.record_id for r in records} == set(originals)
+        for record in records:
+            # Verbatim: the status-quo arm must not be "helpfully" cleaned up,
+            # or it stops being the baseline the other two are measured against.
+            assert record.content == originals[record.record_id]['content']
+            assert record.cluster_id == originals[record.record_id]['cluster_id']
+
+    def test_carries_no_reserved_vocabulary_key_at_all(self):
+        """The α records genuinely have no `metadata` key — arm (a) reproduces that."""
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+
+        for record in _knowledge(_arm('status_quo')):
+            assert not (RESERVED_VOCABULARY_KEYS & set(record.metadata))
+
+    def test_role_preserves_the_alpha_label(self):
+        """The guard-adequacy probe selects the last `duplicate` record, so the
+        α labels must survive into the arm rather than being flattened."""
+        records = _knowledge(_arm('status_quo'))
+
+        assert {r.role for r in records} == {
+            'canonical', 'duplicate', 'pseudo_contradiction', 'distinct',
+        }
+
+
+class TestMaterializeCPeersArm:
+    """Arm (c): short single-claim peers sharing a topic, one flagged canonical."""
+
+    def test_emits_one_peer_per_claim_with_the_claim_text(self):
+        records = _knowledge(_arm('c_peers'))
+        claims = {c.claim_id: c for c in _committed_inputs()['claims']}
+
+        assert len(records) == len(claims) == 176
+        for record in records:
+            assert record.claim_ids and len(record.claim_ids) == 1
+            claim = claims[record.claim_ids[0]]
+            assert record.content == claim.text
+            assert record.cluster_id == claim.cluster_id
+
+    def test_all_peers_of_a_cluster_share_the_registry_topic(self):
+        """PRD D4: one topic namespace — slugs are taken verbatim from E1."""
+        topics = _committed_inputs()['topics']
+
+        for record in _knowledge(_arm('c_peers')):
+            assert record.metadata['topic'] == topics[record.cluster_id].topic
+
+    def test_exactly_one_peer_per_cluster_is_flagged_canonical(self):
+        per_cluster: dict[str, int] = {}
+        for record in _knowledge(_arm('c_peers')):
+            per_cluster.setdefault(record.cluster_id, 0)
+            # β's `invalid_canonical_type` rule is bool-identity, so the arm
+            # must emit a real True — a truthy 1 would be a fatal violation.
+            if record.metadata.get('canonical') is True:
+                per_cluster[record.cluster_id] += 1
+        assert len(per_cluster) == 20
+        assert set(per_cluster.values()) == {1}
+
+    def test_the_canonical_peer_is_short_not_a_concatenation(self):
+        """PRD §3: arm (c)'s canonical is an INDEX claim, not a rolled-up digest.
+
+        This is the load-bearing difference between C and B. If the canonical
+        were built by concatenating its cluster's peers, arm (c) would win
+        claim-recall trivially (every claim is inside the canonical) and lose
+        tokens-per-query for a reason that has nothing to do with the storage
+        shape — the experiment would measure a concatenation, not a peer set.
+        """
+        by_cluster: dict[str, list] = {}
+        for record in _knowledge(_arm('c_peers')):
+            by_cluster.setdefault(record.cluster_id, []).append(record)
+
+        clusters = _committed_inputs()['clusters']
+        for cluster_id, records in by_cluster.items():
+            canonical = next(r for r in records if r.metadata.get('canonical') is True)
+            peers = [r for r in records if r is not canonical]
+
+            # Not a concatenation: shorter than its own peers put together...
+            assert len(canonical.content) < sum(len(p.content) for p in peers)
+            # ...and no longer than the longest single peer, i.e. it sits
+            # inside the peer band rather than above it.
+            assert len(canonical.content) <= max(len(p.content) for p in peers)
+            # And dramatically shorter than the long α original it replaces —
+            # which is exactly the D4 cost question arm (c) exists to answer.
+            assert len(canonical.content) < len(clusters[cluster_id].canonical['content'])
+
+    def test_arm_c_is_flat_no_parent_links(self):
+        """Peers-as-default means no parent edge — that is arm (b)'s shape."""
+        for record in _knowledge(_arm('c_peers')):
+            assert 'parent_id' not in record.metadata
+
+
+class TestMaterializeBGroupedArm:
+    """Arm (b): one canonical per cluster plus `parent_id` children."""
+
+    def test_each_cluster_has_exactly_one_parentless_canonical(self):
+        by_cluster: dict[str, list] = {}
+        for record in _knowledge(_arm('b_grouped')):
+            by_cluster.setdefault(record.cluster_id, []).append(record)
+
+        assert len(by_cluster) == 20
+        for records in by_cluster.values():
+            canonicals = [r for r in records if r.metadata.get('canonical') is True]
+            assert len(canonicals) == 1
+            assert 'parent_id' not in canonicals[0].metadata
+
+    def test_every_child_points_at_its_clusters_canonical(self):
+        by_cluster: dict[str, list] = {}
+        for record in _knowledge(_arm('b_grouped')):
+            by_cluster.setdefault(record.cluster_id, []).append(record)
+
+        for records in by_cluster.values():
+            canonical = next(r for r in records if r.metadata.get('canonical') is True)
+            children = [r for r in records if r is not canonical]
+            assert children  # a grouped arm with no children is not grouped
+            for child in children:
+                assert child.metadata['parent_id'] == canonical.record_id
+
+    def test_children_carry_a_registry_kind_never_the_word_canonical(self):
+        """`kind: 'canonical'` is NOT in β's KIND_REGISTRY and would be fatal.
+
+        Canonicality is expressed by the `canonical` key, not by a `kind` —
+        this test pins that the arm does not conflate the two.
+        """
+        from fused_memory.memory_metadata import KIND_REGISTRY  # noqa: PLC0415
+
+        for record in _knowledge(_arm('b_grouped')):
+            kind = record.metadata.get('kind')
+            if record.metadata.get('canonical') is True:
+                assert kind is None
+                continue
+            assert kind in {'amendment', 'sighting'}
+            assert kind in KIND_REGISTRY
+
+    def test_parent_ids_are_canonical_dashed_uuids(self):
+        """β's `_is_full_uuid` rule: 36 chars, dashed, and its own str() round-trip.
+
+        A short hex id or a bare hex32 would trip `invalid_parent_id_shape`,
+        so the arm cannot mint ids casually.
+        """
+        import uuid  # noqa: PLC0415
+
+        seen = set()
+        for record in _knowledge(_arm('b_grouped')):
+            parent_id = record.metadata.get('parent_id')
+            if parent_id is None:
+                continue
+            assert len(parent_id) == 36
+            assert str(uuid.UUID(parent_id)) == parent_id
+            seen.add(parent_id)
+        assert len(seen) == 20  # one canonical per cluster
+
+
+class TestDistractorSlabIsSharedAndInert:
+    """The contamination variable must be IDENTICAL across arms, and inert."""
+
+    def test_every_arm_carries_the_same_slab_in_the_same_order(self):
+        slabs = {shape: _distractors(_arm(shape)) for shape in _mod().ARM_SHAPES}
+
+        for records in slabs.values():
+            assert len(records) == 300
+        reference = [(r.record_id, r.content) for r in slabs['status_quo']]
+        for shape, records in slabs.items():
+            assert [(r.record_id, r.content) for r in records] == reference, shape
+
+    def test_distractors_are_never_topic_anchorable(self):
+        """A distractor carrying a `topic` would stop being a distractor and
+        start being a right answer for the pin to find."""
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS  # noqa: PLC0415
+
+        for shape in _mod().ARM_SHAPES:
+            for record in _distractors(_arm(shape)):
+                assert not (RESERVED_VOCABULARY_KEYS & set(record.metadata))
+                assert record.cluster_id is None
+                assert record.claim_ids == []
+
+
+class TestClaimCoverageParity:
+    """The mechanical anti-laziness guard for the blind-authoring protocol.
+
+    The eval doc names the experiment's own biggest weakness: "arm quality
+    reflects authoring skill — the experiment is gameable by authoring one
+    arm well and another lazily". The floor against that is coverage parity:
+    an arm cannot be lazily authored by simply dropping claims.
+
+    Deliberately NOT total-content-length parity — arm (a)'s long originals
+    versus arm (c)'s short peers differ BY CONSTRUCTION, and that difference
+    IS the tokens-per-query metric (see the test below).
+    """
+
+    def test_every_arm_realizes_exactly_the_same_claim_set(self):
+        mod = _mod()
+        all_claim_ids = {c.claim_id for c in _committed_inputs()['claims']}
+
+        realized = {
+            shape: {cid for r in _arm(shape) for cid in r.claim_ids}
+            for shape in mod.ARM_SHAPES
+        }
+        for shape, ids in realized.items():
+            assert ids == all_claim_ids, f'{shape} does not realize every claim'
+
+    def test_status_quo_realizes_claims_through_its_source_records(self):
+        """For arm (a) a claim is realized by its `source_memory_id` record
+        being present — that is what makes parity checkable at all for an arm
+        that was never decomposed into claims."""
+        claims = _committed_inputs()['claims']
+        by_record = {r.record_id: r for r in _knowledge(_arm('status_quo'))}
+
+        for claim in claims:
+            assert claim.claim_id in by_record[claim.source_memory_id].claim_ids
+
+    def test_arms_deliberately_differ_in_length_that_is_the_d4_metric(self):
+        """The inverse guard: assert the arms were NOT length-equalized.
+
+        If some future edit "balanced" the arms to look fair, it would delete
+        the tokens-per-query result the D4 question is asked to answer.
+        """
+        totals = {
+            shape: sum(len(r.content) for r in _knowledge(_arm(shape)))
+            for shape in _mod().ARM_SHAPES
+        }
+
+        assert totals['status_quo'] > 2 * totals['c_peers']
+        assert totals['c_peers'] == totals['b_grouped']  # same claim bodies
+
+
+class TestBetaVocabularyConformance:
+    """Every emitted metadata dict must be storable through the real seam.
+
+    The bake-off writes through `Mem0Backend` directly, so it bypasses the
+    service-seam validation entirely. Running β/3195's validator over the
+    emitted metadata keeps the experiment measuring shapes the system could
+    ACTUALLY store — otherwise an arm could win by using a shape the write
+    boundary would have rejected in production.
+    """
+
+    def test_no_arm_emits_a_fatal_metadata_violation(self):
+        from fused_memory.memory_metadata import validate_memory_metadata  # noqa: PLC0415
+
+        for shape in _mod().ARM_SHAPES:
+            for record in _arm(shape):
+                violations = validate_memory_metadata(
+                    dict(record.metadata), enforce_kind_registry=True
+                )
+                fatal = [v for v in violations if v.fatal]
+                assert not fatal, f'{shape}/{record.record_id}: {fatal}'
+
+    def test_every_topic_matches_the_shared_slug_shape(self):
+        """PRD D4's one-namespace rule, pinned mechanically rather than by
+        convention — the slugs come verbatim from E1's registry."""
+        from fused_memory.memory_metadata import (  # noqa: PLC0415
+            TOPIC_SLUG_MAX_LEN,
+            TOPIC_SLUG_RE,
+        )
+
+        topicked = 0
+        for shape in _mod().ARM_SHAPES:
+            for record in _arm(shape):
+                topic = record.metadata.get('topic')
+                if topic is None:
+                    continue
+                topicked += 1
+                assert TOPIC_SLUG_RE.match(topic)
+                assert len(topic) <= TOPIC_SLUG_MAX_LEN
+        assert topicked  # the anchored arms really do carry topics
+
+
+class TestMaterializationIsDeterministic:
+    """A rerun must seed byte-identical collections, or the two runs' reports
+    are not comparable and a diff stops being signal."""
+
+    def test_two_materializations_agree_exactly(self):
+        mod = _mod()
+
+        for shape in mod.ARM_SHAPES:
+            first = mod.materialize_arm(shape, **_committed_inputs())
+            second = mod.materialize_arm(shape, **_committed_inputs())
+
+            assert [(r.record_id, r.content, r.metadata, r.role) for r in first] == [
+                (r.record_id, r.content, r.metadata, r.role) for r in second
+            ]
+
+    def test_record_ids_are_unique_within_an_arm(self):
+        for shape in _mod().ARM_SHAPES:
+            records = _arm(shape)
+            assert len({r.record_id for r in records}) == len(records), shape
