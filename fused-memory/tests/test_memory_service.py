@@ -10674,3 +10674,118 @@ class TestParentIdLivenessAtSeam:
         assert 'invalid_parent_id_shape' in codes
         assert 'dead_parent_id' not in codes
         assert 'parent_id_liveness_unavailable' not in codes
+
+    # -- lookup FAILURE is not the same fact as a dead parent -------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_lookup_failure_censuses_unavailable_not_dead_in_warn_mode(
+        self, service, entry_point, caplog
+    ):
+        """A timed-out read must never be reported as a dead parent.
+
+        `get_point_by_id` deliberately PROPAGATES a Qdrant read timeout
+        rather than collapsing it into None, precisely so the two facts stay
+        distinguishable; folding both into `dead_parent_id` would discard
+        that at the seam and tell an operator a live parent is dead. Warn
+        mode also keeps its promise: validation never blocks a write.
+        """
+        caplog.set_level(logging.WARNING)
+        assert service.config.memory_metadata.enforce is False
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        codes = _mm_census_codes(caplog)
+        assert 'parent_id_liveness_unavailable' in codes
+        assert 'dead_parent_id' not in codes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_lookup_failure_logs_the_raw_backend_cause(
+        self, service, entry_point, caplog
+    ):
+        """The backend cause is degraded, not discarded.
+
+        The census code says only "could not be checked"; without the
+        exception type in the log an operator debugging a burst of
+        `parent_id_liveness_unavailable` has nothing to correlate against.
+        """
+        caplog.set_level(logging.WARNING, logger='fused_memory.services.memory_service')
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        text = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'TimeoutError' in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_lookup_failure_fails_closed_under_enforce(
+        self, service, entry_point
+    ):
+        """INV-3: an actor that cannot corroborate must not act.
+
+        Blast radius is confined to writes that actually carry `parent_id`
+        — a population leaf α measured at zero live records — and only when
+        `enforce` is on.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        codes = {v.code for v in excinfo.value.violations}
+        assert 'parent_id_liveness_unavailable' in codes
+        assert 'dead_parent_id' not in codes
+        _mm_backend_mock(service, entry_point).assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_backend_exception_never_leaks_past_the_seam(
+        self, service, entry_point
+    ):
+        """The MCP boundary must report the metadata contract, not a backend
+        detail: a raw TimeoutError there reads as a transport fault an agent
+        should retry, when the actual state is "this write was rejected"."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+        assert type(excinfo.value) is MemoryMetadataValidationError
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_non_timeout_backend_failure_takes_the_same_arm(
+        self, service, entry_point, caplog
+    ):
+        """The mapping is "liveness is UNKNOWN", not "the timeout case".
+
+        Special-casing TimeoutError would leave every other transport fault
+        — a connection reset, a serialization error — falling through to
+        whatever the raw exception did.
+        """
+        caplog.set_level(logging.WARNING)
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=RuntimeError('qdrant transport blew up')
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'parent_id_liveness_unavailable' in _mm_census_codes(caplog)
