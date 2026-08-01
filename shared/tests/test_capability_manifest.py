@@ -7,10 +7,11 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
   - TestCapabilityManifestDoc: the doc-level label uniqueness invariant.
   - TestLoader: load_capability_manifest / parse_capability_manifest, including
     the committed exemplar sidecar as a CI fixture.
-  - TestManifestCorpusDiscovery / TestCheckManifest / TestCheckedInManifestCorpus:
-    a corpus-wide guard validating every checked-in sidecar (not just the one
-    committed exemplar TestLoader covers), built on the sibling test-support
-    module shared/tests/capability_manifest_corpus.py (task 3362).
+  - TestManifestCorpusDiscovery / TestCheckManifest / TestMissingFromWorktreeMessage /
+    TestCheckedInManifestCorpus: a corpus-wide guard validating every
+    checked-in sidecar (not just the one committed exemplar TestLoader
+    covers), built on the sibling test-support module
+    shared/tests/capability_manifest_corpus.py (task 3362).
   - TestDeliveredCheckMeta / TestMetadataRegistration: the
     metadata.delivered_checks registered sub-model.
 """
@@ -675,6 +676,33 @@ _MANIFEST_PATHS = discover_manifests() or []
 _MANIFEST_IDS = [str(p.relative_to(REPO_ROOT)) for p in _MANIFEST_PATHS]
 
 
+def _missing_from_worktree_message(manifest_path: Path) -> str:
+    """Message for a sidecar ``git ls-files`` tracks but the working tree lacks.
+
+    ``git ls-files`` reports index entries, not working-tree entries: an
+    unstaged deletion (``rm sidecar.yaml`` without ``git rm``) or a
+    skip-worktree/sparse-checkout entry makes :func:`discover_manifests`
+    return a path that doesn't exist on disk. ``check_manifest`` letting
+    ``FileNotFoundError`` propagate is correct for a direct caller (see
+    ``TestCheckManifest.test_missing_file_propagates_file_not_found`` — a
+    missing file is a caller bug, not manifest drift) — but in the corpus
+    sweep below, the "caller" is the guard itself, so a tracked-but-missing
+    file must fail loudly and name the file, not surface as an uncaught
+    traceback from this guard (code-review amendment, task 3362).
+    """
+    rel = manifest_path.relative_to(REPO_ROOT)
+    return f'{rel}: tracked in git but missing from the working tree'
+
+
+class TestMissingFromWorktreeMessage:
+    def test_names_the_repo_relative_path(self):
+        target = REPO_ROOT / 'plans' / 'nonexistent.capability-manifest.yaml'
+        assert _missing_from_worktree_message(target) == (
+            'plans/nonexistent.capability-manifest.yaml: '
+            'tracked in git but missing from the working tree'
+        )
+
+
 class TestCheckedInManifestCorpus:
     """Every checked-in capability-manifest sidecar validates against the schema.
 
@@ -689,25 +717,32 @@ class TestCheckedInManifestCorpus:
         1. Inserted an unknown key (`verdcit: PASS`) into one real capability
            entry of plans/capability-delivered-checks-prd.capability-manifest.yaml
            (the "sidecar-loader-models-exist" capability under task α).
-        2. Ran this class: all three parametrized cases keyed to that one
-           file failed (test_checked_in_manifest_validates,
-           _capabilities_round_trip, and _prd_field_matches_its_own_filename
-           — each loads the same mutated file), while every other file's
-           cases across all three methods stayed green. The
-           test_checked_in_manifest_validates failure carried the exact
-           assertion message: "plans/capability-delivered-checks-prd.
+        2. Ran this class: both parametrized cases keyed to that one file
+           failed (test_checked_in_manifest_validates and
+           _prd_field_matches_its_own_filename — each loads the same mutated
+           file), while every other file's cases across both methods stayed
+           green. The test_checked_in_manifest_validates failure carried the
+           exact assertion message: "plans/capability-delivered-checks-prd.
            capability-manifest.yaml: schema validation failed: 1 validation
            error for CapabilityManifestDoc tasks.0.capabilities.1.verdcit
            Extra inputs are not permitted [...]" — naming both the mutated
            file and the offending `verdcit` key, exactly as check_manifest's
            docstring promises.
         3. Reverted the sidecar (`git checkout --`) and reran: full class
-           green again, all 30 files (181 tests across the whole module).
+           green again (re-verified after the code-review amendment below
+           that dropped the third, tautological parametrization).
 
     Does NOT assert delivered_check `script:` targets exist on disk —
     deliberately out of scope (n=1 in the corpus at planning time, and it
     would couple this authoring guard to script lifecycle rather than
-    manifest shape).
+    manifest shape). Does NOT separately re-validate each capability via
+    `ManifestCapability.model_validate(cap.model_dump()) == cap`
+    (code-review amendment, task 3362: dropped as tautological) —
+    `load_capability_manifest` already constructs every `ManifestCapability`
+    through that same `extra='forbid'` model with plain str/list/int fields,
+    so the round trip could only fail when `load_capability_manifest` itself
+    already raised, which `test_checked_in_manifest_validates` already
+    reports with a better, file-attributed message.
     """
 
     def test_corpus_discovery_is_not_vacuous(self):
@@ -721,18 +756,11 @@ class TestCheckedInManifestCorpus:
 
     @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
     def test_checked_in_manifest_validates(self, manifest_path):
-        message = check_manifest(manifest_path)
+        try:
+            message = check_manifest(manifest_path)
+        except FileNotFoundError:
+            pytest.fail(_missing_from_worktree_message(manifest_path))
         assert message is None, message
-
-    @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
-    def test_checked_in_manifest_capabilities_round_trip(self, manifest_path):
-        # Explicit "every capability validates against ManifestCapability"
-        # signal, exercising extra='forbid' per-capability on top of what
-        # load_capability_manifest already recursed into.
-        doc = load_capability_manifest(manifest_path)
-        for task in doc.tasks:
-            for cap in task.capabilities:
-                assert ManifestCapability.model_validate(cap.model_dump()) == cap
 
     @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
     def test_checked_in_manifest_prd_field_matches_its_own_filename(self, manifest_path):
@@ -742,7 +770,10 @@ class TestCheckedInManifestCorpus:
         # looks for a sidecar that isn't there and silently no-ops (its
         # documented "no sidecar on disk is a complete no-op" contract) —
         # the drift is invisible at exactly the moment it matters.
-        doc = load_capability_manifest(manifest_path)
+        try:
+            doc = load_capability_manifest(manifest_path)
+        except FileNotFoundError:
+            pytest.fail(_missing_from_worktree_message(manifest_path))
         rel = str(manifest_path.relative_to(REPO_ROOT))
         expected_prd = rel[: -len(MANIFEST_SUFFIX)] + '.md'
         assert doc.prd == expected_prd
