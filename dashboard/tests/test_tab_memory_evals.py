@@ -444,3 +444,155 @@ def test_index_html_registers_tab_memory_evals_load_order(
         'already-open browsers; the previous floor, 37, proved task 3332\'s '
         '`const API` collision fix).'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-5 tests: tab_memory_evals.jsx is served and renders eval cards + trends
+# ---------------------------------------------------------------------------
+
+
+def test_tab_memory_evals_jsx_served_and_exports_section(_client) -> None:
+    """The section file must be served and export MemoryEvalsSection on its
+    own window global, following the scheduler_heatmap.jsx:191 producer idiom.
+    """
+    resp = _client.get('/static/redux/tab_memory_evals.jsx')
+    assert resp.status_code == 200, (
+        'GET /static/redux/tab_memory_evals.jsx returned '
+        f'{resp.status_code} — index.html already references the file '
+        '(step-4), so a missing file is a hard 404 in the browser.'
+    )
+    body = resp.text
+    assert 'window.DF_MEMORY_EVALS = {' in body, (
+        'tab_memory_evals.jsx must set `window.DF_MEMORY_EVALS = { ... }` at '
+        'the file tail (the scheduler_heatmap.jsx:191 precedent) — that global '
+        'is what tabs.jsx destructures at module top level.'
+    )
+    assert re.search(
+        r'window\.DF_MEMORY_EVALS\s*=\s*\{[^}]*\bMemoryEvalsSection\b', body
+    ), (
+        'window.DF_MEMORY_EVALS must export MemoryEvalsSection — tabs.jsx '
+        'renders it inside MemoryTab.'
+    )
+
+
+def test_tab_memory_evals_renders_eval_cards_and_trends(
+    tab_memory_evals_jsx_body: str,
+) -> None:
+    """The section renders one card per eval and a trend per metric, from the
+    payload's own parallel-array trend shape.
+    """
+    body = tab_memory_evals_jsx_body
+
+    # (c) the component exists as a named function declaration
+    assert re.search(r'\bfunction\s+MemoryEvalsSection\s*\(', body), (
+        'tab_memory_evals.jsx must define `function MemoryEvalsSection(`.'
+    )
+
+    # (d) chart primitives + PALETTE destructured off DF_CHARTS at module top
+    #     level, under file-unique aliases (the per-file alias convention:
+    #     tabs.jsx uses CP/ST, tab_scheduler.jsx uses stUseState, ...).
+    charts_destructure = re.search(
+        r'const\s*\{([^}]*)\}\s*=\s*window\.DF_CHARTS\s*;', body
+    )
+    assert charts_destructure is not None, (
+        'tab_memory_evals.jsx must destructure its chart primitives off '
+        '`window.DF_CHARTS` at module top level.'
+    )
+    destructured = charts_destructure.group(1)
+    assert 'PALETTE' in destructured, (
+        'tab_memory_evals.jsx must destructure PALETTE off window.DF_CHARTS '
+        '(no hard-coded colour literals).'
+    )
+    assert re.search(r'\b\w+\s*:\s*\w+', destructured), (
+        'chart primitives must be aliased to file-unique names (e.g. '
+        '`Sparkline: MESpark`), following the codebase per-file alias '
+        f'convention. Got: {destructured!r}'
+    )
+    charts_pos = charts_destructure.start()
+    fn_pos = body.index('function MemoryEvalsSection')
+    assert charts_pos < fn_pos, (
+        'the window.DF_CHARTS destructure must sit at module top level, above '
+        'MemoryEvalsSection — not inside it.'
+    )
+
+    # (e) reads DF_DATA.MEMORY_EVALS, maps evals keyed on eval_id, metrics on
+    #     metric_id
+    assert 'window.DF_DATA' in body, (
+        'tab_memory_evals.jsx must read window.DF_DATA.'
+    )
+    assert 'MEMORY_EVALS' in body, (
+        'tab_memory_evals.jsx must read the MEMORY_EVALS key of DF_DATA.'
+    )
+    assert re.search(r'\.evals\b', body), (
+        'tab_memory_evals.jsx must render the payload\'s `evals` list.'
+    )
+    assert re.search(r'key=\{[^}]*\beval_id\b', body), (
+        'each eval card must be keyed on `eval_id`.'
+    )
+    assert re.search(r'\.metrics\b', body), (
+        "tab_memory_evals.jsx must render each eval's `metrics` list."
+    )
+    assert re.search(r'key=\{[^}]*\bmetric_id\b', body), (
+        'each metric row must be keyed on `metric_id`.'
+    )
+
+    # (f) the trend renders from the PARALLEL-ARRAY shape, holes intact
+    assert 'trend.labels' in body, (
+        'the trend must be rendered from `trend.labels` (the payload ships two '
+        'index-aligned parallel arrays, not point objects).'
+    )
+    assert 'trend.values' in body, (
+        'the trend must be rendered from `trend.values`.'
+    )
+    for hostile in (
+        r'trend\.values[^\n]{0,40}\.filter\(',
+        r'trend\.labels[^\n]{0,40}\.filter\(',
+    ):
+        assert not re.search(hostile, body), (
+            'trend values/labels must be passed through UNFILTERED. A `null` '
+            'in `values` is a deliberate hole (that run produced no sample); '
+            'dropping it would shift this metric\'s points against every '
+            "other metric's, since all series share the run_stamps x-axis."
+        )
+
+    # (g) charts.jsx primitives only — no new chart library
+    assert re.search(r'\b(MESpark|MEStep|METile|MELine|Sparkline|StepSpark|StatTile|LineChart)\b', body), (
+        'the section must use at least one charts.jsx primitive '
+        '(Sparkline / StepSpark / StatTile / LineChart).'
+    )
+    for lib in ('d3', 'chart.js', 'recharts', 'plotly'):
+        assert lib not in body.lower(), (
+            f"tab_memory_evals.jsx references '{lib}' — the PRD and the task "
+            'both forbid a new chart library; use charts.jsx primitives only.'
+        )
+
+    # (h) the kind vocabulary lives in the primitive-selection helper, with an
+    #     explicit unknown/null fallback
+    assert re.search(r'\bfunction\s+chartForKind\s*\(', body), (
+        'tab_memory_evals.jsx must define `function chartForKind(kind)` — the '
+        'single place the metric-kind vocabulary maps to a chart primitive.'
+    )
+    kind_body = _extract_function_body(body, 'chartForKind')
+    assert kind_body, 'could not extract the chartForKind body.'
+    for kind in ('tripwire', 'proportion', 'count', 'scalar'):
+        assert f"'{kind}'" in kind_body, (
+            f"chartForKind must name the '{kind}' metric kind — the payload's "
+            'vocabulary is exactly {tripwire, proportion, count, scalar}.'
+        )
+    assert 'return null' in kind_body.replace('  ', ' '), (
+        'chartForKind must fall back to `null` (value only, NO chart) for an '
+        'unknown-or-null kind. A kind outside the known set is a rendering gap '
+        "the payload already files an `unknown_kind` issue for; guessing a "
+        'primitive would render an unvalidated shape as though it were '
+        'understood.'
+    )
+
+    # (i) the truncation disclosure names both counts
+    assert re.search(r'\btruncated\b', body), (
+        "the eval-level `truncated` flag must gate a visible disclosure."
+    )
+    assert 'runs_on_disk' in body and 'run_count' in body, (
+        'the truncation disclosure must name `run_count` shown of '
+        '`runs_on_disk` on disk — a bare "truncated" badge hides how much was '
+        'dropped.'
+    )
