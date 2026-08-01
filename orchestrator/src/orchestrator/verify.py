@@ -4954,6 +4954,29 @@ async def run_verification(
         )
         raise VerifyInfraError(phase='xdist_worker_crash', errno=None)
 
+    # Name the unrun segments in the one-line verdict (task 3338 / esc-3062-2).
+    # `_summarize_checks` already surfaces the NOT RUN block's "unknown is not a
+    # pass" wording, so the run is correctly non-green — but non-green is not
+    # the same as legible: without the labels a triaging agent still cannot tell
+    # WHICH subprojects have no result, which is the human-time cost the whole
+    # task is about.
+    #
+    # Deliberately a small local append rather than a change to
+    # `_summarize_checks`: that function's wide positional signature is shared
+    # with the env-recovery retry path, and both of its call sites are above, so
+    # editing it would be an unrequested blast radius for a purely additive
+    # verdict detail. Placed here — after BOTH `_summarize_checks` calls and
+    # before `runs`/persistence — so the augmented hint reaches
+    # `_persist_attempt_logs`/`_archive_merge_verify_logs` too, not just the
+    # returned VerifyResult.
+    _not_run_labels = [
+        seg['label']
+        for seg in (attempt.test.segments or [])
+        if seg.get('status') == 'not_run'
+    ]
+    if _not_run_labels:
+        cause_hint = f'{cause_hint} | segments not run: {", ".join(_not_run_labels)}'
+
     # Hoist runs list so both the merge-path and task-path branches can use it.
     runs = [c.to_dict() for c in attempt.checks]
 
