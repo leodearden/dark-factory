@@ -1676,16 +1676,24 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
             f'{task_kind!r}, metadata, {project_root!r});'
             'print(json.dumps(result))'
         )
+        fm_project = _REPO_ROOT / 'fused-memory'
+        if not fm_project.is_dir():
+            pytest.fail(
+                'uv fallback mis-wired: computed --project dir does not exist.\n'
+                f'  --project:  {fm_project}\n'
+                f'  _REPO_ROOT: {_REPO_ROOT}\n'
+                f'  __file__:   {__file__}\n'
+                'Expected <repo root>/fused-memory, where repo root is '
+                'Path(__file__).resolve().parents[2].'
+            )
         try:
             out = subprocess.check_output(
-                ['uv', 'run', '--project',
-                 str(_REPO_ROOT / 'fused-memory'), 'python', '-c', code],
+                ['uv', 'run', '--project', str(fm_project), 'python', '-c', code],
                 text=True,
                 timeout=30,
             )
             return json.loads(out.strip()) if out.strip() != 'null' else None
         except (subprocess.SubprocessError, FileNotFoundError) as exc:
-            import pytest
             pytest.skip(f'fused_memory not importable and uv fallback unavailable: {exc}')
             return None  # unreachable but satisfies type checker
 
