@@ -21,6 +21,7 @@ from orchestrator.verify_cmd import (
     VerifyCmd,
     apply_pytest_numprocesses,
     cargo_scope,
+    describe_dropped_clauses,
     govern_cpu,
     has_unpreserved_chain_clauses,
     parse_config_command,
@@ -1611,3 +1612,123 @@ class TestHasUnpreservedChainClauses:
         dropped = has_unpreserved_chain_clauses(prefix, tail)
         expected = not tail and len(split_top_level_and(raw)) > 1
         assert dropped is expected
+
+
+# ---------------------------------------------------------------------------
+# What a gate REJECT actually dropped — the clauses, and whether they re-invoke
+# ---------------------------------------------------------------------------
+
+
+class TestDescribeDroppedClauses:
+    """describe_dropped_clauses(raw, retained, keyword) — the DIAGNOSTIC-ONLY companion.
+
+    ``has_unpreserved_chain_clauses`` answers "was anything dropped at all";
+    this answers "WHAT was dropped, and is it the same tool again". Both are
+    pure, which is what keeps this module logging-free — the caller
+    (``verify_plan.log_dropped_chain_clauses``) turns the answer into a record.
+
+    Two properties are pinned here because the first version of that record
+    got both wrong (task 3218, review findings 1 and 2):
+
+    * the COUNT is the top-level `&&` SEGMENT DELTA across *retained*, not
+      ``len(split_top_level_and(raw)) - 1``. The caller's truncation point is
+      ``head[: idx + len(keyword)]``, which for every ``cd X && <tool>`` config
+      in this repo retains segments 0 AND 1 — so counting every clause in the
+      whole original over-reports by one. Nor can it be the re-split of the
+      dropped TEXT ``raw[len(retained):]``: *retained* normally ends
+      MID-segment (``'uv run pytest'`` of ``'uv run pytest tests/ && ...'``),
+      so the leftover ``tests/`` would be counted as a second clause when it is
+      a truncated ARGUMENT, not a clause;
+    * the FAN-OUT flag comes from the dropped clauses themselves, via the same
+      ``_segment_invokes_tool`` predicate gate condition 7 uses. Keying it on
+      ``keyword == 'pytest'`` instead mislabelled this repo's own root
+      ``test_command`` — a pure pytest fan-out with no sibling checker anywhere
+      — as a dropped sibling check.
+    """
+
+    def test_root_type_check_fan_out(self):
+        """The live root ``type_check_command``: 6 segments, 2 retained, 4 dropped.
+
+        The record used to say 5 — every clause in the original — because the
+        keyword sits in segment 1, not segment 0.
+        """
+        dropped, fan_out = describe_dropped_clauses(
+            _ROOT_TYPE_CHECK_COMMAND, 'cd fused-memory && npx pyright', 'pyright',
+        )
+        assert len(dropped) == 4
+        assert fan_out is True
+        assert dropped[0] == 'cd ../orchestrator'
+        assert dropped[-1] == 'npx pyright'
+
+    def test_root_test_command_fan_out(self):
+        """The live root ``test_command``: 16 segments, 2 retained, 14 dropped.
+
+        This is the regression case for review finding 2. Every dropped
+        ``uv run pytest tests/ --timeout=300`` clause invokes pytest at an
+        argv head, so this is a SAME-TOOL FAN-OUT — never a sibling check —
+        and it is the highest-frequency pytest-slot drop in this repo.
+        """
+        dropped, fan_out = describe_dropped_clauses(
+            _ROOT_TEST_COMMAND, 'cd shared && uv run pytest', 'pytest',
+        )
+        assert len(dropped) == 14
+        assert fan_out is True
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected_clause'),
+        [
+            (_SIBLING_CHECKER_TEST_COMMAND, 'python3 scripts/check_pytest_markers.py tests'),
+            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'python3 scripts/check_markers.py tests'),
+        ],
+        ids=['named-sibling', 'unnamed-sibling'],
+    )
+    def test_pytest_sibling_checker_is_one_clause_and_not_a_fan_out(self, raw, expected_clause):
+        """*retained* ends MID-segment-0 here — ``'uv run pytest'`` drops the
+        ``tests/`` argument — so the count MUST come from the segment delta.
+        Re-splitting ``raw[len(retained):]`` would report 2.
+        """
+        dropped, fan_out = describe_dropped_clauses(raw, 'uv run pytest', 'pytest')
+        assert dropped == (expected_clause,)
+        assert fan_out is False
+
+    def test_nothing_dropped_for_an_unchained_command(self):
+        """A single-clause command has no clause past the truncation point.
+
+        ``'src/'`` is a leftover ARGUMENT, not a dropped clause: the fallback
+        below must not mistake it for one.
+        """
+        assert describe_dropped_clauses('ruff check src/', 'ruff check', 'ruff check') == ((), False)
+
+    @pytest.mark.parametrize(
+        ('raw', 'retained', 'keyword'),
+        [
+            ('ruff check src/ || python3 x.py', 'ruff check', 'ruff check'),
+            ('npx pyright ; python3 y.py', 'npx pyright', 'pyright'),
+            ('uv run pytest tests/ | tee log', 'uv run pytest', 'pytest'),
+        ],
+        ids=['or', 'semicolon', 'pipe'],
+    )
+    def test_non_and_operator_chain_reports_one_clause(self, raw, retained, keyword):
+        """The segment view cannot see a `||` / `;` / `|` chain — one `&&` segment.
+
+        Without the remainder fallback the record would read "dropped 0
+        trailing chain clause(s)" on a path only reached because
+        ``has_unpreserved_chain_clauses`` reported a REAL drop — a record that
+        contradicts itself.
+        """
+        dropped, fan_out = describe_dropped_clauses(raw, retained, keyword)
+        assert len(dropped) == 1
+        assert fan_out is False
+
+    def test_undecodable_dropped_clause_counts_as_a_fan_out(self):
+        """Mirrors ``_segment_invokes_tool``'s ValueError->True.
+
+        An unbalanced quote makes the clause undecodable, so it cannot be
+        shown NOT to re-invoke the tool. Treat it as the quiet fan-out case
+        rather than shouting a sibling-check claim that may be false.
+        """
+        dropped, fan_out = describe_dropped_clauses(
+            'ruff check src/ && python3 "x.py', 'ruff check', 'ruff check',
+        )
+        assert dropped == ('python3 "x.py',)
+        assert fan_out is True
