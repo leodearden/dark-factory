@@ -572,25 +572,29 @@ The merge procedure is iterative — don't assume one pass will be enough:
   [resumed-poll terminal set](#resumed-poll) below**. Never resubmit and never direct-merge.
 
   <a id="resumed-poll"></a>**Resumed-poll terminal set.** Wherever this section sends you to
-  branch-handle polling with a `superseded` hit already in hand — whether you disregarded it as
-  stale (the rc=1 case below), or fell back here because its `superseded_by` was unpollable or
-  never resolved — drop `superseded` from the terminal set for that resumed loop. The branch
-  handle will otherwise re-serve the identical stale record on tick 1, `accept_terminal` accepts
-  it unconditionally, and you bounce straight back into the bullet you came from — a ping-pong
-  that burns the entire 20-minute budget without ever observing the state change you are waiting
-  for. Use:
+  branch-handle polling with a `superseded` hit already in hand — after an rc=1 ancestry read
+  (the case below), or because its `superseded_by` was unpollable or never resolved — drop
+  `superseded` from the terminal set for that resumed loop. The branch handle will otherwise
+  re-serve the identical record on tick 1, `accept_terminal` accepts it unconditionally, and you
+  bounce straight back into the bullet you came from — a ping-pong that burns the entire
+  20-minute budget without ever observing a `merge_status` state change. Use:
   ```
   terminal_resumed = ("done", "conflict", "blocked", "abandoned")
   # plus: a `superseded` whose `superseded_by` DIFFERS from the one you just disregarded —
   #       that is a genuinely new absorption; re-enter the superseded bullet against it.
   # An identical `superseded`/`superseded_by` pair is the stale record: keep polling.
   ```
-  Break on one of those or on the 20-minute ceiling, then stop-and-report. This does **not**
-  contradict `accept_terminal`'s "do not spin here re-polling this same key": that rule governs
-  the *first* loop, where exiting on `superseded` is exactly what gets you to the ancestry check.
-  This governs the *resumed* loop, which that check has already told you is watching a stale
-  record — here the same key repeating is the non-event you must not exit on. You are waiting for
-  the record to **change**.
+  **`merge_status` will never itself change for a coalesce-absorbed member** — nothing overwrites
+  its `superseded` record (see above) — so `terminal_resumed` alone can starve forever even after
+  the real merge lands. On every tick, alongside the `merge_status` check, also re-run the
+  [canonical ancestry check](#branch-on-main): break the instant it — or, once it reaches
+  rc=128-with-empty-marker, either landing signal below — reports landed. Only stop-and-report
+  once ancestry (and, where reached, both signals) is still not-landed when `terminal_resumed`'s
+  20-minute ceiling arrives; that final check is what "if it never lands" means below. This does
+  **not** contradict `accept_terminal`'s "do not spin here re-polling this same key": that rule
+  governs the *first* loop, where exiting on `superseded` is exactly what gets you to the
+  ancestry check. This governs the *resumed* loop, which is driven by that check, not by
+  `merge_status`'s frozen state.
 
   **Here an empty rc=128 marker search does NOT mean "not landed."** A coalesce train stacks its
   members linearly and merges only the **tip** branch into main (`tip_branch=tip_req.branch`,
@@ -601,17 +605,15 @@ The merge procedure is iterative — don't assume one pass will be enough:
   serves; taking it as "not landed" would report a successful merge to the human as a failure and
   leave the task un-flipped. So:
   - Ancestry `rc=0` is authoritative — landed — while the ref still exists.
-  - Ancestry `rc=1` (the branch ref **exists** and its commits are genuinely not on main) is
-    equally authoritative the other way, and on these unscoped arms it is the affirmative
-    **stale-record tell**: this attempt's commits are demonstrably not on main, so the
-    `superseded` hit belongs to an *earlier round* for this same reused branch/task_id. Do
-    **not** consult signals (a) or (b) here — both are round-1 artifacts that still read
-    "landed" (that train really did land, and `mark_member_done` really did flip this task
-    then), so consulting them would flip the task `done` with the old tip's SHA while this
-    round's commits sit unmerged. Disregard the `superseded` hit and resume branch-handle polling
-    to the 20-minute ceiling **under the [resumed-poll terminal set](#resumed-poll)** — without
-    that carve-out the resumed poll breaks instantly on the same stale record and bounces you
-    right back here. Stop-and-report if it never lands. Never resubmit here.
+  - Ancestry `rc=1` (the branch ref **exists** and its commits are genuinely not on main) means
+    only "not landed **yet**" — right after absorption the train (or successor) is typically
+    still in flight, so this round's commits have legitimately not reached main. It is **not**
+    evidence that the `superseded` hit is a stale prior-round record, and it is not a reason to
+    give up: disregard the raw `superseded`/`superseded_by` value as an action signal (do not
+    try to poll or follow it) and resume branch-handle polling **under the
+    [resumed-poll terminal set](#resumed-poll)**, which re-derives the real answer from ancestry
+    itself on every tick rather than from this frozen record. Stop-and-report only if rc=1 still
+    holds at that loop's 20-minute ceiling. Never resubmit here.
   - **Only under rc=128-with-empty-marker**, do not conclude anything yet — and only here are
     signals (a) and (b) consultable at all. There are exactly **two** affirmative landing
     signals, and only these two:
