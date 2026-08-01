@@ -82,6 +82,47 @@ def _stage_report(stats: dict) -> StageReport:
     )
 
 
+@pytest.fixture
+def mock_deps():
+    """Stage-2 constructor kwargs for the run()-level test harnesses below.
+
+    Shared by TestRunRecordsTaskCountSnapshotWrittenStat and
+    TestSnapshotWrittenStatKeyIsConstantDriven, which exercise the same
+    ``super().run()``-for-real harness and had byte-identical copies of this
+    fixture (code-duplication finding, task-3045 amendment round): two
+    copies drift the moment run()'s dependencies change, and only one gets
+    updated. Classes needing a different shape still define their own
+    ``mock_deps``, which shadows this one.
+    """
+    config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+    memory_service = AsyncMock()
+    # count==1 short-circuits the unrelated stage2-summary verify/repair/
+    # reconstruct chain so these tests stay isolated to the snapshot stat.
+    memory_service.count_memories_by_metadata.return_value = 1
+    memory_service.delete_memory = AsyncMock(return_value=None)
+    memory_service.search.return_value = []
+    memory_service.add_memory.return_value = {'memory_ids': []}
+    taskmaster = AsyncMock()
+    taskmaster.get_tasks.return_value = {'tasks': []}
+    return {
+        'memory_service': memory_service,
+        'taskmaster': taskmaster,
+        'journal': AsyncMock(),
+        'config': config,
+    }
+
+
+def _fake_cli_result():
+    """Canned run_stage_via_cli result — the CLI leg is patched out so these
+    tests target run()'s own pre/post-flight wiring, not the subprocess."""
+    return MagicMock(
+        success=True,
+        report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+        llm_calls=1, tokens_used=0, cost_usd=0.0,
+        model='test-model', error=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -94,6 +135,14 @@ class TestConstants:
         assert TASK_COUNT_SNAPSHOT_KIND == 'task_count_snapshot'
 
     def test_stat_key_value(self):
+        """Exact-value pin — also the anti-regression guard for the task-3045
+        rename: the un-namespaced spelling read as a persistence claim about
+        Graphiti, which is what drove Stage 3 / the judge to report a
+        "rejected write" for a snapshot that is Mem0-only BY DESIGN (see
+        Snapshot Discipline, prompts/stage1.py). Pinning the exact value is
+        what stops a future edit from quietly restoring a Graphiti-implying
+        spelling.
+        """
         assert SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_mem0_written'
 
     def test_prune_enumerated_stat_key_value(self):
@@ -104,20 +153,6 @@ class TestConstants:
 
     def test_legacy_written_stat_key_value(self):
         assert LEGACY_SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_written'
-
-    def test_renamed_keys_are_mem0_namespaced(self):
-        """Anti-regression pin (task 3045).
-
-        The un-namespaced spellings read as a persistence claim about
-        Graphiti, which is what drove Stage 3 / the judge to report a
-        "rejected write" for a snapshot that is Mem0-only BY DESIGN (see
-        Snapshot Discipline, prompts/stage1.py). This is the assertion
-        that stops a future edit from quietly restoring a
-        Graphiti-implying spelling.
-        """
-        assert 'mem0' in SNAPSHOT_WRITTEN_STAT_KEY
-        assert 'mem0' in SNAPSHOT_PRUNED_STAT_KEY
-        assert SNAPSHOT_WRITTEN_STAT_KEY != LEGACY_SNAPSHOT_WRITTEN_STAT_KEY
 
     def test_prune_enumeration_ok_stat_key_value(self):
         assert SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 'task_count_snapshot_prune_enumeration_ok'
@@ -1523,34 +1558,10 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
     while the module-level helper is patched directly, so these tests target
     only the run()-level wiring — not _verify_task_count_snapshot_written's
     own internals (covered by TestVerifyTaskCountSnapshotWritten above).
+
+    Consumes the module-level ``mock_deps`` fixture and ``_fake_cli_result``
+    helper, shared with TestSnapshotWrittenStatKeyIsConstantDriven below.
     """
-
-    @pytest.fixture
-    def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        memory_service = AsyncMock()
-        # count==1 short-circuits the unrelated stage2-summary verify/repair/
-        # reconstruct chain so these tests stay isolated to the new stat.
-        memory_service.count_memories_by_metadata.return_value = 1
-        memory_service.delete_memory = AsyncMock(return_value=None)
-        memory_service.search.return_value = []
-        memory_service.add_memory.return_value = {'memory_ids': []}
-        taskmaster = AsyncMock()
-        taskmaster.get_tasks.return_value = {'tasks': []}
-        return {
-            'memory_service': memory_service,
-            'taskmaster': taskmaster,
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def _fake_cli_result(self):
-        return MagicMock(
-            success=True,
-            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
-            llm_calls=1, tokens_used=0, cost_usd=0.0,
-            model='test-model', error=None,
-        )
 
     async def _run_with_snapshot_check(self, mock_deps, snapshot_result, run_id):
         stage = TaskKnowledgeSync(
@@ -1562,7 +1573,7 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
         with (
             patch(
                 'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=self._fake_cli_result()),
+                new=AsyncMock(return_value=_fake_cli_result()),
             ),
             patch(
                 'fused_memory.reconciliation.stages.task_knowledge_sync'
@@ -1642,7 +1653,7 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
 
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(return_value=self._fake_cli_result()),
+            new=AsyncMock(return_value=_fake_cli_result()),
         ):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='dark_factory'),
@@ -1680,7 +1691,7 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
 
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-            new=AsyncMock(return_value=self._fake_cli_result()),
+            new=AsyncMock(return_value=_fake_cli_result()),
         ):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id='dark_factory'),
@@ -1719,39 +1730,13 @@ class TestSnapshotWrittenStatKeyIsConstantDriven:
     name up at call time. ``raising=True`` (the default) additionally pins
     that the producer imports the constant at all.
 
-    Mirrors TestRunRecordsTaskCountSnapshotWrittenStat's harness above:
+    Shares TestRunRecordsTaskCountSnapshotWrittenStat's harness above via the
+    module-level ``mock_deps`` fixture and ``_fake_cli_result`` helper:
     super().run() executes for real via a patched run_stage_via_cli while
     the module-level freshness helper is patched directly.
     """
 
     SENTINEL_KEY = '__sentinel_written_key__'
-
-    @pytest.fixture
-    def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        memory_service = AsyncMock()
-        # count==1 short-circuits the unrelated stage2-summary verify/repair/
-        # reconstruct chain so this test stays isolated to the stat key.
-        memory_service.count_memories_by_metadata.return_value = 1
-        memory_service.delete_memory = AsyncMock(return_value=None)
-        memory_service.search.return_value = []
-        memory_service.add_memory.return_value = {'memory_ids': []}
-        taskmaster = AsyncMock()
-        taskmaster.get_tasks.return_value = {'tasks': []}
-        return {
-            'memory_service': memory_service,
-            'taskmaster': taskmaster,
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def _fake_cli_result(self):
-        return MagicMock(
-            success=True,
-            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
-            llm_calls=1, tokens_used=0, cost_usd=0.0,
-            model='test-model', error=None,
-        )
 
     @pytest.mark.asyncio
     async def test_stat_is_emitted_under_the_rebound_constant(
@@ -1772,7 +1757,7 @@ class TestSnapshotWrittenStatKeyIsConstantDriven:
         with (
             patch(
                 'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=self._fake_cli_result()),
+                new=AsyncMock(return_value=_fake_cli_result()),
             ),
             patch(
                 'fused_memory.reconciliation.stages.task_knowledge_sync'

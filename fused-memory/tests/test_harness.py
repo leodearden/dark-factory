@@ -13357,8 +13357,9 @@ def _snapshot_stage_reports(stat: int | None, key: str = SNAPSHOT_WRITTEN_STAT_K
     *key* selects the stat spelling (task 3045). Journal rows persisted
     before the Mem0-namespacing rename carry
     LEGACY_SNAPSHOT_WRITTEN_STAT_KEY, and the harness reads its miss streak
-    straight out of those historical blobs — so every case below is run
-    against both spellings.
+    straight out of those historical blobs — so the cases below whose
+    outcome turns on key resolution are run against both spellings via
+    _both_stat_key_spellings.
     """
     if stat is None:
         return {}
@@ -13400,11 +13401,23 @@ def _make_prior_run(
     )
 
 
-@pytest.mark.parametrize(
+_both_stat_key_spellings = pytest.mark.parametrize(
     'stat_key',
     [SNAPSHOT_WRITTEN_STAT_KEY, LEGACY_SNAPSHOT_WRITTEN_STAT_KEY],
     ids=['new_key', 'legacy_key'],
 )
+"""Run a case under both the post-3045 and pre-3045 stat spellings.
+
+Applied per-method, NOT to the whole class: a case whose outcome does not
+depend on key resolution (the current-stat-absent case builds an EMPTY
+stage_reports dict, so no key is ever read; the blocked-project case returns
+before any stat is read) gains no coverage from a second run, and the
+'legacy_key' id would over-promise what it exercises. Mixed-spelling
+histories — the real post-rename journal shape — are covered separately by
+TestSnapshotMissStreakBridgesTheRenameBoundary below.
+"""
+
+
 class TestMaybeEscalateStaleTaskCountSnapshot:
     """_maybe_escalate_stale_task_count_snapshot(project_id, run_id, run).
 
@@ -13422,6 +13435,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         finding = call.kwargs.get('finding')
         return category, run_id, finding
 
+    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_two_consecutive_full_cycle_misses_escalates(
         self, journal, event_buffer, mock_memory_service, stat_key,
@@ -13430,7 +13444,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         project_id = 'test-project'
         run_id = 'run-current'
-        run = _make_current_run(run_id, 0)
+        run = _make_current_run(run_id, 0, stat_key)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
             _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100, key=stat_key),
         ])
@@ -13444,6 +13458,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         assert esc_run_id == run_id
         assert finding['affected_ids'] == [f'task_count_snapshot:{project_id}']
 
+    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_single_miss_below_threshold_not_called(
         self, journal, event_buffer, mock_memory_service, stat_key,
@@ -13458,6 +13473,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 
         harness._escalate.assert_not_called()
 
+    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_current_written_not_called(
         self, journal, event_buffer, mock_memory_service, stat_key,
@@ -13476,13 +13492,19 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 
     @pytest.mark.asyncio
     async def test_current_stat_absent_not_called(
-        self, journal, event_buffer, mock_memory_service, stat_key,
+        self, journal, event_buffer, mock_memory_service,
     ):
-        """(d) current cycle's stat is absent (unknown) -> NOT called."""
+        """(d) current cycle's stat is absent (unknown) -> NOT called.
+
+        Deliberately NOT parametrized over both stat spellings: ``stat=None``
+        makes _snapshot_stage_reports return an EMPTY dict, so no stat key of
+        either spelling is ever read on the current run, and the early return
+        happens before the priors matter.
+        """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', None, stat_key)
+        run = _make_current_run('run-current', None)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100, key=stat_key),
+            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
         ])
         harness._escalate = MagicMock()
 
@@ -13492,7 +13514,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 
     @pytest.mark.asyncio
     async def test_blocked_project_not_called_despite_long_streak(
-        self, journal, event_buffer, mock_memory_service, stat_key,
+        self, journal, event_buffer, mock_memory_service,
     ):
         """(e) is_snapshot_write_blocked project (know_live) -> NOT called.
 
@@ -13501,12 +13523,16 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         blocked project's cycle never issues a get_recent_runs query or
         rebuilds/sorts a prior-flags list that evaluate_snapshot_cadence
         would discard anyway.
+
+        Deliberately NOT parametrized over both stat spellings: that same
+        short-circuit returns before any stat is read, so the key never
+        participates in the outcome.
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0, stat_key)
+        run = _make_current_run('run-current', 0)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
-            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100, key=stat_key),
-            _make_prior_run('run-prior-2', 'full', 'completed', 0, offset_seconds=200, key=stat_key),
+            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
+            _make_prior_run('run-prior-2', 'full', 'completed', 0, offset_seconds=200),
         ])
         harness._escalate = MagicMock()
 
@@ -13515,6 +13541,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         assert harness._escalate.call_count == 0
         harness.journal.get_recent_runs.assert_not_awaited()
 
+    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_remediation_run_interleaved_ignored_still_escalates(
         self, journal, event_buffer, mock_memory_service, stat_key,
@@ -13533,6 +13560,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 
         harness._escalate.assert_called_once()
 
+    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_remediation_run_only_does_not_reach_threshold(
         self, journal, event_buffer, mock_memory_service, stat_key,
@@ -13550,6 +13578,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 
         harness._escalate.assert_not_called()
 
+    @_both_stat_key_spellings
     @pytest.mark.asyncio
     async def test_failed_full_run_skipped_streak_bridges_to_next_completed(
         self, journal, event_buffer, mock_memory_service, stat_key,
