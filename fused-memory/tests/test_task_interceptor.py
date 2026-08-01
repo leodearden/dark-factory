@@ -10428,6 +10428,139 @@ class TestMultiProjectRoutingWiring:
         )
         assert result is None, f'submission must stay allowed, got: {result!r}'
 
+    async def test_raising_guard_check_does_not_break_an_override_submission(
+        self,
+        interceptor,
+        tmp_path,
+        caplog,
+    ):
+        """The verdicts are computed for REPORTING ONLY, so a defect in the
+        guard machinery must not break a submission that asked to bypass it.
+
+        Before task 3123 this branch did literally nothing, which made an
+        override caller STRUCTURALLY immune to any guard defect.  Buying the
+        audit record its paths must not hand that immunity back: a raise from
+        _path_guard_check (a future extractor meeting a malformed metadata
+        shape, a registry/regex change, a path string that trips
+        normpath/expanduser) would otherwise turn an explicitly-bypassed
+        submission into an exception out of submit_task.  Mirrors
+        test_override_escalator_failure_does_not_break_submission one call
+        earlier in the same branch.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        def boom(*a, **kw):
+            raise RuntimeError('guard machinery defect')
+
+        interceptor._path_guard_check = boom
+
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                raise AssertionError('report_rejection must not fire on an override')
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        with caplog.at_level(logging.WARNING):
+            # Must not raise.
+            result = await interceptor._path_guard_or_skip(
+                {
+                    'title': 'Mirror the orchestrator/harness.py logic',
+                    'metadata': {'files': ['crates/widget.rs']},
+                },
+                '/foo',
+                'other',
+                routing_override_reason='deliberate',
+            )
+
+        assert result is None, f'submission must stay allowed, got: {result!r}'
+        # The audit record is still filed — degraded to no paths, which is
+        # honest: the guard genuinely produced none.
+        assert len(override_calls) == 1, override_calls
+        assert override_calls[0]['matched_paths'] == ()
+        assert override_calls[0]['reason'] == 'deliberate'
+        # NOT SILENT: the swallowed defect is on the record.
+        assert any(
+            'ROUTING-OVERRIDE reporting path' in r.message
+            for r in caplog.records if r.levelno >= logging.ERROR
+        ), f'the swallowed defect must be logged: {[r.message for r in caplog.records]}'
+
+    async def test_override_suggestion_falls_through_to_prose_when_files_is_ambiguous(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """A files verdict can REJECT and still name no owner: with two
+        distinct foreign owners in metadata.files, check_files_for_scope
+        cannot pick one and returns suggested_project=None.  The audit record
+        must then fall through to the prose verdict's suggestion rather than
+        discarding an available hint — the same degradation
+        _override_matched_paths already makes for the path union.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'know-live').mkdir()
+        (tmp_path / 'know-live' / 'corpus').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([
+            str(tmp_path / 'reify'),
+            str(tmp_path / 'know-live'),
+            str(tmp_path / 'dark-factory'),
+        ])
+        interceptor._prefix_registry = registry
+
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                raise AssertionError('report_rejection must not fire on an override')
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                # TWO distinct foreign owners -> files verdict rejects with
+                # suggested_project=None...
+                'title': 'Touch the orchestrator/harness.py path too',
+                'metadata': {'files': ['crates/widget.rs', 'corpus/loader.py']},
+            },
+            '/foo',
+            'other',
+            routing_override_reason='cross-cutting by design',
+        )
+
+        assert result is None
+        assert len(override_calls) == 1, override_calls
+        call = override_calls[0]
+        # ...but the prose signal DID name one, so the record reports it.
+        assert call['suggested_project'] == 'dark_factory', (
+            f'ambiguous files owner must degrade to the prose suggestion: {call!r}'
+        )
+        # Both signals still union into the path list, as before.
+        paths = call['matched_paths']
+        assert 'crates/widget.rs' in paths
+        assert 'corpus/loader.py' in paths
+        assert 'orchestrator/' in paths
+
     async def test_override_with_no_escalator_configured_is_a_noop(
         self,
         interceptor,

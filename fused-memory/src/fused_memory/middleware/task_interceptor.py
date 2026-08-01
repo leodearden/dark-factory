@@ -2216,6 +2216,41 @@ class TaskInterceptor:
         )
         return None
 
+    def _escalation_suggested_root(self, suggested_project: str | None) -> str | None:
+        """Resolve the filesystem root of *suggested_project*, or ``None``.
+
+        Shared by both scope_violation emit helpers so the resolution — and in
+        particular the defensive ``registry is not None`` guard — exists once.
+        That guard is belt-and-suspenders (see :meth:`_files_scope_check`): the
+        constructor has guaranteed a non-None :attr:`_prefix_registry` since
+        task 2208, but ``root_for_project`` must never be reached on a None
+        registry from an escalation path, where an AttributeError would
+        convert a reporting side-effect into a guard exception.
+        """
+        registry = self._prefix_registry
+        if not suggested_project or registry is None:
+            return None
+        return registry.root_for_project(suggested_project)
+
+    @staticmethod
+    def _escalation_candidate_title(
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+    ) -> str:
+        """Best available human label for an escalation record, length-bounded.
+
+        Shared by both scope_violation emit helpers.  Note where the ``[:200]``
+        binds: it applies to the WHOLE expression, so a candidate-supplied
+        title is bounded too.  Binding it to the fallback branch alone (the
+        earlier shape) left the common case — a real ``CandidateTask`` whose
+        title came from caller-supplied text — unbounded in a field that is
+        rendered verbatim into agent briefings.
+        """
+        return (
+            (candidate.title if candidate else '')
+            or str(kwargs.get('title') or kwargs.get('prompt') or '<unknown>')
+        )[:200]
+
     def _emit_scope_violation_escalation(
         self,
         verdict: PathGuardVerdict,
@@ -2262,16 +2297,8 @@ class TaskInterceptor:
         """
         if self._scope_violation_escalator is None:
             return
-        registry = self._prefix_registry
-        suggested_root: str | None = None
-        # `registry is not None` is defensive belt-and-suspenders here too
-        # (see :meth:`_files_scope_check`): the constructor guarantees a
-        # non-None :attr:`_prefix_registry` since task 2208.
-        if verdict.suggested_project and registry is not None:
-            suggested_root = registry.root_for_project(verdict.suggested_project)
-        candidate_title = (candidate.title if candidate else '') or str(
-            kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
-        )[:200]
+        suggested_root = self._escalation_suggested_root(verdict.suggested_project)
+        candidate_title = self._escalation_candidate_title(candidate, kwargs)
         try:
             self._scope_violation_escalator.report_rejection(
                 project_root=project_root,
@@ -2333,8 +2360,8 @@ class TaskInterceptor:
 
         *files_verdict* / *prose_verdict* are computed for REPORTING ONLY by
         the caller; nothing is enforced from them.  ``suggested_project`` is
-        the files verdict's suggestion when it rejected, else the prose
-        verdict's, else ``None``.
+        the files verdict's suggestion when it rejected AND named one, else
+        the prose verdict's, else ``None``.
         """
         if self._scope_violation_escalator is None:
             return
@@ -2350,21 +2377,21 @@ class TaskInterceptor:
         # Flood risk is handled by the escalator's content-fingerprint fold,
         # not by suppressing the signal.
         matched_paths = self._override_matched_paths(files_verdict, prose_verdict)
+        # The files verdict wins when it rejected — it is the CERTAIN signal
+        # (an exact metadata.files owner mismatch) against the prose scan's
+        # heuristic.  But it can reject and STILL yield no suggestion: with
+        # two distinct foreign owners in metadata.files, check_files_for_scope
+        # cannot pick one and returns None.  Falling through to the prose
+        # suggestion there rather than reporting None keeps the degradation
+        # symmetric with :meth:`_override_matched_paths`, which unions both
+        # signals for exactly this multi-signal case.  Nothing enforces on
+        # this field — it is the audit record's best-available hint.
         suggested_project = (
-            files_verdict.suggested_project
-            if files_verdict.is_rejection
-            else prose_verdict.suggested_project
+            (files_verdict.suggested_project if files_verdict.is_rejection else None)
+            or prose_verdict.suggested_project
         )
-        registry = self._prefix_registry
-        suggested_root: str | None = None
-        # Same defensive `registry is not None` check as
-        # :meth:`_emit_scope_violation_escalation` — root_for_project must
-        # never be reached on a None registry.
-        if suggested_project and registry is not None:
-            suggested_root = registry.root_for_project(suggested_project)
-        candidate_title = (candidate.title if candidate else '') or str(
-            kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
-        )[:200]
+        suggested_root = self._escalation_suggested_root(suggested_project)
+        candidate_title = self._escalation_candidate_title(candidate, kwargs)
         try:
             self._scope_violation_escalator.report_routing_override(
                 project_root=project_root,
@@ -2410,7 +2437,10 @@ class TaskInterceptor:
           functions returning frozen verdicts, and NONE of the enforcement
           side-effects (the reject dict, the ``possible_scope_mismatch``
           stamp, the ``cross_repo`` tag, ``report_rejection``) is reachable
-          from it.  A ``scope_violation`` override record is filed via
+          from it.  That computation is itself guarded, so a defect anywhere
+          in the guard machinery degrades the audit record's path list rather
+          than breaking a submission that explicitly asked to bypass it.
+          A ``scope_violation`` override record is filed via
           :meth:`_emit_routing_override_escalation` so the bypass is visible
           in the operator queue and not only in a ``logger.warning``.
         * Outcome (1), FILES-CERTAIN reject — :meth:`_files_scope_check`.  No
@@ -2479,10 +2509,35 @@ class TaskInterceptor:
         # stamp, no cross_repo tag and no report_rejection is reachable from
         # here.  It buys the audit record its paths.
         if is_routing_override(routing_override_reason):
-            if candidate is None:
-                candidate = self._build_candidate(kwargs)
-            files_verdict = self._files_scope_check(candidate, kwargs, project_id)
-            prose_verdict = self._path_guard_check(candidate, kwargs, project_id)
+            # NEVER-RAISE, and the reason is stronger here than for the
+            # escalation emit below.  Before task 3123 this branch did
+            # literally nothing, which made an override caller STRUCTURALLY
+            # immune to any defect in the guard machinery; buying the audit
+            # record its paths must not hand that immunity back.  A raise out
+            # of candidate-building or either verdict — a future extractor
+            # meeting a malformed metadata shape, a registry/regex change, a
+            # path string that trips normpath/expanduser — would turn a
+            # submission the caller EXPLICITLY asked to bypass into an
+            # exception out of submit_task, which is the precise failure the
+            # reporting-only design exists to be immune to.  Degrade to empty
+            # verdicts instead: the audit record is still filed (with no
+            # paths, which is honest — the guard genuinely produced none), and
+            # the bypass still bypasses.
+            try:
+                if candidate is None:
+                    candidate = self._build_candidate(kwargs)
+                files_verdict = self._files_scope_check(candidate, kwargs, project_id)
+                prose_verdict = self._path_guard_check(candidate, kwargs, project_id)
+            except Exception:
+                logger.exception(
+                    'task_interceptor: path-guard verdict computation raised on '
+                    'the ROUTING-OVERRIDE reporting path for project_id=%s; '
+                    'filing the audit record with no paths and leaving the '
+                    'submission allowed',
+                    project_id,
+                )
+                files_verdict = PathGuardVerdict(outcome='ok', project_id=project_id)
+                prose_verdict = PathGuardVerdict(outcome='ok', project_id=project_id)
             override_paths = self._override_matched_paths(files_verdict, prose_verdict)
             logger.warning(
                 'path-guard ROUTING OVERRIDE: skipping path guards for '
