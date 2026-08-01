@@ -635,11 +635,17 @@ _TC_SITES = {
 class TestTrainCallbacksDeliveredChecksGuard:
     """Task 2794's six-row matrix, applied to both harness train callbacks.
 
-    On every block the recovery is this factory's OWN existing no-op shape:
-    return without marking, WITHOUT consuming the write-ahead LandedRow (the
-    reconciler still needs the crash-window record) and WITHOUT releasing the
-    lane (the member is not terminal). The un-flipped member self-heals through
-    the 2794-guarded stranded sweep.
+    On every block the seam withholds the stamp and REVERTS the member to
+    'pending' (task 3057 step-23/24 — review remediation). It still does NOT
+    consume the write-ahead LandedRow (the reconciler needs the crash-window
+    record) and does NOT release the lane through
+    ``release_lane_for_terminal_task`` (the member is not terminal; the revert
+    itself makes the lane a legitimate reclaim victim).
+
+    The revert is the member's ONLY recovery edge: a member left at
+    'merge-deferred' is unreachable by every recovery path — see
+    ``TestWithheldTrainMemberHasRecoveryEdge`` in test_reconcile_stranded.py,
+    which pins the three status filters that make it a permanent wedge.
     """
 
     # --- row 1: hollow-done regression / FAILED ---------------------------
@@ -666,6 +672,83 @@ class TestTrainCallbacksDeliveredChecksGuard:
         git_ops.release_lane_for_terminal_task.assert_not_awaited()
         assert _TC_TRAIN in caplog.text
         assert '7001' in caplog.text
+
+    # --- step-23 (RED): the withhold path's ACTUAL recovery edge ----------
+
+    @pytest.mark.parametrize('reason', ['failed', 'errored', 'main_sha_unresolved'])
+    async def test_withheld_member_is_reverted_to_pending(
+        self, closure: str, reason: str, tmp_path: Path, caplog,
+    ) -> None:
+        """A withheld member must be handed back to the scheduler.
+
+        Before step-24 all four train seams withheld by RETURNING with the
+        member's status untouched at 'merge-deferred' — a status no recovery
+        path can reach (the stranded sweep does not iterate it,
+        ``_reconcile_one_stranded`` early-returns on it, the train already
+        advanced main so the merge worker will not re-drive it, and warm-lane
+        reclaim is barred from taking its lane). The revert to 'pending' IS
+        the recovery edge; without it a permanently-ERRORing check descriptor
+        wedges the member forever.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'), \
+                patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block(reason))), \
+                patch('orchestrator.harness.MergeProvenance') as prov:
+            await _tc_drive(cbs, closure)  # must NOT raise
+
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+        # UNCHANGED from step-17 — this remediation must not silently relax
+        # either contract:
+        sched.mark_done.assert_not_called()
+        prov.consume.assert_not_called()
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert _TC_TRAIN in blob, f'WARNING must name the train: {blob!r}'
+        assert '7001' in blob, f'WARNING must name the member: {blob!r}'
+        assert reason in blob, f'WARNING must name the block reason: {blob!r}'
+
+    async def test_revert_failure_is_swallowed_not_raised(
+        self, closure: str, tmp_path: Path, caplog,
+    ) -> None:
+        """A FAILED recovery edge must never become a TRAIN_PARTIAL_FLIP.
+
+        ``mark_member_done`` is called from ``_do_train_merge``'s post-advance
+        flip loop, which collects raises into TRAIN_PARTIAL_FLIP. If the revert
+        itself fails the member simply stays merge-deferred — no worse than
+        before this remediation — and that is logged rather than raised.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        sched.set_task_status = AsyncMock(side_effect=RuntimeError('scheduler down'))
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'), \
+                patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block('failed'))), \
+                patch('orchestrator.harness.MergeProvenance') as prov:
+            await _tc_drive(cbs, closure)  # must NOT raise
+
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+        sched.mark_done.assert_not_called()
+        prov.consume.assert_not_called()
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert '7001' in blob
+        assert 'merge-deferred' in blob, (
+            'a failed revert must say the member is left parked: ' f'{blob!r}'
+        )
 
     # --- row 2: all_delivered -> byte-identical flip ----------------------
 
@@ -727,11 +810,16 @@ class TestTrainCallbacksDeliveredChecksGuard:
     # --- rows 4 & 5: fail-safe blocks withhold identically ----------------
 
     @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
-    async def test_fail_safe_blocks_withhold_and_leave_status_untouched(
+    async def test_fail_safe_blocks_withhold_and_revert_to_pending(
         self, closure: str, reason: str, tmp_path: Path,
     ) -> None:
-        """A permanently-ERRORing descriptor must not wedge the member — it is
-        left for the 2794-guarded stranded sweep to re-evaluate."""
+        """A permanently-ERRORing descriptor must not wedge the member.
+
+        A malformed check descriptor ERRORs forever, so the fail-safe arms are
+        exactly where a silent park becomes a permanent wedge. They take the
+        SAME recovery edge as ``failed``: revert to pending and let the
+        scheduler re-dispatch.
+        """
         from orchestrator.harness import build_train_callback_factory
 
         sched = _tc_scheduler()
@@ -746,7 +834,7 @@ class TestTrainCallbacksDeliveredChecksGuard:
             await _tc_drive(cbs, closure)
 
         sched.mark_done.assert_not_called()
-        sched.set_task_status.assert_not_called()
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
         prov.consume.assert_not_called()
 
     # --- row 6: config=None -> FULLY inert (every existing caller) --------
@@ -843,6 +931,10 @@ class TestTrainCallbacksDeliveredChecksGuard:
             await _tc_drive(cbs, closure)  # must NOT raise
 
         sched.mark_done.assert_not_called()
+        # The fail-safe withholds need the recovery edge too — they are the
+        # arms most likely to fire repeatedly on a degraded backend, so a
+        # silent park here is the same permanent wedge.
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
 
     async def test_guard_exception_withholds_rather_than_propagating(
         self, closure: str, tmp_path: Path,
@@ -863,6 +955,7 @@ class TestTrainCallbacksDeliveredChecksGuard:
             await _tc_drive(cbs, closure)  # must NOT raise
 
         sched.mark_done.assert_not_called()
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
 
     # --- git_ops unbound: degrade to TODAY's behavior, but not silently ---
 

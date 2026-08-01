@@ -1362,6 +1362,15 @@ def _done_ids(f: _Fixture) -> list[str]:
     return [c.args[0] for c in f.scheduler.mark_done.await_args_list]
 
 
+def _status_transitions(f: _Fixture) -> list[tuple[str, str]]:
+    """``(task_id, status)`` for every ``scheduler.set_task_status`` await."""
+    return [
+        (c.args[0], c.args[1])
+        for c in f.scheduler.set_task_status.await_args_list
+        if len(c.args) >= 2
+    ]
+
+
 @pytest.mark.asyncio
 class TestAttributeTrainFailurePasserDeliveredChecksGuard:
     """The delivered-capability guard on the attribution solo-passer stamp.
@@ -1369,7 +1378,11 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
     A withheld passer is never appended to ``landed_ids`` and never emits a
     ``train_merged`` event — it must not be REPORTED as attributed when its
     declared capability is unverifiable.  The write-ahead ``LandedRow`` is
-    retained and the member self-heals through the 2794-guarded stranded sweep.
+    retained, and the passer is REVERTED to 'pending' (task 3057 step-23/24 —
+    review remediation) so the scheduler re-dispatches it.  Leaving it at
+    'merge-deferred' would wedge it permanently: see
+    ``TestWithheldTrainMemberHasRecoveryEdge`` in test_reconcile_stranded.py
+    for the three status filters that make that status unreachable.
     """
 
     # --- row 1: hollow-done regression / FAILED ---------------------------
@@ -1402,6 +1415,101 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
 
         blob = '\n'.join(r.getMessage() for r in caplog.records)
         assert _ATTR_TRAIN in blob and '103' in blob
+
+    # --- step-23 (RED): the withhold path's ACTUAL recovery edge ----------
+
+    @pytest.mark.parametrize('reason', ['failed', 'errored', 'main_sha_unresolved'])
+    async def test_withheld_passer_is_reverted_to_pending(
+        self, reason: str, tmp_path: Path, caplog,
+    ):
+        """A withheld passer must be handed back to the scheduler.
+
+        Before step-24 this seam ``continue``\\ d with the passer left at
+        'merge-deferred' — a status no recovery path can reach (see
+        ``TestWithheldTrainMemberHasRecoveryEdge``). A permanently-ERRORing
+        check descriptor therefore wedged the passer forever.
+        """
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='102', branch_tip_sha='tip',
+            advanced_sha='landedsha', landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+
+        f = _armed_attr_fixture()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_ATTR_GATE_TARGET, _attr_guard({'102', '103'}, reason=reason)):
+            await _run_attribution(f)  # must return normally
+
+        transitions = _status_transitions(f)
+        assert ('102', 'pending') in transitions, (
+            f'withheld passer 102 must get its recovery edge: {transitions!r}'
+        )
+        assert ('103', 'pending') in transitions, (
+            f'withheld passer 103 must get its recovery edge: {transitions!r}'
+        )
+        # UNCHANGED from step-11 — this remediation must not silently relax
+        # any of the four contracts:
+        assert _done_ids(f) == [], 'no passer may be stamped'
+        assert _train_merged_ids(f) == [], (
+            'a withheld member must never be reported as attributed'
+        )
+        assert outbox.lookup('102') is not None, (
+            'the write-ahead row must still survive a withholding'
+        )
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert _ATTR_TRAIN in blob, f'WARNING must name the train: {blob!r}'
+        assert '102' in blob, f'WARNING must name the member: {blob!r}'
+        assert reason in blob, f'WARNING must name the block reason: {blob!r}'
+
+    async def test_withholding_stays_per_member_after_the_revert(self):
+        """Member 102 withheld-and-reverted; member 103 lands normally.
+
+        The recovery edge must not turn a per-member withholding into a
+        train-wide abort: a clean sibling still stamps, consumes its row and
+        emits its ``train_merged`` attribution.
+        """
+        f = _armed_attr_fixture()
+
+        with patch(_ATTR_GATE_TARGET, _attr_guard({'102'})):
+            result = await _run_attribution(f)
+
+        assert _done_ids(f) == ['103'], 'the clean sibling must still land'
+        assert _train_merged_ids(f) == ['103']
+        assert ('102', 'pending') in _status_transitions(f)
+        assert result == WorkflowOutcome.DONE, (
+            'the tip landed, so the tip surfaces DONE'
+        )
+
+    async def test_revert_failure_is_swallowed_not_raised(self, caplog):
+        """A FAILED recovery edge must not abort the attribution loop.
+
+        The sibling that follows the failed revert must still be attributed —
+        a scheduler hiccup while reverting one member cannot be allowed to
+        strand the rest of the train.
+        """
+        f = _armed_attr_fixture()
+
+        async def _set_status(tid, status, **kwargs):  # noqa: ANN001, ANN202
+            if tid == '102':
+                raise RuntimeError('scheduler down')
+
+        f.scheduler.set_task_status = AsyncMock(side_effect=_set_status)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_ATTR_GATE_TARGET, _attr_guard({'102'})):
+            await _run_attribution(f)  # must NOT raise
+
+        assert _done_ids(f) == ['103'], (
+            'a failed revert must not abort the loop before the next member'
+        )
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert '102' in blob
+        assert 'merge-deferred' in blob, (
+            f'a failed revert must say the member is left parked: {blob!r}'
+        )
 
     # --- row 2: all_delivered -> byte-identical land, in order -------------
 
@@ -1454,11 +1562,13 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
     # --- rows 4 & 5: fail-safe blocks withhold identically ----------------
 
     @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
-    async def test_fail_safe_blocks_withhold_without_mutating_status(
+    async def test_fail_safe_blocks_withhold_and_revert_passers_to_pending(
         self, reason: str,
     ):
-        """A withheld PASSER's status is not mutated — only the failer '101' is
-        blocked — so the member is left for the 2794-guarded stranded sweep."""
+        """A malformed check descriptor ERRORs forever, so the fail-safe arms
+        are exactly where a silent park becomes a permanent wedge.  They take
+        the SAME recovery edge as ``failed``: each withheld PASSER is reverted
+        to pending; the solo failer '101' is still blocked as today."""
         f = _armed_attr_fixture()
         prov = MagicMock()
 
@@ -1469,11 +1579,15 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
 
         assert _done_ids(f) == []
         prov.consume.assert_not_called()
-        status_ids = [
-            c.args[0] for c in f.scheduler.set_task_status.await_args_list
-        ]
-        assert status_ids == ['101'], (
-            f'only the solo failer may be status-mutated, got {status_ids!r}'
+        transitions = _status_transitions(f)
+        assert ('102', 'pending') in transitions, (
+            f'withheld passer 102 must get its recovery edge: {transitions!r}'
+        )
+        assert ('103', 'pending') in transitions, (
+            f'withheld passer 103 must get its recovery edge: {transitions!r}'
+        )
+        assert ('101', 'blocked') in transitions, (
+            f'the solo failer must still be blocked: {transitions!r}'
         )
 
     # --- row 6: kill switch is FORWARDED, never re-implemented ------------

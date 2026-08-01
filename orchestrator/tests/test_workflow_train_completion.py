@@ -568,8 +568,12 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
     — and a capability withholding is NOT a partial flip: main genuinely
     advanced, only this member's declared deliverable is unverifiable.  The
     write-ahead ``LandedRow`` is deliberately NOT consumed (it is the only
-    record of the crash-window intent) and the un-flipped member self-heals
-    through the 2794-guarded stranded sweep.
+    record of the crash-window intent), and the member is REVERTED to
+    'pending' (task 3057 step-23/24 — review remediation) so the scheduler
+    re-dispatches it.  Leaving it at 'merge-deferred' would wedge it
+    permanently: see ``TestWithheldTrainMemberHasRecoveryEdge`` in
+    test_reconcile_stranded.py for the three status filters that make that
+    status unreachable by every recovery path.
     """
 
     # --- row 1: hollow-done regression / FAILED ---------------------------
@@ -601,6 +605,69 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
         blob = '\n'.join(r.getMessage() for r in caplog.records)
         assert _DC_TRAIN in blob, f'WARNING must name the train: {blob!r}'
         assert '101' in blob, f'WARNING must name the member: {blob!r}'
+
+    # --- step-23 (RED): the withhold path's ACTUAL recovery edge ----------
+
+    @pytest.mark.parametrize('reason', ['failed', 'errored', 'main_sha_unresolved'])
+    async def test_withheld_member_is_reverted_to_pending(
+        self, reason: str, tmp_path: Path, caplog,
+    ):
+        """A withheld member must be handed back to the scheduler.
+
+        Before step-24 this seam withheld by RETURNING with the member left at
+        'merge-deferred' — a status no recovery path can reach (see
+        ``TestWithheldTrainMemberHasRecoveryEdge``). A permanently-ERRORing
+        check descriptor therefore wedged the member forever.
+        """
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='101', branch_tip_sha='tip',
+            advanced_sha='deadbeef', landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+
+        f, cb = await _armed_member_callback()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_GATE_TARGET, AsyncMock(return_value=_dc_block(reason))):
+            await cb('101', 'sha9')  # must return normally
+
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')
+        # UNCHANGED from step-11 — this remediation must not silently relax
+        # either contract:
+        f.scheduler.mark_done.assert_not_awaited()
+        assert outbox.lookup('101') is not None, (
+            'the write-ahead row must still survive a withholding'
+        )
+        cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_not_awaited()
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert _DC_TRAIN in blob, f'WARNING must name the train: {blob!r}'
+        assert '101' in blob, f'WARNING must name the member: {blob!r}'
+        assert reason in blob, f'WARNING must name the block reason: {blob!r}'
+
+    async def test_revert_failure_is_swallowed_not_raised(self, caplog):
+        """A FAILED recovery edge must never become a TRAIN_PARTIAL_FLIP."""
+        f, cb = await _armed_member_callback()
+        f.scheduler.set_task_status = AsyncMock(
+            side_effect=RuntimeError('scheduler down'),
+        )
+        prov = MagicMock()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_GATE_TARGET, AsyncMock(return_value=_dc_block('failed'))), \
+                patch(_PROV_TARGET, prov):
+            await cb('101', 'sha9')  # must NOT raise
+
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')
+        f.scheduler.mark_done.assert_not_awaited()
+        prov.consume.assert_not_called()
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert '101' in blob
+        assert 'merge-deferred' in blob, (
+            f'a failed revert must say the member is left parked: {blob!r}'
+        )
 
     # --- row 2: all_delivered -> byte-identical flip, in order -------------
 
@@ -648,12 +715,12 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
     # --- rows 4 & 5: fail-safe blocks withhold identically ----------------
 
     @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
-    async def test_fail_safe_blocks_withhold_without_mutating_status(
+    async def test_fail_safe_blocks_withhold_and_revert_to_pending(
         self, reason: str,
     ):
-        """The member's status is NOT mutated — it is left stranded for the
-        2794-guarded stranded sweep to re-evaluate, closing a self-healing
-        loop rather than opening a new one."""
+        """A malformed check descriptor ERRORs forever, so the fail-safe arms
+        are exactly where a silent park becomes a permanent wedge.  They take
+        the SAME recovery edge as ``failed``."""
         f, cb = await _armed_member_callback()
         prov = MagicMock()
 
@@ -662,7 +729,7 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
             await cb('101', 'sha9')
 
         f.scheduler.mark_done.assert_not_awaited()
-        f.scheduler.set_task_status.assert_not_awaited()
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')
         prov.consume.assert_not_called()
         cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_not_awaited()
 
@@ -730,6 +797,9 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
 
         f.scheduler.mark_done.assert_not_awaited()
         prov.consume.assert_not_called()
+        # The fail-safe withholds need the recovery edge too — a silent park
+        # here is the same permanent wedge.
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')
 
     async def test_guard_exception_withholds_without_raising(self):
         """A raise from the guard itself is swallowed into a withholding: a
@@ -740,3 +810,4 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
             await cb('101', 'sha9')  # must not raise
 
         f.scheduler.mark_done.assert_not_awaited()
+        f.scheduler.set_task_status.assert_awaited_once_with('101', 'pending')
