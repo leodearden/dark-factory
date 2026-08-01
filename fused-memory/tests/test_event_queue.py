@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import time
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -22,6 +23,28 @@ from fused_memory.models.reconciliation import (
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue, _iter_lines_reversed
+
+
+async def _wait_for_buffer_size(
+    buffer: EventBuffer, project_id: str, expected: int, *, timeout: float = 10.0,
+) -> dict:
+    """Poll get_buffer_stats until size reaches expected, or the deadline lapses.
+
+    Load-tolerant alternative to gating a drainer handoff on
+    ``asyncio.wait_for(queue._queue.join(), timeout=<small>)``: that pattern
+    ties the pass/fail line to how fast a (possibly starved, under full-suite
+    xdist load) event loop happened to schedule the drainer, not to whether
+    the drainer actually did its job. Polling the observable outcome keeps the
+    guard meaningful — it still fails loudly if the drainer never catches up
+    within the (generous) outer deadline — without being sensitive to
+    scheduling jitter.
+    """
+    deadline = time.monotonic() + timeout
+    stats = await buffer.get_buffer_stats(project_id)
+    while stats['size'] < expected and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        stats = await buffer.get_buffer_stats(project_id)
+    return stats
 
 
 def _make_event(
@@ -71,9 +94,11 @@ async def test_enqueue_persists_to_buffer(queue, real_buffer):
     """Enqueued events eventually land in SQLite."""
     for _ in range(5):
         assert queue.enqueue(_make_event()) is True
-    # Wait for drainer to catch up.
-    await asyncio.wait_for(queue._queue.join(), timeout=1.0)
-    stats = await real_buffer.get_buffer_stats('test-project')
+    # Wait for drainer to catch up. Polls the outcome (buffer size) under a
+    # generous outer deadline rather than gating on how fast a (possibly
+    # starved, under full-suite xdist load) event loop scheduled the drainer
+    # — see _wait_for_buffer_size.
+    stats = await _wait_for_buffer_size(real_buffer, 'test-project', 5)
     assert stats['size'] == 5
 
 
@@ -374,8 +399,13 @@ async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
     """_drain_for_test() waits until every enqueued event has been processed.
 
     Constructs an EventQueue wired to a real SQLite buffer, enqueues 5 events,
-    then awaits q._drain_for_test(timeout=1.0).  After the call returns the
+    then awaits q._drain_for_test(timeout=5.0).  After the call returns the
     buffer must contain exactly 5 committed events (stats['size'] == 5).
+
+    5.0s (rather than a tighter ceiling) matches the sibling
+    `_drain_for_test(timeout=5.0)` calls elsewhere in this file and keeps the
+    guard tolerant of a starved event loop under full-suite xdist load while
+    still failing loudly if the drainer genuinely never runs.
     """
     q = EventQueue(
         real_buffer,
@@ -389,7 +419,7 @@ async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
     try:
         for _ in range(5):
             q.enqueue(_make_event())
-        await q._drain_for_test(timeout=1.0)
+        await q._drain_for_test(timeout=5.0)
         stats = await real_buffer.get_buffer_stats('test-project')
         assert stats['size'] == 5, (
             f"Expected 5 events in buffer after _drain_for_test, got {stats['size']}"
