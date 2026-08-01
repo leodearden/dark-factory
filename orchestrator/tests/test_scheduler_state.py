@@ -1477,3 +1477,58 @@ class TestDelegatesToSharedAtomicWriter:
         scheduler.finish_startup()
         with pytest.raises(OSError, match='disk full'):
             scheduler._write_state_snapshot_raw(tmp_path / 'scheduler_state.json')
+
+    @pytest.mark.asyncio
+    async def test_failed_write_does_not_advance_snapshot_bookkeeping(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed write must NOT advance ``_last_snapshot_payload``.
+
+        This is the invariant that MOTIVATES the propagation asserted above,
+        pinned at the level where the bookkeeping actually lives.  Note that
+        ``_write_state_snapshot_raw`` never touches ``_last_snapshot_payload``
+        itself — ``_write_snapshot_best_effort`` does, at scheduler.py:6837,
+        only after the awaited write returns — so asserting the attribute
+        around the ``pytest.raises`` above would be vacuous (None == None).
+
+        Why it matters: scheduler.py:6816 short-circuits the next write when
+        the payload is unchanged.  A regression that both propagated the error
+        AND advanced the bookkeeping would therefore record a snapshot that
+        never reached disk, and silently suppress the NEXT write as a no-op
+        dedup — leaving the on-disk state stale indefinitely.
+        """
+        import shared.safe_io as _safe_io
+
+        snapshot_path = tmp_path / 'scheduler_state.json'
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        scheduler._state_snapshot_path = snapshot_path
+
+        # 1. A real, successful write establishes a non-None payload, so the
+        #    assertion below discriminates rather than comparing None to None.
+        await scheduler._write_snapshot_best_effort(force=True)
+        good_payload = scheduler._last_snapshot_payload
+        assert good_payload is not None, 'precondition: a successful write records a payload'
+
+        # 2. Force a GENUINELY DIFFERENT snapshot, so the content-dedup
+        #    short-circuit at scheduler.py:6816 cannot be what keeps the
+        #    payload unchanged — without this the test would pass vacuously.
+        changed_state = {**scheduler.get_state_snapshot(), 'probe_3223': 'changed'}
+        monkeypatch.setattr(scheduler, 'get_state_snapshot', lambda: dict(changed_state))
+        assert scheduler._build_snapshot_payload() != good_payload, (
+            'precondition: the second write must carry a different payload, '
+            'else dedup — not the failure — would explain an unchanged value'
+        )
+
+        # 3. Now break the write itself.
+        def boom(*_a, **_kw):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', boom)
+        await scheduler._write_snapshot_best_effort(force=True)
+
+        assert scheduler._last_snapshot_payload == good_payload, (
+            '_last_snapshot_payload advanced despite a failed disk write; the '
+            'next snapshot would be short-circuited as an unchanged dedup and '
+            'the on-disk state would stay stale'
+        )
