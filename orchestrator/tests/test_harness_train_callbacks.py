@@ -787,6 +787,7 @@ class TestTrainCallbacksDeliveredChecksGuard:
                 patch('orchestrator.harness.MergeProvenance'):
             await _tc_drive(cbs, closure)
 
+        assert guard.await_args is not None
         assert guard.await_args.kwargs['enabled'] is False
 
     # --- plumbing: ONE metadata read, live config forwarded ---------------
@@ -811,6 +812,7 @@ class TestTrainCallbacksDeliveredChecksGuard:
 
         sched.get_task.assert_awaited_once_with('7001')
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.args[0] == '7001'
         assert guard.await_args.args[1] == meta
         assert guard.await_args.kwargs['project_root'] == str(tmp_path)

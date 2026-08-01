@@ -23,7 +23,7 @@ bare-harness construction helper exactly.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -999,7 +999,9 @@ _ARM_EVIDENCE_SHA = {
 _DC_CHECK = {'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present'}
 
 
-def _arm_harness(mock_orch_config, arm: str, *, metadata: dict | None = None) -> Harness:
+def _arm_harness(
+    mock_orch_config, arm: str, *, metadata: dict | None = None,
+) -> tuple[Harness, dict[str, Any]]:
     """Build a harness wired so *arm* is the arm that reaches a stamp.
 
     Reuses this module's existing per-arm wiring helpers verbatim, then
@@ -1068,6 +1070,7 @@ class TestAlreadyLandedGateDeliveredChecksGuard:
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.args[0] == '42'
         assert guard.await_args.args[1] == meta
         kwargs = guard.await_args.kwargs
@@ -1093,6 +1096,7 @@ class TestAlreadyLandedGateDeliveredChecksGuard:
         assert result is True
         mark = cast(AsyncMock, h._mark_in_progress_done)
         mark.assert_awaited_once()
+        assert mark.await_args is not None
         assert mark.await_args.args[0] == '42'
         assert mark.await_args.args[1] == _ARM_EVIDENCE_SHA[arm]
         assert mark.await_args.args[3] == _ARM_REASON[arm]
@@ -1120,6 +1124,7 @@ class TestAlreadyLandedGateDeliveredChecksGuard:
         assert result is True
         cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert 'delivered_checks' not in guard.await_args.args[1]
 
     # --- rows 4 & 5: fail-safe blocks are handled UNIFORMLY with FAILED ----
@@ -1165,6 +1170,7 @@ class TestAlreadyLandedGateDeliveredChecksGuard:
 
         assert result is True
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.kwargs['enabled'] is False
 
     @pytest.mark.parametrize('arm', _ARMS)
@@ -1183,6 +1189,7 @@ class TestAlreadyLandedGateDeliveredChecksGuard:
         assert result is True
         mark = cast(AsyncMock, h._mark_in_progress_done)
         mark.assert_awaited_once()
+        assert mark.await_args is not None
         assert mark.await_args.args[3] == _ARM_REASON[arm]
 
     # --- ordering: no wasted check work on landings already refused -------

@@ -167,6 +167,7 @@ class TestHarnessArmsDeliveredChecksGuard:
         ) as mock_reconcile:
             await h._reconcile_landed_outbox()
 
+        assert mock_reconcile.await_args is not None
         kwargs = mock_reconcile.await_args.kwargs
         assert kwargs['project_root'] == str(h.config.project_root)
         assert kwargs['check_timeout_secs'] == 11.0
@@ -183,6 +184,7 @@ class TestHarnessArmsDeliveredChecksGuard:
         ) as mock_reconcile:
             await h._landed_dispatch_gate('Z')
 
+        assert mock_reconcile.await_args is not None
         kwargs = mock_reconcile.await_args.kwargs
         assert kwargs['project_root'] == str(h.config.project_root)
         assert kwargs['check_timeout_secs'] == 11.0
@@ -210,6 +212,7 @@ class TestHarnessArmsDeliveredChecksGuard:
         ) as mock_reconcile:
             await getattr(h, method)(*args)
 
+        assert mock_reconcile.await_args is not None
         assert mock_reconcile.await_args.kwargs['delivered_checks_enabled'] is False
         # ...and still ARMED: the kill switch is the helper's business, so the
         # path must stay wired rather than falling back to the None default.

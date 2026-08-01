@@ -1196,6 +1196,7 @@ class TestOnArchitectMergeDoneDeliveredChecksGuard:
 
         f.scheduler.mark_done.assert_awaited_once()
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.args[1] == f.wf.task['metadata']
 
     # --- rows 4 & 5: fail-safe blocks must NOT be misrouted into the L2 ----
@@ -1209,7 +1210,9 @@ class TestOnArchitectMergeDoneDeliveredChecksGuard:
         would both misclassify the condition and erode a load-bearing L2 that
         operators must keep trusting."""
         escalations = _FakeEscalationQueue()
-        guard = AsyncMock(return_value=DeliveredChecksBlock(reason=reason))
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason=reason,  # type: ignore[arg-type]
+        ))
 
         with patch(_MD_GATE_TARGET, guard):
             f = await self._fire(
@@ -1231,6 +1234,7 @@ class TestOnArchitectMergeDoneDeliveredChecksGuard:
             f = await self._fire(tmp_path, self._done(), enabled=False)
 
         f.scheduler.mark_done.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.kwargs['enabled'] is False
 
     async def test_kill_switch_with_real_helper_flips_as_today(

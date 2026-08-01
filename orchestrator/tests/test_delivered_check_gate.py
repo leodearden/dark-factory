@@ -3384,6 +3384,7 @@ class TestGateMarkDoneOnDeliveredChecks:
 
         assert block is None
         git_ops.get_main_sha.assert_not_awaited()
+        assert verify.await_args is not None
         assert verify.await_args.kwargs['main_sha'] == supplied
 
     @pytest.mark.asyncio
@@ -3400,6 +3401,7 @@ class TestGateMarkDoneOnDeliveredChecks:
         )
 
         assert block is None
+        assert verify.await_args is not None
         assert verify.await_args.kwargs['main_sha'] == supplied
 
     @pytest.mark.asyncio
@@ -3440,6 +3442,7 @@ class TestGateMarkDoneOnDeliveredChecks:
 
         assert block is None
         verify.assert_awaited_once()
+        assert verify.await_args is not None
         assert verify.await_args.args[0] == checks
         assert verify.await_args.kwargs['project_root'] == '/some/main/checkout'
         assert verify.await_args.kwargs['check_timeout_secs'] == 17.5

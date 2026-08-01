@@ -3581,6 +3581,7 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         # The WARNING now comes FROM the helper, but must still be addressable
         # as 'orchestrator.harness' — that holds only because the harness
         # passes its own module logger through as log=. Pinned directly...
+        assert helper.await_args is not None
         assert helper.await_args.kwargs['log'] is logging.getLogger(
             'orchestrator.harness',
         )
@@ -3649,6 +3650,7 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         )
         assert result == 1
         helper.assert_awaited_once()
+        assert helper.await_args is not None
         assert 'delivered_checks' not in helper.await_args.args[1]
 
     # --- row 5: ERRORED/timeout -> fail-safe (no mark, no revert) ------------
@@ -3843,4 +3845,5 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         )
         assert result == 1
         helper.assert_awaited_once()
+        assert helper.await_args is not None
         assert helper.await_args.kwargs['enabled'] is False

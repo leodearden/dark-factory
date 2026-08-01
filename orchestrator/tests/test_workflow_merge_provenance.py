@@ -1064,6 +1064,7 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
         assert outcome == WorkflowOutcome.DONE
         f.mark_done.assert_awaited_once()
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.args[1] == f.wf.task['metadata']
 
     # --- rows 4 & 5: fail-safe blocks are handled UNIFORMLY with FAILED ----
@@ -1077,7 +1078,9 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
         claim either way means no recovery-DONE. Fail-safe here is cheap —
         the workflow simply proceeds with the phase and re-delivers."""
         f = _arm_recovery_fixture(tmp_path)
-        guard = AsyncMock(return_value=DeliveredChecksBlock(reason=reason))
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason=reason,  # type: ignore[arg-type]
+        ))
 
         with patch(_WF_GATE_TARGET, guard):
             outcome = await f.wf._finalise_recovery_done(
@@ -1105,6 +1108,7 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
 
         assert outcome == WorkflowOutcome.DONE
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.kwargs['enabled'] is False
 
     @pytest.mark.parametrize(('basis', 'kind'), _RECOVERY_ARMS)
@@ -1144,6 +1148,7 @@ class TestFinaliseRecoveryDoneDeliveredChecksGuard:
                 basis=basis, sha='advancedsha123', kind=kind, note='n',
             )
 
+        assert guard.await_args is not None
         kwargs = guard.await_args.kwargs
         assert kwargs['project_root'] == str(f.wf.config.project_root)
         assert kwargs['project_root'] != str(f.wf.worktree)

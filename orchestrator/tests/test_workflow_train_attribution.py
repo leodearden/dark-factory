@@ -14,6 +14,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1415,7 +1416,7 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
             side_effect=lambda mid: order.append(f'consume:{mid}'),
         )
         emit = f.wf.event_store.emit  # type: ignore[union-attr]
-        emit.side_effect = lambda et, **k: (
+        cast(MagicMock, emit).side_effect = lambda et, **k: (
             order.append(f'emit:{k.get("task_id")}')
             if et == EventType.train_merged else None
         )
@@ -1485,6 +1486,7 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
             await _run_attribution(f)
 
         assert _done_ids(f) == ['102', '103']
+        assert guard.await_args is not None
         assert guard.await_args.kwargs['enabled'] is False
 
     async def test_kill_switch_with_real_helper_lands_as_today(self):
@@ -1510,6 +1512,7 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
         )
         gated = [c.args[0] for c in guard.await_args_list]
         assert gated == ['102', '103'], 'must gate on the MEMBER ids'
+        assert guard.await_args is not None
         assert guard.await_args.args[1] == {'delivered_checks': [_ATTR_DC_CHECK]}
         assert guard.await_args.kwargs['site'] == 'train-attribution-solo-passer'
         assert guard.await_args.kwargs['project_root'] == str(

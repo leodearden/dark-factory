@@ -403,6 +403,7 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
         assert f.artifacts.read_already_done() is None
 
         mark_blocked.assert_awaited_once()
+        assert mark_blocked.await_args is not None
         args, kwargs = mark_blocked.await_args
         # Deliberately NOT escalate_to_human: like the unreachable-commit
         # case, this is an architect mistake a steward retry can resolve.
@@ -425,6 +426,7 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
         assert f.wf.state == WorkflowState.DONE
         mark_done = cast(AsyncMock, f.wf.scheduler.mark_done)
         mark_done.assert_awaited_once()
+        assert mark_done.await_args is not None
         assert mark_done.await_args.args[0] == '50'
         kwargs = mark_done.await_args.kwargs
         assert kwargs['kind'] == 'found_on_main'
@@ -444,6 +446,7 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
         assert outcome == WorkflowOutcome.DONE
         cast(AsyncMock, f.wf.scheduler.mark_done).assert_awaited_once()
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.args[1] == f.wf.task['metadata']
 
     # --- rows 4 & 5: fail-safe blocks also produce a VISIBLE blocked task --
@@ -458,7 +461,9 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
         f = _arm_already_done_fixture(tmp_path)
         mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-        guard = AsyncMock(return_value=DeliveredChecksBlock(reason=reason))
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason=reason,  # type: ignore[arg-type]
+        ))
 
         with patch(_AD_GATE_TARGET, guard):
             outcome = await f.wf._handle_already_done_report()
@@ -467,6 +472,7 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
         cast(AsyncMock, f.wf.scheduler.mark_done).assert_not_awaited()
         assert f.wf.state != WorkflowState.DONE
         mark_blocked.assert_awaited_once()
+        assert mark_blocked.await_args is not None
         assert mark_blocked.await_args.kwargs.get('escalate_to_human') is not True
 
     # --- row 6: kill switch is FORWARDED, never re-implemented -------------
@@ -482,6 +488,7 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
 
         assert outcome == WorkflowOutcome.DONE
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.kwargs['enabled'] is False
 
     async def test_kill_switch_with_real_helper_stamps_as_today(
@@ -538,6 +545,7 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
             await f.wf._handle_already_done_report()
 
         f.get_main_sha.assert_awaited_once()
+        assert guard.await_args is not None
         kwargs = guard.await_args.kwargs
         assert kwargs['main_sha'] == _AD_MAIN_SHA
         assert kwargs['project_root'] == str(f.wf.config.project_root)

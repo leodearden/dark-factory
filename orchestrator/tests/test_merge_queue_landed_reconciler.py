@@ -765,6 +765,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
                 check_timeout_secs=7.5, delivered_checks_enabled=False,
             )
 
+        assert guard.await_args is not None
         assert guard.await_args.kwargs['enabled'] is False
 
     async def test_kill_switch_with_real_helper_marks_done_as_today(
@@ -803,6 +804,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
 
         scheduler.get_task.assert_awaited_once_with('Z')
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.args[0] == 'Z'
         assert guard.await_args.args[1] == meta
         assert guard.await_args.kwargs['main_sha'] == 'MAIN'

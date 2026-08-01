@@ -21,7 +21,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -596,7 +596,7 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
         # The write-ahead row SURVIVES: it is the reconciler's only record of
         # the crash-window intent, so a withholding must not consume it.
         assert outbox.lookup('101') is not None
-        f.wf.git_ops.release_lane_for_terminal_task.assert_not_awaited()
+        cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_not_awaited()
 
         blob = '\n'.join(r.getMessage() for r in caplog.records)
         assert _DC_TRAIN in blob, f'WARNING must name the train: {blob!r}'
@@ -626,6 +626,7 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
             f'ordering must be byte-identical to today, got {order!r}'
         )
         call = f.scheduler.mark_done.await_args
+        assert call is not None
         assert call.args[0] == '101'
         assert call.kwargs['kind'] == 'merged'
         assert call.kwargs['sha'] == 'sha9'
@@ -642,7 +643,7 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
 
         f.scheduler.mark_done.assert_awaited_once()
         assert f.scheduler.mark_done.await_args.kwargs['kind'] == 'merged'
-        f.wf.git_ops.release_lane_for_terminal_task.assert_awaited_once_with('101')
+        cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_awaited_once_with('101')
 
     # --- rows 4 & 5: fail-safe blocks withhold identically ----------------
 
@@ -663,7 +664,7 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
         f.scheduler.mark_done.assert_not_awaited()
         f.scheduler.set_task_status.assert_not_awaited()
         prov.consume.assert_not_called()
-        f.wf.git_ops.release_lane_for_terminal_task.assert_not_awaited()
+        cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_not_awaited()
 
     # --- row 6: kill switch is FORWARDED, never re-implemented ------------
 
@@ -675,6 +676,7 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
             await cb('101', 'sha9')
 
         f.scheduler.mark_done.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.kwargs['enabled'] is False
 
     async def test_kill_switch_with_real_helper_flips_as_today(self):
@@ -700,6 +702,7 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
 
         get_task.assert_awaited_once_with('101')
         guard.assert_awaited_once()
+        assert guard.await_args is not None
         assert guard.await_args.args[0] == '101', 'must gate on the MEMBER id'
         assert guard.await_args.args[1] == member_meta
         assert guard.await_args.kwargs['site'] == 'workflow-train-member-merged'
