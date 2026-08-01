@@ -233,3 +233,96 @@ def _assert_script_loads_before(
         f'BEFORE {after_label} (position {after_pos}). '
         f'{consumer_note}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-1 test: data.js registers the memory-evals endpoint + seed
+# ---------------------------------------------------------------------------
+
+
+# The seven top-level keys of ``redux_api.shape_memory_evals``'s return body.
+# This list IS the payload contract (that fn's own docstring says so, per PRD
+# open question 4); the React section consumes exactly these spellings.
+_MEMORY_EVALS_CONTRACT_KEYS = (
+    'generated_at',
+    'root_present',
+    'storm_escape',
+    'evals',
+    'issues',
+    'issue_count',
+    'unmatched_escalations',
+)
+
+
+def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
+    """data.js must register /api/v2/dashboard/memory-evals -> ['MEMORY_EVALS']
+    and seed DF_DATA.MEMORY_EVALS with the server's own default body.
+
+    The seed is asserted key-by-key against the ``shape_memory_evals`` contract
+    rather than eyeballed, and its defaults must be the *empty* shape
+    (``root_present: false``, empty lists) — NOT illustrative rows.  A
+    default-shaped body is structurally identical to a real one, so the
+    pre-fetch render and a genuine empty response are indistinguishable and no
+    component has to branch on which it got.  Any invented row would be
+    synthetic data (feedback_redux_no_synthetic_data).
+    """
+    assert '/api/v2/dashboard/memory-evals' in data_js_body, (
+        "data.js does not register '/api/v2/dashboard/memory-evals'. Add a "
+        'static (non-windowed) row to endpointsFor() mapping it to '
+        "['MEMORY_EVALS']."
+    )
+
+    # (b) key and value must be checked as a PAIR — two independent substring
+    # hits would pass even if the endpoint mapped to some other DF_DATA key.
+    assert re.search(
+        r"""['"]/api/v2/dashboard/memory-evals['"]\s*:\s*\[\s*['"]MEMORY_EVALS['"]\s*,?\s*\]""",
+        data_js_body,
+    ), (
+        "data.js's endpointsFor() must map '/api/v2/dashboard/memory-evals' to "
+        "exactly ['MEMORY_EVALS']."
+    )
+
+    # (c) the DF_DATA seed block exists
+    seed_block = _extract_df_data_block(data_js_body, 'MEMORY_EVALS')
+    assert seed_block, (
+        'data.js has no MEMORY_EVALS seed in the `window.DF_DATA = {...}` '
+        'literal. Without it the first render before the fetch completes '
+        'reads undefined and crashes the Memory tab.'
+    )
+
+    # (d) exactly the seven contract keys — no more, no fewer
+    for key in _MEMORY_EVALS_CONTRACT_KEYS:
+        assert re.search(rf'\b{key}\s*:', seed_block), (
+            f"data.js MEMORY_EVALS seed is missing the '{key}' key required by "
+            f'redux_api.shape_memory_evals. Seed block was: {seed_block}'
+        )
+    seeded = set(re.findall(r'\b(\w+)\s*:', seed_block))
+    assert seeded == set(_MEMORY_EVALS_CONTRACT_KEYS), (
+        'data.js MEMORY_EVALS seed keys do not match the shape_memory_evals '
+        f'contract exactly. Extra: {sorted(seeded - set(_MEMORY_EVALS_CONTRACT_KEYS))}, '
+        f'missing: {sorted(set(_MEMORY_EVALS_CONTRACT_KEYS) - seeded)}.'
+    )
+
+    # (e) the defaults are the server's own healthy no-artifacts shape
+    assert re.search(r'\broot_present\s*:\s*false\b', seed_block), (
+        "data.js MEMORY_EVALS seed must default root_present to `false` — the "
+        "server's own default body. Seeding `true` would claim an eval root "
+        'exists before anything has been fetched.'
+    )
+    assert re.search(r'\bgenerated_at\s*:\s*null\b', seed_block), (
+        'data.js MEMORY_EVALS seed must default generated_at to `null`.'
+    )
+    assert re.search(r'\bstorm_escape\s*:\s*null\b', seed_block), (
+        'data.js MEMORY_EVALS seed must default storm_escape to `null` — a '
+        'non-null block renders the storm banner.'
+    )
+    assert re.search(r'\bissue_count\s*:\s*0\b', seed_block), (
+        'data.js MEMORY_EVALS seed must default issue_count to `0`.'
+    )
+    for list_key in ('evals', 'issues', 'unmatched_escalations'):
+        assert re.search(rf'\b{list_key}\s*:\s*\[\s*\]', seed_block), (
+            f"data.js MEMORY_EVALS seed must default '{list_key}' to an empty "
+            'array — never to illustrative rows '
+            '(feedback_redux_no_synthetic_data). Seed block was: '
+            f'{seed_block}'
+        )
