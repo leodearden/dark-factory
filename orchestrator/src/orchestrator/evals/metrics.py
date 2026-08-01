@@ -187,6 +187,45 @@ class EvalMetrics:
         return asdict(self)
 
 
+def produced_a_plan(metrics: dict[str, Any]) -> bool:
+    """THE plan-production predicate: did this architect actually emit a plan?
+
+    Reads the PERSISTED ``plan_steps`` field above and nothing else. This is the
+    metrics-dict twin of :func:`orchestrator.evals.judge.is_scorable_plan`, which
+    asks the same question of the plan ARTIFACT — the form the report layer can
+    never use, because by report time it holds only a persisted metrics dict.
+    ``run_architect_eval`` derives ``plan_steps`` from the identical
+    ``len(plan.get('steps') or [])``, so the two are equivalent BY CONSTRUCTION
+    (pinned by ``TestProducedAPlan.test_equivalent_to_the_artifact_level_twin``
+    rather than left to coincidence — the drift hazard
+    ``report._has_plan_quality_score`` was written to close).
+
+    **Why not ``plan_quality > 0``** (the rule this replaces everywhere, task
+    3302): the two plan scorers disagree exactly on a stepless artifact.
+    :func:`judge.score_plan_structure` returns ``0.0`` for one as a deliberate
+    ANTI-FABRICATION guard, while the LLM plan judge has no such guard and can
+    score the same artifact nonzero (Graphiti episode e2066ec6). So a nonzero
+    ``plan_quality`` is not evidence a plan exists, and a zero one is not
+    evidence it does not — the number is the thing being decided, not the
+    evidence for it.
+
+    **Why not ``outcome == 'done'``** (task 2863 AMENDMENT §1): done-without-a-plan
+    and blocked-with-a-good-plan cells both occur, so the workflow outcome
+    answers a different question.
+
+    Two in-repo surfaces already got this right and this predicate makes the
+    pipeline agree with them rather than contradict them:
+    ``scripts/eval_bootstrap_smoke.sh`` gates its smoke on ``metrics.plan_steps
+    > 0 & outcome == 'done'``, and ``plans/eval-architect-effort-verdict-2026-07-27.md``
+    hand-computed the campaign's ``planRate`` / ``meanPQ_all`` from
+    ``plan_steps > 0`` because the pipeline's own ranking could not be used.
+
+    Pure: no I/O, no mutation. Tolerates a missing key and an explicit ``None``
+    (the empty shape ``len(... or [])`` guards) — both mean "no plan".
+    """
+    return int(metrics.get('plan_steps') or 0) > 0
+
+
 def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:
     """The 404-bug signature: iteration cap hit with zero work but T/T/T.
 
@@ -335,14 +374,41 @@ def blend_composite(
     *,
     tests_pass: bool | None,
     plan_only: bool = False,
+    no_plan: bool = False,
     weights: dict[str, float] = DEFAULT_COMPOSITE_WEIGHTS,
 ) -> float:
     """The C4 efficiency-adjusted ``composite``: *quality* blended with
     normalized cost + latency scores, bounded to ``[0, 1]``.
 
-    Keeps ``compute_composite``'s HARD GATE (decision 11): a failing (or
-    ``None``) *tests_pass* returns ``0.0`` regardless of the efficiency axes, so
-    a cheap+fast WRONG answer can never outrank a correct one.
+    TWO HARD GATES, one per path, resting on ONE argument: a cheap+fast WRONG
+    answer must never outrank a correct one.
+
+    - Keeps ``compute_composite``'s gate (decision 11): a failing (or ``None``)
+      *tests_pass* returns ``0.0`` regardless of the efficiency axes.
+    - **no_plan** (task 3302): the architect produced NO PLAN, so the plan-only
+      path returns ``0.0`` the same way. The asymmetry the earlier docstring got
+      wrong is that the plan-only path bypasses *tests_pass* because "no test
+      signal was collected" is not "the answer was wrong" — but "the architect
+      produced no plan" IS the answer being wrong, and it is the one quality
+      signal a plan-only cell ALWAYS has. It therefore gates exactly the way a
+      failing workflow trial does.
+
+    The bound *no_plan* closes: flooring such a cell's *quality* axis to ``0.0``
+    (the report layer's :func:`_plan_quality_score`) bounds only the 0.6 quality
+    weight. The remaining 0.2 cost + 0.2 latency is still collected, so an
+    ungated no-plan cell caps at ``0.40`` — and a cell that is the sole member of
+    its ``(fixture, 'plan_only')`` group takes the report layer's all-trials
+    fallback baseline, earning ratios of ``1.0`` on both axes and banking the
+    full ``0.40`` for having FAILED. Measured (task 3302 review): a no-plan cell
+    at ``0.40`` outranked a config that produced a real 6-step plan at ``0.26``
+    and survived ``select_survivors(top_k=2)``, while the plan-producing one was
+    cut. Barring the cell from SEEDING its group's floor closes only the
+    intra-group route; this gate closes the cross-group one.
+
+    The gate is UNCONDITIONAL rather than scoped to *plan_only*, so a caller
+    cannot silently bypass it by forgetting the flag. The report layer computes
+    it as ``plan_only and not produced_a_plan(m)``, so it is never ``True`` on
+    the workflow path — where the plan-production question does not exist.
 
     *quality* is the pure :func:`compute_composite` score; *cost_score* and
     *latency_score* are per-fixture NORMALIZED efficiency scores in ``[0, 1]``
@@ -362,9 +428,16 @@ def blend_composite(
     UNMEASURABLE cell: a cap-tainted trial (no ``plan_quality`` at all) must be
     dropped from the pool by the report layer, never passed here as a fabricated
     ``0.0``, which would penalise whichever candidate happened to be scheduled
-    inside a cap window (the task-3118 invariant, one layer up).
+    inside a cap window (the task-3118 invariant, one layer up). *no_plan* is
+    owned by the caller for the same reason it owns *tests_pass* and *plan_only*:
+    this function stays PURE over floats + bools and never sees a metrics dict.
     """
+    # The two hard gates, as one parallel pair — not one gate plus a special
+    # case. Left: the workflow path's answer was wrong. Right: the plan-only
+    # path's answer was nothing.
     if not plan_only and not tests_pass:
+        return 0.0
+    if no_plan:
         return 0.0
     blended = (
         weights['quality'] * quality

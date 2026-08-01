@@ -722,6 +722,64 @@ conservative or the insertion point is wrong. Debug before expanding.
 
 ---
 
+## The plan-production predicate (task 3302)
+
+**The rule: `plan_steps > 0`. Never `plan_quality > 0`, never `outcome ==
+'done'`.** Wherever the pipeline or a downstream consumer —
+`select_survivors`, `compute_composite`, `blend_composite`,
+`build_composite_report`, `build_plan_quality_report` — needs to know whether
+an architect actually produced a plan, that is the question it asks, via
+`metrics.produced_a_plan(metrics_dict)`.
+
+**Why not `plan_quality > 0`.** The two plan scorers disagree exactly on a
+stepless artifact. `judge.score_plan_structure` returns `0.0` for one as a
+deliberate anti-fabrication guard (through `judge.is_scorable_plan`, which also
+catches the truthy header-only stub `create_plan` writes). The LLM plan judge
+has no such guard and can score the same artifact `0.95`. So `plan_quality` is
+the number being *decided*, not evidence for the decision — using it as the
+predicate makes a no-plan cell certify itself. Recorded in Graphiti episode
+`e2066ec6` (edges `23d9c24f` / `8092af24`).
+
+**Why not `outcome == 'done'`.** Done-without-a-plan and blocked-with-a-good-plan
+cells both occur — task 2863 AMENDMENT §1.
+
+**Two failure causes, two treatments, two counts, neither silent:**
+
+| Cause | Treatment | Count |
+|---|---|---|
+| Transport refusal (`cap_tainted`: 429 / auth / model-not-found / wedge) — we never got to ask | **EXCLUDED** from every pool | `plan_quality_cap_excluded` (composite row) / `cap_excluded` (θ table) |
+| No plan produced (`not produced_a_plan`) — we asked, the answer was nothing | **FLOORED** to `0.0` on the quality axis *and* **HARD-GATED** to `composite = 0.0` (`blend_composite(no_plan=True)`), kept in every pool and counted | `plan_quality_no_plan` (composite row) / `no_plan` (θ table) |
+
+A no-plan cell is additionally barred from *setting* its `(fixture,
+'plan_only')` cost/latency baseline, though its real spend still enters the
+row's pools: it is cheap and fast precisely because it failed
+(`plans/eval-architect-effort-verdict-2026-07-27.md` measured $0.5–$3 against a
+real plan's ~$3.7), so seeding the floor with it deflates every candidate that
+succeeded. Barring it from the baseline was *not sufficient on its own*: it
+closes only the intra-group route. Flooring the quality axis bounds just the
+0.6 quality weight, and a no-plan cell that is the sole cell of its `(fixture,
+'plan_only')` group takes the all-trials fallback baseline — earning ratios of
+`1.0` on both efficiency axes and banking the remaining 0.4 as credit for
+having failed. Measured on the pre-fix pipeline: a no-plan cell scored `0.40`,
+outranked a config that produced a real 6-step plan at `0.26`, and survived
+`select_survivors(top_k=2)` while the plan-producing one was cut. Hence the
+composite hard gate — the plan-only analogue of the workflow `tests_pass` gate,
+closing the cross-group route.
+
+**Fixed at both ends.** `run_architect_eval` gates the LLM judge on
+`is_scorable_plan` so no new incoherent cell is written; `report._plan_quality_score`
+floors at read time because the whole 2026-07-27 corpus is already on disk
+carrying the old shape.
+
+**Prior art in-repo — this makes the pipeline agree with surfaces that already
+got it right:** `scripts/eval_bootstrap_smoke.sh` gates its smoke on
+`metrics.plan_steps > 0 & outcome == 'done'`, and
+`plans/eval-architect-effort-verdict-2026-07-27.md` hand-computed the campaign's
+`planRate` / `meanPQ_all` ("scores a no-plan cell as 0") from `plan_steps > 0`
+because the pipeline's own ranking could not be used.
+
+---
+
 ## Sharp edges — read these before starting
 
 1. **Cost ceiling at full matrix scale.** Worst case: 5 tasks × 5

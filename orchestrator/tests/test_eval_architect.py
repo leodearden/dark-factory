@@ -1264,6 +1264,134 @@ class TestRunArchitectEval:
 
 
 # ---------------------------------------------------------------------------
+# Task 3302: gate the LLM plan judge at the SOURCE.
+#
+# run_architect_eval's healthy branch called judge_plan_quality with no
+# scorability gate, and judge_plan_quality has no guard of its own — it returns
+# whatever the LLM says in [0, 1]. So a HEALTHY architect that produced a
+# stepless artifact persisted the self-contradictory cell
+# `cap_tainted=False, plan_steps=0, plan_quality=0.9`, which is exactly the
+# two-scorer disagreement score_plan_structure's anti-fabrication short-circuit
+# exists to prevent (Graphiti e2066ec6). Gating here keeps plan_steps and the
+# persisted plan_quality consistent for every NEW cell.
+# ---------------------------------------------------------------------------
+
+_STEPLESS_PLANS = [
+    pytest.param({}, id='empty-dict'),
+    pytest.param({'steps': []}, id='explicit-empty-steps'),
+    pytest.param(
+        {'task_id': 't', 'title': 'x', 'analysis': 'a', 'files': [], 'steps': []},
+        id='header-only-create_plan-stub',
+    ),
+]
+
+
+@pytest.mark.asyncio
+class TestSteplessPlanIsNeverJudged:
+    """A healthy architect that produced nothing scores the structural floor."""
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    @staticmethod
+    def _confident_judge():
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        # What the ungated judge really does with an unjudgeable artifact.
+        return PlanQualityVerdict(
+            plan_quality=0.9, per_criterion={}, reasoning='looks fine',
+        )
+
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
+    async def test_stepless_plan_scores_the_structural_floor(self, plan):
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=self._confident_judge(),
+            arch_success=True,
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        # The deterministic floor, NOT the judge's 0.9.
+        assert persisted['plan_quality'] == 0.0
+        assert persisted['plan_steps'] == 0
+        assert result.metrics['plan_quality'] == 0.0
+
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
+    async def test_stepless_plan_is_a_content_failure_not_an_exclusion(self, plan):
+        """No infra failure occurred: the architect ran fine and answered with
+        nothing. That is worth 0.0, never the cap-tainted exclusion a transport
+        refusal earns (task 3118)."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=self._confident_judge(),
+            arch_success=True,
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['cap_tainted'] is False
+        assert persisted['invocation_error'] is None
+        assert result.metrics['cap_tainted'] is False
+
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
+    async def test_the_plan_judge_is_never_invoked(self, plan):
+        """Nothing to judge — and inside a cap window the call would 429 anyway,
+        so an opus invocation on an unjudgeable artifact is pure waste (the same
+        justification the arch_unmeasurable branch already records)."""
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=self._confident_judge(),
+            arch_success=True,
+        )
+        mocks['judge'].assert_not_awaited()
+
+    async def test_a_real_plan_still_awaits_the_judge(self):
+        """The control: the gate fires ONLY on a stepless artifact."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        mocks['judge'].assert_awaited_once()
+        assert persisted['plan_quality'] == 0.77
+        assert persisted['plan_steps'] > 0
+        assert persisted['cap_tainted'] is False
+
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS + [
+        pytest.param(None, id='no-plan-artifact'),
+        pytest.param(_well_formed_plan(), id='real-plan'),
+    ])
+    async def test_persisted_metrics_agree_with_the_artifact_level_twin(self, plan):
+        """produced_a_plan(PERSISTED metrics) == is_scorable_plan(artifact).
+
+        The equivalence the report layer depends on: it only ever sees a
+        persisted metrics dict and cannot call is_scorable_plan, which reads the
+        plan ARTIFACT. Driven through the REAL runner (reviewer: test-quality) —
+        asserting against a metrics dict the test built itself would only pin
+        produced_a_plan against a copy of run_architect_eval's derivation living
+        in this file, and would stay green while the two surfaces diverged.
+        """
+        from orchestrator.evals.judge import is_scorable_plan
+        from orchestrator.evals.metrics import produced_a_plan
+
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=self._confident_judge(),
+            arch_success=True,
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert produced_a_plan(persisted) is is_scorable_plan(plan)
+
+
+# ---------------------------------------------------------------------------
 # plan_quality report column — additive interim surface (step-11/12)
 #
 # A distinct per-(task_id, config_name, role_under_test) column μ/λ consume in
@@ -1278,7 +1406,15 @@ def _architect_result(
     task_id: str = 'df_task_2605',
     config_name: str = 'architect-sonnet-high',
     plan_quality: float = 0.75,
+    plan_steps: int = 6,
 ):
+    """An architect cell that DID produce a plan.
+
+    ``plan_steps`` defaults NONZERO (task 3302): a ``plan_quality`` is a score
+    over the steps a plan actually carried, and ``plan_steps > 0`` is the
+    predicate the report layer reads to know one exists. A stepless cell is the
+    distinct no-plan shape, requested explicitly by the tests that exercise it.
+    """
     from orchestrator.evals.runner import EvalResult
 
     return EvalResult(
@@ -1288,6 +1424,7 @@ def _architect_result(
         metrics={
             'role_under_test': 'architect',
             'plan_quality': plan_quality,
+            'plan_steps': plan_steps,
             'composite_score': 0.0,
         },
         worktree_path='/tmp/wt-arch',

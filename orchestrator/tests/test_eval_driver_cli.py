@@ -38,6 +38,7 @@ def _mk_result(
     dur_ms: int = 120_000,
     tests_pass: bool | None = True,
     plan_quality: float | None = None,
+    plan_steps: int | None = None,
     cap_tainted: bool = False,
     invocation_error: str | None = None,
 ) -> EvalResult:
@@ -47,7 +48,15 @@ def _mk_result(
     PLAN-ONLY architect shape ``run_architect_eval`` writes (task 3099): a
     plan-only cell runs no test, so it carries ``tests_pass=None`` and its
     quality in ``plan_quality``.
+
+    ``plan_steps`` (task 3302) defaults to the step count implied by *role*:
+    NONZERO for an architect cell — the ordinary case is a cell that actually
+    produced a plan, and ``plan_steps > 0`` is the predicate the report layer
+    reads to know it — and 0 for an implementer cell, which the plan-production
+    surfaces never consult. Pass it explicitly for the no-plan shape.
     """
+    if plan_steps is None:
+        plan_steps = 6 if role == 'architect' else 0
     return EvalResult(
         task_id=task_id,
         config_name=config_name,
@@ -62,6 +71,7 @@ def _mk_result(
             'judge_cost_usd': 0.05,
             'cost_source': 'price_table',
             'plan_quality': plan_quality,
+            'plan_steps': plan_steps,
             'cap_tainted': cap_tainted,
             'invocation_error': invocation_error,
         },

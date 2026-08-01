@@ -503,6 +503,54 @@ class TestBlendComposite:
             -5.0, 0.0, 0.0, tests_pass=None, plan_only=True,
         ) == 0.0
 
+    # -- task 3302: the NO-PLAN hard gate ---------------------------------
+    # The exact analogue of ``test_tests_fail_hard_gates_to_zero``, for the
+    # one quality signal a plan-only cell ALWAYS has. Flooring the quality
+    # axis to 0.0 bounds only 0.6 of the weight: the remaining 0.2 cost +
+    # 0.2 latency is still collected, so a no-plan cell caps at 0.40 — and a
+    # cell that is the sole member of its (fixture, plan_only) group takes
+    # the *_all fallback baseline and earns ratios of 1.0 on both axes,
+    # banking the full 0.40 for having FAILED. Measured on the pre-fix HEAD
+    # (task 3302 review): A (plan_steps=0, $0.3/60s) = 0.40 outranked B (a
+    # real 6-step plan, plan_quality=0.35, $4.0/400s) = 0.26 and survived
+    # top_k=2. That is the same "cheap+fast WRONG answer outranks a correct
+    # one" the tests_pass gate exists to prevent.
+
+    def test_no_plan_hard_gates_to_zero(self):
+        """The HARD GATE: no_plan → 0.0 regardless of the efficiency axes."""
+        from orchestrator.evals.metrics import blend_composite
+
+        # Perfect efficiency ratios, but the architect produced nothing.
+        assert blend_composite(
+            0.0, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=True,
+        ) == 0.0
+
+    def test_no_plan_gate_ignores_a_fabricated_quality_axis(self):
+        """Even the ungated LLM judge's number for a stepless artifact — the
+        `plan_steps=0` beside `plan_quality=0.95` shape — cannot buy credit."""
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            0.95, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=True,
+        ) == 0.0
+
+    def test_no_plan_defaults_false_so_every_existing_blend_is_identical(self):
+        """Additive: the default leaves the plan-only path byte-identical."""
+        from orchestrator.evals.metrics import blend_composite
+
+        # 0.6*0.9 + 0.2 + 0.2 == 0.94, exactly as before the gate existed.
+        assert blend_composite(
+            0.9, 1.0, 1.0, tests_pass=None, plan_only=True,
+        ) == pytest.approx(0.94, abs=1e-4)
+
+    def test_explicit_no_plan_false_is_unchanged(self):
+        """Passing the flag off must be identical to omitting it."""
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            0.9, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=False,
+        ) == pytest.approx(0.94, abs=1e-4)
+
 
 # ---------------------------------------------------------------------------
 # Amendment (reviewer: code-reuse) — the cost primitives (_FALLBACK_PRICE / _rate)
@@ -527,3 +575,78 @@ class TestCostPrimitivesSingleHome:
         from orchestrator.evals import metrics
 
         assert metrics._rate is invoke._rate
+
+
+# ---------------------------------------------------------------------------
+# Task 3302: THE plan-production predicate — `plan_steps > 0`, never
+# `plan_quality > 0` and never `outcome == 'done'`.
+#
+# `plan_steps` was persisted by run_architect_eval and read by NOBODY, so every
+# "did this architect actually produce a plan?" question downstream was answered
+# from plan_quality instead — a number the LLM judge can return NONZERO for a
+# stepless artifact that score_plan_structure floors to 0.0 (Graphiti episode
+# e2066ec6). These pin the predicate and its equivalence with the artifact-level
+# twin judge.is_scorable_plan.
+# ---------------------------------------------------------------------------
+
+class TestProducedAPlan:
+    """`produced_a_plan(metrics_dict)` — did this architect emit a plan?"""
+
+    def test_nonzero_plan_steps_is_a_plan(self):
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({'plan_steps': 3}) is True
+
+    def test_zero_plan_steps_is_not_a_plan(self):
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({'plan_steps': 0}) is False
+
+    def test_absent_key_is_not_a_plan(self):
+        """A legacy / hand-edited metrics dict must not read as a plan."""
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({}) is False
+
+    def test_none_plan_steps_is_not_a_plan(self):
+        """The `or 0` empty shape run_architect_eval's len(... or []) guards."""
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({'plan_steps': None}) is False
+
+    def test_does_not_consult_plan_quality(self):
+        """THE point of the predicate (task 2863 AMENDMENT §1 / e2066ec6).
+
+        The two scorers disagree exactly on a stepless artifact: the LLM plan
+        judge can score it 0.95 while score_plan_structure floors it to 0.0. So
+        a nonzero plan_quality is NOT evidence a plan exists, and a zero one is
+        NOT evidence it does not.
+        """
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({'plan_steps': 0, 'plan_quality': 0.95}) is False
+        assert produced_a_plan({'plan_steps': 4, 'plan_quality': 0.0}) is True
+
+    @pytest.mark.parametrize('plan', [
+        None,
+        {},
+        {'steps': []},
+        # The header-only stub create_plan writes on the architect's FIRST
+        # plan-tools call — TRUTHY, but not a plan.
+        {'task_id': 't', 'title': 'x', 'analysis': 'a', 'files': [], 'steps': []},
+        {'task_id': 't', 'title': 'x', 'steps': [{'id': 'step-1'}, {'id': 'step-2'}]},
+    ])
+    def test_equivalent_to_the_artifact_level_twin(self, plan):
+        """produced_a_plan(metrics) == is_scorable_plan(plan), by construction.
+
+        The report layer only ever sees a persisted metrics dict and cannot call
+        is_scorable_plan, which reads the plan ARTIFACT. run_architect_eval
+        derives plan_steps from the identical `len(plan.get('steps') or [])`, so
+        the two ask the same question — PINNED here rather than left to
+        coincidence (the drift hazard _has_plan_quality_score was written for).
+        """
+        from orchestrator.evals.judge import is_scorable_plan
+        from orchestrator.evals.metrics import produced_a_plan
+
+        persisted = {'plan_steps': len((plan or {}).get('steps') or [])}
+        assert produced_a_plan(persisted) is is_scorable_plan(plan)
