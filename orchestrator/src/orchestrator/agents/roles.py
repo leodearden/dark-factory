@@ -341,6 +341,36 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
 """
 
 
+# How the server-side backstop in fused-memory's task_interceptor actually
+# reports failure, spliced into both STEWARD "Marking tasks done" call sites
+# alongside ANCESTRY_CHECK_INSTRUCTIONS. Kept factual rather than aspirational:
+# `_validate_done_provenance` rev-parses BEFORE it merge-bases, and it wraps
+# every `_verify_commit_on_main` failure -- rc=1 and non-rc=1 alike -- in one
+# "is not on main" prefix. Documenting the prefix as trustworthy would recreate
+# the exact rc=1/rc=128 conflation this whole section exists to prevent.
+SERVER_BACKSTOP_NOTE = """\
+The server runs the same checks as a backstop, in this order. Read the TRAILING
+DETAIL of a rejection, never the leading prefix:
+
+1. `git rev-parse --verify <commit>^{commit}` resolves the SHA first. An
+   unresolvable or mistyped SHA is rejected HERE, before merge-base ever runs,
+   with `commit <x> not found in <project_root>: ...`. That message is the
+   server's rc=128 analogue -- fetch and re-run; do not re-derive the SHA on
+   the strength of this message alone.
+2. `git merge-base --is-ancestor <sha> main` runs only if step 1 resolved. rc=0
+   accepts. EVERY failure -- rc=1, a non-1 git error, a 5s timeout, a missing
+   git binary -- is reported under the single prefix `kind=<k> but commit <sha>
+   is not on main: <detail>`. That prefix is accurate ONLY for rc=1, so treat
+   `<detail>` as the verdict:
+     - `commit is not an ancestor of main` -> rc=1. The SHA really is off main;
+       re-derive the landing commit.
+     - anything else (raw git stderr, `git merge-base timed out`, `git binary
+       not found`) -> NOT-YET-CONFIRMED, not not-on-main. Treat it exactly like
+       rc=128 above: fetch and re-run. Do not repeat the server's "is not on
+       main" wording back into a note, an escalation, or a task record.
+"""
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
@@ -1239,11 +1269,7 @@ the merge SHA. Required shape:
 
 Before calling, sanity-check the SHA is actually on main:
 
-""" + ANCESTRY_CHECK_INSTRUCTIONS + """
-The server runs the identical `git merge-base --is-ancestor` command as a backstop
-and branches the same three ways: rc=0 accepts, rc=1 rejects with `'commit is not
-an ancestor of main'`, and any other rc (128 included) rejects with git's raw
-stderr -- so the rejection reason tells you which of the two failure modes you hit.
+""" + ANCESTRY_CHECK_INSTRUCTIONS + '\n' + SERVER_BACKSTOP_NOTE + """
 
 ### `kind="found_on_main"` — the implementation is already on main from a sibling task
 
@@ -1265,11 +1291,11 @@ impl-providing commit and verify it is on main:
 
     git -C <project_root> log main --oneline -- <relevant_paths>
 """ + ANCESTRY_CHECK_INSTRUCTIONS + """
-Cite the commit and the providing-task id (when known) in `note`. The server runs
-the identical `git merge-base --is-ancestor` command as a backstop for this kind
-too (post-3092 phantom-done hardening, 2026-05-09) and branches the same three
-ways: rc=0 accepts, rc=1 rejects with `'commit is not an ancestor of main'`, and
-any other rc rejects with git's raw stderr.
+Cite the commit and the providing-task id (when known) in `note`. The same
+server-side backstop applies to this kind too (post-3092 phantom-done hardening,
+2026-05-09):
+
+""" + SERVER_BACKSTOP_NOTE + """
 
 ### Forbidden
 

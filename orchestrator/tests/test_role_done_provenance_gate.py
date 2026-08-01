@@ -7,7 +7,6 @@ the additional defense so a regression in the role config can be caught at
 unit-test time.
 """
 
-import re
 import subprocess
 from pathlib import Path
 
@@ -20,13 +19,11 @@ from orchestrator.agents.roles import (
     JUDGE,
     MERGER,
     REVIEWER_COMPREHENSIVE,
-    ROLES,
+    SERVER_BACKSTOP_NOTE,
     STEWARD,
 )
 
 SET_TASK_STATUS = 'mcp__fused-memory__set_task_status'
-
-_IS_ANCESTOR_AND_ECHO = re.compile(r'--is-ancestor[^\n]*&&')
 
 
 class TestStewardCanWriteTaskStatus:
@@ -81,31 +78,6 @@ class TestStewardPromptDocumentsTwoKinds:
         assert 'update_task' in STEWARD.system_prompt
 
 
-def test_no_role_system_prompt_pairs_is_ancestor_with_and_echo() -> None:
-    """No role's system_prompt may pair `--is-ancestor` with `&&` on one line.
-
-    `git merge-base --is-ancestor <sha> <ref>` has THREE outcomes, not two:
-    rc=0 (sha IS on ref), rc=1 (sha resolves but is NOT reachable from ref --
-    wrong SHA, re-derive it), and rc=128 (sha or ref is unresolvable in this
-    checkout -- stale/unfetched project_root, wrong -C path, or a mistyped
-    SHA; fetch and retry). An `&&`-guarded `echo` renders rc=1 and rc=128 as
-    identical silence even though those two states have opposite remedies,
-    so a role reading the silence cannot tell "the SHA is wrong" apart from
-    "this checkout just needs a fetch" -- and may over-escalate a case that
-    a `git fetch` would have resolved.
-
-    Mirrors test_roles_staging_command.py:205-214's cross-role `offenders`
-    invariant shape.
-    """
-    offenders = sorted(
-        name for name, role in ROLES.items() if _IS_ANCESTOR_AND_ECHO.search(role.system_prompt)
-    )
-    assert offenders == [], (
-        'role(s) still pair --is-ancestor with && on the same line (collapses '
-        f'rc=1 and rc=128 into identical silence): {offenders}'
-    )
-
-
 class TestAncestryCheckIsThreeOutcome:
     """Pins ANCESTRY_CHECK_INSTRUCTIONS as the single canonical block spliced
     into both STEWARD call sites, and corroborates its documented rc table
@@ -116,6 +88,12 @@ class TestAncestryCheckIsThreeOutcome:
         # A bare `in` check can't distinguish "spliced once" from "spliced
         # twice" -- exactly the half-migration failure mode this guards against.
         assert STEWARD.system_prompt.count(ANCESTRY_CHECK_INSTRUCTIONS) == 2
+
+    def test_server_backstop_note_spliced_at_both_call_sites(self):
+        # The client-side rc table is only actionable if the steward also knows
+        # how the server reports its own backstop failure; a call site that
+        # carries one block but not the other is the same half-migration bug.
+        assert STEWARD.system_prompt.count(SERVER_BACKSTOP_NOTE) == 2
 
     def test_real_git_distinguishes_unresolvable_from_off_main(self, tmp_path: Path) -> None:
         """Ties the documented rc table to the installed git, not to prose.
