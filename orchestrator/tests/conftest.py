@@ -740,6 +740,20 @@ def _drain_async_mock_coroutines():
 
 
 @pytest.fixture
+def steward_worktree(tmp_path: Path) -> Path:
+    """Single-source the ``tmp_path``-rooted worktree dir for the ``_make_steward`` helpers.
+
+    This single-sources the literal; it is a convention, not an enforced
+    invariant — a test can still build its own path and pass that instead.
+    Lives in conftest.py because that is the only module every call-site file
+    reaches without a cross-module import, which would collide with their
+    function-local-import convention.  Does NOT create the directory —
+    ``_make_steward`` mkdir's it.
+    """
+    return tmp_path / 'wt'
+
+
+@pytest.fixture
 def mock_orch_config(tmp_path: Path) -> MagicMock:
     """Return a MagicMock OrchestratorConfig with the standard harness defaults pre-applied.
 
