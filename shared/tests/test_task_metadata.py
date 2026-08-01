@@ -1729,6 +1729,24 @@ class TestListValuedSubmodelSlice:
         }
 
 
+class TestRegistryKeyOwnershipGuard:
+    """Task 3352: the autouse fixture's teardown key-ownership guard.
+
+    Replaces the deleted AST drift scan. The predicate is a plain function so
+    it has direct RED/GREEN coverage instead of shipping as a bare assert
+    buried in fixture teardown.
+    """
+
+    def test_production_key_addition_is_rejected(self):
+        with pytest.raises(AssertionError, match='deploy_state'):
+            _assert_only_test_owned_registry_keys({'deploy_state'})
+
+    def test_test_owned_stub_keys_are_accepted(self):
+        _assert_only_test_owned_registry_keys(
+            {_DEPLOY_STATE_STUB_KEY, TestListValuedSubmodelSlice._KEY}
+        )
+
+
 class TestRegistryCoRunIsolation:
     """Task 3352: keep _FOREIGN_REGISTRANT_KEYS honest.
 
