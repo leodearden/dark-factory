@@ -43,6 +43,19 @@ venv = ".venv"
 [tool.pytest.ini_options]
 markers = [
     "smoke: live smoke tests requiring a real X11/tmux host (DISPLAY, wmctrl/xdotool/xprop/tmux, python3-tk); deselect: -m 'not smoke'",
+    "integration: live tests requiring real external services/credentials (live Claude CLI + OAuth accounts, real Qdrant/OpenAI); deselect: -m 'not integration'",
 ]
-addopts = "--import-mode=importlib -m 'not smoke'"
+# pytest reads exactly ONE [tool.pytest.ini_options] — the rootdir's inifile —
+# and never merges addopts/markers across pyproject.toml files. So any marker a
+# workspace member deselects must be MIRRORED here, or that member's decision is
+# silently ignored on every root-bound run (`-c pyproject.toml`, a bare `pytest`
+# from the repo root, or any arg set spanning two subprojects) and those tests
+# RUN. Owners today: `smoke` (cockpit), `integration` (shared, fused-memory).
+# Enforced by tests/scripts/test_pytest_workspace_collection.py
+# ::test_root_pyproject_mirrors_member_marker_deselections.
+#
+# ONE combined -m expression, never two -m flags: -m is a single argparse
+# option, so a second one would silently REPLACE the first and drop that
+# deselect.
+addopts = "--import-mode=importlib -m 'not smoke and not integration'"
 asyncio_mode = "auto"
