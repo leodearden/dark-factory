@@ -36,13 +36,19 @@ discriminator in its own right.
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import re
 import sqlite3
 import sys
-from pathlib import Path
 from typing import NamedTuple
+
+from _task_db_scan import (
+    add_db_discovery_args,
+    discover_db_paths,
+    format_json,
+    group_matches_by_db,
+    run_scan_cli,
+    truncate,
+)
 
 LEAK_TAIL = re.compile(
     r'</(?:description|parameter|details)>\s+(<parameter\s+name="[^"]*">.*)$',
@@ -119,46 +125,6 @@ def scan_db(db_path: str) -> list[LeakMatch]:
     return matches
 
 
-# Multi-project discovery fallback, mirroring
-# scripts/migrate_metadata_modules_to_files.py's DEFAULT_ROOTS.
-_DEFAULT_PROJECT_ROOTS = ("/home/leo/src/dark-factory",)
-
-
-def _tasks_db_path(project_root: str) -> str:
-    return str(Path(project_root) / ".taskmaster" / "tasks" / "tasks.db")
-
-
-def discover_db_paths(
-    explicit_dbs: list[str] | None = None,
-    project_roots: list[str] | None = None,
-    env: dict[str, str] | None = None,
-) -> list[str]:
-    """Resolve the list of tasks.db paths to scan.
-
-    Precedence (first supplied wins): *explicit_dbs* > *project_roots* >
-    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (read from *env*, defaulting to the
-    real ``os.environ`` when *env* is None) > the dark-factory default root.
-
-    A resolved db path that does not exist on disk is silently skipped —
-    this never raises on a missing/not-yet-set-up project.
-    """
-    if explicit_dbs is not None:
-        candidates = list(explicit_dbs)
-    else:
-        if project_roots is not None:
-            roots = list(project_roots)
-        else:
-            environ = env if env is not None else os.environ
-            roots_env = (environ.get("DASHBOARD_KNOWN_PROJECT_ROOTS") or "").strip()
-            if roots_env:
-                roots = [r.strip() for r in roots_env.split(",") if r.strip()]
-            else:
-                roots = list(_DEFAULT_PROJECT_ROOTS)
-        candidates = [_tasks_db_path(root) for root in roots]
-
-    return [path for path in candidates if os.path.exists(path)]
-
-
 _DEFAULT_MAX_FRAGMENT_LEN = 80
 
 
@@ -175,17 +141,11 @@ def format_report(matches: list[LeakMatch], max_fragment_len: int = _DEFAULT_MAX
     if not matches:
         return "no leaked tool-call fragments found"
 
-    by_db: dict[str, list[LeakMatch]] = {}
-    for m in matches:
-        by_db.setdefault(m.db_path, []).append(m)
-
     lines: list[str] = []
-    for db_path in sorted(by_db):
+    for db_path, db_matches in group_matches_by_db(matches).items():
         lines.append(f"{db_path}:")
-        for m in by_db[db_path]:
-            fragment = m.fragment
-            if len(fragment) > max_fragment_len:
-                fragment = fragment[:max_fragment_len] + "..."
+        for m in db_matches:
+            fragment = truncate(m.fragment, max_fragment_len)
             lines.append(
                 f"  task_id={m.task_id} tag={m.tag} column={m.column} fragment={fragment!r}"
             )
@@ -193,11 +153,6 @@ def format_report(matches: list[LeakMatch], max_fragment_len: int = _DEFAULT_MAX
     distinct_tasks = {(m.db_path, m.tag, m.task_id) for m in matches}
     lines.append(f"{len(matches)} leaked fragments across {len(distinct_tasks)} tasks")
     return "\n".join(lines)
-
-
-def format_json(matches: list[LeakMatch]) -> str:
-    """Render *matches* as a JSON array, carrying the FULL untruncated fragment."""
-    return json.dumps([m._asdict() for m in matches])
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -209,20 +164,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "Detection/reporting only -- never mutates task text."
         ),
     )
-    parser.add_argument(
-        "--db", dest="dbs", action="append",
-        help="Explicit tasks.db path to scan. May be repeated.",
-    )
-    parser.add_argument(
-        "--project-root", dest="project_roots", action="append",
-        help=(
-            "Project root to scan (maps to <root>/.taskmaster/tasks/tasks.db). "
-            "May be repeated."
-        ),
-    )
-    parser.add_argument(
-        "--json", action="store_true",
-        help="Emit a JSON array (full untruncated fragments) instead of a report.",
+    add_db_discovery_args(
+        parser,
+        json_help="Emit a JSON array (full untruncated fragments) instead of a report.",
     )
     parser.add_argument(
         "--max-fragment-len", type=int, default=_DEFAULT_MAX_FRAGMENT_LEN,
@@ -244,39 +188,14 @@ def main(argv: list[str] | None = None) -> int:
     the sweep: it is logged to stderr and skipped so every other resolvable
     database is still scanned and reported.
     """
-    args = _build_parser().parse_args(argv)
+    def _render(matches: list[LeakMatch], args: argparse.Namespace) -> str:
+        if args.json:
+            return format_json(matches)
+        return format_report(matches, max_fragment_len=args.max_fragment_len)
 
-    db_paths = discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
-    if not db_paths:
-        print(
-            "no tasks.db resolvable (checked --db / --project-root / "
-            "DASHBOARD_KNOWN_PROJECT_ROOTS / the dark-factory default)",
-            file=sys.stderr,
-        )
-        return 2
-
-    matches: list[LeakMatch] = []
-    unreadable: list[str] = []
-    for db_path in db_paths:
-        try:
-            matches.extend(scan_db(db_path))
-        except sqlite3.Error as exc:
-            print(f"warning: skipping unreadable database {db_path}: {exc}", file=sys.stderr)
-            unreadable.append(db_path)
-
-    if unreadable:
-        print(
-            f"warning: {len(unreadable)} database(s) skipped due to read errors "
-            "(see warnings above); results below are incomplete",
-            file=sys.stderr,
-        )
-
-    if args.json:
-        print(format_json(matches))
-    else:
-        print(format_report(matches, max_fragment_len=args.max_fragment_len))
-
-    return 1 if matches else 0
+    return run_scan_cli(
+        argv, parser=_build_parser(), scan_fn=scan_db, render=_render
+    )
 
 
 if __name__ == "__main__":
