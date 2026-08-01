@@ -160,6 +160,8 @@ class _Scaffold:
     plan_target: Path
     uv_cache: Path
     uv_data: Path
+    tree_sitter_cache: Path
+    cache_sibling: Path
     claude_fleet: Path
     settings_json: Path
 
@@ -236,6 +238,10 @@ def landlock_matrix_scaffold():
     real production symlink shape); ``~/.local/share/uv/`` pre-created
     as an empty, non-writable-by-contract sibling of the (writable)
     ``~/.cache/uv/``, so row 8's denial is a true EACCES rather than ENOENT;
+    ``~/.cache/tree-sitter/`` (writable carve-out) and ``~/.cache/other-tool/``
+    (a non-writable-by-contract ``~/.cache`` peer) both pre-created for row
+    8b, so its allowed half is grantable at wrap time and its denial is a
+    true EACCES;
     ``~/.claude/fleet/`` pre-created so the ``claude_fleet`` carve-out is
     grantable at wrap time (row 10 — an absent fleet/ dir would make
     landlock_exec's ``_add_path`` skip the grant and wrongly deny); and
@@ -299,6 +305,19 @@ def landlock_matrix_scaffold():
         uv_data = home / '.local' / 'share' / 'uv'
         uv_data.mkdir(parents=True)
 
+        # Row 08b: both dirs MUST exist at wrap time (same constraint row 10
+        # calls out for claude_fleet below) — landlock_exec's _add_path skips
+        # granting a non-existent writable dir, so an absent tree_sitter_cache
+        # would turn the allowed half into a wrongful denial, and an absent
+        # cache_sibling would make the denied half vacuous (ENOENT rather than
+        # a true EACCES). cache_sibling is a second ~/.cache/<tool> peer that
+        # must stay read-only, proving the grant is scoped to the tree-sitter
+        # subdir and was not widened to the whole ~/.cache parent.
+        tree_sitter_cache = home / '.cache' / 'tree-sitter'
+        tree_sitter_cache.mkdir(parents=True)
+        cache_sibling = home / '.cache' / 'other-tool'
+        cache_sibling.mkdir(parents=True)
+
         # Row 10: ~/.claude/fleet/ must already EXIST at wrap time — landlock_
         # exec's _add_path skips granting a non-existent writable dir, which
         # would silently turn this happy-path row into a wrongful denial.
@@ -334,6 +353,7 @@ def landlock_matrix_scaffold():
             sibling_worktree=sibling_worktree, other_task_meta=other_task_meta,
             plan_symlink=plan_symlink, plan_target=plan_target,
             uv_cache=uv_cache, uv_data=uv_data,
+            tree_sitter_cache=tree_sitter_cache, cache_sibling=cache_sibling,
             claude_fleet=claude_fleet, settings_json=settings_json,
         )
     finally:
