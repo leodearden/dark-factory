@@ -226,18 +226,22 @@ def build_repair_payload(candidate: WipeCandidate, *, now_iso: str) -> dict:
 # when it may well mean "was never evaluated".
 # ---------------------------------------------------------------------------
 
-REPAIR = "repair"                                # written (or would be, in a dry run)
-SKIP_CONTRADICTED = "skip_contradicted"          # constraint 2, dropped by selection
-SKIP_LOCK_LEVEL_FIDELITY = "skip_lock_level_fidelity"  # constraint 1, dropped by selection
-SKIP_LOCK_CHARTER = "skip_lock_charter"          # the interceptor would reject the files
-SKIP_NOT_TERMINAL = "skip_not_terminal"          # live task is not done/cancelled
-SKIP_FILES_PRESENT = "skip_files_present"        # already has a scope; re-run safe
-SKIP_MISSING = "skip_missing"                    # live re-read returned nothing usable
-FAILED = "failed"                                # the write was attempted and errored
+# Annotated `: str` rather than left to inference: a bare assignment infers as
+# Literal['repair'] etc., which makes dict.fromkeys(ALL_DISPOSITIONS, 0) a
+# dict[Literal[...], int] that no longer satisfies a dict[str, int] signature.
+# These are an open vocabulary of report keys, not a closed enum.
+REPAIR: str = "repair"                           # written (or would be, in a dry run)
+SKIP_CONTRADICTED: str = "skip_contradicted"     # constraint 2, dropped by selection
+SKIP_LOCK_LEVEL_FIDELITY: str = "skip_lock_level_fidelity"  # constraint 1, dropped by selection
+SKIP_LOCK_CHARTER: str = "skip_lock_charter"     # the interceptor would reject the files
+SKIP_NOT_TERMINAL: str = "skip_not_terminal"     # live task is not done/cancelled
+SKIP_FILES_PRESENT: str = "skip_files_present"   # already has a scope; re-run safe
+SKIP_MISSING: str = "skip_missing"               # live re-read returned nothing usable
+FAILED: str = "failed"                           # the write was attempted and errored
 
 # Report order, and the exhaustive list the summary iterates. Printed in full
 # on EVERY run, zero counts included.
-ALL_DISPOSITIONS = (
+ALL_DISPOSITIONS: tuple[str, ...] = (
     REPAIR,
     SKIP_CONTRADICTED,
     SKIP_LOCK_LEVEL_FIDELITY,
@@ -250,7 +254,7 @@ ALL_DISPOSITIONS = (
 
 # Dispositions whose entries are listed INDIVIDUALLY, with id and reason. An
 # aggregate "2 failed" tells an operator nothing they can act on.
-_ITEMISED_DISPOSITIONS = (
+_ITEMISED_DISPOSITIONS: tuple[str, ...] = (
     FAILED,
     SKIP_LOCK_CHARTER,
     SKIP_CONTRADICTED,

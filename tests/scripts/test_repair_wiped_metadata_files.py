@@ -31,7 +31,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from audit_wiped_metadata_files import (
+# Both modules live in <repo>/scripts, which tests/scripts/conftest.py puts on
+# sys.path at collection time. scripts/ is a flat script directory, not a
+# package src root, so it is deliberately absent from [tool.pyright] extraPaths
+# in the root pyproject.toml — hence the targeted ignore, matching the same
+# convention at tests/scripts/test_reviewer_redundancy_diagnostic.py:6.
+from audit_wiped_metadata_files import (  # pyright: ignore[reportMissingImports]
     CLEAN_MERGE_SHA,
     AuditCoverage,
     CONFIRMED_NULL_SHA_DONE_PATH,
@@ -43,7 +48,7 @@ from audit_wiped_metadata_files import (
     WipeCandidate,
 )
 
-from repair_wiped_metadata_files import (
+from repair_wiped_metadata_files import (  # pyright: ignore[reportMissingImports]
     PROVENANCE_KEY,
     REPAIR,
     REPAIR_TASK_ID,
