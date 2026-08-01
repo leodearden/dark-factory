@@ -17,11 +17,13 @@ mechanics).
 from __future__ import annotations
 
 import gzip
+import importlib.util
 import json
 from datetime import date as dt_date
 from pathlib import Path
 
-from legibility import inventory as mod
+from legibility import digest, inventory as mod
+from orchestrator import session_registry
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 WORKTREE_CWD = '/home/leo/src/dark-factory/.worktrees/2573'
@@ -96,6 +98,70 @@ class TestEncodeCwd:
         encoded_cockpit = mod.encode_cwd(COCKPIT_CWD)
         assert encoded_cockpit.startswith(encoded_main)
         assert encoded_cockpit != encoded_main
+
+
+def _load_sibling_test_module(name: str):
+    """Import a sibling scripts/tests module by file path.
+
+    ``scripts/tests`` is not on ``sys.path`` (its conftest inserts
+    ``scripts/`` and ``scripts/legibility``, not itself), so a bare
+    ``import test_legibility_nightly`` would not resolve under the suite's
+    ``--import-mode=importlib`` collection. Loading by path is the sanctioned
+    equivalent and avoids restructuring the nightly fixture.
+    """
+    spec = importlib.util.spec_from_file_location(
+        f'_lockstep_{name}', Path(__file__).parent / f'{name}.py'
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestEncoderLockstep:
+    """Every in-repo copy of the cwd encoding must agree with the canonical (task 3272).
+
+    The rule is duplicated four times across the repo, and in 3272 ALL FOUR
+    copies were found to be missing the same character (``_`` -> ``-``) at
+    once. The old ``inventory.encode_cwd`` docstring asserted the mirrors were
+    "kept in lockstep with the canonical implementation" — a claim nothing
+    checked, and which was false in fact.
+
+    This class replaces that aspiration with an enforced invariant. Each
+    mirror is asserted equal to BOTH:
+
+      - ``session_registry.encode_cwd``, the canonical — so a mirror that
+        drifts from it fails loudly; and
+      - the hard-coded ``REAL_ENCODED_DIR_PAIRS`` dir names — so the
+        canonical drifting from REALITY fails too.
+
+    The second assertion is the load-bearing one. A mirror-only check would
+    have passed cleanly on the pre-3272 tree, because all four copies were
+    consistently wrong together. The same defect explains why 37 green tests
+    never caught it: every fixture built its session dirs by calling the
+    encoder under test, so the fixtures tracked the bug. Only literals read
+    off a real ``~/.claude/projects`` tree can detect an encoder that is
+    self-consistently wrong.
+    """
+
+    def _mirrors(self):
+        """(label, callable) for every in-repo copy of the rule."""
+        nightly_tests = _load_sibling_test_module('test_legibility_nightly')
+        return (
+            ('legibility.inventory.encode_cwd', mod.encode_cwd),
+            ('legibility.digest._encode_cwd', digest._encode_cwd),
+            ('test_legibility_nightly._encode_cwd', nightly_tests._encode_cwd),
+        )
+
+    def test_every_mirror_agrees_with_canonical_and_with_reality(self):
+        canonical = session_registry.encode_cwd
+        for cwd, expected_dir in REAL_ENCODED_DIR_PAIRS:
+            # The canonical itself must match the real on-disk dir name.
+            assert canonical(cwd) == expected_dir, f'canonical drifted from reality: {cwd}'
+            for label, mirror in self._mirrors():
+                got = mirror(cwd)
+                assert got == canonical(cwd), f'{label} drifted from canonical: {cwd}'
+                assert got == expected_dir, f'{label} drifted from reality: {cwd}'
 
 
 def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'):
