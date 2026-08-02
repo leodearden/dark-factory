@@ -525,6 +525,7 @@ def build_report(
     reason: str | None,
     recall: dict[str, Any],
     provenance: dict[str, Any],
+    per_category: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON-serializable calibration report.
 
@@ -539,6 +540,14 @@ def build_report(
     refusal, so they are still emitted. The false-positive tally is then
     ``None`` rather than ``0`` — with no deterministic band, ``0`` would
     read as "measured, and safe".
+
+    ``per_category`` (from ``derive_bands_per_category``) is carried
+    verbatim under ``per_category``. It is strictly ADDITIVE: the pooled
+    numbers above are unchanged by its presence, since the pooled t_high
+    remains the calibration of record and this section is the evidence
+    about whether it is warranted per category. It defaults to
+    present-and-empty rather than absent, because an absent key cannot be
+    told apart from an artifact predating the measurement.
     """
     scores = {name: list(scores_by_class.get(name) or []) for name in PAIR_CLASSES}
 
@@ -550,8 +559,12 @@ def build_report(
         else sum(per_band[name]['deterministic'] for name in NEGATIVE_PAIR_CLASSES)
     )
 
+    per_category = dict(per_category or {})
     run_provenance = dict(provenance)
     run_provenance['pair_counts'] = {name: len(values) for name, values in scores.items()}
+    run_provenance['per_category_pair_counts'] = {
+        category: entry['pair_counts'] for category, entry in per_category.items()
+    }
 
     return {
         'chosen_t_high': t_high,
@@ -562,6 +575,7 @@ def build_report(
             name: summarize_distribution(values) for name, values in scores.items()
         },
         'per_band': per_band,
+        'per_category': per_category,
         'recall_at_k': recall,
         'provenance': run_provenance,
     }
@@ -677,6 +691,22 @@ def render_markdown(report: dict[str, Any]) -> str:
     for name in PAIR_CLASSES:
         b = report['per_band'][name]
         lines.append(f'| {name} | {b["deterministic"]} | {b["judge"]} | {b["store"]} |')
+    per_category = report.get('per_category') or {}
+    if per_category:
+        lines += ['', '## Per-category bands', '',
+                  '| category | n true_dup | n negative | t_high | t_low '
+                  '| pooled t_high admits | reason |',
+                  '|---|---|---|---|---|---|---|']
+        for name in sorted(per_category):
+            entry = per_category[name]
+            counts = entry['pair_counts']
+            lines.append(
+                f'| {name} | {counts["true_dup"]} '
+                f'| {counts["unrelated"] + counts["hard_negative"]} '
+                f'| {entry["t_high"]} | {entry["t_low"]} '
+                f'| {entry["pooled_t_high_negatives_admitted"]} '
+                f'| {entry["reason"] or ""} |',
+            )
     lines += ['', '## Candidate-retrieval recall', '',
               '| k | hits | total | recall |', '|---|---|---|---|']
     for row in report['recall_at_k'].get('per_k', []):
@@ -725,6 +755,24 @@ def run_calibration(
     if reason:
         logger.warning('Band derivation returned no complete calibration: %s', reason)
 
+    # Measured a SECOND way out of the SAME `vectors` — no extra embed calls,
+    # so the O(n) embed budget above is unchanged.
+    partition = partition_pairs_by_category(records)
+    scores_by_category_and_class = {
+        category: {
+            name: [
+                cosine_similarity(vectors[p['a']], vectors[p['b']])
+                for p in buckets[f'{name}_pairs']
+            ]
+            for name in PAIR_CLASSES
+        }
+        for category, buckets in partition['by_category'].items()
+    }
+    per_category = derive_bands_per_category(scores_by_category_and_class, t_high, t_low)
+    for category, entry in sorted(per_category.items()):
+        if entry['reason']:
+            logger.warning('Category %s: %s', category, entry['reason'])
+
     max_k = max(ks) if ks else 0
     retrievals = []
     for record in records:
@@ -739,12 +787,23 @@ def run_calibration(
         })
     recall = compute_recall_at_k(retrievals, list(ks))
 
+    per_category_record_counts: dict[str, int] = {}
+    for record in records:
+        category = record.get('category')
+        if category:
+            per_category_record_counts[str(category)] = (
+                per_category_record_counts.get(str(category), 0) + 1
+            )
+
     run_provenance = dict(provenance)
     run_provenance.setdefault('record_count', len(records))
     run_provenance.setdefault('cluster_count', len({r['cluster_id'] for r in records}))
+    run_provenance.setdefault('per_category_record_counts', per_category_record_counts)
+    run_provenance.setdefault('cross_category_dropped', partition['cross_category_dropped'])
     report = build_report(
         scores_by_class=scores_by_class, t_high=t_high, t_low=t_low,
         reason=reason, recall=recall, provenance=run_provenance,
+        per_category=per_category,
     )
 
     report_path = Path(report_path)

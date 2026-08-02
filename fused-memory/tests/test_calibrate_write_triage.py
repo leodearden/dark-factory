@@ -1303,14 +1303,25 @@ class TestBuildReportPerCategory:
         got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=per_category)
         assert got['per_category'] == per_category
 
+    # The provenance keys that PREDATE this change. per_category_pair_counts
+    # belongs to the new section, so it is excluded here by construction
+    # rather than by a blanket comparison that would silently absorb it.
+    POOLED_PROVENANCE_KEYS = (*_PROVENANCE, 'pair_counts')
+
     def test_the_pooled_measurement_is_byte_identical_with_and_without_it(self) -> None:
         """Additive means additive: same inputs, same pooled numbers."""
         without = _report(OVERLAP_SCORES, 0.80, 0.70)
         with_ = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
         for key in self.POOLED_KEYS:
             assert with_[key] == without[key], f'{key} drifted when per_category was added'
-        for key, value in without['provenance'].items():
-            assert with_['provenance'][key] == value, f'provenance[{key!r}] drifted'
+        for key in self.POOLED_PROVENANCE_KEYS:
+            assert with_['provenance'][key] == without['provenance'][key], (
+                f'provenance[{key!r}] drifted'
+            )
+        assert set(without['provenance']) == set(with_['provenance']), (
+            'the two runs must expose the same provenance KEYS — a key that '
+            'appears only when calibrated would make the two shapes diverge'
+        )
 
     def test_defaults_to_an_empty_section_so_existing_callers_are_unaffected(self) -> None:
         """Present-and-empty, not missing: 'measured nothing' is still a state."""
