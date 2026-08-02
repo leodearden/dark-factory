@@ -347,16 +347,28 @@ def is_scorable_plan(plan: object) -> TypeGuard[dict]:
 
 
 def clamp_unit_score(score: float) -> float:
-    """THE output-range contract shared by both plan-quality instruments.
+    """THE output-range contract shared by the two plan-quality instruments.
 
     :func:`score_plan_structure` and :func:`judge_plan_quality` are a
     two-instrument pair reduced onto ONE axis (``EvalMetrics.plan_quality``) —
     exactly the shape :func:`is_scorable_plan` (above) already solved for
     scorability. That function's docstring records the rule: "making both call
     sites literally this function makes that drift structurally impossible."
-    The range invariant gets the same treatment — the ONE named contract both
-    instruments call, rather than a copied expression the two can silently
-    drift apart on the next time either is edited.
+    The range invariant gets the same treatment within THIS pair — the ONE
+    named contract both plan-quality instruments call, rather than a copied
+    expression the two can silently drift apart on the next time either is
+    edited. This is also THE canonical explanation of the schema-gap/NaN
+    reasoning below — other call sites in this module and its tests point
+    back here rather than restating it, so the rationale cannot drift out of
+    step with itself across copies the way the clamp expression used to.
+
+    Scoped to this instrument pair, not the whole ``evals`` package: the
+    identical ``round(min(max(x, 0.0), 1.0), 4)`` idiom still exists verbatim
+    at ``scoring.py``'s recovery rubric and ``metrics.py``'s composite blend —
+    different instruments, on different axes, deliberately left unmigrated
+    here to avoid widening this fix's blast radius (see this task's plan). A
+    future unification of those is a separate decision, not an oversight of
+    this one.
 
     Covers a real schema gap: ``PLAN_QUALITY_SCHEMA`` declares
     ``{'minimum': 0.0, 'maximum': 1.0}``, but that only constrains the
@@ -511,21 +523,16 @@ async def judge_plan_quality(
     ``0.0``, never a cap-tainted exclusion.
 
     A successfully parsed ``plan_quality`` is put through
-    :func:`clamp_unit_score` — the same ``[0, 1]``/4dp contract
-    :func:`score_plan_structure` uses — rather than returned as a raw float.
-    This matters because ``PLAN_QUALITY_SCHEMA``'s declared bounds only
-    constrain the ``structured_output`` delivery path: the
-    ``json.loads(result.output)`` fallback above bypasses schema enforcement
-    entirely, so an out-of-range judge answer must still be caught at runtime
-    regardless of which path delivered it. The parse contract is one rule
-    with two LOUD exceptions (never silent — each leaves one WARNING naming
-    the cell): an out-of-range-but-orderable answer (e.g. ``1.5``) is clamped
-    and the WARNING names the raw and clamped values; a non-finite,
-    unorderable answer (``NaN``) cannot be clamped meaningfully — ``min``/
-    ``max`` pass NaN straight through unchanged — so it degrades to the
-    ``None`` sentinel instead, exactly like a parse failure. ``+/-Infinity``
-    IS orderable, so it takes the ordinary clamp path (``1.0``/``0.0``), not
-    the NaN one.
+    :func:`clamp_unit_score` rather than returned as a raw float — see that
+    function's docstring for why a runtime clamp is still needed despite
+    ``PLAN_QUALITY_SCHEMA``'s declared bounds, and for the NaN-is-unorderable
+    mechanics behind the exception below. The parse contract is one rule with
+    two LOUD exceptions (never silent — each leaves one WARNING naming the
+    cell): an out-of-range-but-orderable answer (e.g. ``1.5``) is clamped and
+    the WARNING names the raw and clamped values; a non-finite, unorderable
+    answer (``NaN``) degrades to the ``None`` sentinel instead, exactly like a
+    parse failure. ``+/-Infinity`` IS orderable, so it takes the ordinary
+    clamp path (``1.0``/``0.0``), not the NaN one.
 
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
     sentinel :func:`run_architect_eval` degrades on), never a crash. When the
@@ -662,13 +669,12 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
         else:
             raw_quality = float(raw_quality)
             # NaN is unorderable, so clamp_unit_score cannot enforce [0, 1] on
-            # it (round(min(max(nan, 0.0), 1.0), 4) is itself nan — verified
-            # by execution) — checked BEFORE the clamp, not after.
-            # +/-Infinity IS orderable and falls through to the clamp +
-            # out-of-range warning below instead: a judge answering infinity
-            # clearly means "as high/low as it goes", the same
-            # intent-preserving reasoning that governs any other
-            # out-of-range-but-orderable answer.
+            # it (see that function's docstring for the mechanics) — checked
+            # BEFORE the clamp, not after. +/-Infinity IS orderable and falls
+            # through to the clamp + out-of-range warning below instead: a
+            # judge answering infinity clearly means "as high/low as it
+            # goes", the same intent-preserving reasoning that governs any
+            # other out-of-range-but-orderable answer.
             if math.isnan(raw_quality):
                 logger.warning(
                     f'Plan judge for {cell} answered a non-finite '
@@ -685,14 +691,12 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
                     ),
                 )
             plan_quality = clamp_unit_score(raw_quality)
-            # PLAN_QUALITY_SCHEMA declares {'minimum': 0.0, 'maximum': 1.0},
-            # but that only binds the structured_output delivery path — the
-            # json.loads(result.output) fallback above bypasses schema
-            # enforcement entirely, so an out-of-range answer reaches here
-            # unchecked whenever that path is taken. LOUD, not silent: the
-            # value is still corrected (clamp_unit_score), but an operator
-            # must be able to see that the judge answered OUTSIDE its
-            # declared contract, not just read its silently-corrected output.
+            # See clamp_unit_score's docstring for why the schema bound alone
+            # (structured_output-only) does not stop an out-of-range answer
+            # reaching here. LOUD, not silent: the value is still corrected,
+            # but an operator must be able to see that the judge answered
+            # OUTSIDE its declared contract, not just read the
+            # silently-corrected output.
             if raw_quality < 0.0 or raw_quality > 1.0:
                 logger.warning(
                     f'Plan judge for {cell} answered OUTSIDE its declared '
