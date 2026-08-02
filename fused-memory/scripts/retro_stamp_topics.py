@@ -71,23 +71,91 @@ Usage
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import re
+import sys
+import types
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from fused_memory.memory_metadata import _is_full_uuid, normalize_supersedes
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 
 __all__ = [
+    'CALIBRATION_FIXTURE_PATH',
     'CLUSTER_MEMBER_KEYS',
+    'TOPIC_REGISTRY_PATH',
     'TOPIC_SLUG_MAX_LEN',
     'ClusterPlan',
     'PatchDecision',
     'compute_patch',
     'derive_topic_slug',
     'is_valid_topic_slug',
+    'load_calibration_rows',
+    'load_topic_registry',
     'normalize_supersedes',
+    'plan_calibration_clusters',
     'plan_canonical_clusters',
 ]
+
+#: This script lives at ``<repo>/fused-memory/scripts/``.
+_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+_REPO_ROOT = _PACKAGE_ROOT.parent
+
+#: 3130's labeled curator dataset — source (3).  104 rows over 20 clusters,
+#: each row carrying ``memory_id``, ``cluster_id`` and a curator ``label``.
+CALIBRATION_FIXTURE_PATH = str(
+    _PACKAGE_ROOT / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
+)
+
+#: The committed E1 topic registry — the hand-authored topic slugs, keyed by
+#: ``provenance.cluster_id``.  Its 20 ``derived_from: curator_gate`` entries
+#: are 3112's reify gate census already materialized and human-completed,
+#: which is what makes it the reify half of source (2) as well.
+TOPIC_REGISTRY_PATH = str(
+    _PACKAGE_ROOT / 'tests' / 'fixtures' / 'memory_eval_topic_registry.json'
+)
+
+_PROBE_SCRIPT_PATH = _PACKAGE_ROOT / 'scripts' / 'memory_eval_retrieval_probe.py'
+
+
+def _load_probe_module() -> types.ModuleType:
+    """Load ``memory_eval_retrieval_probe`` by path.
+
+    ``scripts/`` is not a package, so a plain import cannot reach it — the
+    same importlib idiom this script's own tests use to reach this script.
+    Cached in ``sys.modules`` so repeat calls return the same module (and
+    therefore the same class objects, which the reuse assertions depend on).
+    """
+    mod_name = 'memory_eval_retrieval_probe'
+    cached = sys.modules.get(mod_name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(mod_name, _PROBE_SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {_PROBE_SCRIPT_PATH}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
+
+
+_probe = _load_probe_module()
+
+#: The registry loader and its model, REUSED rather than re-parsed.  It is
+#: required-strict (a malformed entry fails by name) and additive-tolerant —
+#: ``RegistryEntry.extra`` exists precisely so this consumer can load a
+#: richer entry without forcing a fixture rewrite; its docstring names 3201.
+load_topic_registry = _probe.load_topic_registry
+RegistryEntry = _probe.RegistryEntry
+TopicRegistry = _probe.TopicRegistry
+Canonical = _probe.Canonical
+Phrasing = _probe.Phrasing
 
 
 # ---------------------------------------------------------------------------
@@ -387,5 +455,139 @@ def plan_canonical_clusters(
             member_memory_ids=members,
             source='canonical_scroll',
             provenance={'raw_topic': metadata.get('topic')},
+        ))
+    return plans, skips
+
+
+# ---------------------------------------------------------------------------
+# Pure core — planning sources (2)-reify and (3): ONE join on cluster_id
+# ---------------------------------------------------------------------------
+
+#: The curator label that means "this row is a member of the cluster".
+#:
+#: ONLY ``duplicate``.  ``distinct`` and ``pseudo_contradiction`` rows were
+#: adjudicated as separate claims that merely READ as contradictory — the
+#: rule ``_derive_curator_gate_candidates`` documents.  θ reuses it rather
+#: than inventing a second, looser notion of "cluster", because two
+#: definitions of the same word are how they drift apart.
+_MEMBER_LABEL = 'duplicate'
+_CANONICAL_LABEL = 'canonical'
+
+
+def load_calibration_rows(path: str | Path) -> list[dict]:
+    """Read 3130's labeled calibration fixture (JSONL, one row per line).
+
+    Blank lines are tolerated; a malformed line raises, because a fixture
+    this sweep reads ids out of is not a place to guess.
+    """
+    rows: list[dict] = []
+    with Path(path).open(encoding='utf-8') as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def plan_calibration_clusters(
+    rows: list[dict], registry: object
+) -> tuple[list[ClusterPlan], list[dict]]:
+    """Join 3130's labeled rows to the E1 registry on ``cluster_id``.
+
+    One join resolves TWO of the bounded sources: source (3) outright, and
+    the reify half of source (2) — the registry's ``derived_from:
+    curator_gate`` entries are 3112's reify gate census, already materialized
+    and topic-completed by a human.
+
+    The join direction matters.  The rows carry ids and labels but NO topic;
+    the registry carries the hand-authored slug, which is the part a machine
+    cannot regenerate.  Re-deriving instead would send
+    ``_derive_curator_gate_candidates`` down its ``_slugify(cluster_id)``
+    fallback and mint a slugified UUID as a topic — so a cluster with no
+    registry entry is skipped rather than stamped.
+
+    Pure: no I/O (the caller loads both fixtures), no mutation of *rows*.
+
+    Args:
+        rows: Calibration rows, as :func:`load_calibration_rows` returns.
+        registry: A ``TopicRegistry`` — anything exposing ``.entries``.
+
+    Returns:
+        ``(plans, skips)``.
+    """
+    by_cluster: dict[str, object] = {}
+    for entry in getattr(registry, 'entries', ()):
+        cluster_id = (getattr(entry, 'provenance', None) or {}).get('cluster_id')
+        if cluster_id:
+            by_cluster.setdefault(str(cluster_id), entry)
+
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        cluster_id = row.get('cluster_id')
+        if cluster_id:
+            grouped.setdefault(str(cluster_id), []).append(row)
+
+    plans: list[ClusterPlan] = []
+    skips: list[dict] = []
+    for cluster_id, group in sorted(grouped.items()):
+        entry = by_cluster.get(cluster_id)
+        if entry is None:
+            skips.append({
+                'reason': 'no_registry_topic',
+                'cluster_id': cluster_id,
+                'row_count': len(group),
+            })
+            continue
+        topic = derive_topic_slug(getattr(entry, 'topic', None))
+        if topic is None:
+            skips.append({
+                'reason': 'topic_underivable',
+                'cluster_id': cluster_id,
+                'raw_topic': getattr(entry, 'topic', None),
+            })
+            continue
+        project_id = getattr(entry, 'project_id', None) or 'reify'
+
+        canonical_id: str | None = None
+        members: dict[str, None] = {}
+        for row in group:
+            label = row.get('label')
+            if label not in (_CANONICAL_LABEL, _MEMBER_LABEL):
+                continue
+            memory_id = row.get('memory_id')
+            if not _is_full_uuid(memory_id):
+                skips.append({
+                    'reason': 'member_not_a_uuid',
+                    'cluster_id': cluster_id,
+                    'key': 'memory_id',
+                    'value': memory_id,
+                })
+                continue
+            if label == _CANONICAL_LABEL:
+                if canonical_id is None:
+                    canonical_id = memory_id
+                continue
+            members.setdefault(memory_id, None)
+
+        if canonical_id is None:
+            # Not a blocker: the members are still a real cluster and still
+            # benefit from a topic. What the sweep must not do is PICK one.
+            skips.append({
+                'reason': 'cluster_without_canonical',
+                'cluster_id': cluster_id,
+                'topic': topic,
+            })
+        members.pop(canonical_id, None)  # type: ignore[arg-type]
+
+        plans.append(ClusterPlan(
+            topic=topic,
+            project_id=project_id,
+            canonical_memory_id=canonical_id,
+            member_memory_ids=tuple(members),
+            source='calibration_registry_join',
+            provenance={
+                'cluster_id': cluster_id,
+                'gate_ids': (getattr(entry, 'provenance', None) or {}).get('gate_ids'),
+            },
         ))
     return plans, skips
