@@ -245,7 +245,8 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
 
     The entry must be present in the static (unwindowed) section of endpointsFor,
     and the empty-defaults block must initialise ESCALATIONS with the shape
-    expected by redux_api.shape_escalations: {subsections, summary:{by_level,by_status}}.
+    expected by redux_api.shape_escalations:
+    {subsections, summary:{by_level, by_status, skipped_count}}.
     """
     assert '/api/v2/dashboard/escalations' in data_js_body, (
         "data.js does not contain the literal URL '/api/v2/dashboard/escalations' — "
@@ -283,6 +284,13 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
     assert re.search(r'\bby_status\s*:', summary_block), (
         "ESCALATIONS.summary seed missing key 'by_status:' — "
         'add it nested under summary in the ESCALATIONS seed block.'
+    )
+    assert re.search(r'\bskipped_count\s*:', summary_block), (
+        "ESCALATIONS.summary seed missing key 'skipped_count:' — "
+        'add it nested under summary in the ESCALATIONS seed block.  The seed '
+        "declares the server's true payload shape before the first poll resolves; "
+        'omitting the key leaves the global "N unreadable" pill reading `undefined` '
+        'rather than a real zero.'
     )
 
 
