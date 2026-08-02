@@ -540,6 +540,55 @@ class Mem0Backend:
         )
         return result.count
 
+    def _build_payload_filter(self, filters: dict[str, Any]):
+        """Build the Qdrant payload ``Filter`` for a key→value equality dict.
+
+        THE single construction site for this filter (INV-5).  Every
+        metadata-addressed Qdrant read in this class routes through here:
+        :meth:`count_by_metadata`, :meth:`scroll_by_metadata` and
+        :meth:`scroll_all_by_metadata`.
+
+        This is a correctness requirement, not tidiness.  The metadata census
+        (``scripts/census_memory_metadata.py``) reconciles its SCROLL against
+        :meth:`count_by_metadata`'s COUNT to decide ``coverage.complete``.  If
+        the two filter constructions ever drifted, that reconciliation would
+        silently compare two *different* point sets and still report complete
+        coverage — a no-silent-fail violation with no error surface.  The
+        sharing is pinned by an equality assertion at each entry point in
+        ``tests/test_mem0_client.py::TestMem0BackendPayloadFilterSingleHome``.
+
+        Args:
+            filters: Non-empty dict of key→value equality filters.  Mem0
+                stores ``add_memory(metadata=...)`` fields as top-level keys
+                on the Qdrant payload, so ``{'source': 'X'}`` matches against
+                ``payload.source == 'X'``.
+
+        Returns:
+            A ``qdrant_client.http.models.Filter`` whose ``must`` list holds
+            one ``FieldCondition``/``MatchValue`` per item, in dict-insertion
+            order.
+
+        Raises:
+            ValueError: If *filters* is empty — an unfiltered ``Filter``
+                selects the WHOLE collection, which is a bug at every caller.
+                Callers validate first with their own message naming the right
+                unfiltered alternative (``count()`` / ``get_all()``); this
+                guard is the backstop so the shared builder can never become
+                the hole that lets one through.
+        """
+        if not filters:
+            raise ValueError(
+                '_build_payload_filter requires at least one filter; '
+                'an empty filter would select every point in the collection',
+            )
+        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+        must: list[qmodels.Condition] = [
+            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
+            for k, v in filters.items()
+        ]
+        return qmodels.Filter(must=must)
+
     async def count_by_metadata(
         self,
         scope: Scope,
@@ -566,15 +615,9 @@ class Mem0Backend:
                 'count_by_metadata requires at least one filter; '
                 'use count() to count all memories in the collection',
             )
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
-
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        must: list[qmodels.Condition] = [
-            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
-            for k, v in filters.items()
-        ]
-        qdrant_filter = qmodels.Filter(must=must)
+        qdrant_filter = self._build_payload_filter(filters)
         result = await asyncio.wait_for(
             client.count(
                 collection_name=collection_name,
@@ -647,15 +690,9 @@ class Mem0Backend:
                 'scroll_by_metadata requires at least one filter; '
                 'use get_all() to retrieve all memories in the collection',
             )
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
-
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        must: list[qmodels.Condition] = [
-            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
-            for k, v in filters.items()
-        ]
-        qdrant_filter = qmodels.Filter(must=must)
+        qdrant_filter = self._build_payload_filter(filters)
         points, _next_offset = await asyncio.wait_for(
             client.scroll(
                 collection_name=collection_name,
