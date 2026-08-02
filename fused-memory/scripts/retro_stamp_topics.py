@@ -1426,10 +1426,15 @@ async def run(
 # Report rendering, exit code, CLI
 # ---------------------------------------------------------------------------
 
-#: Committed artifact paths, beside the census report leaf β already writes
-#: (``census_memory_metadata.py``).  Committed rather than /tmp because the
-#: PRD's θ bullet has to cite this run, and a report that exists only on one
-#: operator's disk cannot be cited.
+#: Default artifact paths, beside the census report leaf β already writes
+#: (``census_memory_metadata.py``) — the conventional place, so an operator's
+#: run lands somewhere reviewable and committable rather than in /tmp.
+#:
+#: Whether to commit the result is the operator's call, and the PRD's θ bullet
+#: deliberately does NOT cite one as existing: a stamping report snapshots
+#: live corpus state that rots immediately, so a committed copy invites
+#: trusting a stale count.  Contrast leaf α's census, a one-shot measurement
+#: worth pinning.
 DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'retro-topic-stamping-report.json')
 DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'retro-topic-stamping-report.md')
 
