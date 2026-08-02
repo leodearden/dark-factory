@@ -18,6 +18,11 @@ import subprocess
 
 import pytest
 
+from systemd_unit_invariants import (
+    assert_restart_backoff_effective as _assert_restart_backoff_effective,
+    restart_directive as _restart_directive,
+)
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"
 HARDCODED = REPO_ROOT / "dashboard" / "dark-factory-dashboard.service"
@@ -768,95 +773,22 @@ def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
 # ---------------------------------------------------------------------------
 # Restart backoff
 #
-# RestartMaxDelaySec= is silently INERT unless RestartSteps= accompanies it.
-# systemd parses the cap, logs "Service has RestartMaxDelaySec= but no
-# RestartSteps= setting. Ignoring." at load time, and then discards it — so the
-# interpolated 5s -> 60s backoff the unit's own comment advertises never
-# happens and every restart waits exactly RestartSec, forever.  Nothing in the
-# unit's text reveals this; the only signal is a load-time warning nobody reads.
+# The invariant and its directive reader now live in systemd_unit_invariants,
+# imported at the top of this module under the private aliases this file has
+# always used.  They were lifted out of here by task 3408 so that the
+# fleet-wide sweep in test_systemd_restart_backoff.py applies the SAME
+# assertion rather than a second copy of it — see that module's docstring.
 #
-# The invariant below is RELATIONAL and CONDITIONAL, mirroring
-# _assert_drain_bounded above: the defect is the missing PAIRING, not the
-# absence of either directive on its own.  RestartSteps= alone is meaningless
-# and RestartMaxDelaySec= alone is thrown away, while a unit that deliberately
-# declares no cap is not in violation of anything.
+# Nothing asserts that the sharing holds, deliberately: the `from
+# systemd_unit_invariants import (...)` at the top of this module IS the
+# sharing, structurally, and a drifted private copy would be caught by that
+# fleet sweep failing on whichever unit the copy stopped checking.  An earlier
+# meta-test pinning it by object identity was dropped as testing the shape of
+# the refactor rather than any behaviour of a systemd unit.
+#
+# The negative-case guard for the helper stays here, below, next to the
+# drain-bound guard it is modelled on.
 # ---------------------------------------------------------------------------
-
-
-def _restart_directive(path: pathlib.Path, name: str) -> str | None:
-    r"""Return the effective value of ``<name>=`` in *path*, or None if absent.
-
-    Mirrors the opaque-token-then-parse style of _timeout_stop_sec: the value is
-    captured as ``(.*)`` and interpreted by the caller, so a valid-but-unexpected
-    spelling (``RestartMaxDelaySec=60s``, ``RestartSec=1min``) is reported as the
-    present directive it is rather than misdiagnosed as a missing line.  Matching
-    ``(\d+)`` here would read ``RestartMaxDelaySec=60s`` as no cap at all and
-    skip the pairing invariant silently — the worst possible failure for a guard
-    whose entire job is to notice a directive that is being ignored.
-
-    LAST occurrence wins, not the first, which is why this uses ``findall`` and
-    not ``search`` (the same reasoning _success_exit_statuses below applies to
-    repeated directives, reaching the opposite conclusion only because
-    SuccessExitStatus= is one of the few systemd directives that ACCUMULATES).
-    These restart directives are scalars, and systemd overwrites on each repeat.
-    Measured on this host (systemd 255.4): a unit carrying ``RestartSteps=4``
-    followed by ``RestartSteps=0`` draws the pairing warning "Service has
-    RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." — i.e. systemd
-    applied the trailing 0 — while the reverse order (0 then 4) is silent.  A
-    first-match read would report 4, and this guard would bless a unit whose
-    backoff systemd has in fact discarded.  Repeats are not hypothetical: a
-    drop-in under <unit>.d/ is merged by appending, so an override that pins one
-    of these values lands as exactly this shape.
-    """
-    matches = re.findall(
-        rf"^{re.escape(name)}=(.*)$",
-        path.read_text(encoding="utf-8"),
-        re.MULTILINE,
-    )
-    return matches[-1].strip() if matches else None
-
-
-def _assert_restart_backoff_effective(path: pathlib.Path) -> None:
-    """Assert *path*'s restart backoff actually engages, given that it declares a cap.
-
-    Conditional on RestartMaxDelaySec= being present: a unit that asks for no
-    backoff cap violates nothing.  But once the cap is written down, systemd
-    needs RestartSteps= to interpolate between RestartSec and that cap; without
-    it the cap is parsed, warned about, and dropped.
-    """
-    cap = _restart_directive(path, "RestartMaxDelaySec")
-    if cap is None:
-        return
-
-    steps = _restart_directive(path, "RestartSteps")
-    assert steps is not None, (
-        f"{path} declares RestartMaxDelaySec={cap} but no RestartSteps=. "
-        "systemd logs 'Service has RestartMaxDelaySec= but no RestartSteps= "
-        "setting. Ignoring.' at unit load and then drops the cap entirely, so "
-        "the backoff this unit advertises never engages — every restart waits "
-        "exactly RestartSec and the delay never grows. Add RestartSteps= to "
-        "make the cap effective; scripts/jcodemunch-watcher.service.template "
-        "already carries this fix for the identical restart shape."
-    )
-    assert steps.isdigit(), (
-        f"could not parse RestartSteps={steps!r} in {path} as an integer; "
-        "systemd accepts only a plain unsigned integer here."
-    )
-    assert int(steps) >= 1, (
-        f"RestartSteps={steps} in {path} produces no backoff curve at all: with "
-        "zero steps there is nothing to interpolate between RestartSec and "
-        f"RestartMaxDelaySec={cap}, leaving the cap as inert as if it had been "
-        "omitted. Use at least 1 step."
-    )
-
-    floor = _restart_directive(path, "RestartSec")
-    assert floor is not None, (
-        f"{path} declares RestartMaxDelaySec={cap} and RestartSteps={steps} but "
-        "no RestartSec=. The curve is interpolated FROM RestartSec TO "
-        "RestartMaxDelaySec, so without an explicit floor the unit silently "
-        "starts from systemd's 100ms default and the backoff that runs is not "
-        "the one the file describes."
-    )
 
 
 def _write_restart_unit(path: pathlib.Path, body: str) -> pathlib.Path:
@@ -959,6 +891,30 @@ def test_restart_backoff_guard_rejects_ineffective_units(
     )
     with pytest.raises(AssertionError, match="but no RestartSteps="):
         _assert_restart_backoff_effective(suffixed_no_steps)
+
+    # Bad: the same inert cap, spelled with the leading and around-separator
+    # whitespace systemd.syntax permits.  This is a VALID unit whose cap systemd
+    # parses and discards, so it must be caught — a column-0-only anchor reads
+    # it as declaring no cap at all and returns early, skipping the invariant
+    # without a word.  That is the one failure direction this guard cannot
+    # afford: it masks the very defect the helper exists to surface, unlike the
+    # opaque-value capture above, which errs toward checking MORE.
+    spaced_no_steps = _write_restart_unit(
+        tmp_path / "spaced_no_steps.service",
+        "Restart=on-failure\n  RestartSec = 5\n\tRestartMaxDelaySec\t=\t60",
+    )
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(spaced_no_steps)
+    assert _restart_directive(spaced_no_steps, "RestartMaxDelaySec") == "60"
+
+    # Good: the whitespace-tolerant read is complete, not just detection-only —
+    # a properly paired unit in that same spelling must not raise.
+    spaced_good = _write_restart_unit(
+        tmp_path / "spaced_good.service",
+        "Restart=on-failure\n  RestartSec = 5\n  RestartSteps = 4\n"
+        "  RestartMaxDelaySec = 60",
+    )
+    _assert_restart_backoff_effective(spaced_good)
 
 
 def test_restart_backoff_is_effective_in_both_unit_files() -> None:

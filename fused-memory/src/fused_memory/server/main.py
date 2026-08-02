@@ -625,6 +625,26 @@ async def run_server():
     # ReconciliationHarness and TicketJanitor so all three consumers share the
     # same snapshot (task 1164).
     _known_projects_map = build_known_projects_map(_primary_root, _extra_roots)
+    # Task 3088: the same snapshot, injected into MemoryService so update_memory's
+    # storm escalator can resolve a project_root. Deliberately HERE — before the
+    # `if config.reconciliation ... enabled:` block below — because the alarm is
+    # owned by MemoryService and constructed unconditionally: it has to keep
+    # working with reconciliation off, which is exactly the degraded
+    # configuration where an unattended in-place rewrite loop is least likely to
+    # be noticed any other way. Pure data, no lifetime coupling, same injection
+    # pattern ReconciliationHarness and TicketJanitor already use.
+    #
+    # KNOWINGLY UNCOVERED, and the asymmetry is the reason. Those two components
+    # need no wiring test because each DEFENDS ITSELF — omit the kwarg and it
+    # calls build_known_projects_map. This escalator has no such fallback (a
+    # safe fallback source is an open question: the module docstring forbids
+    # config.taskmaster.project_root, which defaults to '.'), so it depends on
+    # this one call. Deleting or reordering the line degrades the storm alarm to
+    # a WARN with no test failure. Do NOT "cover" it with a grep- or ast-based
+    # meta-test: that shape was deleted from this repo in fb3c47dccf on a
+    # CONFIRMED review finding. The real fix is tracked as a follow-up to task
+    # 3088 (escalation agent-followup-3088).
+    memory_service.set_known_projects(_known_projects_map)
     if len(_known_projects_map) > 1:
         prefix_registry: ProjectPrefixRegistry | None = (
             ProjectPrefixRegistry.from_roots(list(_known_projects_map.values()))

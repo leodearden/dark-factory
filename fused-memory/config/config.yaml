@@ -222,6 +222,29 @@ summary_rebuild:
   projects: []
   force: false
 
+# In-place Mem0 amendment (task 3088) — the update_memory MCP tool, which
+# rewrites a record's content and/or metadata while PRESERVING its Qdrant point
+# id. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6);
+# every value below is the shipped default, shown so the knobs are discoverable
+# without reading the schema. Uncomment to change one.
+# mem0_update:
+#   # Kill switch. false denies every caller on the very next call, allowlisted
+#   # or not — this is the knob to flip during a runaway-rewrite incident.
+#   enabled: true
+#   # Two independent agent_id-prefix allowlists, one per arm. Widening the
+#   # metadata bar ALONE is the supported way to admit an interactive tagging
+#   # flow without granting content-amend authority: a mistagged record is cheap
+#   # to notice and cheap to correct, a silent content rewrite is neither.
+#   # agent_id is self-reported, so this deters misuse by cooperating callers
+#   # rather than enforcing a security boundary.
+#   content_amend_allowed_agent_prefixes: ['recon-stage-']
+#   metadata_patch_allowed_agent_prefixes: ['recon-stage-']
+#   # Content-amend burst alarm: escalates, never blocks (a hard block would
+#   # risk a legitimate large consolidation cycle failing mid-run over its own
+#   # success count). Metadata-only calls do not count toward it.
+#   storm_threshold: 20
+#   storm_window_seconds: 3600.0
+
 write_triage:
   # CALIBRATION OUTPUT — do not hand-edit.
   # Derived from measured similarity distributions by

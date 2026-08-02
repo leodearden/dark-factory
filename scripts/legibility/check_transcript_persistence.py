@@ -239,8 +239,22 @@ def find_matching_transcript(
     """Find the transcript file under *projects_root* that belongs to *record*, or None.
 
     The expected dir is ``projects_root/<encoded-cwd>`` (via
-    ``inventory.encode_cwd`` — the same lossy ``/``/``.`` -> ``-`` encoding
-    Claude Code itself uses). Missing dir -> ``None``.
+    ``inventory.encode_cwd`` — the same lossy ``/``/``.``/``_`` -> ``-``
+    encoding Claude Code itself uses). Missing dir -> ``None``.
+
+    THIS IS THE ONE CONSUMER THAT USES ``encode_cwd`` AS A DIRECT LOOKUP KEY.
+    Everywhere else in ``inventory.py`` the encoding is only a cheap superset
+    pre-filter over a directory listing, re-checked against the session's real
+    ``cwd`` by ``inventory.is_member``; here there is no such backstop. An
+    encoder that renders even one character differently from Claude Code
+    resolves to a directory that does not exist, this function returns
+    ``None``, and :func:`find_missing_transcripts` emits a FALSE-POSITIVE
+    "session ran, no transcript" finding — which escalates — naming an
+    ``expected_dir`` that was never going to exist. That is why the encoder
+    must be exact, and why it is pinned to real on-disk dir names by
+    ``test_legibility_inventory.py``'s ``TestEncoderLockstep`` (task 3272,
+    which found the ``_`` rule missing and this detector alarming on
+    dark-factory's own ``.eval-worktrees/df_task_<N>/`` sessions).
 
     Matching is PER-SESSION to defeat the same-cwd confound (sibling
     headless-agent transcripts share the encoded-cwd dir):

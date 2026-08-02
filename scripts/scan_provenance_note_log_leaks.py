@@ -58,12 +58,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sqlite3
 import sys
-from pathlib import Path
 from typing import NamedTuple
+
+from _task_db_scan import (
+    add_db_discovery_args,
+    format_json,
+    group_matches_by_db,
+    run_scan_cli,
+    truncate,
+)
 
 # A real log line: ISO date+time (with optional ,milliseconds), then a
 # whitespace-separated logger-name field, then a standalone level token.
@@ -153,45 +159,6 @@ def scan_db(db_path: str) -> list[NoteLeakMatch]:
     return matches
 
 
-# Multi-project discovery fallback, mirroring scan_task_toolcall_leaks.py's.
-_DEFAULT_PROJECT_ROOTS = ('/home/leo/src/dark-factory',)
-
-
-def _tasks_db_path(project_root: str) -> str:
-    return str(Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db')
-
-
-def discover_db_paths(
-    explicit_dbs: list[str] | None = None,
-    project_roots: list[str] | None = None,
-    env: dict[str, str] | None = None,
-) -> list[str]:
-    """Resolve the list of tasks.db paths to scan.
-
-    Precedence (first supplied wins): *explicit_dbs* > *project_roots* >
-    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (read from *env*, defaulting to the real
-    ``os.environ`` when *env* is None) > the dark-factory default root.
-
-    A resolved db path that does not exist on disk is silently skipped — this
-    never raises on a missing/not-yet-set-up project.
-    """
-    if explicit_dbs is not None:
-        candidates = list(explicit_dbs)
-    else:
-        if project_roots is not None:
-            roots = list(project_roots)
-        else:
-            environ = env if env is not None else os.environ
-            roots_env = (environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS') or '').strip()
-            if roots_env:
-                roots = [r.strip() for r in roots_env.split(',') if r.strip()]
-            else:
-                roots = list(_DEFAULT_PROJECT_ROOTS)
-        candidates = [_tasks_db_path(root) for root in roots]
-
-    return [path for path in candidates if os.path.exists(path)]
-
-
 _DEFAULT_MAX_LINE_LEN = 100
 
 
@@ -208,17 +175,11 @@ def format_report(
     if not matches:
         return 'no leaked log lines found in done_provenance notes'
 
-    by_db: dict[str, list[NoteLeakMatch]] = {}
-    for m in matches:
-        by_db.setdefault(m.db_path, []).append(m)
-
     lines: list[str] = []
-    for db_path in sorted(by_db):
+    for db_path, db_matches in group_matches_by_db(matches).items():
         lines.append(f'{db_path}:')
-        for m in by_db[db_path]:
-            leak_line = m.leak_line
-            if len(leak_line) > max_line_len:
-                leak_line = leak_line[:max_line_len] + '...'
+        for m in db_matches:
+            leak_line = truncate(m.leak_line, max_line_len)
             lines.append(
                 f'  task_id={m.task_id} tag={m.tag} '
                 f'provenance_kind={m.provenance_kind} leak_line={leak_line!r}'
@@ -227,11 +188,6 @@ def format_report(
     distinct_tasks = {(m.db_path, m.tag, m.task_id) for m in matches}
     lines.append(f'{len(matches)} leaked notes across {len(distinct_tasks)} tasks')
     return '\n'.join(lines)
-
-
-def format_json(matches: list[NoteLeakMatch]) -> str:
-    """Render *matches* as a JSON array, carrying the FULL untruncated line."""
-    return json.dumps([m._asdict() for m in matches])
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -244,20 +200,9 @@ def _build_parser() -> argparse.ArgumentParser:
             'mutates task data.'
         ),
     )
-    parser.add_argument(
-        '--db', dest='dbs', action='append',
-        help='Explicit tasks.db path to scan. May be repeated.',
-    )
-    parser.add_argument(
-        '--project-root', dest='project_roots', action='append',
-        help=(
-            'Project root to scan (maps to <root>/.taskmaster/tasks/tasks.db). '
-            'May be repeated.'
-        ),
-    )
-    parser.add_argument(
-        '--json', action='store_true',
-        help='Emit a JSON array (full untruncated leak lines) instead of a report.',
+    add_db_discovery_args(
+        parser,
+        json_help='Emit a JSON array (full untruncated leak lines) instead of a report.',
     )
     parser.add_argument(
         '--max-line-len', type=int, default=_DEFAULT_MAX_LINE_LEN,
@@ -279,39 +224,14 @@ def main(argv: list[str] | None = None) -> int:
     the sweep: it is logged to stderr and skipped so every other resolvable
     database is still scanned and reported.
     """
-    args = _build_parser().parse_args(argv)
+    def _render(matches: list[NoteLeakMatch], args: argparse.Namespace) -> str:
+        if args.json:
+            return format_json(matches)
+        return format_report(matches, max_line_len=args.max_line_len)
 
-    db_paths = discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
-    if not db_paths:
-        print(
-            'no tasks.db resolvable (checked --db / --project-root / '
-            'DASHBOARD_KNOWN_PROJECT_ROOTS / the dark-factory default)',
-            file=sys.stderr,
-        )
-        return 2
-
-    matches: list[NoteLeakMatch] = []
-    unreadable: list[str] = []
-    for db_path in db_paths:
-        try:
-            matches.extend(scan_db(db_path))
-        except sqlite3.Error as exc:
-            print(f'warning: skipping unreadable database {db_path}: {exc}', file=sys.stderr)
-            unreadable.append(db_path)
-
-    if unreadable:
-        print(
-            f'warning: {len(unreadable)} database(s) skipped due to read errors '
-            '(see warnings above); results below are incomplete',
-            file=sys.stderr,
-        )
-
-    if args.json:
-        print(format_json(matches))
-    else:
-        print(format_report(matches, max_line_len=args.max_line_len))
-
-    return 1 if matches else 0
+    return run_scan_cli(
+        argv, parser=_build_parser(), scan_fn=scan_db, render=_render
+    )
 
 
 if __name__ == '__main__':

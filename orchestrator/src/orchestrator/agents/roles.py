@@ -315,6 +315,86 @@ leaving a half-done tree that is falsely recorded as a completed, successful run
 """
 
 
+# Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
+# both STEWARD "Marking tasks done" call sites (kind="merged" and
+# kind="found_on_main"). Being a single shared constant IS the mechanism that
+# keeps the two sites consistent -- there is deliberately no test pinning the
+# splice count, since such a test is tautological with the concatenation below
+# and blocks a legitimate third call site. The prohibition on the two-outcome
+# `&& echo` idiom is stated normatively in the block itself, not enforced by a
+# regex over prompt prose. This is the roles.py analogue of the per-file
+# canonical ancestry check task 3281
+# (374468dbad) introduced in skills/merge-queue/SKILL.md and
+# skills/unblock/SKILL.md, adapted for a commit-SHA subject rather than a
+# branch-ref subject: no rc=128 merge-marker search here, since that arm only
+# makes sense for a ref that merge-lane cleanup can delete out from under you.
+# It also diverges by echoing the captured rc (`echo "ancestry rc=$rc"`), which
+# the SKILL.md blocks' `cmd; rc=$?` form does not: a compound command's own
+# exit status is that of its LAST statement, so `cmd; rc=$?` always reports
+# exit 0 to the calling tool no matter what `cmd` did. The SKILL.md blocks
+# carry this identical silent-rc gap (confirmed against real git during task
+# 3406's step-8 amendment) but fixing them is outside this task's file scope.
+ANCESTRY_CHECK_INSTRUCTIONS = """\
+    git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?; echo "ancestry rc=$rc"
+    # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
+    # nothing on rc=0 OR rc=1, and the `rc=$?` assignment itself exits 0, so
+    # without it the tool reports exit 0 and identical empty output for "on
+    # main" and "NOT on main" -- silence you would have to guess at. Echoing the
+    # numeric rc is NOT the two-outcome `&& echo` idiom banned below: it prints
+    # on every path and keeps all three outcomes distinguishable. Do not "tidy"
+    # it away.
+    # rc=0   -> <sha> IS on main. Proceed with the set_task_status call.
+    # rc=1   -> <sha> resolves here but is NOT reachable from the `main` ref as it
+    #           stands in THIS checkout. Usually the SHA is wrong (it is only on a
+    #           feature branch) -- but this checkout's `main` can also simply be
+    #           behind (a just-submitted merge, an unfetched <project_root>). If
+    #           that is plausible, run `git -C <project_root> fetch --all` and
+    #           re-run once before concluding. Still rc=1 after that -> the SHA
+    #           really is off main; re-derive the landing commit.
+    # rc=128 -> git cannot resolve <sha> (or `main`) in this checkout: "fatal: Not a
+    #           valid object name". This is NOT "not on main" -- it is "not yet
+    #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
+    #           or a mistyped SHA. Run `git -C <project_root> fetch --all` and re-run;
+    #           if it still will not resolve, re-derive the SHA. Never record or report
+    #           "not on main" on a 128.
+    # Never guard this call with a trailing `&& echo on-main`: that renders rc=1
+    # and rc=128 as identical silence, and they need opposite remedies.
+"""
+
+
+# How the server-side backstop in fused-memory's task_interceptor actually
+# reports failure. Spliced ONCE, at the kind="merged" call site immediately
+# after ANCESTRY_CHECK_INSTRUCTIONS -- the backstop is identical for both
+# `done_provenance` kinds, so the kind="found_on_main" site just references it
+# by name instead of repeating ~1.1 kB of prose a second time. Kept factual
+# rather than aspirational: `_validate_done_provenance` rev-parses BEFORE it
+# merge-bases, and it wraps every `_verify_commit_on_main` failure -- rc=1 and
+# non-rc=1 alike -- in one "is not on main" prefix. Documenting the prefix as
+# trustworthy would recreate the exact rc=1/rc=128 conflation this whole
+# section exists to prevent.
+SERVER_BACKSTOP_NOTE = """\
+The server runs the same checks as a backstop, in this order. Read the TRAILING
+DETAIL of a rejection, never the leading prefix:
+
+1. `git rev-parse --verify <commit>^{commit}` resolves the SHA first. An
+   unresolvable or mistyped SHA is rejected HERE, before merge-base ever runs,
+   with `commit <x> not found in <project_root>: ...`. That message is the
+   server's rc=128 analogue -- fetch and re-run; do not re-derive the SHA on
+   the strength of this message alone.
+2. `git merge-base --is-ancestor <sha> main` runs only if step 1 resolved. rc=0
+   accepts. EVERY failure -- rc=1, a non-1 git error, a 5s timeout, a missing
+   git binary -- is reported under the single prefix `kind=<k> but commit <sha>
+   is not on main: <detail>`. That prefix is accurate ONLY for rc=1, so treat
+   `<detail>` as the verdict:
+     - `commit is not an ancestor of main` -> rc=1. The SHA really is off main;
+       re-derive the landing commit.
+     - anything else (raw git stderr, `git merge-base timed out`, `git binary
+       not found`) -> NOT-YET-CONFIRMED, not not-on-main. Treat it exactly like
+       rc=128 above: fetch and re-run. Do not repeat the server's "is not on
+       main" wording back into a note, an escalation, or a task record.
+"""
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
@@ -1213,10 +1293,7 @@ the merge SHA. Required shape:
 
 Before calling, sanity-check the SHA is actually on main:
 
-    git -C <project_root> merge-base --is-ancestor <merge-sha> main && echo on-main
-
-The server runs the same check as a backstop; it will reject if the SHA is
-only on a feature branch.
+""" + ANCESTRY_CHECK_INSTRUCTIONS + '\n' + SERVER_BACKSTOP_NOTE + """
 
 ### `kind="found_on_main"` — the implementation is already on main from a sibling task
 
@@ -1237,11 +1314,10 @@ Both `commit` and `note` are required. Before calling, identify the
 impl-providing commit and verify it is on main:
 
     git -C <project_root> log main --oneline -- <relevant_paths>
-    git -C <project_root> merge-base --is-ancestor <sha> main && echo on-main
-
-Cite the commit and the providing-task id (when known) in `note`. The
-server runs the same `git merge-base --is-ancestor` check as a backstop
-for this kind too (post-3092 phantom-done hardening, 2026-05-09).
+""" + ANCESTRY_CHECK_INSTRUCTIONS + """
+Cite the commit and the providing-task id (when known) in `note`. The same
+server-side backstop described above applies to this kind too (post-3092
+phantom-done hardening, 2026-05-09).
 
 ### Forbidden
 

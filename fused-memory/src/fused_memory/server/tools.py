@@ -17,6 +17,10 @@ from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
+from fused_memory.backends.mem0_client import (
+    _FUSED_MEMORY_OWNED_METADATA_KEYS,
+    MEM0_MANAGED_METADATA_KEYS,
+)
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
@@ -58,8 +62,14 @@ from fused_memory.middleware.task_interceptor import (
 )
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
+from fused_memory.reconciliation.citation_verifier import (
+    find_live_citation_occurrences,
+    is_concrete_memory_id,
+    repoint_task_citations,
+)
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
+    INACTIVE_TASK_STATUSES,
     find_conflicting_task_status_ids,
     find_present_tense_completion_claim_task_ids,
     frames_live_task_status_as_current_fact,
@@ -77,6 +87,7 @@ from fused_memory.server.markup_tripwire import (
     markup_override_requested,
     strip_markup_override,
 )
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.server.near_duplicate_guard import (
     build_near_duplicate_block,
     build_topic_cluster_block,
@@ -491,6 +502,240 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
         return canonicalize_project_id(project_id), None
     except PathShapedProjectIdError as e:
         return project_id, {'error': str(e), 'error_type': type(e).__name__}
+
+
+_UPDATE_MEMORY_MODES = ('merge', 'replace')
+
+
+def _update_memory_arm_presence_error(
+    *,
+    content: str | None,
+    metadata_patch: dict | None,
+    metadata_delete_keys: list[str] | None,
+    metadata_mode: str,
+) -> dict[str, str] | None:
+    """The one slice of arm validation that must precede the authorization gate.
+
+    The gate's question is "is this caller authorized for THESE arms", which
+    cannot be asked of an argument set that names no writable arm at all. So
+    ``update_memory`` answers arm PRESENCE first, then authorizes, then runs the
+    rest of the argument checks (:func:`_validate_update_memory_arms`).
+
+    This does not weaken the gate-first ordering the tool documents. That rule
+    protects an unauthorized caller from having work done on its behalf and from
+    learning anything about the system; these two checks read no config, touch no
+    service state and describe nothing but the caller's own arguments. The
+    resolver keeps its own no-arm denial as a fail-closed backstop for any other
+    caller — this simply stops the tool from ever asking it an empty question,
+    which would surface an argument bug as an authorization error.
+
+    Both cases mean "there is nothing here to authorize":
+
+    - no arm supplied at all (an empty dict/list is an ABSENT arm, not a present
+      one — otherwise a caller whose patch computed to ``{}`` gets a success
+      envelope for a write that never happened);
+    - ``metadata_mode='replace'`` with no ``metadata_patch``, which is a request
+      to DELETE every custom key rather than to write one. The reachable shape is
+      ``update_memory(memory_id=..., content='new text', metadata_mode='replace')``:
+      ``content`` satisfies the at-least-one-arm bar, so without this check the
+      record's provenance is wiped as a side effect of an ordinary amend, and
+      unrecoverably so.
+    """
+    has_patch = bool(metadata_patch)
+    has_delete = bool(metadata_delete_keys)
+
+    if metadata_mode == 'replace' and not has_patch:
+        return {
+            'error': (
+                "update_memory: `metadata_mode='replace'` requires a non-empty "
+                '`metadata_patch`. An empty replace would delete every custom '
+                "metadata key on the record. Use `metadata_mode='merge'` (the "
+                'default) to leave metadata untouched, or name the keys to keep '
+                'in `metadata_patch`.'
+            ),
+            'error_type': 'ValidationError',
+        }
+
+    if content is None and not has_patch and not has_delete:
+        return {
+            'error': (
+                'update_memory requires at least one arm: `content` (amend the '
+                'text), `metadata_patch` (write metadata keys), or '
+                '`metadata_delete_keys` (remove metadata keys). An empty '
+                'dict/list counts as no arm.'
+            ),
+            'error_type': 'ValidationError',
+        }
+
+    return None
+
+
+def _validate_update_memory_arms(
+    *,
+    content: str | None,
+    metadata_patch: dict | None,
+    metadata_delete_keys: list[str] | None,
+    metadata_mode: str,
+    reason: str | None,
+) -> dict[str, str] | None:
+    """Validate ``update_memory``'s arm arguments — §5(a) guard steps 5-7.
+
+    Returns a structured ``ValidationError`` dict on the first violation, or
+    ``None`` when the argument set is coherent. Module level (not inside the
+    ``create_mcp_server`` closure) so the rules are reachable from a unit test
+    without standing up an MCP server, and so the tool body stays readable.
+
+    Every rejection NAMES the offending argument, and every check runs BEFORE
+    dispatch — an in-place amendment is invisible to every downstream reader,
+    so the one thing a caller must never be able to do is come away believing
+    it wrote something it did not. Same fail-loud posture as ``update_edge``'s
+    ``invalid_at``/``clear_invalid_at`` mutual-exclusivity check; nothing here
+    is silently dropped, coerced, or half-applied.
+
+    The two ``category`` rules below live at this boundary ONLY, deliberately.
+    ``MemoryService.update_memory`` stays permissive for a direct in-process
+    caller (recon Stage 1 dispatches it with ``_source`` set): the service
+    layer's job is preventing SILENT loss, which
+    ``_apply_metadata_delta``'s protected-key carry-through does structurally
+    for every caller, while this boundary is where a self-reported EXTERNAL
+    caller's explicit destructive intent is refused. Do not "helpfully"
+    duplicate these checks down into the service — two copies of a rule this
+    narrow will drift, and the service-side copy would also have to re-decide
+    what an in-process migration script is allowed to do.
+
+    Task 3195's metadata-vocabulary validators are NOT routed through here:
+    re-verified at implementation time that the module has not landed (no
+    shape validators for topic/canonical/kind/parent_id/supersedes exist in
+    the package). Per this task's SEAM NOTE, ``metadata_patch`` and
+    ``metadata_delete_keys`` route through them once it does.
+    """
+    def _err(message: str) -> dict[str, str]:
+        return {'error': message, 'error_type': 'ValidationError'}
+
+    # Re-run the pre-gate presence checks so this function is TOTAL when called
+    # directly (a unit test, or any future caller that skips the gate). The tool
+    # has already run them, so this is a cheap idempotent repeat, not a second
+    # source of truth.
+    if err := _update_memory_arm_presence_error(
+        content=content,
+        metadata_patch=metadata_patch,
+        metadata_delete_keys=metadata_delete_keys,
+        metadata_mode=metadata_mode,
+    ):
+        return err
+
+    has_patch = bool(metadata_patch)
+    has_delete = bool(metadata_delete_keys)
+
+    if content is not None and not str(content).strip():
+        # Amending a record to whitespace destroys it as surely as deleting it,
+        # and does so while reporting success.
+        return _err(
+            'update_memory: `content` was supplied but is empty or whitespace. '
+            'Omit `content` for a metadata-only update; pass the full replacement '
+            'text to amend the record.'
+        )
+
+    if content is not None and not (reason or '').strip():
+        # A silent rewrite is invisible to every downstream reader; the reason
+        # is the only durable record of WHY the text changed. Deliberately NOT
+        # required on the metadata arms — a mistagged patch is cheap to notice
+        # and cheap to correct.
+        return _err(
+            'update_memory: `reason` is required whenever `content` is supplied. '
+            'A content amend rewrites the record in place, so the justification '
+            'is the only durable record of why the text changed.'
+        )
+
+    if metadata_mode not in _UPDATE_MEMORY_MODES:
+        return _err(
+            f'update_memory: invalid `metadata_mode` {metadata_mode!r}. '
+            f'Must be one of {list(_UPDATE_MEMORY_MODES)}.'
+        )
+
+    # mem0-owned keys are rejected at the boundary rather than silently
+    # stripped, in BOTH directions. Writing one is futile (mem0 recomputes or
+    # restores it); deleting one is worse — mem0's own get/search read those
+    # keys, so a successful deletion would make the point unreadable by the
+    # store that owns it.
+    for key in metadata_patch or {}:
+        if key in MEM0_MANAGED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_patch` names mem0-owned key {key!r}, '
+                f'which this tool will not write. mem0 recomputes or restores '
+                f'{sorted(MEM0_MANAGED_METADATA_KEYS)} on every write, so the '
+                'value would not survive. Remove the key and retry.'
+            )
+    for key in metadata_delete_keys or []:
+        if key in MEM0_MANAGED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_delete_keys` names mem0-owned key '
+                f'{key!r}, which this tool will not remove. mem0 reads '
+                f'{sorted(MEM0_MANAGED_METADATA_KEYS)} to serve get/search, so '
+                'deleting one would make the record unreadable by its own store.'
+            )
+
+    # Fused-memory-owned keys are protected only from the DELETE arm — a
+    # deliberately narrower rule than the mem0-owned one above, and the
+    # asymmetry is load-bearing. mem0 recomputes its own keys, so writing one
+    # is futile in both directions; `category` by contrast is freely patchable
+    # (that is how a record gets re-categorized) but has no coherent removal
+    # intent behind it: Mem0Backend.search pushes it down as a Qdrant payload
+    # filter, so a record without it is unreachable by every category-scoped
+    # search, forever, with no other symptom.
+    for key in metadata_delete_keys or []:
+        if key in _FUSED_MEMORY_OWNED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_delete_keys` names {key!r}, which '
+                'this tool will not remove. It is a Qdrant payload filter — '
+                'search pushes it down as an equality match — so a record '
+                'without it is permanently unreachable by every '
+                'category-scoped search, with no error and no other symptom. '
+                f'To change it, pass {key!r} in `metadata_patch` instead.'
+            )
+
+    # A category no filter can ever match leaves the record exactly as
+    # unreachable as a missing one, so validating the KEY without validating
+    # the VALUE would leave the same hole open. Resolved through the same
+    # MemoryCategory enum add_memory and add_system_record stamp records with;
+    # the ValueError becomes a structured rejection rather than an exception
+    # escaping the tool (INV-1: fail loud, but in the response envelope).
+    if metadata_patch and 'category' in metadata_patch:
+        try:
+            MemoryCategory(metadata_patch['category'])
+        except ValueError:
+            return _err(
+                f'update_memory: `metadata_patch` sets `category` to '
+                f'{metadata_patch["category"]!r}, which is not a valid memory '
+                f'category. Qdrant matches the payload filter exactly, so an '
+                f'unrecognised value makes the record unreachable by every '
+                f'category-scoped search. Must be one of '
+                f'{sorted(c.value for c in MemoryCategory)}.'
+            )
+
+    # Write it and remove it cannot both be honoured; picking one silently
+    # would make the outcome depend on implementation order.
+    if has_patch and has_delete:
+        overlap = sorted(set(metadata_patch or {}) & set(metadata_delete_keys or []))
+        if overlap:
+            return _err(
+                f'update_memory: {overlap} appear in BOTH `metadata_patch` and '
+                '`metadata_delete_keys`. Write and remove are contradictory '
+                'intents for the same key — name each key in exactly one list.'
+            )
+
+    # Replace already decides the whole custom subset, so a delete list is
+    # either redundant or contradictory — never meaningful. (The empty-replace
+    # case is caught earlier, by the pre-gate presence check.)
+    if metadata_mode == 'replace' and has_delete:
+        return _err(
+            "update_memory: `metadata_mode='replace'` cannot be combined with "
+            '`metadata_delete_keys`. Replace already sets the entire '
+            'custom-metadata subset, so anything omitted from `metadata_patch` '
+            'is removed by construction.'
+        )
+
+    return None
 
 
 def _extract_causation(metadata: dict | None, agent_id: str | None) -> tuple[str, str, dict | None]:
@@ -1097,6 +1342,44 @@ def create_mcp_server(
         'rephrase to past/aspirational tense — "will land" / "planned to resolve" / '
         '"intended to enforce" — or wait until the task is actually done/cancelled'
     )
+    # (task 3108) Actionable remediation for a refused consolidation delete.
+    # Names the concrete fix AND rules out the incident's re-derive-via-search
+    # "correction", which resolved back to the superseded cluster members the
+    # consolidation was collapsing.
+    _CITATION_REPOINT_HINT = (
+        'retry with replacement_memory_id=<the surviving entry\'s full 36-char '
+        'UUID>; the cited tasks will be repointed to it before the delete runs. '
+        'It must be an EXISTING entry that still resolves in the store, and it '
+        'must not be the id being deleted — copy it from the search result '
+        'rather than reconstructing it. A search(query=...) instruction is NOT '
+        'an acceptable replacement value — re-deriving at read time resolves '
+        'back to the superseded duplicates this consolidation is collapsing. '
+        'Terminal (done/cancelled) citers are reported, never rewritten.'
+    )
+    _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
+        'replacement_memory_id is well-formed but resolves to nothing, so '
+        'repointing to it would rewrite every live citation to address a '
+        'memory that does not exist — the dangling pointers this gate '
+        'prevents, merely relocated. Re-read the surviving entry\'s id from '
+        'the search/consolidation result and retry with that exact value.'
+    )
+    _CITATION_REPLACEMENT_CHECK_FAILED_HINT = (
+        'the surviving entry could not be resolved, so "exists" cannot be '
+        'distinguished from "does not exist". This delete is irreversible, so '
+        'it is refused rather than risked; retry once the memory store is '
+        'reachable.'
+    )
+    _CITATION_SCAN_FAILED_HINT = (
+        'the task DB could not be read, so an unknown citation state cannot be '
+        'distinguished from "no citations". This delete is irreversible, so it '
+        'is refused rather than risked; retry once the task backend is reachable.'
+    )
+    _CITATION_REPOINT_FAILED_HINT = (
+        'the listed tasks still cite the doomed entry — deleting now would '
+        'strand exactly the pointers this gate protects. Inspect unrepointed[] '
+        'for each write rejection, then retry the delete; already-repointed '
+        'tasks are idempotent on a second pass.'
+    )
     # Categories the premature-completion-claim guard (task 2824) covers — the
     # same four the live-task-status guard (task 2628) covers.
     # preferences_and_norms/procedural_knowledge are deliberately excluded: a norm
@@ -1165,6 +1448,312 @@ def create_mcp_server(
             'blocked_task_ids': sorted(blocked),
             'hint': _PREMATURE_COMPLETION_HINT,
         }
+
+    async def _citation_repoint_gate(
+        memory_id: str,
+        store: str,
+        project_id: str,
+        agent_id: str | None,
+        replacement_memory_id: str | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Repoint live task-metadata citations BEFORE an irreversible delete.
+
+        Returns ``(rejection, repoint_stats)``: a structured error dict to
+        REFUSE the delete, or ``(None, stats)`` to allow it. Same
+        "return None to allow / return an error dict to reject" contract as
+        :func:`_premature_completion_block` (task 2824), and the same
+        ``_taskmaster_configured and project_id in _kp`` precondition — but the
+        opposite failure posture, deliberately (see below).
+
+        Scoped to consolidation deletes only: a ``recon-stage-*`` ``agent_id``
+        AND ``store == 'mem0'``. The recon-stage predicate mirrors the
+        ``recon_write_policy`` call-site idiom (``task_interceptor.py:893``,
+        :3953) and bounds the blast radius to the path the incident came from,
+        so an interactive delete pays no extra ``get_tasks`` read. The mem0
+        scoping mirrors ``verify_cited_memories``' own: the incident's
+        citations were Mem0 entry UUIDs.
+
+        Why here and not in ``MemoryConsolidator.run()``: the consolidator
+        never deletes from Python — the Stage-1 LLM agent calls this very tool
+        (``STAGE1_DISALLOWED`` in ``cli_stage_runner.py:138-143`` does NOT
+        include ``DISALLOW_MEMORY_WRITES``, so the call is permitted and
+        prompt-level discipline was the only guard). A sweep inside ``run()``
+        would therefore execute AFTER the delete and could only report damage.
+        This handler is the one seam that is both strictly before the
+        irreversible destruction and where the surviving id is knowable.
+
+        ``replacement_memory_id`` must clear three preconditions, all of them
+        AFTER the no-live-citers early-out so an uncited delete pays nothing:
+        it must be a concrete 36-char UUID (not prose —
+        ``CitationReplacementInvalid``), it must not be the id being deleted
+        (a self-substitution that reports success while every citation still
+        addresses the destroyed entry — ``CitationReplacementInvalid``), and it
+        must RESOLVE in the store (``CitationReplacementNotFound``; a raised
+        lookup fails closed as ``CitationReplacementCheckFailed``). Shape alone
+        is not enough: ``is_concrete_memory_id`` rules out prose and claims
+        nothing about existence, so a hallucinated-but-well-formed id would
+        otherwise rewrite every live citer to address nothing and THEN land the
+        irreversible delete — the incident's dangling pointers, merely
+        relocated.
+
+        Fails CLOSED. If the task-DB read raises, the delete is REJECTED rather
+        than allowed. This diverges from ``_premature_completion_block``'s
+        fail-open posture on purpose, and the distinction is the cost of being
+        wrong: that gate blocks a cheap, correctable status claim, this one
+        blocks an irreversible destruction whose harm — a dangling live pointer
+        — is exactly what "unknown" might be hiding. It follows
+        ``flag_dedup.filter_false_absence_flags``' posture instead ("present or
+        inconclusive -> drop, to prevent irreversible delete_memory ops"). A
+        refused delete is retried next cycle; a silently permitted one
+        manufactures the L2.
+        """
+        if not isinstance(agent_id, str) or not agent_id.startswith('recon-stage-'):
+            return None, None
+        if store != 'mem0':
+            return None, None
+        if not _taskmaster_configured or project_id not in _kp:
+            # No live task DB to scan — the pre-existing behaviour for
+            # unregistered projects is preserved exactly.
+            return None, None
+
+        project_root = _kp[project_id]
+        try:
+            citers = await _scan_task_citations(project_root, memory_id)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'citation gate: task scan failed for %s; failing closed',
+                memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    'Could not determine whether any task still cites '
+                    f'{memory_id}; refusing an irreversible delete on an '
+                    'unknown citation state.'
+                ),
+                'error_type': 'CitationScanFailed',
+                'memory_id': memory_id,
+                'scan_error': str(exc),
+                'scan_error_type': type(exc).__name__,
+                'hint': _CITATION_SCAN_FAILED_HINT,
+            }, None
+
+        live_citers = [c for c in citers if not c['terminal']]
+        if not live_citers:
+            # Nothing live points at this id, so the delete cannot dangle one.
+            return None, None
+
+        # Every rejection below names the citers, so the caller is never left to
+        # re-derive the enumeration by hand — the step that found 3 of 8 in the
+        # incident.
+        citing_tasks = [
+            {'task_id': c['task_id'], 'status': c['status'], 'paths': c['paths']}
+            for c in live_citers
+        ]
+
+        if replacement_memory_id is None:
+            return {
+                'error': (
+                    f'{len(live_citers)} live task(s) still cite {memory_id}. '
+                    'Supply replacement_memory_id so those citations are '
+                    'repointed before this irreversible delete.'
+                ),
+                'error_type': 'CitationRepointRequired',
+                'memory_id': memory_id,
+                'citing_tasks': citing_tasks,
+                'hint': _CITATION_REPOINT_HINT,
+            }, None
+
+        # A forwarding pointer is only a pointer if it is a concrete id. This
+        # is the mechanical form of incident failure mode (2): prose describing
+        # how to FIND the survivor (the re-derive-via-search "correction") is
+        # not a survivor, and re-deriving at read time resolved straight back
+        # into the superseded duplicates this delete is collapsing.
+        if not is_concrete_memory_id(replacement_memory_id):
+            return {
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id!r} is not a '
+                    'concrete 36-char UUID, so it cannot forward the citations '
+                    f'that {len(live_citers)} live task(s) hold on {memory_id}.'
+                ),
+                'error_type': 'CitationReplacementInvalid',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'hint': _CITATION_REPOINT_HINT,
+            }, None
+
+        # Shape is necessary but not sufficient: is_concrete_memory_id rules out
+        # PROSE and claims nothing about what the id addresses. Two further
+        # preconditions, both deliberately AFTER the no-live-citers early-out so
+        # an uncited delete pays nothing for them.
+        #
+        # (1) SELF-REPOINT. Rewriting the doomed id to itself is a
+        # self-substitution that still reports count > 0 and zero failures, so
+        # the gate would declare a successful repoint while every citation still
+        # addressed the entry this call is about to destroy.
+        if replacement_memory_id == memory_id:
+            return {
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id!r} is the '
+                    'same id being deleted, so repointing to itself would leave '
+                    f'{len(live_citers)} live task(s) citing a destroyed entry '
+                    'while reporting a successful repoint.'
+                ),
+                'error_type': 'CitationReplacementInvalid',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'hint': _CITATION_REPOINT_HINT,
+            }, None
+
+        # (2) EXISTENCE. A hallucinated/typo'd id is root cause (1) named in
+        # verify_cited_memories' own docstring, and here it is worse than a bad
+        # citation: it would rewrite every live citer to address nothing and
+        # THEN land the irreversible delete. get_memory_by_id is the same
+        # Mem0/Qdrant point read verify_cited_memories uses, and the gate's
+        # store == 'mem0' scoping already matches its Mem0-only contract.
+        try:
+            replacement_record = await memory_service.get_memory_by_id(
+                project_id, replacement_memory_id,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            # Fail closed, exactly as the scan does: 'unknown' must not be read
+            # as 'resolves' immediately before an irreversible delete.
+            logger.warning(
+                'citation gate: replacement lookup failed for %s; failing closed',
+                replacement_memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    f'Could not determine whether replacement_memory_id '
+                    f'{replacement_memory_id} exists; refusing an irreversible '
+                    'delete rather than repointing to a possibly-absent entry.'
+                ),
+                'error_type': 'CitationReplacementCheckFailed',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'check_error': str(exc),
+                'check_error_type': type(exc).__name__,
+                'hint': _CITATION_REPLACEMENT_CHECK_FAILED_HINT,
+            }, None
+
+        if not replacement_record:
+            # Distinct from ...Invalid on purpose: the caller must be able to
+            # tell a wrong-but-well-formed id from a malformed value.
+            return {
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id} does not '
+                    f'resolve, so repointing the {len(live_citers)} live '
+                    f'citation(s) of {memory_id} to it would strand them on a '
+                    'memory that does not exist.'
+                ),
+                'error_type': 'CitationReplacementNotFound',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': citing_tasks,
+                'hint': _CITATION_REPLACEMENT_NOT_FOUND_HINT,
+            }, None
+
+        # Repoint BEFORE the delete. The caller falls through to
+        # memory_service.delete_memory only after this returns, which is the
+        # ordering guarantee: no window exists in which the entry is gone but a
+        # live task still points at it.
+        try:
+            stats = await repoint_task_citations(
+                task_interceptor,
+                project_root,
+                memory_id=memory_id,
+                replacement_id=replacement_memory_id,
+                run_id=None,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'citation gate: repoint sweep failed for %s; failing closed',
+                memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    f'Citation repoint sweep failed for {memory_id}; refusing '
+                    'the delete so no live citation is left dangling.'
+                ),
+                'error_type': 'CitationRepointFailed',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'unrepointed': [],
+                'repoint_error': str(exc),
+                'repoint_error_type': type(exc).__name__,
+                'hint': _CITATION_SCAN_FAILED_HINT,
+            }, None
+
+        if stats['stage1_citation_repoint_failures']:
+            # At least one live citer was NOT repointed. Deleting now would
+            # strand exactly the pointer this gate exists to protect, so the
+            # delete is refused and retried next cycle instead.
+            return {
+                'error': (
+                    f'{stats["stage1_citation_repoint_failures"]} live citation(s) '
+                    f'of {memory_id} could not be repointed to '
+                    f'{replacement_memory_id}; refusing the delete.'
+                ),
+                'error_type': 'CitationRepointFailed',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'unrepointed': stats['unrepointed'],
+                'citation_repoint': stats,
+                'hint': _CITATION_REPOINT_FAILED_HINT,
+            }, None
+
+        return None, {'citation_repoint': stats}
+
+    async def _scan_task_citations(
+        project_root: str, memory_id: str
+    ) -> list[dict[str, Any]]:
+        """Return one record per task whose metadata LIVE-cites *memory_id*.
+
+        A read-only pre-pass over the same snapshot semantics
+        ``repoint_task_citations`` uses, so the gate can decide whether a
+        repoint is needed (and name the citers in a refusal) before committing
+        to any write.
+
+        "Cites" is ``find_live_citation_occurrences``, which excludes the
+        ``x_memory_citation_tombstones`` ledger. That exclusion is load-bearing
+        here: a tombstone's ``superseded_memory_id`` names the deleted id BY
+        DESIGN, so counting it would make an already-repointed task look like an
+        outstanding citer forever — and the retry ``_CITATION_REPOINT_FAILED_HINT``
+        instructs the caller to perform would never terminate. The gate and
+        ``repoint_task_citations`` MUST agree on this definition: they read the
+        same snapshot, and a disagreement surfaces as a gate demanding a repoint
+        that the sweep then reports zero work for.
+        """
+        tasks_data = await task_interceptor.get_tasks(project_root)  # type: ignore[union-attr]
+        tasks = (tasks_data or {}).get('tasks') or []
+        found: list[dict[str, Any]] = []
+        if not isinstance(tasks, list):
+            return found
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            paths = find_live_citation_occurrences(task.get('metadata'), memory_id)
+            if not paths:
+                continue
+            status = task.get('status')
+            found.append({
+                'task_id': str(task.get('id')),
+                'status': status,
+                'paths': paths,
+                'terminal': status in INACTIVE_TASK_STATUSES,
+            })
+        return found
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -2318,6 +2907,7 @@ def create_mcp_server(
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
+        replacement_memory_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a specific memory from a store. IRREVERSIBLE.
@@ -2334,6 +2924,13 @@ def create_mcp_server(
         search results and this tool's own response return). Exactly one must
         be provided; supplying both with conflicting values is an error.
 
+        **Consolidation deletes** (a ``recon-stage-*`` caller deleting a
+        ``store='mem0'`` duplicate in favour of a survivor) additionally pass
+        through the citation-repoint gate: task metadata still citing the
+        doomed entry is repointed to *replacement_memory_id* BEFORE the delete
+        runs, and the delete is refused outright if that cannot be done. See
+        ``_citation_repoint_gate``.
+
         Args:
             store: "graphiti" or "mem0" (from search results)
             project_id: Project scope (required)
@@ -2344,6 +2941,23 @@ def create_mcp_server(
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
+            replacement_memory_id: The SURVIVING entry's full 36-char UUID, when
+                this delete supersedes one duplicate in favour of another.
+                Required for a consolidation delete whose id is still cited by a
+                live task. Three requirements, each checked mechanically:
+                (1) it must be a concrete UUID — a ``search(query=...)``
+                instruction is rejected (``CitationReplacementInvalid``),
+                because re-deriving at read time resolves back to the
+                superseded entries consolidation was collapsing;
+                (2) it must RESOLVE in the store — a well-formed but nonexistent
+                id is refused (``CitationReplacementNotFound``) rather than
+                written into every citation, which would strand them exactly as
+                the delete itself would;
+                (3) it must not be the id being deleted
+                (``CitationReplacementInvalid``) — a self-repoint reports
+                success while every citation still addresses the destroyed
+                entry. Copy the value from the search/consolidation result
+                rather than reconstructing it.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -2373,10 +2987,174 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
         causation_id, source, _ = _extract_causation(metadata, agent_id)
-        return await memory_service.delete_memory(
+        # Repoint live task-metadata citations BEFORE the irreversible delete.
+        # Order is the whole point: a rejection here never reaches the service
+        # call, so the dangling-pointer window is closed rather than moved.
+        rejection, repoint_stats = await _citation_repoint_gate(
+            resolved_id, store, project_id, agent_id, replacement_memory_id,
+        )
+        if rejection:
+            return rejection
+        result = await memory_service.delete_memory(
             memory_id=resolved_id,
             store=store,
             project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+        if repoint_stats and isinstance(result, dict):
+            result = {**result, **repoint_stats}
+        return result
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def update_memory(
+        memory_id: str,
+        store: str,
+        project_id: str,
+        content: str | None = None,
+        metadata_patch: dict | None = None,
+        metadata_delete_keys: list[str] | None = None,
+        metadata_mode: str = 'merge',
+        reason: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Amend a Mem0 memory's content and/or patch its metadata IN PLACE.
+
+        The Qdrant point id is preserved, so the record keeps its identity and
+        every reference to it stays valid. Use this to correct a record or tag
+        it for a deterministic (non-semantic) `get_memories_by_metadata` lookup,
+        instead of delete-then-re-add, which mints a new id.
+
+        Mem0 only. `store='graphiti'` is rejected — use `update_edge`.
+
+        NAMING (deliberate, do not "fix"): `metadata_patch` is the record
+        payload you are writing; `metadata` is the causation/envelope kwarg
+        every other tool takes and is NEVER stored on the record. The envelope
+        is consumed for causation and never written; `metadata_patch` is record
+        payload and is never read for causation.
+
+        At least one arm is required. Contradictory or under-specified argument
+        sets are rejected LOUD, naming the offending argument — nothing is
+        silently dropped: a mem0-owned key in either metadata list, the same key
+        in both lists, and `metadata_mode='replace'` without a non-empty
+        `metadata_patch` (an empty replace would delete every custom key).
+
+        Args:
+            memory_id: The memory ID (from search results)
+            store: Must be "mem0"
+            project_id: Project scope (required)
+            content: New content text (the amend arm). Re-embeds the record.
+            metadata_patch: Metadata keys to write (the patch arm)
+            metadata_delete_keys: Metadata keys to remove. There is no magic
+                deletion sentinel: a key is deleted iff it is named here.
+            metadata_mode: "merge" (default) or "replace". Replace swaps the
+                custom-provenance subset only — mem0-owned keys survive.
+            reason: Why the record is being amended. Required with `content`.
+            agent_id: Which agent is updating (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        # (1) Identity first — nothing downstream can gate an unresolved agent_id.
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+
+        # (1b) Arm PRESENCE only — the gate below asks "is this caller
+        # authorized for THESE arms", which is not a question an argument set
+        # naming no writable arm can answer. Reads no config and touches no
+        # service state, so an unauthorized caller still learns nothing about
+        # the system; see _update_memory_arm_presence_error for the full
+        # rationale, and note the resolver keeps its own no-arm denial as a
+        # fail-closed backstop.
+        if err := _update_memory_arm_presence_error(
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+        ):
+            return err
+
+        # (2) Authorization immediately next, BEFORE project canonicalization,
+        # store validation or the remaining arm validation. In-place amendment
+        # is a silent-rewrite primitive, so this gate is the whole point of the
+        # tool: an unauthorized caller is turned away before any work is done on
+        # its behalf, and learns nothing about the validity of its other
+        # arguments. Same ordering rationale add_system_record records for its
+        # own gate.
+        decision = resolve_mem0_update_authorization(
+            memory_service,
+            agent_id=agent_id,
+            content_amend=content is not None,
+            metadata_patch=bool(metadata_patch or metadata_delete_keys),
+        )
+        if not decision.allowed:
+            return {
+                'error': decision.error,
+                'error_type': decision.error_type,
+                'agent_id': agent_id,
+            }
+
+        # (3) delete_memory's prologue verbatim. NO _backlog_gate: that gate is
+        # for tools creating new backlog pressure (add_memory, add_system_record);
+        # this one mutates an existing record and creates none.
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+
+        # (4) Store validation. A valid-but-wrong 'graphiti' is named rather
+        # than silently fanned out — every search result carries a store field,
+        # so a caller updating a record it just found calls this the same way it
+        # calls delete_memory, and a wrong value is actionable.
+        if store not in _VALID_STORES:
+            return {
+                'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
+                'error_type': 'ValidationError',
+            }
+        if store != SourceStore.mem0.value:
+            return {
+                'error': (
+                    f'update_memory does not support store={store!r}. In-place '
+                    'amendment is Mem0-only; use update_edge to change a '
+                    'Graphiti edge fact.'
+                ),
+                'error_type': 'ValidationError',
+            }
+
+        # (5-7) Arm validation. ALL of it completes before any dispatch, so a
+        # rejected call cannot have mutated anything — the point the stateful
+        # fake in tests/test_update_memory_tool.py exists to pin.
+        #
+        # Posture copied from update_edge's invalid_at/clear_invalid_at
+        # mutual-exclusivity check: a contradictory or under-specified argument
+        # set is rejected LOUD, naming the offending argument. Nothing is
+        # silently dropped or coerced — a caller must never come away believing
+        # it wrote something it did not.
+        if err := _validate_update_memory_arms(
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+            reason=reason,
+        ):
+            return err
+
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.update_memory(
+            memory_id=memory_id,
+            project_id=project_id,
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+            reason=reason,
             agent_id=agent_id,
             session_id=session_id,
             causation_id=causation_id,

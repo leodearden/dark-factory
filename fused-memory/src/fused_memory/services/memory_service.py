@@ -11,7 +11,7 @@ import os
 import re
 import time
 import uuid as uuid_mod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -19,7 +19,11 @@ from typing import TYPE_CHECKING, Any, cast
 from graphiti_core.nodes import EpisodeType
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
-from fused_memory.backends.mem0_client import Mem0Backend
+from fused_memory.backends.mem0_client import (
+    _FUSED_MEMORY_OWNED_METADATA_KEYS,
+    Mem0Backend,
+    split_managed_metadata,
+)
 from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
 from fused_memory.memory_metadata import (
     CanonicalUniquenessViolation,
@@ -28,6 +32,7 @@ from fused_memory.memory_metadata import (
     is_valid_topic_slug,
     validate_memory_metadata,
 )
+from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
 from fused_memory.models.enums import (
     GRAPHITI_PRIMARY,
     MEM0_PRIMARY,
@@ -59,6 +64,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
+from fused_memory.server.storm_counter import StormCounter
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.memory_metadata_census import (
     UnknownKeyStormDetector,
@@ -1063,6 +1069,24 @@ class MemoryService:
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         self.recon_ledger: ReconLedgerStore | None = None
+        # {project_id: project_root} registry snapshot (task 3088). Injected by
+        # set_known_projects at server startup — MemoryService is constructed
+        # before build_known_projects_map runs, so it cannot arrive by
+        # constructor. Used to resolve an escalation queue's filesystem root
+        # from the project_id update_memory carries.
+        self._known_projects: dict[str, str] = {}
+        # INV-4 storm escape for update_memory's silent-rewrite primitive (task
+        # 3088). Both are constructed UNCONDITIONALLY — never obtained from
+        # ReconciliationHarness (built behind `if config.reconciliation ...
+        # enabled:` in server/main.py) or curator_escalator (built after this
+        # service). An alarm bound to either would vanish in exactly the
+        # degraded configuration where an unattended rewrite loop is least
+        # likely to be noticed any other way.
+        self._mem0_update_storm_counters: dict[str, StormCounter] = {}
+        self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        # Test seam for the injectable-clock convention: a 3600s window has to
+        # be exercised by advancing a fake clock, not by sleeping.
+        self._mem0_update_storm_time_provider: Callable[[], float] = time.time
         # Process-start baselines for uptime reporting
         self._started_at: datetime = datetime.now(UTC)
         self._start_monotonic: float = time.monotonic()
@@ -1105,6 +1129,25 @@ class MemoryService:
     def set_recon_ledger(self, store: ReconLedgerStore) -> None:
         """Wire the recon ledger store into the service."""
         self.recon_ledger = store
+
+    def set_known_projects(self, known_projects: Mapping[str, str] | None) -> None:
+        """Wire the ``{project_id: project_root}`` registry snapshot (task 3088).
+
+        The same snapshot ``server/main.py`` builds with
+        ``build_known_projects_map`` and already hands to ``ReconciliationHarness``
+        and ``TicketJanitor``. Injected rather than derived so this stays pure
+        data with no lifetime coupling to any conditionally-constructed
+        component — the ``update_memory`` storm alarm must keep working with
+        reconciliation disabled, which is exactly the degraded configuration
+        where an unattended rewrite loop is least likely to be noticed.
+
+        Copied on entry so a later mutation of the caller's map cannot change
+        resolution out from under an in-flight escalation.
+        """
+        self._known_projects = dict(known_projects or {})
+        # Forward to the storm escalator, which is where project_id →
+        # project_root resolution actually happens.
+        self._mem0_update_storm_escalator.set_known_projects(self._known_projects)
 
     async def _emit_event(self, event: ReconciliationEvent) -> None:
         if self._event_buffer:
@@ -3990,6 +4033,370 @@ class MemoryService:
             timestamp=datetime.now(UTC),
             payload={'memory_id': memory_id, 'store': store},
         ))
+
+        return result
+
+    def _record_content_amend(self, project_id: str, agent_id: str | None) -> None:
+        """Count one in-place content amendment; escalate on a burst (INV-4).
+
+        Post-write and never blocking: this is a monitoring alarm, not a rate
+        limiter. Crossing the threshold must not reject the write that crossed
+        it, or a legitimate large consolidation cycle would fail mid-run over
+        its own success count.
+
+        Counts the CONTENT arm only. A metadata patch is cheap to notice and
+        cheap to correct; counting patches would drown the signal that a silent
+        content-rewrite loop is running.
+
+        One counter per ``agent_id``, so two independently-busy agents cannot
+        sum into a false alarm. The threshold and window are read LIVE off the
+        shared config and passed into ``record()`` per call — captured once,
+        they would make both green-tier leaves restart-only in disguise.
+        """
+        label = agent_id or '<unattributed>'
+        counter = self._mem0_update_storm_counters.get(label)
+        if counter is None:
+            counter = StormCounter(time_provider=self._mem0_update_storm_time_provider)
+            self._mem0_update_storm_counters[label] = counter
+
+        cfg = getattr(self.config, 'mem0_update', None)
+        threshold = getattr(cfg, 'storm_threshold', None)
+        window_seconds = getattr(cfg, 'storm_window_seconds', None)
+        if not isinstance(threshold, int) or not isinstance(window_seconds, int | float):
+            return
+
+        storm = counter.record(
+            threshold=threshold,
+            window_seconds=float(window_seconds),
+            label=label,
+        )
+
+        # Evict counters whose window has gone empty. Each counter self-prunes
+        # its own deque, but nothing would drop the counter OBJECT, and
+        # ``agent_id`` is caller-supplied and unbounded in cardinality — the
+        # gate is a self-reported prefix match, so a widened prefix admits
+        # arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
+        # every run). A server designed to run for weeks between restarts would
+        # otherwise accumulate one dead counter per agent it ever saw.
+        #
+        # Runs on EVERY amend, not just a breach: the leak is on the common
+        # path. It is O(live agents) because the sweep is itself what keeps
+        # that from becoming O(agents ever seen). See StormCounter.prune on why
+        # dropping an empty counter is behaviour-preserving.
+        for other, dormant in list(self._mem0_update_storm_counters.items()):
+            if other != label and dormant.prune(float(window_seconds)) == 0:
+                del self._mem0_update_storm_counters[other]
+
+        if storm is None:
+            return
+
+        # Never let the alarm's own failure reach the caller: the write already
+        # landed, and turning a completed amendment into an exception would be
+        # strictly worse than losing the signal. The escalator is itself
+        # never-raise; this is the belt to its braces.
+        try:
+            self._mem0_update_storm_escalator.report_storm(
+                project_id=project_id,
+                agent_id=label,
+                count=storm['count'],
+                threshold=storm['threshold'],
+                window_seconds=storm['window_seconds'],
+            )
+        except Exception:
+            logger.exception(
+                'update_memory storm escalation failed for agent %r in project %r '
+                '(count=%s); the amendment itself succeeded',
+                label, project_id, storm['count'],
+            )
+
+    @staticmethod
+    def _apply_metadata_delta(
+        existing_custom: dict[str, Any],
+        *,
+        metadata_patch: dict | None,
+        metadata_delete_keys: list[str] | None,
+        metadata_mode: str,
+    ) -> dict[str, Any]:
+        """Apply an ``update_memory`` metadata delta to a record's CUSTOM subset.
+
+        The single home for merge / replace / delete semantics (task 3088). Both
+        the metadata-only routes and the combined content+metadata fold call
+        this, so a caller gets the same resulting metadata whether or not it
+        also amended the content — semantics that drifted between the two arms
+        would be invisible to any test that exercised only one of them (INV-5).
+
+        *existing_custom* is the mem0-owned-key-stripped subset from
+        :func:`split_managed_metadata`; mem0-owned keys never reach here, which
+        is why nothing below has to defend against clobbering them.
+
+        ``metadata_mode='replace'`` replaces the custom subset with exactly what
+        *metadata_patch* supplies, PLUS any ``_FUSED_MEMORY_OWNED_METADATA_KEYS``
+        carried over from *existing_custom* — never the whole Qdrant payload.
+        The carry-through is what stops a routine re-tag from silently evicting
+        the record from every category-scoped search (``category`` is a Qdrant
+        payload filter, so losing it has no symptom at all); a *metadata_patch*
+        that names the key explicitly still wins, so deliberate
+        re-categorization needs no special case. Deletions apply after the
+        merge. Returns a fresh dict; the input is not mutated.
+        """
+        if metadata_mode == 'replace':
+            # Seed with the protected subset rather than {}: replace still means
+            # replace for ordinary custom keys, but a key nothing restores must
+            # not be destroyable by omission.
+            new_custom = {
+                k: v for k, v in existing_custom.items()
+                if k in _FUSED_MEMORY_OWNED_METADATA_KEYS
+            }
+        else:
+            new_custom = dict(existing_custom)
+        new_custom.update(metadata_patch or {})
+        for key in metadata_delete_keys or ():
+            new_custom.pop(key, None)
+        return new_custom
+
+    async def update_memory(
+        self,
+        memory_id: str,
+        project_id: str = 'main',
+        content: str | None = None,
+        metadata_patch: dict | None = None,
+        metadata_delete_keys: list[str] | None = None,
+        metadata_mode: str = 'merge',
+        reason: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        emit_event: bool = False,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Amend a Mem0 record's content and/or patch its metadata IN PLACE.
+
+        Task 3088; contract in ``plans/mem0-in-place-update-decision.md`` §3.
+        The Qdrant point id is preserved, so the record keeps its identity and
+        every reference to it stays valid — which is the whole point, and also
+        why the tool sits behind an authorization gate and a storm alarm: an
+        in-place amendment is invisible to every downstream reader.
+
+        Argument validation (arm presence, reserved-key rejection, contradictory
+        key lists, ``metadata_mode`` values) belongs to the MCP tool layer, which
+        fails those loud before dispatching here — mirroring how ``update_edge``
+        splits its boundary checks from its write path.
+
+        Returns the ``{'status': 'updated', 'store': 'mem0', 'id': memory_id,
+        ...}`` envelope on success, or a structured ``{'error_type': ...}``
+        rejection. The id is echoed so a caller can assert identity stability
+        straight from the response instead of re-fetching.
+
+        *emit_event* forces a ``memory_updated`` event on a metadata-only route,
+        which is otherwise silent (a patch leaves the record saying the same
+        thing). It is deliberately INTERNAL: no MCP-level argument surfaces it
+        in this ship, because no concrete consumer needs it yet and an
+        unexercised knob on the event channel is one more thing to get wrong.
+        A content amend always emits, flag or not.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+
+        # Journal params: truncated copies for the audit row only. The full
+        # values go to the backend — same convention as update_edge's fact.
+        params: dict[str, Any] = {'memory_id': memory_id, 'metadata_mode': metadata_mode}
+        if content is not None:
+            params['content'] = content[:200]
+        if metadata_patch:
+            params['metadata_patch'] = metadata_patch
+        if metadata_delete_keys:
+            params['metadata_delete_keys'] = list(metadata_delete_keys)
+        if reason:
+            params['reason'] = reason[:200]
+
+        # §5(c) read leg — runs FIRST, in EVERY arm, before any write.
+        #
+        # Not merely a convenience read for the metadata-reforwarding dance: it
+        # is the existence check. Qdrant's set_payload/delete_payload return
+        # acknowledged/completed for an UNKNOWN point id rather than an error,
+        # so the metadata-only fast paths would otherwise emit a success
+        # envelope AND a journal row for a write that touched nothing.
+        #
+        # A TimeoutError from here PROPAGATES untouched. Mem0Backend.
+        # get_point_by_id deliberately does not swallow it (unlike get()), which
+        # is what keeps "genuinely absent" distinguishable from "backend timed
+        # out"; catching both into one MemoryNotFound outcome would throw that
+        # distinction away at the one layer that still has it.
+        existing = await self.get_memory_by_id(project_id=project_id, memory_id=memory_id)
+        if existing is None:
+            return {
+                'error': (
+                    f'Memory {memory_id!r} does not exist in mem0 for project '
+                    f'{project_id!r}; nothing was updated.'
+                ),
+                'error_type': 'MemoryNotFound',
+                'store': 'mem0',
+                'id': memory_id,
+            }
+
+        # The FULL raw Qdrant payload — mem0-owned keys and custom provenance
+        # keys alike. Copied so the arms below can compute a delta against it
+        # without mutating the value the read leg returned.
+        existing_payload: dict[str, Any] = dict(existing.get('metadata') or {})
+        managed, existing_custom = split_managed_metadata(existing_payload)
+
+        # ONE delta computation, consumed by the two routes that must construct
+        # a full metadata dict themselves: the content arm's ``mem0.update``
+        # (whose backend starts from a FRESH payload) and the metadata-only
+        # ``overwrite_payload`` route. Sharing it is what keeps merge / replace
+        # / delete semantics from drifting between the combined path and the
+        # metadata-only path — a caller must get the same resulting metadata
+        # whether or not it also amended the content.
+        #
+        # The set_payload / delete_payload fast paths deliberately do NOT read
+        # it: they hand the raw patch / key list to Qdrant and let it apply
+        # merge and delete SERVER-side, which is the entire reason those routes
+        # can skip a read-modify-write. So the INV-5 single-home claim is
+        # narrower than "every arm calls _apply_metadata_delta": merge and
+        # delete semantics have two implementations that have to agree — this
+        # one and Qdrant's primitives. ``TestMetadataFastPathEquivalence`` pins
+        # that agreement, so a new rule added here (a second protected key,
+        # say) fails a test instead of silently splitting the routes apart.
+        new_custom = self._apply_metadata_delta(
+            existing_custom,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+        )
+
+        scope = Scope(project_id=project_id)
+
+        if content is not None:
+            # Journal the PRIOR text beside the new one, so the audit row is a
+            # genuine before/after rather than a record of what the text was
+            # rewritten TO. The read leg above already fetched it, so this costs
+            # nothing; without it the storm escalation's "inspect the affected
+            # records" instruction sends an operator to a journal with nothing
+            # to diff against, which is exactly the forensic evidence a
+            # silent-rewrite alarm exists to make reachable. Truncated at 200
+            # like `content`, same convention update_edge uses for `fact`.
+            params['content_before'] = (existing.get('content') or '')[:200]
+
+            # Content-amend arm, folding in any metadata delta rather than
+            # issuing a second write for it — a combined call must never leave
+            # the record carrying new content with stale metadata.
+            #
+            # Forward ONLY the custom subset as metadata=: mem0's
+            # _update_memory starts a FRESH payload from deepcopy(metadata) and
+            # re-attaches just its own nine keys, so anything custom that is not
+            # forwarded here is destroyed. This is the read-modify-forward dance
+            # tag_cgl_eta_rehome_scope.apply_tags already had to solve; the
+            # mem0-owned keys are deliberately NOT forwarded because mem0
+            # restores or recomputes each of them itself.
+            result_data = await self._journaled_backend_call(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend='mem0',
+                operation='update_memory',
+                payload=params,
+                coro=self.mem0.update(
+                    memory_id, content, scope, metadata=new_custom,
+                ),
+            )
+            result: dict[str, Any] = {
+                'status': 'updated',
+                'store': 'mem0',
+                'id': memory_id,
+                'content_amended': True,
+                'metadata_patched': bool(metadata_patch or metadata_delete_keys),
+            }
+            if isinstance(result_data, dict):
+                result.update(result_data)
+                # Re-stamp the envelope keys the backend response must not be
+                # able to overwrite — 'id' above all, since the whole contract
+                # is that the caller can read identity stability off it.
+                result['status'] = 'updated'
+                result['store'] = 'mem0'
+                result['id'] = memory_id
+        else:
+            # Metadata-only arm — §5(b)'s decision table. Deliberately routes
+            # AROUND mem0's Memory.update, which would re-embed the content,
+            # rewrite updated_at and append a history row for what may be a
+            # purely cosmetic tag.
+            #
+            # The three primitives are not interchangeable: set_payload and
+            # delete_payload are native PARTIAL operations, so the new payload
+            # need not be computed from the old one; overwrite_payload replaces
+            # the ENTIRE point payload and therefore requires the mem0-owned
+            # subset re-attached underneath, or the point loses its own
+            # data/hash/created_at and becomes unreadable by mem0's get/search.
+            wants_replace = metadata_mode == 'replace'
+            if (metadata_patch and metadata_delete_keys) or wants_replace:
+                # One read-modify-overwrite_payload write. Chosen over
+                # set_payload-then-delete_payload because two round-trips have
+                # no ordering guarantee, no atomicity and no rollback: a failed
+                # second call leaves the record half-patched while the journal
+                # row claims the whole edit landed.
+                #
+                # overwrite_payload replaces the ENTIRE point payload, so the
+                # mem0-owned subset rides along underneath — omit it and the
+                # point loses its own data/hash/created_at and stops being
+                # readable by mem0's own get/search.
+                new_payload = {**managed, **new_custom}
+                operation = 'update_memory_overwrite_payload'
+                coro = self.mem0.overwrite_payload(memory_id, new_payload, scope)
+            elif metadata_patch:
+                # Qdrant merges server-side, so unlisted pre-existing keys
+                # survive without this layer reconstructing the whole payload.
+                operation = 'update_memory_set_payload'
+                coro = self.mem0.set_payload(memory_id, dict(metadata_patch), scope)
+            else:
+                operation = 'update_memory_delete_payload'
+                coro = self.mem0.delete_payload(
+                    memory_id, list(metadata_delete_keys or ()), scope,
+                )
+
+            await self._journaled_backend_call(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend='mem0',
+                operation=operation,
+                payload=params,
+                coro=coro,
+            )
+            result = {
+                'status': 'updated',
+                'store': 'mem0',
+                'id': memory_id,
+                'content_amended': False,
+                'metadata_patched': True,
+            }
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='update_memory',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params=params,
+                result_summary=result,
+                success=True,
+            )
+
+        # Event on the content arm always; on a metadata-only route only when a
+        # caller explicitly opts in. A metadata patch leaves the record saying
+        # exactly what it said before, so there is nothing for a downstream
+        # consolidator to re-read — announcing it would be noise on a channel
+        # whose consumers act on changed CONTENT.
+        if content is not None or emit_event:
+            await self._emit_event(ReconciliationEvent(
+                id=str(uuid_mod.uuid4()),
+                type=EventType.memory_updated,
+                source=EventSource.agent,
+                project_id=project_id,
+                timestamp=datetime.now(UTC),
+                payload={'memory_id': memory_id, 'store': 'mem0'},
+            ))
+
+        if content is not None:
+            self._record_content_amend(project_id=project_id, agent_id=agent_id)
 
         return result
 

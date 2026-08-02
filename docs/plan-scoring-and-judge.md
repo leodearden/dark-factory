@@ -783,6 +783,75 @@ closing the cross-group route.
 | The **writer** | `run_architect_eval` gates the judge call site on `is_scorable_plan`, so no new incoherent cell is written | 3302 |
 | The **reader** | `report._plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
 
+### The derived reliability surface (task 3379)
+
+Those two counts are collected, but the figure an operator actually compares
+candidates on is the *ratio* over them. Task 3379 derives it — no new
+collection, no new predicate:
+
+```
+plan_rate     = (n_admitted - no_plan) / n_admitted
+cost_per_plan = (spend over ADMITTED plan-only cells) / (n_admitted - no_plan)
+```
+
+| Figure | Composite row key | θ aggregate key | Rendered column |
+|---|---|---|---|
+| `plan_rate` | `plan_rate` (beside `plan_quality_n`, the denominator) | `plan_rate` | `plan_rate` on `format_composite_table` **and** in the `plan_quality by config:` block |
+| `cost_per_plan` | `cost_per_plan` (immediately after `cost_usd`) | — (see below) | `cost_per_plan` on `format_composite_table` |
+
+Both reduce through the shared `report._plan_rate` / `report._cost_per_plan`,
+and `_plan_rate` is called by **both** builders — the `_mean_plan_quality`
+discipline, so the two tables the CLI prints adjacently cannot drift.
+`cost_per_plan` is composite-row-only because `build_plan_quality_report`
+carries no cost data at all; threading some there would create a *second* cost
+surface free to drift from `cost_usd`.
+
+**The denominator rule: the ADMITTED θ pool, never `trials`.** A cap-tainted
+cell leaves *both* the numerator and the denominator. It is a transport refusal
+— we never got to ask — so it is neither a cell that planned nor a cell that
+failed to plan, and counting it would report a candidate as *less reliable* for
+a question a session-cap window stopped it from answering: the
+schedule-attributable penalty tasks 3118 and 3099 spent two rounds removing,
+reintroduced on the surface `select_survivors` ranks on. It also matches the
+campaign this automates —
+`plans/eval-architect-effort-verdict-2026-07-27.md` computes its own `planRate`
+over **19** fixtures, dropping the 3 cap-contaminated ones, not over all 22.
+`plan_quality_n` rides on the row so the ratio is verifiable from the row alone;
+it is the same number the θ table reports as `n`.
+
+**The no-plan cells' real spend stays in the `cost_per_plan` numerator.** That
+asymmetry is the whole figure: you paid for the failed attempt and got nothing,
+which is exactly what "$ per *usable* plan" prices. The verdict doc's own
+arithmetic makes the point — fable read `$3.456`/fixture against the opus-max
+incumbent but `$4.731` per usable plan, i.e. *no cheaper at all*, while failing
+to plan 5× as often. Netting the failed attempts out of the numerator would
+report that illusion rather than remove it. An *unmeasurable* cell's `$0.00` is
+still excluded, for the same reason `_is_unmeasurable` keeps it out of the
+`cost` pool: it is the price of a run that never happened, and letting it in
+would report the cap window as a discount.
+
+**`select_survivors` ranks on `plan_rate` as a TIE-BREAK, below
+`plan_quality`** (axes 5–6 of 7; the name tiebreak falls to 7). Not above:
+a no-plan cell is already paid for twice — floored into `plan_quality` and
+hard-gated in `composite` — so ranking on reliability primarily would charge
+the same failure a third time. Its residual value is real, though: one cell at
+`0.0` beside one at `1.0` yields the *same* mean as two cells at `0.5` while
+the configs differ sharply in reliability, and without this axis that tie falls
+through to the alphabet — the defect the name tiebreak is meant to be a last
+resort against.
+
+**Both figures are `None` (rendered `-`) on an empty pool, never `0.0`.** For
+`plan_rate` the fabrication would be two-sided: a `0.0` slanders a workflow
+config that never ran an architect cell ("it never planned"), a `1.0` flatters
+it ("it always planned"). For `cost_per_plan`, `n_planned == 0` means "we got no
+plan at any price", which must not render as `$0.0000` — nor raise.
+
+**The gap this closes.** The 2026-07-27 operator had to hand-compute `planRate`
+and `$/plan` from the per-cell result JSONs because no report surface exposed
+either, which is precisely why the campaign's headline finding — *what separates
+these candidates is how often they emit a plan at all* — could not be read off
+the pipeline's own ranking table. It can now.
+
 ### The anti-fabrication floor applies uniformly (task 3303)
 
 Gating only the writer left the instrument's coherence resting entirely on its

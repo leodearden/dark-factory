@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import time
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -22,6 +23,64 @@ from fused_memory.models.reconciliation import (
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue, _iter_lines_reversed
+
+
+async def _wait_for(
+    get_current,
+    predicate,
+    *,
+    timeout: float,
+    description: str,
+):
+    """Poll ``get_current()`` until ``predicate`` accepts its value, or the deadline lapses.
+
+    Load-tolerant alternative to gating a drainer handoff on
+    ``asyncio.wait_for(queue._queue.join(), timeout=<small>)``: that pattern
+    ties the pass/fail line to how fast a (possibly starved, under full-suite
+    xdist load) event loop happened to schedule the drainer, not to whether
+    the drainer actually did its job. Polling the observable outcome keeps the
+    guard meaningful — it still fails loudly if the drainer never catches up
+    within the (generous) outer deadline — without being sensitive to
+    scheduling jitter.
+
+    ``get_current`` may be sync or async (an awaitable return value is
+    awaited automatically) — e.g. ``queue.stats`` or
+    ``lambda: buffer.get_buffer_stats(project_id)``. Asserts (naming
+    ``description``, ``timeout``, and the last observed value) rather than
+    returning silently if the deadline lapses, so a future reader can tell
+    "the drainer never ran" from "the drainer produced the wrong value".
+    """
+    async def _read():
+        value = get_current()
+        if asyncio.iscoroutine(value):
+            value = await value
+        return value
+
+    deadline = time.monotonic() + timeout
+    value = await _read()
+    while not predicate(value) and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        value = await _read()
+    assert predicate(value), (
+        f'{description}: not satisfied within {timeout}s (last observed: {value!r})'
+    )
+    return value
+
+
+async def _wait_for_buffer_size(
+    buffer: EventBuffer, project_id: str, expected: int, *, timeout: float = 10.0,
+) -> dict:
+    """Poll get_buffer_stats until size reaches expected, or the deadline lapses.
+
+    Thin wrapper over ``_wait_for`` — see its docstring for the load-tolerance
+    rationale.
+    """
+    return await _wait_for(
+        lambda: buffer.get_buffer_stats(project_id),
+        lambda stats: stats['size'] >= expected,
+        timeout=timeout,
+        description=f"buffer size for project {project_id!r} reaching {expected}",
+    )
 
 
 def _make_event(
@@ -71,9 +130,11 @@ async def test_enqueue_persists_to_buffer(queue, real_buffer):
     """Enqueued events eventually land in SQLite."""
     for _ in range(5):
         assert queue.enqueue(_make_event()) is True
-    # Wait for drainer to catch up.
-    await asyncio.wait_for(queue._queue.join(), timeout=1.0)
-    stats = await real_buffer.get_buffer_stats('test-project')
+    # Wait for drainer to catch up. Polls the outcome (buffer size) under a
+    # generous outer deadline rather than gating on how fast a (possibly
+    # starved, under full-suite xdist load) event loop scheduled the drainer
+    # — see _wait_for_buffer_size.
+    stats = await _wait_for_buffer_size(real_buffer, 'test-project', 5)
     assert stats['size'] == 5
 
 
@@ -81,7 +142,6 @@ async def test_enqueue_persists_to_buffer(queue, real_buffer):
 @pytest.mark.xdist_group('event_queue_enqueue_timing')
 async def test_enqueue_returns_immediately(queue):
     """enqueue is synchronous and non-blocking."""
-    import time
     # Pre-create events so model construction doesn't inflate the timing.
     events = [_make_event() for _ in range(100)]
     t0 = time.perf_counter()
@@ -194,9 +254,17 @@ async def test_non_retriable_error_goes_to_dead_letter(tmp_path):
     try:
         for _ in range(3):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=1.0)
+        # Poll the outcome (dead_letters count) rather than gating on how
+        # fast a (possibly starved, under full-suite xdist load) event loop
+        # scheduled the drainer — see _wait_for.
+        stats = await _wait_for(
+            q.stats,
+            lambda stats: stats['dead_letters'] >= 3,
+            timeout=5.0,
+            description='dead_letters reaching 3',
+        )
         # All 3 should have been dead-lettered after a single failed push.
-        assert q.stats()['dead_letters'] == 3
+        assert stats['dead_letters'] == 3
         lines = dl.read_text().strip().splitlines()
         assert len(lines) == 3
         for line in lines:
@@ -360,8 +428,15 @@ async def test_stats_tracks_commits(queue, real_buffer):
     assert queue.stats()['events_committed'] == 0
     assert queue.stats()['last_commit_ts'] is None
     queue.enqueue(_make_event())
-    await asyncio.wait_for(queue._queue.join(), timeout=1.0)
-    stats = queue.stats()
+    # Poll the outcome (events_committed) rather than gating on how fast a
+    # (possibly starved, under full-suite xdist load) event loop scheduled
+    # the drainer — see _wait_for.
+    stats = await _wait_for(
+        queue.stats,
+        lambda stats: stats['events_committed'] >= 1,
+        timeout=5.0,
+        description='events_committed reaching 1',
+    )
     assert stats['events_committed'] == 1
     assert stats['last_commit_ts'] is not None
 
@@ -374,8 +449,13 @@ async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
     """_drain_for_test() waits until every enqueued event has been processed.
 
     Constructs an EventQueue wired to a real SQLite buffer, enqueues 5 events,
-    then awaits q._drain_for_test(timeout=1.0).  After the call returns the
-    buffer must contain exactly 5 committed events (stats['size'] == 5).
+    then awaits q._drain_for_test() (its default timeout).  After the call
+    returns the buffer must contain exactly 5 committed events
+    (stats['size'] == 5).
+
+    Relies on _drain_for_test's default 5.0s ceiling, which keeps the guard
+    tolerant of a starved event loop under full-suite xdist load while still
+    failing loudly if the drainer genuinely never runs.
     """
     q = EventQueue(
         real_buffer,
@@ -389,7 +469,7 @@ async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
     try:
         for _ in range(5):
             q.enqueue(_make_event())
-        await q._drain_for_test(timeout=1.0)
+        await q._drain_for_test()
         stats = await real_buffer.get_buffer_stats('test-project')
         assert stats['size'] == 5, (
             f"Expected 5 events in buffer after _drain_for_test, got {stats['size']}"

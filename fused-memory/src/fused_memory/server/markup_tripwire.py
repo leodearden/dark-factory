@@ -53,10 +53,11 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections import deque
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from fused_memory.server.storm_counter import StormCounter
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -295,14 +296,13 @@ class MarkupStormCounter:
 
     One bounced write is routine; a BURST means the upstream serialization leak
     is actively running, which is the condition worth escalating rather than
-    merely logging. Reproduces the established storm-counter body from
-    ``reconciliation/harness.py::_record_placeholder_finding_drop`` — append
-    ``(now, project)``, prune to the window, count, compare to the threshold,
-    then rate-limit to one fire per window, and report the DISTINCT project
-    labels seen in the window — using bulk_reset_guard's guard-side
-    injectable-clock convention (``time_provider`` stored as ``self._now``) so
-    the 3600s window can be tested by advancing a fake clock instead of
-    sleeping.
+    merely logging.
+
+    A THIN ADAPTER over the shared ``server/storm_counter.StormCounter``, which
+    is the single home for the append/prune/count/rate-limit body (INV-5, task
+    3088 — this class was its third copy). Everything markup-specific stays
+    here: the module-constant defaults, the ``project=`` parameter name, the
+    ``projects`` result key and the ``hint``.
 
     The per-project dimension is load-bearing, not decoration: one server
     instance serves every known project, so a window that mixed two projects
@@ -328,9 +328,7 @@ class MarkupStormCounter:
     ) -> None:
         self._threshold = threshold
         self._window_seconds = window_seconds
-        self._now = time_provider
-        self._events: deque[tuple[float, str | None]] = deque()
-        self._last_fire_ts: float | None = None
+        self._counter = StormCounter(time_provider=time_provider)
 
     def record(self, project: str | None = None) -> dict[str, Any] | None:
         """Record one rejection; return a storm summary iff a burst just fired.
@@ -339,43 +337,36 @@ class MarkupStormCounter:
         ``project_root``, or ``None`` when the boundary could not resolve one
         (``add_memory``/``add_episode`` take a ``project_id``, which for a project
         absent from the known-projects registry maps to no root at all).
+        Unlabelled rejections still count toward the burst but are not named.
 
         Returns ``None`` when the count within the window is below the threshold,
         AND when the threshold is met but a previous fire is still inside the
         window (the rate limit — without it, a leak emitting hundreds of writes
         would escalate hundreds of times for one incident).
 
-        Otherwise stamps the rate-limit timestamp and returns a JSON-serializable
-        summary with ``count``, ``threshold``, ``window_seconds``, ``hint`` and
-        ``projects`` — the sorted DISTINCT non-``None`` labels seen in the window,
-        so the caller can attribute the burst (and escalate to every project it
-        touched) instead of blaming whichever write crossed the threshold.
+        Otherwise returns a JSON-serializable summary with ``count``,
+        ``threshold``, ``window_seconds``, ``hint`` and ``projects`` — the sorted
+        DISTINCT non-``None`` labels seen in the window, so the caller can
+        attribute the burst (and escalate to every project it touched) instead of
+        blaming whichever write crossed the threshold.
+
+        This counter's threshold and window are module constants, so passing them
+        through on each call is a no-op for reload semantics here; the shared
+        class takes them per call for the benefit of consumers whose knobs come
+        from a green-tier config leaf (see ``storm_counter``'s module docstring).
         """
-        now = self._now()
-
-        # Append, then prune. The window is half-open: an event aged exactly
-        # window_seconds is already out.
-        self._events.append((now, project))
-        cutoff = now - self._window_seconds
-        while self._events and self._events[0][0] <= cutoff:
-            self._events.popleft()
-
-        count = len(self._events)
-        if count < self._threshold:
+        summary = self._counter.record(
+            threshold=self._threshold,
+            window_seconds=self._window_seconds,
+            label=project,
+        )
+        if summary is None:
             return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if self._last_fire_ts is not None and (now - self._last_fire_ts) < self._window_seconds:
-            return None
-
-        self._last_fire_ts = now
         return {
-            'count': count,
-            'threshold': self._threshold,
-            'window_seconds': self._window_seconds,
-            # Unlabelled events still count toward the burst, but there is
-            # nothing to escalate them against, so they are simply not named.
-            'projects': sorted({p for _, p in self._events if p is not None}),
+            'count': summary['count'],
+            'threshold': summary['threshold'],
+            'window_seconds': summary['window_seconds'],
+            'projects': summary['labels'],
             'hint': _MARKUP_STORM_HINT,
         }
 

@@ -490,8 +490,17 @@ class TestEndpointOverLiveArchive:
         body = resp.json()
         assert 'ESCALATION_ANALYTICS' in body
         analytics = body['ESCALATION_ANALYTICS']
-        assert set(analytics) == {'generated_at', 'parse_failures', 'regime_markers', 'per_project'}
+        assert set(analytics) == {
+            'generated_at', 'parse_failures', 'regime_markers', 'per_project',
+            # The two archive-reach signals, and the only fields that can tell
+            # an absent archive from an empty one: ``archives_present`` (all)
+            # is the completeness diagnostic, ``archives_reached`` (any) is the
+            # route's cacheability predicate.
+            'archives_present', 'archives_reached',
+        }
         assert isinstance(analytics['generated_at'], str) and analytics['generated_at']
+        assert analytics['archives_present'] is True
+        assert analytics['archives_reached'] is True
         assert isinstance(analytics['regime_markers'], list)
         assert len(analytics['per_project']) == 1
         entry = analytics['per_project'][0]

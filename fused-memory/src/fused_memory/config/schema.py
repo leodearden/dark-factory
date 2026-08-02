@@ -1629,6 +1629,108 @@ class WriteTriageConfig(BaseModel):
     )
 
 
+class Mem0UpdateConfig(BaseModel):
+    """Authorization + storm knobs for the in-place update_memory tool (task 3088).
+
+    Decided by ``plans/mem0-in-place-update-decision.md`` §4. In-place content
+    amendment is a silent-rewrite primitive, so the tool ships behind a narrow
+    self-reported-agent allowlist and a kill switch.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig: this is exactly the growth ReconciliationConfig's
+    near-dup ownership note anticipated ("if this guard ever grows independent of
+    reconciliation, move these two fields to a dedicated server-owned config
+    section instead of assuming colocation implies subsystem ownership") — recon
+    Stage 1 is this gate's first sanctioned CALLER, not its owner. Starting here
+    avoids a later migration.
+
+    Declared on FusedMemoryConfig as a BARE (non-Optional) submodel so
+    config/reload.py's `_iter_leaves` descends into per-leaf paths. An
+    `X | None` submodel is compared whole and lands as a single
+    restart_required entry (esc-2718-1), which would cost every leaf here its
+    green-tier hot-reload.
+
+    TWO CORRECTIONS to the decision doc a reader should not be misled by:
+
+    1. §4 cites CuratorConfig / TicketJanitorConfig / SummaryRebuildConfig as
+       three top-level precedents, but TicketJanitorConfig is actually NESTED
+       under CuratorConfig as `janitor`. The genuine top-level precedents are
+       `write_triage`, `curator` and `summary_rebuild` — still three, but a
+       different three; WriteTriageConfig is the freshest shape template.
+
+    2. The storm knobs live HERE in config rather than as module constants,
+       diverging from server/markup_tripwire.py's local choice. markup argues a
+       config field "would add hot-reload tier surface and a schema migration for
+       no operator gain"; that reasoning does not transfer. This model must exist
+       regardless to carry the authz knobs, so two more fields buy no new schema
+       surface; §4 explicitly ratifies both as green-tier hot-reloadable; and
+       ReconciliationConfig already carries storm knobs in config. Unlike
+       markup's alarm this one has a real operator-tuning story — see
+       `metadata_patch_allowed_agent_prefixes`.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for the in-place update_memory tool. When false EVERY '
+            'caller is denied regardless of agent_id, with error_type '
+            'Mem0UpdateToolDisabled — the single knob an operator flips to stop an '
+            'in-flight rewrite incident without a restart. Green-tier '
+            'hot-reloadable via reload_config.'
+        ),
+    )
+    content_amend_allowed_agent_prefixes: list[str] = Field(
+        default_factory=lambda: ['recon-stage-'],
+        description=(
+            'agent_id prefixes authorized to AMEND CONTENT in place. Defaults to '
+            'the narrow recon-stage- bar (the same literal prefix '
+            'add_system_record gates on) because a content amend is a silent '
+            'history-rewrite primitive. NOTE: agent_id is SELF-REPORTED, so this '
+            'is a misuse deterrent for cooperating callers, not cryptographic '
+            'authorization. Deliberately a separate list from '
+            'metadata_patch_allowed_agent_prefixes so the two bars move '
+            'independently. Green-tier hot-reloadable via reload_config.'
+        ),
+    )
+    metadata_patch_allowed_agent_prefixes: list[str] = Field(
+        default_factory=lambda: ['recon-stage-'],
+        description=(
+            'agent_id prefixes authorized to PATCH METADATA in place. Ships '
+            'identical to the content-amend list but is independently '
+            'configurable, and that is the point: widening THIS list alone is the '
+            'supported way to admit an interactive curator-gate flow (tagging a '
+            'survivor with topic=) without granting content-amend authority. A '
+            'mistagged patch is cheap to notice and cheap to correct; a runaway '
+            'silent content rewrite is not. Green-tier hot-reloadable via '
+            'reload_config.'
+        ),
+    )
+    storm_threshold: int = Field(
+        default=20,
+        gt=0,
+        description=(
+            'CONTENT-AMEND calls from one agent_id within storm_window_seconds '
+            'before an mem0_in_place_update_storm escalation fires (INV-4). '
+            'Metadata-only calls do not count. This is an ALARM, not a rate '
+            'limiter: crossing the threshold never rejects the write, since a '
+            'hard block would risk a legitimate large consolidation cycle failing '
+            'mid-run over its own success count. Green-tier hot-reloadable — read '
+            'live on every call and passed into StormCounter.record(), which is '
+            'what makes the leaf genuinely reloadable rather than restart-only in '
+            'disguise (see server/storm_counter.py).'
+        ),
+    )
+    storm_window_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'Rolling window for storm_threshold. Half-open: an amend aged exactly '
+            'this long is already out. Green-tier hot-reloadable on the same '
+            'read-live-per-record() basis as storm_threshold.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -1648,6 +1750,8 @@ class FusedMemoryConfig(BaseSettings):
     # reload.py descends only into required submodels, so nullability here would
     # cost the section its per-leaf hot-reload.
     write_triage: WriteTriageConfig = Field(default_factory=WriteTriageConfig)
+    # Bare submodel for the same per-leaf-reload reason as write_triage above.
+    mem0_update: Mem0UpdateConfig = Field(default_factory=Mem0UpdateConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
     summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)
     path_scope_adjudicator: PathScopeAdjudicatorConfig = Field(

@@ -1008,6 +1008,13 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
     term.chmod(0o755)
 
     env = _base_env(bin_dir, "custom-term")
+    # Task 3451 audit: deliberately NOT routed through _set_started_grace.
+    # This test asserts the flag MUST fire, and its launcher exits 0
+    # without ever running the payload, so no evidence (sentinel,
+    # transcript, or claude descendant) can EVER appear -- the watchdog
+    # fires regardless of grace, and the verdict is load-insensitive. The
+    # short pin only bounds how long the test waits for that inevitable
+    # flag; _set_started_grace would merely make it slower.
     env["SPAWN_STARTED_GRACE_SECS"] = "2"
 
     proc = subprocess.Popen(
@@ -1082,6 +1089,50 @@ def _load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
     return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
 
 
+# _NOT_FLAGGED_GRACE_BASE_SECS: raised from 2 to 8 (task 3451). Derived, not
+# tuned -- on this host (nproc 32, /proc/loadavg 212 => load-per-core 6.6),
+# n=3 runs of the normal fast spawn shape (delay=0, grace=2, foreground
+# xterm, fake claude exiting 0) took 2.13s / 3.10s / 4.71s wall. The old 2s
+# pin sat BELOW that entire observed range -- the complete explanation of
+# the flake. 8 > 4.71 gives 1.7x margin from the floor alone, before load
+# scaling multiplies on top: at that same load the full policy yields
+# min(60, ceil(8 * 6.6)) = 53s, ~11x the worst measured happy path.
+#
+# The larger grace is free: measured wall-clock is NOT proportional to
+# grace (grace=2 -> 2.13-4.71s vs grace=90 (unpinned) -> 2.54-7.28s,
+# overlapping ranges) because _cleanup (skills/spawn/spawn-claude.sh:107)
+# kills the backgrounded watchdog at parent exit, so the grace is only an
+# upper bound the watchdog polls to, never a wait the happy path pays.
+#
+# cap_secs=60 (below) is RAISED by this change from _load_scaled_grace's
+# own default cap of 30 -- not unchanged. The raise is load-bearing, not
+# cosmetic: at load-per-core 6.6, ceil(8*6.6)=53 would otherwise be
+# clamped down to 30, discarding most of the load headroom the base bump
+# from 2 to 8 was meant to buy. 60 stays strictly below the 90s production
+# default (skills/spawn/spawn-claude.sh:89), so this pin never tests an
+# unreachable configuration.
+_NOT_FLAGGED_GRACE_BASE_SECS = 8
+
+
+def _set_started_grace(env: dict[str, str]) -> int:
+    """Compute and write the load-adaptive started-grace for tests that
+    assert the failed-to-start flag must NOT fire.
+
+    Delegates entirely to _load_scaled_grace so such tests inherit the
+    load-adaptive policy by default instead of each hand-picking a fixed
+    number (the third recurrence of a started-grace flake in this file:
+    task 2367 bumped 1s/2s -> 3s/8s, task 2733 added _load_scaled_grace, and
+    2733 missed this site). Writing the env var is part of the contract, not
+    a side effect a caller must remember to do -- it is what makes the
+    policy deterministically unit-testable (assert the returned int and the
+    string that landed in env) without a source-grepping meta-test to prove
+    call sites were rewired.
+    """
+    grace = _load_scaled_grace(_NOT_FLAGGED_GRACE_BASE_SECS, cap_secs=60)
+    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
+    return grace
+
+
 def test_load_scaled_grace_idle_host_returns_base_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1128,24 +1179,88 @@ def test_load_scaled_grace_getloadavg_error_returns_base(
     assert _load_scaled_grace(3, cap_secs=30) == 3
 
 
+# ===========================================================================
+# Task 3451: _set_started_grace -- shared started-grace policy for the
+# "must NOT be flagged failed-to-start" test family
+# ===========================================================================
+# Third recurrence of a started-grace flake in this file (task 2367 bumped a
+# fixed 1s/2s -> 3s/8s; task 2733 added _load_scaled_grace above but missed
+# wiring test_normal_spawn_exit0_not_flagged to it, leaving it pinned at a
+# fixed "2" against a 90s production default -- skills/spawn/spawn-claude.sh:89).
+# _set_started_grace both computes the load-scaled grace via
+# _load_scaled_grace AND writes it into env["SPAWN_STARTED_GRACE_SECS"], so
+# the fix is deterministically unit-testable here -- assert the returned int
+# and the string that landed in env -- instead of requiring a forbidden
+# source-grepping meta-test to prove call sites were rewired.
+
+
+def test_set_started_grace_writes_env_matching_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_set_started_grace delegates to _load_scaled_grace and writes the
+    identical value into env["SPAWN_STARTED_GRACE_SECS"] as a string.
+
+    The floor/scale/cap arithmetic itself is already pinned three ways by
+    the test_load_scaled_grace_* tests above (idle/scale/clamp/error-safe);
+    re-deriving that same arithmetic here through _set_started_grace would
+    just be duplicate coverage of task 2733's tests. The only contract that
+    is genuinely new at this layer is that _set_started_grace's return
+    value and the string it writes into env agree -- so this test uses
+    _load_scaled_grace itself as the oracle rather than hardcoding an
+    expected number, on an IDLE host (load-per-core < 1) where
+    _load_scaled_grace floors at the bare base unchanged.
+
+    That idle-host floor is also where _NOT_FLAGGED_GRACE_BASE_SECS's own
+    value must clear the parent script's measured happy-path startup
+    latency -- not just be a low fixed number. MEASURED, not guessed: on
+    this host (nproc 32, /proc/loadavg 212 => load-per-core 6.6) three runs
+    of the normal fast spawn shape (delay=0, grace=2, foreground xterm,
+    fake claude exiting 0) took 2.13s / 3.10s / 4.71s wall -- the whole
+    observed range sits ABOVE the old 2s pin, which is the complete
+    explanation of the reported flake in test_normal_spawn_exit0_not_flagged
+    (registry status intermittently failed-to-start instead of exited). A
+    floor of 8s clears the 4.71s worst case with a 1.7x margin, before any
+    load scaling multiplies on top of it.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    env: dict[str, str] = {}
+    grace = _set_started_grace(env)
+
+    assert grace == _load_scaled_grace(_NOT_FLAGGED_GRACE_BASE_SECS, cap_secs=60)
+    assert env["SPAWN_STARTED_GRACE_SECS"] == str(grace)
+    assert _NOT_FLAGGED_GRACE_BASE_SECS >= 8, (
+        "must-not-be-flagged started-grace floor must clear the measured "
+        f"worst-case happy-path spawn latency (4.71s at load-per-core 6.6); "
+        f"got {_NOT_FLAGGED_GRACE_BASE_SECS}"
+    )
+
+
 def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     """A fresh transcript file must suppress the failed-to-start flag.
 
     Proves the transcript detector is load-bearing. Uses a DETACHING launcher
     (custom-term, routing through resolve_detached's launch_rc==0 branch --
     the incident path) whose fake claude writes a transcript file under
-    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps well past
-    the shrunk started-grace before exiting and letting $inner write the
-    sentinel. <enc> mirrors session_registry.transcript_path_for_cwd's
-    encoding: cwd with every '/' and '.' replaced by '-'.
+    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps a fixed 8s
+    before exiting and letting $inner write the sentinel -- so the
+    transcript evidence is available from t~0, long before the sentinel can
+    possibly exist, and _started_watchdog (which polls continuously and
+    returns on first evidence) observes only the transcript. <enc> mirrors
+    session_registry.transcript_path_for_cwd's encoding: cwd with every '/'
+    and '.' replaced by '-'.
 
-    Grace is load-adaptive (task 2733): SPAWN_STARTED_GRACE_SECS is
-    _load_scaled_grace(3), not a fixed 3s. Under merge-verify xdist
-    contention the fake launcher->claude->transcript startup chain can take
-    longer than any fixed margin -- this is the SECOND recurrence of this
-    exact flake (task 2367 already bumped the fixed value 1s/2s -> 3s/8s six
-    days before this one). Load-per-core headroom tracks the actual
-    contention instead of chasing a moving target with another fixed bump.
+    Grace is load-adaptive via _set_started_grace (task 3451), which shares
+    one policy across all three must-not-be-flagged sites in this file.
+    Originally task 2733's bare _load_scaled_grace(3) -- but a base of 3s
+    was ALSO below the measured 4.71s worst-case happy-path chain latency
+    (load-per-core 6.6), leaving residual exposure at low-but-nonzero load.
+    Under merge-verify xdist contention the fake launcher->claude->transcript
+    startup chain can take longer than any fixed margin -- this is the THIRD
+    recurrence of this exact flake (task 2367 already bumped the fixed value
+    1s/2s -> 3s/8s six days before task 2733's fix, which task 3451 now
+    supersedes here).
 
     The fake-claude sleep stays FIXED at 8s, decoupled from the now-larger
     grace: the only validity requirement is that the exit sentinel lands
@@ -1163,8 +1278,9 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
 
     # Fake claude: write the transcript file immediately (mirroring a real
     # Claude Code session creating ~/.claude/projects/<enc>/*.jsonl the moment
-    # it starts), then outlast the shrunk started-grace before exiting -- so
-    # only the transcript probe (not the sentinel) can suppress the flag.
+    # it starts), then sleep a fixed 8s before exiting -- the transcript
+    # lands at t~0, long before the sentinel can exist, so only the
+    # transcript probe (not the sentinel) can suppress the flag.
     claude = bin_dir / "claude"
     claude.write_text(
         "#!/usr/bin/env bash\n"
@@ -1179,8 +1295,7 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     _write_detaching_terminal(bin_dir, "custom-term", pidfile)
 
     env = _base_env(bin_dir, "custom-term")
-    grace = _load_scaled_grace(3)
-    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
+    grace = _set_started_grace(env)
 
     result = _run_spawn(env, tmp_path, timeout=grace + 8 + 6)
 
@@ -1213,17 +1328,20 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     evidence (the only positive signal available on this path).
 
     Uses a FOREGROUND launcher (xterm) whose fake claude writes no transcript
-    at all under $CLAUDE_PROJECTS_DIR, but stays alive (sleeping) well past
-    the shrunk started-grace before exiting. Since xterm's fake terminal
+    at all under $CLAUDE_PROJECTS_DIR, but stays alive (sleeping) for a fixed
+    6s before exiting -- so the watchdog observes it as a live descendant
+    long before it exits, regardless of grace. Since xterm's fake terminal
     `exec`s into the payload bash (see _FOREGROUND_TERM_SCRIPT), claude runs
     as a direct descendant of spawn-claude.sh's own $$ -- unlike a detached
     launcher (setsid + background job, reparented once the launcher process
     exits), where this probe is correctly always empty.
 
-    Grace is load-adaptive (task 2733) like
-    test_transcript_appearance_suppresses_flag: SPAWN_STARTED_GRACE_SECS is
-    _load_scaled_grace(2), not a fixed 2s, so the margin tracks host
-    contention instead of chasing a moving target with another fixed bump.
+    Grace is load-adaptive via _set_started_grace (task 3451), the same
+    policy as test_transcript_appearance_suppresses_flag. Originally task
+    2733's bare _load_scaled_grace(2) -- but a base of 2s was ALSO below
+    the measured 4.71s worst-case happy-path chain latency (load-per-core
+    6.6), leaving residual exposure at low-but-nonzero load. All three
+    must-not-be-flagged sites in this file now share one policy.
 
     The fake-claude sleep stays FIXED at 6s, decoupled from the now-larger
     grace: the only validity requirement is that the exit sentinel lands
@@ -1238,16 +1356,15 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     bin_dir = _make_bin_dir(tmp_path)
     _write_foreground_terminal(bin_dir, "xterm")
 
-    # Fake claude: writes NO transcript anywhere, just outlasts the shrunk
-    # started-grace before exiting -- so only _claude_descendant_alive (not
+    # Fake claude: writes NO transcript anywhere, just stays alive (sleeping)
+    # for a fixed 6s before exiting -- so only _claude_descendant_alive (not
     # the transcript probe) can suppress the flag.
     claude = bin_dir / "claude"
     claude.write_text("#!/usr/bin/env bash\nsleep 6\nexit 0\n")
     claude.chmod(0o755)
 
     env = _base_env(bin_dir, "xterm")
-    grace = _load_scaled_grace(2)
-    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
+    grace = _set_started_grace(env)
 
     result = _run_spawn(env, tmp_path, timeout=grace + 6 + 6)
 
@@ -1308,6 +1425,14 @@ def test_foreground_launcher_failure_prefers_127_over_started_grace_race(
 
     env = _base_env(bin_dir, "xterm")
     env["SPAWN_LAUNCH_GRACE_SECS"] = "5"
+    # Task 3451 audit: deliberately NOT routed through _set_started_grace.
+    # Here the SHORT grace IS the premise -- it must stay well below the
+    # SPAWN_LAUNCH_GRACE_SECS="5" set on the line above, and load-scaling a
+    # base of 1 (via _set_started_grace or _load_scaled_grace) could exceed
+    # 5 under contention, inverting the exact 127-vs-144 ordering this test
+    # exists to pin. This is the opposite family from _set_started_grace's
+    # must-not-fire tests: here the flag firing fast is fine, so long as
+    # resolve_foreground's 127 verdict still wins the race.
     env["SPAWN_STARTED_GRACE_SECS"] = "1"
 
     result = _run_spawn(env, tmp_path, timeout=20)
@@ -1327,14 +1452,31 @@ def test_normal_spawn_exit0_not_flagged(tmp_path: pathlib.Path) -> None:
     watchdog is running concurrently in the background. Already green after
     step-2 (the sentinel check alone satisfies it) -- this pins the contract
     before step-4 adds more evidence probes.
+
+    Task 3451: fixes a load-sensitive flake from pinning
+    SPAWN_STARTED_GRACE_SECS to a fixed "2" against a 90s production
+    default. Under merge-verify contention the parent's own
+    launcher->claude->sentinel chain outran the fixed 2s window while all
+    three watchdog probes (sentinel, transcript, live claude descendant)
+    were still empty, so the watchdog overwrote the registry record with
+    failed-to-start AFTER the parent had already written exited, and
+    _cleanup (skills/spawn/spawn-claude.sh:107) then killed the watchdog
+    before its stderr echo -- which is exactly why the reported failure
+    showed registry=failed-to-start with a CLEAN stderr: it passed the
+    "failed-to-start" not in stderr assertion below and failed only the
+    final registry-status assertion. Now uses _set_started_grace, the same
+    load-adaptive policy as the sibling must-not-be-flagged tests, with a
+    grace-relative _run_spawn timeout so the same load that enlarges the
+    grace cannot convert this into a subprocess.TimeoutExpired flake
+    instead.
     """
     bin_dir = _make_bin_dir(tmp_path)
     _write_fake_claude(bin_dir, exit_code=0)
     _write_foreground_terminal(bin_dir, "xterm")
     env = _base_env(bin_dir, "xterm")
-    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+    grace = _set_started_grace(env)
 
-    result = _run_spawn(env, tmp_path)
+    result = _run_spawn(env, tmp_path, timeout=grace + 20)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (

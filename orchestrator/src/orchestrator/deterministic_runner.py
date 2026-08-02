@@ -918,12 +918,36 @@ class DeterministicRunner:
         # ``python -m escalation submit`` argv construction (byte-identical to
         # this method's prior inline argv — see EscalationSpec.to_submit_argv).
         #
-        # Deployment assumption: the `escalation` package must be importable from
-        # sys.executable's interpreter (i.e. installed into site-packages, not
-        # just reachable via a PYTHONPATH side-channel from the orchestrator
-        # service unit).  If it is not, the OnFailure branch itself fails and no
-        # L2 is filed — the task is already marked done=scheduled at this point,
-        # so the failure would be silently lost.  Operators should verify with:
+        # Deployment assumption: the `escalation` package must be importable
+        # from sys.executable's interpreter.  That importability rests on TWO
+        # independent legs (task 3453, both MEASURED):
+        #
+        #  1. Interpreter identity — `sys.executable` IS the workspace venv
+        #     interpreter (`uv run --frozen --project orchestrator` resolves
+        #     ExecStart to `<repo>/.venv/bin/python3`, which carries an editable
+        #     install of `escalation`).  This leg is load-bearing and cannot be
+        #     substituted: `python -S -m escalation submit` with the src roots on
+        #     PYTHONPATH still dies at `shared.async_sqlite_base` ->
+        #     `import aiosqlite`, a site-packages-only wheel.  So PYTHONPATH
+        #     alone is NOT sufficient.
+        #  2. Workspace src roots — supplied explicitly by the
+        #     `--setenv=PYTHONPATH=` token `RestartPlan`'s detached argv now
+        #     carries (proc_supervision._submit_child_pythonpath).  This is the
+        #     only leg systemd-run can break: it propagates NONE of the caller's
+        #     environment to a transient unit.
+        #
+        # NOT via "a PYTHONPATH side-channel from the orchestrator service
+        # unit", as this comment previously claimed — MEASURED FALSE:
+        # orchestrator-dark-factory.service sets only Environment=PATH=/LANG=/
+        # ORCH_UNIT= and no PYTHONPATH, and systemd-run would not propagate it
+        # anyway.
+        #
+        # If `escalation` is nonetheless unimportable, the OnFailure branch
+        # itself fails and no L2 is filed — the task is already marked
+        # done=scheduled at this point, so the failure would be silently lost.
+        # `RestartPlan._execute_detached_systemd_run` now WARNs at registration
+        # time when it can prove that in-process (the `escalation.submit`
+        # canary).  Operators can verify the same thing directly with:
         #   <sys.executable> -c "import escalation"
         # before deploying.  A marker-file fallback is intentionally not
         # implemented here to keep the failure path auditable via journald.

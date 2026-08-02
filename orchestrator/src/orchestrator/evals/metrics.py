@@ -19,6 +19,7 @@ from shared.invocation_outcome import (
     AuthFailed,
     CapHit,
     ModelNotFound,
+    ServerError,
     ZeroOutputWedge,
     classify_invocation,
 )
@@ -142,11 +143,11 @@ class EvalMetrics:
     # ``invocation_error`` records WHAT happened: a stage-prefixed marker for an
     # infra failure observed while producing this cell, e.g.
     # ``"architect:cap_hit: You've hit your session limit · resets 8pm"``,
-    # ``"architect:model_not_found: ..."``, ``"architect:wedge: ..."`` or
-    # ``"judge:api_error: HTTP 429"``. ``None`` means no infra failure was
-    # observed — including for an ordinary content failure (an architect that
-    # ran fine and simply produced a bad/absent plan), which must keep scoring
-    # on content.
+    # ``"architect:model_not_found: ..."``, ``"architect:wedge: ..."``,
+    # ``"architect:server_error: HTTP 529"`` or ``"judge:api_error: HTTP
+    # 429"``. ``None`` means no infra failure was observed — including for an
+    # ordinary content failure (an architect that ran fine and simply
+    # produced a bad/absent plan), which must keep scoring on content.
     #
     # ``cap_tainted`` is the SCORING DECISION derived from it: this cell is not
     # a content measurement at all, so the plan_quality aggregates EXCLUDE it
@@ -294,6 +295,17 @@ def detect_invocation_error(
     It is checked BEFORE the wedge tier so a 429 that also timed out with zero
     turns is reported as the 429 it is, not as a generic wedge.
 
+    ``ServerError`` (HTTP 5xx, including 529 Overloaded) is marked too: the
+    provider refused, so the model never answered and the cell is unmeasurable
+    for the same reason a 429 is. It is attributed ABOVE the wedge tier because
+    a SIGTERM-flushed 5xx on a watchdog-killed CLI is a PROVIDER outage, not a
+    local wedge — the 2026-07-29 incident this tier exists for. This arm also
+    REPAIRS a silent regression: before ``classify_invocation`` grew the
+    ``ServerError`` tier, a timed-out flushed 5xx reached this ladder as a
+    ``ZeroOutputWedge`` and was marked; once that tier was ranked above the
+    wedge upstream, the same case silently fell through to ``None`` until this
+    arm was added.
+
     ``ZeroOutputWedge`` is marked too (reviewer: robustness): a full-timeout
     invocation with zero transcript turns produced no model answer at all, so it
     is unmeasurable for exactly the reason a 429 is, and scoring it 0.0 would
@@ -327,6 +339,14 @@ def detect_invocation_error(
         return None
     if getattr(result, 'api_error_status', None) == 429:
         return 'api_error: HTTP 429'
+    # ServerError sits BELOW the 429 fallback, because a 5xx is never a 429
+    # and 429-body semantics must not move; it sits ABOVE the wedge branch so
+    # this ladder's order tracks classify_invocation's own CapHit/NearCap >
+    # ServerError > ZeroOutputWedge precedence (shared/src/shared/
+    # invocation_outcome.py:398, :523) — a SIGTERM-flushed 5xx on a
+    # watchdog-killed CLI is a provider outage, not a local wedge.
+    if isinstance(outcome, ServerError):
+        return f'server_error: HTTP {outcome.status}'
     if isinstance(outcome, ZeroOutputWedge):
         return 'wedge: zero-output timeout (no transcript turns)'
     return None

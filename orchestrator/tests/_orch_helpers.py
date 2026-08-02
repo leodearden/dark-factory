@@ -69,11 +69,11 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
     scheduler_mock._workflow_cancel_at = {}
     scheduler_mock._RECONCILE_CANCEL_GRACE_S = 30.0
     scheduler_mock.is_dispatched = lambda tid: tid in scheduler_mock._dispatched
-    scheduler_mock.note_workflow_cancelled = (
-        lambda tid: scheduler_mock._workflow_cancel_at.__setitem__(tid, time.monotonic())
+    scheduler_mock.note_workflow_cancelled = lambda tid: (
+        scheduler_mock._workflow_cancel_at.__setitem__(tid, time.monotonic())
     )
-    scheduler_mock.clear_workflow_cancel = (
-        lambda tid: scheduler_mock._workflow_cancel_at.pop(tid, None)
+    scheduler_mock.clear_workflow_cancel = lambda tid: scheduler_mock._workflow_cancel_at.pop(
+        tid, None
     )
 
     def _workflow_cancel_recent(tid: str) -> bool:
@@ -89,6 +89,7 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
         or scheduler_mock.lock_table.is_held(tid)
         or scheduler_mock.workflow_cancel_recent(tid)
     )
+
 
 # task 2376: generous merge-pipeline result-wait ceiling that tolerates host
 # oversubscription; never-narrow — only replaces literals <=15 across the
@@ -267,17 +268,19 @@ class HermeticMcpSession:
             # the response never falls into the resolver-degraded
             # missing-key branch by accident — see class docstring.
             deps = arguments.get('deps') or []
-            statuses = {
-                dep: self._external_statuses.get(dep, 'unknown_task')
-                for dep in deps
-            }
+            statuses = {dep: self._external_statuses.get(dep, 'unknown_task') for dep in deps}
             return self._envelope(json.dumps(statuses))
         if name == 'set_task_claimant':
             return self._envelope(json.dumps({}))
         if name == 'set_task_status':
-            return self._envelope(json.dumps({
-                'id': arguments.get('id'), 'status': arguments.get('status'),
-            }))
+            return self._envelope(
+                json.dumps(
+                    {
+                        'id': arguments.get('id'),
+                        'status': arguments.get('status'),
+                    }
+                )
+            )
         if name == 'get_task':
             return self._envelope(json.dumps({'id': arguments.get('id')}))
         if name == 'update_task':
@@ -334,8 +337,7 @@ def drain_async_mock_coroutines() -> int:
     for obj in gc.get_objects():
         if (
             inspect.iscoroutine(obj)
-            and getattr(getattr(obj, 'cr_code', None), 'co_name', None)
-            == '_execute_mock_call'
+            and getattr(getattr(obj, 'cr_code', None), 'co_name', None) == '_execute_mock_call'
             and inspect.getcoroutinestate(obj) == inspect.CORO_CREATED
         ):
             obj.close()
@@ -486,14 +488,13 @@ async def reap_leaked_claimant_heartbeats() -> int:
         if task.done():
             continue
         coro = task.get_coro()
-        if not getattr(coro, '__qualname__', '').endswith(
-            'TaskWorkflow._claimant_heartbeat_loop'
-        ):
+        if not getattr(coro, '__qualname__', '').endswith('TaskWorkflow._claimant_heartbeat_loop'):
             continue
         task.cancel()
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(
-                asyncio.gather(task, return_exceptions=True), timeout=10.0,
+                asyncio.gather(task, return_exceptions=True),
+                timeout=10.0,
             )
         if task.done():
             reaped += 1
@@ -783,8 +784,7 @@ def make_gate_yielding(slots, *, active_account_name=None) -> MagicMock:
     gate = make_mock_gate(
         account_count=len(slots),
         active_account_name=(
-            active_account_name if active_account_name is not None
-            else slots[0].account_name
+            active_account_name if active_account_name is not None else slots[0].account_name
         ),
         before_invoke=AsyncMock(return_value=slots[0].token),
     )
@@ -937,12 +937,9 @@ def assert_update_wire_mode(
     )
     arguments = update_calls[0]['arguments']
     assert arguments.get('metadata_mode') == expected_mode, (
-        f'update_task wire call must forward metadata_mode={expected_mode!r}; '
-        f'got: {arguments}'
+        f'update_task wire call must forward metadata_mode={expected_mode!r}; got: {arguments}'
     )
-    assert 'append' not in arguments, (
-        f"'append' key must not appear on the wire; got: {arguments}"
-    )
+    assert 'append' not in arguments, f"'append' key must not appear on the wire; got: {arguments}"
     return arguments
 
 

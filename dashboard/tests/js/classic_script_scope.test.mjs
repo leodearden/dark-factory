@@ -62,6 +62,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'runtime_format.js': 'DF_RUNTIME_FMT',
   'orch_filter.js': 'DF_ORCH_FILTER',
   'esc_flow_layout.js': 'DF_ESC_FLOW_LAYOUT',
+  'spark_path.js': 'DF_SPARK_PATH',
 };
 
 function readIndexHtml() {
