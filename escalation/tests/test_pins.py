@@ -11,6 +11,9 @@ Covers:
   step-5: the SEVERITY rules (spec S6 clauses i and ii) — info never pins;
           missing/out-of-vocabulary severity fails safe to pinning, which
           deliberately OUTRANKS the dead-L0 rule.
+  step-7: the LEVEL rule (L1/L2 always pin) and the DEAD-L0 FILING-INCARNATION
+          rule (spec S6 clauses iii and iv) — liveness is judged against the
+          incarnation that FILED the record.
 """
 
 from __future__ import annotations
@@ -243,3 +246,126 @@ class TestKnownNonInfoSeveritiesArePinCandidates:
         failing the classifier's fail-safe branch."""
         assert 'info' in KNOWN_SEVERITIES
         assert {'info', 'blocking', 'critical', 'urgent'} <= KNOWN_SEVERITIES
+
+
+# ---------------------------------------------------------------------------
+# step-7 — level rule + dead-L0 filing-incarnation rule (spec S6 clauses
+# iii and iv): precedence links 3 and 4
+# ---------------------------------------------------------------------------
+
+#: Severities for which the level/liveness outcome must be identical.
+NON_INFO = sorted(KNOWN_SEVERITIES - {'info'})
+
+
+class TestLevelRule:
+    """Clause (iii): L1/L2 are queue-backed handoffs with supervised consumers —
+    they pin regardless of liveness, so the filing-incarnation rule is L0-ONLY."""
+
+    @pytest.mark.parametrize('severity', NON_INFO)
+    @pytest.mark.parametrize('level', [1, 2])
+    @pytest.mark.parametrize('live_claimant', [True, False])
+    @pytest.mark.parametrize('filing', [LIVE_ID, OTHER_ID])
+    def test_l1_and_l2_are_queue_handoff_under_every_liveness_combination(
+        self, severity: str, level: int, live_claimant: bool, filing: str,
+    ) -> None:
+        bucket = _bucket_of(
+            _rec(level=level, severity=severity, filing=filing),
+            live_claimant=live_claimant,
+            live_claimant_id=LIVE_ID,
+        )
+        assert bucket == 'queue_handoff', 'an L1/L2 is never dead_l0'
+
+    @pytest.mark.parametrize('level', [3, 99, -1])
+    def test_out_of_vocabulary_levels_fail_safe_to_queue_handoff(self, level: int) -> None:
+        """A corrupt/out-of-range level pins. This is the exact shape that would
+        wrongly become dead_l0 if the guard were written ``level >= 1`` instead
+        of ``level != 0``."""
+        bucket = _bucket_of(
+            _rec(level=level, severity='blocking', filing=OTHER_ID),
+            live_claimant=False,
+        )
+        assert bucket == 'queue_handoff'
+
+
+class TestDeadL0FilingIncarnationRule:
+    """Clause (iv): an L0 whose FILING incarnation is dead is DEAD_L0.
+
+    Liveness is judged against the incarnation that FILED the record, not
+    "some workflow for this task is alive"."""
+
+    @pytest.mark.parametrize('severity', NON_INFO)
+    @pytest.mark.parametrize('filing', [OTHER_ID, None])
+    def test_no_live_claimant_at_all_is_dead_l0(self, severity: str, filing: str | None) -> None:
+        """With NO incarnation live, the filing one is necessarily dead —
+        identity-independent. This is the 2026-08-02 strand shape: 7 of 9
+        stranded tasks were pinned by their own dead-steward L0."""
+        bucket = _bucket_of(
+            _rec(level=0, severity=severity, filing=filing),
+            live_claimant=False,
+            live_claimant_id=None,
+        )
+        assert bucket == 'dead_l0'
+
+    @pytest.mark.parametrize('severity', NON_INFO)
+    def test_newer_live_incarnation_does_not_keep_a_prior_incarnations_l0_alive(
+        self, severity: str,
+    ) -> None:
+        """THE load-bearing case (spec S6): a claimant IS live, but it is not
+        the one that filed this record — so the record's handoff has no
+        consumer left and must NOT keep pinning the task."""
+        bucket = _bucket_of(
+            _rec(level=0, severity=severity, filing=OTHER_ID),
+            live_claimant=True,
+            live_claimant_id=LIVE_ID,
+        )
+        assert bucket == 'dead_l0'
+
+    @pytest.mark.parametrize('severity', NON_INFO)
+    def test_live_filing_incarnation_is_a_genuine_handoff(self, severity: str) -> None:
+        """An L0 whose filer IS the live incarnation is a real, live handoff —
+        it pins (queue_handoff is the only pinning bucket)."""
+        bucket = _bucket_of(
+            _rec(level=0, severity=severity, filing=LIVE_ID),
+            live_claimant=True,
+            live_claimant_id=LIVE_ID,
+        )
+        assert bucket == 'queue_handoff'
+
+    @pytest.mark.parametrize(
+        ('filing', 'live_id'),
+        [
+            (None, LIVE_ID),      # record's filing identity unknown
+            ('', LIVE_ID),        # ... blank
+            ('   ', LIVE_ID),     # ... whitespace-only
+            (OTHER_ID, None),     # caller could not resolve the live identity
+            (OTHER_ID, ''),       # ... blank
+            (OTHER_ID, '   '),    # ... whitespace-only
+            (None, None),         # neither side known
+        ],
+    )
+    def test_unknown_identity_on_either_side_fails_safe_to_pinning(
+        self, filing: str | None, live_id: str | None,
+    ) -> None:
+        """The classifier may only convert an L0 when it can PROVE the filing
+        incarnation is dead. It cannot here, so it pins.
+
+        This is the branch that governs TODAY: until a producer stamps
+        filing_claimant_run_id, every real record carries None — so the
+        widening cannot by itself change any disposition."""
+        bucket = _bucket_of(
+            _rec(level=0, severity='blocking', filing=filing),
+            live_claimant=True,
+            live_claimant_id=live_id,
+        )
+        assert bucket == 'queue_handoff', 'must never convert on unprovable liveness'
+
+    def test_identities_are_compared_as_exact_strings(self) -> None:
+        """Identities differing only in the ``pid=`` suffix are DIFFERENT
+        incarnations — shared.task_claimant ships a composer and deliberately
+        no parser, so the classifier never decomposes the triple."""
+        bucket = _bucket_of(
+            _rec(level=0, severity='blocking', filing='run-A/sess-A/pid=1'),
+            live_claimant=True,
+            live_claimant_id='run-A/sess-A/pid=2',
+        )
+        assert bucket == 'dead_l0'
