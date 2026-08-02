@@ -611,6 +611,35 @@ class Mem0Backend:
         ]
         return qmodels.Filter(must=must)
 
+    def _normalise_point(self, point: Any, *, with_vectors: bool) -> dict[str, Any]:
+        """Normalise one raw Qdrant point into the standard record dict.
+
+        THE single home for this shape (INV-5), shared by the list-returning
+        :meth:`scroll_by_metadata` and the streaming
+        :meth:`scroll_all_by_metadata` so the two APIs cannot drift in what a
+        record looks like — a caller migrating between them must see
+        byte-identical dicts.
+
+        Returns ``{'id', 'created_at', 'metadata'}`` where ``created_at`` is
+        the raw string from the payload (or ``None`` if absent) and
+        ``metadata`` is the full payload dict.  When *with_vectors* is True
+        the record additionally carries ``'vector'``; that key is absent
+        entirely when False.
+        """
+        payload: dict[str, Any] = dict(point.payload) if point.payload else {}
+        record: dict[str, Any] = {
+            'id': point.id,
+            'created_at': payload.get('created_at'),
+            'metadata': payload,
+        }
+        if with_vectors:
+            # getattr-with-default, not point.vector: Qdrant can return a
+            # point carrying no vector at all.  Degrade to None so the
+            # caller can count it as a disclosure — raising here would
+            # discard an entire otherwise-good scan over one bad point.
+            record['vector'] = getattr(point, 'vector', None)
+        return record
+
     async def count_by_metadata(
         self,
         scope: Scope,
@@ -726,21 +755,7 @@ class Mem0Backend:
             timeout=self._read_timeout,
         )
 
-        result = []
-        for point in points:
-            payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-            record: dict[str, Any] = {
-                'id': point.id,
-                'created_at': payload.get('created_at'),
-                'metadata': payload,
-            }
-            if with_vectors:
-                # getattr-with-default, not point.vector: Qdrant can return a
-                # point carrying no vector at all.  Degrade to None so the
-                # caller can count it as a disclosure — raising here would
-                # discard an entire otherwise-good scan over one bad point.
-                record['vector'] = getattr(point, 'vector', None)
-            result.append(record)
+        result = [self._normalise_point(point, with_vectors=with_vectors) for point in points]
 
         if len(points) == limit:
             logger.warning(
@@ -1015,6 +1030,75 @@ class Mem0Backend:
                     f'still live — the scan is truncated. Raise max_pages or page_size.',
                 )
             offset = next_offset
+
+    async def scroll_all_by_metadata(
+        self,
+        scope: Scope,
+        filters: dict[str, Any],
+        *,
+        page_size: int = 1000,
+        max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+        with_vectors: bool = False,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream EVERY memory matching *filters*, paging until the match set is exhausted.
+
+        The intended primitive for full-enumeration callers.  Same addressing
+        as :meth:`scroll_by_metadata` (Scope + non-empty equality filters) and
+        the same per-record shape — both normalise through
+        :meth:`_normalise_point` — but this one walks Qdrant's
+        ``next_offset`` to completion instead of returning a single capped
+        page.
+
+        There is deliberately NO ``limit`` and NO truncation warning here:
+        this API does not truncate.  Enumeration is exhaustive, and if the
+        collection is so large that the page budget runs out it RAISES
+        (:class:`ScrollPageBudgetExhausted`) rather than quietly returning a
+        short stream.  ``scroll_by_metadata`` is untouched and keeps its
+        one-shot capped-list semantics for callers that genuinely want a
+        bounded read (``scripts/audit_duplicate_memories.py``).
+
+        Records are yielded one at a time, so a caller folding them into
+        counters (``scripts/census_memory_metadata.py``) holds one page in
+        memory regardless of corpus size.
+
+        Args:
+            scope: Project/agent/session scope — resolves the collection
+                exactly as :meth:`scroll_by_metadata` does.
+            filters: Non-empty dict of key→value equality filters, built into
+                a payload filter by the shared :meth:`_build_payload_filter`
+                so this scroll and :meth:`count_by_metadata` provably select
+                the same points.
+            page_size: Points fetched per Qdrant round-trip.
+            max_pages: Page budget for the whole enumeration.
+            with_vectors: Lift each point's stored vector onto its record.
+
+        Yields:
+            ``{'id', 'created_at', 'metadata'}`` dicts (plus ``'vector'`` when
+            *with_vectors*) — identical in shape to
+            :meth:`scroll_by_metadata`'s list elements.
+
+        Raises:
+            ValueError: If *filters* is empty.
+            ScrollPageBudgetExhausted: If the enumeration is truncated by the
+                page budget.
+            TimeoutError: If a single page exceeds the read timeout —
+                propagated, never swallowed into an empty stream.
+        """
+        if not filters:
+            raise ValueError(
+                'scroll_all_by_metadata requires at least one filter; '
+                'use get_all() to retrieve all memories in the collection',
+            )
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        scroll_filter = self._build_payload_filter(filters)
+        async for point in self.scroll_collection_pages(
+            collection_name,
+            scroll_filter=scroll_filter,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=with_vectors,
+        ):
+            yield self._normalise_point(point, with_vectors=with_vectors)
 
     async def get_point_by_id(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
         """Direct Qdrant point-fetch by id (non-semantic) → raw payload dict, or None.

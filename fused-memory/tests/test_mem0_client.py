@@ -767,8 +767,12 @@ class TestMem0BackendScrollAllByMetadata:
             as_stream = await _drain(backend.scroll_all_by_metadata(scope, filters))
 
         assert as_stream == as_list
+        # 'metadata' is the FULL payload (created_at included); 'created_at'
+        # is lifted out of it as a convenience, not moved.
         assert as_stream[0] == {
-            'id': 'id-1', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {'category': 'x'},
+            'id': 'id-1',
+            'created_at': '2026-01-01T00:00:00+00:00',
+            'metadata': {'category': 'x', 'created_at': '2026-01-01T00:00:00+00:00'},
         }
         assert as_stream[1]['created_at'] is None, 'a payload with no created_at degrades to None'
 
