@@ -77,6 +77,29 @@ production (next point).
    here is PRUNE-to-N."* `scripts/sweep_orphan_flag_markers.py` (task-1659) hit the identical wall
    and also deleted rather than retagged.
 
+   > **Correction (2026-08-02, task 3175 / escalation `esc-3175-1`).** Re-verified against this
+   > repo, this "forced" claim does not hold for either script — the missing in-place-update
+   > primitive was not the actual blocker in either case. For `sweep_orphan_flag_markers.py`:
+   > backfilling the missing `kind` key would restore no capability, because nothing reads these
+   > Mem0 marker records — task 2406 retired the Mem0 marker write path,
+   > `fused-memory/src/fused_memory/reconciliation/flag_dedup.py:127-131` confirms reads in that
+   > module never consult Mem0 and the recon_ledger SQLite table is the sole read source, and the
+   > only live runtime reader of the Mem0 marker population is a reaper that enumerates markers
+   > only to delete them (`_sweep_stale_mem0_flag_markers`,
+   > `reconciliation/stages/task_knowledge_sync.py:1272-1340`). For
+   > `prune_recon_cycle_summaries.py`: backfilling `recon_pool` would make pre-existing piles
+   > visible to standing enforcement's filter (`reconciliation/summary_pool.py:314`), but the
+   > eviction sort key (`summary_pool.py:365-388`) is `(is_ledger_stamp, has_parseable_created_at,
+   > created_at)` ascending with the head deleted, against a cap of 2 hardcoded at
+   > `reconciliation/stages/memory_consolidator.py:83` — a backfilled pre-existing summary sorts to
+   > the head on two counts and is deleted the very next cycle. Preserving `created_at` makes that
+   > outcome *more* certain, not less; retagging there would have been deferred deletion, not a
+   > fix. See task 3175 and `esc-3175-1` for the full evidence trail. This correction does not
+   > reopen the DECISION recorded in §3-§7 of this document (building `update_memory` stands on its
+   > own merits) — it corrects only this specific misattributed justification for it. Amending the
+   > adjudicated decision text itself is task 3055/3088 owner territory; this note is deliberately
+   > additive, not a rewrite.
+
 3. **A working in-place precedent already exists in this repo, and it already solved the hard
    part.** `scripts/tag_cgl_eta_rehome_scope.py` DOES edit Mem0 entries in place, by calling
    `memory.mem0.update` directly (`:44-47`) — because it solved the payload-overwrite trap
@@ -762,6 +785,17 @@ Qdrant.
   whose *absence* forced `prune_recon_cycle_summaries.py` and `sweep_orphan_flag_markers.py` to
   delete rather than retag (§2). Both arms must preserve it; the RED test list in §5(d) makes this
   non-negotiable rather than aspirational.
+
+  > **Correction (2026-08-02, task 3175 / escalation `esc-3175-1`).** The "forced ... to delete
+  > rather than retag" causal claim above does not survive verification for either script — see
+  > the correction note in §2 for the full evidence. In short: `sweep_orphan_flag_markers.py`'s
+  > Mem0 markers have no live reader other than a reaper that deletes them (task 2406 already
+  > retired the Mem0 marker write path), and `prune_recon_cycle_summaries.py`'s eviction sort key
+  > would delete a backfilled pre-existing summary on the very next cycle regardless of whether
+  > `created_at` were preserved. Neither script's actual blocker was the missing in-place-update
+  > primitive. The `created_at`-preservation guarantee remains a real requirement for `update_memory`
+  > on its own merits (§3-§5) — only this specific justification for *why it was "the entire
+  > point"* is wrong and should not be cited as precedent going forward.
 - **INV-5 `no-lockstep-duplication` — the module-location call for `_MEM0_MANAGED_METADATA_KEYS`.**
   §3 deferred *where* the shared extraction lands; deciding it here: **`fused_memory/backends/mem0_client.py`**
   (module-level, alongside `Mem0Backend`), **not** `fused_memory/maintenance/rehome_scope_tag.py`.
