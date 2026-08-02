@@ -18,12 +18,12 @@ A `—` cell is **no measurement**, not a measured zero.
 
 | arm | claim recall@5 | claim recall@10 | canonical in top-5 | median canonical rank | tokens/query | guard candidate present | guard matched (replay) | pin changed window |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| status_quo | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3832.8 | 1.00 | 0.00 | — |
-| status_quo+pin | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3832.8 | 1.00 | 0.00 | 0.00 |
-| c_peers | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1179.3 | 0.93 | 0.00 | — |
-| c_peers+pin | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1179.3 | 0.93 | 0.00 | <0.01 |
-| b_grouped | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1195.2 | 0.93 | 0.00 | — |
-| b_grouped+pin | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1201.5 | 0.93 | 0.00 | 0.06 |
+| status_quo | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3830.3 | 1.00 | 0.00 | — |
+| status_quo+pin | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3830.3 | 1.00 | 0.00 | 0.00 |
+| c_peers | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1180.4 | 0.93 | 0.00 | — |
+| c_peers+pin | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1180.4 | 0.93 | 0.00 | 0.00 |
+| b_grouped | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1195.4 | 0.93 | 0.00 | — |
+| b_grouped+pin | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1202.0 | 0.93 | 0.00 | 0.06 |
 
 Token counts come from the `char-proxy:4-chars-per-token` estimator (recorded because a substituted estimator would otherwise be indistinguishable from a measured one).  Guard threshold: 0.92.  Distractor slab: 300 records, identical in every arm.
 
@@ -32,7 +32,7 @@ Token counts come from the `char-proxy:4-chars-per-token` estimator (recorded be
 3111's topic anchor is ADDITIVE at the search seam (PRD D1): it appends a topic's canonical, it never promotes it over a ranked hit.  Both variants of a shape are scored over a window of the same size, so an additive pin can only pay off where a read-side transform freed a slot in that budget.  Per shape, as measured:
 
 - **`status_quo`** — the pin changed 0.00 of the measured windows; every metric column is unchanged from `status_quo`.
-- **`c_peers`** — the pin changed <0.01 of the measured windows; every metric column is unchanged from `c_peers`.
+- **`c_peers`** — the pin changed 0.00 of the measured windows; every metric column is unchanged from `c_peers`.
 - **`b_grouped`** — the pin changed 0.06 of the measured windows; the `tokens_per_query` column(s) moved.
 
 Read a `+pin` row against `pin changed window`, not against its twin alone.  A rate of exactly `0.00` beside identical columns means the pin never fired — at a full window there is no slot for an appended record — which is a different finding from "the pin does not help".  A rate above zero (including `<0.01`) beside identical columns means it fired and moved nothing these metrics measure.  Either way, a pin that is to pay off under a shape whose window is already full would have to PROMOTE rather than append, and that is a design choice for gate η, not a tuning knob for this experiment.
@@ -67,6 +67,6 @@ The **paraphrase band** is the positive pairs no character-level threshold can r
 | --- | --- |
 | `fused-memory/tests/fixtures/write_triage_calibration.jsonl` | 55e242a2c8681fb8a60fdb34e3d5194109781e87 |
 | `fused-memory/tests/fixtures/memory_eval_topic_registry.json` | 02886ef290cde99ce88426cd1d3b5565a551e293 |
-| `fused-memory/tests/fixtures/e2_arm_claims.jsonl` | f1fe9cf040dca324e3bd8cb4c13bf2e65da02620 |
-| `fused-memory/tests/fixtures/e2_query_set.jsonl` | 9c48f3d10c2ee63aeb54443769903740d931aa4c |
-| `fused-memory/tests/fixtures/e2_distractor_slab.jsonl` | 5c4a617265ae0de673825a5b2b881c45bef976ca |
+| `fused-memory/tests/fixtures/e2_arm_claims.jsonl` | 579ffe356c0290cd20b5c38f08f0d02993e576bc |
+| `fused-memory/tests/fixtures/e2_query_set.jsonl` | 2841700cbed399c45b2e7dcdafc601e6c90f39c8 |
+| `fused-memory/tests/fixtures/e2_distractor_slab.jsonl` | d1d0fffb3f3832a999e155108ffea58686ab06f8 |

@@ -13,15 +13,15 @@
       },
       {
         "path": "fused-memory/tests/fixtures/e2_arm_claims.jsonl",
-        "commit": "f1fe9cf040dca324e3bd8cb4c13bf2e65da02620"
+        "commit": "579ffe356c0290cd20b5c38f08f0d02993e576bc"
       },
       {
         "path": "fused-memory/tests/fixtures/e2_query_set.jsonl",
-        "commit": "9c48f3d10c2ee63aeb54443769903740d931aa4c"
+        "commit": "2841700cbed399c45b2e7dcdafc601e6c90f39c8"
       },
       {
         "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl",
-        "commit": "5c4a617265ae0de673825a5b2b881c45bef976ca"
+        "commit": "d1d0fffb3f3832a999e155108ffea58686ab06f8"
       }
     ],
     "token_estimator": "char-proxy:4-chars-per-token",
@@ -29,7 +29,7 @@
     "distractor_slab_size": 300,
     "embedder_model": "text-embedding-3-small",
     "search_limit": 10,
-    "guard_fetch_limit": 6,
+    "guard_fetch_limit_floor": 6,
     "guard_replay_window": 5,
     "seed_concurrency": 8,
     "clusters_measured": 20,
@@ -49,7 +49,7 @@
       },
       "claim_recall": {
         "at_5": 0.7838983050847458,
-        "at_10": 0.902542372881356
+        "at_10": 0.8983050847457628
       },
       "discoverability": {
         "canonical_in_top_5_rate": 0.538135593220339,
@@ -59,7 +59,7 @@
         "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 3832.8050847457625,
+        "mean": 3830.330508474576,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -79,7 +79,7 @@
       },
       "claim_recall": {
         "at_5": 0.7838983050847458,
-        "at_10": 0.902542372881356
+        "at_10": 0.8983050847457628
       },
       "discoverability": {
         "canonical_in_top_5_rate": 0.538135593220339,
@@ -89,7 +89,7 @@
         "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 3832.8050847457625,
+        "mean": 3830.330508474576,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -119,7 +119,7 @@
         "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 1179.3093220338983,
+        "mean": 1180.3940677966102,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -128,14 +128,14 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.8663155,
+        "max_observed_score": 0.866318,
         "probes": 15
       }
     },
     "c_peers+pin": {
       "pin": {
         "enabled": true,
-        "window_changed_rate": 0.004106776180698152
+        "window_changed_rate": 0.0
       },
       "claim_recall": {
         "at_5": 0.9364406779661016,
@@ -149,7 +149,7 @@
         "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 1179.3093220338983,
+        "mean": 1180.3940677966102,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -158,7 +158,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.8663155,
+        "max_observed_score": 0.866318,
         "probes": 15
       }
     },
@@ -179,7 +179,7 @@
         "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 1195.25,
+        "mean": 1195.4406779661017,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -188,14 +188,14 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.86626136,
+        "max_observed_score": 0.866318,
         "probes": 15
       }
     },
     "b_grouped+pin": {
       "pin": {
         "enabled": true,
-        "window_changed_rate": 0.059548254620123205
+        "window_changed_rate": 0.061601642710472276
       },
       "claim_recall": {
         "at_5": 0.9788135593220338,
@@ -209,7 +209,7 @@
         "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 1201.5296610169491,
+        "mean": 1201.957627118644,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -218,7 +218,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.86626136,
+        "max_observed_score": 0.866318,
         "probes": 15
       }
     }
