@@ -157,6 +157,51 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # file:line — task 3445's explicit correction of the convention task 3350
 # established, after every line pin copied forward had already rotted at HEAD.
 lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
+#
+# WHY NOT skills/orchestrator.yaml (task 3485).
+#
+# Task 3485 was explicitly asked to choose between extending the ruff head
+# above and registering a module config for skills/. It chose the head. The
+# rationale is recorded here because the alternative is the obvious-looking
+# "better" fix and would otherwise be re-proposed on every read.
+#
+# FEASIBLE, BUT NOT SUFFICIENT. _discover_module_configs registers a module
+# iff the directory directly contains an `orchestrator.yaml` carrying at least
+# one overridable field, and it SKIPS prefix == '.'. A skills/orchestrator.yaml
+# (prefix `skills`, depth 1) is well inside the effective lock_depth of 4 — the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml ships
+# lock_depth: 4, layered over the pydantic Field default of 2 — so it would in
+# fact be discovered. But it could never cover conftest.py or
+# df_pytest_isolation.py, which sit at the repo ROOT and are excluded by that
+# same prefix == '.' skip. Widening the head above is therefore REQUIRED
+# regardless; once made, it covers `skills` through the same lever with no
+# routing change at all.
+#
+# WHAT REGISTERING ONE WOULD BUY: a strictly stronger gate. A module config
+# participates in run_full_verification's asyncio.gather over
+# module_configs.values(); this root command does not (see SCOPE HONESTY
+# above).
+#
+# WHAT IT WOULD COST: a TEST-routing change, and a new vacuous gate. Today a
+# skills/-only diff matches no module config, so run_scoped_verification falls
+# through to _build_fallback_config and runs the whole fleet test chain.
+# Registering a module config makes module_configs non-empty, and a config
+# with no test_command yields a ScopeKind.SKIPPED PlannedRun that
+# _run_or_skip_timed turns into a CheckRun.skipped — VACUOUSLY PASSING at
+# rc=0. That closes one vacuous gate by opening another, which is precisely
+# the failure class tasks 3350, 3445 and 3485 exist to prevent. Declaring an
+# honest test_command instead is a separate design question: skills/ has no
+# tests/ directory of its own, and pointing it at tests/scripts/ would
+# replicate the byte-identical duplicate-run cost tests/scripts/
+# orchestrator.yaml already documents about itself.
+#
+# CONCLUSION: widen the root command here; leave skills/orchestrator.yaml to a
+# follow-up that can settle the test-routing question on its own merits. Filed
+# from task 3485 as [tkt_0RS0CK3MYE2HG5H7TDMGQP24QB] — a curator TICKET id,
+# not a task id: the curator runs asynchronously and decides create/combine/
+# drop, so the resulting task number is not knowable at this commit. That
+# follow-up cannot subsume the widening above; do not "consolidate" by
+# removing the non-member targets from the ruff head.
 # The bare ``npx pyright`` spelling is DELIBERATE and safe (task 3367 /
 # esc-3359-1): every ``cd`` target below pins pyright's own interpreter via
 # ``[tool.pyright] venvPath = ".."`` / ``venv = ".venv"`` in its pyproject.toml,
