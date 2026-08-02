@@ -622,6 +622,43 @@ class TestScorePlanStructure:
 
 
 # ---------------------------------------------------------------------------
+# clamp_unit_score — THE single output-range contract for BOTH plan-quality
+# instruments (task 3410)
+#
+# score_plan_structure and judge_plan_quality reduce onto the SAME axis
+# (EvalMetrics.plan_quality), so — exactly as is_scorable_plan (below) is the
+# ONE scorability predicate both instruments call — clamp_unit_score is the
+# ONE range/rounding contract both instruments call. Pinning it directly here
+# is the anti-drift anchor: a future edit to either instrument cannot drift
+# the range behaviour without also breaking this class.
+# ---------------------------------------------------------------------------
+
+class TestClampUnitScore:
+    @pytest.mark.parametrize('score', [0.0, 0.5, 1.0])
+    def test_in_range_values_pass_through_unchanged(self, score):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        assert clamp_unit_score(score) == score
+
+    def test_above_range_clamps_to_the_upper_bound(self):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        assert clamp_unit_score(1.5) == 1.0
+        assert clamp_unit_score(42) == 1.0
+
+    def test_below_range_clamps_to_the_lower_bound(self):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        assert clamp_unit_score(-0.4) == 0.0
+
+    def test_result_is_rounded_to_four_decimal_places(self):
+        from orchestrator.evals.judge import clamp_unit_score
+
+        # Exact — verified by execution, not a tuned tolerance.
+        assert clamp_unit_score(0.123456789) == 0.1235
+
+
+# ---------------------------------------------------------------------------
 # is_scorable_plan — THE single "does this artifact carry model content?" test
 # (3118 step-19/20)
 #
@@ -685,6 +722,31 @@ def _judge_task() -> dict:
         'name': 'implement the widget',
         'task_definition': {'description': 'implement the widget correctly'},
     }
+
+
+def _judge_result_scoring(raw, *, via: str) -> MagicMock:
+    """A judge invoke_agent result reporting ``plan_quality=raw``, delivered via
+    *via* (``'structured_output'`` or ``'json_output'``).
+
+    That delivery choice is the ONLY difference between the two mocks, and it
+    is exactly the difference that makes ``PLAN_QUALITY_SCHEMA``'s
+    ``{'minimum': 0.0, 'maximum': 1.0}`` non-binding: the documented
+    ``result.structured_output or json.loads(result.output)`` fallback in
+    ``judge_plan_quality`` bypasses schema enforcement entirely, so an
+    out-of-range *raw* only reaches the parser unchecked via ``'json_output'``.
+    Range/NaN tests parametrize over both so neither path is assumed
+    equivalent to the other.
+    """
+    payload = {'plan_quality': raw, 'per_criterion': {}, 'reasoning': 'r'}
+    fake = MagicMock()
+    if via == 'structured_output':
+        fake.structured_output = payload
+    elif via == 'json_output':
+        fake.structured_output = None
+    else:
+        raise ValueError(f'unknown via: {via!r}')
+    fake.output = json.dumps(payload)
+    return fake
 
 
 @pytest.mark.asyncio
@@ -821,6 +883,38 @@ class TestJudgePlanQuality:
                 _well_formed_plan(), 'diff', _judge_task(),
             )
         assert verdict.plan_quality is None
+
+    # -- Output-range contract (task 3410) --------------------------------
+    # score_plan_structure has always clamped+rounded to [0, 1]/4dp
+    # (judge.py:396). judge_plan_quality's parse block did not, and
+    # PLAN_QUALITY_SCHEMA's declared bounds only constrain the
+    # structured_output path — the documented ``or json.loads(result.output)``
+    # fallback bypasses schema enforcement entirely. Both delivery paths are
+    # covered so that hole cannot hide behind a structured-output-only test.
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        pytest.param(1.5, 1.0, id='above-range-clamps-high'),
+        pytest.param(42, 1.0, id='far-above-range-clamps-high'),
+        pytest.param(-0.4, 0.0, id='below-range-clamps-low'),
+        pytest.param(0.123456789, 0.1235, id='rounds-to-4dp-parity-with-floor'),
+    ])
+    async def test_parsed_score_is_clamped_and_rounded_regardless_of_delivery_path(
+        self, raw, expected, via,
+    ):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert isinstance(verdict.plan_quality, float)
+        assert 0.0 <= verdict.plan_quality <= 1.0
+        assert verdict.plan_quality == expected
 
 
 # ---------------------------------------------------------------------------
