@@ -13,33 +13,34 @@ then deleted the two Mem0 sweeps (``_sweep_stale_flag_markers``,
 population, since the ledger's own ``gc()`` pass reaps ledger rows directly, leaving
 the pre-2406 Mem0 records with no in-cycle collector. That gap has since been partly
 closed: task 2853 restored an automatic, in-cycle, per-project collector —
-``_sweep_stale_mem0_flag_markers`` (``reconciliation/stages/task_knowledge_sync.py:1272-1340``),
-called unconditionally every cycle at ``:3005`` via the shared
-``_sweep_stale_mem0_pool`` helper (defined at ``:945``; source-only filter at
-``:1053``) — which enumerates on ``{'source': 'stage1_flag_marker'}`` and age-GCs
-at 14 days, for every project, not just ``dark_factory`` (the only project this
-script's own systemd timer targets by default); see that helper's own docstring
-(``:1281-1294``) for the gap it documents closing. The pre-2406 Mem0 records remain
-pure dead weight (nothing reads them — see ``find_stale_markers``/
-``find_terminal_task_markers`` docstrings); they are simply no longer *uncollected*
-dead weight. This script is therefore a manual adjunct to that automatic drain, not
-the only thing standing between the repo and an unbounded pool — it remains useful
-for the targeted predicates the in-cycle drain does not implement (``--delete-ids``,
-``--terminal-drain``) and for the deterministic ``--check --max-backlog`` gate. In
-passing: the in-cycle drain's filter matches on ``source`` alone and never on
-``kind``, so it already collects the task-1659 missing-``kind`` orphans this script's
-``find_orphan_markers`` also targets — one more reason (see "Deletion vs backfill"
-below) that backfilling the missing ``kind`` would not preserve anything a live path
-still needs. This script's ``find_stale_markers`` and ``find_terminal_task_markers``
+``_sweep_stale_mem0_flag_markers`` (``reconciliation/stages/task_knowledge_sync.py``),
+called unconditionally every cycle from ``TaskKnowledgeSync.run()`` via the shared
+``_sweep_stale_mem0_pool`` helper, whose only enumeration filter is ``source`` (no
+``kind`` predicate) — it enumerates on ``{'source': 'stage1_flag_marker'}`` and
+age-GCs at 14 days, for every project, not just ``dark_factory`` (the only project
+this script's own systemd timer targets by default); see
+``_sweep_stale_mem0_flag_markers``'s own docstring for the gap it documents closing.
+The pre-2406 Mem0 records remain pure dead weight (nothing reads them — see
+``find_stale_markers``/``find_terminal_task_markers`` docstrings); they are simply
+no longer *uncollected* dead weight. This script is therefore a manual adjunct to
+that automatic drain, not the only thing standing between the repo and an unbounded
+pool — it remains useful for the targeted predicates the in-cycle drain does not
+implement (``--delete-ids``, ``--terminal-drain``) and for the deterministic
+``--check --max-backlog`` gate. In passing: the in-cycle drain's filter matches on
+``source`` alone and never on ``kind``, so it already collects those task-1659
+missing-``kind`` orphans that are older than 14 days and carry a parseable
+``created_at``; records with a missing or unparseable ``created_at`` are skipped by
+``_sweep_stale_mem0_pool``'s fail-safe KEEP-on-uncertainty age filter (see that
+helper's own docstring) and remain this script's job — one more reason (see
+"Deletion vs backfill" below) that backfilling the missing ``kind`` would not
+preserve anything a live path still needs for the population it does reach. This
+script's ``find_stale_markers`` and ``find_terminal_task_markers``
 restore the retired sweeps' semantics here, as a standalone, deterministic,
 exit-code-driven tool usable as a ``task_kind='deterministic'`` ``before_done.script``
 (see ``backlog_verdict`` / ``--check``).
 
 Original background (task-1659/2108)
 -------------------------------------
-
-Background
-----------
 Prior to task-1659, ``flag_dedup._write_and_confirm_marker`` wrote markers with
 ``metadata.source='stage1_flag_marker'`` but omitted ``metadata.kind``.  Dual-filter
 queries keyed on *both* source and kind silently under-count those markers.  At the
@@ -51,8 +52,8 @@ immediately.  (Task 2406 has since retired the write path Fix (1) touched — se
 Deletion vs backfill
 --------------------
 Mem0/Qdrant now exposes an in-place payload-update primitive: task 3088 shipped
-``MemoryService.update_memory`` (``services/memory_service.py:3947``) over
-``Mem0Backend.set_payload`` (``backends/mem0_client.py:343``), a genuine
+``MemoryService.update_memory`` (``services/memory_service.py``) over
+``Mem0Backend.set_payload`` (``backends/mem0_client.py``), a genuine
 server-side partial merge that preserves the Qdrant point id, ``created_at``,
 and every unnamed sibling key. The old "no payload-update primitive on this
 path" objection no longer applies, so this script's choice to delete rather
@@ -61,12 +62,12 @@ than backfill ``kind`` in place is no longer forced by a missing capability.
 Orphan markers are still deleted, not backfilled, for a stronger reason:
 nothing reads them. Task 2406 retired the Mem0 marker write path —
 ``flag_dedup`` persists markers only to the ``recon_ledger`` SQLite table, and
-its module docstring (``reconciliation/flag_dedup.py:127-131``) states
-plainly: "Reads in this module NEVER consult Mem0 — the ledger is the sole
-read source." The write path is doubly closed too: there is no ``add_memory``
-call left in ``flag_dedup`` for markers, and a server-side gate
-(``server/tools.py:1710-1725``) independently rejects any ``recon-stage-*``
-write whose metadata carries ``source`` or ``kind`` equal to
+its module docstring (``reconciliation/flag_dedup.py``) states plainly:
+"Reads in this module NEVER consult Mem0 — the ledger is the sole read
+source." The write path is doubly closed too: there is no ``add_memory``
+call left in ``flag_dedup`` for markers, and the ``add_memory`` MCP tool's
+own server-side gate (``server/tools.py``) independently rejects any
+``recon-stage-*`` write whose metadata carries ``source`` or ``kind`` equal to
 ``'stage1_flag_marker'``. So a backfilled ``kind`` on one of these orphans
 would be consulted by nothing — it would restore zero dedup capability,
 because the population it would join has no live reader left, only a deleter
@@ -129,10 +130,11 @@ from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_i
 # shape any more. ``flag_dedup._write_and_confirm_marker``, the Mem0 writer
 # that used to emit it, was deleted by task 2406. The equivalent payload
 # keys are written today to the recon_ledger row's payload_json by
-# ``flag_dedup.dedup_flags`` instead (``reconciliation/flag_dedup.py:850-851``
-# sets ``source``/``kind``; ``:882`` sets the ledger record's
-# ``record_kind='stage1_flag_marker'``) — that is the live contract now, and
-# it is not reachable from Mem0 at all (see "Task 2596 background" above).
+# ``flag_dedup.dedup_flags`` instead (``reconciliation/flag_dedup.py`` — its
+# ``payload`` dict sets ``source``/``kind``, and the ``ReconLedgerRecord`` it
+# upserts sets ``record_kind='stage1_flag_marker'``) — that is the live
+# contract now, and it is not reachable from Mem0 at all (see "Task 2596
+# background" above).
 # ---------------------------------------------------------------------------
 
 MARKER_SOURCE: str = 'stage1_flag_marker'
