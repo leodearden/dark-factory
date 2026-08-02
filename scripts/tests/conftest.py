@@ -12,9 +12,21 @@ resolve via a bare `import digest` the same way top-level scripts/*.py
 modules do. Without this, scripts/ on sys.path alone only makes
 scripts/legibility/ importable as a namespace package (`import legibility`),
 not its contents as bare top-level names.
+
+Also home to the shared tasks.db test fixtures (`make_tasks_db`,
+`project_root_with_tasks_db`). Each previously existed as three
+near-identical private copies across the sweep-script test files, under
+two different names and with two different return types (task 3336). They are
+real pytest fixtures rather than importable helpers because fixtures
+auto-resolve for every file in this directory, whereas a `from conftest import
+...` spelling is fragile under the repo-wide `--import-mode=importlib` addopts.
 """
+import json
+import sqlite3
 import sys
 from pathlib import Path
+
+import pytest
 
 _SCRIPTS_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -43,3 +55,113 @@ from df_pytest_isolation import (  # noqa: E402
 def pytest_configure(config):
     """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
     reject_unsafe_basetemp(config)
+
+
+# ---------------------------------------------------------------------------
+# Shared tasks.db fixtures (task 3336).
+#
+# _TASKS_SCHEMA mirrors fused-memory's sqlite_task_backend.py _SCHEMA_SQL so
+# tests exercise real column shapes and NOT NULL constraints rather than
+# invented ones. It stays private to `make_tasks_db`, which executes it on
+# every use — that is the executable check, so no test asserts on the literal.
+#
+# The schema is the SUPERSET of what the three sweep-script test files used
+# privately: audit_wiped_metadata_files' copy carries `priority TEXT`, the two
+# scanners' copies do not. A superset is inert for the scanners — neither
+# inserts nor selects priority, and scan_db uses an explicit column list — and
+# required by audit, so one schema serves all three.
+# ---------------------------------------------------------------------------
+
+_TASKS_SCHEMA = """
+CREATE TABLE tasks (
+    tag           TEXT NOT NULL DEFAULT 'master',
+    id            INTEGER NOT NULL,
+    title         TEXT NOT NULL,
+    description   TEXT,
+    details       TEXT,
+    test_strategy TEXT,
+    status        TEXT NOT NULL,
+    priority      TEXT,
+    metadata      TEXT,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (tag, id)
+);
+"""
+
+
+@pytest.fixture
+def make_tasks_db(tmp_path):
+    """Factory: build a temp tasks.db seeded with *rows*, return its Path.
+
+    Each row is a dict of column -> value. ``id`` is required; ``tag``,
+    ``title``, ``status``, ``priority`` and ``updated_at`` (the NOT NULL
+    columns, plus priority) fall back to placeholders, and the nullable
+    columns stay NULL when omitted.
+
+    ``metadata`` is passed through VERBATIM when it is a str or None — so a
+    test can insert deliberately malformed JSON to exercise a decoder's error
+    path — and json-encoded when it is a dict/list.
+
+    *directory* defaults to ``tmp_path``; pass it to seed a db at a
+    project-root-relative location such as ``<root>/.taskmaster/tasks/``.
+    """
+    def _make(rows, name='tasks.db', directory=None):
+        db_path = (Path(directory) if directory is not None else tmp_path) / name
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(_TASKS_SCHEMA)
+            for row in rows:
+                metadata = row.get('metadata')
+                if metadata is not None and not isinstance(metadata, str):
+                    metadata = json.dumps(metadata)
+                conn.execute(
+                    'INSERT INTO tasks (tag, id, title, description, details, '
+                    'test_strategy, status, priority, metadata, updated_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (
+                        row.get('tag', 'master'),
+                        row['id'],
+                        row.get('title', f"task {row['id']}"),
+                        row.get('description'),
+                        row.get('details'),
+                        row.get('test_strategy'),
+                        row.get('status', 'done'),
+                        row.get('priority', 'medium'),
+                        metadata,
+                        row.get('updated_at', '2026-07-30T00:00:00+00:00'),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path
+
+    return _make
+
+
+@pytest.fixture
+def project_root_with_tasks_db():
+    """Factory: create ``<root>/.taskmaster/tasks/tasks.db``, return its Path.
+
+    The file is created empty — callers that need real rows use
+    :func:`make_tasks_db` with ``directory=``.
+
+    Idempotent AND non-destructive: an EXISTING tasks.db is left untouched.
+    Both halves matter. A test may build a root and then re-touch it (hence
+    ``exist_ok=True``), but ``exist_ok`` only makes the *mkdir* idempotent — an
+    unconditional ``write_text('')`` would silently truncate a real database to
+    zero bytes. Since this fixture auto-resolves for every file in
+    ``scripts/tests/``, the natural ordering ``make_tasks_db(rows,
+    directory=root / '.taskmaster' / 'tasks')`` then
+    ``project_root_with_tasks_db(root)`` (reading as "now make this root
+    discoverable") would otherwise blank the seeded rows and leave the
+    downstream assertion passing vacuously.
+    """
+    def _make(root):
+        db = Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True, exist_ok=True)
+        if not db.exists():
+            db.write_text('')
+        return db
+
+    return _make
