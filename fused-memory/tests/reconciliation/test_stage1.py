@@ -4613,3 +4613,173 @@ class TestCuratorGateResolutionSweepGuards:
         assert report.stats.get('curator_gate_resolution_errors') == 0, (
             f'got stats={report.stats!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Stage-1 phantom-citation recurrence, end-to-end through the RRS path
+# (task 2979; reproduces recon finding 171a76e1, run 2026-07-28)
+# ---------------------------------------------------------------------------
+
+
+class TestStage1PhantomCitationRecurrenceRegression:
+    """The exact 171a76e1 shape, driven through MemoryConsolidator.run() with an
+    ACTIVE ReconReportState — the RRS path, not the JSON fallback.
+
+    Finding 171a76e1's prose named three memory ids and its cited_memories
+    carried those three PLUS a fourth (b47ded9b-…) that appeared nowhere in the
+    prose and did not resolve. Task 2978's verification pass was supposed to
+    strip it. It did — but only from the throwaway projection
+    ``get_assembled_report`` builds fresh per finding
+    (``'cited_memories': list(f.cited_memories)``). The authoritative _Finding
+    and its already-persisted SQLite row — written inside the CLI subprocess at
+    add_finding/cite_memory/complete time, strictly BEFORE verification ran —
+    kept the phantom, so the two stores permanently disagreed and a consumer
+    reading recon_report state still saw b47ded9b-….
+
+    This drives the real ordering: the (mocked) subprocess files the finding and
+    its four citations into RRS and completes, THEN BaseStage.run() assembles
+    and verifies. Both halves are asserted — the returned StageReport AND the
+    recon_report state the harness leaves behind.
+    """
+
+    # Stand-ins for the run's real ids, named so the regression stays traceable.
+    _RUN_ID = 'run-171a76e1-recurrence'
+    _CITED_IN_PROSE = (
+        'aaaaaaaa-1111-4111-8111-111111111111',
+        'bbbbbbbb-2222-4222-8222-222222222222',
+        'cccccccc-3333-4333-8333-333333333333',
+    )
+    # The id that appeared in cited_memories but nowhere in the prose, and that
+    # get_memory_by_id cannot resolve.
+    _PHANTOM = 'b47ded9b-4444-4444-8444-444444444444'
+
+    class _CiteTimeMemoryService:
+        """cite_memory's existence check passes for every id (as it did in the
+        real run); the later get_memory_by_id re-resolution is what discovers
+        the phantom — the TOCTOU a cite-time-only check structurally cannot
+        catch."""
+
+        async def get_memory(self, memory_id, project_id, store):
+            return {'category': 'observations_and_summaries', 'agent_id': 'x', 'created_at': 'n'}
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        return ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: 0.0,
+            memory_service=self._CiteTimeMemoryService(),
+        )
+
+    async def _run(self, state):
+        """Drive MemoryConsolidator.run() with *state* active."""
+        from unittest.mock import patch as _patch
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        config = ReconciliationConfig()
+        memory_mock = AsyncMock()
+        memory_mock.get_episodes = AsyncMock(return_value=[])
+        memory_mock.mem0 = AsyncMock()
+        memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
+        memory_mock.get_status = AsyncMock(return_value={})
+
+        async def _resolve(project_id, memory_id):
+            # The three prose-cited ids resolve; the phantom does not.
+            if memory_id in self._CITED_IN_PROSE:
+                return {'id': memory_id, 'content': 'x', 'metadata': {}}
+            return None
+
+        memory_mock.get_memory_by_id = AsyncMock(side_effect=_resolve)
+
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            memory_mock,
+            AsyncMock(),  # taskmaster
+            AsyncMock(),  # journal
+            config,
+            scope=_scope('test_project', '/tmp/test'),
+            recon_report_state=state,
+        )
+        stage.episode_limit = 5
+        stage.memory_limit = 10
+        # Remediation mode: run() early-returns right after super().run(),
+        # isolating this from the full-path filter chain.
+        stage.remediation_findings = [{'description': 'remediation'}]
+
+        async def _fake_cli(**_kwargs):
+            """Stand in for the CLI subprocess: file the finding + its four
+            citations into recon_report state and complete — exactly the writes
+            the real agent makes, all strictly BEFORE verification runs."""
+            finding_id = state.add_finding(
+                run_id=self._RUN_ID,
+                severity='moderate',
+                category='memory_stale',
+                description=(
+                    'Three canonical entries are stale: '
+                    + ', '.join(self._CITED_IN_PROSE)
+                ),
+                suggested_action='refresh them',
+                actionable=True,
+                task_id='42',
+                flag_type='orphaned_knowledge',
+            )['finding_id']
+            for memory_id in (*self._CITED_IN_PROSE, self._PHANTOM):
+                await state.cite_memory(self._RUN_ID, finding_id, memory_id, 'mem0')
+            state.complete(self._RUN_ID, summary='s')
+            return StageResult(report={}, success=True)
+
+        with (
+            _patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(side_effect=_fake_cli),
+            ),
+            _patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id=self._RUN_ID,
+            )
+
+    @pytest.mark.asyncio
+    async def test_phantom_stripped_from_returned_report(self):
+        """The returned StageReport carries only the three resolving ids, names
+        the phantom in citation_failures, and counts 1 dropped / 3 verified."""
+        state = self._make_state()
+        report = await self._run(state)
+
+        finding = report.items_flagged[0]
+        assert [c['memory_id'] for c in finding['cited_memories']] == list(self._CITED_IN_PROSE)
+        assert finding['citation_failures'] == [
+            {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
+        assert report.stats['stage1_phantom_citations_dropped'] == 1
+        assert report.stats['stage1_citations_verified'] == 3
+        assert report.stats['stage1_citation_verification_errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_phantom_also_stripped_from_the_recon_report_state(self):
+        """The SAME correction is visible in the recon_report state the harness
+        leaves behind — not just in the returned StageReport.
+
+        This is the half that was broken: verification mutated only the fresh
+        projection get_assembled_report built, so the authoritative _Finding
+        kept b47ded9b-… and any consumer reading recon_report state still saw
+        the phantom.
+        """
+        state = self._make_state()
+        await self._run(state)
+
+        durable = state.get_findings_for_run(self._RUN_ID)
+        assert len(durable) == 1
+        assert [c['memory_id'] for c in durable[0]['cited_memories']] == list(
+            self._CITED_IN_PROSE
+        ), (
+            'the authoritative _Finding still carries the phantom — verification '
+            'corrected only the throwaway projection'
+        )
+        assert durable[0]['citation_failures'] == [
+            {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
