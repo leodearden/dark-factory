@@ -68,6 +68,7 @@ LIVE_TASK_STATUS_RE = _mod.LIVE_TASK_STATUS_RE
 _LIVE_FIELD_NAMES = _mod._LIVE_FIELD_NAMES
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
+categories_without_own_cutoff = _mod.categories_without_own_cutoff
 fetch_ann_neighbors = _mod.fetch_ann_neighbors
 compute_cluster_metrics = _mod.compute_cluster_metrics
 build_metric_series = _mod.build_metric_series
@@ -2573,6 +2574,77 @@ class TestResolveAnnThreshold:
             assert all(isinstance(v, int) for v in disclosure.values())
 
 
+class TestCategoriesWithoutOwnCutoff:
+    """An operator ``--ann-threshold`` is a RECALL KNOB, never evidence.
+
+    ``resolve_ann_threshold``'s priority-1 branch applies one operator number
+    to EVERY category, so under an override no category is gated by a cutoff
+    measured on its own labeled pairs — including a category that has one in
+    ``t_high_by_category``, whose measured number the override displaced. The
+    two consumers of ``_write_triage_cutoffs`` must agree about what actually
+    gated the sweep, so the evidence predicate has to see the override too.
+    """
+
+    def test_an_override_leaves_every_category_unevidenced(self):
+        """Even a category with its own measured cutoff: the override displaced it."""
+        unevidenced = categories_without_own_cutoff(
+            _config_double(0.42, {_PK: 0.9, _OS: 0.88}),
+            _SWEPT_CATEGORIES,
+            override=0.5,
+        )
+
+        assert unevidenced == frozenset(_SWEPT_CATEGORIES), (
+            'an operator number is weaker evidence than the pooled cutoff, '
+            'which is already fenced — nothing it gates may be deleted'
+        )
+
+    def test_the_predicate_agrees_with_what_actually_gated_the_sweep(self):
+        """The two readers of the same config must not tell different stories."""
+        service = _config_double(0.42, {_PK: 0.9})
+        override = 0.5
+
+        resolved, _disclosure = resolve_ann_threshold(
+            service, override, categories=_SWEPT_CATEGORIES,
+        )
+        unevidenced = categories_without_own_cutoff(
+            service, _SWEPT_CATEGORIES, override=override,
+        )
+
+        assert resolved == dict.fromkeys(_SWEPT_CATEGORIES, 0.5)
+        assert unevidenced == frozenset(resolved), (
+            'every category the override gated is a category no calibration '
+            'measured — the gate and the predicate read one config'
+        )
+
+    def test_a_non_override_leaves_the_config_only_behaviour_intact(self):
+        """None/bool/Mock is not an override there, so it must not fence here.
+
+        ``resolve_ann_threshold`` screens the override through
+        ``_calibrated_float``; a value that fails that screen falls through to
+        the config. Widening this predicate to a bare ``is not None`` would
+        fence every category on a value that never gated anything.
+        """
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        for not_an_override in (None, True, False, MagicMock().unspecced_attr):
+            unevidenced = categories_without_own_cutoff(
+                _config_double(0.42, {_PK: 0.9}),
+                _SWEPT_CATEGORIES,
+                override=not_an_override,
+            )
+
+            assert unevidenced == frozenset({_OS, _PN}), (
+                f'{not_an_override!r} is not an override for the resolver, so '
+                f'it must not be one for the predicate either'
+            )
+
+    def test_the_default_is_still_config_only(self):
+        """Called without an override, the pre-existing behaviour is unchanged."""
+        assert categories_without_own_cutoff(
+            _config_double(0.42, {_PK: 0.9}), _SWEPT_CATEGORIES,
+        ) == frozenset({_OS, _PN})
+
+
 @pytest.mark.asyncio
 class TestFetchAnnNeighbors:
     """query_points once per record, using the record's OWN stored vector."""
@@ -3869,6 +3941,52 @@ class TestRunApplyAnnOnlyClusters:
             t_high_by_category={_PK: 0.9},
         )
         capsys.readouterr()
+
+        assert rc == 0
+        assert service.deleted == ['m2']
+
+    async def test_an_operator_override_forfeits_the_categorys_own_evidence(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Same calibrated fixture, same clique — but --ann-threshold gated it.
+
+        ``--ann-threshold 0.5`` displaces ``t_high_by_category[_PK]`` for every
+        category, so this clique cleared 0.5 — a number no calibration ever
+        measured, and weaker evidence than the pooled cutoff that is already
+        fenced. Report it, withhold it.
+        """
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_PK), self._CLIQUE_HITS, tmp_path,
+            '--ann-threshold', '0.5',
+            t_high_by_category={_PK: 0.9},
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['clusters_total'] == 1, 'still detected and reported'
+        assert plan['delete_candidates'] == ['m2'], 'the report never narrows'
+        assert service.deleted == [], (
+            'an operator recall knob is not per-category evidence'
+        )
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_cutoff_not_evidenced_for_category'
+        )
+        assert rc == 1, 'the pre-existing nothing-applicable guard aborts loudly'
+
+    async def test_a_lexical_span_still_applies_under_an_override(
+        self, monkeypatch, tmp_path,
+    ):
+        """Lexical evidence never depended on the ANN cutoff, overridden or not."""
+        raw = {_PK: [
+            _raw('m1', _VENV_GOTCHA_A, self._OLD, vector=[1.0, 0.0]),
+            _raw('m2', _VENV_GOTCHA_B, self._MID, vector=[0.9, 0.1]),
+        ]}
+        ann_hits = {(1.0, 0.0): [('m2', 0.95)], (0.9, 0.1): [('m1', 0.95)]}
+
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path,
+            '--threshold', '0.75', '--ann-threshold', '0.5',
+            t_high_by_category={_PK: 0.9},
+        )
 
         assert rc == 0
         assert service.deleted == ['m2']
