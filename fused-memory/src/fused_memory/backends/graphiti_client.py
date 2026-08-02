@@ -24,10 +24,12 @@ from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
+from graphiti_core.helpers import validate_group_ids
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
+from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.validation import canonicalize_project_id
@@ -259,7 +261,7 @@ def _normalize_fact_for_grouping(fact: str | None) -> str:
 
 
 class _MultiTenantFalkorDriver(FalkorDriver):
-    """FalkorDriver that suppresses auto-indexing.
+    """FalkorDriver that suppresses auto-indexing and hardens fulltext queries.
 
     Upstream ``__init__`` schedules ``build_indices_and_constraints()``
     against ``_database`` as a fire-and-forget task.  In multi-tenant
@@ -268,12 +270,66 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     CREATE INDEX commands from saturating FalkorDB's single-threaded
     execution.
 
+    ``build_fulltext_query`` is overridden (task 3334) because upstream's
+    assembly emits operands RediSearch cannot parse, which dead-lettered the
+    ``add_episode`` write path — dead-letter 9950, plus an identical 2026-04-02
+    occurrence.  See :mod:`fused_memory.backends.falkor_fulltext` for the root
+    cause and the empirical validation.
+
     ``clone()`` is overridden to return another ``_MultiTenantFalkorDriver``
-    so cloned per-graph drivers also suppress auto-indexing.
+    so cloned per-graph drivers also suppress auto-indexing — and, since task
+    3334, so they inherit the fulltext hardening too.  That matters more than it
+    looks: every per-group driver handed out by ``_driver_for()`` /
+    ``_client_for()`` comes from ``clone()``, including the one behind
+    ``get_relevant_nodes``' per-node dedup query on the ``add_episode`` write
+    path, which is exactly where 9950 originated.  If ``clone()`` ever returns a
+    plain ``FalkorDriver`` again, the hardening silently stops applying
+    everywhere that matters while the unit tests still pass.
     """
 
     async def build_indices_and_constraints(self, delete_existing=False):
         pass
+
+    def build_fulltext_query(
+        self,
+        query: str,
+        group_ids: list[str] | None = None,
+        max_query_length: int = 128,
+    ) -> str:
+        """Assemble a RediSearch fulltext query that the parser will accept.
+
+        Upstream's version emits operands RediSearch cannot parse, which
+        dead-lettered the ``add_episode`` write path (dead-letter 9950, plus an
+        identical 2026-04-02 occurrence).  The reported error —
+        ``Syntax error at offset N near <word>`` — names the token *preceding*
+        the fault, so it reads as a reserved-word collision; it is not one.  See
+        :mod:`fused_memory.backends.falkor_fulltext` for the full root cause.
+
+        CHANGED vs upstream (both only ever *remove* unparseable operands, so
+        recall for every query that already worked is unchanged):
+
+        * tokens containing no alphanumeric character are dropped — they are
+          reduced to nothing by RediSearch's own tokenizer, which leaves the
+          ``|`` union operator with no right-hand operand;
+        * an empty term list short-circuits to ``''`` instead of emitting the
+          equally-unparseable empty operand group ``()``;
+        * ``\\``, ``"`` and ``-`` are escaped inside the ``(@group_id:"...")``
+          filter — upstream's comment claims bare quoting handles hyphens, which
+          was measured false against a live FalkorDB.
+
+        PRESERVED from upstream, deliberately:
+
+        * ``validate_group_ids`` is still called first, so graphiti's fail-fast
+          on invalid group_ids is not silently lost;
+        * ``self.sanitize()`` still does the character-class stripping — only
+          term assembly is replaced, so the rules stay upstream's;
+        * ``STOPWORDS`` is imported rather than re-declared;
+        * the over-length word-count arithmetic, quirks included;
+        * ``''`` as the "no query" sentinel, which every fulltext caller in
+          ``graphiti_core.search.search_utils`` already short-circuits on.
+        """
+        validate_group_ids(group_ids)
+        return build_query(self.sanitize(query), group_ids, max_query_length)
 
     def clone(self, database: str) -> 'GraphDriver':
         if database == self._database:
