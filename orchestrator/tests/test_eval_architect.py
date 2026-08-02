@@ -916,6 +916,59 @@ class TestJudgePlanQuality:
         assert 0.0 <= verdict.plan_quality <= 1.0
         assert verdict.plan_quality == expected
 
+    # -- Loud-over-silent: an out-of-contract answer leaves a WARNING (3410) --
+    # docs/legibility/design-invariants.md loud-over-silent /
+    # structured-facts-at-failure — the same discipline the unjudgeable-
+    # artifact guard's WARNING already follows (judge.py:514).
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    async def test_out_of_range_answer_leaves_exactly_one_warning_naming_it(
+        self, via, caplog,
+    ):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(1.5, via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        warnings = _judge_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'df_task_2605' in warnings[0]   # WHICH cell to go look at
+        assert '1.5' in warnings[0]            # the raw out-of-range value
+        assert '1.0' in warnings[0]            # the substituted value
+
+        # The verdict is otherwise intact: a corrected CONTENT answer, never
+        # an infra refusal (3118 exclusion shape) or a parse failure.
+        assert verdict.plan_quality == 1.0
+        assert verdict.invocation_error is None
+        assert verdict.per_criterion == {}
+        assert verdict.reasoning == 'r'
+
+    async def test_in_range_answer_emits_no_warning(self, caplog):
+        """CONTROL — without this, the warning fires on every judge call and
+        stops meaning anything.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(
+                return_value=_judge_result_scoring(0.83, via='structured_output'),
+            ),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality == 0.83
+        assert _judge_warnings(caplog) == []
+
 
 # ---------------------------------------------------------------------------
 # The plan judge REFUSES an unjudgeable artifact (task 3303)
