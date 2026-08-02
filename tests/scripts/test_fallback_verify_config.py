@@ -664,8 +664,21 @@ class TestRootTypeCheckCommandPyrightInterpreterPinned:
 # still resolves the members that actually carry pyright configs. NOT the
 # authoritative list — same convention as KNOWN_PER_MODULE_CONFIG_NAMES above,
 # so a newly-added workspace member is auto-covered with no edit here.
+#
+# Task 3397: extended from 4 to all 7 members — shared, escalation,
+# orchestrator, fused-memory (pre-existing) plus dashboard, sampler, cockpit,
+# which the task-3397 fan-out confirmed all declare a
+# ``[tool.pyright] venvPath=".." venv=".venv"`` table too.
 KNOWN_PYRIGHT_PINNED_MEMBERS = frozenset(
-    {"shared", "escalation", "orchestrator", "fused-memory"}
+    {
+        "shared",
+        "escalation",
+        "orchestrator",
+        "fused-memory",
+        "dashboard",
+        "sampler",
+        "cockpit",
+    }
 )
 
 
@@ -674,18 +687,30 @@ class TestWorkspacePyrightInterpreterPinned:
 
     Task 3367 / esc-3359-1 — the generalisation of the fleet-chain guard above.
 
-    ``TestRootTypeCheckCommandPyrightInterpreterPinned`` covers only the
-    directories today's ``type_check_command`` happens to ``cd`` into. That is the
-    incident's exact blast radius, but it leaves the hole one config edit away from
-    reopening: ``shared`` and ``escalation`` are type-checked through their own
+    Before task 3397, ``TestRootTypeCheckCommandPyrightInterpreterPinned``
+    covered only the 3 directories ``type_check_command`` happened to ``cd``
+    into, leaving the hole one config edit away from reopening: ``shared`` and
+    ``escalation`` were type-checked only through their own
     ``<sub>/orchestrator.yaml`` ``uv run --project X --directory X pyright``
-    commands, where uv (not ``[tool.pyright]``) currently supplies the interpreter.
-    Adding either to the fleet chain — or dropping the ``uv run --project`` wrapper
-    from their per-module commands — would silently reintroduce ambient resolution.
+    commands, where uv (not ``[tool.pyright]``) supplies the interpreter, and
+    ``sampler``/``cockpit``/``dashboard`` weren't in the fleet chain at all.
+    Task 3397 extended the fleet chain to all 7 workspace members, so today
+    both guards cover the same set in practice.
+
+    This class survives that as more than a near-duplicate: it is
+    CHAIN-INDEPENDENT. It checks every workspace member that declares a
+    ``[tool.pyright]`` table AT ALL — via the fleet chain, a per-module
+    ``orchestrator.yaml``, or a developer running ``npx pyright`` directly in
+    that directory — rather than deriving coverage from walking one
+    particular command string. A future rewrite of ``type_check_command``
+    (e.g. back down to a subset, or into a different shape entirely) would
+    silently narrow ``TestRootTypeCheckCommandPyrightInterpreterPinned``'s
+    coverage without this class noticing, because this class does not read
+    ``type_check_command`` at all.
 
     Members are DISCOVERED at runtime from the root ``pyproject.toml``'s
-    ``[tool.uv.workspace].members``, so a newly-added subproject is covered on day
-    one rather than escaping a hardcoded list.
+    ``[tool.uv.workspace].members``, so a newly-added subproject is covered on
+    day one rather than escaping a hardcoded list.
     """
 
     def _workspace_member_dirs(self) -> list[str]:
