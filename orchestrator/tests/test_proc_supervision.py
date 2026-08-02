@@ -224,6 +224,7 @@ class TestSelfRestartSystemdRunArgv:
         self, tmp_queue_dir: Path,
     ) -> None:
         from orchestrator.proc_supervision import (
+            RP4_ESCALATION_SUBMIT_FAILED_RC,
             EscalationSpec,
             RestartDisposition,
             RestartPlan,
@@ -273,6 +274,13 @@ class TestSelfRestartSystemdRunArgv:
         assert '__rc=$?;' in wrapped
         assert 'if [ "$__rc" -ne 0 ]; then' in wrapped
         assert wrapped.rstrip().endswith('fi; exit "$__rc"')
+        # The submit's OWN rc must be captured and acted on (task 3404). The
+        # `.endswith('fi; exit "$__rc"')` assert above does NOT discriminate
+        # here — the loud shape ends `fi; fi; exit "$__rc"`, so it matches both
+        # it and the old rc-swallowing shape. These two asserts are what catch
+        # a regression back to silently discarding the submit's status.
+        assert '__esc=$?;' in wrapped
+        assert f'exit {RP4_ESCALATION_SUBMIT_FAILED_RC}; fi;' in wrapped
         # on-failure branch carries the escalation-submit argv (RP-4)
         assert '-m escalation submit' in wrapped
         assert '--task task-99' in wrapped
@@ -1119,18 +1127,98 @@ class TestEscalationSpecSubmitArgvExact:
         ]
 
 
+def _write_stub(path: Path, exit_code: int) -> Path:
+    """Write an executable ``#!/bin/sh`` stub that ignores argv and exits *exit_code*."""
+    path.write_text(f'#!/bin/sh\nexit {exit_code}\n')
+    path.chmod(0o755)
+    return path
+
+
+async def _run_rp4_wrapper(
+    *, tmp_path: Path, tmp_queue_dir: Path, monkeypatch, submit_rc: int,
+) -> tuple[int, str]:
+    """Build the REAL RP-4 wrapper, then execute it the way systemd would.
+
+    The payload stub exits 7 and ``sys.executable`` is monkeypatched to a stub
+    interpreter exiting *submit_rc*, so the wrapper's on-failure
+    ``to_submit_argv(sys.executable)`` branch genuinely runs and genuinely
+    succeeds or fails.  This works because
+    ``RestartPlan._execute_detached_systemd_run`` reads ``sys.executable`` at
+    execute() time, so the patch reaches the real production string — no
+    hand-rebuilt wrapper is involved anywhere in this helper.
+
+    Returns ``(returncode, combined_output)`` so assertions can quote what the
+    child actually printed.
+    """
+    import asyncio
+    import sys
+
+    from orchestrator.proc_supervision import EscalationSpec, RestartPlan
+
+    payload = _write_stub(tmp_path / 'payload.sh', 7)
+    monkeypatch.setattr(
+        sys, 'executable', str(_write_stub(tmp_path / 'stub-python', submit_rc)),
+    )
+
+    runner = FakeRunner(returncode=0)
+    plan = RestartPlan(
+        script=payload,
+        args=['--foo'],
+        cwd=tmp_path,
+        target_unit='orch.service',
+        own_unit='orch.service',
+        on_failure_escalation=EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id='task-99',
+            summary='Self-restart fire-time failure',
+        ),
+        verify=None,
+        transient_unit='orch-redeploy-restart-99.service',
+        on_active_secs=10,
+    )
+    await plan.execute(runner=runner)
+    wrapped = runner.calls[0][0][-1]
+
+    proc = await asyncio.create_subprocess_exec(
+        '/bin/sh', '-c', wrapped,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode(errors='replace')
+
+
 @pytest.mark.asyncio
 class TestDetachedWrapperExactnessAndRegistrationFailure:
     """(b) The ``/bin/sh -c`` payload for a detached self-restart is
-    byte-for-byte
-    ``f'{quoted_payload}; __rc=$?; if [ "$__rc" -ne 0 ]; then {quoted_on_failure}; fi; exit "$__rc"'``.
+    byte-for-byte the four-part loud shape (task 3404)::
+
+        {quoted_payload}; __rc=$?;
+        if [ "$__rc" -ne 0 ]; then {quoted_on_failure}; __esc=$?;
+        if [ "$__esc" -ne 0 ]; then echo "RP-4: ..." >&2; exit 97; fi;
+        fi;
+        exit "$__rc"
+
     (c) A non-zero systemd-run registration rc reports REGISTRATION_FAILED —
-    no crash, no false SCHEDULED."""
+    no crash, no false SCHEDULED.
+
+    The byte-exact pin is cheap and guards the systemd / ``/bin/sh -c``
+    contract, but it can only catch a SHAPE change: it is built with the same
+    f-string the production code uses, so a wrapper that is byte-perfect and
+    semantically wrong passes it (which is exactly what happened — the old
+    three-part shape captured ``__rc`` from the payload only and re-exited it,
+    so a failed ``escalation submit`` was swallowed). It is therefore backed
+    by the two BEHAVIOURAL tests below, which execute the real wrapper against
+    a stub interpreter and assert on observed exit codes and stderr."""
 
     async def test_wrapper_payload_is_byte_for_byte(self, tmp_queue_dir: Path) -> None:
         import sys
 
-        from orchestrator.proc_supervision import EscalationSpec, RestartPlan
+        from orchestrator.proc_supervision import (
+            RP4_ESCALATION_SUBMIT_FAILED_RC,
+            EscalationSpec,
+            RestartPlan,
+        )
 
         runner = FakeRunner(returncode=0)
         spec = EscalationSpec(
@@ -1163,10 +1251,71 @@ class TestDetachedWrapperExactnessAndRegistrationFailure:
         )
         expected = (
             f'{quoted_payload}; __rc=$?; '
-            f'if [ "$__rc" -ne 0 ]; then {quoted_on_failure}; fi; '
+            f'if [ "$__rc" -ne 0 ]; then {quoted_on_failure}; __esc=$?; '
+            f'if [ "$__esc" -ne 0 ]; then '
+            f'echo "RP-4: on-failure escalation submit failed '
+            f'rc=$__esc (payload rc=$__rc)" >&2; '
+            f'exit {RP4_ESCALATION_SUBMIT_FAILED_RC}; fi; '
+            f'fi; '
             f'exit "$__rc"'
         )
         assert wrapped == expected
+
+    async def test_wrapper_surfaces_failed_on_failure_submit(
+        self, tmp_path: Path, tmp_queue_dir: Path, monkeypatch,
+    ) -> None:
+        """A FAILING on-failure submit must be loud, not swallowed (task 3404).
+
+        Pre-3404 the wrapper captured ``__rc`` from the payload only and ended
+        in ``exit "$__rc"``, so the submit's own status was read by nothing: a
+        submit that died (service down, bad argv, `escalation` not importable
+        by the named interpreter) was indistinguishable in BOTH exit status and
+        journald from one that filed the L2 successfully.  That is the
+        no-silent-fail-soft violation this pins — and it is the same swallowing
+        that masked this task's own root cause, where an investigation saw
+        ``returncode == 7`` pass while zero escalations had been filed.
+        """
+        from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
+
+        rc, out = await _run_rp4_wrapper(
+            tmp_path=tmp_path,
+            tmp_queue_dir=tmp_queue_dir,
+            monkeypatch=monkeypatch,
+            submit_rc=9,
+        )
+
+        assert rc == RP4_ESCALATION_SUBMIT_FAILED_RC, (
+            f'a failed on-failure submit must exit the reserved '
+            f'{RP4_ESCALATION_SUBMIT_FAILED_RC}, not the payload\'s own code; '
+            f'got {rc}. Child output: {out!r}'
+        )
+        assert 'RP-4' in out, f'missing the RP-4 diagnostic marker: {out!r}'
+        assert 'rc=9' in out, f"missing the submit's own rc: {out!r}"
+        assert 'payload rc=7' in out, f"missing the payload's rc: {out!r}"
+
+    async def test_wrapper_preserves_payload_rc_when_submit_succeeds(
+        self, tmp_path: Path, tmp_queue_dir: Path, monkeypatch,
+    ) -> None:
+        """A SUCCEEDING submit must leave the payload's own rc untouched.
+
+        journald records the transient unit as failed with the RESTART's cause,
+        which is what an operator triaging a failed self-deploy needs; the
+        reserved code is spent only when the submit itself fails.
+        """
+        rc, out = await _run_rp4_wrapper(
+            tmp_path=tmp_path,
+            tmp_queue_dir=tmp_queue_dir,
+            monkeypatch=monkeypatch,
+            submit_rc=0,
+        )
+
+        assert rc == 7, (
+            f"the payload's own exit code must reach journald unchanged when "
+            f'the submit succeeds; got {rc}. Child output: {out!r}'
+        )
+        assert 'RP-4' not in out, (
+            f'no diagnostic must be printed when the submit succeeded: {out!r}'
+        )
 
     async def test_registration_failure_reports_registration_failed(
         self, tmp_queue_dir: Path,
