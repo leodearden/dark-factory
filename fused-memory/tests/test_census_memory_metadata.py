@@ -1109,185 +1109,19 @@ class TestRenderMarkdownDeterminism:
 
 
 # ===========================================================================
-# Tests: scroll_all_payloads
+# Tests: the census's scroll path
+#
+# The paging loop itself no longer lives here. Task 3225 moved it into
+# ``Mem0Backend.scroll_collection_pages`` / ``scroll_all_by_metadata``, and
+# with it the whole contract this section used to assert: multi-page
+# ordering, the exact offset sequence, stop-on-None, page-budget exhaustion
+# and the per-page read bound. Those tests moved to
+# ``tests/test_mem0_client.py::TestMem0BackendScrollCollectionPages`` /
+# ``::TestMem0BackendScrollAllByMetadata`` — coverage follows the code
+# rather than being asserted in two places (INV-5). What remains here is
+# the census's own concern: that it DRIVES that backend generator, with the
+# right scope and filters, and folds what it yields.
 # ===========================================================================
-
-def _record(payload: dict | None) -> MagicMock:
-    """A Qdrant scroll record stand-in (payload only -- id/vector unused)."""
-    record = MagicMock()
-    record.payload = payload
-    return record
-
-
-def _paging_client(pages: list[tuple[list, object]]) -> AsyncMock:
-    """AsyncMock Qdrant client whose scroll() replays a scripted sequence of
-    ``(records, next_offset)`` pairs."""
-    client = AsyncMock()
-    client.scroll = AsyncMock(side_effect=list(pages))
-    return client
-
-
-async def _drain(agen) -> list[dict]:
-    return [payload async for payload in agen]
-
-
-class TestScrollAllPayloads:
-    """Real pagination -- the whole point of this script.
-
-    ``Mem0Backend.scroll_by_metadata`` discards ``next_offset``
-    (mem0_client.py:395) and so re-reads the same head forever; these tests
-    fail any implementation that does the same.
-    """
-
-    @pytest.mark.asyncio
-    async def test_yields_every_payload_across_all_pages_in_order(self):
-        client = _paging_client([
-            ([_record({'n': 1}), _record({'n': 2})], 'off-1'),
-            ([_record({'n': 3})], 'off-2'),
-            ([_record({'n': 4})], None),
-        ])
-        got = await _drain(_mod.scroll_all_payloads(
-            client, 'fused_dark_factory', {'category': OBS}, page_size=2,
-        ))
-        assert got == [{'n': 1}, {'n': 2}, {'n': 3}, {'n': 4}]
-
-    @pytest.mark.asyncio
-    async def test_stops_when_next_offset_is_none(self):
-        client = _paging_client([([_record({'n': 1})], None)])
-        await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
-        assert client.scroll.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_passes_previous_next_offset_on_each_subsequent_call(self):
-        client = _paging_client([
-            ([_record({'n': 1})], 'off-1'),
-            ([_record({'n': 2})], 'off-2'),
-            ([_record({'n': 3})], None),
-        ])
-        await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=1))
-        offsets = [call.kwargs.get('offset') for call in client.scroll.await_args_list]
-        # A non-paging implementation would send offset=None three times and
-        # re-read the same head.
-        assert offsets == [None, 'off-1', 'off-2']
-
-    @pytest.mark.asyncio
-    async def test_requests_payload_and_never_vectors(self):
-        client = _paging_client([([_record({'n': 1})], None)])
-        await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
-        kwargs = client.scroll.await_args_list[0].kwargs
-        assert kwargs['with_payload'] is True
-        assert kwargs.get('with_vectors', False) is False
-        assert kwargs['collection_name'] == 'c'
-        assert kwargs['limit'] == 10
-
-    @pytest.mark.asyncio
-    async def test_filter_is_built_from_the_filters_mapping(self):
-        client = _paging_client([([], None)])
-        await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
-        scroll_filter = client.scroll.await_args_list[0].kwargs['scroll_filter']
-        # Same Filter/FieldCondition/MatchValue construction count_by_metadata
-        # uses (mem0_client.py:386-394), so the cross-check count and the
-        # scroll select identically.
-        assert len(scroll_filter.must) == 1
-        assert scroll_filter.must[0].key == 'category'
-        assert scroll_filter.must[0].match.value == OBS
-
-    @pytest.mark.asyncio
-    async def test_none_payload_yields_an_empty_dict(self):
-        client = _paging_client([([_record(None), _record({'n': 1})], None)])
-        got = await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
-        assert got == [{}, {'n': 1}]
-
-    @pytest.mark.asyncio
-    async def test_empty_collection_yields_nothing(self):
-        client = _paging_client([([], None)])
-        got = await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
-        assert got == []
-
-    @pytest.mark.asyncio
-    async def test_payloads_are_copies_not_live_references(self):
-        payload = {'n': 1}
-        client = _paging_client([([_record(payload)], None)])
-        got = await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
-        got[0]['n'] = 999
-        assert payload == {'n': 1}
-
-
-class TestScrollAllPayloadsBudget:
-    """A truncated stream must raise, never return short (INV-2)."""
-
-    @pytest.mark.asyncio
-    async def test_raises_when_page_budget_exhausted_with_live_next_offset(self):
-        client = _paging_client([
-            ([_record({'n': 1})], 'off-1'),
-            ([_record({'n': 2})], 'off-2'),
-        ])
-        with pytest.raises(_mod.CensusScanIncomplete) as excinfo:
-            await _drain(_mod.scroll_all_payloads(
-                client, 'fused_reify', {'category': OBS}, page_size=1, max_pages=2,
-            ))
-        message = str(excinfo.value)
-        assert 'fused_reify' in message
-        assert 'category' in message
-        assert '2' in message
-
-    @pytest.mark.asyncio
-    async def test_does_not_raise_when_budget_is_exactly_enough(self):
-        client = _paging_client([
-            ([_record({'n': 1})], 'off-1'),
-            ([_record({'n': 2})], None),
-        ])
-        got = await _drain(_mod.scroll_all_payloads(
-            client, 'c', {'category': OBS}, page_size=1, max_pages=2,
-        ))
-        assert got == [{'n': 1}, {'n': 2}]
-
-    @pytest.mark.asyncio
-    async def test_census_scan_incomplete_is_an_exception(self):
-        assert issubclass(_mod.CensusScanIncomplete, Exception)
-
-
-class TestScrollAllPayloadsTimeout:
-    """A wedged connection must fail loudly, not hang the scan.
-
-    Every other Qdrant read on this path bounds itself with the backend's
-    ``_read_timeout`` (mem0_client.py:287, 331, 395). A ~30-round-trip census
-    is the most exposed caller of all: unbounded, a stalled socket produces
-    no artifact and no diagnostic, forever.
-    """
-
-    @pytest.mark.asyncio
-    async def test_a_hung_page_request_raises_instead_of_hanging(self):
-        async def _hang(**kwargs):
-            await asyncio.sleep(3600)
-
-        client = AsyncMock()
-        client.scroll = AsyncMock(side_effect=_hang)
-        with pytest.raises(TimeoutError):
-            await _drain(_mod.scroll_all_payloads(
-                client, 'c', {'category': OBS}, page_size=10, read_timeout=0.01,
-            ))
-
-    @pytest.mark.asyncio
-    async def test_timeout_applies_per_page_not_per_scan(self):
-        # Two quick pages must both complete under a short per-page bound.
-        client = _paging_client([
-            ([_record({'n': 1})], 'off-1'),
-            ([_record({'n': 2})], None),
-        ])
-        got = await _drain(_mod.scroll_all_payloads(
-            client, 'c', {'category': OBS}, page_size=1, read_timeout=5,
-        ))
-        assert got == [{'n': 1}, {'n': 2}]
-
-    @pytest.mark.asyncio
-    async def test_none_disables_the_bound(self):
-        client = _paging_client([([_record({'n': 1})], None)])
-        got = await _drain(_mod.scroll_all_payloads(
-            client, 'c', {'category': OBS}, page_size=1, read_timeout=None,
-        ))
-        assert got == [{'n': 1}]
-
 
 # ===========================================================================
 # Tests: census_project
@@ -1301,31 +1135,34 @@ def _backend(
     *,
     counts_by_category: dict[str, int] | None = None,
     collection_points: int | None = None,
-    page_size_pages: bool = False,
     call_log: list | None = None,
+    scroll_calls: list | None = None,
 ) -> AsyncMock:
-    """Mem0Backend stand-in: count_by_metadata / count / _get_async_qdrant.
+    """Mem0Backend stand-in: count_by_metadata / count / scroll_all_by_metadata.
 
-    The fake Qdrant client dispatches on the scroll filter's ``category``
-    value, returning that category's payloads (one page, or one page per
-    payload when *page_size_pages* is set, to exercise the paging path).
+    ``scroll_all_by_metadata`` is an async generator dispatching on the
+    ``category`` filter and yielding that category's payloads as normalised
+    records.  The offset/next_offset walk this stand-in used to simulate now
+    lives inside the backend (task 3225), so the census sees exactly ONE
+    generator per category no matter how many Qdrant pages back it.
+
+    *scroll_calls* collects ``(scope, filters, kwargs)`` per scroll so tests
+    can assert what the census forwards.
     """
     log = call_log if call_log is not None else []
+    scrolls = scroll_calls if scroll_calls is not None else []
     counts = counts_by_category or {c: len(p) for c, p in payloads_by_category.items()}
 
-    async def _scroll(**kwargs):
-        category = kwargs['scroll_filter'].must[0].match.value
+    async def _scroll_all_by_metadata(scope, filters, **kwargs):
+        category = filters['category']
         log.append(('scroll', category))
-        payloads = payloads_by_category.get(category, [])
-        if not page_size_pages or len(payloads) <= 1:
-            return ([_record(p) for p in payloads], None)
-        offset = kwargs.get('offset') or 0
-        index = int(offset)
-        next_offset = index + 1 if index + 1 < len(payloads) else None
-        return ([_record(payloads[index])], next_offset)
-
-    client = AsyncMock()
-    client.scroll = AsyncMock(side_effect=_scroll)
+        scrolls.append((scope, dict(filters), dict(kwargs)))
+        for index, payload in enumerate(payloads_by_category.get(category, [])):
+            yield {
+                'id': f'{category}-{index}',
+                'created_at': payload.get('created_at'),
+                'metadata': dict(payload),
+            }
 
     async def _count_by_metadata(scope, filters):
         category = filters['category']
@@ -1342,9 +1179,88 @@ def _backend(
     backend.config.mem0.collection_prefix = 'fused'
     backend.count_by_metadata = AsyncMock(side_effect=_count_by_metadata)
     backend.count = AsyncMock(return_value=total)
-    backend._get_async_qdrant = AsyncMock(return_value=client)
-    backend._fake_client = client
+    backend.scroll_all_by_metadata = _scroll_all_by_metadata
+    backend._scroll_calls = scrolls
     return backend
+
+
+class TestCensusUsesTheBackendPager:
+    """The census DRIVES ``Mem0Backend.scroll_all_by_metadata``; it owns no loop.
+
+    Task 3225: the script used to re-implement the payload-filter
+    construction and the offset/next_offset walk against a raw async Qdrant
+    client, because the backend structurally could not page.  It can now, so
+    the duplicate is gone.  That matters beyond tidiness — the census
+    reconciles its SCROLL against ``count_by_metadata``'s COUNT to decide
+    ``coverage.complete``, and two independent filter constructions could
+    drift into comparing two different point sets while still reporting
+    complete coverage.
+    """
+
+    @pytest.mark.asyncio
+    async def test_calls_the_backend_generator_once_per_category(self):
+        scrolls: list = []
+        backend = _backend({OBS: [{}], PROC: [{}]}, scroll_calls=scrolls)
+        await _mod.census_project(backend, 'dark_factory', [OBS, PROC])
+        assert [filters for _scope, filters, _kw in scrolls] == [
+            {'category': OBS}, {'category': PROC},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_forwards_page_size_and_max_pages(self):
+        scrolls: list = []
+        backend = _backend({OBS: [{}]}, scroll_calls=scrolls)
+        await _mod.census_project(backend, 'dark_factory', [OBS], page_size=250, max_pages=7)
+        _scope, _filters, kwargs = scrolls[0]
+        assert kwargs['page_size'] == 250
+        assert kwargs['max_pages'] == 7
+
+    @pytest.mark.asyncio
+    async def test_does_not_replumb_a_read_timeout(self):
+        """The per-page read bound is the backend's own concern now.
+
+        Contract moved to test_mem0_client.py::
+        TestMem0BackendScrollCollectionPages::{test_a_hung_page_request_
+        raises_instead_of_hanging, test_timeout_applies_per_page_not_per_scan}.
+        """
+        scrolls: list = []
+        backend = _backend({OBS: [{}]}, scroll_calls=scrolls)
+        backend._read_timeout = 7.5
+        await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert 'read_timeout' not in scrolls[0][2]
+
+    @pytest.mark.asyncio
+    async def test_scroll_and_count_are_given_the_same_scope(self):
+        """Otherwise the reconciliation compares two different collections."""
+        scrolls: list = []
+        backend = _backend({OBS: [{}]}, scroll_calls=scrolls)
+        await _mod.census_project(backend, 'dark_factory', [OBS])
+        scroll_scope = scrolls[0][0]
+        count_scopes = [call.args[0] for call in backend.count_by_metadata.await_args_list]
+        assert count_scopes, 'count_by_metadata must be called with a positional scope'
+        for count_scope in count_scopes:
+            assert count_scope is scroll_scope
+
+    @pytest.mark.asyncio
+    async def test_folds_record_metadata_into_the_category_census(self):
+        """The census reads ``record['metadata']`` — an empty one still counts."""
+        backend = _backend({OBS: [{'kind': 'a'}, {}]}, counts_by_category={OBS: 2})
+        cells, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert cells[OBS].records == 2, 'a record with empty metadata is still a record'
+        assert cells[OBS].kind_counts['a'] == 1
+        assert cells[OBS].kind_missing == 1
+        assert coverage['categories'][OBS]['scrolled'] == 2
+
+    def test_the_duplicated_local_paging_loop_is_gone(self):
+        """``scroll_all_payloads`` no longer exists — one home for the loop."""
+        assert not hasattr(_mod, 'scroll_all_payloads')
+
+    @pytest.mark.asyncio
+    async def test_census_does_not_open_its_own_qdrant_client(self):
+        """No ``backend._get_async_qdrant()`` for scrolling: it goes through the API."""
+        backend = _backend({OBS: [{}]})
+        await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert backend._get_async_qdrant.await_count == 0
 
 
 class TestCensusProjectCells:
@@ -1375,16 +1291,25 @@ class TestCensusProjectCells:
         assert set(cells) == set(ALL_SIX)
 
     @pytest.mark.asyncio
-    async def test_payloads_stream_through_pagination(self):
+    async def test_every_streamed_record_is_folded_however_many_pages_backed_it(self):
+        """The census consumes the generator to exhaustion, not just its head.
+
+        How many Qdrant pages back that stream is the backend's business now
+        (test_mem0_client.py::TestMem0BackendScrollAllByMetadata::
+        test_records_stream_across_page_boundaries_in_order); from here it is
+        one generator, and every record it yields must land in the census.
+        """
+        scrolls: list = []
         backend = _backend(
             {OBS: [{'kind': 'a'}, {'kind': 'b'}, {'kind': 'c'}]},
             counts_by_category={OBS: 3},
-            page_size_pages=True,
+            scroll_calls=scrolls,
         )
         cells, coverage = await _mod.census_project(backend, 'dark_factory', [OBS], page_size=1)
         assert cells[OBS].records == 3
         assert coverage['categories'][OBS]['scrolled'] == 3
-        assert backend._fake_client.scroll.await_count == 3
+        assert len(scrolls) == 1, 'one generator per category — the paging is inside it'
+        assert scrolls[0][2]['page_size'] == 1
 
 
 class TestCensusProjectCorroboration:
@@ -1507,38 +1432,15 @@ class TestCensusProjectCoverage:
         report = _mod.build_report({'dark_factory': {}}, {'dark_factory': coverage}, top_n=50)
         assert report['coverage']['projects']['dark_factory']['uncovered_points'] == 1562
 
-    @pytest.mark.asyncio
-    async def test_passes_the_backends_read_timeout_to_every_scroll(self, monkeypatch):
-        seen: list = []
-
-        async def _fake_scroll(client, collection, filters, page_size=1000,
-                               max_pages=200, read_timeout=None):
-            seen.append(read_timeout)
-            return
-            yield  # pragma: no cover -- makes this an async generator
-
-        monkeypatch.setattr(_mod, 'scroll_all_payloads', _fake_scroll)
-        backend = _backend({OBS: []}, counts_by_category={OBS: 0})
-        backend._read_timeout = 7.5
-        await _mod.census_project(backend, 'dark_factory', [OBS])
-        assert seen == [7.5]
-
-    @pytest.mark.asyncio
-    async def test_non_numeric_read_timeout_degrades_to_unbounded(self, monkeypatch):
-        # A backend stand-in auto-creates _read_timeout as a Mock; passing
-        # that into asyncio.wait_for would TypeError mid-scan.
-        seen: list = []
-
-        async def _fake_scroll(client, collection, filters, page_size=1000,
-                               max_pages=200, read_timeout=None):
-            seen.append(read_timeout)
-            return
-            yield  # pragma: no cover -- makes this an async generator
-
-        monkeypatch.setattr(_mod, 'scroll_all_payloads', _fake_scroll)
-        backend = _backend({OBS: []}, counts_by_category={OBS: 0})
-        await _mod.census_project(backend, 'dark_factory', [OBS])
-        assert seen == [None]
+    # The read-timeout plumbing tests that stood here are gone with the
+    # plumbing: the per-page bound is applied inside
+    # Mem0Backend.scroll_collection_pages, which reads its own
+    # ``_read_timeout``, so the census neither derives nor forwards one.
+    # Contract moved to test_mem0_client.py::
+    # TestMem0BackendScrollCollectionPages::{test_a_hung_page_request_raises_
+    # instead_of_hanging, test_timeout_applies_per_page_not_per_scan}; that
+    # the census does not re-plumb it is asserted by
+    # TestCensusUsesTheBackendPager::test_does_not_replumb_a_read_timeout.
 
     @pytest.mark.asyncio
     async def test_coverage_feeds_build_report_unchanged(self):
