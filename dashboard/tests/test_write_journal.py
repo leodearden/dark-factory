@@ -506,11 +506,11 @@ class TestOperationsBreakdownQueryPlan:
         db_path = tmp_path / 'ops_plan.db'
         since = _seed_ops_breakdown_plan_fixture(db_path)
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            async with conn.execute(
-                f'EXPLAIN QUERY PLAN {OPS_BREAKDOWN_SQL}', (since,),
-            ) as cursor:
-                plan = ' '.join(row[3] for row in await cursor.fetchall())
+        async with (
+            aiosqlite.connect(str(db_path)) as conn,
+            conn.execute(f'EXPLAIN QUERY PLAN {OPS_BREAKDOWN_SQL}', (since,)) as cursor,
+        ):
+            plan = ' '.join(row[3] for row in await cursor.fetchall())
 
         assert 'SEARCH' in plan, f'expected a range seek, got: {plan}'
         assert 'idx_wo_created' in plan, f'expected idx_wo_created in the plan, got: {plan}'

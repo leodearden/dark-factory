@@ -25,6 +25,11 @@ from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
+OPS_BREAKDOWN_SQL = (
+    'SELECT operation, COUNT(*) AS cnt FROM write_ops INDEXED BY idx_wo_created'
+    ' WHERE created_at >= ? GROUP BY operation ORDER BY cnt DESC'
+)
+
 
 async def get_memory_timeseries(
     db: aiosqlite.Connection | None, *, hours: int = 24, now: datetime | None = None,
@@ -105,11 +110,7 @@ async def get_operations_breakdown(
     since = (resolve_now(now) - timedelta(hours=hours)).isoformat()
 
     async def _query(db: aiosqlite.Connection) -> dict:
-        async with db.execute(
-            'SELECT operation, COUNT(*) AS cnt FROM write_ops'
-            ' WHERE created_at >= ? GROUP BY operation ORDER BY cnt DESC',
-            (since,),
-        ) as cursor:
+        async with db.execute(OPS_BREAKDOWN_SQL, (since,)) as cursor:
             rows = await cursor.fetchall()
         return {
             'labels': [r[0] or 'unknown' for r in rows],
