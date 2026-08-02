@@ -24,6 +24,7 @@ from __future__ import annotations
 import pytest
 
 from orchestrator.pytest_markers import (
+    deselecting_expression_for_targets,
     expression_definitely_deselects,
     module_level_marker_names,
     resolve_marker_expression,
@@ -334,3 +335,101 @@ class TestExpressionDefinitelyDeselects:
 
     def test_literal_true_selects_everything(self):
         assert expression_definitely_deselects('True', frozenset()) is False
+
+
+# ---------------------------------------------------------------------------
+# deselecting_expression_for_targets (step-7: RED)
+# ---------------------------------------------------------------------------
+
+_WARM_LANE_PYPROJECT = _pyproject(f'"{_REAL_ADDOPTS}"')
+
+_MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.warm_lane_bash\n\n\ndef test_x():\n    pass\n'  # noqa: E501
+_UNMARKED_SOURCE = 'import pytest\n\n\ndef test_y():\n    pass\n'
+
+
+class _RecordingReader:
+    """A dict-backed ``read_source`` that RECORDS every path it is asked for.
+
+    Mirrors ``verify_plan``'s injected ``worktree_reader`` seam
+    (``Callable[[str], str | None]``) exactly, so no new I/O seam is introduced;
+    the recording is what makes the short-circuit assertable.
+    """
+
+    def __init__(self, contents: dict[str, str]) -> None:
+        self.contents = contents
+        self.paths: list[str] = []
+
+    def __call__(self, path: str) -> str | None:
+        self.paths.append(path)
+        return self.contents.get(path)
+
+
+class TestDeselectingExpressionForTargets:
+    """``deselecting_expression_for_targets(targets, pyproject_text, test_command, read)``.
+
+    Returns the resolved ``-m`` expression when EVERY target is provably fully
+    deselected by it, else None.  It returns the expression rather than a bool
+    so the caller can name it in the operator-facing ``PlannedRun.reason``.
+    """
+
+    def test_all_marked_targets_return_the_expression(self):
+        read = _RecordingReader({'a/test_a.py': _MARKED_SOURCE, 'a/test_b.py': _MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) == 'not warm_lane_bash'
+
+    def test_one_unmarked_target_is_enough_to_refuse(self):
+        """ALL, not ANY — a single selectable target means the run collects."""
+        read = _RecordingReader({'a/test_a.py': _MARKED_SOURCE, 'a/test_b.py': _UNMARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) is None
+
+    def test_a_single_unmarked_target_is_refused(self):
+        read = _RecordingReader({'a/test_b.py': _UNMARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_b.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) is None
+
+    def test_empty_targets_never_widen(self):
+        """An empty target list is NOT vacuously "all deselected"."""
+        read = _RecordingReader({})
+        assert deselecting_expression_for_targets([], _WARM_LANE_PYPROJECT, None, read) is None
+
+    def test_unreadable_target_is_refused(self):
+        """``read_source`` answering None (missing/unreadable) proves nothing."""
+        read = _RecordingReader({})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) is None
+
+    def test_no_marker_expression_anywhere_is_refused(self):
+        read = _RecordingReader({'a/test_a.py': _MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _pyproject('"-n auto -q"'), 'uv run pytest tests/', read,
+        ) is None
+
+    def test_short_circuits_before_reading_any_target(self):
+        """THE COST BOUND.
+
+        With no ``-m`` expression to resolve, not a single target is read — so
+        consulting this from a verify plan costs exactly one pyproject read per
+        ModuleConfig, and zero target reads for every module that declares no
+        marker expression at all.
+        """
+        read = _RecordingReader({'a/test_a.py': _MARKED_SOURCE})
+        result = deselecting_expression_for_targets(
+            ['a/test_a.py'], _pyproject('"-n auto -q"'), 'uv run pytest tests/', read,
+        )
+        assert result is None
+        assert read.paths == []
+
+    def test_a_cli_dash_m_that_reselects_the_bucket_is_refused(self):
+        """Last-wins: the lane's own ``-m warm_lane_bash`` SELECTS the marked target."""
+        read = _RecordingReader({'a/test_a.py': _MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'],
+            _WARM_LANE_PYPROJECT,
+            'uv run pytest tests/ -m warm_lane_bash',
+            read,
+        ) is None
