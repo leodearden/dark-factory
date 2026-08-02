@@ -3254,6 +3254,11 @@ def test_main_reap_decisions_closes_answered_from_archived_escalation(
             project='df',
             escalation_id='esc-resolved',
             state=sr.DecisionState.OPEN,
+            # Queue-less, as this record was before escalations_dir existed
+            # (_make_decision's field map now defaults it to a foreign queue
+            # so the round-trip tests cover it). The queue-scoped variants
+            # live in test_main_reap_decisions_queue_scoping_matrix.
+            escalations_dir='',
         ),
         root=tmp_path,
     )
@@ -3320,6 +3325,247 @@ def test_main_reap_decisions_scopes_to_project(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-other-project'] == sr.DecisionState.OPEN
+
+
+def _two_queues(tmp_path: Path) -> tuple[Path, Path]:
+    """Build the observed two-queue collision on disk (task 3528).
+
+    dark_factory runs TWO escalation queues over ONE ``esc-<taskid>-<n>`` id
+    namespace: the orchestrator's ``data/escalations`` and the reconciliation
+    watcher's ``data/reconciliation/escalations``. Here that is `orch` and
+    `recon`, both holding an *unrelated* escalation that happens to share the
+    id ``esc-3036-1`` -- RESOLVED (archived) in `orch`, still PENDING (queue
+    root) in `recon`, exactly as observed when a blocking recon gate sat
+    invisible in the cockpit for ~7 days.
+
+    Reuses the layout pinned by test_read_escalation_status_reads_queue_root_file
+    / ..._falls_back_to_archive: queue-root file = pending, dated
+    ``archive/YYYY-MM-DD/`` file = resolved.
+    """
+    orch = tmp_path / 'orch'
+    recon = tmp_path / 'recon'
+    orch_archive = orch / 'archive' / '2026-07-26'
+    orch_archive.mkdir(parents=True)
+    recon.mkdir(parents=True)
+    (orch_archive / 'esc-3036-1.json').write_text(json.dumps({'status': 'resolved'}))
+    (recon / 'esc-3036-1.json').write_text(json.dumps({'status': 'pending'}))
+    return orch, recon
+
+
+def test_main_reap_decisions_does_not_close_across_queues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE REGRESSION (task 3528), cases (a) + (d) in ONE reaper run.
+
+    (a) A decision stamped with the `recon` queue must NOT be closed by a
+    reaper scanning the `orch` queue, even though `orch` holds a RESOLVED
+    escalation with the same id -- they are unrelated escalations that merely
+    collide in the shared id namespace. Before this fix the join was scoped
+    on project alone, so this decision closed to ANSWERED and vanished from
+    the cockpit queue while its own escalation was still PENDING.
+
+    (d) In the SAME run, a queue-less (pre-change, escalations_dir='')
+    decision on the SAME escalation id still closes exactly as before -- so
+    one invocation proves the new guard is both blocking (a) and backward-
+    compatible (d), and that the only thing distinguishing them is the queue
+    stamp.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-recon-gate',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(recon),
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-legacy-queueless',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir='',
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-recon-gate'] == sr.DecisionState.OPEN
+    assert listed['dec-legacy-queueless'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_does_not_close_across_queues_mirrored(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (b): the guard is symmetric. A decision stamped with the `orch`
+    queue is equally protected from the recon watcher's reaper, which scans
+    `recon` and finds a RESOLVED escalation of the same id there. Neither
+    watcher is privileged; either one reaping the other's decisions is the
+    same bug.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    recon_archive = recon / 'archive' / '2026-07-26'
+    recon_archive.mkdir(parents=True)
+    (recon_archive / 'esc-mirror.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-orch-gate',
+            project='df',
+            escalation_id='esc-mirror',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(recon)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-orch-gate'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_same_queue_still_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (c): the guard must not over-block. A decision stamped with the
+    SAME queue the reaper is scanning still closes on its escalation's
+    terminal status -- otherwise queue-scoping would quietly turn the reaper
+    into a permanent no-op and every decision would need manual closure.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-orch-same-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-orch-same-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_queue_match_is_spelling_insensitive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (e): the comparison normalizes BOTH sides, rather than doing a raw
+    string compare of whatever each side happened to store.
+
+    The decision here carries a dotted, trailing-slash spelling of the `orch`
+    queue -- what a hand-repaired record, a future writer, or a record
+    migrated between checkouts can hold, since it bypassed write-decision's
+    write-time normalization. A raw compare would treat it as a foreign
+    queue and fail OPEN forever; worse, the same laxness in reverse is how a
+    false NON-match would reintroduce silent divergence between writer and
+    reaper.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    (tmp_path / 'x').mkdir()
+    dotted = str(orch.parent / 'x' / '..' / orch.name) + '/'
+    assert dotted != str(orch)
+    sr.write_decision(
+        _make_decision(
+            id='dec-dotted-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=dotted,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-dotted-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (f): MODE-2 same-subject collapse (task 3528 ADDENDUM, req. (b)).
+
+    Two collision modes must be kept apart. MODE 1 (esc-3036-1, the cases
+    above) is two UNRELATED escalations sharing an id -- cross-queue closing
+    there is a straight bug. MODE 2 (observed: esc-5914-1) is both queues
+    surfacing the SAME underlying human gate; those must collapse to ONE
+    cockpit decision, because a human asked the same question twice is a
+    regression of its own.
+
+    This design satisfies MODE 2 BY CONSTRUCTION: the queue is recorded as a
+    FIELD on the record and the decision id is left untouched, so a second
+    watcher filing the same question lands on the same id. This case passes
+    both before and after the fix by design -- it is the guard that a future
+    refactor to per-queue decision ids ('recon:esc-5914-1' vs
+    'orch:esc-5914-1') would double-file the same question and must not be
+    adopted. Complements test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
+    which pins the same-queue restart case.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    rc1 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'esc-5914-1',
+            '--project',
+            'df',
+            '--text',
+            'Adopt the reify plan?',
+            '--escalation-id',
+            'esc-5914-1',
+            '--escalations-dir',
+            str(orch),
+        ]
+    )
+    rc2 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'esc-5914-1',
+            '--project',
+            'df',
+            '--text',
+            'Adopt the reify plan?',
+            '--escalation-id',
+            'esc-5914-1',
+            '--escalations-dir',
+            str(recon),
+        ]
+    )
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    # The discriminator is a FIELD holding a normalized queue path, never a
+    # namespace prefix baked into the id.
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert 'esc-5914-1' == listed[0].id
 
 
 def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
