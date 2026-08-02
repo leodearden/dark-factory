@@ -3542,9 +3542,12 @@ class TestRepeatedCategoryDoesNotDoubleIngest:
 
 # --- _run wiring doubles -----------------------------------------------------
 
-def _fake_config(t_high: float | None = 0.9):
+def _fake_config(t_high: float | None = 0.9,
+                 t_high_by_category: dict[str, float] | None = None):
     return types.SimpleNamespace(
-        write_triage=types.SimpleNamespace(t_high=t_high),
+        write_triage=types.SimpleNamespace(
+            t_high=t_high, t_high_by_category=t_high_by_category,
+        ),
         mem0=types.SimpleNamespace(collection_prefix='mem0'),
     )
 
@@ -3604,6 +3607,7 @@ class _FakeMemoryService:
 
 
 def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None = 0.9,
+                         t_high_by_category: dict[str, float] | None = None,
                          ann_hits: dict[tuple, list[tuple]] | None = None):
     import fused_memory.config.schema as schema_mod  # noqa: PLC0415
     import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
@@ -3611,7 +3615,10 @@ def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None =
     _FakeMemoryService.instances = []
     _FakeMemoryService.raw_by_category = raw_by_category
     _FakeMemoryService.ann_hits = ann_hits or {}
-    monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', lambda: _fake_config(t_high))
+    monkeypatch.setattr(
+        schema_mod, 'FusedMemoryConfig',
+        lambda: _fake_config(t_high, t_high_by_category),
+    )
     monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
     return _FakeMemoryService
 
@@ -3895,7 +3902,99 @@ class TestRunWiring:
             _ALL_CATEGORIES,
         ), 'the counter is now per swept category — every one of them is disabled'
         assert plan['ann_disclosure']['ann_pooled_fallback_categories'] == 0
+        assert plan['ann_threshold_by_category'] == {}, (
+            'an empty map is how the report says "no category is calibrated" '
+            '— never a null that could read as "not measured"'
+        )
         assert plan['clusters_total'] == 1, 'the lexical path still ran'
+
+    async def test_min_of_the_per_category_cutoffs_is_pushed_down_to_qdrant(
+        self, monkeypatch, tmp_path,
+    ):
+        """The DB-layer floor cannot drop a candidate any category would take.
+
+        Every per-category cutoff is >= the min, so filtering at the min in
+        Qdrant is provably lossless; the authoritative per-category decision
+        happens afterwards in the pure ann_pairs_from_neighbors.
+        """
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', 'x')]},
+            t_high=0.9, t_high_by_category={_PK: 0.95, _OS: 0.8},
+        )
+        await _run(await self._parse(tmp_path))
+        qdrant = _FakeMemoryService.instances[-1].mem0._qdrant
+
+        assert qdrant.calls, 'a record with a vector must be queried'
+        assert all(c['score_threshold'] == 0.8 for c in qdrant.calls), (
+            'the push-down is the MIN of {0.95, 0.8, 0.9 pooled fallback}'
+        )
+
+    async def test_the_mapping_not_the_floor_reaches_the_pure_filter(
+        self, monkeypatch, tmp_path,
+    ):
+        """ann_pairs_from_neighbors must see per-category cutoffs, not the min.
+
+        If the floor reached it instead, every category would silently be
+        gated at the loosest cutoff any other category earned — exactly the
+        cross-category borrowing this task exists to end.
+        """
+        captured = {}
+        real = _mod.ann_pairs_from_neighbors
+
+        def _spy(memories, neighbors, threshold, **kwargs):
+            captured['threshold'] = threshold
+            return real(memories, neighbors, threshold, **kwargs)
+
+        monkeypatch.setattr(_mod, 'ann_pairs_from_neighbors', _spy)
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', 'x')]},
+            t_high=0.9, t_high_by_category={_PK: 0.95},
+        )
+        await _run(await self._parse(tmp_path))
+
+        assert captured['threshold'] == {_PK: 0.95, _OS: 0.9, _PN: 0.9}
+
+    async def test_partial_calibration_still_runs_the_ann_path(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """One calibrated category is enough — the path is not all-or-nothing.
+
+        The uncalibrated categories are absent from the mapping and counted,
+        so their recall loss is legible instead of being papered over with a
+        borrowed number.
+        """
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', 'x')]},
+            t_high=None, t_high_by_category={_PK: 0.9},
+        )
+        await _run(await self._parse(tmp_path))
+        plan = json.loads(capsys.readouterr().out)
+        service = _FakeMemoryService.instances[-1]
+
+        assert service.mem0._qdrant.calls, 'the calibrated category must be queried'
+        assert all(c['with_vectors'] is True for c in service.mem0.scroll_calls), (
+            'at least one resolved category means the vectors are needed'
+        )
+        assert plan['ann_threshold'] == 0.9
+        assert plan['ann_disclosure']['ann_disabled_uncalibrated'] == 2
+
+    async def test_plan_echoes_the_per_category_cutoffs(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """A report reader must see WHICH number gated WHICH category."""
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', 'x')]},
+            t_high=0.9, t_high_by_category={_PK: 0.95},
+        )
+        await _run(await self._parse(tmp_path))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['ann_threshold_by_category'] == {_PK: 0.95, _OS: 0.9, _PN: 0.9}
+        assert plan['ann_threshold'] == 0.9, (
+            'the scalar stays the Qdrant push-down floor, unchanged in meaning '
+            'for every pre-3357 consumer of the report'
+        )
+        assert plan['ann_disclosure']['ann_pooled_fallback_categories'] == 2
 
     async def test_plan_json_is_printed_to_stdout(self, monkeypatch, tmp_path, capsys):
         """3136 consumes stdout; the report contract is unchanged."""
@@ -3925,7 +4024,8 @@ class TestRunWiring:
         ids = {m.metric_id for m in series.metrics}
         assert f'near_duplicate_clusters.{_PK}' in ids
         for key in (*_ANN_DISCLOSURE_KEYS, *_PLAN_DISCLOSURE_KEYS,
-                    'ann_query_errors', 'ann_disabled_uncalibrated'):
+                    'ann_query_errors', 'ann_disabled_uncalibrated',
+                    'ann_pooled_fallback_categories'):
             assert f'{key}.{_GLOBAL_SCOPE}' in ids, f'{key} must be disclosed'
         assert f'scan_truncated.{_PK}' in ids
 
