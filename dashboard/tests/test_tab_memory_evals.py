@@ -879,6 +879,78 @@ def test_every_open_parity_state_shows_the_escalation_affordance(
         )
 
 
+def test_unknown_verdict_is_visibly_unrenderable(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """An unrecognised verdict must not borrow the healthy or the neutral badge.
+
+    Server-side this is a NAMED issue kind: the reader files an
+    `unknown_verdict` issue naming the eval, metric and offending value,
+    precisely so a value outside the closed vocabulary fails toward "something
+    is wrong here".  Letting it fall through to the muted `no verdict` badge
+    both undoes that and asserts something false — there IS a verdict, it is
+    just unreadable, and the two are different facts about the row.
+
+    Contrast `unjudged`, which correctly stays plain and muted: nothing judged
+    that metric at all, so 'no verdict' is exactly true.  The distinction is
+    the point — these must not render alike.
+
+    Asserted over RENDERED OUTPUT (badge class and the label the operator
+    reads), not over comment prose.
+    """
+    from dashboard.data.memory_evals import PARITY_STATES
+
+    code = tab_memory_evals_jsx_code
+    unknown = {s for s in PARITY_STATES if s.startswith('unknown_verdict')}
+    assert unknown, (
+        'no member of memory_evals.PARITY_STATES starts with '
+        '`unknown_verdict` — this assertion would pass vacuously. Re-derive it '
+        'from whatever the producer renamed the out-of-vocabulary state to '
+        'before deleting this guard.'
+    )
+
+    refinement = _extract_const_object(code, 'PARITY_REFINEMENT')
+    plain = _extract_const_object(code, 'PARITY_PLAIN', open_char='[')
+    assert refinement and plain, (
+        'PARITY_REFINEMENT / PARITY_PLAIN must both be declared (see '
+        'test_parity_vocabulary_fully_covered).'
+    )
+    entries = dict(re.findall(r'[\'"]?(\w+)[\'"]?\s*:\s*\{([^{}]*)\}', refinement))
+    declined = set(re.findall(r"'([^']*)'", plain))
+
+    for state in sorted(unknown):
+        assert state not in declined, (
+            f"'{state}' is in PARITY_PLAIN, so it renders as the plain verdict "
+            "badge — 'no verdict', muted. That reports a present-but-unreadable "
+            'verdict as an ABSENT one, which is the same substitution the '
+            'absent-verdict guard exists to prevent, running the other way. '
+            'The producer files a named `unknown_verdict` issue for this; the '
+            'last render step must not quietly undo it.'
+        )
+        assert state in entries, (
+            f"'{state}' has no PARITY_REFINEMENT entry, so it renders through "
+            'the fall-through with nothing marking the verdict as unreadable.'
+        )
+        cls = re.search(r"cls\s*:\s*'([^']*)'", entries[state])
+        assert cls, f"PARITY_REFINEMENT['{state}'] has no `cls` string."
+        assert cls.group(1) not in ('badge ok', 'badge muted'), (
+            f"PARITY_REFINEMENT['{state}'] renders {cls.group(1)!r}. It may "
+            'borrow neither the healthy badge nor the neutral not-measured '
+            'one: the value is present and outside the vocabulary, so the row '
+            'is broken, not fine and not unmeasured.'
+        )
+        suffix = re.search(r"suffix\s*:\s*'([^']*)'", entries[state])
+        assert suffix, f"PARITY_REFINEMENT['{state}'] has no `suffix` string."
+        assert re.search(r'unrecognis|unknown', suffix.group(1), re.IGNORECASE), (
+            f"PARITY_REFINEMENT['{state}'] renders the suffix "
+            f'{suffix.group(1)!r}, which never names the condition. The '
+            "operator sees a badge that says the metric's verdict is something "
+            'other than what it is; the label must say the verdict was not '
+            'recognised, so the row reads as broken rather than as a '
+            'warn-level parity note.'
+        )
+
+
 def test_verdict_badges_driven_by_persisted_verdict(
     tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
