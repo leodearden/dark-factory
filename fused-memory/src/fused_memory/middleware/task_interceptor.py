@@ -4929,11 +4929,25 @@ async def _validate_done_provenance(
         # 'found_on_main' are validated identically; they differ only in
         # audit semantics).  Unknown kinds are rejected by the early-return
         # above, so this check is always reached for any valid kind.
-        ancestor_err = await _verify_commit_on_main(project_root, sha_or_err)
-        if ancestor_err is not None:
+        ancestor_result = await _verify_commit_on_main(project_root, sha_or_err)
+        if ancestor_result is not None:
+            confirmed_off_main, ancestor_detail = ancestor_result
+            # Only rc=1 (git affirmatively determined the SHA is not
+            # reachable from main) means "is not on main". Every other
+            # failure -- a non-1 git error, a timeout, a missing git
+            # binary -- means the check never completed, i.e.
+            # NOT-YET-CONFIRMED, and carries the opposite remedy (fetch /
+            # fix the checkout / retry, not re-derive the SHA). Task 3455:
+            # reporting those under the same "is not on main" wording as
+            # rc=1 is the same class of defect as task 3119's premature
+            # outcome assertions -- don't conflate them.
+            if confirmed_off_main:
+                prefix = 'is not on main'
+            else:
+                prefix = 'could not be confirmed on main'
             return _done_provenance_error(
                 task_id,
-                f'kind={kind!r} but commit {sha_or_err} is not on main: {ancestor_err}.',
+                f'kind={kind!r} but commit {sha_or_err} {prefix}: {ancestor_detail}.',
             ), None
     if note is not None:
         resolved['note'] = note
@@ -4978,10 +4992,20 @@ async def _validate_done_provenance(
     return None, resolved
 
 
-async def _verify_commit_on_main(project_root: str, sha: str) -> str | None:
+async def _verify_commit_on_main(project_root: str, sha: str) -> tuple[bool, str] | None:
     """Verify ``sha`` is reachable from ``main`` via ``merge-base --is-ancestor``.
 
-    Returns None on success (commit is on main), or a reason string on failure.
+    Returns None on success (commit is on main). On failure, returns a
+    ``(confirmed_off_main, detail)`` tuple:
+
+    - ``confirmed_off_main=True`` only for rc=1 — git affirmatively
+      determined ``sha`` is NOT reachable from ``main``. This is the only
+      case that actually means "not on main".
+    - ``confirmed_off_main=False`` for every other failure (a non-1 git
+      error such as an unresolvable ``main`` ref, a timeout, or a missing
+      git binary) — the check never completed, so the caller must treat
+      this as NOT-YET-CONFIRMED rather than a not-on-main verdict.
+
     Used as a backstop for kind="merged" provenance so that a SHA from a
     feature branch cannot pass as a merge commit.
     """
@@ -5001,11 +5025,11 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> str | None:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         except TimeoutError:
             proc.kill()
-            return 'git merge-base timed out'
+            return False, 'git merge-base timed out'
     except FileNotFoundError:
-        return 'git binary not found'
+        return False, 'git binary not found'
     except Exception as e:
-        return f'{type(e).__name__}: {e}'
+        return False, f'{type(e).__name__}: {e}'
 
     # Exit codes from `git merge-base --is-ancestor`:
     #   0 — sha is reachable from main
@@ -5014,9 +5038,9 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> str | None:
     if proc.returncode == 0:
         return None
     if proc.returncode == 1:
-        return 'commit is not an ancestor of main'
+        return True, 'commit is not an ancestor of main'
     msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'merge-base failed'
-    return msg
+    return False, msg
 
 
 async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
