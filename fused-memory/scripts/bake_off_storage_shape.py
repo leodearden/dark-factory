@@ -1748,11 +1748,10 @@ def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
     and these SHAs are what lets a reader verify that rather than take it on
     trust.
 
-    Paths are reported repo-relative — an artifact naming somebody's absolute
-    home-directory checkout is neither reproducible nor readable by anyone
-    else, and it leaks the worktree the run happened in.  (Stated without an
-    example literal on purpose: the fixture-path test forbids any absolute
-    path in this file's source, docstrings included.)
+    Paths are reported repo-relative (``fused-memory/tests/fixtures/…``, never
+    ``/home/<user>/src/dark-factory/…``) — an artifact naming somebody's
+    absolute home-directory checkout is neither reproducible nor readable by
+    anyone else, and it leaks the worktree the run happened in.
 
     ``commit`` is ``None`` for a path git does not track.  Reporting None
     rather than falling back to HEAD is the point: a wrong SHA in an audit

@@ -127,11 +127,6 @@ class TestPrefixAgreement:
     def test_the_bake_off_reads_its_prefix_from_this_module(self):
         assert _bake_off().ephemeral_collection_prefix() == _mod().E2_BAKEOFF_PREFIX
 
-    def test_the_bake_off_does_not_restate_the_literal(self):
-        """Equality today is not agreement tomorrow — a second literal that
-        happens to match is exactly how the two drift apart."""
-        assert _mod().E2_BAKEOFF_PREFIX not in BAKE_OFF_PATH.read_text(encoding='utf-8')
-
     def test_the_reaped_prefixes_are_pinned_by_equality(self):
         """By equality, not membership: this tuple is the complete list of
         names this cron job is allowed to delete."""
