@@ -430,16 +430,7 @@ class TestRunSingleCatchHardCancel:
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
 
         wedged = asyncio.Event()
-
-        async def _wedge_verify() -> WorkflowOutcome:
-            # Entered only after _enter_phase(VERIFY) (workflow.py, just
-            # above the real _verify_debugfix_loop() call) — so by the time
-            # this fires, workflow.machine.state is already VERIFY.
-            wedged.set()
-            await asyncio.sleep(3600)
-            raise AssertionError('unreachable — cancelled before the sleep returns')
-
-        workflow._verify_debugfix_loop = _wedge_verify  # type: ignore[method-assign]
+        workflow._verify_debugfix_loop = _make_wedge(wedged)  # type: ignore[method-assign]
 
         run_task = asyncio.create_task(workflow.run())
         await asyncio.wait_for(wedged.wait(), timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
@@ -449,18 +440,7 @@ class TestRunSingleCatchHardCancel:
         # (mirrors harness.hard_cancel_workflow's task.cancel() on the
         # registered slot task).
         run_task.cancel()
-        done, _pending = await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
-        assert run_task in done, f'run() task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
-
-        assert not run_task.cancelled(), (
-            'CancelledError escaped run() instead of being translated into '
-            'a TerminalReport(outcome=CANCELLED)'
-        )
-        report = run_task.result()
-        assert isinstance(report, TerminalReport)
-        assert report.outcome == WorkflowOutcome.CANCELLED
-        assert workflow.machine.state == WorkflowState.CANCELLED
-        assert report.phase == WorkflowState.CANCELLED
+        report = await _assert_cancel_report(run_task, workflow, WorkflowOutcome.CANCELLED)
 
         # The live scheduler row was claimed 'in-progress' by
         # _setup_worktree_and_artifacts and never advanced (no terminal
