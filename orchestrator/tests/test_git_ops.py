@@ -13812,3 +13812,87 @@ class TestAdvanceMainIndexLockStandoff:
             if lock_path.exists():
                 lock_path.unlink()
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_lock_clearing_during_grace_lets_the_merge_land(
+        self, git_ops: GitOps,
+    ):
+        """The transient case must LAND, not merely be classified.
+
+        Simulates the ordinary docs-direct-commit-on-main: the lock is held
+        when advance_main starts and is released partway through, as the
+        concurrent `git commit --only` finishes its pre-commit hook. Once
+        clear, every downstream step must be byte-identical to today — the
+        park/apply round-trip runs normally and the merge lands.
+
+        Deliberately asserts NO elapsed-wall-clock bound: the contract is
+        "waits until clear, then proceeds", not a latency figure.
+
+        The release is triggered by OBSERVATION COUNT, not by a sleep. A
+        pass-through spy on `_index_lock_state` unlinks the REAL lock file
+        after the gate has observed it held twice, so the waiter is proven
+        to have looped at least once and the test cannot flake on how long
+        advance_main's preamble happens to take. Everything the spy reports
+        is the real on-disk state; only the moment of the (real) unlink is
+        made deterministic.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-clears', 'lock_clears.py',
+        )
+
+        wip = '# WIP that must survive the stand-off\n'
+        (git_ops.project_root / 'README.md').write_text(wip)
+
+        git_ops.config.merge_park_lock_grace_seconds = 5
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+
+        original_state = git_ops._index_lock_state
+        observations: list[bool] = []
+
+        async def spy_index_lock_state():
+            present, age = await original_state()
+            observations.append(present)
+            # Release on the 2nd held observation: the waiter has polled at
+            # least once, so this genuinely exercises the wait loop.
+            if present and sum(observations) >= 2:
+                with contextlib.suppress(FileNotFoundError):
+                    lock_path.unlink()
+            return (present, age)
+
+        try:
+            with patch.object(
+                git_ops, '_index_lock_state', side_effect=spy_index_lock_state,
+            ):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert sum(observations) >= 2, (
+            'the gate must have observed the lock HELD and then polled again '
+            f'— observations: {observations!r}'
+        )
+
+        # (1) It landed.
+        assert result.result == 'advanced', (
+            'once the foreign lock clears, the advance must proceed exactly '
+            f'as it does today; got {result.result!r}'
+        )
+
+        # (2) main moved to the merge commit.
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_after.strip() == merge_result.merge_commit
+
+        # (3) The park/apply round-trip ran normally — WIP is back.
+        assert (git_ops.project_root / 'README.md').read_text() == wip
+
+        # (4) The park ref was cleaned up.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, f'expected {MERGE_PARK_REF} to be absent after advance'
