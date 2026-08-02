@@ -6897,9 +6897,12 @@ def _group_node_ids_by_subproject(
     *worktree*), sync, never raises on ordinary input. Extracted from
     ``confirm_main_tip_failure_is_real`` so the main-tip-sweep isolated
     pre-filter reuses it rather than the tree gaining a THIRD copy of this
-    block (task 3095; the merge-path copy in
-    ``confirm_merge_verify_flake_suppressible`` takes list-shaped
-    module_configs and is deliberately left alone — filed as a follow-up).
+    block (task 3095). All THREE call sites now share this one implementation
+    — ``confirm_main_tip_failure_is_real``,
+    ``_sweep_failure_reproduces_in_isolation``, and the merge gate
+    ``confirm_merge_verify_flake_suppressible`` (task 3290, which folded in
+    the last inline copy; it passes ``{mc.prefix: mc for mc in
+    module_configs}`` built from its list-shaped parameter).
 
     For each node-id, the file component (``node_id.split('::', 1)[0]``) is
     probed against EVERY discovered subproject — not just the first match —
@@ -7333,10 +7336,15 @@ async def confirm_merge_verify_flake_suppressible(
     infra-sentinel re-run category (``INFRA_TRANSIENT_CATEGORIES`` — never
     trusted as confirmation).
 
-    Node-id -> subproject mapping mirrors ``confirm_main_tip_failure_is_real``
-    but over the GIVEN *module_configs* + *worktree* (the merge tree already on
-    disk), never re-discovered. Empty *module_configs* / files-not-on-disk
-    (unit-test fakes) naturally map nothing -> ``None``, which keeps existing
+    Node-id -> subproject mapping DELEGATES to ``_group_node_ids_by_subproject``
+    over ``{mc.prefix: mc for mc in module_configs}`` — the same shared helper
+    ``confirm_main_tip_failure_is_real`` and the sweep pre-filter use (task
+    3290 retired this call site's inline copy). The list -> dict conversion is
+    order-preserving on a prefix-deduped list, so candidate iteration and
+    first-wins ambiguity resolution are unchanged. The mapping runs over the
+    GIVEN *module_configs* + *worktree* (the merge tree already on disk), never
+    re-discovered. Empty *module_configs* / files-not-on-disk (unit-test fakes)
+    naturally map nothing -> ``None``, which keeps existing
     ``LocalRunner.run_merge_verify`` tests byte-identical.
     """
     try:
@@ -7345,44 +7353,28 @@ async def confirm_merge_verify_flake_suppressible(
             return None
 
         # Map each node-id to its owning subproject over the given
-        # module_configs + the on-disk merge worktree. Any unmapped node-id
-        # fails CLOSED to red (no guessing which subproject a node-id belongs
-        # to). Mirrors confirm_main_tip_failure_is_real's existence mapping:
-        # collect EVERY candidate subproject (not just the first) so a bare
-        # relative path that happens to exist under more than one given
-        # subproject is WARN-flagged rather than silently mis-attributed to
-        # whichever prefix iterates first — which would run the isolated
-        # confirm re-run against the wrong subproject's tests.
+        # module_configs + the on-disk merge worktree, via the SHARED helper
+        # (see its docstring for the probe rules and the ambiguity WARNING).
+        # mc_by_prefix is the single source for both the helper argument and
+        # the per-group lookup below.
         mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
-        groups: dict[str, list[str]] = {}
-        for node_id in node_ids:
-            file_part = node_id.split('::', 1)[0]
-            candidates: list[tuple[str, str]] = []
-            for mc in module_configs:
-                prefix = mc.prefix
-                if (worktree / prefix / file_part).exists():
-                    candidates.append((prefix, f'{prefix}/{node_id}'))
-                elif file_part.startswith(f'{prefix}/') and (worktree / file_part).exists():
-                    candidates.append((prefix, node_id))
-            if not candidates:
-                logger.info(
-                    'confirm_merge_verify_flake_suppressible: node-id %r did '
-                    'not map to any given subproject in %s — unconfirmable, '
-                    'not suppressing',
-                    node_id, worktree,
-                )
-                return None
-            if len(candidates) > 1:
-                logger.warning(
-                    'confirm_merge_verify_flake_suppressible: node-id %r matched '
-                    '%d given subprojects (%s) in %s — using %r; a relative path '
-                    'shared across subprojects can mis-attribute the isolated '
-                    're-run to the wrong ModuleConfig',
-                    node_id, len(candidates), [c[0] for c in candidates],
-                    worktree, candidates[0][0],
-                )
-            matched_prefix, matched_node_id = candidates[0]
-            groups.setdefault(matched_prefix, []).append(matched_node_id)
+        groups = _group_node_ids_by_subproject(
+            worktree, mc_by_prefix, node_ids,
+            log_label='confirm_merge_verify_flake_suppressible',
+        )
+        # `not groups`, NOT `is None`: both sentinels must fail CLOSED. Falling
+        # into the groups.items() loop with an empty dict would exit having run
+        # ZERO isolated re-runs and then `return node_ids` — a full suppression
+        # verdict on zero evidence, letting a genuinely red merge land. Mirrors
+        # the same defensive guard in _sweep_failure_reproduces_in_isolation.
+        if not groups:
+            logger.info(
+                'confirm_merge_verify_flake_suppressible: node-id -> subproject '
+                'mapping yielded nothing usable in %s — unconfirmable, not '
+                'suppressing',
+                worktree,
+            )
+            return None
 
         # Each subproject group gets its own scoped + forced-serial +
         # generous-timeout isolated re-run in the SAME merge worktree. ALL
