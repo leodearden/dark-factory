@@ -6,7 +6,18 @@ const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
+const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+
+// Dot colour per activity pip. activityPips is pure and owns ORDER and
+// zero-suppression; colour is the caller's concern. Each reuses the hue
+// operators already associate with that status elsewhere in this tab
+// (PALETTE aliases `running` to the same hue as `in-progress`).
+const PIP_DOT_COLOR_T = {
+  running: CP_T.accent,
+  blocked: CP_T.bad,
+  'merge-deferred': 'var(--merge-deferred)',
+};
 
 // Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
@@ -712,11 +723,18 @@ function TasksTab({ projectFilter, search }) {
           {projects.map(p => {
             const projTasks = allTasks.filter(t => t.project === p.id);
             const filtered = projTasks.filter(t => statusMatches(t.status) && searchMatches(t));
-            const _fallbackDone = projTasks.filter(t => t.status === 'done').length;
+            // One pass for every header tally. running / blocked / mergeDeferred
+            // are reported SEPARATELY rather than merged into one "N active"
+            // number: only `running` is bounded by max_concurrent_tasks — a
+            // blocked or merge-deferred task holds no agent slot — so the merged
+            // number routinely exceeded the cap and read as a cap breach.
+            // 2026-07-30: dark-factory showed "43 active" against a cap of 24,
+            // reify "50 active" against 48; neither was a real breach.
+            const statusCounts = projectStatusCounts(projTasks);
+            const _fallbackDone = statusCounts.done;
             const counts = {
-              total:    projTasks.length,
-              active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'merge-deferred').length,
-              pending:  projTasks.filter(t => t.status === 'pending').length,
+              // total / running / blocked / mergeDeferred / pending / done
+              ...statusCounts,
               // DONE_COUNTS carries the authoritative full count from the server.
               // The fallback counts only the bounded done rows loaded into ACTIVE_TASKS
               // (≤50 per project). If we hit that cap without a server count, show
@@ -729,7 +747,12 @@ function TasksTab({ projectFilter, search }) {
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
             const summary = (
               <>
-                <span className="pip"><span className="pip-dot" style={{ background: CP_T.accent }}></span>{counts.active} active</span>
+                {activityPips(counts).map(pip => (
+                  <span className="pip" key={pip.key}>
+                    <span className="pip-dot" style={{ background: PIP_DOT_COLOR_T[pip.key] }}></span>
+                    {pip.count} {pip.label}
+                  </span>
+                ))}
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.warn }}></span>{counts.pending} pending</span>
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.ok }}></span>{counts.complete} done</span>
                 <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{filtered.length}/{counts.total} shown</span>
