@@ -358,10 +358,12 @@ callers outside `PROMOTE_ALLOWED` — a header-less `recon-watch/mcp.json`
 session is never identified, so the call goes through and mints a real L2
 file. **It works, and that is exactly the problem:** nothing automated ever
 consumes it. The orchestrator harness supervises `escalation-watcher-auto`
-as its own subprocess and points it only at
-`self.config.escalation.queue_dir`
-(`orchestrator/src/orchestrator/harness.py:9715-9718` — `data/escalations`
-behind 8100/8102); it never opens `data/reconciliation/escalations`. That
+as its own subprocess (`_start_watcher_supervisor`,
+`orchestrator/src/orchestrator/harness.py:10572`), and the rotation prompt
+it builds binds the watched dir to `self.config.escalation.queue_dir`
+(`_run_watcher_rotation`, `harness.py:10618`, queue-dir line at `:10645`
+— `data/escalations` behind 8100/8102); it never opens
+`data/reconciliation/escalations`. That
 does **not** mean the recon queue is invisible to humans — the dashboard's
 Escalations tab does render it, as a read-only `reconciliation` subsection
 built from this same directory (`build_escalation_queues`,
