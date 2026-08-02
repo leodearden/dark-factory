@@ -96,6 +96,16 @@ class TestPinRecordProtocol:
                 f'Escalation must carry {name!r} to satisfy PinRecord'
             )
 
+    def test_escalation_satisfies_pin_record_statically(self) -> None:
+        """The seam is checked by pyright too, not only at runtime — this
+        assignment fails type-check if PinRecord and Escalation ever drift."""
+        esc = Escalation(
+            id='esc-42-1', task_id='42', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+        record: PinRecord = esc
+        assert record.id == 'esc-42-1'
+
 
 class TestPinsModuleExports:
     def test_all_exports_exactly_the_public_surface(self) -> None:

@@ -39,6 +39,8 @@ import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
+from escalation.models import KNOWN_SEVERITIES
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -71,12 +73,28 @@ class PinRecord(Protocol):
     ``filing_claimant_run_id`` carries the FILING incarnation's identity in
     ``shared.task_claimant.compose_claimant_run_id`` format
     (``{run_id}/{session_id}/pid={owner_pid}``); ``None`` means unknown.
+
+    The four members are declared READ-ONLY (property form rather than plain
+    ``id: str`` attributes) because a protocol attribute is writable-invariant:
+    a plain-attribute protocol rejects FROZEN dataclasses, and
+    ``EscalationRef`` — the resolver-side record type this classifier exists to
+    serve — is ``@dataclass(frozen=True)``.  Read-only members accept both
+    frozen and mutable implementations, which is exactly the pairing here
+    (``EscalationRef`` frozen, ``Escalation`` mutable).  The classifier only
+    ever reads, so nothing is given up.
     """
 
-    id: str
-    level: int
-    severity: str
-    filing_claimant_run_id: str | None
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def level(self) -> int: ...
+
+    @property
+    def severity(self) -> str: ...
+
+    @property
+    def filing_claimant_run_id(self) -> str | None: ...
 
 
 @dataclass(frozen=True)
@@ -119,6 +137,56 @@ class PinReport:
         return bool(self.store_unavailable or self.queue_handoff or self.dead_l0)
 
 
+# ---------------------------------------------------------------------------
+# THE precedence chain (spec docs/task-escalation-state-spec.md S6).
+# ONE documented ordering, evaluated top to bottom.  Each link is deliberate;
+# re-ordering them changes dispositions, so change them only with the spec.
+#
+#   1. severity == 'info'                -> NON_PINNING
+#      An info record never pins, at any level, under any liveness.
+#   2. severity not in KNOWN_SEVERITIES  -> QUEUE_HANDOFF   (fail-safe pin)
+#      Missing / blank / out-of-vocabulary severity "fails safe to pinning
+#      (treated as a handoff), never to conversion".  Deliberately ABOVE the
+#      level/L0 links, so an unknown-severity DEAD L0 still pins.
+#   3. level != 0                        -> QUEUE_HANDOFF
+#      L1/L2 are queue-backed handoffs with supervised consumers; written
+#      `!= 0` (not `>= 1`) so a corrupt/out-of-range level fails safe too.
+#   4. level == 0, known non-info severity -> filing-incarnation liveness:
+#        no incarnation live at all         -> DEAD_L0
+#        live, and both identities known and DIFFERENT -> DEAD_L0
+#        live, and identities MATCH         -> QUEUE_HANDOFF
+#        live, either identity unknown      -> QUEUE_HANDOFF (fail-safe pin)
+# ---------------------------------------------------------------------------
+
+
+def _classify_record(
+    record: PinRecord,
+    *,
+    live_claimant: bool,
+    live_claimant_id: str | None,
+) -> PinClass:
+    """Map one open escalation to its :class:`PinClass` (see the chain above)."""
+    # Normalise once. `severity` is read defensively (getattr + str()) because
+    # records arrive from JSON on disk, where the field may be absent or null.
+    sev = str(getattr(record, 'severity', '') or '').strip().lower()
+
+    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.
+    if sev == 'info':
+        return PinClass.NON_PINNING
+
+    # Link 2 — spec S6: an unknown severity "fails safe to pinning (treated as
+    # a handoff), never to conversion".  This link sits ABOVE links 3/4 on
+    # purpose: the "never to conversion" clause is only meaningful if the
+    # fail-safe is evaluated before the L0 branch that produces the
+    # convertible DEAD_L0 class, so an unknown-severity dead L0 STILL pins.
+    if sev not in KNOWN_SEVERITIES:
+        return PinClass.QUEUE_HANDOFF
+
+    # Links 3 and 4 land in step-8; until then every known non-info severity
+    # fails safe to pinning.
+    return PinClass.QUEUE_HANDOFF
+
+
 def classify_pins(
     task_id: str,
     records: Sequence[PinRecord] | None,
@@ -131,4 +199,23 @@ def classify_pins(
     *records* is ``None`` when the escalation store could not be read (no queue
     bound, read failed).  See :class:`PinReport` for the buckets.
     """
-    return PinReport((), (), (), task_id=task_id)
+    if records is None:
+        return PinReport((), (), (), store_unavailable=True, task_id=task_id)
+
+    buckets: dict[PinClass, list[str]] = {
+        PinClass.DEAD_L0: [],
+        PinClass.QUEUE_HANDOFF: [],
+        PinClass.NON_PINNING: [],
+    }
+    for record in records:
+        pin_class = _classify_record(
+            record, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
+        )
+        buckets[pin_class].append(record.id)
+
+    return PinReport(
+        tuple(buckets[PinClass.DEAD_L0]),
+        tuple(buckets[PinClass.QUEUE_HANDOFF]),
+        tuple(buckets[PinClass.NON_PINNING]),
+        task_id=task_id,
+    )
