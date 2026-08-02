@@ -1896,6 +1896,41 @@ def _rank_cell(discoverability: dict[str, Any]) -> str:
     return f'{median} (n={found}/{candidates})'
 
 
+#: Rendered for a pin rate that is real but rounds to zero at 2 decimals.
+#:
+#: `0.00` is the load-bearing value in this column: the artifact's own
+#: reading guide reads it as "the pin NEVER FIRED", which is one of the two
+#: findings the diagnostic exists to separate.  So a rate that fired — 2 of
+#: 487 windows, 0.0041 — must not be allowed to print as that value.  A
+#: distinct token is used rather than more decimals because the reader's
+#: question is categorical ("did it fire at all?"), and `0.00411` invites
+#: reading a magnitude off a number whose only content is "yes, barely".
+_PIN_RATE_UNDERFLOW = '<0.01'
+
+#: Below this, a rate rounds to `0.00` at the table's 2-decimal precision.
+_PIN_RATE_ROUNDS_TO_ZERO = 0.005
+
+
+def _pin_cell(rate: Any) -> str:
+    """The pin diagnostic, where a rounded-down nonzero would be a lie.
+
+    Three outcomes, all distinguishable:
+
+      * ``—``      — the pin was off; the question was never asked.
+      * ``0.00``   — asked, and the pin changed NOTHING.  Exactly zero.
+      * ``<0.01``  — asked, and it fired, on too few windows to round up.
+
+    Reusing :func:`_cell` here collapsed the last two, which made the
+    artifact assert the opposite of what was measured in the one column
+    built to tell them apart.
+    """
+    if rate is None:
+        return _NO_MEASUREMENT
+    if isinstance(rate, (int, float)) and 0 < rate < _PIN_RATE_ROUNDS_TO_ZERO:
+        return _PIN_RATE_UNDERFLOW
+    return _cell(rate)
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     """The operator-facing artifact: prose, decision table, D10, provenance.
 
@@ -1951,7 +1986,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         'left headroom in that budget — under grouping, which collapses the '
         'window.  A `+pin` row identical to its twin at `0.00` means the pin '
         'never fired, which is a different finding from "the pin does not '
-        'help".  `—` on a pin-off row means the question was never asked.',
+        'help".  `<0.01` is a THIRD finding and not a rounded `0.00`: the pin '
+        'fired, on too few windows to round up.  `—` on a pin-off row means '
+        'the question was never asked.',
         '',
         '## Decision table',
         '',
@@ -1971,7 +2008,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             _cell(measurement['tokens_per_query']['mean'], precision=1),
             _cell(guard['candidate_present_rate']),
             _cell(guard['guard_matched_rate']),
-            _cell(measurement['pin']['window_changed_rate']),
+            _pin_cell(measurement['pin']['window_changed_rate']),
         ]) + ' |')
 
     lines += [
@@ -2001,8 +2038,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         rate = on['pin']['window_changed_rate']
         moved = [block for block in pin_blocks if on[block] != off[block]]
         lines.append(
-            f'- **`{shape}`** — the pin changed {_cell(rate)} of the measured '
-            f'windows; '
+            f'- **`{shape}`** — the pin changed {_pin_cell(rate)} of the '
+            f'measured windows; '
             + (
                 f"every metric column is unchanged from `{shape}`."
                 if not moved
@@ -2013,11 +2050,12 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines += [
         '',
         'Read a `+pin` row against `pin changed window`, not against its twin '
-        'alone.  A rate of `0.00` beside identical columns means the pin '
-        'never fired — at a full window there is no slot for an appended '
+        'alone.  A rate of exactly `0.00` beside identical columns means the '
+        'pin never fired — at a full window there is no slot for an appended '
         'record — which is a different finding from "the pin does not help".  '
-        'A rate above zero beside identical columns means it fired and moved '
-        'nothing these metrics measure.  Either way, a pin that is to pay off '
+        'A rate above zero (including `<0.01`) beside identical columns means '
+        'it fired and moved nothing these metrics measure.  Either way, a pin '
+        'that is to pay off '
         'under a shape whose window is already full would have to PROMOTE '
         'rather than append, and that is a design choice for gate η, not a '
         'tuning knob for this experiment.',

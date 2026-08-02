@@ -935,19 +935,36 @@ class TestGroupedReadNeverSuppressesContested:
         assert disputed_hit.content == 'DISPUTED'
 
     def test_a_contested_childs_body_is_not_folded_into_the_group_document(self):
+        """A group must actually FORM, or this asserts nothing.
+
+        A contested child is emitted as itself and deliberately never
+        registered in `group_members`, so a hit list containing only the
+        contested child produces no grouped document at all — and a
+        `if group is not None:` guard around the real assertion would then
+        pass unconditionally, and would keep passing if
+        `_render_grouped_document` began folding contested bodies into the
+        canonical.  That is precisely the esc-5712 silent-resolution failure
+        PRD V2 forbids and this test is named for.  So a NON-contested sibling
+        is seeded alongside, the group's existence is asserted rather than
+        guarded, and the sibling's body is checked present to prove the
+        document was really rendered from its members.
+        """
         mod = _mod()
         parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        plain, _ = _hit('child-a', parent_id=PARENT, kind='amendment',
+                        content='PLAIN')
         disputed, _ = _hit('child-b', parent_id=PARENT, kind='amendment',
                            content='DISPUTED')
-        records_by_id = {PARENT: parent, 'child-b': disputed}
+        records_by_id = {PARENT: parent, 'child-a': plain, 'child-b': disputed}
 
         grouped = mod.apply_grouped_read(
-            [disputed], records_by_id, contested_ids={'child-b'},
+            [plain, disputed], records_by_id, contested_ids={'child-b'},
         )
 
         group = next((r for r in grouped if r.record_id == PARENT), None)
-        if group is not None:
-            assert 'DISPUTED' not in group.content
+        assert group is not None, 'no group formed, so nothing was tested'
+        assert 'PLAIN' in group.content       # the document really was rendered
+        assert 'DISPUTED' not in group.content
 
     def test_a_contested_child_is_the_only_survivor_when_it_is_the_sole_hit(self):
         """Even alone, it must not be replaced by its parent's document —
@@ -2622,6 +2639,41 @@ def _decision_table_rows(rendered: str) -> list[str]:
     return rows
 
 
+class TestPinCellKeepsNeverFiredApartFromBarelyFired:
+    """Three outcomes in one column, and `0.00` is the load-bearing one.
+
+    The reading guide defines `0.00` as "the pin never fired".  Reusing
+    `_cell`'s 2-decimal precision made a rate that DID fire print that value,
+    so the artifact asserted the opposite of the measurement in the one column
+    built to tell the two apart.
+    """
+
+    def test_the_pin_off_row_is_no_measurement_not_a_zero(self):
+        assert _mod()._pin_cell(None) == '—'
+
+    def test_an_exact_zero_still_prints_as_the_never_fired_value(self):
+        """`0.00` must keep meaning what the guide says it means."""
+        assert _mod()._pin_cell(0.0) == '0.00'
+
+    def test_the_committed_runs_underflowing_rate_does_not_print_as_zero(self):
+        """2 of 487 windows — the value that shipped as `0.00`."""
+        mod = _mod()
+
+        assert mod._pin_cell(2 / 487) == '<0.01'
+
+    @pytest.mark.parametrize('rate', [1e-9, 0.0001, 0.004, 0.00499])
+    def test_every_rate_that_rounds_to_zero_is_flagged_instead(self, rate):
+        assert _mod()._pin_cell(rate) == '<0.01'
+
+    @pytest.mark.parametrize('rate,expected', [
+        (0.005, '0.01'),    # the first rate that rounds UP is left alone
+        (0.38, '0.38'),
+        (1.0, '1.00'),
+    ])
+    def test_a_rate_that_survives_rounding_is_untouched(self, rate, expected):
+        assert _mod()._pin_cell(rate) == expected
+
+
 class TestRenderMarkdown:
     """The operator-facing decision table."""
 
@@ -4267,6 +4319,53 @@ class TestCommittedReportMarkdown:
             cells = [cell.strip() for cell in row.strip('|').split('|')]
             arm, pin_cell = cells[0], cells[pin_column]
             assert (pin_cell == '—') is not arm.endswith('+pin'), row
+
+    def test_a_pin_that_fired_never_renders_as_the_never_fired_value(self):
+        """`0.00` in this column is a CLAIM, and the artifact makes it.
+
+        The reading guide reads `0.00` as "the pin never fired" — one of the
+        two findings this diagnostic exists to separate.  A rate of 0.0041 (2
+        of 487 windows) rounded to `0.00` at 2 decimals therefore makes the
+        deliverable state the opposite of what was measured, and steers the
+        gate-η reader to the wrong finding.  Asserted against the COMMITTED
+        pair, because that is the artifact the operator reads.
+        """
+        mod = _mod()
+        report = _committed_report()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        pin_column = mod.DECISION_TABLE_COLUMNS.index('pin changed window')
+
+        by_arm = {}
+        for row in _decision_table_rows(rendered):
+            cells = [cell.strip() for cell in row.strip('|').split('|')]
+            by_arm[cells[0]] = cells[pin_column]
+
+        checked = 0
+        for arm, measurement in report['arms'].items():
+            rate = measurement['pin']['window_changed_rate']
+            if rate is None or rate == 0:
+                continue
+            checked += 1
+            assert by_arm[arm] != '0.00', (
+                f'{arm}: window_changed_rate={rate} rendered as `0.00`, which '
+                f"this artifact's own reading guide defines as \"the pin never "
+                f'fired"'
+            )
+        assert checked, 'no arm fired the pin, so this test asserted nothing'
+
+    def test_the_prose_bullet_agrees_with_the_table_cell(self):
+        """The per-shape bullet restates the rate in words.  It went through
+        the same formatter, so it could contradict the column it summarizes."""
+        mod = _mod()
+        report = _committed_report()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+
+        for shape in mod.ARM_SHAPES:
+            rate = report['arms'][f'{shape}+pin']['pin']['window_changed_rate']
+            assert (
+                f'- **`{shape}`** — the pin changed {mod._pin_cell(rate)} of '
+                f'the measured windows;'
+            ) in rendered
 
     def test_it_renders_byte_identically_from_the_committed_json(self):
         """The markdown is a pure function of the JSON, so the two cannot have

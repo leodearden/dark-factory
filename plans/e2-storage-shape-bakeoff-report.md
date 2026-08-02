@@ -12,7 +12,7 @@ A `—` cell is **no measurement**, not a measured zero.
 
 `median canonical rank` carries its denominator as `(n=found/candidates)`.  The median is over the queries where the canonical surfaced AT ALL, so without that suffix an arm that almost never finds the canonical prints the best rank in the table — scored on the handful of queries where it did.  Rank is measured over the full fetch depth, not the k=5 read window, so "outside top-5" and "absent entirely" stay distinguishable.
 
-`pin changed window` is the diagnostic that makes the `+pin` rows readable.  Every variant is scored over a window of the SAME size (k), so an additive pin can only pay off where a read-side transform left headroom in that budget — under grouping, which collapses the window.  A `+pin` row identical to its twin at `0.00` means the pin never fired, which is a different finding from "the pin does not help".  `—` on a pin-off row means the question was never asked.
+`pin changed window` is the diagnostic that makes the `+pin` rows readable.  Every variant is scored over a window of the SAME size (k), so an additive pin can only pay off where a read-side transform left headroom in that budget — under grouping, which collapses the window.  A `+pin` row identical to its twin at `0.00` means the pin never fired, which is a different finding from "the pin does not help".  `<0.01` is a THIRD finding and not a rounded `0.00`: the pin fired, on too few windows to round up.  `—` on a pin-off row means the question was never asked.
 
 ## Decision table
 
@@ -21,7 +21,7 @@ A `—` cell is **no measurement**, not a measured zero.
 | status_quo | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3832.8 | 1.00 | 0.00 | — |
 | status_quo+pin | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3832.8 | 1.00 | 0.00 | 0.00 |
 | c_peers | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1179.3 | 0.93 | 0.00 | — |
-| c_peers+pin | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1179.3 | 0.93 | 0.00 | 0.00 |
+| c_peers+pin | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1179.3 | 0.93 | 0.00 | <0.01 |
 | b_grouped | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1195.2 | 0.93 | 0.00 | — |
 | b_grouped+pin | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1201.5 | 0.93 | 0.00 | 0.06 |
 
@@ -32,10 +32,10 @@ Token counts come from the `char-proxy:4-chars-per-token` estimator (recorded be
 3111's topic anchor is ADDITIVE at the search seam (PRD D1): it appends a topic's canonical, it never promotes it over a ranked hit.  Both variants of a shape are scored over a window of the same size, so an additive pin can only pay off where a read-side transform freed a slot in that budget.  Per shape, as measured:
 
 - **`status_quo`** — the pin changed 0.00 of the measured windows; every metric column is unchanged from `status_quo`.
-- **`c_peers`** — the pin changed 0.00 of the measured windows; every metric column is unchanged from `c_peers`.
+- **`c_peers`** — the pin changed <0.01 of the measured windows; every metric column is unchanged from `c_peers`.
 - **`b_grouped`** — the pin changed 0.06 of the measured windows; the `tokens_per_query` column(s) moved.
 
-Read a `+pin` row against `pin changed window`, not against its twin alone.  A rate of `0.00` beside identical columns means the pin never fired — at a full window there is no slot for an appended record — which is a different finding from "the pin does not help".  A rate above zero beside identical columns means it fired and moved nothing these metrics measure.  Either way, a pin that is to pay off under a shape whose window is already full would have to PROMOTE rather than append, and that is a design choice for gate η, not a tuning knob for this experiment.
+Read a `+pin` row against `pin changed window`, not against its twin alone.  A rate of exactly `0.00` beside identical columns means the pin never fired — at a full window there is no slot for an appended record — which is a different finding from "the pin does not help".  A rate above zero (including `<0.01`) beside identical columns means it fired and moved nothing these metrics measure.  Either way, a pin that is to pay off under a shape whose window is already full would have to PROMOTE rather than append, and that is a design choice for gate η, not a tuning knob for this experiment.
 
 ## D10 — audit-recall over the labeled fixture
 
