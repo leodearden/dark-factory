@@ -4675,6 +4675,12 @@ _LIVENESS_PLAN_KEYS = frozenset({
     'liveness_snapshot_disclosure',
 })
 
+# Task 3357: the cutoff that authoritatively gated each category, echoed
+# beside the scalar Qdrant floor so a report reader can tell which number
+# gated which category. Kept as its own manifest so the plan's key growth
+# stays attributable to the task that caused it.
+_PER_CATEGORY_PLAN_KEYS = frozenset({'ann_threshold_by_category'})
+
 
 class TestBuildSweepPlanLivenessRecurrences:
     """The third class reaches the plan -- and never reaches a delete."""
@@ -4741,7 +4747,12 @@ class TestBuildSweepPlanLivenessRecurrences:
             threshold=_THRESHOLD,
         )
 
-        assert set(plan) == _PRE_3098_PLAN_KEYS | _LIVENESS_PLAN_KEYS
+        assert set(plan) == (
+            _PRE_3098_PLAN_KEYS | _LIVENESS_PLAN_KEYS | _PER_CATEGORY_PLAN_KEYS
+        )
+        assert plan['ann_threshold_by_category'] == {}, (
+            'a caller that ran no ANN path reports an empty map, not a null'
+        )
         assert plan['clusters_total'] == 1, 'the lexical path is unaffected'
         assert plan['delete_candidates'] == (
             plan['near_duplicate_groups'][0]['delete_candidate_ids']

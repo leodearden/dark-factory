@@ -1251,6 +1251,7 @@ def build_sweep_plan(
     ann_scores: dict[tuple[int, int], float] | None = None,
     ann_disclosure: dict[str, int] | None = None,
     ann_threshold: float | None = None,
+    ann_threshold_by_category: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Orchestrate filtering -> dual-path clustering -> survivor selection -> report.
 
@@ -1281,8 +1282,14 @@ def build_sweep_plan(
             The remap-owned counters in ``_PLAN_DISCLOSURE_KEYS`` are MERGED
             into the echoed copy (the caller's dict is never mutated), so the
             plan carries the ANN path's complete loss accounting.
-        ann_threshold: The ANN cutoff actually in effect, echoed so a reader
-            of the report never has to guess which number produced it.
+        ann_threshold: The scalar ANN cutoff pushed down to Qdrant — the MIN
+            of the per-category cutoffs — echoed so a reader of the report
+            never has to guess which floor produced the candidate set.
+        ann_threshold_by_category: The cutoff that AUTHORITATIVELY gated each
+            category (task 3357), echoed alongside the floor so a reader can
+            tell which number gated which category. An EMPTY mapping says no
+            category was calibrated; ``None`` means the caller ran without
+            the ANN path at all.
 
     Returns:
         JSON-serialisable plan dict. Pre-existing keys keep their exact
@@ -1472,6 +1479,11 @@ def build_sweep_plan(
         'delete_candidates': delete_candidates,
         'threshold': threshold,
         'ann_threshold': ann_threshold,
+        'ann_threshold_by_category': (
+            dict(ann_threshold_by_category)
+            if ann_threshold_by_category is not None
+            else {}
+        ),
         'ann_disclosure': echoed_disclosure,
         'topic_carveout_clusters': len(topic_carveout_groups),
         'topic_carveout_groups': topic_carveout_groups,
@@ -2500,8 +2512,11 @@ async def _run(args: argparse.Namespace) -> int:
                 top_k=args.ann_top_k, score_threshold=ann_threshold,
             )
             disclosures.update(query_disclosure)
+            # The MAPPING, not the floor: the floor only shaped what Qdrant
+            # returned; the cutoff that actually gates a pair is its own
+            # category's.
             ann_pairs, pair_disclosure = ann_pairs_from_neighbors(
-                records, neighbors, ann_threshold, top_k=args.ann_top_k,
+                records, neighbors, ann_thresholds, top_k=args.ann_top_k,
             )
             disclosures.update(pair_disclosure)
             # Scans BOTH endpoints' lists: neighbour lists are asymmetric, so
@@ -2515,6 +2530,7 @@ async def _run(args: argparse.Namespace) -> int:
             records, threshold=args.threshold, categories=categories,
             ann_pairs=ann_pairs, ann_scores=ann_scores,
             ann_disclosure=disclosures, ann_threshold=ann_threshold,
+            ann_threshold_by_category=ann_thresholds,
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
         print(json.dumps(plan, indent=2, default=str))
