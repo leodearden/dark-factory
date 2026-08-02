@@ -2899,6 +2899,64 @@ def test_main_write_decision_severity_defaults_empty(
     assert listed[0].severity == ''
 
 
+def test_main_write_decision_stamps_escalations_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A watcher stamps the queue its --escalation-id belongs to, so the
+    fleet-global decision can later be joined back to the right per-queue
+    escalation-id namespace (task 3528). The verb must store the NORMALIZED
+    form, not the raw argv string: a watcher invoking with a relative/dotted
+    spelling must still match a reaper passing the absolute one.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    recon = tmp_path / 'recon'
+    recon.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'recon') + '/'
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-q',
+            '--project',
+            'df',
+            '--text',
+            'q',
+            '--escalation-id',
+            'esc-1',
+            '--escalations-dir',
+            dotted,
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert Path(listed[0].escalations_dir).is_absolute()
+
+
+def test_main_write_decision_escalations_dir_defaults_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Omitting --escalations-dir yields '' on the filed record: the flag is
+    optional, and a queue-less record keeps today's project-only-scoped
+    reaper behaviour (mirrors --severity's default at
+    test_main_write_decision_severity_defaults_empty).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['write-decision', '--id', 'dec-noq', '--project', 'df', '--text', 'q'])
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].escalations_dir == ''
+
+
 def test_main_write_decision_prints_filed_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
