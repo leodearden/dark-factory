@@ -467,3 +467,297 @@ class TestComputePatchCanonicalAndSupersedes:
 
         assert _mod.normalize_supersedes is memory_metadata.normalize_supersedes
         assert _mod._is_full_uuid is memory_metadata._is_full_uuid
+
+
+# ===========================================================================
+# plan_canonical_clusters — source (1), the live `canonical: true` scroll
+# ===========================================================================
+#
+# Every fixture below is TRANSCRIBED from a live record measured on
+# 2026-08-02 (`get_memories_by_metadata({'canonical': True})`, 1 in
+# dark_factory + 5 in reify).  They are not invented shapes: the point of
+# this source is that the member-bearing keys are heterogeneous in the wild
+# (`consolidates`, `retires`, scalar `replaces`, list `supersedes`, prose
+# `supersedes`), and a planner tested only against a tidy invented shape
+# would miss exactly that.
+
+#: dark_factory 0929cff6 — topic in snake_case, members under `consolidates`.
+LIVE_DF_CANONICAL = {
+    'id': '0929cff6-8efc-4a49-a672-e83f0a41bbfb',
+    'created_at': '2026-07-23T05:40:48.789851+00:00',
+    'metadata': {
+        'topic': 'eval_worktree_plan_tools_missing',
+        'canonical': True,
+        'consolidates': [
+            '0460ebc2-b23f-4366-91ea-4c5d42a7b82b',
+            'ec96e8de-d7f5-4f50-9ce6-53611ed8df7e',
+            '8b38cf14-dfc0-472e-b5eb-a03850a08cda',
+            '25a51e44-cb94-42d5-a236-8ff896f68652',
+            '3d5665c6-6afc-4815-ad7b-513dce2762ad',
+            'd3cded4d-659b-48b4-962a-63a50db0ede0',
+            '7c3f6259-020a-4898-8a33-6d610d5a3eb3',
+        ],
+        'category': 'procedural_knowledge',
+    },
+}
+
+#: reify 28cbf1c4 — members split across `retires` (list) and `replaces`
+#: (SCALAR).  The scalar arm is the one a list-only harvester would drop.
+LIVE_REIFY_RETIRES_AND_REPLACES = {
+    'id': '28cbf1c4-555e-430f-82a7-92578381c8df',
+    'created_at': '2026-07-28T20:08:13.475183+00:00',
+    'metadata': {
+        'topic': 'cross-project-path-scope-guard',
+        'canonical': True,
+        'replaces': 'f2f0cb49-7403-4f10-8f26-2a33ec3b9247',
+        'retires': [
+            'ddc9b76e-d8fb-41d4-b4eb-0d6076f7a18a',
+            '4d2f5b96-d57d-4896-a15c-c5bc660434b5',
+            'bab98983-dc79-4332-9bc1-b3c7aec426f7',
+            'fd179b32-a422-44ab-bf1a-1043e7f96aa6',
+            '2c1f21a2-a812-46ea-af6e-4f0b98bad61e',
+        ],
+        'category': 'procedural_knowledge',
+    },
+}
+
+#: reify bbc063a7 — members under a list `supersedes`.  Also carries
+#: `replaces_verbatim`, which is deliberately NOT a member key: it names the
+#: record this one reissues, and it already appears in `supersedes`.
+LIVE_REIFY_LIST_SUPERSEDES = {
+    'id': 'bbc063a7-ea8f-4262-b9dd-eef3002a99a8',
+    'created_at': '2026-07-28T20:05:44.622926+00:00',
+    'metadata': {
+        'topic': 'harness-layout-gate-decision-rule',
+        'canonical': True,
+        'replaces_verbatim': '168c3a6b-55dd-4f53-88e4-3a829ea210fc',
+        'supersedes': [
+            '168c3a6b-55dd-4f53-88e4-3a829ea210fc',
+            '1a265e20-6e4d-4c7c-a1dd-cdf880c865e4',
+            'ad415479-f6b6-441b-b95f-6bf1d4168804',
+            '80936e18-6a91-4b74-9bb8-cae79e6490b8',
+            '8110c809-04cf-4de8-9aad-1c2c00e25053',
+            '18cbefc3-5845-443b-95cb-1d14b265befd',
+        ],
+        'category': 'procedural_knowledge',
+    },
+}
+
+#: reify dbc478b8 — snake_case topic AND an overlap between `consolidates`
+#: and `supersedes` (``4c2786de`` appears in both), i.e. the live dedup case.
+LIVE_REIFY_OVERLAPPING_MEMBERS = {
+    'id': 'dbc478b8-6357-417f-b114-303ebfe650e5',
+    'created_at': '2026-07-28T00:05:37.968722+00:00',
+    'metadata': {
+        'topic': 'merge_request_bare_task_id_branch_arg',
+        'canonical': True,
+        'supersedes': [
+            '4c2786de-2511-462f-a643-576ddc63fdf5',
+            'f71c92ff-08d5-4264-9a29-f3b1bfcaca61',
+        ],
+        'consolidates': [
+            '4c2786de-2511-462f-a643-576ddc63fdf5',
+            '99ddc1d3-ed7c-44f5-8eae-5c461818da3b',
+            'a5216a28-824f-44ee-828c-fd294dd119fd',
+            'f522b1c8-74e0-4578-9371-bc5749911682',
+            '156b0e6d-2088-444d-a38c-7bea7f5168f3',
+            '40737468-cb02-462a-9a12-5f8b2cd6fb43',
+        ],
+        'category': 'procedural_knowledge',
+    },
+}
+
+#: reify 9a4e568b — the prose `supersedes` again, here as a MEMBER source.
+LIVE_REIFY_PROSE_SUPERSEDES = {
+    'id': '9a4e568b-1b7e-408c-afeb-efde9bde33aa',
+    'created_at': '2026-07-25T16:15:54.557669+00:00',
+    'metadata': {
+        'topic': 'capability-manifest-sidecar-and-g7',
+        'canonical': True,
+        'supersedes': LIVE_PROSE_SUPERSEDES,
+        'category': 'procedural_knowledge',
+    },
+}
+
+
+def _only(plans: list) -> object:
+    assert len(plans) == 1, f'expected exactly one plan, got {plans!r}'
+    return plans[0]
+
+
+def _reasons(skips: list[dict]) -> list[str]:
+    return [s['reason'] for s in skips]
+
+
+class TestPlanCanonicalClusters:
+    """``plan_canonical_clusters(records, *, project_id)``.
+
+    Turns scroll-shaped ``canonical: true`` records into cluster plans.
+    Pure: records in, ``(plans, skips)`` out — no service argument, so it
+    cannot be tested into passing against a mock.
+    """
+
+    def test_member_keys_are_a_reviewable_ordered_constant(self):
+        """The harvested keys are a named constant, not a buried literal.
+
+        Order is part of the contract: it makes member ordering deterministic
+        across runs, so two dry-runs diff cleanly.
+        """
+        assert _mod.CLUSTER_MEMBER_KEYS == (
+            'consolidates',
+            'retires',
+            'replaces',
+            'supersedes',
+        )
+
+    def test_snake_case_topic_folds_and_consolidates_supplies_members(self):
+        """Case (a): the single live dark_factory canonical."""
+        plans, skips = _mod.plan_canonical_clusters(
+            [LIVE_DF_CANONICAL], project_id='dark_factory'
+        )
+        plan = _only(plans)
+        assert plan.topic == 'eval-worktree-plan-tools-missing'
+        assert plan.project_id == 'dark_factory'
+        assert plan.canonical_memory_id == '0929cff6-8efc-4a49-a672-e83f0a41bbfb'
+        assert plan.member_memory_ids == tuple(
+            LIVE_DF_CANONICAL['metadata']['consolidates']
+        )
+        assert plan.canonical_plural is False
+        assert skips == []
+
+    def test_scalar_replaces_is_harvested_alongside_list_retires(self):
+        """Case (b): a scalar member key is a member key.
+
+        ``replaces`` is a bare string on this record.  A harvester that only
+        understood lists would silently drop that edge — the same
+        scalar-vs-list split D2 documents for ``supersedes``.
+        """
+        plans, _ = _mod.plan_canonical_clusters(
+            [LIVE_REIFY_RETIRES_AND_REPLACES], project_id='reify'
+        )
+        plan = _only(plans)
+        meta = LIVE_REIFY_RETIRES_AND_REPLACES['metadata']
+        assert plan.member_memory_ids == (*meta['retires'], meta['replaces'])
+
+    def test_list_supersedes_supplies_members(self):
+        """Case (c) — and ``replaces_verbatim`` is not a member key."""
+        plans, _ = _mod.plan_canonical_clusters(
+            [LIVE_REIFY_LIST_SUPERSEDES], project_id='reify'
+        )
+        plan = _only(plans)
+        assert plan.member_memory_ids == tuple(
+            LIVE_REIFY_LIST_SUPERSEDES['metadata']['supersedes']
+        )
+
+    def test_members_are_deduplicated_across_keys(self):
+        """Case (d): ``4c2786de`` is in BOTH consolidates and supersedes."""
+        plans, _ = _mod.plan_canonical_clusters(
+            [LIVE_REIFY_OVERLAPPING_MEMBERS], project_id='reify'
+        )
+        plan = _only(plans)
+        assert len(plan.member_memory_ids) == len(set(plan.member_memory_ids))
+        assert plan.member_memory_ids == (
+            '4c2786de-2511-462f-a643-576ddc63fdf5',
+            '99ddc1d3-ed7c-44f5-8eae-5c461818da3b',
+            'a5216a28-824f-44ee-828c-fd294dd119fd',
+            'f522b1c8-74e0-4578-9371-bc5749911682',
+            '156b0e6d-2088-444d-a38c-7bea7f5168f3',
+            '40737468-cb02-462a-9a12-5f8b2cd6fb43',
+            'f71c92ff-08d5-4264-9a29-f3b1bfcaca61',
+        )
+
+    def test_a_canonical_is_never_its_own_member(self):
+        """Case (d), second half.
+
+        A self-reference would make ``stamp_one`` visit the same record twice
+        with contradictory ``make_canonical`` values — the kind of ambiguity
+        that is far cheaper to exclude here than to adjudicate later.
+        """
+        record = {
+            'id': '0929cff6-8efc-4a49-a672-e83f0a41bbfb',
+            'metadata': {
+                'topic': 'docs-prd-landing',
+                'canonical': True,
+                'consolidates': [
+                    '0929cff6-8efc-4a49-a672-e83f0a41bbfb',
+                    '0460ebc2-b23f-4366-91ea-4c5d42a7b82b',
+                ],
+            },
+        }
+        plans, _ = _mod.plan_canonical_clusters([record], project_id='dark_factory')
+        plan = _only(plans)
+        assert plan.canonical_memory_id not in plan.member_memory_ids
+        assert plan.member_memory_ids == ('0460ebc2-b23f-4366-91ea-4c5d42a7b82b',)
+
+    def test_non_uuid_member_is_dropped_and_reported_never_swallowed(self):
+        """Case (e): the prose ``supersedes``, seen as a member source.
+
+        The cluster is still planned — its topic is good — but the
+        unresolvable member is named in the skip list.  Dropping it silently
+        would let the report claim a clean sweep over a cluster whose
+        membership was never actually determined.
+        """
+        plans, skips = _mod.plan_canonical_clusters(
+            [LIVE_REIFY_PROSE_SUPERSEDES], project_id='reify'
+        )
+        plan = _only(plans)
+        assert plan.topic == 'capability-manifest-sidecar-and-g7'
+        assert plan.member_memory_ids == ()
+        assert _reasons(skips) == ['member_not_a_uuid']
+        assert skips[0]['memory_id'] == '9a4e568b-1b7e-408c-afeb-efde9bde33aa'
+        assert skips[0]['key'] == 'supersedes'
+        assert skips[0]['value'] == LIVE_PROSE_SUPERSEDES
+
+    @pytest.mark.parametrize(
+        ('topic', 'why'),
+        [(None, 'no topic at all'), ('!!!', 'unfoldable'), ('a' * 120, 'over the cap')],
+    )
+    def test_underivable_topic_yields_no_plan_and_a_named_skip(
+        self, topic: object, why: str
+    ):
+        """Case (f): no topic, no plan — and a line in the report saying so.
+
+        Guessing a slug here would file a whole cluster under a topic nobody
+        chose.  Emitting an empty plan would be worse: it would look like a
+        cluster the sweep handled.
+        """
+        metadata: dict = {'canonical': True, 'consolidates': [
+            '0460ebc2-b23f-4366-91ea-4c5d42a7b82b'
+        ]}
+        if topic is not None:
+            metadata['topic'] = topic
+        plans, skips = _mod.plan_canonical_clusters(
+            [{'id': '0929cff6-8efc-4a49-a672-e83f0a41bbfb', 'metadata': metadata}],
+            project_id='dark_factory',
+        )
+        assert plans == [], why
+        assert _reasons(skips) == ['topic_underivable']
+        assert skips[0]['memory_id'] == '0929cff6-8efc-4a49-a672-e83f0a41bbfb'
+
+    def test_all_six_measured_live_records_plan_without_error(self):
+        """The whole measured source (1), end to end.
+
+        Five reify records plus one dark_factory record is the entire live
+        ``canonical: true`` population at authoring time.  Planning all of
+        them at once is the closest a unit test gets to the real input.
+        """
+        reify_records = [
+            LIVE_REIFY_RETIRES_AND_REPLACES,
+            LIVE_REIFY_LIST_SUPERSEDES,
+            LIVE_REIFY_OVERLAPPING_MEMBERS,
+            LIVE_REIFY_PROSE_SUPERSEDES,
+        ]
+        plans, skips = _mod.plan_canonical_clusters(reify_records, project_id='reify')
+        assert len(plans) == 4
+        assert all(topic_slug_module.is_valid_topic_slug(p.topic) for p in plans)
+        assert all(p.source == 'canonical_scroll' for p in plans)
+        # The one prose member is the only thing this source cannot resolve.
+        assert _reasons(skips) == ['member_not_a_uuid']
+
+    def test_is_pure_and_does_not_mutate_its_input(self):
+        import copy
+
+        records = [copy.deepcopy(LIVE_DF_CANONICAL)]
+        before = copy.deepcopy(records)
+        _mod.plan_canonical_clusters(records, project_id='dark_factory')
+        assert records == before
