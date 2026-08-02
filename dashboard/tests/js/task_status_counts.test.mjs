@@ -16,7 +16,12 @@ import assert from 'node:assert/strict';
 
 import statusCounts from '../../src/dashboard/static/redux/task_status_counts.js';
 
-const { projectStatusCounts } = statusCounts;
+const { projectStatusCounts, activityPips } = statusCounts;
+
+const EXPECTED_FUNCTION_NAMES = [
+  'projectStatusCounts',
+  'activityPips',
+];
 
 // The statuses the legacy single "N active" pip merged into one number.
 // Every split-bucket test below is cross-checked against this set so the
@@ -37,6 +42,16 @@ function mkTask(id, { status } = {}) {
 function tasksWithStatus(status, n) {
   return Array.from({ length: n }, (_, i) => mkTask(`${status}-${i}`, { status }));
 }
+
+test('default-imported module exposes the status-counting functions', () => {
+  for (const name of EXPECTED_FUNCTION_NAMES) {
+    assert.equal(
+      typeof statusCounts[name],
+      'function',
+      `statusCounts.${name} should be a function`,
+    );
+  }
+});
 
 // ---------------------------------------------------------------------------
 // projectStatusCounts — one pass, splitting the legacy merged "active" number
@@ -159,5 +174,98 @@ test('projectStatusCounts: the three components exactly partition the legacy mer
     counts.running + counts.blocked + counts.mergeDeferred,
     legacyActive,
     'the split must neither lose nor double-count a task from the legacy merged set',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// activityPips — turns a projectStatusCounts result into the ordered list of
+// header pips to render. Pure: no colours, no DOM (the caller owns those).
+// ---------------------------------------------------------------------------
+
+test('activityPips: fixed running -> blocked -> merge-deferred order with stable keys', () => {
+  // Ordering lives here, not at the call site, so no caller has to
+  // re-derive it and none can drift out of agreement with another.
+  const pips = activityPips({ running: 4, blocked: 3, mergeDeferred: 2 });
+
+  assert.deepEqual(pips.map(p => p.key), ['running', 'blocked', 'merge-deferred']);
+  assert.deepEqual(pips.map(p => p.count), [4, 3, 2]);
+  for (const p of pips) {
+    assert.equal(typeof p.label, 'string');
+    assert.ok(p.label.length > 0, `pip ${p.key} should carry an operator-facing label`);
+  }
+});
+
+test('activityPips: each entry carries its own count, individually readable', () => {
+  const pips = activityPips({ running: 24, blocked: 9, mergeDeferred: 5 });
+  const byKey = Object.fromEntries(pips.map(p => [p.key, p.count]));
+
+  // The three numbers an operator could not tell apart before this task.
+  assert.deepEqual(byKey, { running: 24, blocked: 9, 'merge-deferred': 5 });
+});
+
+test('activityPips: suppresses a zero-valued component', () => {
+  // Most projects have no merge-deferred tasks; a permanent "0
+  // merge-deferred" pip would be noise in every header that has one.
+  const pips = activityPips({ running: 24, blocked: 9, mergeDeferred: 0 });
+
+  assert.equal(pips.length, 2);
+  assert.deepEqual(pips.map(p => p.key), ['running', 'blocked']);
+  assert.ok(!pips.some(p => p.key === 'merge-deferred'), 'no zero merge-deferred pip');
+});
+
+test('activityPips: suppression is per-component, not all-or-nothing', () => {
+  assert.deepEqual(
+    activityPips({ running: 0, blocked: 0, mergeDeferred: 3 }).map(p => p.key),
+    ['merge-deferred'],
+  );
+  assert.deepEqual(
+    activityPips({ running: 0, blocked: 2, mergeDeferred: 0 }).map(p => p.key),
+    ['blocked'],
+  );
+});
+
+test('activityPips: an all-zero project still renders exactly one "0 running" pip', () => {
+  // Suppressing all three would leave the activity region of the header
+  // empty — indistinguishable from a failed data load, which is the same
+  // ambiguity class this task exists to remove, just inverted.
+  const pips = activityPips({ running: 0, blocked: 0, mergeDeferred: 0 });
+
+  assert.equal(pips.length, 1);
+  assert.equal(pips[0].key, 'running');
+  assert.equal(pips[0].count, 0);
+});
+
+test('activityPips: rendered counts sum to the three components when any is non-zero', () => {
+  // No pip may silently absorb another's tasks: what the header displays
+  // must add back up to what projectStatusCounts measured.
+  const cases = [
+    { running: 24, blocked: 9, mergeDeferred: 5 },
+    { running: 24, blocked: 9, mergeDeferred: 0 },
+    { running: 0, blocked: 0, mergeDeferred: 7 },
+    { running: 1, blocked: 0, mergeDeferred: 0 },
+  ];
+  for (const counts of cases) {
+    const shown = activityPips(counts).reduce((sum, p) => sum + p.count, 0);
+    assert.equal(
+      shown,
+      counts.running + counts.blocked + counts.mergeDeferred,
+      `pips for ${JSON.stringify(counts)} should display every in-flight task exactly once`,
+    );
+  }
+});
+
+test('activityPips: accepts a projectStatusCounts result directly', () => {
+  // The two functions compose: the header calls one on the other's output,
+  // so a rename of a count key can never quietly zero a pip.
+  const counts = projectStatusCounts([
+    ...tasksWithStatus('in-progress', 3),
+    ...tasksWithStatus('merge-deferred', 2),
+    ...tasksWithStatus('done', 9),
+  ]);
+  const pips = activityPips(counts);
+
+  assert.deepEqual(
+    pips.map(p => [p.key, p.count]),
+    [['running', 3], ['merge-deferred', 2]],
   );
 });
