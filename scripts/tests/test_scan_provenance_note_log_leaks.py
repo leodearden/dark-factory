@@ -459,6 +459,19 @@ class TestCli:
         # shape the exit code now disagrees with.
         assert 'no leaked log lines' in result.stdout
 
+        # Same under --json, and pinned deliberately: stdout is a WELL-FORMED
+        # EMPTY payload, indistinguishable from a genuinely clean sweep. So a
+        # `... --json | jq -e 'length == 0'` pipeline that ignores $? still
+        # reads a total failure as clean. That residual gap is documented on
+        # run_scan_cli (and matches audit_wiped_metadata_files.py); this
+        # asserts it rather than leaving it to be rediscovered as a surprise.
+        json_result = _run_cli(
+            '--db', str(bad1), '--db', str(bad2), '--json',
+            env={'DASHBOARD_KNOWN_PROJECT_ROOTS': ''},
+        )
+        assert json_result.returncode == 3, json_result.stderr
+        assert json.loads(json_result.stdout) == []
+
     def test_one_unreadable_db_beside_a_clean_one_still_exits_0(
         self, tmp_path, make_tasks_db
     ):

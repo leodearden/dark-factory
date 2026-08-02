@@ -226,6 +226,11 @@ def main(argv: list[str] | None = None) -> int:
     database is still scanned and reported. That warn-and-continue skip is
     exit 0/1 on the readable remainder — it is only when ALL of them fail,
     leaving nothing scanned at all, that the run is exit 3.
+
+    On exit 3 stdout STILL looks clean: the report is printed before the exit
+    code is decided, so --json emits an empty ``[]`` and the plain report emits
+    its ordinary "nothing found" line. A consumer that reads only stdout cannot
+    tell a total failure from a clean sweep — branch on the exit code.
     """
     def _render(matches: list[NoteLeakMatch], args: argparse.Namespace) -> str:
         if args.json:

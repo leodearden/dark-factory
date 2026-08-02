@@ -257,6 +257,17 @@ def run_scan_cli(
     A SINGLE unreadable database among several is not exit 3: it stays a
     warn-and-continue skip, and the readable remainder decides 0 vs 1.
 
+    STDOUT ON EXIT 3 STILL LOOKS CLEAN — read this before writing a consumer.
+    The report is rendered before the exit-3 branch (mirroring
+    ``audit_wiped_metadata_files.py``), so a total-failure sweep still emits a
+    well-formed EMPTY payload: an empty ``[]`` under ``--json``, or the
+    scanner's ordinary "nothing found" line otherwise. A pipeline that reads
+    only stdout — ``... --json | jq -e 'length == 0'`` and friends — therefore
+    CANNOT distinguish "scanned everything, found nothing" from "scanned
+    NOTHING at all". Every consumer MUST branch on the exit code (and/or read
+    the stderr error line); treating a parseable empty payload as a clean
+    result is exactly the false green this exit code exists to kill.
+
     *render* receives the collected matches and the parsed Namespace and
     returns the exact text to print — that is where each scanner's
     JSON-vs-report choice and its own truncation flag live.

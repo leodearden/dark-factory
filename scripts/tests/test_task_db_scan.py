@@ -6,8 +6,13 @@ Tier 1 (discovery: _DEFAULT_PROJECT_ROOTS / tasks_db_path /
 resolve_project_roots / discover_project_roots / discover_db_paths) is adopted
 by ALL THREE sweep scripts. Tier 2 (leak-scanner CLI plumbing) is adopted by
 the two leak scanners only — audit_wiped_metadata_files.py keeps its own
-CLI layer, whose exit-code-3 and --min-fidelity semantics are genuinely
-different behaviour rather than duplication.
+CLI layer, whose --min-fidelity filter, object-shaped rather than
+array-shaped JSON and different no-roots message are genuinely different
+behaviour rather than duplication. Its exit 3 is NOT one of those
+differences any more: task 3474 gave run_scan_cli the same "nothing was
+scanned, so this is not a clean run" semantics (see
+test_run_scan_cli_exits_3_when_every_db_is_unreadable below), so that
+exit code is now shared by both tiers rather than a differentiator.
 
 The precedence cases below are the consolidated single home for assertions
 that previously lived duplicated across test_scan_task_toolcall_leaks.py,
