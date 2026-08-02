@@ -30,7 +30,7 @@ from __future__ import annotations
 import ast
 import shlex
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 
 class _Unsupported(Exception):
@@ -289,3 +289,48 @@ def expression_definitely_deselects(expr: str, marker_names: frozenset[str]) -> 
         return _kleene(tree.body, marker_names) is False
     except (_Unsupported, RecursionError):
         return False
+
+
+def deselecting_expression_for_targets(
+    targets: Sequence[str],
+    pyproject_text: str | None,
+    test_command: str | None,
+    read_source: Callable[[str], str | None],
+) -> str | None:
+    """The module's effective ``-m`` expression iff it deselects EVERY target, else None.
+
+    The composed entry point: resolve the module's marker expression
+    (:func:`resolve_marker_expression`), then require every target to be
+    provably fully deselected by it (:func:`module_level_marker_names` +
+    :func:`expression_definitely_deselects`).  ALL, not ANY — a single target
+    that still collects means the file-scoped run is not empty.  The EXPRESSION
+    is returned rather than a bool so the caller can name it in the
+    operator-facing ``PlannedRun.reason``.
+
+    *read_source* mirrors ``verify_plan``'s injected ``worktree_reader``
+    (``Callable[[str], str | None]``) exactly, so no new I/O seam is introduced
+    and its content cache is shared: a touched test file already read for
+    STRUCTURAL detection costs zero extra disk I/O.  A ``None`` answer (missing
+    or unreadable) proves nothing and refuses.
+
+    COST BOUND: with no ``-m`` expression resolved this performs ZERO target
+    reads — it short-circuits BEFORE calling *read_source* at all.  The added
+    cost of consulting this from a verify plan is therefore exactly one
+    pyproject read per ModuleConfig, and nothing more for any module that
+    declares no marker expression.
+
+    DIRECTION OF SAFETY: a None return always means "keep today's FILE_SCOPED
+    behaviour".  Widening is only ever chosen on positive proof, so this can
+    turn a false RED into a real run but never a real run into a skip.  An empty
+    *targets* is refused rather than treated as vacuously all-deselected.
+    """
+    if not targets:
+        return None
+    expr = resolve_marker_expression(pyproject_text, test_command)
+    if expr is None:
+        return None
+    for target in targets:
+        guaranteed = module_level_marker_names(read_source(target))
+        if not expression_definitely_deselects(expr, guaranteed):
+            return None
+    return expr
