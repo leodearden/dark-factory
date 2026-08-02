@@ -1004,6 +1004,33 @@ class TestDeterministicInvariants:
                 human_curator_gate=marker,  # type: ignore[call-arg]
             )
 
+    def test_more_fundamental_clause_reports_first(self):
+        """Clause ORDER inside _deterministic_invariants is load-bearing.
+
+        The curator-gate clause is deliberately LAST: pydantic stops at the
+        first raise, so a blob that is ALSO malformed more fundamentally must
+        report that error, not the narrower curator one. This blob trips two
+        clauses at once — before_done on a non-deterministic task, and the
+        marker alongside before_done — and the author-facing remediation the
+        writer sees must be the fundamental one, because fixing task_kind is
+        the prerequisite for the curator question even being coherent.
+
+        Without this row, TestDeterministicInvariants pins each clause only in
+        ISOLATION, so reordering the three `if` blocks would silently swap the
+        message a mis-authoring writer gets with the whole suite still green.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            TaskMetadata(
+                task_kind='normal',
+                before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+                human_curator_gate=True,  # type: ignore[call-arg]
+            )
+        message = str(excinfo.value)
+        assert 'before_done is only valid on deterministic tasks' in message, message
+        # ...and specifically NOT the curator-gate clause, which would mean the
+        # ordering had been reversed.
+        assert 'only valid on a pure gate' not in message, message
+
     # ---- Accepted neighbours: the validator's blast radius is exactly the
     # contradiction and nothing wider. Every shape below exists on the live
     # task store today, so a regression here would break real writes.
