@@ -728,14 +728,16 @@ def _judge_result_scoring(raw, *, via: str) -> MagicMock:
     """A judge invoke_agent result reporting ``plan_quality=raw``, delivered via
     *via* (``'structured_output'`` or ``'json_output'``).
 
-    That delivery choice is the ONLY difference between the two mocks, and it
-    is exactly the difference that makes ``PLAN_QUALITY_SCHEMA``'s
-    ``{'minimum': 0.0, 'maximum': 1.0}`` non-binding: the documented
-    ``result.structured_output or json.loads(result.output)`` fallback in
-    ``judge_plan_quality`` bypasses schema enforcement entirely, so an
-    out-of-range *raw* only reaches the parser unchecked via ``'json_output'``.
-    Range/NaN tests parametrize over both so neither path is assumed
-    equivalent to the other.
+    That delivery choice is the ONLY difference between the two mocks. It
+    matters in PRODUCTION — ``PLAN_QUALITY_SCHEMA``'s ``{'minimum': 0.0,
+    'maximum': 1.0}`` binds a real ``structured_output`` response but not the
+    ``json.loads(result.output)`` fallback (see ``clamp_unit_score``'s
+    docstring in judge.py) — but NOT in this mock: a ``MagicMock`` enforces no
+    schema either way, so both deliveries reach the parser with *raw*
+    unchecked here. What the ``via`` parametrization actually pins is that the
+    clamp/NaN handling lives AFTER the ``structured_output or
+    json.loads(...)`` merge point, so neither delivery path can regress
+    independently of the other.
     """
     payload = {'plan_quality': raw, 'per_criterion': {}, 'reasoning': 'r'}
     fake = MagicMock()
@@ -886,11 +888,10 @@ class TestJudgePlanQuality:
 
     # -- Output-range contract (task 3410) --------------------------------
     # score_plan_structure has always clamped+rounded to [0, 1]/4dp
-    # (judge.py:396). judge_plan_quality's parse block did not, and
-    # PLAN_QUALITY_SCHEMA's declared bounds only constrain the
-    # structured_output path — the documented ``or json.loads(result.output)``
-    # fallback bypasses schema enforcement entirely. Both delivery paths are
-    # covered so that hole cannot hide behind a structured-output-only test.
+    # (judge.py:396). judge_plan_quality's parse block did not (see
+    # clamp_unit_score's docstring in judge.py for why the schema bound alone
+    # is not enough). Both delivery paths are covered so that hole cannot
+    # hide behind a structured-output-only test.
 
     @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
     @pytest.mark.parametrize(('raw', 'expected'), [
@@ -922,29 +923,38 @@ class TestJudgePlanQuality:
     # artifact guard's WARNING already follows (judge.py:514).
 
     @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        pytest.param(1.5, 1.0, id='above-range'),
+        pytest.param(-0.4, 0.0, id='below-range'),
+    ])
     async def test_out_of_range_answer_leaves_exactly_one_warning_naming_it(
-        self, via, caplog,
+        self, via, raw, expected, caplog,
     ):
         from orchestrator.evals.judge import judge_plan_quality
 
         caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
         with patch(
             'orchestrator.evals.judge.invoke_agent',
-            AsyncMock(return_value=_judge_result_scoring(1.5, via=via)),
+            AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
         ):
             verdict = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
+        # Both clamp directions are pinned, not just the above-range case —
+        # the warning text is built from raw_quality!r / plan_quality!r, so a
+        # future edit that only warns on raw_quality > 1.0 would keep every
+        # above-range assertion green while silently dropping the low-side
+        # signal.
         warnings = _judge_warnings(caplog)
         assert len(warnings) == 1
-        assert 'df_task_2605' in warnings[0]   # WHICH cell to go look at
-        assert '1.5' in warnings[0]            # the raw out-of-range value
-        assert '1.0' in warnings[0]            # the substituted value
+        assert 'df_task_2605' in warnings[0]  # WHICH cell to go look at
+        assert repr(raw) in warnings[0]       # the raw out-of-range value
+        assert repr(expected) in warnings[0]  # the substituted value
 
         # The verdict is otherwise intact: a corrected CONTENT answer, never
         # an infra refusal (3118 exclusion shape) or a parse failure.
-        assert verdict.plan_quality == 1.0
+        assert verdict.plan_quality == expected
         assert verdict.invocation_error is None
         assert verdict.per_criterion == {}
         assert verdict.reasoning == 'r'
@@ -970,13 +980,13 @@ class TestJudgePlanQuality:
         assert _judge_warnings(caplog) == []
 
     # -- The hole a bare clamp leaves open: NaN (task 3410) ----------------
-    # min/max are ordering operations and NaN is unordered, so
-    # round(min(max(nan, 0.0), 1.0), 4) is nan — verified by execution. A
-    # clamp alone does NOT keep plan_quality in [0, 1]: a NaN would be
-    # persisted verbatim by runner.py and poison report._mean_plan_quality.
-    # json.loads('{"plan_quality": NaN}') SUCCEEDS in CPython, so this is
-    # reachable through the same schema-bypassing path the rest of this task
-    # is about — not hypothetical.
+    # NaN is unordered, so a bare clamp does NOT keep plan_quality in [0, 1]
+    # (see clamp_unit_score's docstring in judge.py for the mechanics). A NaN
+    # would be persisted verbatim by runner.py and poison
+    # report._mean_plan_quality. json.loads('{"plan_quality": NaN}')
+    # SUCCEEDS in CPython, so this is reachable through the same
+    # schema-bypassing path the rest of this task is about — not
+    # hypothetical.
 
     @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
     async def test_nan_answer_degrades_to_the_none_sentinel_not_a_nan(
@@ -1000,36 +1010,47 @@ class TestJudgePlanQuality:
         # A nonsense answer is a CONTENT failure, never the 3118 infra-refusal
         # exclusion shape.
         assert verdict.invocation_error is None
+        # Same degraded shape the parse-failure fallback uses — pinned here
+        # too, not just plan_quality, so a future edit can't quietly leave
+        # per_criterion/reasoning out of step with that documented shape.
+        assert verdict.per_criterion == {}
+        assert 'nan' in verdict.reasoning.lower()
 
         warnings = _judge_warnings(caplog)
         assert len(warnings) == 1
         assert 'df_task_2605' in warnings[0]           # WHICH cell
         assert 'nan' in warnings[0].lower()            # WHAT was wrong
 
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
     @pytest.mark.parametrize(('raw', 'expected'), [
         pytest.param(float('inf'), 1.0, id='positive-infinity-clamps-high'),
         pytest.param(float('-inf'), 0.0, id='negative-infinity-clamps-low'),
     ])
     async def test_infinity_clamps_because_it_is_orderable_unlike_nan(
-        self, raw, expected,
+        self, raw, expected, via, caplog,
     ):
         """DELIBERATE asymmetry, documented in one place: infinity IS
         orderable, so the clamp has a defined answer; NaN is not, so it has
-        none.
+        none. Parametrized over both delivery paths like the sibling
+        range/NaN tests above, so this path isn't only covered on the
+        structured_output mock.
         """
         from orchestrator.evals.judge import judge_plan_quality
 
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
         with patch(
             'orchestrator.evals.judge.invoke_agent',
-            AsyncMock(
-                return_value=_judge_result_scoring(raw, via='structured_output'),
-            ),
+            AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
         ):
             verdict = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
         assert verdict.plan_quality == expected
+        # Infinity is out-of-range-but-orderable, so it takes the SAME
+        # clamp-and-warn path as any other out-of-contract answer (e.g.
+        # 1.5) — exactly one WARNING, never silent.
+        assert len(_judge_warnings(caplog)) == 1
 
 
 # ---------------------------------------------------------------------------
