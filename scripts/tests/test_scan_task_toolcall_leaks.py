@@ -9,8 +9,10 @@ task 2865). This module — and its tests — never mutate task text; they only
 detect and report.
 
 Mirrors test_recon_busy_check.py: pure functions (detect_leak, scan_db,
-discover_db_paths, format_report, format_json) get direct pytest coverage;
-main() gets subprocess coverage (added alongside the CLI in a later step).
+format_report, format_json) get direct pytest coverage; main() gets
+subprocess coverage (added alongside the CLI in a later step). Discovery
+helpers (discover_db_paths et al.) are covered in
+scripts/tests/test_task_db_scan.py (task 3336).
 
 Fixture shapes below are modeled on the real live-DB leak shapes confirmed
 while planning this task (tasks 992, 1068, 1067, 2691) and the real

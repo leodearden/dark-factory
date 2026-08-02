@@ -11,8 +11,9 @@ DB at the time of writing). The source is fixed; this scanner is the durable
 recurrence guard, mirroring the 2939 precedent.
 
 Mirrors test_scan_task_toolcall_leaks.py: pure functions (detect_log_leak,
-scan_db, discover_db_paths, format_report, format_json) get direct pytest
-coverage; main() gets subprocess coverage.
+scan_db, format_report, format_json) get direct pytest coverage; main()
+gets subprocess coverage. Discovery helpers (discover_db_paths et al.) are
+covered in scripts/tests/test_task_db_scan.py (task 3336).
 
 This module — and the scanner it tests — never mutate task text. Task 2902's
 note is a preserved forensic specimen; the fixture below is a shape-faithful
