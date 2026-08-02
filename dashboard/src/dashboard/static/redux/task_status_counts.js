@@ -64,12 +64,39 @@ function projectStatusCounts(tasks) {
   return counts;
 }
 
+// ── The ordered activity pips to render in a per-project header ──
+// Turns a projectStatusCounts result into `[{key, label, count}]` in the
+// fixed running → blocked → merge-deferred order, so no caller re-derives
+// the ordering and none can drift out of agreement with another.
+//
+// Zero-valued components are suppressed: most projects have no
+// merge-deferred tasks, and a permanent "0 merge-deferred" pip would be
+// noise in every one of their headers.
+//
+// Pure — no `window`, and no colour/DOM concerns (the caller owns the dot
+// colours).
+function activityPips(counts) {
+  const c = counts || {};
+  const all = [
+    { key: 'running', label: 'running', count: c.running || 0 },
+    { key: 'blocked', label: 'blocked', count: c.blocked || 0 },
+    { key: 'merge-deferred', label: 'merge-deferred', count: c.mergeDeferred || 0 },
+  ];
+  const shown = all.filter(p => p.count > 0);
+  // Do NOT "simplify" this into an unconditional filter. When all three are
+  // zero the suppression rule would empty the header's activity region
+  // entirely, and an empty region is indistinguishable from a failed data
+  // load — the same ambiguity this module exists to remove, just inverted.
+  // A quiet project shows an unambiguous "0 running" instead.
+  return shown.length > 0 ? shown : [all[0]];
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced by
 // dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
 // leave window.DF_TASK_STATUS_COUNTS undefined and break tab_tasks.jsx's
 // top-level destructure of it.
-const TASK_STATUS_COUNTS_API = { projectStatusCounts };
+const TASK_STATUS_COUNTS_API = { projectStatusCounts, activityPips };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = TASK_STATUS_COUNTS_API;
