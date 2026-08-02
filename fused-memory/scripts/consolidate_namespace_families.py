@@ -91,6 +91,10 @@ import logging
 import sys
 from typing import Any
 
+from fused_memory.backends.mem0_client import (
+    DEFAULT_SCROLL_MAX_PAGES,
+    ScrollPageBudgetExhausted,
+)
 from fused_memory.maintenance.cross_graph_move import (  # noqa: F401
     SubgraphEdgeResult,
     create_moved_episode,
@@ -600,41 +604,66 @@ async def merge_graph_family(
 # ---------------------------------------------------------------------------
 
 async def scroll_collection_points(
-    qdrant_client: Any,
+    backend: Any,
     collection: str,
     *,
-    limit: int = 1000,
-) -> list:
-    """Read-only scroll of every point in *collection*, WITH vectors.
+    page_size: int = 1000,
+    max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+) -> tuple[list, bool]:
+    """Read-only PAGED scroll of every point in *collection*, WITH vectors.
 
     ``with_vectors=True`` is essential: omitting it drops embeddings from
     the returned points, which would silently destroy them once re-upserted
     into the target collection (see ``merge_collection``).
 
-    Single-page fetch: this issues exactly ONE ``scroll(..., limit=limit)``
-    call and discards the returned ``next_offset`` rather than paging
-    through it, so a collection with more than *limit* points is
-    permanently reported UNRESOLVED at the given --limit. Callers must pass
-    a *limit* larger than the true point count of every collection they
-    intend to migrate in this run; the full result set (with vectors) is
-    held in memory, so raising *limit* trades completeness for peak memory.
+    Drains ``Mem0Backend.scroll_collection_pages``, which walks Qdrant's
+    ``next_offset`` to exhaustion. This used to issue exactly ONE scroll and
+    discard ``next_offset``, so a collection with more than *page_size*
+    points was permanently reported UNRESOLVED and never migrated; it now
+    migrates fully. *collection* is passed VERBATIM -- ``COLLECTION_MERGES``
+    holds legacy mis-named collections (``fused_dark-factory``,
+    ``reify_reify``) that a ``Scope`` structurally cannot produce, which is
+    why this enters at the collection-addressed backend layer.
+
+    The full result set (with vectors) is held in memory, so *page_size* x
+    *max_pages* still bounds peak memory.
+
+    Returns:
+        ``(points, capped)``. ``capped`` can no longer be inferred from
+        ``len(points)`` -- a fully-drained multi-page scroll returns any
+        count -- so it is returned explicitly. The caller's
+        ``if args.apply and not capped`` guard is what stops
+        ``merge_collection`` deleting a source it only half-migrated.
+
+    A ``ScrollPageBudgetExhausted`` is CAUGHT, never propagated: a raising
+    sub-operation must not abort the whole consolidation run, because
+    earlier keys/sections of the same ``--apply`` pass may already hold
+    committed mutations (the same rationale the sibling ``count_graph_nodes``
+    guard states). Exhaustion maps onto the existing capped contract instead
+    -- item UNRESOLVED, no upsert, no source delete, non-zero exit -- so the
+    externally visible behaviour on a too-large collection is unchanged.
     """
-    points, _next_offset = await qdrant_client.scroll(
-        collection_name=collection,
-        with_payload=True,
-        with_vectors=True,
-        limit=limit,
-    )
-    if len(points) >= limit:
+    points: list = []
+    try:
+        async for point in backend.scroll_collection_pages(
+            collection,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=True,
+        ):
+            points.append(point)
+    except ScrollPageBudgetExhausted:
         logger.warning(
-            "consolidate_namespace_families: scrolled %d point(s) from "
-            "collection '%s', which hit limit=%d -- scroll may be "
-            "incomplete/capped. Re-run with a higher --limit value before "
-            "merging, or the source collection will not be deleted "
-            '(see merge_collection).',
-            len(points), collection, limit,
+            "consolidate_namespace_families: scroll of collection '%s' exhausted "
+            'its page budget (%d page(s) of %d) after %d point(s) -- the '
+            'enumeration is INCOMPLETE, so this collection is reported '
+            'UNRESOLVED and its source will not be deleted (see '
+            'merge_collection). Re-run with a higher --limit (page size) or '
+            'raise the page budget.',
+            collection, max_pages, page_size, len(points),
         )
-    return points
+        return points, True
+    return points, False
 
 
 async def merge_collection(
