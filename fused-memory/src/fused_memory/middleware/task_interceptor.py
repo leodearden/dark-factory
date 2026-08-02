@@ -4941,10 +4941,7 @@ async def _validate_done_provenance(
             # reporting those under the same "is not on main" wording as
             # rc=1 is the same class of defect as task 3119's premature
             # outcome assertions -- don't conflate them.
-            if confirmed_off_main:
-                prefix = 'is not on main'
-            else:
-                prefix = 'could not be confirmed on main'
+            prefix = 'is not on main' if confirmed_off_main else 'could not be confirmed on main'
             return _done_provenance_error(
                 task_id,
                 f'kind={kind!r} but commit {sha_or_err} {prefix}: {ancestor_detail}.',
