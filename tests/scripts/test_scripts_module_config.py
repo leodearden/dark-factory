@@ -108,6 +108,47 @@ def _load_root_pyright_config() -> dict[str, Any]:
     return config.get('tool', {}).get('pyright', {})
 
 
+# The two ROOT [tool.pyright] keys that carve paths back out of a run without
+# the command line changing at all: `exclude` drops the files from analysis
+# entirely, `ignore` keeps analysing them but suppresses every diagnostic they
+# produce. Either one naming scripts/ un-gates it while the declared
+# `npx pyright scripts/` stays byte-identical and still exits 0 — the same
+# reports-green failure mode as a None command, reached a different way.
+_CARVE_OUT_KEYS = ('exclude', 'ignore')
+
+
+def _root_carve_outs_naming(segment: str) -> list[str]:
+    """Root ``[tool.pyright]`` exclude/ignore entries that can reach INTO ``<segment>/``.
+
+    Component-wise and ROOT-ANCHORED, not substring, for the same reason
+    ``_targets`` tests exact-element membership: ``'scripts'`` is a substring of
+    ``'tests/scripts'``, and these entries are resolved relative to the repo
+    root. An entry is reported only when it can match a path under
+    ``<segment>/`` — either it is rooted there (``scripts``, ``./scripts``,
+    ``scripts/tests/**``) or it opens with the recursive wildcard and names
+    *segment* later (``**/scripts/**``).
+
+    Deliberately NOT reported: ``tests/scripts`` (rooted in the SIBLING tree —
+    excluding it un-gates that module, not this one, and reporting it here
+    would mis-diagnose which gate is affected) and ``**/node_modules`` and
+    friends (pyright's own defaults, which name nothing under scripts/).
+    """
+    config = _load_root_pyright_config()
+    found: list[str] = []
+    for key in _CARVE_OUT_KEYS:
+        entries = config.get(key, [])
+        if isinstance(entries, str):
+            entries = [entries]
+        for entry in entries:
+            raw = str(entry).replace('\\', '/').split('/')
+            parts = [p for p in raw if p not in ('', '.')]
+            if not parts:
+                continue
+            if parts[0] == segment or (parts[0] == '**' and segment in parts[1:]):
+                found.append(f'{key}={entry!r}')
+    return found
+
+
 def _discovered() -> dict:
     return _discover_module_configs(REPO_ROOT)
 
@@ -145,13 +186,33 @@ def _executed_for_touched(files: list[str]):
 _RUFF = 'ruff check'
 _PYRIGHT = 'pyright'
 
-# Flags that carve files back OUT of a directory-wide target, per checker.
-# ruff's three exclude spellings; for pyright, the shapes that narrow what is
-# actually checked (`--skipunannotated`, `--ignoreexternal` both match by
-# prefix, and both genuinely reduce coverage).
+# Flag PREFIXES that narrow what a directory-wide target actually gets checked,
+# per checker. Prefix-matched, so each entry covers both the `--flag value` and
+# the `--flag=value` spelling.
+#
+# ruff's three exclude spellings are real. PYRIGHT'S SET IS NOT THE SAME, and an
+# earlier draft of this table simply copied ruff's across. Measured against
+# `pyright --help` (v1.1.408): pyright has NO `--exclude` and NO `--ignore` —
+# those two are pyproject `[tool.pyright]` KEYS, not CLI flags, and that vector
+# is checked where it actually lives, by `_root_carve_outs_naming` in assertion
+# (d) below. `--ignoreexternal` does exist but applies only to `--verifytypes`,
+# so it cannot narrow a normal run. Listing flags a CLI does not have is not
+# free defence: it reads as coverage while leaving the real vectors unchecked.
+#
+# The two spellings that genuinely narrow a `pyright <dir>` run:
+#   --skip*       `--skipunannotated` drops every unannotated function from
+#                 analysis. Prefix-matched so a future `--skip<x>` is caught.
+#   -p/--project  points pyright at a DIFFERENT config file, which can relax
+#                 typeCheckingMode, add excludes, or drop extraPaths wholesale.
+#                 Invisible to assertion (c): `_targets` discards every
+#                 `-`-prefixed token, so `pyright -p /tmp/lax.json scripts/`
+#                 still lists 'scripts/' among its targets and satisfies (c)
+#                 while checking almost nothing. Both spellings are listed
+#                 because neither is a prefix of the other, and neither is a
+#                 prefix of pyright's `--python*` flags (those begin `--p`).
 _NARROWING_FLAGS = {
     _RUFF: ('--exclude', '--extend-exclude', '--force-exclude'),
-    _PYRIGHT: ('--exclude', '--ignore', '--skip'),
+    _PYRIGHT: ('--skip', '-p', '--project'),
 }
 
 
@@ -410,6 +471,21 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
     distinction ``scripts/tests/conftest.py`` records about itself, and the
     reason it performs two separate sys.path insertions.
 
+    TWO module gates depend on these entries, not one. The ``tests/scripts``
+    module config next door declares its own ``npx pyright tests/scripts/``,
+    which also runs from the repo root against this same root table, and five
+    of its modules import flat ``scripts/`` names. Those imports used to carry
+    ``# pyright: ignore[reportMissingImports]``; task 3456 dropped the pragmas
+    precisely BECAUSE the extraPaths entries made them resolve, so the masking
+    is gone and the dependency is now live. RE-MEASURED at the branch tip by
+    deleting both entries and re-running each command: ``pyright scripts/`` ->
+    23 errors, 9 of them reportMissingImports; ``pyright tests/scripts/`` -> 8
+    errors, ALL reportMissingImports, naming migrate_metadata_modules_to_files,
+    drain_check, audit_wiped_metadata_files, repair_wiped_metadata_files,
+    reviewer_redundancy_diagnostic and trial_module_tagger_haiku. Removing an
+    entry is therefore a two-gate outage; this test failing alone would
+    under-report it.
+
     MEMBERSHIP, never list equality or a length pin: adding a future entry is
     a legitimate change, not a regression, and an equality assertion would
     reject it with a message accusing the author of removing these two.
@@ -432,7 +508,17 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
             f'diff, which is how a gate gets suppressed and dies. Note '
             f'{_REQUIRED_EXTRA_PATHS[0]!r} alone is NOT sufficient: it makes '
             f'{_REQUIRED_EXTRA_PATHS[1]!r} importable only as a namespace '
-            f'package, not its contents as bare top-level names'
+            f'package, not its contents as bare top-level names. '
+            f'BLAST RADIUS IS TWO GATES, NOT ONE: the {SIBLING_PREFIX} module '
+            f'config declares its own `npx pyright {SIBLING_PREFIX}/`, which '
+            f'also runs from the repo root against this same table, and task '
+            f'3456 dropped the `# pyright: ignore[reportMissingImports]` '
+            f'pragmas that were masking its five modules\' flat '
+            f'{MODULE_PREFIX}/ imports. Re-measured at the branch tip with '
+            f'both entries deleted: `pyright {MODULE_PREFIX}/` -> 23 errors '
+            f'(9 reportMissingImports), `pyright {SIBLING_PREFIX}/` -> 8 '
+            f'errors, ALL reportMissingImports. Restoring these entries is the '
+            f'fix for BOTH; re-adding pragmas to {SIBLING_PREFIX} is not'
         )
 
 
@@ -479,7 +565,14 @@ def test_scripts_diff_is_type_gated() -> None:
     waited on were FIXED — by annotation and narrowing, with zero ``# type:
     ignore`` and zero ``# pyright: ignore`` added — not suppressed and not
     carved out of the target, following the precedent tasks 3350 and 3445 set
-    for the lint gate.
+    for the lint gate. It is asserted in TWO parts because there are two
+    carve-out vectors and the command string only exposes one: the CLI flags
+    (``--skip*``, and ``-p``/``--project``, which redirects pyright at another
+    config entirely and is invisible to (c)), and the ROOT ``[tool.pyright]``
+    table's ``exclude``/``ignore`` keys, which narrow the run with the declared
+    command left byte-identical. pyright's flag set is NOT ruff's — it has no
+    ``--exclude`` and no ``--ignore`` at all — so this half cannot be written
+    by copying the lint test's; see ``_NARROWING_FLAGS``.
 
     Cited by SYMBOL, never by file:line, for the reason the module docstring
     records.
@@ -532,16 +625,44 @@ def test_scripts_diff_is_type_gated() -> None:
         'a substring check would pass for the sibling command'
     )
 
-    # (d) NOTHING CARVED OUT of the directory-wide target.
+    # (d) NOTHING CARVED OUT of the directory-wide target — part 1, the COMMAND
+    # LINE. See _NARROWING_FLAGS for why pyright's set is not ruff's, and why
+    # -p/--project belongs here rather than being caught by (c).
     narrowing = _narrowing_flag_args(mc.type_check_command, _PYRIGHT)
     assert not narrowing, (
         f'{MODULE_PREFIX}/orchestrator.yaml declares type_check_command='
-        f'{mc.type_check_command!r}, which carves files back out with '
-        f'{narrowing!r} (task 3456). The findings measured at declaration time '
-        f'were FIXED by annotation and narrowing — zero `# type: ignore`, zero '
-        f'`# pyright: ignore`, zero excludes — per the task 3350/3445 '
-        f'fix-don\'t-exclude precedent; an exclude here silently un-gates '
-        'whatever it names while the check still reports green'
+        f'{mc.type_check_command!r}, which narrows what is actually checked '
+        f'with {narrowing!r} (task 3456). The findings measured at declaration '
+        f'time were FIXED by annotation and narrowing — zero `# type: ignore`, '
+        f'zero `# pyright: ignore`, zero excludes — per the task 3350/3445 '
+        f'fix-don\'t-exclude precedent; any of these silently un-gates what it '
+        f'names while the check still reports green. `-p`/`--project` is the '
+        f'sharpest of them: it redirects pyright at another config file, and '
+        f'assertion (c) above cannot see it because _targets discards every '
+        '`-`-prefixed token'
+    )
+
+    # (d) part 2 — the OTHER carve-out vector, which NO inspection of the
+    # command can reach. `npx pyright scripts/` runs from the repo root, so it
+    # resolves against the ROOT [tool.pyright] table — the same table
+    # test_root_pyright_extrapaths_resolves_scripts_imports pins, read here
+    # through the same _load_root_pyright_config helper. An `exclude` or
+    # `ignore` entry added there narrows the run while this module config, and
+    # every assertion above it, stays byte-for-byte unchanged.
+    carved = _root_carve_outs_naming(MODULE_PREFIX)
+    assert not carved, (
+        f'ROOT [tool.pyright] in {REPO_ROOT / "pyproject.toml"} carves '
+        f'{MODULE_PREFIX} back out with {carved!r} (task 3456). '
+        f'`{mc.type_check_command}` runs from the repo root and resolves '
+        f'against that table, so an `exclude` there drops those files from '
+        f'analysis and an `ignore` suppresses their diagnostics — either way '
+        f'the gate keeps exiting 0 over a tree it is no longer checking, which '
+        f'is the same reports-green failure as {_VACUOUS_PASS}, reached '
+        f'without touching the command. The findings were FIXED, not excluded; '
+        'if a future finding genuinely cannot be fixed, suppress it at the '
+        'single site with a justified inline pragma, where a reader of that '
+        'code can see it — not repo-wide from a config table nothing in '
+        f'{MODULE_PREFIX}/ mentions'
     )
 
     # (c) ANTI-COPY-PASTE, part 2 — the sibling comparison. These two
