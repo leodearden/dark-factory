@@ -495,15 +495,37 @@ class TaskGroundTruth:
     def _resolve_open_escalations(self, tid: str) -> list[EscalationRef]:
         """Map *tid*'s pending escalations to lightweight refs.
 
+        ``severity`` and ``filing_claimant_run_id`` travel with each ref so
+        consumers can feed ``escalation.pins.classify_pins`` directly instead
+        of re-reading the store (spec ``docs/task-escalation-state-spec.md``
+        S6/E7).  ``row.severity or ''`` normalises a null/absent severity to
+        the unknown-severity sentinel, so the classifier reaches its
+        documented fail-safe-to-pinning branch rather than raising.
+
+        STORE-CORRECTNESS (spec S6; esc-3163 was a wrong-store read): this
+        resolver reads the escalation store INJECTED by the task's owning
+        orchestrator — never the reconciliation store.
+
         ``[]`` when no ``escalation_queue`` was injected — a caller that
         doesn't wire one up gets an empty-but-valid TruthReport field rather
-        than an error.
+        than an error.  That degradation is a KNOWN gap: it is indistinguishable
+        from a genuine "no open escalations", which is exactly the collapse
+        ``classify_pins(records=None)`` -> ``store_unavailable`` exists to
+        prevent.  Task beta (3535) replaces it with that distinguishable third
+        state; it is deliberately left unchanged here so this task ships no
+        disposition change.
         """
         if self.escalation_queue is None:
             return []
         rows = self.escalation_queue.get_by_task(tid, status='pending')
         return [
-            EscalationRef(id=row.id, level=row.level, category=row.category)
+            EscalationRef(
+                id=row.id,
+                level=row.level,
+                category=row.category,
+                severity=row.severity or '',
+                filing_claimant_run_id=row.filing_claimant_run_id,
+            )
             for row in rows
         ]
 
