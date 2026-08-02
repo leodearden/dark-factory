@@ -750,7 +750,17 @@ def validate_memory_metadata(
     deliberate, not an oversight:
 
     * ``parent_id`` **liveness** (does the parent still exist?) is leaf δ's,
-    * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's.
+    * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's, and
+      lives at the async seam
+      (:func:`~fused_memory.services.memory_service._apply_memory_metadata_validation`)
+      because it needs live store state.
+
+    Leaf ε (task 3198) split ``canonical`` along exactly that line.  Its
+    SHAPE half — a canonical assertion requires a ``topic`` (§2b's
+    ``canonical_without_topic``) — is checked HERE, because it needs
+    nothing but the dict.  Its UNIQUENESS half stays at the seam.  The
+    boundary moved no work into this function that a store lookup could
+    have been needed for.
 
     Making the boundary structural rather than a comment means a later leaf
     must add liveness at the seam and cannot accidentally grow a second
@@ -834,6 +844,24 @@ def validate_memory_metadata(
                 f'canonical must be a bool, got {type(canonical).__name__} '
                 f'({canonical!r}); the check is isinstance(x, bool), not '
                 f'truthiness, so 1/0 do not pass as True/False',
+                fatal=True,
+            ))
+        # `is True`, not truthiness — for the reason 2b already documents
+        # above (`1 == True`), and so a non-bool value reports only the TYPE
+        # defect rather than being double-counted here.
+        #
+        # Only the `topic` KEY's presence is tested: when it is present but
+        # malformed, 2a's invalid_topic_slug already describes that defect,
+        # and emitting both would report one defect twice while implying the
+        # writer forgot a key they did supply.
+        elif canonical is True and 'topic' not in meta:
+            violations.append(_violation(
+                'canonical',
+                'canonical_without_topic',
+                'canonical=True requires a topic: the marker asserts "this is '
+                'THE entry for its topic", so outside a topic there is no set '
+                'for it to be canonical of and the <=1-per-(project, topic) '
+                'uniqueness rule has no key to check',
                 fatal=True,
             ))
 
