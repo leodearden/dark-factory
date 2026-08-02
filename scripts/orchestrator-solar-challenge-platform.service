@@ -30,6 +30,7 @@ Environment=ORCH_UNIT=orchestrator-solar-challenge-platform.service
 
 Restart=on-failure
 RestartSec=10
+RestartSteps=4
 RestartMaxDelaySec=60
 TimeoutStopSec=90
 TimeoutStartSec=300

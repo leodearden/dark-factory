@@ -872,6 +872,19 @@ def test_dashboard_service_spec_pins_the_tasks_minimum_coverage():
     assert {"Restart", "RestartSec", "TimeoutStopSec"} <= compared_keys, compared_keys
     assert {"timeout-graceful-shutdown", "timeout-keep-alive"} <= set(spec.exec_start_flags)
 
+    # The cap and the directive that makes it effective must be compared
+    # TOGETHER. systemd discards RestartMaxDelaySec= outright on a unit with no
+    # RestartSteps=, so an installed copy missing only that line matches every
+    # other compared key and reports parity while running with no growing
+    # backoff at all. The repo-file sweep in test_systemd_restart_backoff.py
+    # cannot see this: it reads committed files, never the installed unit.
+    if "RestartMaxDelaySec" in compared_keys:
+        assert "RestartSteps" in compared_keys, (
+            "the dashboard spec compares RestartMaxDelaySec= but not "
+            "RestartSteps=, so an installed unit whose cap systemd is silently "
+            f"ignoring would be reported as parity. compared: {compared_keys}"
+        )
+
 
 def test_watchdog_service_spec_compares_the_whole_tick_bound():
     """TimeoutStartSec is 3308's bound on the whole watchdog tick."""
