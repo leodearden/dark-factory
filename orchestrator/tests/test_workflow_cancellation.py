@@ -1081,3 +1081,73 @@ class TestHarnessSyntheticCancelRetirement:
         assert tid not in h._workflow_slot_tasks, 'slot task not cleaned up in finally'
         assert tid not in h._workflow_cancel_events, 'cancel event not cleaned up in finally'
         assert sem._value == 1, f'semaphore not released by finally (value={sem._value})'
+
+
+# ---------------------------------------------------------------------------
+# task 3412: shared cancel-test helpers — _make_wedge / _assert_cancel_report
+# ---------------------------------------------------------------------------
+#
+# TestRunSingleCatchHardCancel and TestSoftCancelCoversNewAwait independently
+# built an identical wedging _verify_debugfix_loop stand-in and an identical
+# 8-line post-cancel TerminalReport assertion block (modulo the expected
+# outcome). These two module-level helpers de-duplicate that, contract-tested
+# here per the test_conftest_helpers.py precedent — a bug in either helper
+# would make BOTH refactored call sites pass vacuously, so the negative
+# (must-raise) cases below are load-bearing, not decorative.
+
+
+@pytest.mark.asyncio
+class TestMakeWedgeHelper:
+    """Contract tests for the ``_make_wedge`` factory helper.
+
+    Pins the property both cancel-report call sites depend on: the returned
+    coroutine function signals its event and then wedges until cancelled,
+    and building the wedge has no side effect until the coroutine actually
+    runs.
+    """
+
+    async def test_returns_a_callable_that_sets_the_event_then_blocks(self):
+        ev = asyncio.Event()
+        fn = _make_wedge(ev)
+        assert not ev.is_set(), '_make_wedge must not touch the event before its coroutine runs'
+
+        t = asyncio.create_task(fn())
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
+            assert not t.done(), 'the wedge must block after signalling, not return'
+        finally:
+            t.cancel()
+            await asyncio.wait({t}, timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
+
+    async def test_wedge_is_cancellable_and_propagates_cancellederror(self):
+        ev = asyncio.Event()
+        fn = _make_wedge(ev)
+        t = asyncio.create_task(fn())
+        await asyncio.wait_for(ev.wait(), timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
+
+        t.cancel()
+        await asyncio.wait({t}, timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
+        assert t.cancelled(), 'a cancelled wedge task must end up in the cancelled state'
+
+    async def test_each_call_builds_an_independent_wedge(self):
+        a = asyncio.Event()
+        b = asyncio.Event()
+        fn_a = _make_wedge(a)
+        fn_b = _make_wedge(b)
+
+        t_a = asyncio.create_task(fn_a())
+        try:
+            await asyncio.wait_for(a.wait(), timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
+            assert a.is_set()
+            assert not b.is_set(), 'the wedge built for `a` must not also set `b`'
+        finally:
+            t_a.cancel()
+            await asyncio.wait({t_a}, timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
+
+        t_b = asyncio.create_task(fn_b())
+        try:
+            await asyncio.wait_for(b.wait(), timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
+            assert b.is_set()
+        finally:
+            t_b.cancel()
+            await asyncio.wait({t_b}, timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
