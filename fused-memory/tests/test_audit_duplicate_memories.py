@@ -2078,6 +2078,99 @@ class TestRestrictDeleteCandidatesForApply:
         assert restrict_delete_candidates_for_apply([]) == ([], [])
 
 
+class TestApplyGateUnevidencedCategory:
+    """A category gated by a cutoff measured elsewhere may not DELETE (3357).
+
+    This closes the harm the task names: `--apply` deleting
+    observations_and_summaries records that are formulaically similar but
+    semantically distinct. Their cluster is still REPORTED — the dry-run
+    report is the right place for a lower-confidence signal — but the
+    irreversible path narrows to categories whose cutoff is evidenced on
+    their own labeled pairs.
+    """
+
+    def test_an_ann_clique_in_an_unevidenced_category_is_withheld(self):
+        groups = [_grp(['a', 'b'], ['b'], ann_clique=True, category=_OS)]
+
+        actionable, withheld = restrict_delete_candidates_for_apply(
+            groups, unevidenced_categories={_OS},
+        )
+
+        assert actionable == [], (
+            'a clique proves the pairs cleared A cutoff — not that the cutoff '
+            'was ever measured for THIS category'
+        )
+        assert len(withheld) == 1
+        assert withheld[0]['reason'] == 'ann_cutoff_not_evidenced_for_category'
+        assert withheld[0]['withheld_ids'] == ['b']
+        assert withheld[0]['category'] == _OS
+        assert withheld[0]['member_ids'] == ['a', 'b']
+
+    def test_an_ann_clique_in_a_calibrated_category_is_still_actionable(self):
+        """No regression to task 3210's coverage where evidence exists."""
+        groups = [_grp(['a', 'b'], ['b'], ann_clique=True, category=_PK)]
+
+        actionable, withheld = restrict_delete_candidates_for_apply(
+            groups, unevidenced_categories={_OS},
+        )
+
+        assert actionable == ['b']
+        assert withheld == []
+
+    def test_a_lexically_spanning_cluster_is_actionable_regardless(self):
+        """Lexical evidence never depended on the ANN cutoff at all."""
+        groups = [_grp(['a', 'b'], ['b'], lexical_spanning=True, category=_OS)]
+
+        actionable, withheld = restrict_delete_candidates_for_apply(
+            groups, unevidenced_categories={_OS},
+        )
+
+        assert actionable == ['b']
+        assert withheld == []
+
+    def test_an_ann_chain_in_an_unevidenced_category_reports_the_chain_reason(self):
+        """The pre-existing, stricter refusal still wins — it is not masked."""
+        groups = [_grp(['a', 'b', 'c'], ['b', 'c'], category=_OS)]
+
+        _actionable, withheld = restrict_delete_candidates_for_apply(
+            groups, unevidenced_categories={_OS},
+        )
+
+        assert withheld[0]['reason'] == (
+            'ann_chained_without_lexical_span_or_ann_clique'
+        )
+
+    def test_default_is_no_unevidenced_category(self):
+        """Every pre-3357 caller keeps its exact behaviour."""
+        groups = [_grp(['a', 'b'], ['b'], ann_clique=True, category=_OS)]
+        assert restrict_delete_candidates_for_apply(groups) == (['b'], [])
+
+    def test_the_report_still_lists_every_cluster(self):
+        """Only the irreversible path narrows; detection coverage is unchanged."""
+        memories = [
+            _memory('m1', 'alpha one', created_at='2026-01-01T00:00:00+00:00',
+                    category=_OS),
+            _memory('m2', 'beta two', created_at='2026-01-02T00:00:00+00:00',
+                    category=_OS),
+        ]
+
+        plan = build_sweep_plan(
+            memories, threshold=0.99, categories=(_OS,),
+            ann_pairs=[(0, 1)], ann_scores={(0, 1): 0.95}, ann_threshold=0.9,
+            ann_threshold_by_category={_OS: 0.9},
+            unevidenced_categories={_OS},
+        )
+
+        assert plan['clusters_total'] == 1
+        assert plan['delete_candidates'] == ['m2'], (
+            'the dry-run report still shows what the detectors found'
+        )
+        assert plan['apply_delete_candidates'] == [], 'but --apply may not act'
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_cutoff_not_evidenced_for_category'
+        )
+
+
 class TestBuildSweepPlanApplyGateFlags:
     """build_sweep_plan measures the evidence the gate then judges."""
 
@@ -3718,13 +3811,64 @@ class TestRunApplyAnnOnlyClusters:
     _MID = '2026-01-02T00:00:00+00:00'
     _NEW = '2026-01-03T00:00:00+00:00'
 
-    async def _invoke(self, monkeypatch, raw, ann_hits, tmp_path, *argv):
-        _install_run_doubles(monkeypatch, raw, ann_hits=ann_hits)
+    async def _invoke(self, monkeypatch, raw, ann_hits, tmp_path, *argv,
+                      t_high_by_category=None):
+        _install_run_doubles(
+            monkeypatch, raw, ann_hits=ann_hits,
+            t_high_by_category=t_high_by_category,
+        )
         args = _build_parser().parse_args([
             '--project-id', 'p', '--metrics-root', str(tmp_path), '--apply',
             '--threshold', '0.99', *argv,
         ])
         return await _run(args), _FakeMemoryService.instances[-1]
+
+    async def _clique_raw(self, category):
+        return {category: [
+            _raw('m1', 'alpha one', self._OLD, category=category,
+                 vector=[1.0, 0.0]),
+            _raw('m2', 'beta two', self._MID, category=category,
+                 vector=[0.0, 1.0]),
+        ]}
+
+    _CLIQUE_HITS = {(1.0, 0.0): [('m2', 0.95)], (0.0, 1.0): [('m1', 0.95)]}
+
+    async def test_a_clique_in_a_pooled_fallback_category_is_reported_not_deleted(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """The task's named harm, end to end.
+
+        observations_and_summaries has no cutoff of its own, so this clique
+        cleared a number measured on a different population. Formulaic
+        session recaps look alike; deletion is irreversible. Report it,
+        withhold it.
+        """
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_OS), self._CLIQUE_HITS, tmp_path,
+            t_high_by_category={_PK: 0.9},
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert rc == 0
+        assert plan['clusters_total'] == 1, 'still detected and reported'
+        assert plan['delete_candidates'] == ['m2']
+        assert service.deleted == [], 'an un-evidenced cutoff may not delete'
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_cutoff_not_evidenced_for_category'
+        )
+
+    async def test_the_same_clique_in_a_calibrated_category_still_deletes(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Same shape, evidenced cutoff — 3210's coverage is not reverted."""
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_PK), self._CLIQUE_HITS, tmp_path,
+            t_high_by_category={_PK: 0.9},
+        )
+        capsys.readouterr()
+
+        assert rc == 0
+        assert service.deleted == ['m2']
 
     async def test_an_ann_only_clique_deletes_its_losers_and_keeps_the_survivor(
         self, monkeypatch, tmp_path, capsys,
