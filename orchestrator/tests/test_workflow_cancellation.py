@@ -1169,3 +1169,116 @@ class TestMakeWedgeHelper:
         finally:
             t_b.cancel()
             await asyncio.wait({t_b}, timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
+
+
+def _done_task(result: object) -> asyncio.Task:
+    """A Task that resolves to *result* almost immediately.
+
+    Lets :class:`TestAssertCancelReportHelper` build a fake "just-finished
+    run()" task without a real cancellation dance — helper-local to these
+    contract tests, not one of the two extracted helpers itself.
+    """
+
+    async def _return_it() -> object:
+        return result
+
+    return asyncio.create_task(_return_it())
+
+
+@pytest.mark.asyncio
+class TestAssertCancelReportHelper:
+    """Contract tests for the ``_assert_cancel_report`` helper.
+
+    The negative cases are the load-bearing part of this class: an
+    assertion helper that silently asserts nothing would make BOTH
+    TestRunSingleCatchHardCancel and TestSoftCancelCoversNewAwait pass
+    vacuously after the step-5/6 extraction, invisibly weakening the suite.
+    Pinning that the helper actually RAISES on each of the five ways a
+    cancel exit can go wrong is what makes the extraction safe.
+
+    Deliberately NOT tested here: the "run() task did not finish within
+    Ns" branch. Exercising it costs a real CANCEL_SCOPE_BARRIER_TIMEOUT
+    (45s) wait, which is exactly the kind of multi-second unconditional
+    sleep task 3307 retired from this module (see the comment block above
+    test_cancel_scope_barrier_timeout_never_narrowed). This omission is
+    deliberate, not an oversight.
+    """
+
+    @pytest.mark.parametrize('outcome', [WorkflowOutcome.CANCELLED, WorkflowOutcome.SOFT_CANCELLED])
+    async def test_returns_the_report_on_a_clean_cancelled_exit(self, outcome):
+        report = TerminalReport(
+            outcome=outcome,
+            reason='r',
+            phase=WorkflowState.CANCELLED,
+            detail='d',
+            category=None,
+        )
+        run_task = _done_task(report)
+        workflow = SimpleNamespace(machine=SimpleNamespace(state=WorkflowState.CANCELLED))
+
+        result = await _assert_cancel_report(run_task, workflow, outcome)
+
+        assert result is report, 'the helper must return the SAME report object, not a copy'
+
+    async def test_raises_when_run_task_ended_cancelled(self):
+        async def _never() -> TerminalReport:
+            await asyncio.sleep(3600)
+            raise AssertionError('unreachable — the task must be cancelled before the sleep returns')
+
+        run_task = asyncio.create_task(_never())
+        await asyncio.sleep(0)  # let it actually start before cancelling
+        run_task.cancel()
+        await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
+        workflow = SimpleNamespace(machine=SimpleNamespace(state=WorkflowState.CANCELLED))
+
+        with pytest.raises(AssertionError, match='CANCELLED'):
+            await _assert_cancel_report(run_task, workflow, WorkflowOutcome.CANCELLED)
+
+    async def test_raises_on_outcome_mismatch(self):
+        report = TerminalReport(
+            outcome=WorkflowOutcome.CANCELLED,
+            reason='r',
+            phase=WorkflowState.CANCELLED,
+            detail='d',
+            category=None,
+        )
+        run_task = _done_task(report)
+        workflow = SimpleNamespace(machine=SimpleNamespace(state=WorkflowState.CANCELLED))
+
+        with pytest.raises(AssertionError):
+            await _assert_cancel_report(run_task, workflow, WorkflowOutcome.SOFT_CANCELLED)
+
+    async def test_raises_when_machine_state_is_not_cancelled(self):
+        report = TerminalReport(
+            outcome=WorkflowOutcome.CANCELLED,
+            reason='r',
+            phase=WorkflowState.CANCELLED,
+            detail='d',
+            category=None,
+        )
+        run_task = _done_task(report)
+        workflow = SimpleNamespace(machine=SimpleNamespace(state=WorkflowState.VERIFY))
+
+        with pytest.raises(AssertionError):
+            await _assert_cancel_report(run_task, workflow, WorkflowOutcome.CANCELLED)
+
+    async def test_raises_when_report_phase_is_not_cancelled(self):
+        report = TerminalReport(
+            outcome=WorkflowOutcome.CANCELLED,
+            reason='r',
+            phase=WorkflowState.BLOCKED,
+            detail='d',
+            category=None,
+        )
+        run_task = _done_task(report)
+        workflow = SimpleNamespace(machine=SimpleNamespace(state=WorkflowState.CANCELLED))
+
+        with pytest.raises(AssertionError):
+            await _assert_cancel_report(run_task, workflow, WorkflowOutcome.CANCELLED)
+
+    async def test_raises_when_result_is_not_a_terminal_report(self):
+        run_task = _done_task(None)
+        workflow = SimpleNamespace(machine=SimpleNamespace(state=WorkflowState.CANCELLED))
+
+        with pytest.raises(AssertionError):
+            await _assert_cancel_report(run_task, workflow, WorkflowOutcome.CANCELLED)
