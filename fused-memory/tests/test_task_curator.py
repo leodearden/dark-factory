@@ -3909,10 +3909,10 @@ def _make_config_with_blocklist(blocklist_path_str: str) -> FusedMemoryConfig:
 
 @pytest.mark.asyncio
 class TestCuratorBlocklistShortCircuit:
-    """Tests that a blocklist match returns drop BEFORE corpus/LLM calls."""
+    """Tests that a blocklist match returns a refusal BEFORE corpus/LLM calls."""
 
     async def test_blocklist_match_returns_drop_without_llm(self, tmp_path):
-        """(a) curate() returns drop with blocklist justification prefix."""
+        """(a) curate() returns action='refuse' with the blocklist justification prefix."""
         blocklist = _make_blocklist_yaml(
             tmp_path,
             title_subs=["search-then-delete", "fix c"],
@@ -3931,7 +3931,7 @@ class TestCuratorBlocklistShortCircuit:
              patch.object(curator, "_pre_llm_exact_match", new=AsyncMock(side_effect=AssertionError("_pre_llm_exact_match must not be called"))) as mock_exact:
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
-        assert decision.action == "drop"
+        assert decision.action == "refuse"
         assert decision.justification.startswith("cancelled-premise-blocklist:")
         mock_corpus.assert_not_called()
         mock_llm.assert_not_called()
@@ -3957,7 +3957,7 @@ class TestCuratorBlocklistShortCircuit:
         payload_hash = candidate.payload_hash()
         assert payload_hash in curator._decision_cache
         cached_dec, _ = curator._decision_cache[payload_hash]
-        assert cached_dec.action == "drop"
+        assert cached_dec.action == "refuse"
         assert cached_dec.justification == decision.justification
 
     async def test_blocklist_non_matching_candidate_falls_through(self, tmp_path):
@@ -4057,11 +4057,11 @@ class TestCuratorBatchBlocklistShortCircuit:
         # (a) Three decisions returned, one per prepared candidate
         assert len(decisions) == 3
 
-        # (b) decisions[0] is a blocklist drop — NOT a batch_target_index drop
-        assert decisions[0].action == "drop"
+        # (b) decisions[0] is a blocklist REFUSAL — NOT a batch_target_index drop
+        assert decisions[0].action == "refuse"
         assert decisions[0].justification.startswith("cancelled-premise-blocklist:")
         assert decisions[0].batch_target_index is None, (
-            "blocklist drops are real drops, not sibling-substitution drops"
+            "blocklist refusals create nothing; they are not sibling-substitution drops"
         )
 
         # (c) LLM was called with only candidates[1] and [2], not [0]
@@ -4638,12 +4638,12 @@ def _make_config_with_premise_registry(registry_path_str: str) -> FusedMemoryCon
 
 @pytest.mark.asyncio
 class TestCuratorPremiseRefutedDrop:
-    """Tests that a recon code-fix premise refuted by live source returns drop
+    """Tests that a recon code-fix premise refuted by live source returns a refusal
     BEFORE corpus/LLM calls. Mirrors TestCuratorBlocklistShortCircuit.
     """
 
     async def test_premise_refuted_returns_drop_without_llm(self, tmp_path):
-        """(a)+(b) curate() returns drop with recon-premise-refuted justification;
+        """(a)+(b) curate() returns action='refuse' with the recon-premise-refuted justification;
         taskmaster/LLM path is NOT invoked (pre-LLM drop)."""
         source_root = tmp_path / "source_root"
         source_root.mkdir()
@@ -4672,7 +4672,7 @@ class TestCuratorPremiseRefutedDrop:
              patch.object(curator, "_pre_llm_exact_match", new=AsyncMock(side_effect=AssertionError("_pre_llm_exact_match must not be called"))) as mock_exact:
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
-        assert decision.action == "drop"
+        assert decision.action == "refuse"
         assert decision.justification.startswith("recon-premise-refuted:")
         assert "test_premise_entry" in decision.justification
         mock_corpus.assert_not_called()
@@ -4680,8 +4680,8 @@ class TestCuratorPremiseRefutedDrop:
         mock_exact.assert_not_called()
 
     async def test_premise_refuted_drop_not_stored_in_cache(self, tmp_path):
-        """The recon-premise-refuted drop is deliberately NOT stored in
-        _decision_cache — unlike the blocklist's unconditional forever-drop,
+        """The recon-premise-refuted refusal is deliberately NOT stored in
+        _decision_cache — unlike the blocklist's unconditional forever-refusal,
         this guard must re-verify live source on every call so it self-corrects
         the moment the source stops refuting the premise. Caching the drop would
         let a stale decision suppress a genuinely-fixed premise for up to
@@ -4708,7 +4708,7 @@ class TestCuratorPremiseRefutedDrop:
 
         decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
-        assert decision.action == "drop"
+        assert decision.action == "refuse"
         assert decision.justification.startswith("recon-premise-refuted:")
         assert candidate.payload_hash() not in curator._decision_cache
 
@@ -4749,7 +4749,7 @@ class TestCuratorPremiseRefutedDrop:
                    new=AsyncMock(return_value=create_result)):
             decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
 
-            assert decision1.action == "drop"
+            assert decision1.action == "refuse"
             assert decision1.justification.startswith("recon-premise-refuted:")
             assert candidate.payload_hash() not in curator._decision_cache
 
@@ -4917,11 +4917,11 @@ class TestCuratorBatchPremiseRefutedDrop:
         # (a) Two decisions returned, one per prepared candidate
         assert len(decisions) == 2
 
-        # (b) decisions[0] is a recon-premise-refuted drop — NOT a batch_target_index drop
-        assert decisions[0].action == "drop"
+        # (b) decisions[0] is a recon-premise-refuted REFUSAL — NOT a batch_target_index drop
+        assert decisions[0].action == "refuse"
         assert decisions[0].justification.startswith("recon-premise-refuted:")
         assert decisions[0].batch_target_index is None, (
-            "premise-refuted drops are real drops, not sibling-substitution drops"
+            "premise-refuted refusals create nothing; they are not sibling-substitution drops"
         )
 
         # (c) LLM was called with only candidates[1], not [0]
@@ -5046,8 +5046,8 @@ class TestCuratorBatchPremiseRefutedDrop:
                 prepared, project_id="p", project_root="/x"
             )
 
-            # c0 is dropped pre-LLM; only the ordinary c1 reaches the mocked LLM.
-            assert decisions1[0].action == "drop"
+            # c0 is refused pre-LLM; only the ordinary c1 reaches the mocked LLM.
+            assert decisions1[0].action == "refuse"
             assert decisions1[0].justification.startswith("recon-premise-refuted:")
             assert decisions1[1].action == "create"
             assert len(llm_candidates_received) == 1
@@ -5396,7 +5396,7 @@ class TestCuratorCurateRouteDeterministicIntegration:
              patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))):
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
-        assert decision.action == "drop"
+        assert decision.action == "refuse"
         assert decision.justification.startswith("cancelled-premise-blocklist:")
 
     async def test_exact_match_dedup_takes_precedence_over_route(self, tmp_path):
@@ -5526,7 +5526,7 @@ class TestCuratorBatchRouteDeterministic:
 
     async def test_batch_blocklist_precedence_over_route(self, tmp_path):
         """(b) Within a batch, a candidate matching BOTH the blocklist and the
-        operational registry resolves to the blocklist drop, not route."""
+        operational registry resolves to the blocklist refusal, not route."""
         from fused_memory.middleware.task_curator import PreparedCandidate
 
         blocklist = _make_blocklist_yaml(
@@ -5576,7 +5576,7 @@ class TestCuratorBatchRouteDeterministic:
                 prepared, project_id="p", project_root="/x"
             )
 
-        assert decisions[0].action == "drop"
+        assert decisions[0].action == "refuse"
         assert decisions[0].justification.startswith("cancelled-premise-blocklist:")
         assert len(llm_candidates_received) == 1
         assert llm_candidates_received[0] is c1

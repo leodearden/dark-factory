@@ -111,7 +111,15 @@ class CuratorFailureError(RuntimeError):
         self.cost_usd = cost_usd
 
 
-Action = Literal['drop', 'combine', 'create', 'route_deterministic']
+# 'drop', 'combine' and 'create' are the only actions the LLM may request — see
+# CURATOR_OUTPUT_SCHEMA / CURATOR_BATCH_OUTPUT_SCHEMA below, whose enums stay
+# exactly those three. 'route_deterministic' and 'refuse' are DETERMINISTIC-ONLY
+# verdicts, reachable solely from a `_maybe_*` guard backed by an
+# operator-curated YAML registry; the model must never be able to emit either.
+# 'refuse' in particular means "this candidate's premise is dead — create
+# NOTHING", which is deliberately distinct from 'drop' ("fold into existing
+# target task N", which requires a target).
+Action = Literal['drop', 'combine', 'create', 'route_deterministic', 'refuse']
 
 _STATUS_RANK = {
     'pending': 0,
@@ -871,7 +879,14 @@ class TaskCurator:
     async def _maybe_blocklist_drop(
         self, candidate: CandidateTask, payload_hash: str,
     ) -> CuratorDecision | None:
-        """Return a drop decision if the candidate matches the cancelled-premise blocklist.
+        """Return a REFUSAL decision if the candidate matches the cancelled-premise blocklist.
+
+        The returned decision is ``action='refuse'`` — a deterministic verdict
+        that creates NOTHING. It is deliberately not ``action='drop'``: a drop
+        means "fold this into existing target task N" and carries a
+        ``target_id``, so a targetless drop is inert at the dispatch chokepoint
+        (``TaskInterceptor._dispatch_ticket_decision``) and fails open into
+        creating the very candidate this guard exists to reject.
 
         Lazy-loads the blocklist from ``self._config.curator.cancelled_premise_blocklist_path``
         on the first call and caches it for the lifetime of this :class:`TaskCurator`
@@ -919,7 +934,7 @@ class TaskCurator:
             return None
 
         decision = CuratorDecision(
-            action='drop',
+            action='refuse',
             target_id=None,
             target_fingerprint=None,
             rewritten_task=None,
@@ -929,7 +944,8 @@ class TaskCurator:
         )
         self._store_cache(payload_hash, decision)
         logger.info(
-            'task_curator: blocklist drop entry=%s candidate=%r',
+            'task_curator: blocklist refusal (no task will be created) '
+            'entry=%s candidate=%r',
             entry.name, candidate.title,
         )
         return decision
@@ -937,7 +953,11 @@ class TaskCurator:
     async def _maybe_premise_refuted_drop(
         self, candidate: CandidateTask, payload_hash: str,
     ) -> CuratorDecision | None:
-        """Return a drop decision if the candidate's premise is refuted by live source.
+        """Return a REFUSAL decision if the candidate's premise is refuted by live source.
+
+        The returned decision is ``action='refuse'`` — a deterministic verdict
+        that creates NOTHING (see :meth:`_maybe_blocklist_drop` for why this is
+        not ``action='drop'``).
 
         Lazy-loads the registry from
         ``self._config.curator.recon_code_fix_premise_registry_path`` on the first
@@ -945,9 +965,9 @@ class TaskCurator:
         :class:`TaskCurator` instance (no hot-reload; a server restart is required
         to pick up YAML changes). The live source/test re-verification itself is
         NOT cached — it re-reads the cited files on every call, so the guard is
-        self-correcting. Unlike ``_maybe_blocklist_drop``, the resulting drop
+        self-correcting. Unlike ``_maybe_blocklist_drop``, the resulting REFUSAL
         DECISION is also deliberately NOT written to the idempotency cache
-        (``self._decision_cache``): caching it would let a stale drop resurface
+        (``self._decision_cache``): caching it would let a stale refusal resurface
         via ``_check_cache`` for up to ``idempotency_ttl_seconds`` after the
         cited source stops refuting the premise, silently suppressing a
         genuinely-fixed bug-fix task. ``payload_hash`` is accepted only for
@@ -1000,7 +1020,7 @@ class TaskCurator:
             return None
 
         decision = CuratorDecision(
-            action='drop',
+            action='refuse',
             target_id=None,
             target_fingerprint=None,
             rewritten_task=None,
@@ -1013,7 +1033,8 @@ class TaskCurator:
         # premise, so every call re-verifies live source rather than trusting a
         # cached decision for the idempotency TTL.
         logger.info(
-            'task_curator: recon-premise-refuted drop entry=%s candidate=%r',
+            'task_curator: recon-premise-refuted refusal (no task will be created) '
+            'entry=%s candidate=%r',
             entry.name, candidate.title,
         )
         return decision
