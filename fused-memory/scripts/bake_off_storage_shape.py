@@ -114,7 +114,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2231,7 +2233,26 @@ DEFAULT_SEARCH_LIMIT = 10
 #: for the baseline alone and bias the column the other way.
 #: The replay still happens at :data:`GUARD_TOP_K`, which ``guard_adequacy``
 #: enforces itself.
+#:
+#: This is the FLOOR, not the depth: it pays for the one removal the
+#: status-quo arm makes.  A decomposed arm removes one record PER CLAIM the
+#: probe was split into (up to four), so the depth is computed per probe by
+#: :func:`guard_fetch_limit`.  A fixed +1 would leave a decomposed arm
+#: replaying over a 2-record window while the baseline replayed over 5 —
+#: the same unequal-window defect the query side was fixed for, biased
+#: against exactly the two arms this experiment is arbitrating in favour of.
 GUARD_FETCH_LIMIT = GUARD_TOP_K + 1
+
+
+def guard_fetch_limit(own_record_ids: set[str]) -> int:
+    """Fetch depth that still leaves :data:`GUARD_TOP_K` after the self-drop.
+
+    The replay window must be the SAME SIZE for every arm, or the guard
+    column measures how finely an arm was decomposed rather than how well it
+    guards.  So the depth grows with the number of records the probe's own
+    content occupies in THIS arm.
+    """
+    return GUARD_TOP_K + len(own_record_ids)
 
 #: Agent id every seeded record is written under.
 SEED_AGENT_ID = 'e2-bakeoff-seed'
@@ -2555,10 +2576,10 @@ async def fetch_arm(
 
     fetched_probes: dict[str, list[ScoredHit]] = {}
     for cluster_id, probe in probes:
-        raw = await _search(
-            backend, seeded, probe['content'], limit=GUARD_FETCH_LIMIT,
-        )
         own = probe_own_record_ids(seeded, probe['memory_id'])
+        raw = await _search(
+            backend, seeded, probe['content'], limit=guard_fetch_limit(own),
+        )
         fetched_probes[cluster_id] = [
             hit for hit in raw if hit.record.record_id not in own
         ]
@@ -2744,7 +2765,14 @@ def measure_arm(
     for cluster_id, _probe in probes:
         probe_hits = fetched['probes'][cluster_id]
         window = _window(probe_hits, GUARD_TOP_K)
-        rescored = rescore(window, probe_hits)
+        # The SAME slice both times.  `rescore` builds `best_child` by
+        # iterating everything it is handed, so passing the full fetched list
+        # here lets a child OUTSIDE the replayed top-5 donate its score to a
+        # grouped document inside it — booking a `guard_matched` production,
+        # whose pre-check runs at limit=5, structurally could not produce.
+        # The leak happens before `guard_adequacy`'s defensive window, so
+        # that window cannot catch it.
+        rescored = rescore(window, probe_hits[:GUARD_TOP_K])
         for scored in rescored[:GUARD_TOP_K]:
             if max_observed_score is None or scored.relevance_score > max_observed_score:
                 max_observed_score = scored.relevance_score
@@ -2916,6 +2944,28 @@ async def run_bake_off(
         openai_provider.api_key = None
     qdrant_url = config.mem0.qdrant_url
 
+    # NEVER let this run attach to the shared durable write queue.
+    #
+    # `MemoryService.initialize()` is not a mem0-only spin-up: it builds a
+    # `DurableWriteQueue` on `config.queue.data_dir`, which defaults to a
+    # RELATIVE path (`./data/queue`).  Run from the repo root — the natural
+    # cwd — that is the very queue DB the live fused-memory server is using.
+    # Initialising it would run `_recover_in_flight()`, flipping the other
+    # process's in-flight rows back to pending, and start workers that drain
+    # real user writes through `memory.mem0` — the backend whose
+    # `collection_prefix` was just repointed at `_test_e2_bakeoff_*`.  Those
+    # writes would land in this experiment's ephemeral collections, be marked
+    # completed in the shared queue, and then be destroyed by the
+    # `drop_collections` in the `finally` below: silent data loss on the
+    # production memory store, invisible in the artifact and the logs.
+    #
+    # A per-run temp dir is used rather than dropping to a bare `Mem0Backend`
+    # because `resolve_guard_threshold` navigates the SERVICE to find the
+    # threshold production would really run at, and hard-coding or defaulting
+    # that number is what its docstring exists to forbid.
+    queue_dir = tempfile.mkdtemp(prefix='e2-bakeoff-queue-')
+    config.queue.data_dir = queue_dir
+
     drop_collections(collections.values(), qdrant_url=qdrant_url)
     memory = MemoryService(config)
     await memory.initialize()
@@ -2939,6 +2989,7 @@ async def run_bake_off(
     finally:
         await memory.close()
         drop_collections(collections.values(), qdrant_url=qdrant_url)
+        shutil.rmtree(queue_dir, ignore_errors=True)
 
     return build_report(
         arms=arms,
@@ -2955,7 +3006,11 @@ async def run_bake_off(
             'distractor_slab_size': len(distractors),
             'embedder_model': config.embedder.model,
             'search_limit': limit,
-            'guard_fetch_limit': GUARD_FETCH_LIMIT,
+            # The FLOOR.  The live depth is per-probe-per-arm
+            # (`guard_fetch_limit`), because a decomposed arm has to over-fetch
+            # by the number of records its probe was split into to leave the
+            # same GUARD_TOP_K replay window every other arm gets.
+            'guard_fetch_limit_floor': GUARD_FETCH_LIMIT,
             'guard_replay_window': GUARD_TOP_K,
             'seed_concurrency': seed_concurrency,
             'clusters_measured': len(clusters),

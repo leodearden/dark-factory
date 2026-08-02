@@ -2839,7 +2839,7 @@ import copy  # noqa: E402
 
 
 class _FakeConfig(types.SimpleNamespace):
-    """A config with the four leaves the driver reads, plus ``model_copy``.
+    """A config with the leaves the driver reads, plus ``model_copy``.
 
     ``model_copy(deep=True)`` is the seam that keeps the driver from mutating
     the caller's config in place — so the double has to implement it for real
@@ -2863,6 +2863,11 @@ def _driver_config() -> _FakeConfig:
                 openai=types.SimpleNamespace(api_key='sk-fake-must-be-cleared'),
             ),
         ),
+        # The SHARED durable-write-queue path, as it comes out of the schema:
+        # relative, so from the repo root it resolves onto the live server's
+        # own queue DB.  The driver must repoint it at a per-run temp dir
+        # before `MemoryService.initialize()` can attach to it.
+        queue=types.SimpleNamespace(data_dir='./data/queue'),
     )
 
 
@@ -3167,7 +3172,7 @@ class TestRunBakeOffWiring:
         assert len(issued) == len(set(issued))          # no query issued twice
         assert len({project_id for project_id, _ in issued}) == 3
 
-    async def test_the_guard_probe_over_fetches_by_exactly_one_slot(
+    async def test_the_guard_probe_over_fetches_to_cover_its_own_removal(
         self, monkeypatch,
     ):
         """The probing write's own record has to leave its own guard window:
@@ -3175,17 +3180,59 @@ class TestRunBakeOffWiring:
         arm (a) stores it verbatim — leaving it in would hand the BASELINE a
         free ~1.0 self-match the peer arms structurally cannot get, and the
         table would read that as arm (a) having the better guard.  Dropping it
-        costs a slot, so the fetch is one deeper; the replay itself still
-        happens at GUARD_TOP_K, which `guard_adequacy` enforces on its own
-        (server/tools.py:1556 runs production's pre-check at limit=5)."""
+        costs a slot, so the fetch is deeper — by the number of records the
+        probe's own content occupies in THIS arm, which the decomposed arms
+        split into several.  A fixed +1 would leave them replaying over a
+        2-record window while the baseline replayed over 5.  The replay itself
+        still happens at GUARD_TOP_K, which `guard_adequacy` enforces on its
+        own (server/tools.py:1556 runs production's pre-check at limit=5)."""
         mod = _mod()
         _install_driver_doubles(monkeypatch)
 
         await mod.run_bake_off(**_SMALL_RUN)
 
         limits = {limit for _, _, limit in _FakeMemoryService.instances[-1].mem0.searches}
-        assert mod.GUARD_FETCH_LIMIT == mod.GUARD_TOP_K + 1
-        assert limits == {mod.GUARD_FETCH_LIMIT, mod.DEFAULT_SEARCH_LIMIT}
+        assert mod.GUARD_FETCH_LIMIT == mod.GUARD_TOP_K + 1     # the FLOOR
+        assert mod.guard_fetch_limit(set()) == mod.GUARD_TOP_K
+        assert mod.guard_fetch_limit({'a', 'b', 'c'}) == mod.GUARD_TOP_K + 3
+        # Every probe limit clears the floor, and at least one arm fetched
+        # DEEPER than the floor — otherwise the dynamic depth is untested.
+        probe_limits = limits - {mod.DEFAULT_SEARCH_LIMIT}
+        assert probe_limits
+        assert min(probe_limits) >= mod.GUARD_FETCH_LIMIT
+        assert max(probe_limits) > mod.GUARD_FETCH_LIMIT
+
+    async def test_every_arms_replay_window_is_at_least_GUARD_TOP_K_deep(
+        self, monkeypatch,
+    ):
+        """The two invariants — drop ALL of the probe's own records, and
+        replay over 5 — are enforced in different places and drifted apart
+        once already (the fixed +1).  Tie them together: for EVERY arm and
+        EVERY probe, what survives the self-drop must still be 5 deep, or the
+        guard column measures how finely an arm was decomposed rather than
+        how well it guards."""
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+
+        for shape in ('status_quo', 'c_peers', 'b_grouped'):
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+            for cluster_id in sorted(clusters):
+                probe = mod.select_probing_write(clusters[cluster_id])
+                if probe is None:
+                    continue
+                own = mod.probe_own_record_ids(seeded, probe['memory_id'])
+                depth = mod.guard_fetch_limit(own)
+                # A store returning a FULL page of `depth` hits is the best
+                # case; after dropping every own record it must still leave a
+                # full GUARD_TOP_K window for the replay.
+                assert depth - len(own) >= mod.GUARD_TOP_K, (
+                    f'{shape}/{cluster_id}: fetch depth {depth} minus '
+                    f'{len(own)} own records leaves fewer than '
+                    f'{mod.GUARD_TOP_K} for the replay'
+                )
 
     async def test_the_probing_write_is_never_its_own_guard_match(
         self, monkeypatch,
@@ -3682,6 +3729,45 @@ class TestRescoreAgreesWithTheRankTheGroupedReadGave:
         )
 
         assert verdict['guard_matched'] is True
+
+    def test_a_child_outside_the_replay_window_cannot_donate_its_score(self):
+        """The mirror of the test above, and the boundary between them.
+
+        `rescore` builds `best_child` by iterating everything it is HANDED, so
+        handing it the full fetched list while the window was truncated to 5
+        lets hit #6 donate its score to a group inside the window.  The arm
+        then books a `guard_matched` that production — whose pre-check runs at
+        limit=5 — structurally could not produce.  `guard_adequacy`'s own
+        defensive window cannot catch this: the leak happens upstream of it.
+        """
+        mod = _mod()
+        canonical = _rec('canon', topic='t', claim_ids=['k0'])
+        fillers = [_rec(f'f{i}', topic='other', claim_ids=[f'f{i}']) for i in range(4)]
+        # Rank 6 — one past the k=5 replay window — and scoring high enough to
+        # clear the 0.92 threshold if it were ever allowed to count.
+        outsider = _rec('kid', topic='t', parent_id='canon', claim_ids=['k1'])
+        hits = (
+            [_sh(canonical, 0.30)]
+            + [_sh(filler, 0.29) for filler in fillers]
+            + [_sh(outsider, 0.95)]
+        )
+        seeded = _seeded(
+            'b_grouped', [canonical, *fillers, outsider],
+            canonical_by_cluster={'c1': 'canon'},
+            siblings_by_cluster={'c1': {'canon', 'kid'}},
+        )
+
+        window = mod.read_path(seeded, hits, mod.GUARD_TOP_K, pin=False)
+        leaky = mod.guard_adequacy(
+            mod.rescore(window, hits), {'canon', 'kid'}, 0.92,
+        )
+        honest = mod.guard_adequacy(
+            mod.rescore(window, hits[:mod.GUARD_TOP_K]), {'canon', 'kid'}, 0.92,
+        )
+
+        # The fixture is only meaningful if the leak is reachable at all.
+        assert leaky['guard_matched'] is True
+        assert honest['guard_matched'] is False
 
 
 class TestCanonicalRankIsNotCensoredByTheReadWindow:
