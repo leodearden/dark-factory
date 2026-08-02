@@ -263,3 +263,216 @@ def test_registry_matches_setup_host_cp_lines():
         "installed-but-unchecked: it can drift forever while this gate "
         "reports green."
     )
+
+
+# ---------------------------------------------------------------------------
+# compare_unit — full symmetric directive equality  (step-5 / step-6)
+# ---------------------------------------------------------------------------
+
+_BASE_TIMER = """\
+[Unit]
+Description=Orchestrator escalation-MCP health probe (every 60s)
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _drift_keys(drifts) -> list[tuple[str, str]]:
+    """Reduce a Drift list to comparable (section, key) pairs."""
+    return [(d.section, d.key) for d in drifts]
+
+
+def test_identical_texts_report_no_drift():
+    """Byte-identical copies are parity, full stop."""
+    checker = _load_checker()
+
+    assert checker.compare_unit("u.timer", _BASE_TIMER, _BASE_TIMER) == []
+
+
+def test_differing_value_is_reported_with_both_sides():
+    """A directive present on both sides with different VALUES is drift.
+
+    Value comparison is what catches present-but-WRONG. A presence-only check
+    would wave through an installed TimeoutStartSec=300 against a committed
+    1800 — the bound would look enforced and be four minutes short of a
+    half-hour.
+    """
+    checker = _load_checker()
+
+    repo = "[Service]\nTimeoutStartSec=1800\n"
+    installed = "[Service]\nTimeoutStartSec=300\n"
+
+    drifts = checker.compare_unit("u.service", repo, installed)
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.unit == "u.service"
+    assert drift.section == "Service"
+    assert drift.key == "TimeoutStartSec"
+    assert drift.repo_value == "1800"
+    assert drift.installed_value == "300"
+    assert "differ" in drift.reason
+
+
+def test_directive_only_in_repo_copy_is_drift():
+    """A committed directive missing from the installed copy is drift.
+
+    This is the measured task-3392 case: the committed watchdog service gained
+    TimeoutStartSec=1800 and the installed copy never did, so a whole-tick
+    bound on the fleet probe was inert on this host for the entire time it
+    appeared to be in force.
+    """
+    checker = _load_checker()
+
+    repo = "[Service]\nType=oneshot\nTimeoutStartSec=1800\n"
+    installed = "[Service]\nType=oneshot\n"
+
+    drifts = checker.compare_unit("u.service", repo, installed)
+
+    assert _drift_keys(drifts) == [("Service", "TimeoutStartSec")]
+    assert drifts[0].repo_value == "1800"
+    assert drifts[0].installed_value == checker._ABSENT
+    assert "absent from the installed copy" in drifts[0].reason
+
+
+def test_directive_only_in_installed_copy_is_drift():
+    """An INSTALLED-only directive is drift — the case curation cannot see.
+
+    This is the whole reason the rule here is full symmetric equality rather
+    than the curated (section, key) registry check_dashboard_unit_parity.py
+    uses. A curated key list can only ever contain keys someone thought to
+    register, so it is structurally blind to a directive that exists ONLY on
+    the installed side.
+
+    The fixture is the real measured case: the installed
+    orchestrator-watchdog.timer carries AccuracySec=5s and no committed copy
+    ever has. systemd's default AccuracySec is 1min, so propagating the
+    committed timer without noticing this would have widened the 60s probe's
+    elapse window from [60s, 65s] to [60s, 120s] — a supervision regression
+    shipped as a "parity fix". A registry-based checker would have reported
+    green on it.
+    """
+    checker = _load_checker()
+
+    repo = "[Timer]\nOnUnitActiveSec=60\n"
+    installed = "[Timer]\nOnUnitActiveSec=60\nAccuracySec=5s\n"
+
+    drifts = checker.compare_unit("u.timer", repo, installed)
+
+    assert _drift_keys(drifts) == [("Timer", "AccuracySec")]
+    assert drifts[0].repo_value == checker._ABSENT
+    assert drifts[0].installed_value == "5s"
+    assert "absent from the repo copy" in drifts[0].reason
+
+
+def test_comment_only_divergence_is_not_drift():
+    """Comments and blank lines must NOT fire the gate.
+
+    Task 3392 added ~35 comment lines to the committed watchdog service. If a
+    comment reflow reported as drift, the gate would fire on edits that change
+    nothing systemd reads — and a gate nobody believes is worse than no gate.
+    This is the credibility cost that curation exists to avoid, paid by the
+    parser instead, which is what lets the comparison itself stay unbounded.
+    """
+    checker = _load_checker()
+
+    repo = (
+        "# Rewritten by task 3392 to bound the whole tick.\n"
+        "# The probe may block on a slow socket; without this the unit\n"
+        "# could hang indefinitely.\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "\n"
+        "TimeoutStartSec=1800\n"
+    )
+    installed = (
+        "[Service]\n"
+        "; a semicolon-style comment, the other spelling systemd accepts\n"
+        "Type=oneshot\n"
+        "TimeoutStartSec=1800\n"
+    )
+
+    assert checker.compare_unit("u.service", repo, installed) == []
+
+
+def test_changed_occurrence_count_of_a_repeated_directive_is_drift():
+    """A repeated directive losing an occurrence is drift.
+
+    systemd APPLIES every occurrence of Environment=, so comparing only the
+    first value would wave through a dropped variable. The comparison is over
+    the whole values LIST for that reason.
+    """
+    checker = _load_checker()
+
+    repo = "[Service]\nEnvironment=A=1\nEnvironment=B=2\n"
+    installed = "[Service]\nEnvironment=A=1\n"
+
+    drifts = checker.compare_unit("u.service", repo, installed)
+
+    assert _drift_keys(drifts) == [("Service", "Environment")]
+    # Both sides declare the key, so neither renders as <absent> — the
+    # difference is in the list, and the report must show both lists.
+    assert "B=2" in drifts[0].repo_value
+    assert drifts[0].installed_value != checker._ABSENT
+
+
+def test_same_key_in_different_sections_is_not_conflated():
+    """[Unit] Description and [Timer] Description are different directives.
+
+    A parser keyed on bare directive names would fold these together and
+    could report parity on a pair of units whose sections disagree.
+    """
+    checker = _load_checker()
+
+    repo = "[Unit]\nDescription=probe\n\n[Timer]\nDescription=timer-desc\n"
+    installed = "[Unit]\nDescription=probe\n\n[Timer]\nDescription=CHANGED\n"
+
+    drifts = checker.compare_unit("u.timer", repo, installed)
+
+    assert _drift_keys(drifts) == [("Timer", "Description")]
+    assert drifts[0].repo_value == "timer-desc"
+
+
+def test_section_present_on_one_side_only_surfaces_as_drifts():
+    """A whole missing section reports its keys as drift, and does not crash.
+
+    Walking the UNION of sections (not the intersection) is what makes this
+    work; an intersection walk would silently ignore an entire dropped
+    [Install] section, i.e. a unit that is no longer enable-able.
+    """
+    checker = _load_checker()
+
+    repo = "[Timer]\nOnBootSec=30\n\n[Install]\nWantedBy=timers.target\n"
+    installed = "[Timer]\nOnBootSec=30\n"
+
+    drifts = checker.compare_unit("u.timer", repo, installed)
+
+    assert _drift_keys(drifts) == [("Install", "WantedBy")]
+    assert drifts[0].repo_value == "timers.target"
+    assert drifts[0].installed_value == checker._ABSENT
+
+
+def test_drift_ordering_is_deterministic():
+    """Drifts come back sorted by (section, key) so reports are diffable.
+
+    An operator comparing two runs should see a stable report; dict-insertion
+    ordering would make the same drift set render differently depending on
+    the order directives happened to appear in the file.
+    """
+    checker = _load_checker()
+
+    repo = "[Timer]\nZeta=1\nAlpha=1\n\n[Install]\nWantedBy=timers.target\n"
+    installed = "[Timer]\nZeta=2\nAlpha=2\n\n[Install]\nWantedBy=other.target\n"
+
+    drifts = checker.compare_unit("u.timer", repo, installed)
+
+    assert _drift_keys(drifts) == [
+        ("Install", "WantedBy"),
+        ("Timer", "Alpha"),
+        ("Timer", "Zeta"),
+    ]
