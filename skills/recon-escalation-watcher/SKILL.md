@@ -142,7 +142,7 @@ degrades to re-firing on parked items: noisy, never silent. Blank lines and
 annotated.
 
 **`--baseline` is NOT safe for this loop — do not reach for it here**,
-despite being listed as an available flag above. `_snapshot_pending_ids()`
+even though `escalation.watcher` accepts it as a flag. `_snapshot_pending_ids()`
 (`watcher.py:151-158`) freezes the pending-id set exactly once, at launch,
 strictly before `add_watch` arms the inotify watch (`watcher.py:238` runs
 before `watcher.py:243`) — and unlike `--exclude-file`, that snapshot is
