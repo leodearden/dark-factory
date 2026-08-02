@@ -904,6 +904,22 @@ def _ruff_leg_targets(cmd: str) -> list[str]:
     return []
 
 
+def _magicmock_leg_targets(cmd: str) -> list[str]:
+    """Return the whitespace-tokenized positional targets of *cmd*'s bare-MagicMock leg.
+
+    Sibling to :func:`_ruff_leg_targets`: identifies the fleet
+    ``lint_command``'s ``check_bare_magicmock_config.py`` leg by substring
+    after a plain ``&&`` split, then ``shlex.split``s it so callers compare
+    whole path tokens rather than substring-matching the raw command (the
+    same "in cmd" vacuity trap ``_ruff_leg_targets`` avoids — e.g. a member
+    named only in the OTHER leg's arguments).
+    """
+    for leg in cmd.split("&&"):
+        if "check_bare_magicmock_config.py" in leg:
+            return shlex.split(leg)
+    return []
+
+
 class TestFleetLintCoversEveryWorkspaceMember:
     """The fleet LINT chain must ruff-check every workspace member.
 
@@ -944,4 +960,30 @@ class TestFleetLintCoversEveryWorkspaceMember:
         assert not missing, (
             f"fleet lint_command's ruff-check leg is missing known workspace "
             f"member(s) {sorted(missing)} (task 3397); targets: {targets}"
+        )
+
+    def test_every_present_workspace_member_tests_dir_is_magicmock_checked(self) -> None:
+        cmd = _fleet_lint_command()
+        targets = _magicmock_leg_targets(cmd)
+
+        for member in _workspace_member_dirs():
+            if not (REPO_ROOT / member / "tests").is_dir():
+                # check_bare_magicmock_config.py takes directories; naming one
+                # that doesn't exist would make this leg exit non-zero, so a
+                # member with no tests/ dir is skipped rather than failed.
+                continue
+            tests_dir = f"{member}/tests"
+            assert tests_dir in targets, (
+                f"fleet lint_command's check_bare_magicmock_config.py leg "
+                f"does not target {tests_dir!r} (task 3397) — a docs-only or "
+                "cross-cutting diff (zero .py files touched) runs this chain "
+                f"verbatim with no rescoping, so {tests_dir!r} would never be "
+                f"checked for bare MagicMock config at the gating layer; "
+                f"targets: {targets}"
+            )
+
+        assert targets, (
+            "the fleet lint_command's check_bare_magicmock_config.py leg had "
+            "no positional targets at all (task 3397) — this coverage "
+            "invariant would pass vacuously"
         )
