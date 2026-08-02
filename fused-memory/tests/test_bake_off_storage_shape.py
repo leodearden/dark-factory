@@ -2364,9 +2364,19 @@ class TestAuditRecallReusesTheRealImplementations:
 # is synthetic, chosen to make a shape assertion legible, and means nothing.
 
 
-def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words'):
-    """One arm's four metrics, fully populated. Values are arbitrary."""
+def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
+                     pin_on=False, window_changed_rate=0.25):
+    """One arm's metrics, fully populated. Values are arbitrary.
+
+    ``window_changed_rate`` is ``None`` on a pin-OFF arm: the question "did
+    the pin change the window?" was never asked there, and a 0.0 would read
+    as "asked, and it changed nothing".
+    """
     return {
+        'pin': {
+            'enabled': pin_on,
+            'window_changed_rate': window_changed_rate if pin_on else None,
+        },
         'claim_recall': {'at_5': recall5, 'at_10': recall10},
         'discoverability': {
             'canonical_in_top_5_rate': 0.7,
@@ -2385,7 +2395,10 @@ def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words'):
 
 
 def _all_arms():
-    return {arm: _arm_measurement() for arm in _mod().ARM_VARIANTS}
+    return {
+        arm: _arm_measurement(pin_on=arm.endswith('+pin'))
+        for arm in _mod().ARM_VARIANTS
+    }
 
 
 def _protocol():
@@ -3148,6 +3161,376 @@ class TestRunBakeOffWiring:
                 assert metric in report['arms'][arm]
         assert report['protocol']['distractor_slab_size'] == 12
         assert report['protocol']['embedder_model'] == 'text-embedding-3-small'
+
+
+# ===========================================================================
+# step-26 — the equal-window discipline
+# ===========================================================================
+#
+# THE BUG THIS SECTION PINS.  `apply_topic_anchor` APPENDS: a full 5-hit
+# window plus one pinned canonical is six records.  `measure_arm` then scored
+# every metric at `k = len(window)`, so the +pin variants were measured over a
+# SIX-record window while their pin-off twins were measured over five.  The
+# pin column did not report "the pin helped"; it reported "the pin was given
+# a bigger budget".  In the first committed artifact that showed up as
+# c_peers 0.504 -> c_peers+pin 0.992 on canonical-in-top-5 and 1180 -> 1290
+# tokens/query — a discoverability "win" bought entirely with extra results.
+#
+# The fix is a post-transform truncation in `read_path` plus literal-k
+# scoring in `measure_arm`.  It is deliberately NOT a change to
+# `apply_topic_anchor`, which stays additive-and-never-subtractive per PRD D1
+# — the window budget is the READER's, so it belongs at the read path.
+#
+# Grouping is untouched by this: it SHRINKS the window, so it keeps its
+# legitimate token win, and a pin that lands in the headroom grouping freed
+# still survives.  That is the pin's real win, and it is the one the decision
+# table should show.
+
+
+def _rec(record_id, **kwargs):
+    """Just the `ArmRecord` half of `_hit` — this section never needs the flag."""
+    record, _ = _hit(record_id, **kwargs)
+    return record
+
+
+def _sh(record, score=0.5):
+    return _mod().ScoredHit(record=record, relevance_score=score)
+
+
+def _seeded(shape, records, *, canonical_by_topic=None, contested_ids=None,
+            canonical_by_cluster=None, siblings_by_cluster=None):
+    """A `SeededArm` over hand-built records — no store, no network."""
+    mod = _mod()
+    return mod.SeededArm(
+        shape=shape,
+        project_id=f'e2_{shape}_utest',
+        collection=f'e2_{shape}_utest',
+        records=list(records),
+        by_stored_id={},
+        records_by_id={record.record_id: record for record in records},
+        canonical_by_topic=canonical_by_topic or {},
+        contested_ids=contested_ids or set(),
+        canonical_by_cluster=canonical_by_cluster or {},
+        siblings_by_cluster=siblings_by_cluster or {},
+    )
+
+
+def _full_window_arm(shape='c_peers', *, n=12, topic='t'):
+    """An arm whose fetch fills any window, with a pinnable canonical OUTSIDE it.
+
+    The canonical is deliberately never a hit: that is the case where the pin
+    has something to add, and therefore the case where an unequal window would
+    show up as a fake win.
+    """
+    canonical = _rec('canon', topic=topic, canonical=True, claim_ids=['k-canon'])
+    hits = [
+        _sh(_rec(f'p{i}', topic=topic, claim_ids=[f'k{i}']), 0.9 - i / 100.0)
+        for i in range(n)
+    ]
+    seeded = _seeded(
+        shape,
+        [canonical, *(hit.record for hit in hits)],
+        canonical_by_topic={topic: canonical},
+        canonical_by_cluster={'c1': 'canon'},
+        siblings_by_cluster={'c1': {hit.record.record_id for hit in hits}},
+    )
+    return seeded, hits
+
+
+def _query(query_id='q1', *, topic='t', expects=('k0',), cluster_id='c1'):
+    return _mod().Query(
+        query_id=query_id,
+        kind='claim',
+        text='does the pin change the window?',
+        topic=topic,
+        cluster_id=cluster_id,
+        expects_claim_ids=list(expects),
+        held_out=False,
+    )
+
+
+#: A `(name, encode)` estimator that is trivially checkable by hand.
+_CHARS = ('injected:chars', len)
+
+
+def _measure(seeded, hits, *, pin, queries=None, probes=()):
+    return _mod().measure_arm(
+        seeded,
+        {'queries': {'q1': hits}, 'probes': {'c1': hits}},
+        pin=pin,
+        queries=list(queries if queries is not None else [_query()]),
+        probes=list(probes),
+        estimator=_CHARS,
+        guard_threshold=0.92,
+    )
+
+
+class TestReadPathHoldsTheWindowBudget:
+    """Pin-on and pin-off must be scored over equal-size windows."""
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers', 'b_grouped'])
+    @pytest.mark.parametrize('k', [5, 10])
+    def test_a_pinned_window_is_never_wider_than_k(self, shape, k):
+        mod = _mod()
+        seeded, hits = _full_window_arm(shape)
+
+        assert len(mod.read_path(seeded, hits, k, pin=True)) <= k
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers', 'b_grouped'])
+    @pytest.mark.parametrize('k', [5, 10])
+    def test_a_full_fetch_gives_both_variants_the_same_size_window(self, shape, k):
+        """The A/B is only controlled if the two arms get the same budget."""
+        mod = _mod()
+        seeded, hits = _full_window_arm(shape)
+
+        off = mod.read_path(seeded, hits, k, pin=False)
+        on = mod.read_path(seeded, hits, k, pin=True)
+
+        assert len(on) == len(off) == k
+
+    def test_the_pre_transform_truncation_still_stands(self):
+        """A record the store never returned must not enter the window, so the
+        transforms still act on `hits[:k]` and not on the whole fetch."""
+        mod = _mod()
+        seeded, hits = _full_window_arm('c_peers', n=12)
+
+        window = mod.read_path(seeded, hits, 5, pin=False)
+
+        assert [r.record_id for r in window] == ['p0', 'p1', 'p2', 'p3', 'p4']
+
+
+class TestGroupingKeepsItsAdvantage:
+    """The fix must not take back grouping's legitimate win."""
+
+    def _grouped_arm(self):
+        """Four children of one parent, plus one hit on a second topic.
+
+        The grouped read collapses the four into one document, taking a
+        5-record window down to 2 — real headroom, freed by the storage shape
+        rather than by a wider budget.
+        """
+        parent = _rec(PARENT, topic='t1', canonical=True, claim_ids=['k-par'])
+        children = [
+            _rec(f'child-{i}', parent_id=PARENT, kind='amendment', topic='t1',
+                 claim_ids=[f'k{i}'])
+            for i in range(4)
+        ]
+        other = _rec('other-1', topic='t2', claim_ids=['k-other'])
+        anchor = _rec('canon-t2', topic='t2', canonical=True, claim_ids=['k-t2'])
+        hits = [_sh(record, 0.9 - i / 100.0)
+                for i, record in enumerate([*children, other])]
+        seeded = _seeded(
+            'b_grouped',
+            [parent, *children, other, anchor],
+            canonical_by_topic={'t1': parent, 't2': anchor},
+            canonical_by_cluster={'c1': PARENT},
+            siblings_by_cluster={'c1': {c.record_id for c in children}},
+        )
+        return seeded, hits, anchor
+
+    def test_a_collapsed_window_stays_short_it_is_not_padded_back_to_k(self):
+        mod = _mod()
+        seeded, hits, _ = self._grouped_arm()
+
+        window = mod.read_path(seeded, hits, 5, pin=False)
+
+        assert len(window) == 2  # the four children became one document
+        assert {r.record_id for r in window} == {PARENT, 'other-1'}
+
+    def test_a_pin_landing_in_freed_headroom_survives_the_truncation(self):
+        """Grouping frees a slot; the pin fills it.  THAT is the pin's real
+        win, and truncating at k must not delete it."""
+        mod = _mod()
+        seeded, hits, anchor = self._grouped_arm()
+
+        window = mod.read_path(seeded, hits, 5, pin=True)
+
+        assert len(window) == 3
+        assert anchor.record_id in {r.record_id for r in window}
+
+
+class TestTopicDiscoverabilityRespectsTheLiteralK:
+    """A rank-6 record is not "in the top 5", whatever the caller passes."""
+
+    def test_a_canonical_past_k_is_reported_absent_but_its_rank_survives(self):
+        hits = [_rec(f'r{i}', topic='t') for i in range(5)]
+        hits.append(_rec('canon', topic='t', canonical=True))
+
+        found = _mod().topic_discoverability(hits, 't', 'canon', 5)
+
+        assert found['canonical_in_top_k'] is False
+        assert found['canonical_rank'] == 6  # "nearly there" is its own finding
+
+    def test_the_boundary_rank_equal_to_k_is_inside_the_window(self):
+        hits = [_rec(f'r{i}', topic='t') for i in range(4)]
+        hits.append(_rec('canon', topic='t', canonical=True))
+
+        found = _mod().topic_discoverability(hits, 't', 'canon', 5)
+
+        assert found['canonical_in_top_k'] is True
+        assert found['canonical_rank'] == 5
+
+
+class TestMeasureArmScoresBothVariantsAtTheSameK:
+    """The inflated column, asserted directly on `measure_arm`'s output."""
+
+    def test_a_full_window_arm_measures_identically_with_and_without_the_pin(self):
+        """The committed artifact's c_peers/c_peers+pin divergence, in one
+        assertion: at a fixed result budget an append-only pin has nowhere to
+        put anything, so every column must be unchanged."""
+        seeded, hits = _full_window_arm('c_peers')
+
+        off = _measure(seeded, hits, pin=False)
+        on = _measure(seeded, hits, pin=True)
+
+        assert on['discoverability']['canonical_in_top_5_rate'] == (
+            off['discoverability']['canonical_in_top_5_rate']
+        )
+        assert on['claim_recall']['at_5'] == off['claim_recall']['at_5']
+        assert on['tokens_per_query']['mean'] == off['tokens_per_query']['mean']
+
+    def test_every_block_is_unchanged_not_merely_the_three_headline_numbers(self):
+        seeded, hits = _full_window_arm('c_peers')
+
+        off = _measure(seeded, hits, pin=False)
+        on = _measure(seeded, hits, pin=True)
+
+        for metric in ('claim_recall', 'discoverability', 'tokens_per_query',
+                       'guard_adequacy'):
+            assert on[metric] == off[metric], metric
+
+    def test_a_claim_only_the_pinned_record_realizes_is_not_credited_at_5(self):
+        """The mechanism, isolated: `k-canon` lives on the appended canonical
+        alone, so crediting it at 5 is exactly the off-by-one-window bug."""
+        seeded, hits = _full_window_arm('c_peers')
+
+        on = _measure(seeded, hits, pin=True, queries=[_query(expects=('k-canon',))])
+
+        assert on['claim_recall']['at_5'] == 0.0
+
+    def test_the_token_column_charges_for_ten_payloads_not_eleven(self):
+        """tokens/query is the cost half of the decision.  An eleventh payload
+        billed to the pin is a cost the reader would never have paid."""
+        seeded, hits = _full_window_arm('c_peers')
+
+        on = _measure(seeded, hits, pin=True)
+
+        # `_CHARS` counts characters, and every hand-built body is `'body'`.
+        assert on['tokens_per_query']['mean'] == 10 * len('body')
+
+
+class TestPinDiagnostic:
+    """`pin` says whether the pin was on, and whether it did anything."""
+
+    def test_pin_off_reports_not_applicable_rather_than_a_measured_zero(self):
+        seeded, hits = _full_window_arm('c_peers')
+
+        off = _measure(seeded, hits, pin=False)
+
+        assert off['pin'] == {'enabled': False, 'window_changed_rate': None}
+
+    def test_a_full_window_arm_reports_a_zero_change_rate(self):
+        """Enabled, asked, and it changed nothing — a measured zero, which is
+        a different statement from `None`."""
+        seeded, hits = _full_window_arm('c_peers')
+
+        on = _measure(seeded, hits, pin=True)
+
+        assert on['pin']['enabled'] is True
+        assert on['pin']['window_changed_rate'] == 0.0
+
+    def test_a_grouped_arm_with_headroom_reports_a_positive_change_rate(self):
+        mod = _mod()
+        parent = _rec(PARENT, topic='t1', canonical=True, claim_ids=['k-par'])
+        children = [
+            _rec(f'child-{i}', parent_id=PARENT, kind='amendment', topic='t1',
+                 claim_ids=[f'k{i}'])
+            for i in range(4)
+        ]
+        other = _rec('other-1', topic='t2', claim_ids=['k-other'])
+        anchor = _rec('canon-t2', topic='t2', canonical=True, claim_ids=['k-t2'])
+        hits = [_sh(record, 0.9 - i / 100.0)
+                for i, record in enumerate([*children, other])]
+        seeded = _seeded(
+            'b_grouped',
+            [parent, *children, other, anchor],
+            canonical_by_topic={'t1': parent, 't2': anchor},
+            canonical_by_cluster={'c1': PARENT},
+            siblings_by_cluster={'c1': {c.record_id for c in children}},
+        )
+
+        on = mod.measure_arm(
+            seeded,
+            {'queries': {'q1': hits}, 'probes': {}},
+            pin=True, queries=[_query(topic='t2')], probes=[],
+            estimator=_CHARS, guard_threshold=0.92,
+        )
+
+        assert on['pin']['window_changed_rate'] > 0
+
+
+class TestReportCarriesThePinDiagnostic:
+    """A column that explains the other columns has to be in the artifact."""
+
+    def test_build_report_refuses_an_arm_with_no_pin_block(self):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['c_peers+pin']['pin']
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'c_peers+pin' in str(excinfo.value)
+        assert 'pin' in str(excinfo.value)
+
+    @pytest.mark.parametrize('key', ['enabled', 'window_changed_rate'])
+    def test_build_report_refuses_a_pin_block_missing_either_key(self, key):
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped+pin']['pin'][key]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'b_grouped+pin' in str(excinfo.value)
+        assert key in str(excinfo.value)
+
+    def test_the_decision_table_surfaces_the_diagnostic(self):
+        """Without it, two identical rows read as "the pin is useless" rather
+        than "the pin never fired"."""
+        mod = _mod()
+        arms = _all_arms()
+        arms['c_peers+pin']['pin']['window_changed_rate'] = 0.375
+
+        rendered = mod.render_markdown(mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        ))
+
+        row = next(
+            r for r in _decision_table_rows(rendered) if r.startswith('| c_peers+pin |')
+        )
+        assert '0.38' in row
+
+    def test_a_pin_off_row_renders_no_measurement_not_a_zero(self):
+        mod = _mod()
+
+        rendered = mod.render_markdown(_report())
+
+        row = next(
+            r for r in _decision_table_rows(rendered) if r.startswith('| c_peers |')
+        )
+        assert '—' in row
+
+    def test_the_render_stays_byte_deterministic_for_identical_input(self):
+        """The artifact's whole value is that a rerun's diff is signal."""
+        mod = _mod()
+        report = _report()
+
+        assert mod.render_markdown(report) == mod.render_markdown(report)
 
 
 class TestBuildParser:
