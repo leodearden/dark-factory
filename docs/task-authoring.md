@@ -473,8 +473,10 @@ open (quiescence guard — no re-dispatch, no churn).
 
 **Runner stamps** (written by `DeterministicRunner`, never
 author-supplied): `before_done_ran_at`, `before_done_verified_at`,
-`gate_escalated_at`, `done_provenance` (`kind='deterministic-deploy'`
-cross-unit; `kind='deterministic-deploy-scheduled'` self-restart).
+`gate_escalated_at`, and `done_provenance` (stamped for all four
+`deterministic-*` kinds — see the requirement table in §2 for
+per-kind semantics; `deterministic-milestone` is stamped on both the
+first-pass check and the post-escalation re-check described in §6).
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks
