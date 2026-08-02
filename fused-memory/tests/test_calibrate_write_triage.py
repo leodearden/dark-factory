@@ -924,17 +924,29 @@ class TestDeriveBandsPerCategory:
         report keeps every category and distinguishes the two by reason.
         """
         got = self._derive({
-            'procedural_knowledge': _classes([0.5, 0.6, 0.7, 0.8, 0.9], [0.1], [0.2]),
+            'procedural_knowledge': _classes([0.5, 0.6, 0.7, 0.8, 0.9], [0.1], [0.55]),
             'preferences_and_norms': _classes([0.8, 0.9], [], []),
             'observations_and_summaries': _classes([0.4], [0.9], []),
         })
         assert set(got) == {
             'procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries',
         }
+        assert got['procedural_knowledge']['t_high'] is not None
         for category, entry in got.items():
-            assert (entry['t_high'] is None) == bool(entry['reason']), (
-                f'{category}: a null t_high must carry a reason and vice versa'
-            )
+            if entry['t_high'] is None:
+                assert (entry['reason'] or '').strip(), (
+                    f'{category}: a null t_high must never be silent — it carries the '
+                    'reason code that distinguishes "refused" from "not measured"'
+                )
+            if entry['reason']:
+                # derive_bands also reasons on a SUCCESS (REASON_NO_JUDGE_BAND:
+                # a derived t_high with no derivable judge band), so a reason
+                # does not imply refusal — only that a caller can branch on it.
+                assert entry['reason'].split(':')[0] in {
+                    _mod().REASON_EMPTY_CLASS,
+                    _mod().REASON_NOT_SEPARABLE,
+                    _mod().REASON_NO_JUDGE_BAND,
+                }, f'{category}: unbranchable reason {entry["reason"]!r}'
 
     def test_every_entry_carries_its_measured_distributions_and_pair_counts(self) -> None:
         """The evidence that justifies the number — or the refusal."""

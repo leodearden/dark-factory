@@ -468,6 +468,56 @@ def _band_counts(
     }
 
 
+def derive_bands_per_category(
+    scores_by_category_and_class: Mapping[str, Mapping[str, Sequence[float]]],
+    pooled_t_high: float | None,
+    pooled_t_low: float | None,
+) -> dict[str, dict[str, Any]]:
+    """Derive one band pair per Mem0 category, delegating to ``derive_bands``.
+
+    No second derivation path: each category's cutoff is exactly as
+    evidence-bound as the pooled one, and refuses on the same terms. A
+    category with no negatives (the measured ``preferences_and_norms`` case
+    — all its records in one cluster) yields ``REASON_EMPTY_CLASS``; one
+    whose negatives reach every duplicate yields ``REASON_NOT_SEPARABLE``.
+    Either way the refusal, not a fabricated number, is the finding.
+
+    Every category present in the input is present in the output, an
+    uncalibrated one INCLUDED with a null ``t_high`` and its reason code.
+    Omitting it would read as "not measured" rather than "measured, and
+    refused" — the ambiguity this calibration exists to remove.
+
+    ``pooled_t_high_negatives_admitted`` counts the category's OWN negatives
+    that the POOLED cutoff would restate deterministically. That count is
+    the direct evidence for or against one cutoff serving every category. It
+    is ``None`` when there is no pooled band to measure against, since ``0``
+    would read as "measured, and safe".
+    """
+    per_category: dict[str, dict[str, Any]] = {}
+    for category, scores_by_class in scores_by_category_and_class.items():
+        scores = {name: list(scores_by_class.get(name) or []) for name in PAIR_CLASSES}
+        negatives = [s for name in NEGATIVE_PAIR_CLASSES for s in scores[name]]
+        t_high, t_low, reason = derive_bands(scores['true_dup'], negatives)
+        admitted = (
+            None if pooled_t_high is None
+            else sum(
+                _band_counts(scores[name], pooled_t_high, pooled_t_low)['deterministic']
+                for name in NEGATIVE_PAIR_CLASSES
+            )
+        )
+        per_category[category] = {
+            'distributions': {
+                name: summarize_distribution(values) for name, values in scores.items()
+            },
+            't_high': t_high,
+            't_low': t_low,
+            'reason': reason,
+            'pair_counts': {name: len(values) for name, values in scores.items()},
+            'pooled_t_high_negatives_admitted': admitted,
+        }
+    return per_category
+
+
 def build_report(
     scores_by_class: Mapping[str, Sequence[float]],
     t_high: float | None,
