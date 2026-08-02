@@ -509,6 +509,37 @@ if unsure which one owns it) — `resolve_issue` on it un-halts the whole
 queue. If the log shows the halt cleared but the escalation record still
 shows `pending`, that's a genuine bug, not something to dismiss.
 
+#### `park_lock_contended` — a blocked merge, **not** a halt
+
+Contrast the two categories above, and `stash_failed` (which *does* halt:
+`project_root` carries dirty tracked files that could not be parked — a
+shared hygiene fault that recurs identically for every subsequent task).
+`park_lock_contended` is the opposite and **never halts the queue**: a
+foreign git process held `project_root`'s `.git/index.lock` — dominantly a
+`git commit --only` holding it across its pre-commit hook (see CLAUDE.md
+§"Working in the main checkout"). `advance_main` stands off for up to
+`git.merge_park_lock_grace_seconds` (default 300s) and, if the lock is
+still held, gives up having modified **nothing** — no ref move, no tree
+write, no park, and the foreign lock left strictly alone.
+
+That one merge is reported as a per-task **blocked** merge whose reason
+names the lock path, how long it had been held, and how long we waited:
+
+> `advance_main stood off: a foreign git process held /…/.git/index.lock
+> for 301s (waited 300s). The merge did NOT land and NOTHING in
+> project_root was modified. … transient and will be retried on
+> re-dispatch.`
+
+Normally there is **nothing to do** — it is retried on re-dispatch. There
+is exactly one genuine operator action: if the reason reports an **age
+above the grace** (as in the example above, 301s > 300s), the lock may be
+a crashed-git leftover rather than a live commit. Confirm no git process
+is running in `project_root`, then `rm -f .git/index.lock`.
+
+The stand-off budget is **green tier** — retune it live with
+`mcp__escalation__reload_config`, no restart (the value is re-read per
+advance).
+
 ---
 
 ## 6. Config reload vs restart
@@ -532,6 +563,9 @@ takes no arguments: it always re-reads that process's own
 - `session_resume.*` (whole submodel, including the `restore_from_archive`
   rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
 - `verify_env`
+- `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
+  stand-off budget — re-read per advance, see
+  [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
 - The `git.offline_lane_*` leaf tunables
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
