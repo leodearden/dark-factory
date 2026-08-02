@@ -21,7 +21,13 @@ including the real-config incident golden — at the end.
 """
 from __future__ import annotations
 
-from orchestrator.pytest_markers import module_level_marker_names, resolve_marker_expression
+import pytest
+
+from orchestrator.pytest_markers import (
+    expression_definitely_deselects,
+    module_level_marker_names,
+    resolve_marker_expression,
+)
 
 # ---------------------------------------------------------------------------
 # resolve_marker_expression (step-1: RED)
@@ -233,3 +239,98 @@ class TestModuleLevelMarkerNames:
 
     def test_none_source_is_empty(self):
         assert module_level_marker_names(None) == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# expression_definitely_deselects (step-5: RED)
+# ---------------------------------------------------------------------------
+
+
+class TestExpressionDefinitelyDeselects:
+    """``expression_definitely_deselects(expr, marker_names) -> bool``.
+
+    True ONLY on positive proof that every collected item in the file is
+    deselected: the ``-m`` expression evaluates to a definite FALSE under Kleene
+    (strong 3-valued) logic, with names outside the guaranteed *marker_names*
+    treated as UNKNOWN rather than False.  Sound but deliberately incomplete;
+    the incompleteness fails safe (no widening, status quo FILE_SCOPED).
+    """
+
+    @pytest.mark.parametrize(
+        ('expr', 'markers'),
+        [
+            ('not warm_lane_bash', frozenset({'warm_lane_bash'})),  # the esc-3292-1 case
+            ('not integration', frozenset({'integration'})),        # shared/, fused-memory/
+            ('not smoke', frozenset({'smoke'})),                    # cockpit/, root
+        ],
+    )
+    def test_every_live_expression_in_this_repo_is_decided(self, expr: str, markers: frozenset):
+        """The three ``-m`` expressions actually configured in this repo."""
+        assert expression_definitely_deselects(expr, markers) is True
+
+    # -- selected / unknown -> no widening ------------------------------------
+
+    def test_unmarked_file_is_selected_not_deselected(self):
+        """THE ANTI-OVER-WIDENING PIN.
+
+        An unmarked file under ``-m 'not warm_lane_bash'`` is SELECTED, so a
+        file-scoped run over it collects normally.  This is also the "a
+        genuinely-vanished test target stays rc=5 RED" pin: nothing here may
+        widen a target whose emptiness is a real defect.
+        """
+        assert expression_definitely_deselects('not warm_lane_bash', frozenset()) is False
+
+    def test_a_positive_expression_selects_the_marked_file(self):
+        assert expression_definitely_deselects(
+            'warm_lane_bash', frozenset({'warm_lane_bash'}),
+        ) is False
+
+    def test_an_unrelated_guaranteed_marker_proves_nothing(self):
+        assert expression_definitely_deselects('not a', frozenset({'b'})) is False
+
+    # -- Kleene soundness / incompleteness ------------------------------------
+
+    def test_false_and_unknown_is_false(self):
+        """``not a and not b`` with only ``a`` guaranteed: FALSE and UNKNOWN == FALSE."""
+        assert expression_definitely_deselects('not a and not b', frozenset({'a'})) is True
+
+    def test_false_or_unknown_is_unknown(self):
+        """``not a or b``: an item also carrying ``b`` would be SELECTED — not provable."""
+        assert expression_definitely_deselects('not a or b', frozenset({'a'})) is False
+
+    def test_contradiction_over_unknowns_is_not_proven(self):
+        """``a and not a`` is False for every assignment, but Kleene reads UNKNOWN.
+
+        Pins the documented, deliberately-safe incompleteness: Kleene evaluates
+        each occurrence independently, so it cannot see the contradiction.  The
+        cost is a missed widening, never a wrong one.
+        """
+        assert expression_definitely_deselects('a and not a', frozenset()) is False
+
+    def test_tautology_over_unknowns_is_not_proven(self):
+        assert expression_definitely_deselects('a or not a', frozenset()) is False
+
+    # -- grammar bail-outs -> False, never a raise ----------------------------
+
+    @pytest.mark.parametrize(
+        'expr',
+        [
+            "device(type='cpu')",  # pytest DOES accept this; this detector does not
+            'a == b',
+            'a > 1',
+            'not "s"',
+            '',
+            'not (',               # SyntaxError
+            'lambda: 1',
+        ],
+    )
+    def test_unsupported_grammar_bails_out(self, expr: str):
+        assert expression_definitely_deselects(expr, frozenset({'a', 'b'})) is False
+
+    # -- boolean literals are inside the grammar ------------------------------
+
+    def test_literal_false_deselects_everything(self):
+        assert expression_definitely_deselects('False', frozenset()) is True
+
+    def test_literal_true_selects_everything(self):
+        assert expression_definitely_deselects('True', frozenset()) is False
