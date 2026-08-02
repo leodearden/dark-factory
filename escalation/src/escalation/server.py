@@ -2290,17 +2290,21 @@ def create_server(
     def _found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, Any]:
         """Build the git-authority Tier-3.5 done/found_on_main response.
 
-        ``merge_sha`` semantics differ between the two resolution paths:
+        ``merge_sha`` is always a commit ON MAIN, on both resolution paths
+        (task 3103):
 
-        - **Live-branch path** (``is_ancestor`` hit): ``merge_sha`` is the
-          *branch tip* SHA — an ancestor of main but, for ``--no-ff`` merges,
-          NOT the merge-commit SHA (they are distinct commits).
-        - **Deleted-branch path** (``find_merge_marker`` hit): ``merge_sha``
-          is the *merge-commit* SHA found on main via ``git log``.
+        - **Live-branch path** (``is_ancestor`` hit): the citation commit
+          discovered by ``validate_landing_evidence`` — a commit on main
+          whose subject cites the task.
+        - **Deleted-branch path** (``find_merge_marker`` hit): the
+          merge-commit SHA found on main via ``git log``.
 
-        Callers that specifically need the merge commit (e.g. for provenance
-        that must reference the commit on main's first-parent chain) should
-        prefer the deleted-branch path's value or resolve via ``git log``.
+        Both are effect-present-checked against current main HEAD before
+        being returned, so ``merge_sha`` is safe to record as provenance
+        as-is.  (Before task 3103 the live-branch path returned the *branch
+        tip*, which for a ``--no-ff`` merge is a distinct commit that is not
+        on main's first-parent chain — callers were told to prefer the
+        deleted-branch path's value.  That caveat no longer applies.)
         """
         return {
             'state': 'done',
@@ -2367,14 +2371,29 @@ def create_server(
         ``orch_config.git.branch_prefix`` unless the value already starts
         with the prefix — the same shape-tolerant rule shared with
         ``recover_pending_merges``), then:
-        - If the branch still exists: calls ``is_ancestor(tip, main)``.
-          An additional ``tip != main_tip`` guard prevents a false-positive
-          ``done`` when the branch sits at exactly main's HEAD with no extra
-          commits (a commit is its own ancestor).  On hit →
-          state='done', kind='found_on_main',
-          merge_sha=<branch-tip SHA>.
-          Note: for ``--no-ff`` merges the branch tip is NOT the merge-commit;
-          see ``_found_on_main_response`` for the semantic distinction.
+        - If the branch still exists: calls ``is_ancestor(tip, main)``, then
+          applies THREE guards in order (task 3103 brought the last two to
+          parity with the orchestrator harness's already-landed dispatch
+          gate, which has had them since task 1226):
+            1. ``tip != main_tip`` — a branch sitting at exactly main's HEAD
+               satisfies ``is_ancestor`` trivially (a commit is its own
+               ancestor) but nothing has been merged;
+            2. NOT degenerate — a tip still equal to the recorded
+               ``branch_base_sha`` proves zero commits were ever pushed, so
+               the branch is merely parked at an OLD main commit (which IS an
+               ancestor of main and IS distinct from main_tip, so guard 1
+               does not catch it);
+            3. ``validate_landing_evidence`` DISCOVERY mode — a commit on
+               main must positively cite the task and its effect must still
+               be present at main HEAD.
+          On hit → state='done', kind='found_on_main',
+          merge_sha=<the citation commit on main>.
+          Guards 2 and 3 are independent and both required: a re-seeded
+          branch is non-degenerate yet uncited, while a degenerate branch may
+          still have a citing commit on main.  When
+          ``git.commit_citation_pattern`` is ``''`` (the documented
+          per-project opt-out) guard 3 is skipped and merge_sha is the branch
+          tip; guard 2 still applies.
         - If the branch ref is gone (tip is None): calls ``find_merge_marker``
           which searches git log for the merge commit subject.
           On hit → state='done', kind='found_on_main',
@@ -2389,9 +2408,9 @@ def create_server(
         Live entries also carry: position, enqueued_at, eta_seconds.
         Terminal entries carry: outcome (raw state), finished_at.
         git-authority terminal shape: state='done', kind='found_on_main',
-            merge_sha=<branch-tip or merge-commit SHA — see
-            ``_found_on_main_response`` docstring for path-specific
-            semantics>, outcome='found_on_main'.
+            merge_sha=<a commit ON MAIN — the discovered citation or the
+            merge marker; see ``_found_on_main_response``>,
+            outcome='found_on_main'.
         Unknown carries: hint.
         """
         # Validation — at least one key required
@@ -2479,6 +2498,7 @@ def create_server(
                     # already degrades to the honest Tier-4 unknown via the wrapper below.
                     from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
                         branch_is_degenerate,
+                        validate_landing_evidence,
                     )
                     if (tip is not None and tip != main_tip
                             and await git_ops.is_ancestor(tip, orch_config.git.main_branch)):
@@ -2499,9 +2519,40 @@ def create_server(
                         # main (reify 5493) is caught only by this ordering.
                         metadata = await _git_authority_task_metadata(tid)
                         if not await branch_is_degenerate(git_ops, full_branch, metadata):
-                            # merge_sha = branch tip (NOT the merge commit for --no-ff; see
-                            # _found_on_main_response docstring for the semantic distinction).
-                            return _found_on_main_response(request_id, tip)
+                            # Citation gate.  Read the pattern off orch_config.git for
+                            # consistency with the adjacent .main_branch / .branch_prefix
+                            # reads (same object as git_ops.config in production).
+                            pattern = orch_config.git.commit_citation_pattern
+                            if pattern == '':
+                                # Documented per-project opt-out (config.py
+                                # commit_citation_pattern): '' disables the citation
+                                # check entirely for projects without citation
+                                # conventions, and find_task_citation_commit honours it
+                                # by returning None for EVERYTHING.  Running the gate
+                                # here would therefore reject unconditionally and turn
+                                # Tier 3.5 into dead code rather than merely un-gated —
+                                # a silent capability loss for an explicit opt-in.
+                                # Note: None means "use the built-in
+                                # DEFAULT_COMMIT_CITATION_PATTERN" and is NOT the
+                                # opt-out.  The degeneracy guard above still applies in
+                                # this mode.
+                                return _found_on_main_response(request_id, tip)
+                            # DISCOVERY mode: a commit on main must positively cite the
+                            # task (FIX 2) AND its effect must still be present at main
+                            # HEAD (FIX 1', the task-1175 reverted-landing guard).  The
+                            # accepted evidence_sha is a commit ON MAIN, which also
+                            # retires the old wart of answering with the branch tip.
+                            # No escalation on reject — mirrors the harness ancestor
+                            # arm's silent-False, and merge_status is a read-only probe.
+                            verdict = await validate_landing_evidence(
+                                git_ops, tid, full_branch,
+                                branch_tip_sha=tip,
+                                pattern_template=pattern,
+                            )
+                            if verdict.accepted:
+                                return _found_on_main_response(
+                                    request_id, verdict.evidence_sha,
+                                )
                     elif tip is None:
                         # Branch ref gone — the canonical 4352 deleted-branch shape.
                         # find_merge_marker internally gates on branch existence so it only
