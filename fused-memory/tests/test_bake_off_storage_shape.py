@@ -2381,6 +2381,9 @@ def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
         'discoverability': {
             'canonical_in_top_5_rate': 0.7,
             'median_canonical_rank': 2.0,
+            'canonical_found_count': 14,
+            'canonical_candidates': 20,
+            'canonical_rank_window': 10,
             'mean_topic_member_count': 3.0,
         },
         'tokens_per_query': {'mean': 412.0, 'estimator': estimator},
@@ -2390,6 +2393,7 @@ def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
             'guard_matched_rate': 0.2,
             'threshold_replay': True,
             'threshold': 0.92,
+            'max_observed_score': 0.71,
         },
     }
 
@@ -3198,7 +3202,8 @@ def _sh(record, score=0.5):
 
 
 def _seeded(shape, records, *, canonical_by_topic=None, contested_ids=None,
-            canonical_by_cluster=None, siblings_by_cluster=None):
+            canonical_by_cluster=None, siblings_by_cluster=None,
+            records_by_source=None):
     """A `SeededArm` over hand-built records — no store, no network."""
     mod = _mod()
     return mod.SeededArm(
@@ -3212,6 +3217,7 @@ def _seeded(shape, records, *, canonical_by_topic=None, contested_ids=None,
         contested_ids=contested_ids or set(),
         canonical_by_cluster=canonical_by_cluster or {},
         siblings_by_cluster=siblings_by_cluster or {},
+        records_by_source=records_by_source or {},
     )
 
 
@@ -3369,6 +3375,254 @@ class TestTopicDiscoverabilityRespectsTheLiteralK:
 
         assert found['canonical_in_top_k'] is True
         assert found['canonical_rank'] == 5
+
+
+class TestTheSelfHitFilterIsProvenanceBasedNotIdBased:
+    """Pure — the bias is a property of the committed fixtures, not the store."""
+
+    def test_the_self_hit_filter_bites_in_the_PEER_arms_not_only_the_baseline(
+        self,
+    ):
+        """An id-equality filter is a NO-OP outside `status_quo`.
+
+        `record_id == memory_id` holds only in `_materialize_status_quo`; the
+        peer arms derive every id through `_derive_record_id`.  So filtering
+        on id removes the self-match for the BASELINE alone — while the peer
+        arms keep searching a corpus that still contains the probing write's
+        own claims, decomposed into peers.  That biases the guard column in
+        the opposite direction from the one GUARD_FETCH_LIMIT's rationale
+        describes, and the guard column is one of E2's four named metrics.
+
+        Asserted over the REAL fixtures, because the bias is a property of how
+        the committed decomposition assigns `source_memory_id` — a hand-built
+        double could be written so the question never arises.
+        """
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+
+        bit_in: dict[str, int] = {}
+        for shape in mod.ARM_SHAPES:
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+            removed = 0
+            for cluster_id in sorted(clusters):
+                probe = mod.select_probing_write(clusters[cluster_id])
+                if probe is None:
+                    continue
+                own = mod.probe_own_record_ids(seeded, probe['memory_id'])
+                removed += len(own & set(seeded.records_by_id))
+            bit_in[shape] = removed
+
+        # Every arm — not just the one whose ids happen to collide.
+        for shape in mod.ARM_SHAPES:
+            assert bit_in[shape] > 0, (
+                f'{shape}: the probing write leaves nothing behind, so its own '
+                f'content stayed in its own guard window'
+            )
+
+    def test_a_peer_arm_drops_MORE_than_one_record_per_probing_write(self):
+        """The decomposition splits one original into several peers, so the
+        filter has to remove all of them, not one representative."""
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+
+        for shape in ('c_peers', 'b_grouped'):
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+            widest = max(
+                len(mod.probe_own_record_ids(seeded, probe['memory_id']) - {probe['memory_id']})
+                for probe in (
+                    mod.select_probing_write(clusters[c]) for c in sorted(clusters)
+                )
+                if probe is not None
+            )
+            assert widest > 1, (
+                f'{shape}: no probing write decomposed into more than one peer, '
+                f'so this test can no longer tell an id filter from a '
+                f'provenance filter'
+            )
+
+
+@pytest.mark.asyncio
+class TestAFailedQueryIsNotAMeasuredZero:
+    """`Mem0Client.search` swallows `TimeoutError` and returns `{}`.
+
+    So a network failure and a shape that ranked nothing arrive at `_search`
+    as the same empty list — which this module's own rule ("an empty hits list
+    with a real expectation IS a measured zero") then scores as 0.0 recall,
+    0.0 discoverability and 0.0 guard, indistinguishable in the artifact from
+    a real result.  Every arm seeds the SHARED distractor slab, so an empty
+    ranking is not a possible outcome here: it is unambiguously detectable and
+    must be loud, per the no-silent-fail-soft design invariant.
+    """
+
+    class _Backend:
+        def __init__(self, response):
+            self._response = response
+
+        async def search(self, **kwargs):
+            return self._response
+
+    async def _search_against(self, response):
+        mod = _mod()
+        seeded = _seeded('status_quo', [_rec('r0')])
+        return await mod._search(
+            self._Backend(response), seeded, 'anything', limit=10,
+        )
+
+    @pytest.mark.parametrize('response', [{}, None, {'results': []}, {'results': None}])
+    async def test_an_empty_ranking_raises_rather_than_scoring_zero(self, response):
+        with pytest.raises(_mod().MeasurementError, match='no results'):
+            await self._search_against(response)
+
+    async def test_a_scoreless_hit_raises_rather_than_defaulting_to_zero(self):
+        """A 0.0 default feeds the THRESHOLD replay a value the store never
+        produced, and `guard matched (replay) = 0.00` then reads as a shape
+        finding rather than as missing score plumbing."""
+        mod = _mod()
+        record = _rec('r0')
+        seeded = _seeded('status_quo', [record])
+        seeded.by_stored_id['stored-0'] = record
+
+        with pytest.raises(mod.MeasurementError, match='no score'):
+            await mod._search(
+                self._Backend({'results': [{'id': 'stored-0'}]}),
+                seeded, 'anything', limit=10,
+            )
+
+    async def test_a_real_ranking_still_passes_through(self):
+        """The guard must not fire on the healthy path."""
+        mod = _mod()
+        record = _rec('r0')
+        seeded = _seeded('status_quo', [record])
+        seeded.by_stored_id['stored-0'] = record
+
+        hits = await mod._search(
+            self._Backend({'results': [{'id': 'stored-0', 'score': 0.42}]}),
+            seeded, 'anything', limit=10,
+        )
+
+        assert [(h.record.record_id, h.relevance_score) for h in hits] == [('r0', 0.42)]
+
+
+class TestTheGuardColumnSaysWhatTheReplayActuallySaw:
+    """Pure — the diagnostic half of the same no-silent-zero concern."""
+
+    def test_the_guard_column_carries_the_best_score_the_replay_actually_saw(self):
+        """`guard_matched_rate: 0.00` across every arm is ambiguous on its own.
+        "the best candidate scored 0.71 against a 0.92 threshold" is a shape
+        finding; "the best candidate scored 0.00" is a bug report."""
+        seeded, hits = _full_window_arm('status_quo')
+
+        measured = _measure(seeded, hits, pin=False, probes=[('c1', {'memory_id': 'x'})])
+
+        assert measured['guard_adequacy']['max_observed_score'] == pytest.approx(0.9)
+
+
+class TestRescoreAgreesWithTheRankTheGroupedReadGave:
+    """Score and rank are two views of one ordering. They cannot disagree.
+
+    `apply_grouped_read` gives a group the BEST rank among its members
+    (`group_rank[parent] = min(...)`).  If `rescore` gave it the canonical's
+    OWN score whenever the canonical was itself a hit, a group could rank 1st
+    on a child's 0.95 and then replay into the threshold guard at the
+    canonical's 0.30 — a guard false negative attributable to this helper
+    rather than to the storage shape, which is exactly the materialization
+    artifact `_claim_categories` warns about.
+    """
+
+    def test_a_group_takes_its_best_childs_score_even_when_the_canonical_hit(self):
+        mod = _mod()
+        canonical = _rec('canon', topic='t')
+        child = _rec('kid', topic='t', parent_id='canon')
+        hits = [_sh(child, 0.95), _sh(canonical, 0.30)]
+
+        rescored = mod.rescore([canonical], hits)
+
+        assert rescored[0].relevance_score == 0.95
+
+    def test_a_canonical_that_outscores_its_children_keeps_its_own_score(self):
+        """max(), not "children always win" — the rule is best-available."""
+        mod = _mod()
+        canonical = _rec('canon', topic='t')
+        child = _rec('kid', topic='t', parent_id='canon')
+        hits = [_sh(canonical, 0.95), _sh(child, 0.30)]
+
+        rescored = mod.rescore([canonical], hits)
+
+        assert rescored[0].relevance_score == 0.95
+
+    def test_the_guard_replay_sees_the_rank_one_score_not_the_canonicals(self):
+        """The consequence, at the seam that matters: a group the grouped read
+        ranked first must not fail a threshold its best member cleared."""
+        mod = _mod()
+        canonical = _rec('canon', topic='t', claim_ids=['k0'])
+        child = _rec('kid', topic='t', parent_id='canon', claim_ids=['k1'])
+        hits = [_sh(child, 0.95), _sh(canonical, 0.30)]
+        seeded = _seeded(
+            'b_grouped', [canonical, child],
+            canonical_by_cluster={'c1': 'canon'},
+            siblings_by_cluster={'c1': {'canon', 'kid'}},
+        )
+
+        window = mod.read_path(seeded, hits, 5, pin=False)
+        verdict = mod.guard_adequacy(
+            mod.rescore(window, hits), {'canon', 'kid'}, 0.92,
+        )
+
+        assert verdict['guard_matched'] is True
+
+
+class TestCanonicalRankIsNotCensoredByTheReadWindow:
+    """"Outside top-5" and "absent entirely" are different findings.
+
+    `topic_discoverability` documents that its rank survives past the window.
+    Scoring it against an ALREADY-truncated k=5 window makes that contract
+    dead in the live path: rank can never exceed 5, so a near-miss shape and a
+    shape that never surfaces the canonical both report `None`, and the median
+    — taken over successes only — prints BEST for the arm that found it least.
+    """
+
+    def test_measure_arm_reports_a_rank_beyond_the_five_record_read_window(self):
+        seeded, hits = _full_window_arm('status_quo', n=12)
+        # Put the canonical at rank 8 — outside the k=5 read window, but well
+        # inside the fetch depth the arm was actually measured over.
+        canonical = seeded.records_by_id['canon']
+        hits = [*hits[:7], _sh(canonical, 0.5), *hits[7:]]
+
+        measured = _measure(seeded, hits, pin=False)
+        disco = measured['discoverability']
+
+        assert disco['canonical_in_top_5_rate'] == 0.0   # genuinely not in the read
+        assert disco['median_canonical_rank'] == 8.0     # but NOT "absent entirely"
+        assert disco['canonical_found_count'] == 1
+
+    def test_the_censored_denominator_travels_with_the_median(self):
+        """A median over successes only is uninterpretable without its n."""
+        seeded, hits = _full_window_arm('status_quo')
+
+        disco = _measure(seeded, hits, pin=False)['discoverability']
+
+        assert disco['canonical_candidates'] == 1
+        assert disco['canonical_found_count'] == 0       # never surfaced at all
+        assert disco['median_canonical_rank'] is None
+
+    def test_the_markdown_prints_the_denominator_next_to_the_median(self):
+        """The JSON already carried `canonical_found_count`; the OPERATOR
+        making the shape decision reads the markdown."""
+        mod = _mod()
+
+        cell = mod._rank_cell({
+            'median_canonical_rank': 2.0,
+            'canonical_found_count': 119,
+            'canonical_candidates': 236,
+        })
+
+        assert cell == '2.00 (n=119/236)'
 
 
 class TestMeasureArmScoresBothVariantsAtTheSameK:
