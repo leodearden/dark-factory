@@ -2915,6 +2915,75 @@ def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
 # ---------------------------------------------------------------------------
 
 
+def test_normalize_escalations_dir_makes_a_relative_path_absolute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A queue passed relative to the watcher's cwd must be stored/compared as
+    an absolute path, so a reaper invoked from a different cwd still matches.
+    """
+    (tmp_path / 'esc').mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    assert sr.normalize_escalations_dir('esc') == str((tmp_path / 'esc').resolve())
+
+
+def test_normalize_escalations_dir_collapses_equivalent_spellings(tmp_path: Path) -> None:
+    """The whole point of the helper: two spellings of the SAME queue dir must
+    produce ONE identical string, so the reaper's queue guard compares equal
+    for a decision stamped via a dotted/trailing-slash spelling.
+    """
+    esc = tmp_path / 'esc'
+    esc.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'esc') + '/'
+
+    assert sr.normalize_escalations_dir(dotted) == sr.normalize_escalations_dir(esc)
+
+
+def test_normalize_escalations_dir_empty_and_blank_are_the_unset_sentinel() -> None:
+    """'' means "unset/legacy" and is never a path; a whitespace-only value
+    from a sloppy shell interpolation must collapse to the same sentinel
+    rather than normalizing to the cwd.
+    """
+    assert sr.normalize_escalations_dir('') == ''
+    assert sr.normalize_escalations_dir('   ') == ''
+    assert sr.normalize_escalations_dir('\t\n') == ''
+
+
+def test_normalize_escalations_dir_expands_user(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Watchers write queue paths as ~/... in SKILL.md snippets; those must
+    expand, or a stamped record would never match a reaper's absolute path.
+    """
+    monkeypatch.setenv('HOME', str(tmp_path))
+
+    assert sr.normalize_escalations_dir('~/data/escalations') == str(
+        (tmp_path / 'data' / 'escalations').resolve()
+    )
+
+
+def test_normalize_escalations_dir_nonexistent_dir_still_normalizes(tmp_path: Path) -> None:
+    """Path.resolve() is non-strict in Python 3.11+: a well-formed queue path
+    that does not exist yet (a project checked out but never escalated, or a
+    record migrated between machines) still normalizes rather than faulting.
+    """
+    missing = tmp_path / 'never' / 'created'
+
+    assert sr.normalize_escalations_dir(missing) == str(missing)
+
+
+def test_normalize_escalations_dir_fail_soft_on_unresolvable_value() -> None:
+    """Fail-soft, matching the module's contract for helpers a C8 watch loop
+    calls directly: a value the OS cannot resolve (embedded NUL) degrades to
+    the raw string instead of raising into the caller. The raw string simply
+    won't match any real queue, which is the fail-OPEN direction.
+    """
+    assert sr.normalize_escalations_dir('a\x00b') == 'a\x00b'
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
