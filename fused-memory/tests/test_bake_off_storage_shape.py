@@ -3131,19 +3131,62 @@ class TestRunBakeOffWiring:
         assert len(issued) == len(set(issued))          # no query issued twice
         assert len({project_id for project_id, _ in issued}) == 3
 
-    async def test_the_guard_probe_is_fetched_at_the_window_production_uses(
+    async def test_the_guard_probe_over_fetches_by_exactly_one_slot(
         self, monkeypatch,
     ):
-        """server/tools.py:1556 runs the pre-check search at limit=5.  A wider
-        replay would measure a more generous guard than the one running."""
+        """The probing write's own record has to leave its own guard window:
+        in the real timeline that write had not landed when the guard ran, and
+        arm (a) stores it verbatim — leaving it in would hand the BASELINE a
+        free ~1.0 self-match the peer arms structurally cannot get, and the
+        table would read that as arm (a) having the better guard.  Dropping it
+        costs a slot, so the fetch is one deeper; the replay itself still
+        happens at GUARD_TOP_K, which `guard_adequacy` enforces on its own
+        (server/tools.py:1556 runs production's pre-check at limit=5)."""
         mod = _mod()
         _install_driver_doubles(monkeypatch)
 
         await mod.run_bake_off(**_SMALL_RUN)
 
         limits = {limit for _, _, limit in _FakeMemoryService.instances[-1].mem0.searches}
-        assert mod.GUARD_TOP_K in limits
-        assert limits == {mod.GUARD_TOP_K, mod.DEFAULT_SEARCH_LIMIT}
+        assert mod.GUARD_FETCH_LIMIT == mod.GUARD_TOP_K + 1
+        assert limits == {mod.GUARD_FETCH_LIMIT, mod.DEFAULT_SEARCH_LIMIT}
+
+    async def test_the_probing_write_is_never_its_own_guard_match(
+        self, monkeypatch,
+    ):
+        """The over-fetched slot is worthless unless the self-hit is actually
+        dropped, so assert the drop and not merely the fetch depth."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        clusters = mod.load_calibration_clusters()
+        probe_by_cluster = {}
+        for cluster_id in sorted(clusters)[:_SMALL_RUN['cluster_limit']]:
+            probe = mod.select_probing_write(clusters[cluster_id])
+            if probe is not None:
+                probe_by_cluster[cluster_id] = probe['memory_id']
+        assert probe_by_cluster  # the subset really does contain a probeable cluster
+
+        captured: list[dict[str, list[str]]] = []
+        real_fetch = mod.fetch_arm
+
+        async def _capture(backend, seeded, queries, probes, **kwargs):
+            fetched = await real_fetch(backend, seeded, queries, probes, **kwargs)
+            captured.append({
+                cluster_id: [hit.record.record_id for hit in hits]
+                for cluster_id, hits in fetched['probes'].items()
+            })
+            return fetched
+
+        monkeypatch.setattr(mod, 'fetch_arm', _capture)
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert len(captured) == len(mod.ARM_SHAPES)  # the probe path ran per arm
+        # status_quo stores the alpha record verbatim under its own memory_id,
+        # so this is the arm where a self-hit is even possible.  Checked
+        # per-cluster: another cluster's probe record is a legitimate hit.
+        for arm in captured:
+            for cluster_id, probe_id in probe_by_cluster.items():
+                assert probe_id not in arm[cluster_id]
 
     async def test_every_collection_is_dropped_before_and_after_the_run(
         self, monkeypatch,
@@ -3318,3 +3361,69 @@ class TestMain:
         ])
 
         assert 'absent.jsonl' in capsys.readouterr().err
+
+
+# ===========================================================================
+# step-20 — the ONE live end-to-end test
+# ===========================================================================
+#
+# Everything above measures this script's arithmetic against injected hit
+# lists and doubled backends.  This measures it against a real Qdrant, a real
+# embedder and a real MemoryService, and asserts the one thing a double can
+# never prove: that a full seed/query/measure/teardown cycle produces a
+# COMPLETE report and leaves NOTHING behind.
+#
+# It pins no metric value (G6).  A live embedding ranking is exactly the kind
+# of number eval-design §1 says moves wholesale with wording and config drift
+# — asserting one here would make this test fail for a reason that is not a
+# defect.
+#
+# Marked PER-TEST, never via a module `pytestmark`: fused-memory's
+# `addopts = -m 'not integration'` would otherwise deselect the ~200 pure
+# tests above from the merge lane along with this one.
+
+import os  # noqa: E402
+
+from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
+
+
+@pytest.mark.integration
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+@qdrant_skipif()
+@pytest.mark.skipif(
+    not os.environ.get('OPENAI_API_KEY'),
+    reason='the seeded bake-off needs a real embedder',
+)
+async def test_a_live_two_cluster_run_reports_completely_and_leaves_nothing(
+    worker_id,
+):
+    """A 2-cluster / 12-distractor subset: enough to exercise every seam
+    (three collections, six variants, both read transforms, the guard replay,
+    the D10 block, both artifacts) at a fraction of a full run's wall clock."""
+    from qdrant_client import QdrantClient  # noqa: PLC0415
+
+    mod = _mod()
+    suffix = f'live_{worker_id}'
+    collections = set(mod.ephemeral_collections(suffix=suffix).values())
+
+    report = await mod.run_bake_off(
+        cluster_limit=2, distractor_limit=12, project_suffix=suffix,
+    )
+
+    assert list(report['arms']) == list(mod.ARM_VARIANTS)
+    for arm in mod.ARM_VARIANTS:
+        for metric, required in mod._REQUIRED_ARM_METRICS.items():
+            for key in required:
+                assert key in report['arms'][arm][metric]
+    assert report['audit_recall']['true_dup']['pairs'] > 0
+    assert report['protocol']['distractor_slab_size'] == 12
+
+    # The teardown is the half that leaks silently: a report that looks right
+    # while three collections survive is the failure this asserts against.
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    try:
+        live = {col.name for col in client.get_collections().collections}
+    finally:
+        client.close()
+    assert live.isdisjoint(collections)

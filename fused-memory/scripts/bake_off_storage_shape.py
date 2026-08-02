@@ -112,7 +112,9 @@ embedder.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2035,3 +2037,716 @@ def _atomic_write_text(path: Path, text: str) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
+
+
+# ---------------------------------------------------------------------------
+# The live driver — the only part that touches Qdrant or an embedder
+# ---------------------------------------------------------------------------
+#
+# Everything above is pure and runs in the merge lane.  Below, three seeded
+# ephemeral collections are created, queried once each, measured twice each
+# (pin off / pin on), and dropped.
+#
+# ISOLATION, in the order it matters:
+#   - ``collection_prefix`` is set on the CONFIG, not merely the project_id.
+#     Collections are ``f'{collection_prefix}_{project_id}'``
+#     (``Scope.mem0_collection_name``), so scoping only the project_id would
+#     write under the default ``fused`` prefix — which the reaper does not
+#     match, by design.  That is a permanent leak, not a slow one.
+#   - the prefix string itself lives in ``cleanup_test_collections`` and is
+#     imported from there.  A collection named in one file and reaped by
+#     another is one rename away from orphaning.
+#   - every collection is dropped BEFORE and AFTER, so a swallowed teardown
+#     self-heals on the next run rather than poisoning it.
+#   - the project_id carries the xdist worker id, so concurrent workers
+#     cannot seed each other's arms.
+#
+# SIX VARIANTS, THREE COLLECTIONS: the topic pin is a READ-side transform, so
+# each shape is fetched ONCE and measured twice.  Pin-on and pin-off therefore
+# compare identical stored state and an identical ranked list — an exactly
+# controlled A/B rather than two ANN draws.
+
+#: Concurrent seeding writes in flight.  Bounded rather than one gather over
+#: the whole arm: an unbounded fan-out opens hundreds of simultaneous
+#: embedding requests, which the provider answers with rate-limit retries —
+#: a run whose wall clock is set by the throttler instead of the experiment,
+#: and (worse) a partially-seeded arm if the retries give up.
+SEED_CONCURRENCY = 8
+
+#: Fetch depth for the claim-recall / discoverability / cost queries.
+DEFAULT_SEARCH_LIMIT = 10
+
+#: Fetch depth for a guard probe: production's window plus one.
+#:
+#: The extra slot pays for dropping the probing write's OWN record from its
+#: own window.  In the real timeline that write had not landed when the guard
+#: ran, and arm (a) stores it verbatim — leaving it in would hand the
+#: baseline a free ~1.0 self-match the peer arms structurally cannot get, and
+#: the decision table would read that as arm (a) having the better guard.
+#: The replay still happens at :data:`GUARD_TOP_K`, which ``guard_adequacy``
+#: enforces itself.
+GUARD_FETCH_LIMIT = GUARD_TOP_K + 1
+
+#: Agent id every seeded record is written under.
+SEED_AGENT_ID = 'e2-bakeoff-seed'
+
+#: Recorded verbatim in the artifact's protocol block.
+BLIND_AUTHORING_PROTOCOL = (
+    'single-author-blind-to-metrics, mechanized by commit ordering: the arm '
+    'decomposition and query set were committed before any metric function '
+    'existed in the tree'
+)
+
+
+class SeedingError(RuntimeError):
+    """A seeded record could not be mapped back to its stored id.
+
+    Loud rather than skipped: a hit this script cannot resolve to an
+    :class:`ArmRecord` is a hit that would silently vanish from every metric,
+    and a shape that lost results would look like a shape that ranked badly.
+    """
+
+
+def load_cleanup_script() -> Any:
+    """``scripts/cleanup_test_collections.py`` — the reaper, and the prefix's home."""
+    return _load_sibling_script('cleanup_test_collections')
+
+
+def ephemeral_collection_prefix() -> str:
+    """The collection prefix, read from the reaper that has to match it."""
+    return load_cleanup_script().E2_BAKEOFF_PREFIX
+
+
+def worker_suffix() -> str:
+    """The xdist worker id, or ``'main'`` outside a parallel test run.
+
+    Never empty: an unsuffixed project_id would give two concurrent workers
+    the same collection, and each would measure the other's arm.
+    """
+    import os  # noqa: PLC0415
+
+    return os.environ.get('PYTEST_XDIST_WORKER') or 'main'
+
+
+def arm_project_id(shape: str, *, suffix: str | None = None) -> str:
+    """The ephemeral project id one arm seeds into."""
+    return f'e2_bakeoff_{shape}_{suffix or worker_suffix()}'
+
+
+def ephemeral_collections(
+    shapes: tuple[str, ...] = ARM_SHAPES,
+    *,
+    suffix: str | None = None,
+    prefix: str | None = None,
+) -> dict[str, str]:
+    """``shape -> qdrant collection name``, derived the way mem0 derives it.
+
+    Through :meth:`Scope.mem0_collection_name` rather than an f-string here:
+    ``Scope`` canonicalizes the project_id (lowercased, ``-`` to ``_``), so a
+    hand-built name could differ from the collection mem0 actually writes to
+    — and the reap would then miss it.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    resolved_prefix = prefix or ephemeral_collection_prefix()
+    return {
+        shape: Scope(
+            project_id=arm_project_id(shape, suffix=suffix),
+        ).mem0_collection_name(resolved_prefix)
+        for shape in shapes
+    }
+
+
+def drop_collections(names: Any, *, qdrant_url: str) -> None:
+    """Delete each named collection, tolerating absence and per-name failure.
+
+    Absence is the NORMAL case on the pre-run sweep, so it is not an error.
+    A failure on one name must not abandon the rest: the whole point of the
+    teardown is that nothing survives it.
+    """
+    from qdrant_client import QdrantClient  # noqa: PLC0415
+
+    client = QdrantClient(url=qdrant_url, timeout=10)
+    try:
+        for name in names:
+            try:
+                client.delete_collection(name)
+            except Exception as exc:  # noqa: BLE001 - absence is the normal case
+                print(f'could not drop {name}: {exc}', file=sys.stderr)
+    finally:
+        client.close()
+
+
+def canonical_record_ids(
+    records: list[ArmRecord], claims: list[ArmClaim],
+) -> dict[str, str]:
+    """``cluster_id -> the record realizing that cluster's canonical claim``.
+
+    Keyed off the CLAIM rather than off ``metadata['canonical']`` so that arm
+    (a) — which carries no vocabulary metadata at all, because the α fixture
+    genuinely has none — is measurable on the same footing as the two shapes
+    that do.  Reading the metadata key would have reported arm (a) as having
+    no canonical to discover, which is a statement about the measurement, not
+    about the shape.
+    """
+    canonical_claims = {c.cluster_id: c.claim_id for c in claims if c.canonical}
+    index: dict[str, str] = {}
+    for record in records:
+        if record.cluster_id is None:
+            continue
+        claim_id = canonical_claims.get(record.cluster_id)
+        if claim_id is not None and claim_id in record.claim_ids:
+            index.setdefault(record.cluster_id, record.record_id)
+    return index
+
+
+def contested_record_ids(
+    records: list[ArmRecord], claims: list[ArmClaim],
+) -> set[str]:
+    """Records realizing a contested claim — never folded by the grouped read."""
+    contested = {c.claim_id for c in claims if c.contested}
+    return {
+        record.record_id for record in records
+        if any(claim_id in contested for claim_id in record.claim_ids)
+    }
+
+
+@dataclass
+class SeededArm:
+    """One materialized shape, live in its own ephemeral collection."""
+
+    shape: str
+    project_id: str
+    collection: str
+    records: list[ArmRecord]
+    #: Mem0's assigned id -> the record it stored.  The join key between a
+    #: search result and this experiment's bookkeeping.  Deliberately NOT a
+    #: content match: mem0 is free to normalize what it echoes back, and a
+    #: near-miss would silently drop the hit.
+    by_stored_id: dict[str, ArmRecord]
+    records_by_id: dict[str, ArmRecord]
+    canonical_by_topic: dict[str, ArmRecord]
+    contested_ids: set[str]
+    canonical_by_cluster: dict[str, str]
+    siblings_by_cluster: dict[str, set[str]]
+
+
+def _index_arm(
+    shape: str, project_id: str, collection: str,
+    records: list[ArmRecord], claims: list[ArmClaim],
+) -> SeededArm:
+    """Every pure index an arm needs, built once before a byte is written."""
+    siblings: dict[str, set[str]] = {}
+    for record in records:
+        if record.cluster_id is not None:
+            siblings.setdefault(record.cluster_id, set()).add(record.record_id)
+    return SeededArm(
+        shape=shape,
+        project_id=project_id,
+        collection=collection,
+        records=records,
+        by_stored_id={},
+        records_by_id={record.record_id: record for record in records},
+        canonical_by_topic=build_canonical_by_topic(records),
+        contested_ids=contested_record_ids(records, claims),
+        canonical_by_cluster=canonical_record_ids(records, claims),
+        siblings_by_cluster=siblings,
+    )
+
+
+async def seed_arm(
+    backend: Any,
+    seeded: SeededArm,
+    *,
+    concurrency: int = SEED_CONCURRENCY,
+) -> SeededArm:
+    """Write every record of one arm into its own ephemeral collection.
+
+    Populates ``by_stored_id`` in place and returns the same object.
+
+    ``instance.db.add_history`` is stubbed first: mem0's SQLite history
+    writer is process-shared and xdist-contended (and read-only in the
+    sandbox).  It is not the question under test, and its failure would mask
+    the one that is — the same reason ``test_recon_dedup_premise.py:135`` and
+    the E1 probe stub it.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    scope = Scope(project_id=seeded.project_id, agent_id=SEED_AGENT_ID)
+    instance = await backend._get_instance(scope)
+    instance.db.add_history = lambda *args, **kwargs: None
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _write(record: ArmRecord) -> None:
+        async with semaphore:
+            response = await backend.add(
+                record.content, scope, metadata=dict(record.metadata),
+            )
+        results = (response or {}).get('results') or []
+        if not results or not results[0].get('id'):
+            raise SeedingError(
+                f'mem0 returned no id for {seeded.shape} record '
+                f'{record.record_id!r}. Continuing would measure an arm that '
+                f'is quietly missing a record.'
+            )
+        seeded.by_stored_id[results[0]['id']] = record
+
+    await asyncio.gather(*(_write(record) for record in seeded.records))
+    return seeded
+
+
+async def _search(
+    backend: Any, seeded: SeededArm, text: str, *, limit: int,
+) -> list[ScoredHit]:
+    """One ranked list from the arm's collection, joined back to its records."""
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    response = await backend.search(
+        query=text, scope=Scope(project_id=seeded.project_id), limit=limit,
+    )
+    hits: list[ScoredHit] = []
+    for item in (response or {}).get('results') or []:
+        record = seeded.by_stored_id.get(item.get('id'))
+        if record is None:
+            raise SeedingError(
+                f"{seeded.collection} returned point {item.get('id')!r}, which "
+                f'this run did not seed. The collection is not clean; dropping '
+                f'the hit would silently shrink the measured ranking.'
+            )
+        hits.append(ScoredHit(
+            record=record, relevance_score=float(item.get('score') or 0.0),
+        ))
+    return hits
+
+
+async def fetch_arm(
+    backend: Any,
+    seeded: SeededArm,
+    queries: list[Query],
+    probes: list[tuple[str, dict[str, Any]]],
+    *,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+) -> dict[str, dict[str, list[ScoredHit]]]:
+    """Every ranked list this arm needs, fetched ONCE.
+
+    Both pin variants are measured from these same lists, so the pin
+    comparison is exactly controlled and the run pays for one shape's
+    embeddings rather than two.
+
+    Guard probes drop the probing write's own record — see
+    :data:`GUARD_FETCH_LIMIT`.
+    """
+    fetched_queries: dict[str, list[ScoredHit]] = {}
+    for query in queries:
+        fetched_queries[query.query_id] = await _search(
+            backend, seeded, query.text, limit=limit,
+        )
+
+    fetched_probes: dict[str, list[ScoredHit]] = {}
+    for cluster_id, probe in probes:
+        raw = await _search(
+            backend, seeded, probe['content'], limit=GUARD_FETCH_LIMIT,
+        )
+        fetched_probes[cluster_id] = [
+            hit for hit in raw if hit.record.record_id != probe['memory_id']
+        ]
+
+    return {'queries': fetched_queries, 'probes': fetched_probes}
+
+
+def read_path(
+    seeded: SeededArm, hits: list[ScoredHit], k: int, *, pin: bool,
+) -> list[ArmRecord]:
+    """What a reader of this arm variant actually receives for a top-*k* fetch.
+
+    Truncation happens BEFORE the transforms, because that is the order
+    production runs in: the store returns k, and the read-side transforms act
+    on what came back.  Transforming first would let a record the store never
+    returned into the window.
+    """
+    records = [hit.record for hit in hits[:k]]
+    if seeded.shape == 'b_grouped':
+        records = apply_grouped_read(
+            records, seeded.records_by_id, contested_ids=seeded.contested_ids,
+        )
+    if pin:
+        records = apply_topic_anchor(records, seeded.canonical_by_topic)
+    return records
+
+
+def rescore(transformed: list[ArmRecord], hits: list[ScoredHit]) -> list[ScoredHit]:
+    """Re-attach the store's scores after a read-side transform.
+
+    Only the guard replay needs scores, and only because the production
+    selector is threshold-based.
+
+      * a record the store ranked keeps its own score;
+      * a grouped document takes the BEST score among the children that
+        collapsed into it, matching the rank the grouped read gives it;
+      * a PINNED canonical the store never returned scores 0.0 — the honest
+        value, because the ANN produced no similarity evidence for it at all.
+        It still counts for the rank-based ``candidate_present`` half, which
+        is where a pin can legitimately show a win.
+    """
+    direct = {hit.record.record_id: hit.relevance_score for hit in hits}
+    best_child: dict[str, float] = {}
+    for hit in hits:
+        parent_id = hit.record.metadata.get('parent_id')
+        if parent_id is not None:
+            best_child[parent_id] = max(
+                best_child.get(parent_id, 0.0), hit.relevance_score,
+            )
+    return [
+        ScoredHit(
+            record=record,
+            relevance_score=direct.get(
+                record.record_id, best_child.get(record.record_id, 0.0),
+            ),
+        )
+        for record in transformed
+    ]
+
+
+def _mean(values: list[float | None]) -> float | None:
+    """Mean over the MEASURED values, or ``None`` when there are none.
+
+    ``None`` entries are non-observations, not zeros: averaging them in as 0
+    would drag an arm's reported score down for questions it was never asked.
+    """
+    measured = [value for value in values if value is not None]
+    if not measured:
+        return None
+    return sum(measured) / len(measured)
+
+
+def measure_arm(
+    seeded: SeededArm,
+    fetched: dict[str, dict[str, list[ScoredHit]]],
+    *,
+    pin: bool,
+    queries: list[Query],
+    probes: list[tuple[str, dict[str, Any]]],
+    estimator: tuple[str, Any],
+    guard_threshold: float,
+) -> dict[str, Any]:
+    """The four E2 metrics for one arm variant.  Pure — no store, no await."""
+    recall_5: list[float | None] = []
+    recall_10: list[float | None] = []
+    canonical_in_5: list[float | None] = []
+    canonical_ranks: list[int] = []
+    token_counts: list[float | None] = []
+
+    for query in queries:
+        hits = fetched['queries'][query.query_id]
+        top_5 = read_path(seeded, hits, 5, pin=pin)
+        top_10 = read_path(seeded, hits, 10, pin=pin)
+
+        # k = len(window): the window IS what the reader receives.  Grouping
+        # collapses it, the pin appends to it — and both of those changes are
+        # exactly the shape difference under measurement.
+        recall_5.append(claim_recall_at_k(top_5, query.expects_claim_ids, len(top_5)))
+        recall_10.append(claim_recall_at_k(top_10, query.expects_claim_ids, len(top_10)))
+
+        canonical_id = seeded.canonical_by_cluster.get(query.cluster_id)
+        if canonical_id is not None:
+            found = topic_discoverability(
+                top_5, query.topic, canonical_id, len(top_5),
+            )
+            canonical_in_5.append(1.0 if found['canonical_in_top_k'] else 0.0)
+            if found['canonical_rank'] is not None:
+                canonical_ranks.append(found['canonical_rank'])
+        else:
+            canonical_in_5.append(None)
+
+        token_counts.append(float(
+            tokens_returned(top_10, len(top_10), estimator)['tokens']
+        ))
+
+    candidate_present: list[float | None] = []
+    guard_matched: list[float | None] = []
+    for cluster_id, _probe in probes:
+        probe_hits = fetched['probes'][cluster_id]
+        window = read_path(seeded, probe_hits, GUARD_TOP_K, pin=pin)
+        verdict = guard_adequacy(
+            rescore(window, probe_hits),
+            seeded.siblings_by_cluster.get(cluster_id, set()),
+            guard_threshold,
+        )
+        candidate_present.append(1.0 if verdict['candidate_present'] else 0.0)
+        guard_matched.append(1.0 if verdict['guard_matched'] else 0.0)
+
+    median_rank: float | None = None
+    if canonical_ranks:
+        import statistics  # noqa: PLC0415
+
+        median_rank = float(statistics.median(canonical_ranks))
+
+    return {
+        'claim_recall': {'at_5': _mean(recall_5), 'at_10': _mean(recall_10)},
+        'discoverability': {
+            'canonical_in_top_5_rate': _mean(canonical_in_5),
+            'median_canonical_rank': median_rank,
+            'canonical_found_count': len(canonical_ranks),
+        },
+        'tokens_per_query': {
+            'mean': _mean(token_counts),
+            'estimator': estimator[0],
+            'window': 10,
+        },
+        'guard_adequacy': {
+            'candidate_present_rate': _mean(candidate_present),
+            'guard_matched_rate': _mean(guard_matched),
+            # Carried per-arm, not only in the protocol block: a reader who
+            # copies one row out of the table must not lose the flag that
+            # says the last column is a threshold replay.
+            'threshold_replay': True,
+            'threshold': guard_threshold,
+            'probes': len(probes),
+        },
+    }
+
+
+async def run_arm(
+    backend: Any,
+    seeded: SeededArm,
+    *,
+    queries: list[Query],
+    probes: list[tuple[str, dict[str, Any]]],
+    limit: int,
+    estimator: tuple[str, Any],
+    guard_threshold: float,
+) -> dict[str, dict[str, Any]]:
+    """One shape's two rows of the decision table, off ONE set of fetches."""
+    fetched = await fetch_arm(backend, seeded, queries, probes, limit=limit)
+    return {
+        seeded.shape: measure_arm(
+            seeded, fetched, pin=False, queries=queries, probes=probes,
+            estimator=estimator, guard_threshold=guard_threshold,
+        ),
+        f'{seeded.shape}+pin': measure_arm(
+            seeded, fetched, pin=True, queries=queries, probes=probes,
+            estimator=estimator, guard_threshold=guard_threshold,
+        ),
+    }
+
+
+def _subset(
+    clusters: dict[str, CalibrationCluster],
+    topics: dict[str, RegistryTopic],
+    claims: list[ArmClaim],
+    queries: list[Query],
+    cluster_limit: int | None,
+) -> tuple[dict[str, CalibrationCluster], dict[str, RegistryTopic],
+           list[ArmClaim], list[Query]]:
+    """The first *cluster_limit* clusters by id, with their claims and queries.
+
+    Cluster-aligned so the subset stays internally consistent (a claim whose
+    cluster went missing would fail cross-validation).  Deterministic by
+    sorted id so a smoke run is reproducible.
+    """
+    if cluster_limit is None:
+        return clusters, topics, claims, queries
+    keep = sorted(clusters)[:cluster_limit]
+    kept = set(keep)
+    return (
+        {cluster_id: clusters[cluster_id] for cluster_id in keep},
+        {cluster_id: topics[cluster_id] for cluster_id in keep if cluster_id in topics},
+        [claim for claim in claims if claim.cluster_id in kept],
+        [query for query in queries if query.cluster_id in kept],
+    )
+
+
+async def run_bake_off(
+    *,
+    config: Any = None,
+    alpha_fixture: str | Path = DEFAULT_ALPHA_FIXTURE_PATH,
+    registry: str | Path = DEFAULT_REGISTRY_PATH,
+    arm_claims: str | Path = DEFAULT_ARM_CLAIMS_PATH,
+    query_set: str | Path = DEFAULT_QUERY_SET_PATH,
+    distractor_slab: str | Path = DEFAULT_DISTRACTOR_SLAB_PATH,
+    cluster_limit: int | None = None,
+    distractor_limit: int | None = None,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    seed_concurrency: int = SEED_CONCURRENCY,
+    project_suffix: str | None = None,
+) -> dict[str, Any]:
+    """Seed, query, measure, tear down — and return the validated report.
+
+    Fixtures are loaded and cross-validated FIRST, before a collection
+    exists: a fixture checked after seeding would leave three live
+    collections behind on every typo.
+
+    Raises :class:`FixtureError` for any fixture problem, and re-raises
+    anything a live run throws — but never without tearing down, because the
+    failure that leaks is the mid-run one.
+    """
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    clusters = load_calibration_clusters(alpha_fixture)
+    topics = load_registry_topics(registry)
+    claims = load_arm_claims(arm_claims)
+    queries = load_query_set(query_set)
+    distractors = load_distractor_slab(distractor_slab)
+    cross_validate_fixtures(
+        clusters=clusters, topics=topics, claims=claims, queries=queries,
+    )
+
+    clusters, topics, claims, queries = _subset(
+        clusters, topics, claims, queries, cluster_limit,
+    )
+    if distractor_limit is not None:
+        distractors = distractors[:distractor_limit]
+
+    probes: list[tuple[str, dict[str, Any]]] = []
+    for cluster_id in sorted(clusters):
+        probe = select_probing_write(clusters[cluster_id])
+        if probe is not None:
+            probes.append((cluster_id, probe))
+
+    estimator = resolve_token_estimator()
+    collections = ephemeral_collections(suffix=project_suffix)
+
+    config = (config or FusedMemoryConfig()).model_copy(deep=True)
+    config.mem0.collection_prefix = ephemeral_collection_prefix()
+    # Clearing the pinned key makes mem0's OpenAIEmbedding fall back to the
+    # real OPENAI_API_KEY.  A stub constant vector would make every ranking in
+    # this report meaningless.  `providers.openai` is optional in the schema
+    # and its absence already means "fall back", so a missing provider is not
+    # an error here.
+    openai_provider = getattr(config.embedder.providers, 'openai', None)
+    if openai_provider is not None:
+        openai_provider.api_key = None
+    qdrant_url = config.mem0.qdrant_url
+
+    drop_collections(collections.values(), qdrant_url=qdrant_url)
+    memory = MemoryService(config)
+    await memory.initialize()
+    arms: dict[str, Any] = {}
+    try:
+        guard_threshold = resolve_guard_threshold(memory)
+        for shape in ARM_SHAPES:
+            seeded = _index_arm(
+                shape,
+                arm_project_id(shape, suffix=project_suffix),
+                collections[shape],
+                materialize_arm(shape, clusters, claims, topics, distractors),
+                claims,
+            )
+            await seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
+            arms.update(await run_arm(
+                memory.mem0, seeded, queries=queries, probes=probes,
+                limit=limit, estimator=estimator,
+                guard_threshold=guard_threshold,
+            ))
+    finally:
+        await memory.close()
+        drop_collections(collections.values(), qdrant_url=qdrant_url)
+
+    return build_report(
+        arms=arms,
+        audit_recall=audit_recall_over_labeled_fixture(
+            load_labeled_fixture(alpha_fixture),
+        ),
+        protocol={
+            'blind_authoring': BLIND_AUTHORING_PROTOCOL,
+            'fixtures': fixture_provenance([
+                alpha_fixture, registry, arm_claims, query_set, distractor_slab,
+            ]),
+            'token_estimator': estimator[0],
+            'guard_threshold': guard_threshold,
+            'distractor_slab_size': len(distractors),
+            'embedder_model': config.embedder.model,
+            'search_limit': limit,
+            'guard_fetch_limit': GUARD_FETCH_LIMIT,
+            'guard_replay_window': GUARD_TOP_K,
+            'seed_concurrency': seed_concurrency,
+            'clusters_measured': len(clusters),
+            'queries_measured': len(queries),
+            'guard_probes_measured': len(probes),
+            'collections': sorted(collections.values()),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> Any:
+    """The CLI.  Every flag is a knob on the experiment, none on its verdict."""
+    import argparse  # noqa: PLC0415
+
+    parser = argparse.ArgumentParser(
+        description=(
+            'E2 storage-shape bake-off: seed three ephemeral collections, '
+            'measure six arm variants, and emit the decision table gate eta '
+            'reads.'
+        ),
+    )
+    parser.add_argument('--alpha-fixture', default=str(DEFAULT_ALPHA_FIXTURE_PATH),
+                        help='alpha/3130 curator-labeled fixture (JSONL)')
+    parser.add_argument('--registry', default=str(DEFAULT_REGISTRY_PATH),
+                        help='E1 topic registry (JSON)')
+    parser.add_argument('--arm-claims', default=str(DEFAULT_ARM_CLAIMS_PATH),
+                        help='blind-authored arm claim decomposition (JSONL)')
+    parser.add_argument('--query-set', default=str(DEFAULT_QUERY_SET_PATH),
+                        help='blind-authored query set (JSONL)')
+    parser.add_argument('--distractor-slab', default=str(DEFAULT_DISTRACTOR_SLAB_PATH),
+                        help='shared contamination slab (JSONL)')
+    parser.add_argument('--clusters', type=int, default=None,
+                        help='measure only the first N clusters (smoke runs)')
+    parser.add_argument('--distractors', type=int, default=None,
+                        help='cap the contamination slab at N records')
+    parser.add_argument('--limit', type=int, default=DEFAULT_SEARCH_LIMIT,
+                        help='fetch depth for the claim/cost queries')
+    parser.add_argument('--seed-concurrency', type=int, default=SEED_CONCURRENCY,
+                        help='concurrent seeding writes in flight')
+    parser.add_argument('--project-suffix', default=None,
+                        help='override the per-xdist-worker project id suffix')
+    parser.add_argument('--json-out', default=str(DEFAULT_REPORT_JSON),
+                        help='where to write the machine-readable report')
+    parser.add_argument('--md-out', default=str(DEFAULT_REPORT_MD),
+                        help='where to write the operator-facing report')
+    return parser
+
+
+async def _run(args: Any) -> int:
+    """Exit 2 for a fixture problem, with NO artifact written.
+
+    A fixture failure must not overwrite a good committed report with a
+    partial one — the artifact is the gate's input, and a silently truncated
+    decision table reads exactly like a measured one.
+    """
+    try:
+        report = await run_bake_off(
+            alpha_fixture=args.alpha_fixture,
+            registry=args.registry,
+            arm_claims=args.arm_claims,
+            query_set=args.query_set,
+            distractor_slab=args.distractor_slab,
+            cluster_limit=args.clusters,
+            distractor_limit=args.distractors,
+            limit=args.limit,
+            seed_concurrency=args.seed_concurrency,
+            project_suffix=args.project_suffix,
+        )
+    except FixtureError as exc:
+        print(f'fixture error: {exc}', file=sys.stderr)
+        return 2
+
+    json_path, md_path = write_artifacts(report, args.json_out, args.md_out)
+    print(f'wrote {json_path}')
+    print(f'wrote {md_path}')
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Injectable argv so the CLI is testable without a subprocess."""
+    return asyncio.run(_run(build_parser().parse_args(argv)))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -9,6 +9,15 @@ from __future__ import annotations
 import sys
 
 PREFIX = '_test_mem0_qdrant_integration_'
+
+#: Prefix for the ephemeral collections the E2 storage-shape bake-off seeds
+#: (``scripts/bake_off_storage_shape.py``, task 3199).  It lives HERE, in the
+#: reaper, and is imported from here by the bake-off — a collection whose name
+#: is coined in one file and reaped by another is one rename away from leaking
+#: forever, and nothing under the default ``fused`` prefix is reapable by
+#: design.
+E2_BAKEOFF_PREFIX = '_test_e2_bakeoff'
+
 QDRANT_URL = 'http://localhost:6333'
 
 
