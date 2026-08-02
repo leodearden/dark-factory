@@ -1568,17 +1568,46 @@ def _make_run_qdrant_mock(
     client.count = AsyncMock(side_effect=_count)
     client.upsert = AsyncMock(return_value=None)
     client.delete_collection = AsyncMock(return_value=None)
+    # Carried so _make_run_memory_service can back the BACKEND's paging
+    # generator with the same fixture data (task 3225: the collection scroll
+    # goes through mem0.scroll_collection_pages, not the raw transport).
+    client._points_by_collection = points_by_collection
     return client
 
 
-def _make_run_memory_service(graphiti: MagicMock, qdrant_client: AsyncMock) -> MagicMock:
-    """MagicMock memory_service wired the way run() consumes it: .graphiti
-    directly, and the raw Qdrant transport via .mem0._get_async_qdrant()
-    (PRD reuse note: mem0_client.py's _get_async_qdrant)."""
+def _make_run_memory_service(
+    graphiti: MagicMock,
+    qdrant_client: AsyncMock,
+    *,
+    budget_exhausted: set[str] | None = None,
+) -> MagicMock:
+    """MagicMock memory_service wired the way run() consumes it.
+
+    ``.graphiti`` directly; ``.mem0`` is the Mem0Backend, which run() uses
+    two ways: ``scroll_collection_pages`` to ENUMERATE a collection (task
+    3225 -- the paging lives in the backend now) and ``_get_async_qdrant()``
+    for the raw transport the upsert/delete/count paths still need.
+
+    *budget_exhausted* names collections whose paging generator raises
+    ``ScrollPageBudgetExhausted`` after yielding everything it has, modelling
+    a collection larger than the page budget.
+    """
+    exhausted = budget_exhausted or set()
+    points_by_collection = getattr(qdrant_client, '_points_by_collection', {}) or {}
+
+    async def _scroll_collection_pages(collection, **_kwargs):
+        for point in points_by_collection.get(collection, []):
+            yield point
+        if collection in exhausted:
+            raise _mod.ScrollPageBudgetExhausted(
+                f'collection={collection!r} exhausted its page budget',
+            )
+
     memory_service = MagicMock()
     memory_service.graphiti = graphiti
     memory_service.mem0 = MagicMock()
     memory_service.mem0._get_async_qdrant = AsyncMock(return_value=qdrant_client)
+    memory_service.mem0.scroll_collection_pages = _scroll_collection_pages
     return memory_service
 
 
@@ -1723,10 +1752,37 @@ class TestRunDryRun:
 
     @pytest.mark.asyncio
     async def test_dry_run_collection_unresolved_when_scroll_capped(self):
-        """A collection whose scroll hits --limit is UNRESOLVED, not MERGE:
-        no-silent-caps -- a capped scroll may be incomplete, so it must not
-        be reported as a clean merge."""
+        """A collection whose scroll exhausts the page budget is UNRESOLVED,
+        not MERGE: no-silent-caps -- a capped scroll may be incomplete, so it
+        must not be reported as a clean merge.
+
+        Task 3225: capped now comes from the flag scroll_collection_points
+        returns, NOT from len(points) >= limit -- with real paging, a
+        fully-drained multi-page scroll can return any count.
+        """
         points = [_make_point(f'p{i}') for i in range(2)]
+        graphiti = _make_run_graphiti_mock()
+        qdrant_client = _make_run_qdrant_mock(
+            points_by_collection={'fused_dark-factory': points},
+        )
+        memory_service = _make_run_memory_service(
+            graphiti, qdrant_client, budget_exhausted={'fused_dark-factory'},
+        )
+
+        report = await _mod.run(_run_args(apply=False), memory_service, limit=2)
+
+        collection_by_source = {item['source']: item for item in report['collection_merges']}
+        assert collection_by_source['fused_dark-factory']['disposition'] == 'UNRESOLVED'
+
+    @pytest.mark.asyncio
+    async def test_dry_run_collection_with_more_points_than_limit_is_no_longer_capped(self):
+        """THE bug fix, end to end: a collection larger than --limit now
+        MERGEs instead of being permanently UNRESOLVED.
+
+        Before task 3225 this scroll stopped at the first page and
+        `len(points) >= limit` marked it capped forever.
+        """
+        points = [_make_point(f'p{i}') for i in range(5)]
         graphiti = _make_run_graphiti_mock()
         qdrant_client = _make_run_qdrant_mock(
             points_by_collection={'fused_dark-factory': points},
@@ -1735,8 +1791,9 @@ class TestRunDryRun:
 
         report = await _mod.run(_run_args(apply=False), memory_service, limit=2)
 
-        collection_by_source = {item['source']: item for item in report['collection_merges']}
-        assert collection_by_source['fused_dark-factory']['disposition'] == 'UNRESOLVED'
+        item = {i['source']: i for i in report['collection_merges']}['fused_dark-factory']
+        assert item['disposition'] == 'MERGE'
+        assert item['point_count'] == 5, 'point_count must reflect EVERY page, not just the first'
 
     @pytest.mark.asyncio
     async def test_dry_run_sibling_unresolved_when_enumeration_capped(self):
@@ -2076,6 +2133,84 @@ class TestRunApply:
         assert dark_factory_item['source_deleted'] is True
 
     @pytest.mark.asyncio
+    async def test_apply_merges_every_page_and_keeps_using_the_raw_client_to_upsert(self, monkeypatch):
+        """run() hands the BACKEND to the scroll and the RAW CLIENT to the merge.
+
+        Task 3225 split the two: enumeration goes through
+        memory_service.mem0.scroll_collection_pages (which pages), while
+        merge_collection still needs the raw AsyncQdrantClient for
+        upsert/delete_collection. A multi-page collection must upsert ALL its
+        points, not just the first page's.
+        """
+        merge_calls: list = []
+        real_merge = _mod.merge_collection
+
+        async def _spy_merge(qdrant_client, source, target, canonical_user_id, points, *, capped):
+            merge_calls.append((qdrant_client, source, list(points), capped))
+            return await real_merge(
+                qdrant_client, source, target, canonical_user_id, points, capped=capped,
+            )
+
+        monkeypatch.setattr(_mod, 'merge_collection', _spy_merge)
+        _patch_merge_primitives(monkeypatch)
+
+        points = [
+            _make_point(f'p{i}', payload={'user_id': 'dark-factory'}) for i in range(5)
+        ]
+        graphiti = _make_run_graphiti_mock()
+        qdrant_client = _make_run_qdrant_mock(
+            points_by_collection={'fused_dark-factory': points},
+        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=2)
+
+        assert len(merge_calls) == 1
+        merged_client, source, merged_points, capped = merge_calls[0]
+        assert source == 'fused_dark-factory'
+        assert merged_client is qdrant_client, (
+            'merge_collection still takes the RAW client -- the upsert/delete '
+            'path is unchanged and still needs it'
+        )
+        assert merged_points == points, 'every page must reach the merge, not just the first'
+        assert capped is False
+
+        upserted = [
+            c for c in qdrant_client.upsert.call_args_list
+            if c.kwargs.get('collection_name') == 'fused_dark_factory'
+        ][0].kwargs['points']
+        assert len(upserted) == 5
+
+        item = {i['source']: i for i in report['collection_merges']}['fused_dark-factory']
+        assert item['point_count'] == 5
+        assert item['disposition'] == 'MERGE'
+
+    @pytest.mark.asyncio
+    async def test_apply_passes_the_backend_not_the_raw_client_to_the_scroll(self, monkeypatch):
+        """The enumeration is addressed at memory_service.mem0, and --limit
+        becomes the collection scroll's PAGE SIZE."""
+        seen: list = []
+        real_scroll = _mod.scroll_collection_points
+
+        async def _spy_scroll(backend, collection, **kwargs):
+            seen.append((backend, collection, dict(kwargs)))
+            return await real_scroll(backend, collection, **kwargs)
+
+        monkeypatch.setattr(_mod, 'scroll_collection_points', _spy_scroll)
+        _patch_merge_primitives(monkeypatch)
+        memory_service, _, qdrant_client = self._scenario()
+
+        await _mod.run(_run_args(apply=True), memory_service, limit=250)
+
+        assert seen, 'the collection-merge section must scroll at least one collection'
+        for backend, _collection, kwargs in seen:
+            assert backend is memory_service.mem0, (
+                'scroll_collection_points takes the BACKEND, not '
+                'memory_service.mem0._get_async_qdrant()\'s raw client'
+            )
+            assert kwargs['page_size'] == 250
+
+    @pytest.mark.asyncio
     async def test_apply_deletes_zero_count_junk_key_and_leaves_nonzero_unresolved(self, monkeypatch):
         """delete_junk_key deletes the zero-count key (test-project,
         disposition DELETE) but leaves the non-empty one (my-project,
@@ -2107,16 +2242,24 @@ class TestRunApply:
 
     @pytest.mark.asyncio
     async def test_apply_capped_collection_not_deleted_and_stays_unresolved(self, monkeypatch):
-        """A collection whose scroll hits --limit is NOT deleted even with
-        --apply (no data loss on a partial migration) and its disposition
-        stays UNRESOLVED."""
+        """A collection whose scroll exhausts the page budget is NOT deleted
+        even with --apply (no data loss on a partial migration), is never
+        upserted at all, and its disposition stays UNRESOLVED -- which makes
+        the run exit non-zero.
+
+        The externally visible contract is unchanged from before task 3225;
+        only the SOURCE of `capped` moved (a caught ScrollPageBudgetExhausted
+        rather than len(points) >= limit).
+        """
         _patch_merge_primitives(monkeypatch)
         points = [_make_point(f'p{i}') for i in range(2)]
         graphiti = _make_run_graphiti_mock()
         qdrant_client = _make_run_qdrant_mock(
             points_by_collection={'fused_dark-factory': points},
         )
-        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+        memory_service = _make_run_memory_service(
+            graphiti, qdrant_client, budget_exhausted={'fused_dark-factory'},
+        )
 
         report = await _mod.run(_run_args(apply=True), memory_service, limit=2)
 
@@ -2125,9 +2268,15 @@ class TestRunApply:
             if c.args and c.args[0] == 'fused_dark-factory'
         ]
         assert capped_deletes == []
+        capped_upserts = [
+            c for c in qdrant_client.upsert.call_args_list
+            if c.kwargs.get('collection_name') == 'fused_dark_factory'
+        ]
+        assert capped_upserts == [], 'a capped scroll must not even partially upsert'
 
         collection_by_source = {item['source']: item for item in report['collection_merges']}
         assert collection_by_source['fused_dark-factory']['disposition'] == 'UNRESOLVED'
+        assert _mod.has_unresolved(report) is True, 'an UNRESOLVED item must exit non-zero'
 
     @pytest.mark.asyncio
     async def test_apply_deletes_zero_count_empty_collection_and_leaves_nonzero_unresolved(self, monkeypatch):
