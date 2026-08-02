@@ -31,6 +31,7 @@ in ``test_orchestrator_restart_config_drift.py``.
 import os
 import pathlib
 import re
+import shlex
 import tomllib
 
 import yaml
@@ -87,6 +88,10 @@ def _fleet_test_command() -> str:
 
 def _fleet_type_check_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["type_check_command"]
+
+
+def _fleet_lint_command() -> str:
+    return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["lint_command"]
 
 
 def _pyproject_at(rel_dir: str) -> dict:
@@ -870,4 +875,73 @@ class TestFleetTypeCheckCoversEveryWorkspaceMember:
             f"type_check_command chain it is meant to cost (task 3397); walked: "
             f"{sorted(walked)}. Update the table to match whenever the chain "
             "changes."
+        )
+
+
+def _ruff_leg_targets(cmd: str) -> list[str]:
+    """Return the whitespace-tokenized positional targets of *cmd*'s ruff-check leg.
+
+    *cmd* is the fleet ``lint_command``, an ``&&``-chain of two legs: a ``ruff
+    check <targets...>`` leg and a ``check_bare_magicmock_config.py
+    <targets...>`` sibling-checker leg (covered separately by
+    ``TestFleetLintCoversEveryWorkspaceMember.
+    test_every_present_workspace_member_tests_dir_is_magicmock_checked``).
+    The ruff leg is identified by the substring ``"ruff check"`` after a
+    plain ``&&`` split — unlike the TYPE chain, this command has no ``cd``
+    clauses to walk (every target is an explicit repo-root-relative path),
+    so the production ``_AND_CLAUSE_SPLIT_RE``/``_cd_clause_target``
+    cwd-tracking walk does not apply here.
+
+    Returns ``shlex.split`` TOKENS, not the raw leg string, so callers
+    compare whole path tokens against member names. A substring check like
+    ``"shared" in cmd`` is already true via the OTHER leg's ``shared/tests``
+    argument, so it would pass vacuously for a member this leg never
+    actually checks.
+    """
+    for leg in cmd.split("&&"):
+        if "ruff check" in leg:
+            return shlex.split(leg)
+    return []
+
+
+class TestFleetLintCoversEveryWorkspaceMember:
+    """The fleet LINT chain must ruff-check every workspace member.
+
+    Task 3397. ``lint_command`` is, like ``test_command``/``type_check_command``
+    above, the FALLBACK chain: ``verify._build_fallback_config`` returns
+    ``None`` for a zero-``.py``-file diff, so a docs-only or cross-cutting
+    diff runs this chain verbatim with no
+    ``_scope_fallback_tool_to_subproject`` rescoping. Before task 3397 the
+    ``ruff check`` leg covered only 5 of 7 ``[tool.uv.workspace].members``
+    (sampler and cockpit were absent), so a docs-only or cross-cutting diff
+    never ruff-checked either at the gating layer.
+    """
+
+    def test_every_present_workspace_member_is_ruff_checked(self) -> None:
+        cmd = _fleet_lint_command()
+        targets = _ruff_leg_targets(cmd)
+
+        for member in _workspace_member_dirs():
+            if not (REPO_ROOT / member / "pyproject.toml").is_file():
+                # Mirrors the presence tolerance used throughout this file: a
+                # member genuinely absent from this checkout is skipped
+                # rather than failed.
+                continue
+            assert member in targets, (
+                f"fleet lint_command's ruff-check leg does not target "
+                f"workspace member {member!r} (task 3397) — a docs-only or "
+                "cross-cutting diff (zero .py files touched) runs this chain "
+                f"verbatim with no rescoping, so {member!r} would never be "
+                f"ruff-checked at the gating layer; targets: {targets}"
+            )
+
+        assert targets, (
+            "the fleet lint_command's ruff-check leg had no positional "
+            "targets at all (task 3397) — this coverage invariant would pass "
+            "vacuously"
+        )
+        missing = KNOWN_FLEET_TYPE_MEMBERS - set(targets)
+        assert not missing, (
+            f"fleet lint_command's ruff-check leg is missing known workspace "
+            f"member(s) {sorted(missing)} (task 3397); targets: {targets}"
         )
