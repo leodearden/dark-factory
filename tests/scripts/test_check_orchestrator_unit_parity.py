@@ -476,3 +476,133 @@ def test_drift_ordering_is_deterministic():
         ("Timer", "Alpha"),
         ("Timer", "Zeta"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Drop-in override detection  (step-7 / step-8)
+# ---------------------------------------------------------------------------
+
+# A real registered unit name, so --unit (which uses argparse `choices`)
+# accepts it in the CLI-level tests below.
+_REAL_UNIT = "orchestrator-watchdog.timer"
+_REAL_UNIT_RELPATH = "scripts/orchestrator-watchdog.timer"
+
+
+def _make_trees(
+    tmp_path: pathlib.Path,
+    *,
+    repo_text: str | None = _BASE_TIMER,
+    installed_text: str | None = _BASE_TIMER,
+    unit: str = _REAL_UNIT,
+    relpath: str = _REAL_UNIT_RELPATH,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Build a (repo_root, installed_dir) pair under tmp_path.
+
+    Passing None for either text omits that side's file, which is how the
+    ``[vanished]`` (no committed copy) and ``[skip]`` (no installed copy)
+    branches are exercised. NEVER touches ~/.config/systemd/user.
+    """
+    repo_root = tmp_path / "repo"
+    installed_dir = tmp_path / "installed"
+    (repo_root / "scripts").mkdir(parents=True, exist_ok=True)
+    installed_dir.mkdir(parents=True, exist_ok=True)
+
+    if repo_text is not None:
+        (repo_root / relpath).write_text(repo_text, encoding="utf-8")
+    if installed_text is not None:
+        (installed_dir / unit).write_text(installed_text, encoding="utf-8")
+
+    return repo_root, installed_dir
+
+
+def test_find_dropins_returns_empty_when_no_dropin_dir(tmp_path: pathlib.Path):
+    """No `<unit>.d/` directory at all => no overrides."""
+    checker = _load_checker()
+    _, installed_dir = _make_trees(tmp_path)
+
+    assert checker.find_dropins(installed_dir, _REAL_UNIT) == []
+
+
+def test_find_dropins_finds_an_override_conf(tmp_path: pathlib.Path):
+    """A `<unit>.d/override.conf` — what `systemctl --user edit` writes."""
+    checker = _load_checker()
+    _, installed_dir = _make_trees(tmp_path)
+
+    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
+    dropin_dir.mkdir()
+    override = dropin_dir / "override.conf"
+    override.write_text("[Timer]\nAccuracySec=1min\n", encoding="utf-8")
+
+    assert checker.find_dropins(installed_dir, _REAL_UNIT) == [override]
+
+
+def test_find_dropins_returns_all_conf_files_sorted(tmp_path: pathlib.Path):
+    """Several drop-ins all count, in sorted order (systemd merges them all)."""
+    checker = _load_checker()
+    _, installed_dir = _make_trees(tmp_path)
+
+    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
+    dropin_dir.mkdir()
+    for fname in ("20-second.conf", "10-first.conf"):
+        (dropin_dir / fname).write_text("[Timer]\n", encoding="utf-8")
+
+    found = checker.find_dropins(installed_dir, _REAL_UNIT)
+
+    assert [p.name for p in found] == ["10-first.conf", "20-second.conf"]
+
+
+def test_find_dropins_ignores_non_conf_files(tmp_path: pathlib.Path):
+    """Non-`.conf` files are ignored, matching what systemd actually merges.
+
+    Counting a stray `override.conf.bak` would report an override that has no
+    effect — a false positive in a report whose whole value is being believed.
+    """
+    checker = _load_checker()
+    _, installed_dir = _make_trees(tmp_path)
+
+    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
+    dropin_dir.mkdir()
+    (dropin_dir / "override.conf.bak").write_text("[Timer]\n", encoding="utf-8")
+    (dropin_dir / "notes.txt").write_text("hello\n", encoding="utf-8")
+
+    assert checker.find_dropins(installed_dir, _REAL_UNIT) == []
+
+
+def test_dropin_over_identical_units_does_not_report_parity(
+    tmp_path: pathlib.Path,
+):
+    """BYTE-IDENTICAL unit files + a drop-in must NOT report parity.
+
+    This is the behavioural claim that makes find_dropins worth having.
+    `systemctl --user edit` never modifies the unit file; it writes
+    `<unit>.d/override.conf`, which systemd merges OVER the unit at load
+    time. So every compared directive can match character for character while
+    the EFFECTIVE configuration differs — the precise claim this gate exists
+    to make checkable.
+
+    Not hypothetical on this host: `~/.config/systemd/user/orchestrator-reify.service.d/`
+    exists, so the mechanism is already in live use here.
+
+    The override shares exit 1 with drift because "I could not verify" belongs
+    with "I found a difference", not with the benign "not installed here" that
+    2 denotes — but it is WORDED apart ([override], not [drift]) so the
+    operator is not sent hunting for a directive diff that does not exist.
+    """
+    checker = _load_checker()
+    repo_root, installed_dir = _make_trees(tmp_path)
+
+    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
+    dropin_dir.mkdir()
+    (dropin_dir / "override.conf").write_text(
+        "[Timer]\nAccuracySec=1min\n", encoding="utf-8"
+    )
+
+    rc = checker.main(
+        [
+            "--installed-dir", str(installed_dir),
+            "--repo-root", str(repo_root),
+            "--unit", _REAL_UNIT,
+        ]
+    )
+
+    assert rc == 1, "A drop-in override must not be reported as parity."
