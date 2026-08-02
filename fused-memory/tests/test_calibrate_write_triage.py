@@ -2127,10 +2127,19 @@ class TestCommittedPerCategoryEvidenceIsRecorded:
             t_high = entry.get('t_high')
             reason = entry.get('reason')
             if t_high is None:
-                assert reason in refusals, (
+                # derive_bands emits `<code>: <measured detail>` — the code is
+                # the machine-readable prefix, the tail carries the counts that
+                # justify it. Split rather than startswith, so a code that
+                # merely shares a prefix cannot pass as a known refusal.
+                code = (reason or '').split(':', 1)[0]
+                assert code in refusals, (
                     f'{category}: no cutoff and no recognised refusal code '
                     f'(reason={reason!r}) — "not measured" and "measured, and '
                     f'refused" must never be indistinguishable'
+                )
+                assert code != reason, (
+                    f'{category}: refusal code {code!r} carries no measured '
+                    f'detail — the counts that force the refusal are the evidence'
                 )
                 assert entry.get('t_low') is None, (
                     f'{category}: refused a t_high but kept a t_low'

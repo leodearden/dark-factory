@@ -253,6 +253,27 @@ write_triage:
   # Report: calibration/write_triage_calibration_report.json
   # -- records the measured distributions and the deterministic band's
   # false-positive count. Re-run the script to change these values.
-  t_high: 0.8868293243724489
-  t_low: 0.522971590497168
+  t_high: 0.8868282526657318
+  t_low: 0.52299575012145
   calibration_report_path: calibration/write_triage_calibration_report.json
+  # Per-category cutoffs, measured the same way over each category's
+  # OWN pairs. A category ABSENT here has no derived cutoff — see the
+  # report's per_category section for the refusal and its reason.
+  t_high_by_category:
+    observations_and_summaries: 0.8868282526657318
+    procedural_knowledge: 0.8390612912630236
+  # EVIDENCE STATUS (hand-added prose, task 3357 — no numbers here; the
+  # machine-readable record is the report's per_category section, which
+  # the calibration guard test binds. A later --write-config run rewrites
+  # this whole block and drops this note; the report survives it.)
+  # - procedural_knowledge, observations_and_summaries: each has its own
+  #   cutoff above, derived from that category's own labeled pairs.
+  # - preferences_and_norms: NO cutoff is derivable from this corpus.
+  #   Refusal reason `empty_class` — every one of its fixture records sits
+  #   in a single cluster, so the category has zero negative pairs and
+  #   there is nothing to separate a duplicate from. It is therefore
+  #   ABSENT above and falls back to the pooled t_high. That fallback is
+  #   counted by audit_duplicate_memories (`ann_pooled_fallback_categories`),
+  #   and its ANN-only clusters are withheld from `--apply` deletion
+  #   (`ann_cutoff_not_evidenced_for_category`): still reported, never
+  #   irreversibly acted on with a cutoff measured elsewhere.
