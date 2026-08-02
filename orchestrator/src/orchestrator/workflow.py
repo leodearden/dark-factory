@@ -13,6 +13,7 @@ import string
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -70,6 +71,10 @@ from orchestrator.artifacts import (
     TaskArtifacts,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.delivered_checks import (
+    DeliveredChecksBlock,
+    gate_mark_done_on_delivered_checks,
+)
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
@@ -1600,6 +1605,28 @@ class TaskWorkflow:
             return statuses or {}  # type: ignore[return-value]
 
         async def _mark_member_done(mid: str, sha: str) -> None:
+            # task 3057 (seam 10): a landed train proves MAIN advanced, never
+            # that THIS member's declared capability rode along (a member can be
+            # mis-stacked, dropped by a rebase, or have delivered nothing at
+            # all).  On a withholding we RETURN rather than raise: the merge
+            # worker's post-advance flip loop collects raises into
+            # TRAIN_PARTIAL_FLIP, and this is NOT a partial flip — the merge
+            # genuinely advanced main; only this member's declared deliverable
+            # is unverifiable.  The write-ahead LandedRow is deliberately NOT
+            # consumed (it is the only record of the crash-window intent), and
+            # the member is REVERTED TO PENDING — its only recovery edge, since
+            # the stranded sweep provably cannot reach a merge-deferred task
+            # (see _revert_withheld_member).
+            block = await self._member_delivered_checks_withhold(
+                mid, site='workflow-train-member-merged',
+            )
+            if block is not None:
+                await self._revert_withheld_member(
+                    mid, train_id=train_id,
+                    site='workflow-train-member-merged',
+                    reason=block.reason,
+                )
+                return
             await self.scheduler.mark_done(
                 mid, kind='merged', sha=sha, note=f'train {train_id}',
             )
@@ -1975,6 +2002,21 @@ class TaskWorkflow:
                 'Internal: SUCCESS without merge_sha — provenance unconstructable',
                 escalate_to_human=True,
             )
+        # task 3057: this stamp is DELIBERATELY NOT routed through
+        # `gate_mark_done_on_delivered_checks`, unlike the eleven
+        # attribution-shaped seams in this module, harness.py and
+        # merge_queue.py.  It is not attribution-shaped: the workflow just
+        # performed the merge itself and holds its own `self._merge_sha`, so
+        # there is no INFERENCE here that could be wrong (no git-ancestry
+        # guess, no journal row, no architect claim, no sibling's train
+        # landing credited to this task).  Guarding it would gate EVERY
+        # task's normal completion on `delivered_checks`, converting an
+        # attribution guard into a fleet-wide merge-blocking quality gate —
+        # a far larger behavioural change than task 3057 authorises.  See
+        # task 3057 design decision 2; a follow-up task candidate
+        # (suggestion_hash `3057-workflow-post-merge-success-stamp`) holds
+        # that decision open so a human makes it deliberately rather than by
+        # omission.
         try:
             await self.scheduler.mark_done(
                 self.task_id, kind='merged', sha=self._merge_sha,
@@ -5777,15 +5819,33 @@ class TaskWorkflow:
 
         Caller has already verified the artifact exists.
 
-        Validation: ``commit`` must be non-empty and reachable from main.
-        ``git merge-base --is-ancestor`` returns false for both unknown SHAs
-        and SHAs not on main, so this single check covers both.
+        Validation, in two halves. **Reachability**: ``commit`` must be
+        non-empty and reachable from main — ``git merge-base --is-ancestor``
+        returns false for both unknown SHAs and SHAs not on main, so that
+        single check covers both. **Capability** (task 3057, seam 5 of
+        eleven): reachability proves only that the cited commit EXISTS on
+        main, never that THIS task's declared capability is present in it, so
+        when the task declares ``metadata.delivered_checks`` those are
+        re-checked against the SAME main SHA the reachability test used
+        (forwarded as ``main_sha=``, so no second ``get_main_sha`` call and no
+        risk of accepting a claim against one main while rejecting it against
+        another).
+
+        That second half matters here more than anywhere else in the eleven
+        stamp seams: this one is LLM-driven (an architect's claim) rather than
+        git-driven, which makes it the least self-correcting of them all — and
+        the repo's own architect prompt actively instructs agents to use
+        ``report_task_already_done``.
 
         On success: set task status to ``done`` with provenance pointing
         at the architect-named commit, return ``DONE``.
-        On validation failure: clear the artifact, route to ``_mark_blocked``
-        without escalating to a human — this is an architect mistake
-        (wrong/missing commit), not an unworkable task.
+        On validation failure of EITHER half: clear the artifact, route to
+        ``_mark_blocked`` without escalating to a human — this is an architect
+        mistake (wrong/missing commit, or a claim main does not support), not
+        an unworkable task, so a steward retry can resolve it. A capability
+        block surfaces as a VISIBLE blocked task rather than a silent no-op
+        precisely because the artifact is consumed before validation: unlike
+        the sweep seams, nothing here retries on a timer.
         """
         assert self.artifacts is not None
         report = self.artifacts.read_already_done()
@@ -5811,6 +5871,22 @@ class TaskWorkflow:
                 f'but commit is not reachable from main',
                 detail=(
                     f'commit: {commit}\nmain_sha: {main_sha}\n'
+                    f'evidence: {evidence}'
+                )[:2000],
+            )
+
+        block = await self._delivered_checks_block(
+            self.task_id, (self.task.get('metadata') or {}),
+            site='architect-already-done-report', main_sha=main_sha,
+        )
+        if block is not None:
+            return await self._mark_blocked(
+                f'Architect reported task already done at {commit[:12]} but '
+                f'the declared delivered_checks are not present on main',
+                detail=(
+                    f'commit: {commit}\nmain_sha: {block.main_sha or main_sha}\n'
+                    f'block_reason: {block.reason}\n'
+                    f'failed_check: {block.failed_check}\n'
                     f'evidence: {evidence}'
                 )[:2000],
             )
@@ -6241,6 +6317,16 @@ class TaskWorkflow:
         - success WITH a landed sha → ``mark_done(kind='found_on_main')``;
         - success without a sha → no provenance to write, so degrade to the
           reconciler rather than stamping a bogus one;
+        - success WITH a landed sha but the task's declared
+          ``metadata.delivered_checks`` absent from main (task 3057, seam 6 of
+          eleven) → withhold the stamp and degrade to the reconciler, exactly
+          like the success-without-a-sha case above it. The parallel is
+          deliberate: this method ALREADY holds the precedent that we may land
+          and still be unable to write HONEST provenance, in which case we
+          degrade rather than stamp a bogus one. The guard applies that same
+          judgement to capability evidence rather than SHA evidence. A landed
+          merge sha proves main advanced — never that THIS task's declared
+          capability rode along;
         - transient / superseded → a strict no-op, re-driven by a later sweep;
         - durable failure, or any status in NEITHER classification set →
           leave the task blocked, emit a structured failure event AND file a
@@ -6258,11 +6344,32 @@ class TaskWorkflow:
         signals a human: without this escalation the exit that exists to stop
         a branch sitting stranded would itself strand the task forever, worse
         than the pre-change ``report_unactionable_task`` L1 it replaced.
+
+        A delivered-checks withholding is deliberately NOT routed into that L2
+        (:meth:`_file_architect_merge_failed`): it is not a durable merge
+        failure — the merge genuinely landed — so misrouting it would both
+        misclassify the condition and erode a signal operators must keep
+        trusting. The durable backstop for a withheld flip is instead the
+        found_on_main reconciler, which is itself guarded by the same shared
+        decision, so this degradation closes a loop rather than opening one.
         """
         status = outcome.status
         landed = outcome.merge_sha
         if status in SUCCESS_TRANSIENT_MERGE_STATUSES:
             if status == 'done' and landed:
+                block = await self._delivered_checks_block(
+                    self.task_id, (self.task.get('metadata') or {}),
+                    site='architect-desync-merge-landed',
+                )
+                if block is not None:
+                    logger.warning(
+                        'Task %s: architect-desync merge landed at %s but '
+                        'delivered_checks are not verifiably present on main '
+                        '(%s) — NOT stamping found_on_main; leaving blocked '
+                        'for the reconciler backstop',
+                        self.task_id, landed[:12], block.reason,
+                    )
+                    return
                 logger.info(
                     'Task %s: architect-desync merge landed at %s — marking '
                     'done (found_on_main)',
@@ -10575,6 +10682,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         - All pass → genuine cross-member INTERACTION: emit train_derailed
           (verdict='interaction'), escalate the train, land nothing.
         - Some fail → land each passer, block each failer (steps 12/14).
+
+        Delivered-capability guard (task 3057, seam 11):
+          A passer's solo verify + ``advance_main`` prove its DELTA reached
+          main; they say nothing about whether the member's DECLARED
+          ``metadata.delivered_checks`` capability is present there.  Each
+          passer's done-stamp is therefore gated on
+          :meth:`_member_delivered_checks_withhold`, and a withheld passer
+          ``continue``\\ s — never raises — WITHOUT appending to ``landed_ids``
+          and WITHOUT emitting ``train_merged``, so it is never REPORTED as
+          attributed.  Its write-ahead ``LandedRow`` stays unconsumed (the only
+          record of the crash-window intent) and the passer is REVERTED TO
+          PENDING via :meth:`_revert_withheld_member` for the scheduler to
+          re-dispatch — NOT left parked for the stranded sweep, which provably
+          cannot reach a ``'merge-deferred'`` task (see that method).  The
+          decision is per-member: a blocked member never aborts its siblings,
+          and neither does a failed revert.
         """
         # Sort members by their metadata train 'order' (root→tip) so that the
         # predecessor_ref computation is correct regardless of caller-side ordering.
@@ -10729,6 +10852,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 landed_sha: str = (
                     (outcome.advanced_sha if outcome else None) or r.merge_sha
                 )
+                # task 3057 (seam 11): passing solo and advancing main proves
+                # the member's DELTA landed — never that its DECLARED
+                # capability is what landed.  On a withholding we `continue`
+                # rather than raise, deliberately WITHOUT appending to
+                # landed_ids and WITHOUT emitting train_merged, so a member
+                # whose capability is unverifiable is never REPORTED as
+                # attributed.  Per-member by construction: a blocked member
+                # never aborts its siblings' attribution.  The write-ahead
+                # LandedRow is left unconsumed, and the passer is REVERTED TO
+                # PENDING — its only recovery edge, since the stranded sweep
+                # provably cannot reach a merge-deferred task (see
+                # _revert_withheld_member).
+                block = await self._member_delivered_checks_withhold(
+                    r.member_id, site='train-attribution-solo-passer',
+                )
+                if block is not None:
+                    await self._revert_withheld_member(
+                        r.member_id, train_id=train_id,
+                        site='train-attribution-solo-passer',
+                        reason=block.reason,
+                    )
+                    continue
                 await self.scheduler.mark_done(
                     r.member_id,
                     kind='merged',
@@ -12418,10 +12563,181 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return False
         return self._has_prior_implementation(wt_head=wt_head).has_work
 
+    async def _delivered_checks_block(
+        self,
+        task_id: str,
+        metadata: Mapping[str, Any] | None,
+        *,
+        site: str,
+        main_sha: str | None = None,
+    ) -> DeliveredChecksBlock | None:
+        """Workflow-side binding of the ONE shared mark-done decision (task 3057).
+
+        The twin of :meth:`~orchestrator.harness.Harness._delivered_checks_block`,
+        so the workflow's attribution-shaped stamp seams cannot drift from the
+        harness's. A non-``None`` result means **do NOT stamp done at this
+        site** — take that site's EXISTING "no landing evidence" path instead.
+
+        ``project_root``, deliberately NOT ``self.worktree``: the ``grep`` kind
+        evaluates the COMMITTED tree at ``ref=main_sha``, so a worktree path
+        would silently audit the wrong tree — and would usually still pass,
+        leaving the guard looking armed while proving nothing about ``main``.
+
+        Inertness (no ``delivered_checks``) and the kill switch live in
+        :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+        ALONE; workflow sites delegate unconditionally rather than
+        re-implementing either locally. ``main_sha`` lets a seam that has
+        ALREADY resolved a main SHA forward it, so the guard audits the SAME
+        main that seam's other evidence test used with no second git call.
+
+        Never raises.
+        """
+        return await gate_mark_done_on_delivered_checks(
+            task_id,
+            metadata,
+            git_ops=self.git_ops,
+            project_root=str(self.config.project_root),
+            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+            enabled=self.config.delivered_checks.enabled,
+            main_sha=main_sha,
+            site=site,
+            log=logger,
+        )
+
+    async def _revert_withheld_member(
+        self, mid: str, *, train_id: str, site: str, reason: str,
+    ) -> None:
+        """Hand a withheld train member back to the scheduler (task 3057).
+
+        The withheld member's ONLY recovery edge, shared by the two workflow
+        seams that stamp OTHER members (the inline ``_mark_member_done``
+        closure and :meth:`_attribute_train_failure`'s solo-passer arm) so
+        they cannot drift apart, and mirroring
+        ``harness.build_train_callback_factory``'s identically-named inner
+        coroutine so all four train seams stay one behaviour.
+
+        A withheld member sits at ``'merge-deferred'``, which is unreachable
+        by every recovery path: the harness's stranded sweep excludes that
+        status (``_RECONCILE_SWEEP_STATUSES``) and ``_reconcile_one_stranded``
+        early-returns on it, the train already advanced main so the merge
+        worker will not re-drive it, and ``_WARM_LANE_RECLAIM_PROTECTED_STATUSES``
+        contains it so even the leaked warm lane cannot be reclaimed. The
+        revert is safe precisely BECAUSE this seam fires AFTER the merge
+        advanced main, so PRD § 9.8's "the worktree must survive for the
+        train-merge worker" rationale for the park has expired. Termination is
+        guaranteed rather than assumed: a re-dispatched member that
+        re-implements and merges completes through :meth:`_finalise_merged_done`,
+        which task 3057 design decision 2 deliberately leaves unguarded, so
+        even a permanently-ERRORing check descriptor cannot produce an
+        infinite withhold/revert cycle.
+
+        NEVER raises: a failed recovery edge must not reach the merge worker's
+        post-advance flip loop as a false ``TRAIN_PARTIAL_FLIP``, nor abort
+        the attribution loop before its remaining members. When the revert
+        itself fails the member stays merge-deferred — no worse than before
+        this edge existed — and that is logged rather than escalated.
+        """
+        try:
+            await self.scheduler.set_task_status(mid, 'pending')
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'Task %s: train %r member %s (%s) — delivered-checks withheld '
+                'but the revert to pending FAILED; member remains '
+                'merge-deferred and will need operator attention',
+                self.task_id, train_id, mid, site, exc_info=True,
+            )
+            return
+        logger.warning(
+            'Task %s: train %r member %s (%s) — delivered_checks not '
+            'verifiably on main (%s); NOT stamping done, reverted to pending '
+            'for re-dispatch (LandedRow retained for the reconciler)',
+            self.task_id, train_id, mid, site, reason,
+        )
+
+    async def _member_delivered_checks_withhold(
+        self, mid: str, *, site: str,
+    ) -> DeliveredChecksBlock | None:
+        """Non-``None`` => do NOT stamp train member *mid* done here (task 3057).
+
+        The shared binding for the two workflow seams that stamp OTHER
+        members' rows (the inline ``_mark_member_done`` closure and
+        ``_attribute_train_failure``'s solo-passer arm), so those two cannot
+        drift apart — and so a future third member-stamping seam has a
+        one-line adoption path rather than a block to hand-copy.
+
+        Unlike the self-task seams, the metadata is not in scope here: a
+        member id is, so this costs ONE ``scheduler.get_task(mid)``
+        round-trip. Because that read precedes the shared decision, the kill
+        switch is re-checked LOCALLY first (task 3057 review) — at this seam
+        alone, delegating it to
+        :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+        would leave the pre-read's fail-safe arms live on a disarmed fleet.
+        The check-less case still short-circuits inside the shared gate with
+        zero I/O beyond that read.
+
+        Returns the :class:`DeliveredChecksBlock` rather than a bool so the
+        caller's recovery log can name the REASON — an operator seeing a
+        member bounced back to pending needs to know whether a check FAILED
+        (the capability is genuinely absent) or the guard ERRORED (it could
+        not tell), because those call for very different responses.
+
+        Fail-safe in ALL directions, and it NEVER propagates an exception to
+        the caller: an unreadable member row, an absent member, or an errored
+        guard all WITHHOLD. Stamping done on unknown metadata is the exact
+        failure this task exists to close, and a raise escaping a train-flip
+        callback would be misread by the merge worker's post-advance loop as a
+        ``TRAIN_PARTIAL_FLIP`` — a capability check must never be ABLE to
+        fabricate one. Those fail-safe arms synthesise ``reason='errored'`` —
+        accurate for all three (they ARE errors), and each already emits its
+        own distinct WARNING naming the specific cause, so no diagnostic
+        detail is lost by the collapse.
+        """
+        if not self.config.delivered_checks.enabled:
+            # Kill switch, checked BEFORE the metadata pre-read (task 3057
+            # review) — see the note below on why delegating it to
+            # `gate_mark_done_on_delivered_checks` alone is not sufficient at
+            # THIS seam. A disarmed fleet must reproduce the pre-3057
+            # behaviour exactly, and the pre-read's fail-safe arms synthesise a
+            # block without ever reaching the gate, so a transient
+            # `scheduler.get_task` failure would otherwise still withhold the
+            # stamp and revert the member to pending with the switch off.
+            logger.debug(
+                'Task %s: delivered_checks.enabled=False — member guard inert '
+                'for %s (%s)', self.task_id, mid, site,
+            )
+            return None
+        try:
+            member = await self.scheduler.get_task(mid)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'Task %s: could not read member %s metadata for the '
+                'delivered-checks guard (%s) — withholding the done-stamp',
+                self.task_id, mid, site, exc_info=True,
+            )
+            return DeliveredChecksBlock(reason='errored')
+        if member is None:
+            logger.warning(
+                'Task %s: member %s has no scheduler task row (%s) — '
+                'withholding the done-stamp',
+                self.task_id, mid, site,
+            )
+            return DeliveredChecksBlock(reason='errored')
+        try:
+            return await self._delivered_checks_block(
+                mid, (member.get('metadata') or {}), site=site,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'Task %s: delivered-checks guard errored for member %s (%s) '
+                '— withholding the done-stamp',
+                self.task_id, mid, site, exc_info=True,
+            )
+            return DeliveredChecksBlock(reason='errored')
+
     async def _finalise_recovery_done(
         self, *, basis: str, sha: str, kind: str, note: str,
         files: list[str] | None = None,
-    ) -> WorkflowOutcome:
+    ) -> WorkflowOutcome | None:
         """Shared DONE-finalisation for all already-merged guards (PRD α, MP-2).
 
         The sole writer of :attr:`_merge_recovery_basis`.  Every already-merged
@@ -12452,6 +12768,31 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         provenance basis": a future guard that calls this chokepoint without
         a valid basis fails loudly instead of silently producing a
         phantom-done.
+
+        **Delivered-capability guard** (task 3057, seams 4+7 of eleven).
+        A journal row or a branch-on-main probe proves only that SOMETHING of
+        this branch reached ``main`` — never that THIS task's declared
+        capability (``metadata.delivered_checks``) survived to it. The guard
+        sits HERE, at the SINGLE chokepoint all six recovery stamps funnel
+        through (3x journal ``kind='merged'`` + 3x fallback
+        ``kind='found_on_main'``), rather than at the six call sites,
+        precisely so a future SEVENTH recovery arm cannot be added unguarded —
+        the failure mode that re-opened this defect class eight times.
+
+        Returning ``None`` means "capability not verifiably on main — withhold
+        the recovery and let the workflow actually deliver it". It is placed
+        AFTER the MP-2 ``AssertionError`` (so a malformed caller still fails
+        loudly rather than being masked by a capability withholding) and
+        BEFORE the ``_merge_recovery_basis`` write, so a withheld recovery
+        leaves ZERO side effects: no basis marker, no DONE phase, no
+        metadata-files reconcile, no ``mark_done``. All three callers are
+        already typed ``WorkflowOutcome | None`` where ``None`` already means
+        "no recovery — proceed with the phase", so the withholding needs no
+        new state machine.
+
+        The helper resolves ``main_sha`` itself, which is why the journal arm
+        (where no main SHA is in scope) needs no plumbing and both bases stay
+        uniform.
         """
         if basis not in ('journal', 'fallback') or not sha:
             raise AssertionError(
@@ -12459,6 +12800,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 f"(basis='journal'|'fallback' and a truthy sha) — got "
                 f'basis={basis!r}, sha={sha!r} (task {self.task_id})'
             )
+        if await self._delivered_checks_block(
+            self.task_id, (self.task.get('metadata') or {}),
+            site=f'workflow-recovery-{basis}',
+        ) is not None:
+            return None
         self._merge_recovery_basis = basis
         self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done(override_files=files)
@@ -12491,7 +12837,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Returns WorkflowOutcome.DONE if the branch is already merged to main AND
         there is prior implementation work.  Returns None in all other cases
-        (branch not merged, no prior work, missing worktree/git_ops, exceptions).
+        (branch not merged, no prior work, missing worktree/git_ops, exceptions,
+        or — task 3057 — the shared :meth:`_finalise_recovery_done` chokepoint
+        withholding the recovery because the task's declared
+        ``metadata.delivered_checks`` are not verifiably present on main).
         """
         row: LandedRow | None = MergeProvenance.lookup(self.task_id)
         if row is not None:
@@ -12649,8 +12998,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         already merged AND ``base_commit..wt_head`` is a non-empty diff.
         Returns ``None`` in all other cases (external worktree, not on main,
         on main but a zero-diff branch — a fresh, re-dispatched, or
-        otherwise stale/unadvanced branch point) so the caller proceeds with
-        the normal execute/verify/review loop.
+        otherwise stale/unadvanced branch point, or — task 3057 — the
+        chokepoint withholding the recovery because the task's declared
+        ``metadata.delivered_checks`` are not verifiably present on main) so
+        the caller proceeds with the normal execute/verify/review loop.
         """
         if self._worktree_external:
             return None
@@ -12716,8 +13067,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Returns ``WorkflowOutcome.DONE`` (via the shared
         :meth:`_finalise_recovery_done` chokepoint, MP-2) when the branch is
         already merged AND there is prior implementation work. Returns
-        ``None`` in all other cases (not an ancestor, or a spurious merge
-        signal) so the caller proceeds with the merge-retry loop.
+        ``None`` in all other cases (not an ancestor, a spurious merge
+        signal, or — task 3057 — the chokepoint withholding the recovery
+        because the task's declared ``metadata.delivered_checks`` are not
+        verifiably present on main) so the caller proceeds with the
+        merge-retry loop, which is already how ``_run_merge_phase`` reads a
+        ``None`` result.
         """
         row: LandedRow | None = MergeProvenance.lookup(self.task_id)
         if row is not None:

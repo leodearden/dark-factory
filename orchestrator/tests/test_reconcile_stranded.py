@@ -18,7 +18,10 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.delivered_checks import DeliveredChecksVerdict
+from orchestrator.delivered_checks import (
+    DeliveredChecksBlock,
+    DeliveredChecksVerdict,
+)
 from orchestrator.harness import Harness, _pid_alive
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.warm_lane_pool import WarmLanePool
@@ -3473,18 +3476,64 @@ class TestReconcileStrandedResolverGuard:
 # the same ON_MAIN git-fallback setup (is_ancestor True, resolve_branch_sha
 # <sha>, commit_effect_present_in_main default True so control reaches the
 # NEW guard AFTER the effect-present downgrade), but with a truthy
-# metadata.delivered_checks and orchestrator.harness.verify_delivered_checks_on_main
-# patched to return each row of the acceptance matrix. The capability guard
-# asks the orthogonal question git attribution + effect-present cannot: is
-# the task's OWN declared capability actually present on main? A hollow-done
-# (attribution/effect present, but the declared capability absent) must
-# re-dispatch (in-progress) or be left alone (blocked), never stamped
-# found_on_main.
+# metadata.delivered_checks and the guard patched to return each row of the
+# acceptance matrix. The capability guard asks the orthogonal question git
+# attribution + effect-present cannot: is the task's OWN declared capability
+# actually present on main? A hollow-done (attribution/effect present, but
+# the declared capability absent) must re-dispatch (in-progress) or be left
+# alone (blocked), never stamped found_on_main.
+#
+# RETARGETED by task 3057 step-19: the patch target moved DOWN a layer, from
+# the low-level `verify_delivered_checks_on_main` runner to the shared
+# `gate_mark_done_on_delivered_checks` DECISION that all eleven
+# attribution-shaped stamp seams now route through. Every behavioural
+# assertion below is preserved verbatim — only the staged mock return values
+# change (DeliveredChecksVerdict -> DeliveredChecksBlock | None). That is
+# what proves the generalization is behaviour-preserving on the one arm that
+# already had coverage.
+#
+# Consequence of single-sourcing: the harness no longer decides ANYTHING
+# locally. Inertness (no delivered_checks), the kill switch, and main-SHA
+# resolution all moved INTO the helper, so rows that used to assert
+# "helper not awaited" now assert "delegated, with the right inputs". The
+# coverage those rows lost is not gone — it is pinned AT SOURCE in
+# test_delivered_check_gate.py::TestGateMarkDoneOnDeliveredChecks.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestReconcileOneStrandedDeliveredChecksGuard:
-    _PATCH_TARGET = 'orchestrator.harness.verify_delivered_checks_on_main'
+    _PATCH_TARGET = 'orchestrator.harness.gate_mark_done_on_delivered_checks'
+
+    @staticmethod
+    def _gate(block: DeliveredChecksBlock | None) -> AsyncMock:
+        """Stand-in for the shared helper that returns *block*.
+
+        Faithful to the real helper in the one respect these rows assert on:
+        a ``reason='failed'`` decision emits its WARNING on the
+        CALLER-SUPPLIED ``log``, never on the delivered_checks module logger.
+
+        SCOPE OF WHAT THAT PROVES (amendment, reviewer suggestion 5): because
+        this stand-in composes the message itself, the caplog-content
+        assertions below pin only the WIRING — that whatever the helper logs
+        lands on the ``orchestrator.harness`` stream, i.e. that the harness
+        hands its own module logger through. They do NOT pin the real
+        helper's message CONTENT; substituting a different message here would
+        keep them green. Task 2794's operator-facing WARNING content contract
+        is pinned separately, against the REAL helper, in
+        ``TestStrandedArmRealHelperWarningContent`` below.
+        """
+        async def _impl(task_id, metadata, *, log, **kwargs):
+            if block is not None and block.reason == 'failed':
+                failed = block.failed_check or {}
+                log.warning(
+                    'Task %s: delivered check %r (pattern %r) is NOT present '
+                    'on main %s — withholding the done stamp',
+                    task_id, failed.get('name'), failed.get('pattern'),
+                    block.main_sha,
+                )
+            return block
+
+        return AsyncMock(side_effect=_impl)
 
     def _on_main_in_progress(self, harness: Harness, tid: str, *, sha: str,
                              main_sha: str, metadata: dict) -> None:
@@ -3524,10 +3573,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             harness, tid, sha=sha, main_sha=main_sha,
             metadata={'delivered_checks': [failing]},
         )
-        verdict = DeliveredChecksVerdict(
-            outcome='failed', main_sha=main_sha, failed_check=failing,
-        )
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(DeliveredChecksBlock(
+            reason='failed', main_sha=main_sha, failed_check=failing,
+        ))
 
         with patch(self._PATCH_TARGET, helper), \
                 caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
@@ -3539,6 +3587,18 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         )
         assert result == 1
         helper.assert_awaited_once()
+        # The WARNING now comes FROM the helper, but must still be addressable
+        # as 'orchestrator.harness' — that holds only because the harness
+        # passes its own module logger through as log=. Pinned directly...
+        assert helper.await_args is not None
+        assert helper.await_args.kwargs['log'] is logging.getLogger(
+            'orchestrator.harness',
+        )
+        # ...and end-to-end through caplog: _gate emits on whatever `log` it
+        # was handed, so these reaching the 'orchestrator.harness' stream at
+        # all proves the harness passed its own module logger. This pins the
+        # WIRING only — the real helper's message CONTENT is pinned against
+        # the real helper in TestStrandedArmRealHelperWarningContent.
         assert tid in caplog.text
         assert 'cap-x' in caplog.text
         assert 'SomePattern' in caplog.text
@@ -3557,8 +3617,7 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             harness, tid, sha=sha, main_sha=main_sha,
             metadata={'delivered_checks': [check]},
         )
-        verdict = DeliveredChecksVerdict(outcome='all_delivered', main_sha=main_sha)
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(None)
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3570,19 +3629,28 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         assert result == 1
         helper.assert_awaited_once()
 
-    # --- row 4: no delivered_checks -> guard inert, mark done, helper skipped -
+    # --- row 4: no delivered_checks -> DELEGATED, and inertly marks done ----
 
-    async def test_no_delivered_checks_marks_done_and_skips_helper(
+    async def test_no_delivered_checks_marks_done_and_delegates(
         self, harness: Harness,
     ):
         """A check-less task must not gain a new requirement: it is stamped
-        found_on_main exactly as today and the helper is never consulted."""
+        found_on_main exactly as today.
+
+        Changed by 3057 step-19: the harness now DELEGATES unconditionally
+        rather than short-circuiting on `metadata.delivered_checks` itself —
+        the inertness lives in the shared helper (one implementation for all
+        eleven seams), pinned at source by
+        test_delivered_check_gate.py::TestGateMarkDoneOnDeliveredChecks row 4,
+        which additionally asserts the zero-I/O property (no get_main_sha, no
+        check run) that cannot be observed from here.
+        """
         tid = '2794003'
         sha = 'deadbeef' + 'c' * 32
         self._on_main_in_progress(
             harness, tid, sha=sha, main_sha='mc' * 20, metadata={},
         )
-        helper = AsyncMock()
+        helper = self._gate(None)
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3592,7 +3660,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
         )
         assert result == 1
-        helper.assert_not_awaited()
+        helper.assert_awaited_once()
+        assert helper.await_args is not None
+        assert 'delivered_checks' not in helper.await_args.args[1]
 
     # --- row 5: ERRORED/timeout -> fail-safe (no mark, no revert) ------------
 
@@ -3607,8 +3677,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             harness, tid, sha='deadbeef' + 'd' * 32, main_sha=main_sha,
             metadata={'delivered_checks': [check]},
         )
-        verdict = DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(DeliveredChecksBlock(
+            reason='errored', main_sha=main_sha,
+        ))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3621,9 +3692,18 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
     # --- main-sha unresolved -> fail-safe (sibling of ERRORED) --------------
 
     async def test_main_sha_unresolved_is_fail_safe(self, harness: Harness):
-        """If get_main_sha() raises, we cannot resolve the ref the checks
-        would run against: fail-safe no-op (no mark, no revert, no helper
-        call), retried next sweep."""
+        """An unresolvable main SHA means the checks have no ref to run
+        against: fail-safe no-op (no mark, no revert), retried next sweep.
+
+        Changed by 3057 step-19: main-SHA resolution moved INTO the shared
+        helper, so this row now stages the resulting decision rather than the
+        git failure that produces it. The raises-vs-empty-string distinction
+        this test used to own is not lost — it is pinned AT SOURCE, as two
+        separate rows, in
+        test_delivered_check_gate.py::TestGateMarkDoneOnDeliveredChecks
+        (get_main_sha raising, and get_main_sha returning ''), where the
+        helper's own fail-safe arms live.
+        """
         tid = '2794005'
         check = {'name': 'cap-z', 'kind': 'grep', 'pattern': 'Pat'}
         self._on_main_in_progress(
@@ -3633,7 +3713,7 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         harness.git_ops.get_main_sha = AsyncMock(  # type: ignore[attr-defined]
             side_effect=RuntimeError('git rev-parse failed'),
         )
-        helper = AsyncMock()
+        helper = self._gate(DeliveredChecksBlock(reason='main_sha_unresolved'))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3641,35 +3721,34 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         assert result == 0
-        helper.assert_not_awaited()
+        helper.assert_awaited_once()
 
-    # --- main-sha empty string -> fail-safe (distinct from the raises path) --
+    # --- main_sha_unresolved must NOT revert, unlike 'failed' ---------------
 
-    async def test_main_sha_empty_is_fail_safe(self, harness: Harness):
-        """If get_main_sha() returns an empty/falsy string (rather than
-        raising), we still cannot resolve the ref the checks would run
-        against: the ``if not main_sha`` arm defers mark-done exactly like the
-        raises path — no mark, no revert, no helper call, retried next sweep.
+    async def test_main_sha_unresolved_does_not_revert_in_progress(
+        self, harness: Harness,
+    ):
+        """The fail-safe reasons are DISTINCT from 'failed' at this seam.
 
-        This pins the empty-string branch of the fail-safe, which is DISTINCT
-        from test_main_sha_unresolved_is_fail_safe (that covers get_main_sha()
-        *raising*). Without this, a regression dropping the ``if not main_sha``
-        guard would still pass CI."""
-        tid = '2794008'
+        'failed' is a definitive absence and drives revert-to-pending;
+        'main_sha_unresolved' makes no claim either way, so an in-progress
+        task must be left exactly as it is. Pinned separately so a refactor
+        that collapsed the two reasons into one branch — losing the
+        distinction 2794 established — fails here.
+        """
+        tid = '2794010'
         check = {'name': 'cap-z', 'kind': 'grep', 'pattern': 'Pat'}
         self._on_main_in_progress(
-            harness, tid, sha='deadbeef' + '8' * 32, main_sha='',
+            harness, tid, sha='deadbeef' + '0' * 32, main_sha='m0' * 20,
             metadata={'delivered_checks': [check]},
         )
-        helper = AsyncMock()
+        helper = self._gate(DeliveredChecksBlock(reason='main_sha_unresolved'))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
 
-        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         assert result == 0
-        helper.assert_not_awaited()
 
     # --- row 6: FAILED, blocked -> leave untouched (blocked discipline) ------
 
@@ -3691,10 +3770,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             return_value='deadbeef' + 'f' * 32,
         )
         harness.git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[attr-defined]
-        verdict = DeliveredChecksVerdict(
-            outcome='failed', main_sha=main_sha, failed_check=failing,
-        )
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(DeliveredChecksBlock(
+            reason='failed', main_sha=main_sha, failed_check=failing,
+        ))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3728,8 +3806,9 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             return_value='deadbeef' + '9' * 32,
         )
         harness.git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[attr-defined]
-        verdict = DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
-        helper = AsyncMock(return_value=verdict)
+        helper = self._gate(DeliveredChecksBlock(
+            reason='errored', main_sha=main_sha,
+        ))
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3739,15 +3818,24 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         assert result == 0
         helper.assert_awaited_once()
 
-    # --- kill switch: enabled=False -> guard inert even on a FAILED verdict --
+    # --- kill switch: enabled=False -> FORWARDED, and inertly marks done ----
 
-    async def test_kill_switch_disabled_marks_done_and_skips_helper(
+    async def test_kill_switch_disabled_is_forwarded_and_marks_done(
         self, harness: Harness,
     ):
-        """config.delivered_checks.enabled=False turns the whole guard off:
-        even with a FAILED verdict staged, the task is STILL marked done and
-        the helper is never consulted — kill-switch parity with the
-        dependent-side dispatch gate's documented inertness."""
+        """config.delivered_checks.enabled=False turns the whole guard off,
+        and the task is STILL marked done.
+
+        Changed by 3057 step-19: the harness FORWARDS `enabled=False` rather
+        than short-circuiting on it. That is the point of single-sourcing —
+        the kill switch has exactly one implementation, so one hot reload
+        disarms all eleven attribution-shaped seams together instead of
+        eleven local checks drifting apart. The inert-when-disabled behaviour
+        itself is pinned at source in
+        test_delivered_check_gate.py::TestGateMarkDoneOnDeliveredChecks row 6,
+        which also asserts that neither get_main_sha nor the check runner is
+        awaited.
+        """
         tid = '2794007'
         sha = 'deadbeef' + '7' * 32
         failing = {'name': 'cap-k', 'kind': 'grep', 'pattern': 'KPat'}
@@ -3756,10 +3844,8 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             harness, tid, sha=sha, main_sha='mk' * 20,
             metadata={'delivered_checks': [failing]},
         )
-        verdict = DeliveredChecksVerdict(
-            outcome='failed', main_sha='mk' * 20, failed_check=failing,
-        )
-        helper = AsyncMock(return_value=verdict)
+        # The REAL helper is inert when disabled, so stage its inert answer.
+        helper = self._gate(None)
 
         with patch(self._PATCH_TARGET, helper):
             result = await harness._reconcile_stranded_in_progress()
@@ -3769,4 +3855,312 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
             done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
         )
         assert result == 1
-        helper.assert_not_awaited()
+        helper.assert_awaited_once()
+        assert helper.await_args is not None
+        assert helper.await_args.kwargs['enabled'] is False
+
+
+# ---------------------------------------------------------------------------
+# Amendment (reviewer suggestion 5) — task 2794's WARNING CONTENT contract,
+# pinned against the REAL shared helper.
+#
+# The matrix above patches `gate_mark_done_on_delivered_checks` with a
+# stand-in that composes its own message, so its caplog-content assertions
+# pin the log= WIRING and nothing more. The operator-facing content contract
+# 2794 actually established — a stranded-arm withholding names the task, the
+# failed check, its pattern and the main SHA at WARNING on
+# 'orchestrator.harness' — therefore needs one row that runs the real
+# decision end to end. The ONLY thing faked here is the low-level check
+# runner (`verify_delivered_checks_on_main`), so main-SHA plumbing, the
+# verdict collapse, the log= hand-off and the message itself are all real.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestStrandedArmRealHelperWarningContent:
+    _VERIFY_TARGET = 'orchestrator.delivered_checks.verify_delivered_checks_on_main'
+
+    async def test_failed_withholding_warns_with_the_2794_content(
+        self, harness: Harness, caplog,
+    ):
+        tid = '2794100'
+        sha = 'deadbeef' + 'e' * 32
+        main_sha = 'mr' * 20
+        failing = {
+            'name': 'cap-real', 'kind': 'grep', 'pattern': 'RealPattern',
+            'expect': 'present',
+        }
+        guard = TestReconcileOneStrandedDeliveredChecksGuard()
+        guard._on_main_in_progress(
+            harness, tid, sha=sha, main_sha=main_sha,
+            metadata={'delivered_checks': [failing]},
+        )
+
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='failed', main_sha=main_sha, failed_check=failing,
+        ))
+        # NOTE: `gate_mark_done_on_delivered_checks` is deliberately NOT
+        # patched — this exercises the real decision.
+        with patch(self._VERIFY_TARGET, verify), \
+                caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress()
+
+        # Behaviour is the matrix's row 2, reached through the real helper.
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        assert result == 1
+
+        # ...and the real WARNING carries task 2794's operator-facing content
+        # on the harness logger. Deleting or hollowing any of these four
+        # fields in the shared helper's message now fails HERE.
+        assert tid in caplog.text
+        assert 'cap-real' in caplog.text
+        assert 'RealPattern' in caplog.text
+        assert main_sha in caplog.text
+        # The `site` label the guard was adopted with — how an operator tells
+        # WHICH seam withheld — is part of the same message.
+        assert 'reconcile-stranded-found-on-main' in caplog.text
+        assert any(
+            r.levelno == logging.WARNING and r.name == 'orchestrator.harness'
+            for r in caplog.records
+        ), 'the withholding must be operator-visible at WARNING, on the harness logger'
+
+    async def test_all_delivered_stamps_without_a_warning(
+        self, harness: Harness, caplog,
+    ):
+        """The mirror row: a satisfied verdict through the REAL helper stamps
+        as today and emits NO delivered-checks WARNING, so the assertions
+        above cannot be passing off unrelated log noise."""
+        tid = '2794101'
+        sha = 'deadbeef' + 'f' * 32
+        main_sha = 'ms' * 20
+        check = {
+            'name': 'cap-real', 'kind': 'grep', 'pattern': 'RealPattern',
+            'expect': 'present',
+        }
+        guard = TestReconcileOneStrandedDeliveredChecksGuard()
+        guard._on_main_in_progress(
+            harness, tid, sha=sha, main_sha=main_sha,
+            metadata={'delivered_checks': [check]},
+        )
+
+        verify = AsyncMock(return_value=DeliveredChecksVerdict(
+            outcome='all_delivered', main_sha=main_sha,
+        ))
+        with patch(self._VERIFY_TARGET, verify), \
+                caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
+        )
+        assert result == 1
+        assert 'cap-real' not in caplog.text
+        assert 'Delivered-checks guard' not in caplog.text
+
+
+# ===========================================================================
+# Task 3057 step-23 (RED) — the withheld train member's recovery edge.
+#
+# All four delivered-checks train seams (harness `mark_member_done` /
+# `redrive_member`, workflow's inline `_mark_member_done` /
+# `_attribute_train_failure` solo-passer) originally withheld the done-flip by
+# RETURNING with the member's status untouched at 'merge-deferred', on the
+# documented promise that the stranded sweep would re-evaluate it.  That loop
+# does not exist.  'merge-deferred' is a status with NO recovery edge at all:
+#
+#   1. `_RECONCILE_SWEEP_STATUSES` excludes it, so the sweep never iterates it;
+#   2. `_reconcile_one_stranded` early-returns on it even if the sweep did;
+#   3. the train already advanced main, so the merge worker will not re-drive;
+#   4. `_WARM_LANE_RECLAIM_PROTECTED_STATUSES` contains it, so even its warm
+#      lane leaks (`release_lane_for_terminal_task` is on the skipped
+#      fall-through, and the member is not terminal).
+#
+# This class pins (1), (2) and (4) against the REAL imported constants — not
+# literals — so a future edit to either filter surfaces here, and pins that
+# the status the withhold path reverts to actually satisfies the
+# reclaim-eligibility PREDICATE rather than a hardcoded 'pending'.
+# ===========================================================================
+
+_WEDGE_TRAIN = 'train-wedge'
+_WEDGE_MID = '7001'
+_WEDGE_CHECK = {
+    'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
+}
+
+
+class _RecordingScheduler:
+    """Scheduler double that HOLDS the member's status like the real one.
+
+    Deliberately not a MagicMock: the property under test is what the member's
+    status actually BECOMES, which an auto-mock cannot express.
+    """
+
+    def __init__(self, mid: str = _WEDGE_MID, status: str = 'merge-deferred') -> None:
+        self.mid = mid
+        self.status = status
+        self.marked_done: list[str] = []
+        self.clear_requeue_count = MagicMock()
+
+    async def get_statuses(self, ids):  # noqa: ANN001, ANN202
+        return ({i: self.status for i in ids if i == self.mid}, None)
+
+    async def get_task(self, tid):  # noqa: ANN001, ANN202
+        return {'id': tid, 'metadata': {'delivered_checks': [_WEDGE_CHECK]}}
+
+    async def mark_done(self, tid, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        self.marked_done.append(tid)
+        self.status = 'done'
+
+    async def set_task_status(self, tid, status, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        if tid == self.mid:
+            self.status = status
+
+
+def _wedge_config(tmp_path: Path) -> MagicMock:
+    from orchestrator.config import DeliveredChecksConfig
+
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.project_root = tmp_path
+    config.delivered_checks = DeliveredChecksConfig(
+        enabled=True, check_timeout_secs=7.5,
+    )
+    return config
+
+
+async def _drive_withheld_flip(tmp_path: Path) -> _RecordingScheduler:
+    """Drive `mark_member_done` with a FAILED block; return the scheduler."""
+    from orchestrator.harness import build_train_callback_factory
+
+    sched = _RecordingScheduler()
+    git_ops = MagicMock()
+    git_ops.release_lane_for_terminal_task = AsyncMock()
+    cbs = build_train_callback_factory(
+        sched, git_ops, _wedge_config(tmp_path),
+    )(_WEDGE_TRAIN)
+
+    block = DeliveredChecksBlock(
+        reason='failed', main_sha='m' * 40, failed_check=_WEDGE_CHECK,
+    )
+    with patch(
+        'orchestrator.harness.gate_mark_done_on_delivered_checks',
+        AsyncMock(return_value=block),
+    ), patch('orchestrator.harness.MergeProvenance'):
+        await cbs.mark_member_done(_WEDGE_MID, 'deadbeefcafe')
+
+    assert sched.marked_done == [], 'the withholding must not stamp'
+    return sched
+
+
+class TestWithheldTrainMemberHasRecoveryEdge:
+    """'merge-deferred' is a permanent wedge — the withhold path must leave it."""
+
+    def test_merge_deferred_is_excluded_from_the_stranded_sweep(self) -> None:
+        """Filter (1): the sweep never even iterates a merge-deferred task."""
+        from orchestrator import harness as harness_mod
+
+        assert 'merge-deferred' not in harness_mod._RECONCILE_SWEEP_STATUSES, (
+            'if merge-deferred is ever swept, revisit the withhold recovery '
+            'edge — the sweep would then be a real second recovery path'
+        )
+
+    def test_merge_deferred_lane_is_protected_from_reclaim(self) -> None:
+        """Filter (4): the leaked warm lane cannot be reclaimed either."""
+        from orchestrator import harness as harness_mod
+
+        assert 'merge-deferred' in harness_mod._WARM_LANE_RECLAIM_PROTECTED_STATUSES
+
+    @pytest.mark.asyncio
+    async def test_reconcile_one_stranded_is_not_the_recovery_edge(
+        self, harness: Harness,
+    ) -> None:
+        """Filter (2): the early return is real, so the sweep cannot recover it.
+
+        Pinned HERE (not only in ``test_skips_merge_deferred_status``) because
+        the four train seams' recovery design depends on this specific fact.
+        """
+        result = await harness._reconcile_one_stranded(
+            _WEDGE_MID, 'merge-deferred', mid_run=False,
+        )
+
+        assert result is None
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_withheld_member_leaves_merge_deferred(
+        self, tmp_path: Path,
+    ) -> None:
+        sched = await _drive_withheld_flip(tmp_path)
+
+        assert sched.status != 'merge-deferred', (
+            'a member left at merge-deferred has no recovery edge at all'
+        )
+
+    @pytest.mark.asyncio
+    async def test_withheld_status_satisfies_the_reclaim_predicate(
+        self, tmp_path: Path,
+    ) -> None:
+        """The PREDICATE, never the literal 'pending'.
+
+        ``_warm_lane_reclaim_candidates`` admits any status that is
+        non-terminal and not protected; asserting the predicate means the
+        lane-leak fix cannot regress if either status set is edited later.
+        """
+        from orchestrator import harness as harness_mod
+        from orchestrator.task_status import TERMINAL_STATUSES
+
+        sched = await _drive_withheld_flip(tmp_path)
+
+        assert sched.status not in TERMINAL_STATUSES, (
+            f'{sched.status!r} would make the member terminal-by-status'
+        )
+        assert sched.status not in harness_mod._WARM_LANE_RECLAIM_PROTECTED_STATUSES, (
+            f'{sched.status!r} would keep the warm lane leaked'
+        )
+
+    @pytest.mark.asyncio
+    async def test_withheld_members_lane_becomes_a_reclaim_candidate(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """End-to-end through the REAL reclaim-candidate provider."""
+        sched = await _drive_withheld_flip(tmp_path)
+        branch = f'task/{_WEDGE_MID}'
+        harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+            return_value=({branch: sched.status}, None),
+        )
+
+        admitted = await harness._warm_lane_reclaim_candidates([branch])
+
+        assert admitted == {branch}, (
+            f'status {sched.status!r} must un-leak the lane, got {admitted!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_withheld_status_matches_the_harness_hand_back_edge(
+        self, tmp_path: Path,
+    ) -> None:
+        """Same status the factory's OWN re-dispatch edge already uses.
+
+        ``redrive_member``'s not-on-main arm is the harness's established
+        "hand this member back to the scheduler" transition, and the scheduler
+        dispatches from exactly that status.  Comparing the two production
+        paths (rather than a literal) keeps them from drifting apart.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        withheld = await _drive_withheld_flip(tmp_path)
+
+        hand_back = _RecordingScheduler()
+        cbs = build_train_callback_factory(
+            hand_back, MagicMock(), _wedge_config(tmp_path),
+        )(_WEDGE_TRAIN)
+        assert cbs.redrive_member is not None
+        await cbs.redrive_member(_WEDGE_MID, False, None)
+
+        assert withheld.status == hand_back.status, (
+            f'withhold reverts to {withheld.status!r} but the factory hands '
+            f'members back at {hand_back.status!r}'
+        )
