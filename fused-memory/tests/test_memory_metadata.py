@@ -453,6 +453,89 @@ class TestErrorTypes:
         assert 'fused_memory.memory_metadata' in text
 
 
+class TestCanonicalUniquenessViolationType:
+    """The second contract-fixed rejection type (V1, task 3198 leaf ε).
+
+    Pure type contract only -- no service. The type is raised from the
+    async seam (it needs live store state), but its SHAPE is pinned here,
+    next to its sibling, because that is what callers program against.
+    """
+
+    #: The live record leaf α measured; used as a realistic incumbent id.
+    _INCUMBENT = '0929cff6-8efc-4a49-a672-e83f0a41bbfb'
+
+    def test_is_importable_and_exported(self):
+        import fused_memory.memory_metadata as mm
+
+        assert hasattr(mm, 'CanonicalUniquenessViolation')
+        assert 'CanonicalUniquenessViolation' in mm.__all__
+
+    def _make(self):
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        return CanonicalUniquenessViolation(
+            project_id='dark_factory',
+            topic='some-topic',
+            incumbent_id=self._INCUMBENT,
+        )
+
+    def test_carries_the_structured_fields(self):
+        """INV-2: a rejection carries structured facts, not just prose."""
+        exc = self._make()
+        assert exc.project_id == 'dark_factory'
+        assert exc.topic == 'some-topic'
+        assert exc.incumbent_id == self._INCUMBENT
+
+    def test_str_names_the_incumbent_verbatim(self):
+        """V1's contract-fixed obligation: NAME the existing canonical's id.
+
+        Counting is not enough -- an operator who trips this must be able
+        to go look at the record that already holds the topic. This is
+        also why the seam counts first and then scrolls: an int cannot
+        carry an id.
+        """
+        text = str(self._make())
+        assert self._INCUMBENT in text
+        assert 'some-topic' in text
+
+    def test_str_names_the_registry_location(self):
+        """Asserted via the constant, not a literal, so it tracks a rename."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        assert MemoryMetadataValidationError.REGISTRY_LOCATION in str(self._make())
+
+    def test_is_a_sibling_of_the_shape_error_not_a_subclass(self):
+        """Deliberate: the two rejection contracts must be distinguishable.
+
+        Subclassing would let the five pre-existing
+        `pytest.raises(MemoryMetadataValidationError)` sites in
+        test_memory_service.py silently swallow a uniqueness violation --
+        a test passing for the wrong reason. Keeping them siblings makes
+        "which contract rejected this write" observable at the `except`.
+        """
+        from fused_memory.memory_metadata import (
+            CanonicalUniquenessViolation,
+            MemoryMetadataValidationError,
+        )
+
+        assert issubclass(CanonicalUniquenessViolation, Exception)
+        assert not issubclass(CanonicalUniquenessViolation, MemoryMetadataValidationError)
+        assert not issubclass(MemoryMetadataValidationError, CanonicalUniquenessViolation)
+
+    def test_shape_error_handler_does_not_catch_it(self):
+        """The sibling relationship, asserted behaviourally rather than by type."""
+        from fused_memory.memory_metadata import (
+            CanonicalUniquenessViolation,
+            MemoryMetadataValidationError,
+        )
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            try:
+                raise self._make()
+            except MemoryMetadataValidationError:  # pragma: no cover - must not catch
+                pytest.fail('the shape-error handler swallowed a uniqueness violation')
+
+
 _UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
 _UUID2 = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 
