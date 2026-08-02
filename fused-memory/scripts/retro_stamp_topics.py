@@ -97,6 +97,8 @@ __all__ = [
     'load_calibration_rows',
     'load_topic_registry',
     'normalize_supersedes',
+    'StampTarget',
+    'merge_plans',
     'plan_calibration_clusters',
     'plan_canonical_clusters',
     'plan_gate_clusters',
@@ -826,3 +828,133 @@ def plan_gate_clusters(
             },
         ))
     return plans, skips
+
+
+# ---------------------------------------------------------------------------
+# Pure core — merging three plan lists into one per-record work list
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StampTarget:
+    """One record to stamp, and what to stamp on it.
+
+    The unit ``run`` iterates.  Everything ambiguous has already been
+    resolved into a skip by :func:`merge_plans`, so a target is unconditional
+    intent: this id gets this topic, and possibly ``canonical``.
+    """
+
+    project_id: str
+    memory_id: str
+    topic: str
+    make_canonical: bool
+    source: str
+
+
+def merge_plans(*plan_lists: list[ClusterPlan]) -> tuple[list[StampTarget], list[dict]]:
+    """Flatten the three planners into a deduplicated, ordered work list.
+
+    Overlap between sources is EXPECTED — the live canonical scroll and the
+    E1 registry genuinely cover some of the same topics — so two plans for
+    one ``(project_id, topic)`` merge: members union, sources combine.
+
+    Genuine ambiguity is never resolved here, only reported:
+
+    * two sources naming DIFFERENT canonicals for one topic ->
+      ``canonical_disagreement``: stamp the topic on every member, canonical
+      on none.  Picking one risks stamping the wrong record, and since the
+      loser keeps no marker it would also erase the evidence that anything
+      was in doubt;
+    * a ``canonical_plural`` cluster -> ``canonical_plural``, same treatment;
+    * one memory id claimed by two topics -> ``conflicting_topic_claim``, and
+      that id is stamped by neither.  Letting iteration order decide would
+      make the corpus depend on which planner ran first, invisibly.
+
+    The result upholds ε's <=1-canonical-per-``(project_id, topic)`` rule
+    BEFORE any write — necessary because ``update_memory`` never reaches the
+    service-side uniqueness probe, so a violating plan would reach Qdrant
+    unchallenged.
+
+    Output is sorted by ``(project_id, topic, memory_id)`` so two dry-runs of
+    an unchanged corpus produce byte-comparable reports.
+    """
+    grouped: dict[tuple[str, str], dict] = {}
+    for plans in plan_lists:
+        for plan in plans:
+            key = (plan.project_id, plan.topic)
+            group = grouped.setdefault(key, {
+                'members': {},
+                'canonicals': {},
+                'sources': set(),
+                'plural': False,
+                'notes': [],
+            })
+            group['sources'].add(plan.source)
+            group['plural'] = group['plural'] or plan.canonical_plural
+            note = (plan.provenance or {}).get('note')
+            if note:
+                group['notes'].append(note)
+            if plan.canonical_memory_id:
+                group['canonicals'].setdefault(plan.canonical_memory_id, None)
+            for member in plan.member_memory_ids:
+                group['members'].setdefault(member, None)
+
+    skips: list[dict] = []
+    # (project_id, topic) -> resolved canonical id (or None)
+    resolved: dict[tuple[str, str], str | None] = {}
+    for (project_id, topic), group in sorted(grouped.items()):
+        canonicals = list(group['canonicals'])
+        if group['plural']:
+            skips.append({
+                'reason': 'canonical_plural',
+                'project_id': project_id,
+                'topic': topic,
+                'note': '; '.join(group['notes']) or None,
+            })
+            resolved[(project_id, topic)] = None
+        elif len(canonicals) > 1:
+            skips.append({
+                'reason': 'canonical_disagreement',
+                'project_id': project_id,
+                'topic': topic,
+                'canonical_memory_ids': sorted(canonicals),
+            })
+            resolved[(project_id, topic)] = None
+        else:
+            resolved[(project_id, topic)] = canonicals[0] if canonicals else None
+
+    # Which topics claim each id, per project. A canonical is also a claim,
+    # so a record cannot be one topic's canonical and another's member.
+    claims: dict[tuple[str, str], set[str]] = {}
+    for (project_id, topic), group in grouped.items():
+        ids = set(group['members']) | set(group['canonicals'])
+        for memory_id in ids:
+            claims.setdefault((project_id, memory_id), set()).add(topic)
+
+    targets: list[StampTarget] = []
+    for (project_id, topic), group in grouped.items():
+        source = '+'.join(sorted(group['sources']))
+        canonical_id = resolved[(project_id, topic)]
+        ids = set(group['members']) | set(group['canonicals'])
+        for memory_id in ids:
+            if len(claims[(project_id, memory_id)]) > 1:
+                continue  # reported once, below
+            targets.append(StampTarget(
+                project_id=project_id,
+                memory_id=memory_id,
+                topic=topic,
+                make_canonical=memory_id == canonical_id,
+                source=source,
+            ))
+
+    for (project_id, memory_id), topics in sorted(claims.items()):
+        if len(topics) > 1:
+            skips.append({
+                'reason': 'conflicting_topic_claim',
+                'project_id': project_id,
+                'memory_id': memory_id,
+                'topics': sorted(topics),
+            })
+
+    targets.sort(key=lambda t: (t.project_id, t.topic, t.memory_id))
+    return targets, skips
