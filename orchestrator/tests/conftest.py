@@ -5,6 +5,7 @@ uniquely-named sibling module — so they can be imported from test files
 without conflicting with sibling subprojects' conftests under
 `sys.modules['conftest']`.
 """
+import itertools
 import os
 import sys
 from pathlib import Path
@@ -743,24 +744,32 @@ def _drain_async_mock_coroutines():
 def make_steward(tmp_path: Path):
     """Build a minimal ``TaskSteward`` on a fixture-OWNED, ``tmp_path``-rooted worktree.
 
-    The single steward factory for the orchestrator suite (task 3461 merged
-    ``test_suggestion_triage.py``'s and ``test_workflow_state_machine_boundary.py``'s
-    two near-identical copies).  Lives in conftest.py — rather than
-    ``_orch_helpers.py``, which is scoped to non-fixture helpers — because it
-    must close over ``tmp_path`` to own the worktree directory; ``mock_orch_config``
-    below is the same shape and the precedent for it.
+    Merges the two near-identical ``_make_steward`` copies that used to live in
+    ``test_suggestion_triage.py`` and ``test_workflow_state_machine_boundary.py``
+    (task 3461).  It is NOT yet the suite's only steward factory: ``test_steward.py``
+    keeps its own richer fixture graph (``worktree`` / ``mock_config`` / ``mock_queue``
+    / ``mock_mcp`` / ``mock_briefing`` / ``_build_steward`` / ``steward``) and
+    ``test_out_of_band_routing.py`` has a third, ``_build_steward``.  Folding those in
+    was out of 3461's scope — if you are here to add a fourth, extend this one instead.
+
+    Lives in conftest.py — rather than ``_orch_helpers.py``, which is scoped to
+    non-fixture helpers — because it must close over ``tmp_path`` to own the
+    worktree directory; ``mock_orch_config`` below is the same shape and the
+    precedent for it.
 
     Worktree ownership — an ENFORCED invariant, not a convention: with no
-    ``worktree=`` argument the fixture picks ``tmp_path / 'wt'`` and creates it
-    (plus a ``.task`` subdir), so the common case is structurally safe and no
-    caller needs to name a path.  A caller-supplied path (for the
-    two-stewards-in-one-test case) is asserted to resolve *strictly below*
-    ``tmp_path`` before anything is created, because the steward derives its
-    artifacts root as a SIBLING of the worktree —
-    ``<worktree.parent>/.task-meta/<worktree.name>``, see ``TASK_META_DIRNAME``
-    in ``orchestrator/config.py`` and ``TaskArtifacts.meta_root_for`` in
-    ``orchestrator/artifacts.py`` — so ``worktree=tmp_path`` would put that
-    sibling outside the directory pytest's retention policy reclaims.
+    ``worktree=`` argument the fixture picks a per-call directory (``tmp_path /
+    'wt'``, then ``'wt-2'``, ``'wt-3'``, …) and creates it plus a ``.task`` subdir,
+    so the common case is structurally safe, no caller needs to name a path, and
+    two default builds in one test never share mutable state (``.task/`` and the
+    ``.task-meta`` sibling that holds ``verdicts/triage.json``).  A
+    caller-supplied path is asserted to resolve *strictly below* ``tmp_path``
+    before anything is created, because the steward derives its artifacts root as
+    a SIBLING of the worktree — ``<worktree.parent>/.task-meta/<worktree.name>``,
+    see ``TASK_META_DIRNAME`` in ``orchestrator/config.py`` and
+    ``TaskArtifacts.meta_root_for`` in ``orchestrator/artifacts.py`` — so
+    ``worktree=tmp_path`` would put that sibling outside the directory pytest's
+    retention policy reclaims.
 
     Config defaults applied (union of what both former factories set; a caller
     overrides any of them via ``config_overrides``, applied last):
@@ -772,14 +781,33 @@ def make_steward(tmp_path: Path):
       - triage + steward ``models`` / ``budgets`` / ``max_turns`` / ``effort`` / ``backends``
       - ``escalation.host`` / ``escalation.port``
 
+    KNOWN GAPS — the defaults are the union of the *two* retired factories only,
+    so relative to ``test_steward.py``'s ``mock_config`` these are still unset and
+    will surface as a bare ``MagicMock`` (and then a confusing ``TypeError``)
+    rather than a clear missing-default message:
+      - ``stamp_stock_routing_config(config)`` — needed by anything reaching
+        ``resolve_route`` (it does real membership/dict ops on ``config.routing.*``);
+        already exported from ``_orch_helpers.py``
+      - ``config.timeouts.steward`` and ``config.steward_completion_timeout`` —
+        the spawn/completion-timeout path
+      - ``config.fused_memory.*``
+      - ``escalation_queue.queue_dir`` — read at ``steward.py`` in the spawn argv
+    All five migrated call sites patch the invoke seam, so none of them reach these
+    today.  If yours does, EXTEND this fixture (and this list) rather than debugging
+    the MagicMock.
+
     The config mock is ``spec_set``'d against ``OrchestratorConfig`` so a typo'd
     field name raises ``AttributeError`` on both read and write.
     """
+    # Per-call counter so repeated default builds get isolated directories.
+    default_worktree_count = itertools.count(1)
+
     def _make(*, worktree: Path | None = None, config_overrides: dict | None = None):
         from orchestrator.steward import TaskSteward
 
         if worktree is None:
-            worktree = tmp_path / 'wt'
+            n = next(default_worktree_count)
+            worktree = tmp_path / ('wt' if n == 1 else f'wt-{n}')
         else:
             # Checked BEFORE any mkdir, so a rejected path is never created.
             resolved, root = worktree.resolve(), tmp_path.resolve()
