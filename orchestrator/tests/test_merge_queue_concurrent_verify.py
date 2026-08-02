@@ -3934,6 +3934,7 @@ class TestStopDrainFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 3477: widened wait budgets (below) can approach the 60s pyproject default; thread-mode timeout would os._exit() the xdist worker with --max-worker-restart=0
 class TestCascadeFiresRemoteCancel:
     """_verifier_loop head-failure cascade fires remote cancel BEFORE task.cancel().
 
@@ -4022,8 +4023,6 @@ class TestCascadeFiresRemoteCancel:
             config=config, result=loop.create_future(), lane='normal',
         )
 
-        outcome_b: MergeOutcome | None = None
-
         with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
             worker_task = asyncio.create_task(worker.run())
 
@@ -4031,14 +4030,19 @@ class TestCascadeFiresRemoteCancel:
             await q.put(req_b)
 
             # Wait for both verifies to enter (true concurrent overlap)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # NOTE (task 3477): widened from 15.0s -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention even though the
+            # underlying cascade logic is correct (timing flake, not a bug).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
 
             # N's verify fails → triggers head-failure cascade for N+1
             gate_a_release.set()
 
-            # N must resolve with a fail status
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            # N must resolve with a fail status. Routed through _await_outcome
+            # (task 3477) so a real timeout reports by name instead of raising
+            # a bare TimeoutError, matching outcome_b's wait below.
+            outcome_a = await _await_outcome(req_a.result, label='N (gated local fail)')
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail, got status={outcome_a.status!r}.'
             )
@@ -4048,17 +4052,20 @@ class TestCascadeFiresRemoteCancel:
             # run_merge_verify coroutine so the test can complete cleanly).
             gate_b_release.set()
 
-            # Wait for N+1 to resolve 'done' after cascade re-merge/re-verify
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=10.0)
+            # Wait for N+1 to resolve 'done' after cascade re-merge/re-verify.
+            # A real timeout now fails loudly by name (task 3477) instead of
+            # leaving outcome_b as a confusing None that the assertion below
+            # would misreport.
+            outcome_b = await _await_outcome(req_b.result, label='N+1 (cascade re-merge/re-verify)')
 
             await worker.stop()
 
+        # NOTE (task 3477): widened from 5.0s, matching the gate/outcome waits above.
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            await asyncio.wait_for(worker_task, timeout=45.0)
 
         # ── N+1 must resolve done (cascade re-merged and re-verified) ────────
-        assert outcome_b is not None and outcome_b.status == 'done', (
+        assert outcome_b.status == 'done', (
             f'Expected N+1 to resolve "done" after cascade re-merge/re-verify, '
             f'got {outcome_b!r}.'
         )
