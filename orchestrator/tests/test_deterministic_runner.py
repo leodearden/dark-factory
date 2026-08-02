@@ -392,15 +392,23 @@ def _assert_submit_cli_invokable(python_exe: str) -> None:
         env=_child_env(),
     )
     if result.returncode != 0:
+        from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
+
         raise AssertionError(
             f'the escalation submit CLI is not invokable by {python_exe!r} '
             f'(exit {result.returncode}): '
             f'{result.stdout.decode(errors="replace").strip()!r}. '
             f'The RP-4 wrapper files its on-failure L2 by exec-ing '
-            f'{" ".join(probe[:4])!r}, so this environment would file NOTHING '
-            f'while the wrapper still exits with the payload\'s own code. '
+            f'{" ".join(probe[:4])!r}, so this environment would file NOTHING. '
             f'Remedy: this venv most likely lacks the `escalation` editable '
-            f'install — run `uv sync` at the repo root.'
+            f'install — run `uv sync` at the repo root. '
+            f'In PRODUCTION, an interpreter that cannot run this makes a fired '
+            f'RP-4 transient unit exit {RP4_ESCALATION_SUBMIT_FAILED_RC} '
+            f'(RP4_ESCALATION_SUBMIT_FAILED_RC) with '
+            f'"RP-4: on-failure escalation submit failed rc=<N> '
+            f'(payload rc=<M>)" on stderr, instead of the payload\'s own exit '
+            f'code — that line and that code are the journald signature to '
+            f'grep for (task 3404).'
         )
 
 
@@ -408,18 +416,22 @@ async def _run_wrapper_payload(wrapped: str) -> tuple[int, str]:
     """Execute a deferred RP-4 ``/bin/sh -c`` wrapper the way systemd would.
 
     *wrapped* is the payload `systemd-run` was asked to defer — i.e. the
-    `{payload}; __rc=$?; if [ "$__rc" -ne 0 ]; then {on_failure}; fi;
-    exit "$__rc"` shell built by
+    four-part `{payload}; __rc=$?; if [ "$__rc" -ne 0 ]; then {on_failure};
+    __esc=$?; if [ "$__esc" -ne 0 ]; then echo "RP-4: ..." >&2; exit 97; fi;
+    fi; exit "$__rc"` shell built by
     ``RestartPlan``/``EscalationSpec.to_submit_argv``.  Running it for real is
     what makes the wrapper-exec tests higher-fidelity than argv assertions.
 
     Returns ``(returncode, combined_output)``.  The output half is returned
-    **specifically so assertion failures can quote it**: the wrapper swallows
-    its on-failure branch's exit status (it ends in `exit "$__rc"`, the
-    payload's own code), so when the branch dies the ONLY evidence of why is
-    the text the child printed.  The pre-3404 inline pattern called
-    ``await proc.communicate()`` and discarded the result, leaving a failure to
-    report itself as a bare "got 0" with the real diagnosis unread.
+    **specifically so assertion failures can quote it**: on the
+    submit-succeeded path the wrapper still exits the PAYLOAD's own code, so
+    the exit status alone never says which of the two commands produced it,
+    and the text the child printed is the only evidence.  The pre-3404 inline
+    pattern called ``await proc.communicate()`` and discarded that result,
+    leaving a failure to report itself as a bare "got 0" with the real
+    diagnosis unread.  (Pre-3404 the wrapper also swallowed a FAILED submit
+    entirely; it now exits ``RP4_ESCALATION_SUBMIT_FAILED_RC`` with an `RP-4:`
+    line on stderr, which this helper likewise surfaces.)
 
     The child is given the repo's src roots on ``PYTHONPATH``.  WHY (measured,
     task 3404): the wrapper's on-failure branch is
@@ -6828,10 +6840,11 @@ class TestDefaultScheduleDetachedRestart:
             f'wrapper output: {out!r}'
         )
 
-        # Preflight: the wrapper ends in `exit "$__rc"`, so a dead on-failure
-        # branch still exits 7 and the assertions below would report "got 0"
-        # while the real cause (an interpreter that cannot import escalation)
-        # went unnamed.  Fail on the actual cause instead.
+        # Preflight: a non-invokable interpreter would make the assertions
+        # below report "got 0" while the real cause went unnamed.  Fail on the
+        # actual cause instead.  (Since 3404 such a wrapper exits the reserved
+        # RP4_ESCALATION_SUBMIT_FAILED_RC, so the `wrapper_rc == 7` assert
+        # above would now catch it too — but with a bare number, not a name.)
         _assert_submit_cli_invokable(sys.executable)
 
         filed = queue.get_by_task('901')
