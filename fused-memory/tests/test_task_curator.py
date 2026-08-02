@@ -6049,3 +6049,135 @@ class TestCuratorPromptLoaderWiringBatch:
             CURATOR_BATCH_SPEC.contract, heuristics,
         )
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-3126 step-1 RED: TestCuratorDeterministicRefusal
+#
+# Both deterministic guards previously emitted `action='drop', target_id=None`.
+# That shape is INERT at the dispatch chokepoint — the interceptor's drop
+# handler requires a target, so a targetless drop fell through and CREATED the
+# very candidate its own justification said to refuse. These tests pin the new
+# explicit `action='refuse'` verdict, which creates nothing.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCuratorDeterministicRefusal:
+    """Both deterministic guards emit action='refuse', not a targetless 'drop'."""
+
+    async def test_blocklist_guard_emits_refuse_not_targetless_drop(self, tmp_path):
+        """_maybe_blocklist_drop returns action='refuse' with no target."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        decision = await curator._maybe_blocklist_drop(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is not None
+        assert decision.action == "refuse", (
+            "a blocklisted candidate must be REFUSED (creates nothing), not "
+            "emitted as a targetless 'drop' that the dispatcher fails open on"
+        )
+        assert decision.target_id is None
+        assert decision.justification.startswith("cancelled-premise-blocklist: ")
+        assert "test_entry" in decision.justification
+
+    async def test_premise_refuted_guard_emits_refuse_not_targetless_drop(self, tmp_path):
+        """_maybe_premise_refuted_drop returns action='refuse' with no target."""
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        decision = await curator._maybe_premise_refuted_drop(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is not None
+        assert decision.action == "refuse", (
+            "a premise-refuted candidate must be REFUSED (creates nothing), not "
+            "emitted as a targetless 'drop' that the dispatcher fails open on"
+        )
+        assert decision.target_id is None
+        assert decision.justification.startswith("recon-premise-refuted: ")
+        assert "test_premise_entry" in decision.justification
+
+    async def test_refuse_preserves_blocklist_caching_contract(self, tmp_path):
+        """Switching drop→refuse must not regress the blocklist's idempotency cache write."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+        payload_hash = candidate.payload_hash()
+
+        decision = await curator._maybe_blocklist_drop(candidate, payload_hash)
+
+        assert decision is not None and decision.action == "refuse"
+        assert payload_hash in curator._decision_cache
+        assert curator._decision_cache[payload_hash][0].action == "refuse"
+
+    async def test_refuse_preserves_premise_non_caching_contract(self, tmp_path):
+        """The premise guard must STILL skip the cache — it re-verifies live source
+        on every call, so a cached refusal could suppress a genuinely-fixed bug."""
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text("invalid_at\n", encoding="utf-8")
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+        payload_hash = candidate.payload_hash()
+
+        decision = await curator._maybe_premise_refuted_drop(candidate, payload_hash)
+
+        assert decision is not None and decision.action == "refuse"
+        assert payload_hash not in curator._decision_cache
