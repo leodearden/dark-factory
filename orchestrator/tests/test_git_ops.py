@@ -13690,3 +13690,125 @@ class TestDisableSharedRepoAutoMaintenance:
         assert gc_val.strip() == '0'
         assert rc_mt == 0
         assert mt_val.strip() == 'false'
+
+
+# ---------------------------------------------------------------------------
+# task 3060: advance_main stands off from a FOREIGN project_root index.lock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAdvanceMainIndexLockStandoff:
+    """A concurrent `git commit --only <path>` in project_root holds
+    `.git/index.lock` for the ENTIRE pre-commit hook run (this repo's hook
+    runs pyright; CLAUDE.md instructs callers to pass `timeout: 300000`).
+
+    Verified on git 2.43.0: with the lock held and a dirty tracked file,
+    `git status --porcelain` and `git diff --name-only` both succeed (rc=0)
+    while `git stash create` exits **rc=1 with EMPTY stdout AND stderr** — so
+    advance_main's park detects WIP, fails to stash it, and returns
+    `stash_failed`, which is in `_HALT_ADVANCE_RESULTS` and halts the WHOLE
+    merge queue behind an L1 escalation. That is the recurring 2+/day halt.
+
+    The fix stands off: wait (bounded by
+    `git.merge_park_lock_grace_seconds`) for the foreign lock to clear, and
+    if it is still held at the deadline return the new transient
+    `park_lock_contended` code having touched NOTHING — no ref move, no tree
+    write, no park, and the foreign lock left strictly alone.
+    """
+
+    @staticmethod
+    async def _make_merge(git_ops: GitOps, branch: str, filename: str):
+        """Create a mergeable commit on *branch* and merge it, returning the
+        MergeResult (not yet advanced)."""
+        worktree_info = await git_ops.create_worktree(branch)
+        (worktree_info.path / filename).write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, f'Add {filename}')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, branch)
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        return merge_result
+
+    async def test_held_index_lock_returns_park_lock_contended_not_stash_failed(
+        self, git_ops: GitOps,
+    ):
+        """The headline regression: a held foreign index.lock must produce the
+        transient `park_lock_contended`, NOT the queue-halting `stash_failed`.
+
+        No `_run` mocking — a REAL `.git/index.lock` file is created, exactly
+        what a concurrent `git commit --only` leaves behind, so the real
+        rc=1/empty-stderr `git stash create` failure is what the gate is
+        protecting against.
+        """
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        merge_result = await self._make_merge(
+            git_ops, 'lock-standoff', 'lock_standoff.py',
+        )
+
+        # Dirty a TRACKED file so the park would be armed.
+        dirty = '# dirty tracked edit racing a concurrent commit --only\n'
+        (git_ops.project_root / 'README.md').write_text(dirty)
+
+        # grace=0 == probe-only fail-fast. Direct attribute mutation is safe:
+        # GitConfig declares no model_config, so it is neither frozen nor
+        # validate_assignment.
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended', (
+            'a foreign index.lock must be classified as transient contention, '
+            f'never as the queue-halting stash_failed; got {result.result!r}'
+        )
+
+        # (2) main did NOT move — nothing landed.
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # (3) The dirty edit is untouched: advance_main did NOT run
+        # `read-tree -u --reset`, which would have clobbered the concurrent
+        # commit's staged/working state.
+        assert (git_ops.project_root / 'README.md').read_text() == dirty
+
+    async def test_foreign_lock_file_is_never_deleted(self, git_ops: GitOps):
+        """We stand off; we never break another process's lock.
+
+        Deleting a live `git commit --only`'s index.lock would corrupt the
+        in-flight commit — the whole point of standing off is that when a
+        foreign process owns the index, the only safe action is to touch
+        nothing and come back later.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-untouched', 'lock_untouched.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty\n')
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('sentinel-contents')
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+            assert result.result == 'park_lock_contended'
+            assert lock_path.exists(), (
+                'advance_main must never delete a foreign index.lock'
+            )
+            assert lock_path.read_text() == 'sentinel-contents', (
+                'the foreign lock file must be left byte-identical'
+            )
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
