@@ -78,7 +78,18 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # bare-MagicMock config gate — whole-repo scope on this rare module_config-less
 # fallback path (per-module orchestrator.yaml lint_commands carry the per-package
 # scope; also runs in merge-queue verify; see hooks/project-checks).
-lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
+# task 3397: the ``ruff check`` leg now covers all 7 [tool.uv.workspace].members
+# (added sampler and cockpit — cockpit is on main now), closing the gap where a
+# docs-only or cross-cutting diff (zero .py files touched -> verify._build_
+# fallback_config returns None -> this chain runs verbatim, no per-subproject
+# rescoping) left them never ruff-checked at the gating layer. Enforced by
+# tests/scripts/test_fallback_verify_config.py::TestFleetLintCoversEveryWorkspaceMember.
+# Preserve the existing chain SHAPE when editing either leg — the leading
+# ``uv run ruff check ...`` head plus the ``&& python3 ...`` tail:
+# verify._reproject_str relies on split_chain_tail(cmd, 'uv run') carrying the
+# tail through verbatim; adding target names to the head does not disturb it,
+# restructuring the chain would.
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
 # The bare ``npx pyright`` spelling is DELIBERATE and safe (task 3367 /
 # esc-3359-1): every ``cd`` target below pins pyright's own interpreter via
 # ``[tool.pyright] venvPath = ".."`` / ``venv = ".venv"`` in its pyproject.toml,
