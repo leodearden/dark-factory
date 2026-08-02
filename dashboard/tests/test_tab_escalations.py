@@ -705,6 +705,8 @@ def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: s
     (f) the per-subsection group summary carries a skipped badge, beside the
         existing L1/L2 pips, so it is visible while the group is collapsed.
     (g) the global controls header renders a ``skipped_count`` pill, gated on > 0.
+    (h) the notice caps how many rows it lists while still counting the true
+        total, so a whole-directory fault does not bury the escalation table.
     """
     body = tab_escalations_jsx_body
 
@@ -838,6 +840,21 @@ def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: s
     assert re.search(r'skipped_count[^\n]*>\s*0', pills_window), (
         'the global `skipped_count` pill is not gated on `> 0` — a clean fleet must not '
         'render a permanent "0 unreadable" pill.'
+    )
+
+    # (h) The notice bounds how many rows it renders, without understating the
+    # loss.  A whole-directory fault (truncated write, permission fault, a
+    # half-synced mount) yields hundreds of records; rendering them all,
+    # always-expanded, pushes the escalation table below the fold and degrades
+    # the same operator view the notice exists to serve.
+    assert '.slice(' in notice, (
+        'SkippedNotice renders every entry unbounded — slice the list to a cap and add '
+        'an overflow line, so a whole-directory fault does not bury the escalation table.'
+    )
+    assert 'rows.length' in notice, (
+        'the SkippedNotice headline no longer counts from the full `rows.length` — the '
+        'headline must state the TRUE total even when the listing is capped, or the '
+        'notice understates the loss it exists to report.'
     )
 
 

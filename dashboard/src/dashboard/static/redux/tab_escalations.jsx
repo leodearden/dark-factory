@@ -143,9 +143,21 @@ function sevClass(sev) {
 // that could not be parsed has neither a `level` nor a `status`, so there is
 // nothing for matchesFilter to test, and routing them through the chips would
 // let an arbitrary default decide whether the operator is told about corruption.
+//
+// At most SKIPPED_ROW_CAP paths are listed, with an overflow line for the rest.
+// The normal case is one or two files, but a truncated write, a permission
+// fault, or a half-synced mount degrades a whole directory at once — hundreds of
+// always-expanded rows would push the actual escalation table far below the fold
+// and degrade the same operator view this notice exists to serve.  The headline
+// and the collapsed-group badge always state the TRUE total, so the cap shortens
+// the list without ever understating the loss.
+const SKIPPED_ROW_CAP = 20;
+
 function SkippedNotice({ skipped }) {
   const rows = skipped || [];
   if (!(rows.length > 0)) return null;
+  const shown = rows.slice(0, SKIPPED_ROW_CAP);
+  const hidden = rows.length - shown.length;
   return (
     <div
       data-testid="escalation-skipped"
@@ -163,11 +175,16 @@ function SkippedNotice({ skipped }) {
       <div style={{ color: 'var(--warn)', marginBottom: 4 }}>
         {rows.length} queue file(s) unreadable — the counts for this queue are short by that many
       </div>
-      {rows.map((s, i) => (
+      {shown.map((s, i) => (
         <div key={`${s.path}-${i}`} style={{ color: 'var(--fg-3)' }}>
           {s.path || '—'} — {s.error || '—'}
         </div>
       ))}
+      {hidden > 0 && (
+        <div style={{ color: 'var(--fg-3)', marginTop: 4 }}>
+          …and {hidden} more (listing the first {SKIPPED_ROW_CAP})
+        </div>
+      )}
     </div>
   );
 }
@@ -510,7 +527,19 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
         {/* Summary pills */}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)' }}>
           {byStatus.pending || 0} pending · {byLevel[1] || 0} L1 · {byLevel[2] || 0} L2
-          {(gs.skipped_count || 0) > 0 && <span> · {gs.skipped_count} unreadable</span>}
+          {/* Global, like the pips beside it: read from the unfiltered top-level
+              summary, so with a project filter active this can count files in
+              queues that are not rendered below.  Titled rather than re-derived
+              from the filtered subsections — a corruption signal that shrinks
+              when you narrow the view would understate the fleet's actual
+              degraded state, which is the failure this whole notice exists to
+              prevent.  The title states the mismatch instead of leaving the
+              operator to infer it from a count with no visible source. */}
+          {(gs.skipped_count || 0) > 0 && (
+            <span title="Across all queues, including any hidden by the project filter">
+              {' '}· {gs.skipped_count} unreadable
+            </span>
+          )}
         </span>
       </div>
 
