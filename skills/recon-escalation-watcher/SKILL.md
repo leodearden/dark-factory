@@ -223,6 +223,27 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   close the task), say so explicitly in the cockpit decision text as a
   NO-OP marker, so the next human triaging the queue doesn't have to
   re-derive that conclusion.
+- **`reconciliation_stale_human_operator`** (blocking) — a task has stayed
+  flagged `human_operator_required` for `STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD`
+  = 5 Stage 1 cycles that survived dedup, filed once per task while it has
+  no open level-1 escalation (`maybe_escalate_stalled_tasks`,
+  `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).
+  Same aging/park shape as `reconciliation_stale_gate_backlog` above —
+  **default: PARK**, file a cockpit DecisionRecord, pass `--exclude-id
+  <esc-id>` on the watcher's next start; see that row above for the
+  mechanism and churn evidence, not repeated here. **Asymmetry to know:**
+  this path dedups on an *un-categorized* `has_open_l1(task_id)` (same
+  module, line 385), so an open `reconciliation_stale_gate_backlog` L1 on
+  the **same task** CAN suppress a would-be HOR escalation, while the
+  reverse can't happen (the gate-backlog lookup is category-scoped).
+  Practically: a parked gate-backlog record may be masking a HOR condition
+  on that same task — don't read "no pending HOR record for this task" as
+  "no HOR condition for this task". **Same resolve-to-tidy trap as above,
+  for a different reason:** the stall marker that counts cycles never
+  resets (same module docstring, lines 48-59) — resolving a HOR escalation
+  while the task is still flagged `human_operator_required` can cause an
+  immediate re-file on the very next cycle, since the accumulated cycle
+  count is already at or past the threshold.
 
 ## Priority Hierarchy
 
