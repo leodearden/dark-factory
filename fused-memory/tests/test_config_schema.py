@@ -1727,6 +1727,71 @@ class TestWriteTriageConfig:
             f'write_triage must be annotated as a bare submodel, got {annotation!r}'
         )
 
+    # -- per-category cutoffs (task 3357) -----------------------------------
+
+    def test_t_high_by_category_defaults_to_none(self):
+        """None means NO category is calibrated — the same fail-open posture.
+
+        Asserted on the schema class for the same reason as the pooled
+        fields above: FusedMemoryConfig() loads config.yaml, which by design
+        carries a calibration run's output.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig().t_high_by_category is None
+
+    def test_the_root_wiring_introduces_no_per_category_default(self):
+        factory = FusedMemoryConfig.model_fields['write_triage'].default_factory
+        assert factory is not None
+        assert factory().t_high_by_category is None  # type: ignore[call-arg]
+
+    def test_accepts_a_measured_mapping(self):
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        mapping = {'procedural_knowledge': 0.8868293243724489}
+        assert WriteTriageConfig(t_high_by_category=mapping).t_high_by_category == mapping
+
+    def test_an_empty_mapping_is_accepted_and_means_no_category_calibrated(self):
+        """Distinct from None only in provenance, identical in effect.
+
+        A calibration run that derived nothing may still write an empty map;
+        rejecting it would force the writer to choose between two spellings
+        of the same measured outcome.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig(t_high_by_category={}).t_high_by_category == {}
+
+    @pytest.mark.parametrize('value', [-0.1, 1.1, 42.0])
+    def test_rejects_a_per_category_cutoff_outside_the_cosine_unit_range(self, value):
+        """A bad cutoff must fail at LOAD, not silently gate deletions.
+
+        This map is read by audit_duplicate_memories --apply. A cutoff of
+        42.0 would match nothing and a negative one would match everything;
+        either way the failure would surface as deleted (or undeleted)
+        memories rather than as a config error.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
+
+    @pytest.mark.parametrize('value', ['0.9', None, [0.9]])
+    def test_rejects_a_non_numeric_per_category_cutoff(self, value):
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
+
+    def test_one_bad_entry_rejects_the_whole_map(self):
+        """No partial acceptance: a half-applied set of cutoffs must not gate a sweep."""
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(t_high_by_category={
+                'procedural_knowledge': 0.88, 'observations_and_summaries': 9.0,
+            })
+
 
 class TestMemoryMetadataConfig:
     """`memory_metadata` — the Mem0 metadata write-boundary section (task 3195, leaf β).

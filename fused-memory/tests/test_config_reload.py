@@ -555,3 +555,72 @@ class TestWriteTriageLeavesAreGreenTier:
         )
         assert d.applied_candidates[path] == {'old': old, 'new': new_value}
         assert path not in d.restart_required
+
+
+class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
+    """The per-category cutoff map (task 3357), reloaded as ONE leaf.
+
+    Same green tier as its pooled sibling, and for the same reason: a
+    re-calibration must take effect on a running server. Atomicity is the
+    part that matters here — _iter_leaves yields a container WHOLE (as it
+    already does for reconciliation.procedural_knowledge_topic_guard_clusters),
+    so a half-applied set of per-category cutoffs can never gate a sweep.
+    """
+
+    PATH = 'write_triage.t_high_by_category'
+    MEASURED = {'procedural_knowledge': 0.8868293243724489}
+
+    def test_the_leaf_is_allowlisted(self):
+        assert self.PATH in RELOADABLE_FIELDS, (
+            f'{self.PATH} must be allowlisted so a re-calibration needs no restart'
+        )
+
+    def test_iter_leaves_yields_the_map_as_exactly_one_whole_leaf(self):
+        """Not one leaf per category — the map reloads all-or-nothing."""
+        from fused_memory.config.reload import _iter_leaves  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        object.__setattr__(config.write_triage, 't_high_by_category', dict(self.MEASURED))
+        paths = [path for path, _ in _iter_leaves(config)]
+
+        assert paths.count(self.PATH) == 1, (
+            f'expected exactly one leaf at {self.PATH}, got {paths.count(self.PATH)}'
+        )
+        assert not [p for p in paths if p.startswith(f'{self.PATH}.')], (
+            'the map must not be descended into: a per-category leaf would let '
+            'one cutoff land while another did not'
+        )
+        assert dict(_iter_leaves(config))[self.PATH] == self.MEASURED, (
+            'the leaf value must be the whole mapping'
+        )
+
+    def test_a_changed_map_lands_in_applied_candidates(self):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.write_triage.t_high_by_category
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.MEASURED))
+
+        d = diff_config(live, fresh)
+
+        assert d.applied_candidates[self.PATH] == {'old': old, 'new': self.MEASURED}
+        assert self.PATH not in d.restart_required
+
+    def test_apply_reload_replaces_the_map_wholesale(self):
+        """Never merged into the old map.
+
+        A merge would leave a category calibrated after the run that
+        calibrated it stopped deriving a cutoff for it — a stale number
+        outliving its own evidence.
+        """
+        from fused_memory.config.reload import apply_reload  # noqa: PLC0415
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        object.__setattr__(live.write_triage, 't_high_by_category', {
+            'procedural_knowledge': 0.5, 'observations_and_summaries': 0.6,
+        })
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.MEASURED))
+
+        apply_reload(live, fresh)
+
+        assert live.write_triage.t_high_by_category == self.MEASURED
