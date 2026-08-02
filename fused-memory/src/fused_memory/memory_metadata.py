@@ -7,27 +7,17 @@ the vocabulary.  A second copy of any constant in this module is a bug.
 
 Contents
 --------
-* ``TOPIC_SLUG_RE`` / ``TOPIC_SLUG_MAX_LEN`` — the shared ``topic`` slug
-  shape (PRD D4: ``ProceduralTopicCluster.topic_id`` and
-  ``metadata.topic`` are one namespace with one regex).
+* ``TOPIC_SLUG_RE`` / ``TOPIC_SLUG_MAX_LEN`` / ``is_valid_topic_slug`` —
+  the shared ``topic`` slug shape (PRD D4:
+  ``ProceduralTopicCluster.topic_id`` and ``metadata.topic`` are one
+  namespace with one regex).  **Defined in**
+  :mod:`fused_memory.topic_slug` (task 3198, leaf ε) and re-exported here
+  bound to the *same objects*, so this registry remains the advertised
+  import site while ``config/schema.py`` — which cannot import this
+  module without a cycle — validates through the identical rule.  See
+  that module's docstring for the measured ``ImportError`` behind the
+  split.
 * ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
-
-Measured basis for the slug shape
----------------------------------
-Derived from leaf α's census
-(``plans/memory-metadata-census-report.json`` @ ``b5af3e4b03``,
-``coverage.complete = true``) rather than guessed:
-
-* accepts all **5** seeded ``ProceduralTopicCluster.topic_id`` values
-  (PRD §10's one hard requirement); longest is 52 chars;
-* accepts **254 of 352** distinct live ``topic`` values (355 of 491
-  records); the longest conforming live value is 69 chars, so the
-  100-char cap bounds the key while rejecting nothing observed;
-* the 98 non-conforming live values are all snake_case.  Under the
-  warn-mode default (``memory_metadata.enforce = False``) these emit a
-  census line and the write proceeds — leaf θ's bounded retro-stamping
-  sweep is the intended normalizer.  This is why the warn default is
-  load-bearing rather than merely cautious.
 
 ``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
