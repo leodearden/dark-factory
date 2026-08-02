@@ -126,3 +126,104 @@ class TestTopicSlugLeafModule:
             [sys.executable, '-c', probe], capture_output=True, text=True, timeout=120
         )
         assert result.returncode == 0, result.stderr
+
+
+class TestOneNamespaceOneConstant:
+    """INV-5: ONE home for the rule, both consumers importing the SAME objects.
+
+    Every assertion here is ``is``, never ``==``. Equality would be
+    satisfied by a re-typed copy of the pattern in either consumer — which
+    is precisely the drift INV-5 forbids and which prose alone cannot
+    prevent. Identity fails the moment someone inlines a second copy.
+    """
+
+    def test_memory_metadata_re_exports_the_same_objects(self):
+        import fused_memory.memory_metadata as mm
+        import fused_memory.topic_slug as ts
+
+        assert mm.TOPIC_SLUG_RE is ts.TOPIC_SLUG_RE
+        assert mm.TOPIC_SLUG_MAX_LEN is ts.TOPIC_SLUG_MAX_LEN
+        assert mm.is_valid_topic_slug is ts.is_valid_topic_slug
+
+    def test_registry_still_advertises_the_names(self):
+        """The re-export is not a silent deprecation.
+
+        ``memory_metadata`` remains the advertised vocabulary home, so the
+        names must stay in its ``__all__`` — every existing importer keeps
+        working through it.
+        """
+        import fused_memory.memory_metadata as mm
+
+        for name in ('TOPIC_SLUG_RE', 'TOPIC_SLUG_MAX_LEN', 'is_valid_topic_slug'):
+            assert name in mm.__all__
+
+    def test_config_schema_validates_through_the_same_predicate(self):
+        import fused_memory.config.schema as schema
+        import fused_memory.topic_slug as ts
+
+        assert schema.is_valid_topic_slug is ts.is_valid_topic_slug
+
+    def test_every_seeded_cluster_id_satisfies_the_shared_predicate(self):
+        for cluster in _default_topic_guard_clusters():
+            assert is_valid_topic_slug(cluster.topic_id)
+
+    @pytest.mark.parametrize(('value', 'expected', 'why'), _SLUG_CASES)
+    def test_both_consumers_reach_the_same_verdict(self, value, expected, why):
+        """D4's closure property: one namespace, one verdict.
+
+        The memory side (``validate_memory_metadata``'s ``topic`` check) and
+        the config side (``ProceduralTopicCluster.topic_id``) are driven
+        over the SAME table. If they ever disagree on a single value, the
+        namespace has split in two and 3135's auto-seed invariant
+        (``cluster.topic_id == canonical.metadata.topic``) becomes
+        unsatisfiable for that value.
+        """
+        import pydantic
+
+        from fused_memory.config.schema import ProceduralTopicCluster
+        from fused_memory.memory_metadata import validate_memory_metadata
+
+        memory_codes = {
+            v.code
+            for v in validate_memory_metadata({'topic': value}, enforce_kind_registry=False)
+        }
+        memory_accepts = 'invalid_topic_slug' not in memory_codes
+
+        try:
+            ProceduralTopicCluster(topic_id=value, phrases=['a', 'b'])
+            config_accepts = True
+        except pydantic.ValidationError:
+            config_accepts = False
+
+        assert memory_accepts is expected, f'memory side disagreed on {value!r}: {why}'
+        assert config_accepts is expected, f'config side disagreed on {value!r}: {why}'
+
+
+class TestConfigSchemaImportStaysMem0Free:
+    """Regression guard for the measured import cycle (task 3198).
+
+    Reproduced before the fix: a ``config/schema.py`` carrying
+    ``from fused_memory.memory_metadata import TOPIC_SLUG_RE`` raises
+    ``ImportError: cannot import name 'FusedMemoryConfig' from
+    'fused_memory.config.schema'`` — because ``memory_metadata`` imports
+    ``backends.mem0_client``, which imports ``config.schema`` at module
+    scope.
+
+    Without this guard a future refactor could re-inline that import and
+    break config loading for every mem0-less consumer, including
+    ``orchestrator/tests/test_reopen_sticks_e2e.py:58``, which imports
+    ``FusedMemoryConfig`` with no mem0 SDK present.
+    """
+
+    def test_importing_config_schema_pulls_neither_mem0_nor_the_registry(self):
+        probe = (
+            'import sys; from fused_memory.config.schema import FusedMemoryConfig; '
+            "assert 'mem0' not in sys.modules, sorted(k for k in sys.modules if 'mem0' in k); "
+            "assert 'fused_memory.memory_metadata' not in sys.modules; "
+            'from fused_memory.config.schema import ProceduralTopicCluster as C; '
+            "C(topic_id='a-good-slug', phrases=['a', 'b'])"
+        )
+        result = subprocess.run(
+            [sys.executable, '-c', probe], capture_output=True, text=True, timeout=120
+        )
+        assert result.returncode == 0, result.stderr
