@@ -129,7 +129,8 @@ over the code-owned `PLAN_QUALITY_RUBRIC` (`judge.py:297-317`), whose six criter
 weights are `2, 2, 1, 1, 1, 1` — total 8. The deterministic floor's entire reachable
 range is therefore the nine multiples of 1/8: {0.0, 0.125, 0.25, 0.375, 0.5, 0.625,
 0.75, 0.875, 1.0}. The 12 `df_task_18` cells record 0.65, 0.68, 0.71, 0.82, 0.88,
-0.93, 0.94, 0.95, 0.97 — **not one is a multiple of 0.125**, so not one came from the
+0.88, 0.93, 0.93, 0.94, 0.95, 0.95, 0.97 (all twelve, ascending; 0.88, 0.93 and 0.95
+each occur twice) — **not one is a multiple of 0.125**, so not one came from the
 floor. The LLM plan judge must have run and returned a score on all 12. That rules
 out a cap window covering the judge call, since on a cap the runner skips the judge
 and persists the structural floor instead (`runner.py:528-533`). The fixture did not
