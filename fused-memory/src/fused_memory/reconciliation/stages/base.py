@@ -371,6 +371,43 @@ class BaseStage:
         )
         _stats.update(_cite_stats)
 
+        # Write the outcome back to the AUTHORITATIVE recon_report record
+        # (task 2979). verify_cited_memories above mutated the projection
+        # get_assembled_report built — a fresh dict per finding, carrying a NEW
+        # cited_memories list — so without this the durable row keeps the
+        # phantom and the two stores permanently disagree about the same
+        # finding. Keyed on finding_id, which only the RRS-assembled projection
+        # carries; the structured-output JSON fallback has no RRS record to
+        # correct, so those findings are skipped (their correction lives in the
+        # returned StageReport alone, which is all that exists for them).
+        if _active_rrs is not None:
+            _corrections = [
+                {
+                    'finding_id': _item['finding_id'],
+                    'cited_memories': _item.get('cited_memories') or [],
+                    'citation_failures': _item.get('citation_failures') or [],
+                }
+                for _item in _flagged
+                if isinstance(_item, dict) and _item.get('finding_id')
+            ]
+            if _corrections:
+                try:
+                    _active_rrs.apply_citation_verification(run_id, _corrections)
+                except Exception as exc:  # noqa: BLE001
+                    # Degrade to "report is correct, durable record is stale" —
+                    # never to a failed stage. Loud, not silent (the repo's
+                    # loud-over-silent-degradation norm): name the run, stage and
+                    # the findings whose durable citations may now be stale.
+                    logger.warning(
+                        'reconciliation.citation_writeback_failed',
+                        extra={
+                            'run_id': run_id,
+                            'stage': self.stage_id.value,
+                            'finding_ids': [c['finding_id'] for c in _corrections],
+                            'error': repr(exc),
+                        },
+                    )
+
         stage_report = StageReport(
             stage=self.stage_id,
             started_at=started,

@@ -311,6 +311,14 @@ class _Finding:
     # cited entity carries an active decision; defaults None so old persisted
     # rows hydrate round-trip-safe via _Finding(**fd).
     standing_decision_id: str | None = None
+    # Task 2979: markers for cited memories that failed post-assembly
+    # re-verification — {memory_id, store, reason} (plus error_type on a
+    # verification_error). Written by apply_citation_verification, so a phantom
+    # claim is SURFACED rather than silently vanishing when it is stripped from
+    # cited_memories. Defaulted for the same round-trip-safety reason as
+    # standing_decision_id above: rows persisted before this field existed must
+    # still hydrate via _Finding(**fd) with no migration.
+    citation_failures: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -1380,6 +1388,87 @@ class ReconReportState:
 
         return {'status': 'deleted', 'finding_id': finding_id}
 
+    def apply_citation_verification(
+        self, run_id: str, results: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Write a post-assembly citation-verification outcome back to the
+        AUTHORITATIVE findings, then persist once (task 2979).
+
+        Each entry of *results* is
+        ``{'finding_id': str, 'cited_memories': list[dict],
+        'citation_failures': list[dict]}`` — the surviving citations and the
+        failure markers that ``citation_verifier.verify_cited_memories``
+        produced for that finding. ``cited_memories`` REPLACES the finding's
+        list (the verifier returns the kept set, not a delta);
+        ``citation_failures`` is EXTENDED, so markers from an earlier pass are
+        never lost.
+
+        Why this exists: ``get_assembled_report`` builds a fresh dict per
+        finding with ``'cited_memories': list(f.cited_memories)`` — a NEW list
+        object. Verification therefore corrects only that throwaway projection,
+        while the authoritative ``_Finding`` and its durable row (written inside
+        the CLI subprocess at add_finding/cite_memory/complete time, strictly
+        BEFORE verification runs) keep the phantom. Without this write-back the
+        report and the store permanently disagree, and whether a consumer sees
+        the phantom depends on which one it happens to read.
+
+        Findings are resolved via :meth:`_resolve_finding`, so this is
+        cross-stage capable exactly as the ``cite_*`` tools are.
+
+        **Deliberately NOT guarded by ``_ERR_ALREADY_COMPLETED``**, unlike
+        :meth:`delete_finding`. That guard exists to stop an in-flight agent
+        RETRACTING a finding after ``complete()`` cached ``flagged_count`` /
+        ``stats``. This is a harness-side integrity correction that by
+        construction runs after the subprocess has already called
+        ``complete()``, so the guard would reject every legitimate call. It is
+        also strictly narrower than a retraction: it only edits citation lists,
+        never adds or removes a finding, so the cached ``flagged_count`` stays
+        accurate.
+
+        Never raises, and never returns an error for an unresolvable
+        ``run_id``/``finding_id`` — this is a post-hoc hygiene pass, and turning
+        a citation-hygiene miss into a failed reconciliation stage would be a
+        far worse outcome than a stale marker. Skips are logged (WARNING,
+        structured) rather than swallowed silently. Returns
+        ``{'status': 'applied', 'findings_updated': int, 'findings_skipped':
+        int}``.
+        """
+        updated = 0
+        skipped = 0
+        for result in results:
+            finding_id = (result or {}).get('finding_id')
+            if not finding_id:
+                skipped += 1
+                continue
+            resolved = self._resolve_finding(run_id, finding_id)
+            if resolved is None:
+                logger.warning(
+                    'recon_report: apply_citation_verification could not resolve '
+                    'run_id=%r finding_id=%r; skipping (citation correction not '
+                    'applied to the durable record)',
+                    run_id,
+                    finding_id,
+                )
+                skipped += 1
+                continue
+            _owning_entry, finding = resolved
+            finding.cited_memories = list(result.get('cited_memories') or [])
+            failures = result.get('citation_failures') or []
+            if failures:
+                finding.citation_failures.extend(failures)
+            updated += 1
+
+        # One persist for the whole batch — _persist_run upserts every entry of
+        # the run, so a per-finding call would re-write the same rows N times.
+        if updated:
+            self._persist_run(run_id)
+
+        return {
+            'status': 'applied',
+            'findings_updated': updated,
+            'findings_skipped': skipped,
+        }
+
     def set_stat(
         self,
         run_id: str,
@@ -1557,6 +1646,7 @@ class ReconReportState:
                 'cited_memories': list(f.cited_memories),
                 'cited_runs': list(f.cited_runs),  # task-2595
                 'standing_decision_id': f.standing_decision_id,  # task 2897 δ
+                'citation_failures': list(f.citation_failures),  # task 2979
             }
             # Cross-project routing taxonomy guard (task-2453): downgrade an
             # anchor-less cross_project_routing claim before the Fix-1 check
@@ -1632,6 +1722,7 @@ class ReconReportState:
                     'cited_memories': list(f.cited_memories),
                     'cited_runs': list(f.cited_runs),  # task-2595
                     'standing_decision_id': f.standing_decision_id,  # task 2897 δ
+                    'citation_failures': list(f.citation_failures),  # task 2979
                 })
         return results
 
