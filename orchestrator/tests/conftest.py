@@ -754,6 +754,92 @@ def steward_worktree(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def make_steward(tmp_path: Path):
+    """Build a minimal ``TaskSteward`` on a fixture-OWNED, ``tmp_path``-rooted worktree.
+
+    The single steward factory for the orchestrator suite (task 3461 merged
+    ``test_suggestion_triage.py``'s and ``test_workflow_state_machine_boundary.py``'s
+    two near-identical copies).  Lives in conftest.py — rather than
+    ``_orch_helpers.py``, which is scoped to non-fixture helpers — because it
+    must close over ``tmp_path`` to own the worktree directory; ``mock_orch_config``
+    below is the same shape and the precedent for it.
+
+    Worktree ownership: with no ``worktree=`` argument the fixture picks
+    ``tmp_path / 'wt'`` and creates it (plus a ``.task`` subdir), so no caller
+    needs to name a path.  A caller-supplied path is accepted for the
+    two-stewards-in-one-test case.
+
+    Config defaults applied (union of what both former factories set; a caller
+    overrides any of them via ``config_overrides``, applied last):
+      - ``project_root`` = ``tmp_path / 'project'`` (created)
+      - ``steward_lifetime_budget`` = 12.0, ``steward_max_attempts`` = 3
+      - ``steward_max_timeouts_per_escalation`` = 3,
+        ``steward_max_empty_outputs_per_escalation`` = 2
+      - ``suggestion_triage_threshold`` = 10
+      - triage + steward ``models`` / ``budgets`` / ``max_turns`` / ``effort`` / ``backends``
+      - ``escalation.host`` / ``escalation.port``
+
+    The config mock is ``spec_set``'d against ``OrchestratorConfig`` so a typo'd
+    field name raises ``AttributeError`` on both read and write.
+    """
+    def _make(*, worktree: Path | None = None, config_overrides: dict | None = None):
+        from orchestrator.steward import TaskSteward
+
+        if worktree is None:
+            worktree = tmp_path / 'wt'
+        worktree.mkdir(parents=True, exist_ok=True)
+        (worktree / '.task').mkdir(exist_ok=True)
+
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        project_root = tmp_path / 'project'
+        project_root.mkdir(parents=True, exist_ok=True)
+        config.project_root = project_root
+        config.steward_lifetime_budget = 12.0
+        config.steward_max_attempts = 3
+        config.steward_max_timeouts_per_escalation = 3
+        config.steward_max_empty_outputs_per_escalation = 2
+        config.suggestion_triage_threshold = 10
+        config.models.triage = 'sonnet'
+        config.budgets.triage = 2.0
+        config.max_turns.triage = 25
+        config.effort.triage = 'medium'
+        config.backends.triage = 'claude'
+        config.models.steward = 'opus'
+        config.budgets.steward = 5.0
+        config.max_turns.steward = 100
+        config.effort.steward = 'high'
+        config.backends.steward = 'claude'
+        config.escalation.host = '127.0.0.1'
+        config.escalation.port = 8100
+        for k, v in (config_overrides or {}).items():
+            setattr(config, k, v)
+
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-42-1'
+        queue.get_by_task.return_value = []
+        queue.get.return_value = None
+
+        briefing = AsyncMock()
+        briefing.build_steward_initial_prompt = AsyncMock(return_value='initial prompt')
+
+        mcp = MagicMock()
+        mcp.mcp_config_json.return_value = {'mcpServers': {}}
+
+        return TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'desc'},
+            worktree=worktree,
+            config=config,
+            mcp=mcp,
+            escalation_queue=queue,
+            briefing=briefing,
+            usage_gate=None,
+        )
+
+    return _make
+
+
+@pytest.fixture
 def mock_orch_config(tmp_path: Path) -> MagicMock:
     """Return a MagicMock OrchestratorConfig with the standard harness defaults pre-applied.
 
