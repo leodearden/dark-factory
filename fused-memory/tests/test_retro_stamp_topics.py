@@ -16,6 +16,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -582,7 +583,13 @@ LIVE_REIFY_PROSE_SUPERSEDES = {
 }
 
 
-def _only(plans: list) -> object:
+def _only(plans: list) -> Any:
+    """The single plan in *plans*.
+
+    Returns ``Any``, not ``object``: the subject module is loaded by path at
+    runtime, so its ``ClusterPlan`` has no statically-visible type here and
+    every ``plan.topic`` read would be an attribute error on ``object``.
+    """
     assert len(plans) == 1, f'expected exactly one plan, got {plans!r}'
     return plans[0]
 

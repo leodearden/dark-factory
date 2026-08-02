@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import importlib.util
 import json
 import re
@@ -142,13 +143,23 @@ TOPIC_REGISTRY_PATH = str(
 _PROBE_SCRIPT_PATH = _PACKAGE_ROOT / 'scripts' / 'memory_eval_retrieval_probe.py'
 
 
+@functools.cache
 def _load_probe_module() -> types.ModuleType:
     """Load ``memory_eval_retrieval_probe`` by path.
 
     ``scripts/`` is not a package, so a plain import cannot reach it — the
     same importlib idiom this script's own tests use to reach this script.
-    Cached in ``sys.modules`` so repeat calls return the same module (and
-    therefore the same class objects, which the reuse assertions depend on).
+
+    Memoized on THIS function, not merely in ``sys.modules``: repeat calls
+    must return the same module object the aliases below were bound from,
+    and ``sys.modules`` is a shared slot any other by-path loader of the
+    same script may overwrite with a freshly executed module (the probe's
+    own test module does exactly that).  Reading the slot on every call
+    would then hand back a module whose ``RegistryEntry`` is a *different
+    class object* than the one this module re-exports — silently breaking
+    any ``isinstance`` check across the seam.  ``sys.modules`` is still
+    consulted for the FIRST resolution so an already-imported probe is not
+    executed twice.
     """
     mod_name = 'memory_eval_retrieval_probe'
     cached = sys.modules.get(mod_name)
