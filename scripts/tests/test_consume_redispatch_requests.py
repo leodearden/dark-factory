@@ -534,9 +534,14 @@ def test_an_unparsed_text_payload_is_read_as_a_rejection_not_a_success():
     That shape is what a bare error string looks like coming back, so treating
     it as a success (no `error` key, no `success: False`) would count a failed
     write as applied and archive the request."""
-    assert crr.rejection_reason({'_raw': 'Input validation error: nope'}) is not None
-    assert 'Input validation error' in crr.rejection_reason(
-        {'_raw': 'Input validation error: nope'})
+    # Bound once: rejection_reason returns str | None, and the not-None
+    # assertion below only narrows the value it is applied to — a second,
+    # separate call is a fresh Optional as far as the type checker is
+    # concerned. Binding also makes the two assertions talk about one result
+    # rather than two independent invocations.
+    reason = crr.rejection_reason({'_raw': 'Input validation error: nope'})
+    assert reason is not None
+    assert 'Input validation error' in reason
     # The shapes that really are successes stay successes.
     assert crr.rejection_reason({'success': True}) is None
     assert crr.rejection_reason({'success': True, 'no_op': True}) is None
@@ -705,6 +710,7 @@ def test_guard_proceeds_on_an_unchanged_in_scope_row(requests_dir):
     client = RecordingClient({5321: _row('blocked')})
     row, skip = _confirm(client, req)
     assert skip is None
+    assert row is not None  # the row is None exactly when skip is not
     assert row['status'] == 'blocked'
     assert client.tools_called == ['get_task']
 

@@ -19,6 +19,7 @@ import logging
 import subprocess
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1956,7 +1957,10 @@ class TestRunNightlyRecordsTrickleState:
         else:
             projects_root.mkdir(parents=True, exist_ok=True)
 
-        kwargs = dict(
+        # Annotated: a heterogeneous dict (Paths, a date, a datetime, injected
+        # callables, None) whose inferred value union would otherwise be
+        # re-reported once per union member at the run_nightly(**kwargs) call.
+        kwargs: dict[str, Any] = dict(
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),

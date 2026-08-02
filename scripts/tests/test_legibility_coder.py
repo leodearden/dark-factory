@@ -328,6 +328,10 @@ def test_code_digest_happy_path_success(tmp_path):
     )
 
     assert result.ok is True
+    # result.record is Optional on the CodingResult — an unparseable or
+    # schema-invalid coding record is SKIPPED and leaves it None. ok is True
+    # here, so it is populated; narrowed rather than subscripted blind.
+    assert result.record is not None
     assert result.record["session"] == meta["session"]
     assert result.record["date"] == meta["date"]
     assert result.record["agent_class"] == meta["agent_class"]
