@@ -12245,3 +12245,95 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
     assert r2 is not None and r2['status'] == 'created', r2
     assert r2['task_id'] == '77', r2
     assert taskmaster.add_task.await_count == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-3126 step-10 RED: a refusal must not be bypassable by submitting the
+# SAME candidate twice in one batch.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _real_blocklist_curator(tmp_path):
+    """A REAL TaskCurator wired to a tmp_path blocklist YAML.
+
+    A mock curator would bypass ``curate_batch_prepared``'s pre-batch
+    payload_hash dedup — the very code under test — so this test needs the real
+    thing. Only ``prepare_candidate`` (corpus assembly, not under test) is
+    stubbed, to keep the test hermetic and off the network.
+    """
+    import yaml
+    from fused_memory.middleware.task_curator import PreparedCandidate, TaskCurator
+
+    blocklist = tmp_path / 'e2e_blocklist.yaml'
+    blocklist.write_text(
+        yaml.dump([{
+            'name': 'fixc_flag_marker_search_then_delete',
+            'reason': 'premise reverted by ae58a59d81f1',
+            'title_substrings': ['search-then-delete', 'fix c'],
+            'description_substrings': ['fixc_flags_deleted_not_found'],
+        }]),
+        encoding='utf-8',
+    )
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(
+        enabled=True, cancelled_premise_blocklist_path=str(blocklist),
+    )
+    curator = TaskCurator(config=cfg, taskmaster=None)
+
+    async def _prepare(candidate, project_id, project_root):
+        return PreparedCandidate(
+            candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0,
+        )
+
+    curator.prepare_candidate = AsyncMock(side_effect=_prepare)
+    return curator
+
+
+@pytest.mark.asyncio
+async def test_identical_blocklisted_duplicates_in_one_batch_create_nothing(
+    curator_interceptor, taskmaster, tmp_path,
+):
+    """Two BYTE-IDENTICAL blocklisted candidates in one batch must BOTH refuse.
+
+    The pre-batch payload_hash dedup runs before the blocklist guard, so the
+    duplicate was never checked and carried a synthetic batch_target_index drop.
+    At dispatch that drop resolved against a sibling with task_id=None (a
+    refusal creates nothing), took the 'sibling failed' branch and degraded to
+    create — filing the very dead-premise task the guard had just refused. Net
+    effect was identical to the pre-fix bug.
+    """
+    store = curator_interceptor._ticket_store
+
+    payload = json.dumps({
+        'project_root': '/project',
+        'kwargs': {
+            'title': 'Convert FIX C relay-flag deletion: search-then-delete',
+            'description': 'Metric fixc_flags_deleted_not_found is not tracked.',
+        },
+        'metadata': None,
+    })
+    # Byte-identical payloads → identical payload_hash → the dedup path.
+    t1 = await store.submit('project', payload)
+    t2 = await store.submit('project', payload)
+
+    curator = _real_blocklist_curator(tmp_path)
+    taskmaster.add_task = AsyncMock(return_value={'id': '99', 'title': 'x'})
+
+    with patch.object(
+        type(curator_interceptor), '_get_curator',
+        new=AsyncMock(return_value=curator),
+    ), patch.object(
+        type(curator_interceptor), '_ensure_taskmaster',
+        new=AsyncMock(return_value=taskmaster),
+    ):
+        await curator_interceptor._process_add_tickets_batch([t1, t2])
+
+    # THE HEADLINE ASSERTION: a refused dead-premise candidate is never filed,
+    # no matter how many byte-identical copies land in the same batch.
+    taskmaster.add_task.assert_not_awaited()
+
+    for tid in (t1, t2):
+        row = await store.get(tid)
+        assert row is not None and row['status'] == 'refused', (tid, row)
+        assert row['task_id'] is None, (tid, row)
+        assert 'cancelled-premise-blocklist:' in (row['reason'] or ''), (tid, row)
