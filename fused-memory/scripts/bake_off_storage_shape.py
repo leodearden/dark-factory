@@ -970,10 +970,16 @@ def apply_topic_anchor(
     discoverability feature into a write-guard regression.
 
     Pinned canonicals are appended after the original ranking rather than
-    promoted to the front.  Appending is the conservative choice: it cannot
-    flatter the pin on any rank-based metric, so a measured improvement is
-    attributable to the canonical becoming *reachable at all* rather than to
-    the transform having hand-placed it high.
+    promoted to the front, so a measured improvement is attributable to the
+    canonical becoming *reachable at all* rather than to the transform having
+    hand-placed it high.
+
+    Appending alone does NOT make that guarantee, though — what enforces it is
+    :func:`read_path`'s post-transform truncation at *k*.  Without it an
+    appended record simply widens the window, and every rank-based metric
+    improves because the variant was handed an extra result.  This function
+    stays additive-and-never-subtractive per PRD D1; the window budget is the
+    reader's, and it is enforced at the read path.
 
     Returns the input list unchanged (same contents, same order) when nothing
     is pinnable — the pin is not a rewrite.
@@ -1686,6 +1692,10 @@ ARM_VARIANTS: tuple[str, ...] = tuple(
 #: completeness check and the renderer, so a metric cannot be validated into
 #: the JSON and then quietly dropped from the table.
 _REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
+    # Both halves: "was the pin on?" and "did it change anything?".  Two
+    # identical rows are ambiguous without the second — "the pin is useless"
+    # and "the pin never fired" are different findings.
+    'pin': ('enabled', 'window_changed_rate'),
     'claim_recall': ('at_5', 'at_10'),
     'discoverability': ('canonical_in_top_5_rate',),
     'tokens_per_query': ('mean', 'estimator'),
@@ -1714,6 +1724,9 @@ DECISION_TABLE_COLUMNS: tuple[str, ...] = (
     'tokens/query',
     'guard candidate present',
     'guard matched (replay)',
+    # Reads the other columns for you: a +pin row identical to its twin is
+    # "the pin never fired" when this is 0.00, not "the pin is useless".
+    'pin changed window',
 )
 
 #: Rendered for a measurement that is None.  Deliberately NOT '0.00': the
@@ -1901,6 +1914,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         '',
         'A `—` cell is **no measurement**, not a measured zero.',
         '',
+        '`pin changed window` is the diagnostic that makes the `+pin` rows '
+        'readable.  Every variant is scored over a window of the SAME size '
+        '(k), so an additive pin can only pay off where a read-side transform '
+        'left headroom in that budget — under grouping, which collapses the '
+        'window.  A `+pin` row identical to its twin at `0.00` means the pin '
+        'never fired, which is a different finding from "the pin does not '
+        'help".  `—` on a pin-off row means the question was never asked.',
+        '',
         '## Decision table',
         '',
         '| ' + ' | '.join(DECISION_TABLE_COLUMNS) + ' |',
@@ -1919,6 +1940,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             _cell(measurement['tokens_per_query']['mean'], precision=1),
             _cell(guard['candidate_present_rate']),
             _cell(guard['guard_matched_rate']),
+            _cell(measurement['pin']['window_changed_rate']),
         ]) + ' |')
 
     lines += [
@@ -2362,10 +2384,22 @@ def read_path(
 ) -> list[ArmRecord]:
     """What a reader of this arm variant actually receives for a top-*k* fetch.
 
-    Truncation happens BEFORE the transforms, because that is the order
-    production runs in: the store returns k, and the read-side transforms act
-    on what came back.  Transforming first would let a record the store never
-    returned into the window.
+    Truncated TWICE, and both truncations are load-bearing.
+
+    BEFORE the transforms, because that is the order production runs in: the
+    store returns k, and the read-side transforms act on what came back.
+    Transforming first would let a record the store never returned into the
+    window.
+
+    AFTER them, because *k* is the READER's budget and pin-on/pin-off have to
+    be scored over equal-size windows.  ``apply_topic_anchor`` is additive, so
+    without this an arm variant would be measured over k+1 records and its
+    every column would improve for having been handed an extra result — a
+    "win" that says nothing about the storage shape.  With it, an append-only
+    pin can only pay off where a read-side transform left HEADROOM in the
+    budget.  Grouping, which SHRINKS the window, is untouched: a collapsed
+    window stays short (its legitimate token win) and a canonical pinned into
+    the slot grouping freed survives.
     """
     records = [hit.record for hit in hits[:k]]
     if seeded.shape == 'b_grouped':
@@ -2374,7 +2408,7 @@ def read_path(
         )
     if pin:
         records = apply_topic_anchor(records, seeded.canonical_by_topic)
-    return records
+    return records[:k]
 
 
 def rescore(transformed: list[ArmRecord], hits: list[ScoredHit]) -> list[ScoredHit]:
@@ -2432,44 +2466,67 @@ def measure_arm(
     estimator: tuple[str, Any],
     guard_threshold: float,
 ) -> dict[str, Any]:
-    """The four E2 metrics for one arm variant.  Pure — no store, no await."""
+    """The E2 metrics for one arm variant.  Pure — no store, no await.
+
+    Every metric is scored at the LITERAL k, never at ``len(window)``.  The
+    window a reader receives is capped at k by :func:`read_path`, and scoring
+    at its length would hand an append-only pin a wider budget than its
+    pin-off twin — see that function for the full rationale.
+
+    The ``pin`` block reports whether the pin was enabled and, when it was,
+    the fraction of measured read windows it actually changed.  Without it two
+    identical rows read as "the pin is useless" when the honest statement may
+    be "the pin never fired": at a full window an additive pin has nowhere to
+    put anything.  It is ``None`` when the pin is off — the question was never
+    asked, and a 0.0 would claim it was asked and answered.
+    """
     recall_5: list[float | None] = []
     recall_10: list[float | None] = []
     canonical_in_5: list[float | None] = []
     canonical_ranks: list[int] = []
     token_counts: list[float | None] = []
+    #: Every read window this arm was measured over, pin-on vs pin-off.  Both
+    #: query windows AND the guard probe window: a pin that fires only on a
+    #: probe still moves the guard column, and a diagnostic that missed it
+    #: would say "nothing changed" next to a column that did.
+    windows_compared = 0
+    windows_changed = 0
+
+    def _window(hits: list[ScoredHit], k: int) -> list[ArmRecord]:
+        """One read window, plus its pin-off counterfactual when pin is on."""
+        nonlocal windows_compared, windows_changed
+        records = read_path(seeded, hits, k, pin=pin)
+        if pin:
+            baseline = read_path(seeded, hits, k, pin=False)
+            windows_compared += 1
+            if [r.record_id for r in records] != [r.record_id for r in baseline]:
+                windows_changed += 1
+        return records
 
     for query in queries:
         hits = fetched['queries'][query.query_id]
-        top_5 = read_path(seeded, hits, 5, pin=pin)
-        top_10 = read_path(seeded, hits, 10, pin=pin)
+        top_5 = _window(hits, 5)
+        top_10 = _window(hits, 10)
 
-        # k = len(window): the window IS what the reader receives.  Grouping
-        # collapses it, the pin appends to it — and both of those changes are
-        # exactly the shape difference under measurement.
-        recall_5.append(claim_recall_at_k(top_5, query.expects_claim_ids, len(top_5)))
-        recall_10.append(claim_recall_at_k(top_10, query.expects_claim_ids, len(top_10)))
+        recall_5.append(claim_recall_at_k(top_5, query.expects_claim_ids, 5))
+        recall_10.append(claim_recall_at_k(top_10, query.expects_claim_ids, 10))
 
         canonical_id = seeded.canonical_by_cluster.get(query.cluster_id)
         if canonical_id is not None:
-            found = topic_discoverability(
-                top_5, query.topic, canonical_id, len(top_5),
-            )
+            found = topic_discoverability(top_5, query.topic, canonical_id, 5)
             canonical_in_5.append(1.0 if found['canonical_in_top_k'] else 0.0)
             if found['canonical_rank'] is not None:
                 canonical_ranks.append(found['canonical_rank'])
         else:
             canonical_in_5.append(None)
 
-        token_counts.append(float(
-            tokens_returned(top_10, len(top_10), estimator)['tokens']
-        ))
+        token_counts.append(float(tokens_returned(top_10, 10, estimator)['tokens']))
 
     candidate_present: list[float | None] = []
     guard_matched: list[float | None] = []
     for cluster_id, _probe in probes:
         probe_hits = fetched['probes'][cluster_id]
-        window = read_path(seeded, probe_hits, GUARD_TOP_K, pin=pin)
+        window = _window(probe_hits, GUARD_TOP_K)
         verdict = guard_adequacy(
             rescore(window, probe_hits),
             seeded.siblings_by_cluster.get(cluster_id, set()),
@@ -2485,6 +2542,12 @@ def measure_arm(
         median_rank = float(statistics.median(canonical_ranks))
 
     return {
+        'pin': {
+            'enabled': pin,
+            'window_changed_rate': (
+                _rate(windows_changed, windows_compared) if pin else None
+            ),
+        },
         'claim_recall': {'at_5': _mean(recall_5), 'at_10': _mean(recall_10)},
         'discoverability': {
             'canonical_in_top_5_rate': _mean(canonical_in_5),
