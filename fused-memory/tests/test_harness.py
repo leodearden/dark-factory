@@ -2296,10 +2296,10 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
     """run_loop() must skip run_full_cycle for projects that are halted by the judge.
 
     Bug 3: judge.is_halted() is never called in run_loop, so halted projects keep
-    processing new cycles.  This test drives one run_loop iteration via a short
-    asyncio.wait_for and confirms run_full_cycle is never called for a halted project.
+    processing new cycles.  This test drives run_loop until the halt-SKIP branch
+    is observed (see _patch_halt_skip_witness) and confirms run_full_cycle is never
+    called for a halted project.
     """
-    import asyncio
     from unittest.mock import AsyncMock, patch
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
@@ -2340,12 +2340,16 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    with (
-        patch.object(harness, 'run_full_cycle', side_effect=spy_rfc),
-        contextlib.suppress(TimeoutError),
-    ):
-        # Run loop for one sleep cycle (loop sleeps 5s; we wait 0.2s — enough for 1 iteration)
-        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+    # Positive witness for the halt-SKIP branch — see _patch_halt_skip_witness.
+    skipped = _patch_halt_skip_witness(harness)
+
+    with patch.object(harness, 'run_full_cycle', side_effect=spy_rfc):
+        await _drive_run_loop_until(harness, skipped)
+
+    assert skipped.is_set(), (
+        'halt check never reached — the run_full_cycle absence assertion below '
+        'would pass vacuously'
+    )
 
     # For a halted project, run_full_cycle must NOT have been called
     assert len(run_full_cycle_called) == 0, (
@@ -2580,6 +2584,50 @@ async def _drive_run_loop_until(harness, *events, timeout: float = 10.0):
             await loop_task
 
 
+def _witness_call(func):
+    """Return ``(wrapper, event)``: an async *wrapper* delegating to *func*
+    that sets *event* in a ``finally``, once the real callee has RETURNED.
+
+    Pair with _drive_run_loop_until to wait on a real call COMPLETING rather
+    than on a wall-clock budget. The set-after-the-await ordering is
+    load-bearing, not stylistic: the drive cancels run_loop the instant every
+    event fires, so any state the callee commits after its own inner awaits
+    would race the caller's assertions if the event were set any earlier. The
+    canonical trap is Judge.consume_grace_cycle, which assigns
+    _unhalt_grace_remaining only AFTER awaiting journal.decrement_unhalt_grace:
+    a witness on that inner journal call can be cancelled between the two, so
+    the outer call is the layer to wrap. Delegating rather than replacing also
+    keeps the real behaviour under test.
+
+    Prefer _witness when the callee is an attribute that can be patched in
+    place; this lower-level form exists for callables handed straight to
+    ``patch.object(..., side_effect=...)``, which have no owner to patch.
+    """
+    fired = asyncio.Event()
+
+    async def _signal(*a, **k):
+        try:
+            return await func(*a, **k)
+        finally:
+            fired.set()
+
+    return _signal, fired
+
+
+def _witness(owner, attr: str) -> asyncio.Event:
+    """Replace ``owner.attr`` with an AsyncMock delegating to the real
+    attribute, and return an Event set once that real call has completed.
+
+    The installed mock stays reachable as ``getattr(owner, attr)``, so a caller
+    that also asserts on call/await args reads it back from the owner rather
+    than binding a second name. See _witness_call for why the Event is set
+    after the await, and for the ``patch.object`` variant.
+    """
+    wrapper, fired = _witness_call(getattr(owner, attr))
+    setattr(owner, attr, AsyncMock(side_effect=wrapper))
+    return fired
+
+
 async def _drive_halt_notify(harness, event_buffer, timeout: float = 10.0):
     """Drive run_loop for a pre-halted project until the halt-check branch
     (which calls _notify_judge_halt) has fired, then cancel the loop. Mirrors
@@ -2605,6 +2653,30 @@ async def _drive_halt_notify(harness, event_buffer, timeout: float = 10.0):
     on_judge_halt.side_effect = _signal_halt
 
     await _drive_run_loop_until(harness, halted, timeout=timeout)
+
+
+def _patch_halt_skip_witness(harness) -> asyncio.Event:
+    """Patch harness._notify_judge_halt with a witness (see _witness) and
+    return an Event set once the halt-SKIP branch has actually fired.
+
+    _notify_judge_halt is that branch's observable signature: the else-branch
+    of _project_loop's halt check ("Skipping cycle for halted project") awaits
+    it immediately before returning, and it is still CALLED when
+    _backlog_policy is None — its `if self._backlog_policy is None` guard
+    early-returns internally. So it is a valid witness for the pure-negative
+    halt tests, none of which wire a backlog policy.
+
+    Those tests assert only ABSENCES (run_full_cycle not called, unhalt not
+    awaited). An absence assertion is satisfied both by "the code correctly
+    declined" and by "the loop never got there" — so each caller pairs this
+    witness with an explicit `assert skipped.is_set()`. Without it, driving via
+    _drive_run_loop_until with no events would return immediately with nothing
+    to wait on, making that vacuity permanent and silent. It is also exactly
+    the descriptive caller-side assertion _drive_run_loop_until's docstring
+    anticipates, since that helper suppresses its own backstop TimeoutError and
+    falls through to the caller.
+    """
+    return _witness(harness, '_notify_judge_halt')
 
 
 @pytest.mark.asyncio
@@ -2830,7 +2902,6 @@ class TestNotifyJudgeHaltDedupeToken:
 @pytest.mark.asyncio
 async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_memory_service):
     """_project_loop decrements post-unhalt grace before running a cycle."""
-    import asyncio
     from unittest.mock import AsyncMock, patch
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
@@ -2840,6 +2911,14 @@ async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_me
     harness.judge._unhalt_grace_remaining['test-project'] = 2
     # The journal mock should return decremented values
     harness.journal.decrement_unhalt_grace = AsyncMock(return_value=1)
+
+    # Witness for the drive below. It MUST hang off consume_grace_cycle rather
+    # than the journal.decrement_unhalt_grace mock above, because
+    # consume_grace_cycle assigns self._unhalt_grace_remaining[project_id] only
+    # AFTER awaiting the journal — wrapping the inner call would make the
+    # `== 1` assertion below a coin flip. See _witness_call's docstring, which
+    # records that ordering rule (this site is its worked example).
+    consumed = _witness(harness.judge, 'consume_grace_cycle')
 
     for _ in range(3):
         await event_buffer.push(_make_event())
@@ -2861,11 +2940,8 @@ async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_me
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    with (
-        patch.object(harness, 'run_full_cycle', side_effect=fake_rfc),
-        contextlib.suppress(TimeoutError),
-    ):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.5)
+    with patch.object(harness, 'run_full_cycle', side_effect=fake_rfc):
+        await _drive_run_loop_until(harness, consumed)
 
     harness.journal.decrement_unhalt_grace.assert_awaited()
     assert harness.judge.unhalt_grace_remaining('test-project') == 1
@@ -2906,9 +2982,19 @@ async def test_auto_unhalt_resumes_after_cooldown_expiry(
     harness.judge._halt_cooldown_until['test-project'] = (
         datetime.now(UTC) - timedelta(hours=1)  # expired
     )
-    # Spy on unhalt while preserving real behaviour (clears halt, seeds grace).
-    unhalt_spy = AsyncMock(side_effect=harness.judge.unhalt)
-    harness.judge.unhalt = unhalt_spy
+    # Spy on unhalt while preserving real behaviour (clears halt, seeds grace);
+    # _witness fires only after the real unhalt returns, so the state the
+    # assertions read (is_halted cleared) is committed before the drive cancels
+    # the loop. Read the installed mock back off the judge — its await_args are
+    # recorded independently of the wrapper's *a signature.
+    unhalted = _witness(harness.judge, 'unhalt')
+    unhalt_spy: AsyncMock = harness.judge.unhalt  # type: ignore[assignment]
+
+    # Wrap (never edit) the shared _fake_completed_cycle — sites 4/5/6 reuse it
+    # and two of them assert rfc_mock.assert_not_awaited(). _witness_call rather
+    # than _witness: this callable is handed to patch.object below, so there is
+    # no owner attribute to patch in place.
+    _signal_cycle, cycled = _witness_call(_fake_completed_cycle)
 
     for _ in range(3):
         await event_buffer.push(_make_event())
@@ -2917,13 +3003,14 @@ async def test_auto_unhalt_resumes_after_cooldown_expiry(
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    with (
-        patch.object(
-            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
-        ) as rfc_mock,
-        contextlib.suppress(TimeoutError),
-    ):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.5)
+    # Both events are named even though `cycled` strictly implies `unhalted`
+    # (the auto-unhalt branch precedes the fall-through cycle): keeping the
+    # witness set in one-to-one correspondence with the assertion set is what
+    # makes a future assertion edit obviously require a witness edit.
+    with patch.object(
+        harness, 'run_full_cycle', side_effect=_signal_cycle,
+    ) as rfc_mock:
+        await _drive_run_loop_until(harness, unhalted, cycled)
 
     unhalt_spy.assert_awaited()
     assert unhalt_spy.await_args is not None
@@ -2956,14 +3043,21 @@ async def test_no_auto_unhalt_when_disabled(
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    with (
-        patch.object(
-            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
-        ) as rfc_mock,
-        contextlib.suppress(TimeoutError),
-    ):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+    # Positive witness for the halt-SKIP branch — see _patch_halt_skip_witness.
+    skipped = _patch_halt_skip_witness(harness)
 
+    with patch.object(
+        harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+    ) as rfc_mock:
+        await _drive_run_loop_until(harness, skipped)
+
+    # FIRST, ahead of the absence assertions: proves auto_resume_pending was
+    # actually evaluated and returned False, turning 'unhalt was not awaited'
+    # from 'we never got there' into 'we got there and correctly declined'.
+    assert skipped.is_set(), (
+        'halt-skip branch never reached — the assertions below would pass '
+        'vacuously'
+    )
     unhalt_spy.assert_not_awaited()
     rfc_mock.assert_not_awaited()
     assert harness.judge.is_halted('test-project')  # still halted
@@ -2993,14 +3087,21 @@ async def test_no_auto_unhalt_before_cooldown_expiry(
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    with (
-        patch.object(
-            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
-        ) as rfc_mock,
-        contextlib.suppress(TimeoutError),
-    ):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+    # Positive witness for the halt-SKIP branch — see _patch_halt_skip_witness.
+    skipped = _patch_halt_skip_witness(harness)
 
+    with patch.object(
+        harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+    ) as rfc_mock:
+        await _drive_run_loop_until(harness, skipped)
+
+    # FIRST, ahead of the absence assertions: proves cooldown_expired was
+    # actually evaluated and returned False, turning 'unhalt was not awaited'
+    # from 'we never got there' into 'we got there and correctly declined'.
+    assert skipped.is_set(), (
+        'halt-skip branch never reached — the assertions below would pass '
+        'vacuously'
+    )
     unhalt_spy.assert_not_awaited()
     rfc_mock.assert_not_awaited()
     assert harness.judge.is_halted('test-project')
@@ -3037,19 +3138,25 @@ async def test_auto_unhalt_seeds_grace_and_rehalt_reescalates(
     )
 
     # Capture the grace counter at the instant the auto path calls judge.unhalt,
-    # BEFORE the resumed cycles consume it down — so assertion (1) isolates the
-    # SEEDING performed by the auto path from later per-cycle consumption (the
-    # driven loop spins several cycles because the mocked run_full_cycle never
-    # drains the buffer, so a post-loop read would race that consumption to 0).
+    # BEFORE any resumed cycle consumes it down — so assertion (1) isolates the
+    # SEEDING performed by the auto path from later per-cycle consumption,
+    # independently of how far the drive below happens to get. (Bespoke rather
+    # than _witness: this witness must RECORD state before it fires, not merely
+    # fire after the real callee returns.)
     grace_at_unhalt: dict[str, int] = {}
     # Bind the bound methods here (harness.judge is narrowed non-None by the
     # assert above) so the closure captures them already-narrowed.
     real_unhalt = harness.judge.unhalt
     grace_remaining = harness.judge.unhalt_grace_remaining
+    unhalted = asyncio.Event()
 
     async def _capture_grace(pid):
         await real_unhalt(pid)  # real unhalt seeds grace + clears _halt_escalated
         grace_at_unhalt[pid] = grace_remaining(pid)
+        # Witness LAST, strictly after the capture above is recorded: the drive
+        # cancels run_loop as soon as this fires, so setting it any earlier
+        # would race assertion (1) against the capture.
+        unhalted.set()
 
     unhalt_mock = AsyncMock(side_effect=_capture_grace)
     harness.judge.unhalt = unhalt_mock
@@ -3061,16 +3168,12 @@ async def test_auto_unhalt_seeds_grace_and_rehalt_reescalates(
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    with (
-        patch.object(
-            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
-        ),
-        contextlib.suppress(TimeoutError),
+    with patch.object(
+        harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
     ):
-        # 1.0s (vs the sibling tests' 0.5s) gives the driven loop extra headroom
-        # to reach the auto-unhalt branch under parallel-suite load, so a timing
-        # miss can't masquerade as a grace/sentinel regression.
-        await asyncio.wait_for(harness.run_loop(), timeout=1.0)
+        # Driven until the auto-unhalt branch has actually captured grace, so a
+        # timing miss is impossible by construction rather than by budget tuning.
+        await _drive_run_loop_until(harness, unhalted)
 
     # Precondition: the auto-unhalt branch actually fired (distinguishes a real
     # grace/sentinel regression below from a mere timing miss reaching the branch).
@@ -3085,6 +3188,10 @@ async def test_auto_unhalt_seeds_grace_and_rehalt_reescalates(
     # (2) The unhalt callback cleared the _halt_escalated sentinel — the auto
     # path did NOT re-escalate itself (skip branch was bypassed)...
     assert 'test-project' not in harness._halt_escalated
+    # The observation window for this absence is now one halt-check pass (the
+    # drive stops at the first unhalt) rather than a wall-clock budget's worth
+    # of cycles. Sufficient: the claim is that the AUTO path does not
+    # re-escalate, and the skip branch it must bypass sits on that same pass.
     harness._backlog_policy.on_judge_halt.assert_not_called()
 
     # ...so if the judge re-halts (still-sick pipeline), the halt re-escalates
@@ -5419,8 +5526,12 @@ async def test_run_loop_releases_stale_claims_on_startup(
     released unconditionally.  The per-project reconciliation lock guarantees
     at most one active replayer per project, so there is nothing to race with at
     startup before any project loop has spawned.
+
+    Drives run_loop via _drive_run_loop_until, waiting on the OBSERVABLE EVENT
+    the assertion below checks (the startup release ran) rather than budgeting
+    run_loop's startup path inside a fixed wall-clock wait_for — see that
+    helper's docstring for the full rationale.
     """
-    import asyncio
     from unittest.mock import AsyncMock
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
@@ -5434,17 +5545,19 @@ async def test_run_loop_releases_stale_claims_on_startup(
     if harness.judge is not None:
         harness.judge.initialize = AsyncMock()
 
-    # Spy on release_stale_claims: side_effect passes through to the real method,
-    # so return_value is intentionally omitted (side_effect takes precedence).
-    original_release = event_buffer.release_stale_claims
-    harness.buffer.release_stale_claims = AsyncMock(side_effect=original_release)
+    # Spy on release_stale_claims. _witness delegates to the real method (so the
+    # behaviour under test is preserved) and fires only once that release has
+    # COMPLETED — strictly stronger than the call-recorded assertion at the
+    # bottom of this test. harness.buffer IS the event_buffer fixture, so this
+    # wraps the same real bound method the harness will call.
+    released = _witness(harness.buffer, 'release_stale_claims')
+    release_spy: AsyncMock = harness.buffer.release_stale_claims  # type: ignore[assignment]
 
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+    await _drive_run_loop_until(harness, released)
 
     # Must be called exactly once (startup, not per loop iteration)
     # Cutoff must be 0 so even a freshly-claimed row is re-queued on fast restart.
-    harness.buffer.release_stale_claims.assert_called_once_with(0.0)
+    release_spy.assert_called_once_with(0.0)
 
 
 @pytest.mark.asyncio
@@ -5527,29 +5640,44 @@ async def test_run_loop_recovers_predecessor_runs_once_at_startup_before_reaper_
     """run_loop() must invoke _recover_predecessor_runs() exactly once at
     startup, before the periodic _recover_stale_runs ticks — and a raised
     exception from it must not crash run_loop (task 2711 / E6).
+
+    Drives run_loop via _drive_run_loop_until, waiting on the OBSERVABLE EVENTS
+    the assertions below actually check (the predecessor pass ran; stale ticked
+    twice) rather than budgeting the whole startup path inside a fixed
+    wall-clock wait_for — see that helper's docstring for the full rationale.
     """
     real_sleep = asyncio.sleep
 
     async def fast_sleep(seconds: float) -> None:
         await real_sleep(0)
 
-    # Patch the module-local _sleep binding so many loop iterations execute
-    # within the wait_for() window below (same technique as
-    # test_main_loop_does_not_emit_drain_progress_after_idle_drain).
+    # Patch the module-local _sleep binding: _drive_run_loop_until removes the
+    # wall-clock BUDGET but not the real ~5s _sleep ending each run_loop
+    # iteration. The _recover_stale_runs.call_count >= 2 assertion below needs
+    # multiple iterations, so without fast_sleep the two-tick witness would
+    # take ~10s and collide with the helper's 10s deadlock backstop.
     monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     call_order = []
+    predecessor_event = asyncio.Event()
+    stale_event = asyncio.Event()
 
     async def predecessor_side_effect():
         call_order.append('predecessor')
+        predecessor_event.set()
         # Raise on every call (there should only ever be one) to prove the
-        # startup try/except guard keeps run_loop alive.
+        # startup try/except guard keeps run_loop alive. The event is set
+        # BEFORE the raise so the deliberate startup exception still exercises
+        # the try/except guard rather than stalling the drive below.
         raise RuntimeError('boom — simulated predecessor-recovery failure')
 
     async def stale_runs_side_effect():
         call_order.append('stale')
+        # Gate on >= 2 to match the reaper-tick assertion at the bottom exactly.
+        if call_order.count('stale') >= 2:
+            stale_event.set()
 
     harness._recover_predecessor_runs = AsyncMock(side_effect=predecessor_side_effect)
     harness._recover_stale_runs = AsyncMock(side_effect=stale_runs_side_effect)
@@ -5561,8 +5689,7 @@ async def test_run_loop_recovers_predecessor_runs_once_at_startup_before_reaper_
     if harness.judge is not None:
         harness.judge.initialize = AsyncMock()
 
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+    await _drive_run_loop_until(harness, predecessor_event, stale_event)
 
     # Startup pass ran exactly once, despite raising — not once per iteration.
     assert harness._recover_predecessor_runs.call_count == 1, (
@@ -8305,8 +8432,10 @@ class TestHarnessDrainIdleShortCircuit:
         active).
 
         We patch the module-local _sleep to yield immediately so the loop body runs
-        many iterations within the 0.2 s window, maximising the chance of catching
-        spurious emissions.
+        many iterations quickly, maximising the chance of catching spurious
+        emissions.  The loop is driven by _drive_run_loop_until, waiting on the
+        OBSERVABLE EVENT the non-vacuity guard below checks (MIN_ITERATIONS reaper
+        ticks) rather than a fixed wall-clock window — see that helper's docstring.
         """
         real_sleep = asyncio.sleep
 
@@ -8319,8 +8448,31 @@ class TestHarnessDrainIdleShortCircuit:
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
-        # Stub side-effect dependencies so the loop body runs without network calls
-        harness._recover_stale_runs = AsyncMock(return_value=None)
+        # How many loop iterations must run for the absence-assertions below to
+        # be meaningful. Bound ONCE: the drive gate and the non-vacuity guard
+        # must never drift apart, or raising the guard alone would make the test
+        # fail with a confusing "only ran N times" instead of driving longer.
+        MIN_ITERATIONS = 3
+
+        # Stub side-effect dependencies so the loop body runs without network calls.
+        # _recover_stale_runs doubles as the iteration witness: the sync side_effect
+        # counts ticks and sets `ticked` at MIN_ITERATIONS, then returns DEFAULT so
+        # the configured return_value=None is preserved (the _drive_halt_notify
+        # pattern). See the guard's REFACTOR NOTE below for why this call is a
+        # reliable per-iteration proxy.
+        ticked = asyncio.Event()
+        stale_ticks = 0
+
+        def _count_stale_tick(*_args, **_kwargs):
+            nonlocal stale_ticks
+            stale_ticks += 1
+            if stale_ticks >= MIN_ITERATIONS:
+                ticked.set()
+            return DEFAULT  # preserve the configured return_value
+
+        harness._recover_stale_runs = AsyncMock(
+            return_value=None, side_effect=_count_stale_tick
+        )
         harness._start_escalation_server = AsyncMock()
         harness._stop_escalation_server = AsyncMock()
         harness.buffer.get_active_projects = AsyncMock(return_value=[])
@@ -8328,27 +8480,31 @@ class TestHarnessDrainIdleShortCircuit:
         with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
             # Idle path: drain() fires the marker synchronously; _drain_complete_logged=True
             harness.drain()
-            # Run the main loop; with fast_sleep many iterations execute in 0.2 s.
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+            # Drive the loop until MIN_ITERATIONS iterations have run. Stays
+            # INSIDE caplog.at_level so the absence-assertions below still see
+            # every record emitted while the loop was running.
+            await _drive_run_loop_until(harness, ticked)
 
         # Guard: ensure the loop body actually ran enough iterations to make the
-        # absence-assertions below meaningful.  On a heavily-loaded CI host the 0.2 s
-        # window could expire before any iteration runs, making the absence-assertions
-        # pass vacuously.  This fails loudly with a diagnostic when that happens.
+        # absence-assertions below meaningful.  Retained after the migration: the
+        # drive above waits on exactly this condition, but _drive_run_loop_until
+        # deliberately suppresses its own deadlock backstop and falls through to
+        # caller assertions, so this is the descriptive assertion that reports it.
         #
         # Why _recover_stale_runs.call_count is a reliable iteration proxy:
         # `await self._recover_stale_runs()` is the FIRST awaited call inside the
-        # per-iteration try-block of run_loop()'s while-True loop (harness.py:588).
-        # It runs unconditionally on every iteration regardless of self._draining —
-        # unlike buffer.get_active_projects, which is gated by `if not self._draining:`
-        # (harness.py:591) and would have call_count == 0 in this test (drain() is
-        # called before run_loop()).  REFACTOR NOTE: if _recover_stale_runs is ever
-        # made conditional or moved below another awaited call, update this proxy to
-        # something that remains unconditional at the top of each iteration.
-        assert harness._recover_stale_runs.call_count >= 3, (
-            f"Loop body must run multiple times to make the absence assertion meaningful; "
-            f"only ran {harness._recover_stale_runs.call_count} times"
+        # per-iteration try-block of run_loop()'s `while True:` loop. It runs
+        # unconditionally on every iteration regardless of self._draining — unlike
+        # buffer.get_active_projects, which run_loop guards with
+        # `if not self._draining:` and which would have call_count == 0 in this
+        # test (drain() is called before run_loop()).  REFACTOR NOTE: if
+        # _recover_stale_runs is ever made conditional or moved below another
+        # awaited call, update this proxy to something that remains unconditional
+        # at the top of each iteration.
+        assert harness._recover_stale_runs.call_count >= MIN_ITERATIONS, (
+            f"Loop body must run at least {MIN_ITERATIONS} times to make the "
+            f"absence assertion meaningful; only ran "
+            f"{harness._recover_stale_runs.call_count} times"
         )
         # After an idle drain all subsequent 'Harness draining:' progress messages
         # must be absent — the gate restructuring ensures the else-branch (which emits
