@@ -315,3 +315,155 @@ class TestComputePatchTopic:
         )
         assert isinstance(decision.dispositions, tuple)
         assert isinstance(decision.patch, dict)
+
+
+#: The real ``supersedes`` value carried by two of the six live
+#: ``canonical: true`` records (``9a4e568b`` capability-manifest-sidecar-and-g7
+#: and ``9b01e961`` docs-prd-landing).  Transcribed, not invented — the whole
+#: point of the case is that prose like this EXISTS in the corpus today.
+LIVE_PROSE_SUPERSEDES = (
+    '0d542614 (2026-07-20 07:03) and b5cc4f3c (2026-07-20 14:07), '
+    'both deleted 2026-07-25 as part of the same consolidation'
+)
+
+
+class TestComputePatchCanonicalAndSupersedes:
+    """The ``canonical`` and ``supersedes`` halves of ``compute_patch``."""
+
+    # -- canonical: stamping only, never demotion ---------------------------
+
+    def test_canonical_is_stamped_when_requested_and_absent(self):
+        decision = _mod.compute_patch(
+            {'topic': 'docs-prd-landing'},
+            target_topic='docs-prd-landing',
+            make_canonical=True,
+        )
+        assert decision.patch == {'canonical': True}
+        assert 'canonical_stamped' in decision.dispositions
+
+    def test_canonical_already_true_writes_nothing(self):
+        decision = _mod.compute_patch(
+            {'topic': 'docs-prd-landing', 'canonical': True},
+            target_topic='docs-prd-landing',
+            make_canonical=True,
+        )
+        assert 'canonical' not in decision.patch
+        assert 'canonical_already_present' in decision.dispositions
+
+    @pytest.mark.parametrize(
+        'existing',
+        [
+            {'topic': 'docs-prd-landing'},
+            {'topic': 'docs-prd-landing', 'canonical': True},
+            {'topic': 'docs-prd-landing', 'canonical': False},
+        ],
+        ids=['absent', 'true', 'false'],
+    )
+    def test_make_canonical_false_never_emits_the_key(self, existing: dict):
+        """Stamping only — θ never demotes, in any spelling.
+
+        Not writing ``canonical: False`` matters as much as not deleting an
+        existing ``True``: an explicit ``False`` is a *claim* ("this is not
+        the canonical"), and θ has no basis for it.  Members of a cluster
+        whose canonical is disputed or plural must come out of the sweep
+        carrying a ``topic`` and no opinion at all about canonicity.
+        """
+        decision = _mod.compute_patch(
+            existing, target_topic='docs-prd-landing', make_canonical=False
+        )
+        assert 'canonical' not in decision.patch
+
+    # -- supersedes: PRD D2, normalize only where it is honest --------------
+
+    def test_scalar_uuid_supersedes_is_folded_to_a_list(self):
+        """D2's scalar->list fold, riding the sweep where it touches anyway."""
+        uuid_value = '0d542614-1b2c-4d3e-8f90-abcdef123456'
+        decision = _mod.compute_patch(
+            {'topic': 'docs-prd-landing', 'supersedes': uuid_value},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert decision.patch == {'supersedes': [uuid_value]}
+        assert 'supersedes_normalized' in decision.dispositions
+
+    def test_conforming_list_supersedes_is_left_alone(self):
+        """Already a list of full UUIDs -> no write, so run two stays empty."""
+        uuids = [
+            '0d542614-1b2c-4d3e-8f90-abcdef123456',
+            'b5cc4f3c-1b2c-4d3e-8f90-abcdef123456',
+        ]
+        decision = _mod.compute_patch(
+            {'topic': 'docs-prd-landing', 'supersedes': list(uuids)},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert 'supersedes' not in decision.patch
+
+    def test_prose_supersedes_is_left_byte_identical_and_reported(self):
+        """The measured case that makes blind normalization wrong.
+
+        ``normalize_supersedes`` faithfully wraps ANY scalar, so folding this
+        sentence would write ``['<prose>']`` — a one-member list whose member
+        fails ``_is_full_uuid``, turning a record that merely has a legacy
+        shape into one that fails ``validate_memory_metadata`` outright.  D2
+        offers the fold as a convenience; it does not license manufacturing a
+        validation failure.  Leave it, name it, move on.
+        """
+        decision = _mod.compute_patch(
+            {'topic': 'docs-prd-landing', 'supersedes': LIVE_PROSE_SUPERSEDES},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert 'supersedes' not in decision.patch
+        assert 'supersedes_not_normalizable' in decision.dispositions
+
+    def test_list_with_a_non_uuid_member_is_also_left_alone(self):
+        """Same reasoning, list shape: never rewrite a value we cannot vouch for."""
+        decision = _mod.compute_patch(
+            {'topic': 'docs-prd-landing', 'supersedes': ['0d542614', 'not-a-uuid']},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert 'supersedes' not in decision.patch
+        assert 'supersedes_not_normalizable' in decision.dispositions
+
+    def test_absent_supersedes_produces_no_key_and_no_disposition(self):
+        """θ never INVENTS a supersedes edge — it only reshapes an existing one."""
+        decision = _mod.compute_patch(
+            {'topic': 'docs-prd-landing'},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert 'supersedes' not in decision.patch
+        assert not [d for d in decision.dispositions if d.startswith('supersedes')]
+
+    # -- the three halves compose ------------------------------------------
+
+    def test_all_three_halves_can_land_in_one_patch(self):
+        uuid_value = '0d542614-1b2c-4d3e-8f90-abcdef123456'
+        decision = _mod.compute_patch(
+            {'topic': 'docs_prd_landing', 'supersedes': uuid_value},
+            target_topic='docs-prd-landing',
+            make_canonical=True,
+        )
+        assert decision.patch == {
+            'topic': 'docs-prd-landing',
+            'canonical': True,
+            'supersedes': [uuid_value],
+        }
+        assert set(decision.dispositions) == {
+            'topic_normalized',
+            'canonical_stamped',
+            'supersedes_normalized',
+        }
+
+    def test_shape_helpers_come_from_the_registry_not_a_local_copy(self):
+        """INV-5 again: the UUID predicate and the fold have one home.
+
+        Same private-helper reuse ``strip_leaked_control_keys.py`` already
+        establishes for ``_drop_reserved_control_keys``.
+        """
+        from fused_memory import memory_metadata
+
+        assert _mod.normalize_supersedes is memory_metadata.normalize_supersedes
+        assert _mod._is_full_uuid is memory_metadata._is_full_uuid
