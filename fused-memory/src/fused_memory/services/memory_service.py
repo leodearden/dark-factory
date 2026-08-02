@@ -24,6 +24,7 @@ from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
 from fused_memory.memory_metadata import (
     CanonicalUniquenessViolation,
     MemoryMetadataValidationError,
+    MetadataViolation,
     is_valid_topic_slug,
     validate_memory_metadata,
 )
@@ -491,6 +492,8 @@ async def _apply_memory_metadata_validation(
     await _check_canonical_uniqueness(
         meta,
         project_id=project_id,
+        agent_id=agent_id,
+        config=config,
         count_canonical=count_canonical,
         find_canonical=find_canonical,
     )
@@ -507,6 +510,8 @@ async def _check_canonical_uniqueness(
     meta: dict,
     *,
     project_id: str,
+    agent_id: str | None,
+    config: MemoryMetadataConfig,
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
 ) -> None:
@@ -541,6 +546,18 @@ async def _check_canonical_uniqueness(
     first honours both, and confines the second round-trip to a path that is
     already failing the write, where its cost is irrelevant.
 
+    WHY THE EXISTING ``enforce`` FLAG AND NOT A NEW ONE: measured, not
+    assumed.  At the time of writing the live ``dark_factory`` corpus holds
+    exactly ONE ``canonical: true`` record, and its ``topic`` is
+    ``eval_worktree_plan_tools_missing`` — snake_case, which fails
+    ``TOPIC_SLUG_RE``.  Enforcing uniqueness on day one over a topic key
+    whose own live values still only warn would be the census-refuted-premise
+    outage the warn default exists to prevent, and would make uniqueness the
+    single fatal check that ignores the flag every sibling check honours.
+    THE PRECONDITION for flipping ``memory_metadata.enforce`` is leaf θ's
+    retro-stamping sweep normalizing those topics — check that has landed
+    before you flip it.
+
     RESIDUAL — this check is inherently TOCTOU-windowed: two concurrent
     first-canonical writes for one topic can both observe 0 and both
     succeed.  The PRD specifies no locking and Qdrant has no unique
@@ -567,8 +584,31 @@ async def _check_canonical_uniqueness(
         if records
         else _CANONICAL_INCUMBENT_UNKNOWN
     )
-    raise CanonicalUniquenessViolation(
+    error = CanonicalUniquenessViolation(
         project_id=project_id, topic=topic, incumbent_id=incumbent_id
+    )
+
+    # `config.enforce` is read PER CALL off the shared config object, never
+    # captured, so a config edit takes effect on the next write — the same
+    # note this seam already makes about the shape-check enforce flag.
+    if config.enforce:
+        raise error
+
+    # Warn mode: census the violation and let the write proceed.  Routed
+    # through the SAME emit_schema_warnings path the shape violations use, so
+    # the code is grep-anchored in the one census format operators already
+    # know (V1: "grep-anchored, never renamed").
+    emit_schema_warnings(
+        [
+            MetadataViolation(
+                key='canonical',
+                code='canonical_uniqueness_violation',
+                message=str(error),
+                fatal=True,
+            )
+        ],
+        project_id=project_id,
+        agent_id=agent_id,
     )
 
 
