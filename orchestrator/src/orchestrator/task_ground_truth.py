@@ -16,6 +16,15 @@ instead of re-deriving recovery policy themselves is a separate task (θ2).
 TG-1 (journal-first branch state) / TG-2 (one classification table) / TG-3
 (liveness via the public accessor, not scheduler privates) are implemented
 in :meth:`TaskGroundTruth.derive_truth` and :func:`classify_recovery` below.
+
+Task 3533 widened :class:`EscalationRef` with ``severity`` and
+``filing_claimant_run_id`` so refs can feed the shared
+``escalation.pins.classify_pins`` predicate (spec
+``docs/task-escalation-state-spec.md`` S6/E7) without a downstream re-read.
+That task deliberately rewires NO veto site: ``_shape``'s
+``has_open_escalation = bool(report.open_escalations)``, ``classify_recovery``
+and the ``_RECOVERY`` table are unchanged, and making that boolean
+pin-class-aware is task eta (3541).
 """
 
 from __future__ import annotations
@@ -112,11 +121,29 @@ class Claimant:
 
 @dataclass(frozen=True)
 class EscalationRef:
-    """A lightweight reference to an open escalation."""
+    """A lightweight reference to an open escalation.
+
+    Severity and level must BOTH travel with every escalation reference — a
+    predicate that cannot see severity cannot discriminate a pinning record
+    from a non-pinning one (spec ``docs/task-escalation-state-spec.md`` S6/E7),
+    which is why ``severity`` is carried here rather than re-read downstream.
+
+    ``severity=''`` means "unknown" (the queue row carried no severity);
+    ``escalation.pins.classify_pins`` fails that safe to PINNING rather than
+    raising.  ``filing_claimant_run_id`` carries the FILING incarnation's
+    identity in ``shared.task_claimant.compose_claimant_run_id`` format
+    (``{run_id}/{session_id}/pid={owner_pid}``); ``None`` means unknown, which
+    the classifier likewise fails safe to pinning.
+
+    Both new fields are DEFAULTED so every existing construction site keeps
+    working untouched.
+    """
 
     id: str
     level: int
     category: str = ''
+    severity: str = ''
+    filing_claimant_run_id: str | None = None
 
 
 @dataclass(frozen=True)
