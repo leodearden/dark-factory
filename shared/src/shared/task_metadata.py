@@ -94,8 +94,12 @@ KNOWN_ROLE_NAMES: frozenset[str] = frozenset(
 # non-strict mode -- silently rewriting an author's value in the one direction
 # that makes it look intentional, breaking I1 -- and a concrete default would
 # add ``human_curator_gate: false`` noise to every task's model_dump(), the
-# same objection already documented for merge_retry_pending. This constant
-# exists so the key has ONE spelling inside this module.
+# same objection already documented for merge_retry_pending.
+#
+# This is the key's SINGLE definition codebase-wide (exported via __all__):
+# orchestrator.deterministic_runner — the only other module that acts on the
+# key — imports it from here rather than restating the literal, so the write
+# boundary's rejection and the runner's dispatch-time guard cannot drift apart.
 HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
 
 

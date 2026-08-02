@@ -310,7 +310,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from shared.task_metadata import DoneProvenance
+from shared.task_metadata import HUMAN_CURATOR_GATE_KEY, DoneProvenance
 
 from orchestrator import systemd_inspect
 from orchestrator.deploy_state import (
@@ -403,8 +403,7 @@ OPERATIONAL_LLM_NEEDS_LANE_TOKEN: str = 'operational_llm_needs_lane'
 # operational_mode) is the precise signal to key on.
 OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 
-# Task 3341: the human-curator-gate contract, as two bare orchestrator-side
-# literals in the same metadata-key-as-literal convention as the key above.
+# Task 3341: the human-curator-gate contract — a marker key plus a stamp key.
 #
 # `human_curator_gate` marks a pure deterministic gate whose resolution requires
 # human CONTENT adjudication, not merely a closed escalation record.  It is
@@ -418,6 +417,16 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # CONTENT", the stamp says "a human did".  Task 3181 is the incident where the
 # runner had the first and inferred the second from a closed escalation record.
 #
+# SINGLE SOURCE (task 3369): the MARKER's spelling is imported from
+# `shared.task_metadata` (see the import block above) rather than restated as a
+# local literal.  That module's `_deterministic_invariants` validator now reads
+# the key too — to reject the marker alongside a non-null `before_done` at the
+# write boundary — so a second definition would put two spellings of one key in
+# the two modules that both act on it, which is exactly the drift a named
+# constant exists to prevent.  The STAMP keeps a bare literal because `shared`
+# offers no constant to import: it names the stamp only inside
+# `_BLESSED_METADATA_KEYS`, with no validator reading it.
+#
 # NAMING (reviewer amendment): the stamp is `human_curator_adjudicated_at`, NOT
 # `curator_adjudicated_at`.  The bare `curator_*` metadata namespace is already
 # owned by a different subsystem — `curator_action` / `curator_justification` /
@@ -426,7 +435,6 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # curator would invite a reader of the Tier-A list, or a census consumer
 # grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
 # prefix pairs the stamp unambiguously with its marker.
-HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
 HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
 
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
