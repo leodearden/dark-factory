@@ -275,7 +275,9 @@ def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
 _READINESS_WAIT_CAP_SECS = 30
 
 
-def _wait_for_path_scaled(path: pathlib.Path, base_secs: int) -> float:
+def _wait_for_path_scaled(
+    path: pathlib.Path, base_secs: int, *, extra_secs: float = 0.0
+) -> float:
     """Wait for *path* with a load-scaled budget, and return the budget used.
 
     A fixed _wait_for_path timeout races a host-load-dependent subprocess
@@ -292,8 +294,16 @@ def _wait_for_path_scaled(path: pathlib.Path, base_secs: int) -> float:
     Floored at base_secs: an idle host (load-per-core <= 1) returns
     base_secs unchanged, so every rewired call site stays byte-identical to
     its old fixed pin on an unloaded host.
+
+    extra_secs exists for gates that sit behind a DELIBERATELY INJECTED,
+    wall-clock-fixed sleep (today only
+    test_window_close_129_robust_to_delayed_trap_install's DELAY = 1.0,
+    injected by _STRESS_DETACHING_TERM_TEMPLATE before $inner runs). Such a
+    sleep does not stretch with host load, so it is added UNSCALED and is
+    NOT subject to _READINESS_WAIT_CAP_SECS -- only the load-dependent
+    startup chain around it is scaled.
     """
-    budget = _load_scaled_grace(base_secs, cap_secs=_READINESS_WAIT_CAP_SECS)
+    budget = _load_scaled_grace(base_secs, cap_secs=_READINESS_WAIT_CAP_SECS) + extra_secs
     _wait_for_path(path, timeout=budget)
     return budget
 
