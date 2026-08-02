@@ -1776,12 +1776,27 @@ class TestWriteTriageConfig:
         with pytest.raises(ValidationError):
             WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
 
-    @pytest.mark.parametrize('value', ['0.9', None, [0.9]])
+    @pytest.mark.parametrize('value', [None, [0.9], 'abc', {'x': 1}])
     def test_rejects_a_non_numeric_per_category_cutoff(self, value):
         from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
 
         with pytest.raises(ValidationError):
             WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
+
+    def test_a_numeric_string_is_coerced_exactly_as_the_pooled_sibling_coerces_it(self):
+        """Measured, not assumed: both fields take pydantic's lax float path.
+
+        The real input is a YAML numeric scalar written by the calibration
+        script, and demanding stricter parsing for the map than for the
+        pooled t_high beside it would be an inconsistency invented here
+        rather than one the config actually has.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig(t_high='0.9').t_high == 0.9
+        assert WriteTriageConfig(
+            t_high_by_category={'procedural_knowledge': '0.9'},
+        ).t_high_by_category == {'procedural_knowledge': 0.9}
 
     def test_one_bad_entry_rejects_the_whole_map(self):
         """No partial acceptance: a half-applied set of cutoffs must not gate a sweep."""
