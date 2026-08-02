@@ -824,6 +824,95 @@ class TestBuildEscalationQueuesSummary:
         assert primary_sub['summary']['by_status']['pending'] == 1
         assert sum(primary_sub['summary']['by_status'].values()) == 1
 
+    def test_per_subsection_summary_carries_skipped_count(self, tmp_path):
+        """``skipped_count`` sits beside the counts it explains, and does not inflate them.
+
+        The summary dict is precisely "the per-level/per-status counts that may
+        be quietly low"; the skip count is the honest annotation on those counts,
+        read by the same consumers at the same nesting.
+        """
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good', level=1, status='pending'))
+        (esc_dir / 'esc-bad.json').write_text('{not json')
+        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+
+        config = self._make_config(tmp_path, primary)
+        result = build_escalation_queues(config)
+
+        primary_sub = next(s for s in result['subsections'] if s['id'] == str(primary.resolve()))
+        recon_sub = next(s for s in result['subsections'] if s['id'] == 'reconciliation')
+
+        assert primary_sub['summary']['skipped_count'] == 1, (
+            'the summary must report how many files this queue could not read'
+        )
+        assert recon_sub['summary']['skipped_count'] == 0, (
+            "a clean queue's skipped_count is 0, not another queue's count"
+        )
+
+        # The skip must NOT inflate the level/status counts it qualifies.
+        assert sum(primary_sub['summary']['by_level'].values()) == 1
+        assert primary_sub['summary']['by_level'][1] == 1
+        assert sum(primary_sub['summary']['by_status'].values()) == 1
+        assert primary_sub['summary']['by_status']['pending'] == 1
+
+    def test_top_level_summary_aggregates_skipped_count(self, tmp_path):
+        """The top-level rollup sums every subsection's skips."""
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good'))
+        (esc_dir / 'esc-bad.json').write_text('{not json')
+
+        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
+        recon_dir.mkdir(parents=True)
+        (recon_dir / 'esc-bad-rc.json').write_text('also not json')
+
+        config = self._make_config(tmp_path, primary)
+        result = build_escalation_queues(config)
+
+        assert result['summary']['skipped_count'] == 2, (
+            'the top-level summary must aggregate skipped_count across every '
+            'subsection, through the same _merge_summaries path the level/status '
+            'counts already take'
+        )
+
+    def test_skipped_count_zero_when_all_files_readable(self, tmp_path):
+        """``skipped_count`` is always present — never conditionally absent.
+
+        A missing key reads as "unknown" and forces every consumer into a
+        ``.get(..., 0)`` guess; an explicit 0 states the fact.
+        """
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        primary.mkdir()
+        reify.mkdir()
+
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good'))
+        (reify / 'data' / 'escalations').mkdir(parents=True)
+        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+
+        config = self._make_config(tmp_path, primary, [reify])
+        result = build_escalation_queues(config)
+
+        for sub in result['subsections']:
+            assert sub['summary']['skipped_count'] == 0, (
+                f"subsection {sub['id']!r} has no unreadable files — skipped_count "
+                'must be present and 0'
+            )
+        assert result['summary']['skipped_count'] == 0
+
 
 # ---------------------------------------------------------------------------
 # Regression tests for resolve_owning_project — worktree false-positive
