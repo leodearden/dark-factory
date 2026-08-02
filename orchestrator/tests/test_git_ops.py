@@ -30,6 +30,8 @@ from orchestrator.git_ops import (
     CommitEffectProbe,
     GitOps,
     MergeParkContentionError,
+    MergeParkError,
+    MergeParkLockContentionError,
     MergeResult,
     TrainStackResult,
     WorktreeConflictError,
@@ -13958,3 +13960,112 @@ class TestAdvanceMainIndexLockStandoff:
             ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
         )
         assert main_before.strip() == main_after.strip()
+
+    async def test_lock_appearing_after_the_gate_is_still_transient(
+        self, git_ops: GitOps,
+    ):
+        """TOCTOU: a lock that appears BETWEEN the gate and `git stash create`
+        must still be classified as transient, not halt the queue.
+
+        The gate is a probe, so the window it cannot cover is the one where a
+        concurrent `git commit --only` starts right after the probe. The park
+        itself must therefore re-probe on failure and raise
+        MergeParkLockContentionError rather than the generic MergeParkError.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-toctou', 'lock_toctou.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty during toctou\n')
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                # The concurrent `git commit --only` grabs the index right
+                # after the gate probed it clear. Reproduce git 2.43's real
+                # signature: rc=1 with EMPTY stdout AND stderr.
+                lock_path.write_text('')
+                return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        try:
+            with patch('orchestrator.git_ops._run', side_effect=mock_run):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended', (
+            'a lock appearing inside the TOCTOU window must still be '
+            f'transient, never a queue halt; got {result.result!r}'
+        )
+
+    async def test_park_raises_lock_contention_error_when_lock_present(
+        self, git_ops: GitOps,
+    ):
+        """_park_wip_on_private_ref itself raises the subclass, so the
+        classification lives at the source rather than being re-derived by
+        every caller."""
+        (git_ops.project_root / 'README.md').write_text('# dirty for park\n')
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                lock_path.write_text('')
+                return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=mock_run),
+                pytest.raises(MergeParkLockContentionError),
+            ):
+                await git_ops._park_wip_on_private_ref('lbl')
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+
+        # It must remain a MergeParkError subclass so any existing
+        # `except MergeParkError` handler still catches it.
+        assert issubclass(MergeParkLockContentionError, MergeParkError)
+
+    async def test_stash_failure_without_a_lock_still_halts(self, git_ops: GitOps):
+        """NON-REGRESSION: a genuine park failure with NO index.lock present
+        keeps its existing loud queue-halt semantics.
+
+        The fix must narrow `stash_failed` to exactly the shared-hygiene
+        fault it was meant to report — not weaken it.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'stash-fail-nolock', 'stash_fail_nolock.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty tracked edit\n')
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        assert not lock_path.exists(), 'this test requires NO index.lock present'
+
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                return (1, '', 'fatal: cannot stash changes')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(merge_result.merge_commit)
+
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'stash_failed', (
+            'a park failure with no lock present must keep halting the queue; '
+            f'got {result.result!r}'
+        )
+        assert git_ops._last_stash_dirty_files == ['README.md'], (
+            'the stash_failed escalation must still name the dirty tracked '
+            f'file(s); got {getattr(git_ops, "_last_stash_dirty_files", "<unset>")!r}'
+        )
