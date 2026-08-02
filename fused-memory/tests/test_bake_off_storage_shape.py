@@ -3259,7 +3259,7 @@ def _query(query_id='q1', *, topic='t', expects=('k0',), cluster_id='c1'):
 _CHARS = ('injected:chars', len)
 
 
-def _measure(seeded, hits, *, pin, queries=None, probes=()):
+def _measure(seeded, hits, *, pin, queries=None, probes=(), limit=10):
     return _mod().measure_arm(
         seeded,
         {'queries': {'q1': hits}, 'probes': {'c1': hits}},
@@ -3268,6 +3268,7 @@ def _measure(seeded, hits, *, pin, queries=None, probes=()):
         probes=list(probes),
         estimator=_CHARS,
         guard_threshold=0.92,
+        limit=limit,
     )
 
 
@@ -3624,6 +3625,46 @@ class TestCanonicalRankIsNotCensoredByTheReadWindow:
 
         assert cell == '2.00 (n=119/236)'
 
+    def test_the_disclosed_rank_window_is_the_depth_THIS_run_fetched_at(self):
+        """`canonical_rank_window` is what stops the uncensoring fix from just
+        moving the censoring point somewhere undisclosed.
+
+        Rank is no longer censored at the k=5 read window, but it is still
+        censored at the FETCH depth — and that depth is `--limit`, a CLI flag,
+        not a constant.  Reporting `DEFAULT_SEARCH_LIMIT` would mean a
+        `--limit 25` run publishes a field claiming 10: the artifact would
+        understate how far it actually looked, which is the same class of
+        defect as the censored median it replaces.
+        """
+        seeded, hits = _full_window_arm('status_quo', n=12)
+
+        measured = _measure(seeded, hits, pin=False, limit=25)
+
+        assert measured['discoverability']['canonical_rank_window'] == 25
+
+    def test_run_arm_threads_its_own_fetch_depth_into_the_report(
+        self, monkeypatch
+    ):
+        """The seam that matters: the number in the artifact has to come from
+        the same `limit` the fetch was actually issued at."""
+        mod = _mod()
+        seeded, hits = _full_window_arm('status_quo', n=12)
+        issued_at: list[int] = []
+
+        async def _fake_fetch(backend, s, queries, probes, *, limit):
+            issued_at.append(limit)
+            return {'queries': {'q1': hits}, 'probes': {}}
+
+        monkeypatch.setattr(mod, 'fetch_arm', _fake_fetch)
+        rows = asyncio.run(mod.run_arm(
+            None, seeded, queries=[_query()], probes=[],
+            limit=25, estimator=_CHARS, guard_threshold=0.92,
+        ))
+
+        assert issued_at == [25]
+        for row in rows.values():
+            assert row['discoverability']['canonical_rank_window'] == 25
+
 
 class TestMeasureArmScoresBothVariantsAtTheSameK:
     """The inflated column, asserted directly on `measure_arm`'s output."""
@@ -3717,7 +3758,7 @@ class TestPinDiagnostic:
             seeded,
             {'queries': {'q1': hits}, 'probes': {}},
             pin=True, queries=[_query(topic='t2')], probes=[],
-            estimator=_CHARS, guard_threshold=0.92,
+            estimator=_CHARS, guard_threshold=0.92, limit=10,
         )
 
         assert on['pin']['window_changed_rate'] > 0

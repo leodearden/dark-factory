@@ -1697,11 +1697,17 @@ _REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
     # and "the pin never fired" are different findings.
     'pin': ('enabled', 'window_changed_rate'),
     'claim_recall': ('at_5', 'at_10'),
-    'discoverability': ('canonical_in_top_5_rate',),
+    # The rate, AND the censored denominator the median rank is taken over:
+    # a median over successes only lets an arm that rarely finds the
+    # canonical print the best rank, so the two must travel together.
+    'discoverability': ('canonical_in_top_5_rate', 'median_canonical_rank',
+                        'canonical_found_count', 'canonical_candidates'),
     'tokens_per_query': ('mean', 'estimator'),
-    # Both halves, always: the rank-based one and the threshold replay.
+    # Both halves, always: the rank-based one and the threshold replay —
+    # plus the best score the replay saw, which is what separates "no
+    # candidate cleared the threshold" from "no score ever arrived".
     'guard_adequacy': ('candidate_present_rate', 'guard_matched_rate',
-                       'threshold_replay', 'threshold'),
+                       'threshold_replay', 'threshold', 'max_observed_score'),
 }
 
 #: What the artifact must say about how it was produced.  An arbitration
@@ -1873,6 +1879,23 @@ def _cell(value: Any, *, precision: int = 2) -> str:
     return str(value)
 
 
+def _rank_cell(discoverability: dict[str, Any]) -> str:
+    """Median canonical rank, WITH the censored denominator it is taken over.
+
+    The median is over successes only: a query whose canonical never surfaced
+    contributes no rank at all.  Printing the bare median therefore lets an
+    arm that almost never finds the canonical show the best rank in the
+    table, because it was scored on the handful of queries where it did.  The
+    ``n=found/candidates`` suffix is what makes two medians comparable.
+    """
+    median = _cell(discoverability.get('median_canonical_rank'))
+    found = discoverability.get('canonical_found_count')
+    candidates = discoverability.get('canonical_candidates')
+    if found is None or candidates is None:
+        return median
+    return f'{median} (n={found}/{candidates})'
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     """The operator-facing artifact: prose, decision table, D10, provenance.
 
@@ -1914,6 +1937,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         '',
         'A `—` cell is **no measurement**, not a measured zero.',
         '',
+        '`median canonical rank` carries its denominator as `(n=found/'
+        'candidates)`.  The median is over the queries where the canonical '
+        'surfaced AT ALL, so without that suffix an arm that almost never '
+        'finds the canonical prints the best rank in the table — scored on '
+        'the handful of queries where it did.  Rank is measured over the '
+        'full fetch depth, not the k=5 read window, so "outside top-5" and '
+        '"absent entirely" stay distinguishable.',
+        '',
         '`pin changed window` is the diagnostic that makes the `+pin` rows '
         'readable.  Every variant is scored over a window of the SAME size '
         '(k), so an additive pin can only pay off where a read-side transform '
@@ -1936,7 +1967,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             _cell(measurement['claim_recall']['at_5']),
             _cell(measurement['claim_recall']['at_10']),
             _cell(measurement['discoverability']['canonical_in_top_5_rate']),
-            _cell(measurement['discoverability'].get('median_canonical_rank')),
+            _rank_cell(measurement['discoverability']),
             _cell(measurement['tokens_per_query']['mean'], precision=1),
             _cell(guard['candidate_present_rate']),
             _cell(guard['guard_matched_rate']),
@@ -2141,11 +2172,15 @@ DEFAULT_SEARCH_LIMIT = 10
 
 #: Fetch depth for a guard probe: production's window plus one.
 #:
-#: The extra slot pays for dropping the probing write's OWN record from its
+#: The extra slot pays for dropping the probing write's OWN content from its
 #: own window.  In the real timeline that write had not landed when the guard
-#: ran, and arm (a) stores it verbatim — leaving it in would hand the
-#: baseline a free ~1.0 self-match the peer arms structurally cannot get, and
-#: the decision table would read that as arm (a) having the better guard.
+#: ran, and every arm carries it in some form — arm (a) verbatim, the peer
+#: arms as whatever claims were decomposed OUT of it.  Leaving it in would
+#: hand an arm a free near-1.0 self-match, and the decision table would read
+#: that as a better guard.  The removal is by PROVENANCE
+#: (:func:`probe_own_record_ids`), not by record id: only arm (a) reuses the
+#: α memory_id as its record id, so an id filter would drop the self-match
+#: for the baseline alone and bias the column the other way.
 #: The replay still happens at :data:`GUARD_TOP_K`, which ``guard_adequacy``
 #: enforces itself.
 GUARD_FETCH_LIMIT = GUARD_TOP_K + 1
@@ -2167,6 +2202,22 @@ class SeedingError(RuntimeError):
     Loud rather than skipped: a hit this script cannot resolve to an
     :class:`ArmRecord` is a hit that would silently vanish from every metric,
     and a shape that lost results would look like a shape that ranked badly.
+    """
+
+
+class MeasurementError(RuntimeError):
+    """A query returned nothing measurable, so nothing was measured.
+
+    ``Mem0Client.search`` swallows ``TimeoutError`` and returns ``{}``
+    (``backends/mem0_client.py``), so a network failure and a shape that
+    ranked nothing arrive here as the same empty list — which this module's
+    own rule ("an empty hits list with a real expectation IS a measured
+    zero") would then score as 0.0 recall, 0.0 discoverability, 0.0 guard
+    across the board.  Every arm seeds the SHARED distractor slab, so an
+    empty result list is never a legitimate outcome here: it is unambiguously
+    a failed query, and it is raised rather than recorded.  Silently
+    publishing a network failure as a measured zero in the artifact gate η
+    reads is precisely the silent fail-soft the design invariants forbid.
     """
 
 
@@ -2292,6 +2343,13 @@ class SeededArm:
     contested_ids: set[str]
     canonical_by_cluster: dict[str, str]
     siblings_by_cluster: dict[str, set[str]]
+    #: α ``memory_id`` -> every record in THIS arm that realizes a claim
+    #: decomposed from it.  The guard probe drops its own write's content by
+    #: PROVENANCE, not by record id: only ``_materialize_status_quo`` reuses
+    #: the α memory_id as its record id, so an id-equality filter is a no-op
+    #: in ``c_peers``/``b_grouped`` and would leave those arms searching a
+    #: corpus that still contains the probing write's own claims.
+    records_by_source: dict[str, set[str]]
 
 
 def _index_arm(
@@ -2303,6 +2361,13 @@ def _index_arm(
     for record in records:
         if record.cluster_id is not None:
             siblings.setdefault(record.cluster_id, set()).add(record.record_id)
+    source_by_claim = {claim.claim_id: claim.source_memory_id for claim in claims}
+    records_by_source: dict[str, set[str]] = {}
+    for record in records:
+        for claim_id in record.claim_ids:
+            source = source_by_claim.get(claim_id)
+            if source is not None:
+                records_by_source.setdefault(source, set()).add(record.record_id)
     return SeededArm(
         shape=shape,
         project_id=project_id,
@@ -2314,6 +2379,7 @@ def _index_arm(
         contested_ids=contested_record_ids(records, claims),
         canonical_by_cluster=canonical_record_ids(records, claims),
         siblings_by_cluster=siblings,
+        records_by_source=records_by_source,
     )
 
 
@@ -2368,8 +2434,18 @@ async def _search(
     response = await backend.search(
         query=text, scope=Scope(project_id=seeded.project_id), limit=limit,
     )
+    results = (response or {}).get('results') or []
+    if not results:
+        raise MeasurementError(
+            f'{seeded.collection} returned no results for a {limit}-limit '
+            f'query. Every arm seeds the shared distractor slab, so an empty '
+            f'ranking is not a possible outcome — this is a failed query '
+            f'(mem0 swallows TimeoutError and returns {{}}), and recording it '
+            f'would publish a network failure as a measured zero. '
+            f'Query text: {text[:120]!r}'
+        )
     hits: list[ScoredHit] = []
-    for item in (response or {}).get('results') or []:
+    for item in results:
         record = seeded.by_stored_id.get(item.get('id'))
         if record is None:
             raise SeedingError(
@@ -2377,10 +2453,33 @@ async def _search(
                 f'this run did not seed. The collection is not clean; dropping '
                 f'the hit would silently shrink the measured ranking.'
             )
-        hits.append(ScoredHit(
-            record=record, relevance_score=float(item.get('score') or 0.0),
-        ))
+        score = item.get('score')
+        if score is None:
+            raise MeasurementError(
+                f"{seeded.collection} returned point {item.get('id')!r} with "
+                f'no score. Defaulting it to 0.0 would feed the threshold '
+                f'replay a value the store never produced, and the guard '
+                f'column would read as a shape finding rather than as '
+                f'missing score plumbing.'
+            )
+        hits.append(ScoredHit(record=record, relevance_score=float(score)))
     return hits
+
+
+def probe_own_record_ids(seeded: SeededArm, probe_memory_id: str) -> set[str]:
+    """Every record in this arm that carries the probing write's own content.
+
+    Provenance, not id equality.  ``record_id == memory_id`` holds ONLY in
+    ``_materialize_status_quo``; ``c_peers`` and ``b_grouped`` derive every id
+    through :func:`_derive_record_id`, so an id-equality filter silently
+    removes nothing there and the probe would search a corpus that still
+    contains its own claims — a free self-match for exactly the two arms the
+    :data:`GUARD_FETCH_LIMIT` rationale says structurally cannot get one.
+
+    The id itself stays in the set so the status-quo arm, whose originals may
+    carry no decomposed claim at all, is still covered.
+    """
+    return {probe_memory_id} | set(seeded.records_by_source.get(probe_memory_id, ()))
 
 
 async def fetch_arm(
@@ -2411,8 +2510,9 @@ async def fetch_arm(
         raw = await _search(
             backend, seeded, probe['content'], limit=GUARD_FETCH_LIMIT,
         )
+        own = probe_own_record_ids(seeded, probe['memory_id'])
         fetched_probes[cluster_id] = [
-            hit for hit in raw if hit.record.record_id != probe['memory_id']
+            hit for hit in raw if hit.record.record_id not in own
         ]
 
     return {'queries': fetched_queries, 'probes': fetched_probes}
@@ -2457,8 +2557,14 @@ def rescore(transformed: list[ArmRecord], hits: list[ScoredHit]) -> list[ScoredH
     selector is threshold-based.
 
       * a record the store ranked keeps its own score;
-      * a grouped document takes the BEST score among the children that
-        collapsed into it, matching the rank the grouped read gives it;
+      * a grouped document takes the BEST score available to it — its own if
+        the canonical was itself a hit, its best child's, whichever is
+        higher.  This is the same rule ``apply_grouped_read`` applies to
+        RANK (``group_rank[parent] = min(...)``), and the two have to agree:
+        a canonical hit at rank 5 / score 0.30 with a child at rank 1 /
+        score 0.95 ranks the group 1st, so replaying the threshold guard at
+        0.30 would be a false negative attributable to this helper rather
+        than to the storage shape;
       * a PINNED canonical the store never returned scores 0.0 — the honest
         value, because the ANN produced no similarity evidence for it at all.
         It still counts for the rank-based ``candidate_present`` half, which
@@ -2475,8 +2581,9 @@ def rescore(transformed: list[ArmRecord], hits: list[ScoredHit]) -> list[ScoredH
     return [
         ScoredHit(
             record=record,
-            relevance_score=direct.get(
-                record.record_id, best_child.get(record.record_id, 0.0),
+            relevance_score=max(
+                direct.get(record.record_id, 0.0),
+                best_child.get(record.record_id, 0.0),
             ),
         )
         for record in transformed
@@ -2504,6 +2611,7 @@ def measure_arm(
     probes: list[tuple[str, dict[str, Any]]],
     estimator: tuple[str, Any],
     guard_threshold: float,
+    limit: int,
 ) -> dict[str, Any]:
     """The E2 metrics for one arm variant.  Pure — no store, no await.
 
@@ -2523,6 +2631,11 @@ def measure_arm(
     recall_10: list[float | None] = []
     canonical_in_5: list[float | None] = []
     canonical_ranks: list[int] = []
+    #: Queries that HAD a canonical to look for — the honest denominator for
+    #: ``canonical_found_count``.  The median rank is a median over successes
+    #: only, so without this an arm that almost never finds the canonical
+    #: prints the best median in the decision table.
+    canonical_candidates = 0
     token_counts: list[float | None] = []
     #: Every read window this arm was measured over, pin-on vs pin-off.  Both
     #: query windows AND the guard probe window: a pin that fires only on a
@@ -2552,10 +2665,21 @@ def measure_arm(
 
         canonical_id = seeded.canonical_by_cluster.get(query.cluster_id)
         if canonical_id is not None:
+            canonical_candidates += 1
             found = topic_discoverability(top_5, query.topic, canonical_id, 5)
             canonical_in_5.append(1.0 if found['canonical_in_top_k'] else 0.0)
-            if found['canonical_rank'] is not None:
-                canonical_ranks.append(found['canonical_rank'])
+            # RANK is measured over the deepest window this arm was fetched
+            # at, NOT over the k=5 read window the rate is measured over.
+            # Scoring the rank inside an already-truncated window censors it
+            # at 5, collapsing "rank 7" and "absent entirely" into the same
+            # None — exactly the conflation topic_discoverability's docstring
+            # says would hide a shape that gets the canonical NEARLY there.
+            deep = topic_discoverability(
+                read_path(seeded, hits, len(hits), pin=pin),
+                query.topic, canonical_id, 5,
+            )
+            if deep['canonical_rank'] is not None:
+                canonical_ranks.append(deep['canonical_rank'])
         else:
             canonical_in_5.append(None)
 
@@ -2563,11 +2687,21 @@ def measure_arm(
 
     candidate_present: list[float | None] = []
     guard_matched: list[float | None] = []
+    #: The highest score the threshold replay ever SAW.  Carried because a
+    #: guard_matched_rate of 0.00 is otherwise indistinguishable from score
+    #: plumbing that never delivered a score: "the best candidate scored 0.71
+    #: against a 0.92 threshold" is a shape finding, "the best candidate
+    #: scored 0.00" is a bug report.
+    max_observed_score: float | None = None
     for cluster_id, _probe in probes:
         probe_hits = fetched['probes'][cluster_id]
         window = _window(probe_hits, GUARD_TOP_K)
+        rescored = rescore(window, probe_hits)
+        for scored in rescored[:GUARD_TOP_K]:
+            if max_observed_score is None or scored.relevance_score > max_observed_score:
+                max_observed_score = scored.relevance_score
         verdict = guard_adequacy(
-            rescore(window, probe_hits),
+            rescored,
             seeded.siblings_by_cluster.get(cluster_id, set()),
             guard_threshold,
         )
@@ -2592,6 +2726,15 @@ def measure_arm(
             'canonical_in_top_5_rate': _mean(canonical_in_5),
             'median_canonical_rank': median_rank,
             'canonical_found_count': len(canonical_ranks),
+            'canonical_candidates': canonical_candidates,
+            # Ranks are censored at the fetch depth, not at the read window.
+            # Stated so a reader knows what "absent entirely" here means —
+            # and taken from the depth THIS run fetched at, never from the
+            # module default: `--limit` is a CLI flag, and an artifact that
+            # printed the constant would understate how far a `--limit 25`
+            # run actually looked. That is the same class of defect as the
+            # censored median this field exists to disclose.
+            'canonical_rank_window': limit,
         },
         'tokens_per_query': {
             'mean': _mean(token_counts),
@@ -2606,6 +2749,7 @@ def measure_arm(
             # says the last column is a threshold replay.
             'threshold_replay': True,
             'threshold': guard_threshold,
+            'max_observed_score': max_observed_score,
             'probes': len(probes),
         },
     }
@@ -2626,11 +2770,11 @@ async def run_arm(
     return {
         seeded.shape: measure_arm(
             seeded, fetched, pin=False, queries=queries, probes=probes,
-            estimator=estimator, guard_threshold=guard_threshold,
+            estimator=estimator, guard_threshold=guard_threshold, limit=limit,
         ),
         f'{seeded.shape}+pin': measure_arm(
             seeded, fetched, pin=True, queries=queries, probes=probes,
-            estimator=estimator, guard_threshold=guard_threshold,
+            estimator=estimator, guard_threshold=guard_threshold, limit=limit,
         ),
     }
 
