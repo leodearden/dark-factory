@@ -1186,6 +1186,7 @@ def _pairs_span_members(
 
 def restrict_delete_candidates_for_apply(
     groups: Iterable[dict[str, Any]],
+    unevidenced_categories: Iterable[str] = (),
 ) -> tuple[list[Any], list[dict[str, Any]]]:
     """Narrow the reported delete candidates to the ones ``--apply`` may act on.
 
@@ -1197,10 +1198,16 @@ def restrict_delete_candidates_for_apply(
     Two facts make the ANN path riskier than the lexical one it joins, and
     only on deletion:
 
-      1. Its cutoff (``config.write_triage.t_high``) was calibrated for the
-         write-triage decision on a corpus that is overwhelmingly
-         ``procedural_knowledge``. Its pairwise precision on the two
-         newly-swept categories is thinly evidenced by comparison.
+      1. Its cutoff is only as good as the corpus it was measured on. Task
+         3357 made that measurable PER CATEGORY: a category with its own
+         derived cutoff in ``config.write_triage.t_high_by_category`` is
+         evidenced on its own labeled pairs, while one that fell back to the
+         pooled ``t_high`` is gated by a number measured on a corpus that is
+         overwhelmingly ``procedural_knowledge``. The calibration REFUSES a
+         cutoff for a category with no negative pairs to separate against,
+         and that refusal is a recorded finding, not a defect — so the
+         un-evidenced categories are named (*unevidenced_categories*) and
+         fenced out of deletion rather than silently trusted.
       2. Pairwise precision does not imply CLUSTER precision. The transitive
          closure chains A~B and B~C into one cluster even when A~C is far
          below the cutoff, and under ``--apply`` every non-survivor of that
@@ -1213,31 +1220,49 @@ def restrict_delete_candidates_for_apply(
         i.e. the cluster is one this detector would have actioned before the
         ANN path existed. Pre-existing behaviour, unchanged.
       - ``ann_clique`` — EVERY member pair independently cleared the ANN
-        cutoff, so no member is in the cluster by transitivity alone.
+        cutoff, so no member is in the cluster by transitivity alone — AND
+        that cutoff was measured for the cluster's own category.
 
     Anything else is withheld, with its ids and the reason reported so the
     withholding is legible rather than a silent shortfall.
 
     Args:
         groups: The plan's ``near_duplicate_groups`` entries.
+        unevidenced_categories: Categories whose ANN cutoff was NOT derived
+            for that category (they ran on the pooled fallback — see
+            ``resolve_ann_threshold``). A group in one of them may not
+            contribute deletions on ANN evidence alone. A
+            ``lexical_spanning`` group is unaffected: its evidence never
+            depended on the ANN cutoff.
 
     Returns:
         ``(delete_candidates, withheld_groups)``.
     """
+    unevidenced = frozenset(unevidenced_categories)
     actionable: list[Any] = []
     withheld: list[dict[str, Any]] = []
     for group in groups:
         losers = list(group.get('delete_candidate_ids') or ())
         if not losers:
             continue
-        if group.get('lexical_spanning') or group.get('ann_clique'):
+        if group.get('lexical_spanning'):
             actionable.extend(losers)
             continue
+        if group.get('ann_clique'):
+            if group.get('category') not in unevidenced:
+                actionable.extend(losers)
+                continue
+            reason = 'ann_cutoff_not_evidenced_for_category'
+        else:
+            # The stricter, pre-existing refusal wins: a chained cluster is
+            # not actionable in ANY category, so naming the weaker reason
+            # here would understate why it was withheld.
+            reason = 'ann_chained_without_lexical_span_or_ann_clique'
         withheld.append({
             'member_ids': list(group.get('member_ids') or ()),
             'category': group.get('category'),
             'withheld_ids': losers,
-            'reason': 'ann_chained_without_lexical_span_or_ann_clique',
+            'reason': reason,
         })
     return actionable, withheld
 
@@ -1252,6 +1277,7 @@ def build_sweep_plan(
     ann_disclosure: dict[str, int] | None = None,
     ann_threshold: float | None = None,
     ann_threshold_by_category: Mapping[str, float] | None = None,
+    unevidenced_categories: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Orchestrate filtering -> dual-path clustering -> survivor selection -> report.
 
@@ -1285,6 +1311,10 @@ def build_sweep_plan(
         ann_threshold: The scalar ANN cutoff pushed down to Qdrant — the MIN
             of the per-category cutoffs — echoed so a reader of the report
             never has to guess which floor produced the candidate set.
+        unevidenced_categories: Categories running on the pooled fallback
+            cutoff; passed through to
+            ``restrict_delete_candidates_for_apply``, which withholds their
+            ANN-only clusters from ``--apply``. The REPORT still lists them.
         ann_threshold_by_category: The cutoff that AUTHORITATIVELY gated each
             category (task 3357), echoed alongside the floor so a reader can
             tell which number gated which category. An EMPTY mapping says no
@@ -1464,7 +1494,7 @@ def build_sweep_plan(
     )
 
     apply_candidates, apply_withheld = restrict_delete_candidates_for_apply(
-        near_duplicate_groups,
+        near_duplicate_groups, unevidenced_categories,
     )
     echoed_disclosure: dict[str, int] | None = None
     if ann_disclosure is not None or ann_pairs is not None:
@@ -2152,6 +2182,44 @@ def _calibrated_float(value: Any) -> float | None:
     return None
 
 
+def _write_triage_cutoffs(
+    memory_service: Any,
+) -> tuple[Any, float | None, Mapping[str, Any]]:
+    """The ONE read of ``config.write_triage``: ``(raw, pooled, by_category)``.
+
+    Both the cutoff resolver and :func:`categories_without_own_cutoff` need
+    the same two calibration leaves, so the defensive getattr chain lives
+    here once — the config keeps a single reader, and the two consumers can
+    never disagree about what it said. *raw* is the unscreened ``t_high``,
+    kept only so a failure can report what it actually found.
+    """
+    write_triage = getattr(getattr(memory_service, 'config', None), 'write_triage', None)
+    raw_t_high = getattr(write_triage, 't_high', None)
+    by_category = getattr(write_triage, 't_high_by_category', None)
+    if not isinstance(by_category, Mapping):
+        by_category = {}
+    return raw_t_high, _calibrated_float(raw_t_high), by_category
+
+
+def categories_without_own_cutoff(
+    memory_service: Any,
+    categories: Iterable[str],
+) -> frozenset[str]:
+    """Swept categories for which the calibration derived NO cutoff.
+
+    These ran on the pooled fallback (or on an operator override, which is a
+    recall knob, not evidence), so their ANN clusters rest on a number
+    measured on a different population. ``build_sweep_plan`` hands this set
+    to ``restrict_delete_candidates_for_apply``, which keeps them in the
+    REPORT and out of irreversible deletion.
+    """
+    _raw, _pooled, by_category = _write_triage_cutoffs(memory_service)
+    return frozenset(
+        category for category in categories
+        if _calibrated_float(by_category.get(category)) is None
+    )
+
+
 def resolve_ann_threshold(
     memory_service: Any,
     override: float | None = None,
@@ -2215,11 +2283,7 @@ def resolve_ann_threshold(
             {'ann_disabled_uncalibrated': 0, 'ann_pooled_fallback_categories': 0},
         )
 
-    write_triage = getattr(getattr(memory_service, 'config', None), 'write_triage', None)
-    pooled = _calibrated_float(getattr(write_triage, 't_high', None))
-    by_category = getattr(write_triage, 't_high_by_category', None)
-    if not isinstance(by_category, Mapping):
-        by_category = {}
+    raw_t_high, pooled, by_category = _write_triage_cutoffs(memory_service)
 
     resolved: dict[str, float] = {}
     pooled_fallback: list[str] = []
@@ -2250,7 +2314,7 @@ def resolve_ann_threshold(
             'got %r) and no --ann-threshold override was given. Refusing to '
             'invent a similarity cutoff — run scripts/calibrate_write_triage.py, '
             'or pass --ann-threshold explicitly. The lexical path still runs.',
-            ', '.join(uncalibrated), getattr(write_triage, 't_high', None),
+            ', '.join(uncalibrated), raw_t_high,
         )
 
     return resolved, {
@@ -2531,6 +2595,7 @@ async def _run(args: argparse.Namespace) -> int:
             ann_pairs=ann_pairs, ann_scores=ann_scores,
             ann_disclosure=disclosures, ann_threshold=ann_threshold,
             ann_threshold_by_category=ann_thresholds,
+            unevidenced_categories=categories_without_own_cutoff(memory, categories),
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
         print(json.dumps(plan, indent=2, default=str))

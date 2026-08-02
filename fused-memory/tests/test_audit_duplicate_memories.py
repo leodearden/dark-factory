@@ -3849,7 +3849,10 @@ class TestRunApplyAnnOnlyClusters:
         )
         plan = json.loads(capsys.readouterr().out)
 
-        assert rc == 0
+        assert rc == 1, (
+            'the pre-existing guard: --apply with nothing applicable aborts '
+            'loudly rather than silently deleting nothing'
+        )
         assert plan['clusters_total'] == 1, 'still detected and reported'
         assert plan['delete_candidates'] == ['m2']
         assert service.deleted == [], 'an un-evidenced cutoff may not delete'
@@ -3882,7 +3885,10 @@ class TestRunApplyAnnOnlyClusters:
             (1.0, 0.0): [('m2', 0.95)],
             (0.0, 1.0): [('m1', 0.95)],
         }
-        rc, service = await self._invoke(monkeypatch, raw, ann_hits, tmp_path)
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path,
+            t_high_by_category={_PK: 0.9},
+        )
         plan = json.loads(capsys.readouterr().out)
 
         assert plan['near_duplicate_groups'][0]['found_by'] == ['ann'], (
@@ -3933,7 +3939,10 @@ class TestRunApplyAnnOnlyClusters:
             (0.0, 1.0, 0.0): [('m1', 0.95), ('m3', 0.93)],
             (0.0, 0.0, 1.0): [('m1', 0.94), ('m2', 0.93)],
         }
-        rc, service = await self._invoke(monkeypatch, raw, ann_hits, tmp_path)
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path,
+            t_high_by_category={_PK: 0.9},
+        )
 
         assert rc == 0
         assert service.deleted == ['m2', 'm3']
@@ -4867,9 +4876,9 @@ class TestBuildSweepPlanLivenessRecurrences:
         seen: list[list[dict]] = []
         real = _mod.restrict_delete_candidates_for_apply
 
-        def _spy(groups):
+        def _spy(groups, *args, **kwargs):
             seen.append(groups)
-            return real(groups)
+            return real(groups, *args, **kwargs)
 
         monkeypatch.setattr(_mod, 'restrict_delete_candidates_for_apply', _spy)
         build_sweep_plan(_liveness_corpus())
