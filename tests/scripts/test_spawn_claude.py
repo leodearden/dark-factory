@@ -1180,6 +1180,87 @@ def test_load_scaled_grace_getloadavg_error_returns_base(
 
 
 # ===========================================================================
+# Task 3486: _wait_for_path_scaled -- load-scaled readiness-gate policy
+# ===========================================================================
+# FOURTH recurrence of the fixed-timeout-vs-load-dependent-startup flake
+# class in this file: task 2367 bumped a fixed started-grace 1s/2s -> 3s/8s;
+# task 2733 added _load_scaled_grace above; task 3451 added _set_started_grace
+# for the started-grace family; task 3486 (here) covers the _wait_for_path
+# readiness-gate family. Observed instance:
+# test_window_close_yields_129_not_hang[konsole] timing out at
+# _wait_for_path(pidfile, timeout=5.0) during task 3451's step-7 full-suite
+# verify -- passing in isolation and on immediate rerun (a burst-load
+# excursion past a fixed pin, not a genuine hang).
+
+
+def test_wait_for_path_scaled_returns_load_scaled_budget_on_loaded_host(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a loaded host, the returned budget matches _load_scaled_grace's own
+    output -- used as the oracle rather than a hardcoded expected number, so
+    the floor/scale/clamp/error-safe arithmetic stays pinned exactly once,
+    by the test_load_scaled_grace_* family above.
+
+    The path already exists, so the call returns immediately: this is what
+    makes the policy assertable without ever sleeping.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    assert _wait_for_path_scaled(existing, 5) == _load_scaled_grace(
+        5, cap_secs=_READINESS_WAIT_CAP_SECS
+    )
+
+
+def test_wait_for_path_scaled_idle_host_floors_at_base(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle host (load-per-core < 1) floors at base_secs unchanged --
+    pinning the no-regression property that every rewired call site stays
+    byte-identical to the fixed pin it replaces on an unloaded host.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    assert _wait_for_path_scaled(existing, 5) == 5
+
+
+def test_wait_for_path_scaled_enforces_the_scaled_budget_not_the_base(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Propagation test -- the one property the return value alone cannot
+    prove: a buggy implementation could return the scaled number but still
+    pass the raw, unscaled base through to _wait_for_path. Points at a path
+    that never appears so the real enforced timeout is observable both via
+    the raised message and via measured wall-clock.
+
+    Deliberately sized at ~2s of real wall-clock (base_secs=1 x load-per-core
+    2.0 => scaled budget 2); a larger base would only make the suite slower
+    without pinning anything further.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    missing = tmp_path / "never-appears"
+
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match=r"Timed out after 2"):
+        _wait_for_path_scaled(missing, 1)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 2.0, (
+        f"expected the SCALED budget (2s), not the 1s base, to be enforced; "
+        f"only waited {elapsed:.2f}s"
+    )
+
+
+# ===========================================================================
 # Task 3451: _set_started_grace -- shared started-grace policy for the
 # "must NOT be flagged failed-to-start" test family
 # ===========================================================================
