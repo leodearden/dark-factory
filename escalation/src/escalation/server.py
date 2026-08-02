@@ -2311,6 +2311,41 @@ def create_server(
             'outcome': 'found_on_main',
         }
 
+    async def _git_authority_task_metadata(tid: str) -> dict[str, Any]:
+        """Best-effort task metadata for the git-authority guards (task 3103).
+
+        Returns ``{}`` on EVERY failure mode — no harness, no ``scheduler``
+        attribute, ``get_task`` raising, or a None/metadata-less task — and
+        never raises.  A scheduler fault must degrade a single guard, not
+        swallow the whole probe.
+
+        ``{}`` deliberately FAILS OPEN out of the degeneracy check and falls
+        THROUGH to the citation gate, which is git-only and needs no task
+        metadata.  This is exact parity with the harness, which treats an
+        absent or non-40-hex ``branch_base_sha`` as "no degeneracy signal"
+        rather than as grounds to reject: a metadata fault must never
+        fabricate a confident answer, and must never hard-fail a genuinely
+        merged branch.
+        """
+        if harness is None:
+            return {}
+        scheduler = getattr(harness, 'scheduler', None)
+        if scheduler is None:
+            return {}
+        try:
+            task = await scheduler.get_task(tid)
+        except Exception:
+            logger.warning(
+                'merge_status: scheduler.get_task(%s) failed — proceeding '
+                'without task metadata (degeneracy check skipped, citation '
+                'gate still applies)',
+                tid, exc_info=True,
+            )
+            return {}
+        if not task:
+            return {}
+        return task.get('metadata') or {}
+
     @mcp.tool()
     async def merge_status(
         request_id: str | None = None,
@@ -2435,15 +2470,38 @@ def create_server(
                     full_branch = canonical_queued_branch_name(key, prefix)
                     tip = await git_ops.resolve_branch_sha(full_branch)
                     main_tip = await git_ops.resolve_branch_sha(orch_config.git.main_branch)
+                    tid = full_branch.removeprefix(prefix)
+                    # Runtime-only reverse import: orchestrator depends on escalation,
+                    # not vice versa, so this lazy import deliberately avoids a static
+                    # cycle (same shape as server.py:1423 / :2049 / :2148).  It resolves
+                    # at runtime because the escalation server is hosted inside the
+                    # orchestrator process.  An ImportError is an Exception and therefore
+                    # already degrades to the honest Tier-4 unknown via the wrapper below.
+                    from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+                        branch_is_degenerate,
+                    )
                     if (tip is not None and tip != main_tip
                             and await git_ops.is_ancestor(tip, orch_config.git.main_branch)):
                         # Live branch is already an ancestor of main (normal merged case).
                         # tip != main_tip guards against the no-op case: a branch sitting at
                         # exactly main's HEAD satisfies is_ancestor trivially (a commit is
                         # its own ancestor) but nothing has been merged.
-                        # merge_sha = branch tip (NOT the merge commit for --no-ff; see
-                        # _found_on_main_response docstring for the semantic distinction).
-                        return _found_on_main_response(request_id, tip)
+                        # Degeneracy guard (task 3103): a tip still equal to the
+                        # recorded branch_base_sha proves ZERO commits were ever
+                        # pushed beyond the creation point.  Such a branch is parked
+                        # at an OLD main commit, which makes it an ancestor of main
+                        # AND distinct from main_tip — both conjuncts above pass — so
+                        # without this guard the tier stamps a confident `done`
+                        # against a commit containing none of the task's work.  A
+                        # degenerate branch falls through to the honest Tier-4
+                        # unknown.  Runs FIRST and independently of the citation gate:
+                        # a degenerate branch whose task DOES have a citing commit on
+                        # main (reify 5493) is caught only by this ordering.
+                        metadata = await _git_authority_task_metadata(tid)
+                        if not await branch_is_degenerate(git_ops, full_branch, metadata):
+                            # merge_sha = branch tip (NOT the merge commit for --no-ff; see
+                            # _found_on_main_response docstring for the semantic distinction).
+                            return _found_on_main_response(request_id, tip)
                     elif tip is None:
                         # Branch ref gone — the canonical 4352 deleted-branch shape.
                         # find_merge_marker internally gates on branch existence so it only
