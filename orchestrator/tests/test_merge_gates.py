@@ -1177,6 +1177,11 @@ class TestMapAdvanceFailureParkLockContended:
             'lock_path': '/p/.git/index.lock',
             'age_seconds': 301.0,
             'waited_seconds': 300.0,
+            # A coherent real shape: the lock was ~1s old when first observed
+            # and the full 300s grace was waited out. (This test asserts
+            # nothing about recovery advice — see the dedicated tests below.)
+            'initial_age_seconds': 1.0,
+            'grace_seconds': 300.0,
             'dirty_files': [],
         }
         halt = MagicMock()
@@ -1239,3 +1244,119 @@ class TestMapAdvanceFailureParkLockContended:
 
         halt.assert_not_called()
         assert outcome.status == 'blocked'
+
+    async def _map(self, info: dict | None) -> tuple:
+        """Map a `park_lock_contended` with *info* as the side channel.
+
+        Returns ``(outcome, halt)`` so each caller can assert both the
+        recovery text and the (invariant) non-halting disposition.
+        """
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        if info is not None:
+            git_ops._last_park_lock_info = info
+        halt = MagicMock()
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t9',
+            merge_commit_fallback='deadbeef',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+        return (outcome, halt)
+
+    async def test_live_commit_shape_gets_no_destructive_advice(self) -> None:
+        """A live `git commit --only` must NEVER be told to `rm -f` its lock.
+
+        This is the headline regression.  Telling an operator to delete a
+        live commit's index.lock corrupts that in-flight commit — the exact
+        destruction the implementation forbids ITSELF from doing elsewhere
+        (see test_foreign_lock_file_is_never_deleted, and git_ops' "the
+        foreign lock left strictly alone").
+
+        The shape below is an ordinary docs-direct-commit-on-main: the lock
+        was 2s old when we first saw it and its pre-commit hook (this repo's
+        runs pyright; CLAUDE.md instructs `timeout: 300000`) merely outlived
+        the 300s grace by a couple of seconds.  Note `age_seconds` (302) is
+        greater than `waited_seconds` (300) — which is why a staleness test
+        keyed on the POST-wait age fires here, wrongly.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 302.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 2.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+
+        assert 'rm -f' not in outcome.reason, (
+            'a live commit must never be offered destructive lock removal; '
+            f'got {outcome.reason!r}'
+        )
+        assert 'crashed' not in outcome.reason.lower(), (
+            'a 2-second-old lock must not be described as a crashed leftover; '
+            f'got {outcome.reason!r}'
+        )
+
+        # Suppressing the ADVICE must not suppress the DIAGNOSIS.
+        assert '/p/.git/index.lock' in outcome.reason
+        assert '302' in outcome.reason, (
+            f'reason must still report the observed age; got {outcome.reason!r}'
+        )
+        assert '300' in outcome.reason, (
+            f'reason must still report how long we waited; got {outcome.reason!r}'
+        )
+
+    async def test_crashed_leftover_shape_still_gets_the_advice(self) -> None:
+        """A lock already older than a full grace when FIRST observed is the
+        one shape for which `rm -f` is defensible."""
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+
+        assert 'rm -f /p/.git/index.lock' in outcome.reason, (
+            'an hour-old leftover must carry actionable recovery; got '
+            f'{outcome.reason!r}'
+        )
+        # Asserted on the substantive token, never on prose wording: the
+        # advice is only safe when paired with the liveness check.
+        assert 'no git process' in outcome.reason.lower(), (
+            'destructive advice must tell the operator to confirm no git '
+            f'process is running in project_root first; got {outcome.reason!r}'
+        )
+
+    async def test_missing_staleness_keys_default_to_no_advice(self) -> None:
+        """Absent evidence of staleness is not evidence of staleness.
+
+        A pre-step-15 (legacy) side-channel dict carries neither
+        `initial_age_seconds` nor `grace_seconds`.  The failure mode of a
+        false positive here is data loss, so the conservative default is no
+        advice — and never a raise.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'rm -f' not in outcome.reason, (
+            'a side channel with no staleness evidence must not produce '
+            f'destructive advice; got {outcome.reason!r}'
+        )
