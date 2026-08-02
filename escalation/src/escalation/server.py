@@ -1404,7 +1404,11 @@ def create_server(
           that verify has been running.  Cancel it (merge_cancel) then resubmit.
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
-          already an ancestor of main (fast-path — no enqueue, no request_id)
+          already an ancestor of main AND the branch is not degenerate — i.e.
+          it advanced past its recorded ``branch_base_sha``; a zero-commit
+          branch is parked at an OLD main commit, which satisfies ancestry
+          while carrying none of the task's work (task 3103)
+          (fast-path — no enqueue, no request_id)
           or the worker detected the branch was already merged via merge marker
           (worker-path — also carries request_id and a None commit from
           outcome.merge_sha).  All keys are present in both paths; callers
@@ -1420,6 +1424,9 @@ def create_server(
         # resolves at runtime because the escalation server is hosted inside the
         # orchestrator process; it is unresolvable in escalation's standalone
         # typecheck env (orchestrator is not on its path), hence the suppression.
+        from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+            branch_is_degenerate,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
@@ -1461,22 +1468,54 @@ def create_server(
                 'conflict_details': '',
                 'push_status': None,
             }
-            if resolved_tip is not None and await git_ops_for_scan.is_ancestor(
-                resolved_tip, orch_config.git.main_branch
-            ):
-                return already_merged_response
-            # Rebased-landing backstop (task 2945): a branch whose content
-            # landed on main as a rebased/cherry-picked commit is NOT a literal
-            # ancestor of main (is_ancestor misses above), yet its work is
-            # fully present by patch-id.  patch_content_contained (`git cherry`)
-            # catches this dominant landing mode and kills the guaranteed-no-op
-            # resubmission at the door — NO enqueue, NO merge_queued event, same
-            # already_merged shape as the ancestor arm.  Fail-open: any git
-            # error → False → falls through to the normal coalesce/enqueue path.
-            if resolved_tip is not None and await patch_content_contained(
-                resolved_tip, orch_config.git.main_branch, git_ops_for_scan
-            ):
-                return already_merged_response
+            # Degeneracy guard (task 3103).  Gates the WHOLE fast-path block —
+            # both arms, deliberately.  patch_content_contained runs
+            # `git cherry <main> <tip>` and returns True when no `+` lines
+            # appear, which for a ZERO-COMMIT branch is true VACUOUSLY (git
+            # emits nothing), so gating only the is_ancestor arm would leak the
+            # degenerate branch into the backstop and still return
+            # {status:'already_merged', commit:<parked foreign SHA>} — a phantom
+            # done on a WRITE path (the runbooks treat already_merged the same
+            # as done and stamp done_provenance from result['commit']).  The
+            # 2945 backstop's own logic is untouched: a rebased landing has
+            # commits beyond its base, so it is non-degenerate by construction
+            # and this guard never fires on it.
+            #
+            # Fail-soft with its OWN try/except (merge_request's fast-path has
+            # no enclosing fire-safe wrapper): a probe fault must never break
+            # submission.  The failure direction is benign either way — an
+            # over-tightened check merely falls through to the normal
+            # coalesce/enqueue, where the worker re-detects already-merged.
+            # That is a redundant no-op merge, never a wrong answer.
+            try:
+                degenerate = await branch_is_degenerate(
+                    git_ops_for_scan, full_branch,
+                    await _git_authority_task_metadata(task_id),
+                )
+            except Exception:
+                logger.warning(
+                    'merge_request: degeneracy probe failed for %s — proceeding '
+                    'as non-degenerate',
+                    full_branch, exc_info=True,
+                )
+                degenerate = False
+            if not degenerate:
+                if resolved_tip is not None and await git_ops_for_scan.is_ancestor(
+                    resolved_tip, orch_config.git.main_branch
+                ):
+                    return already_merged_response
+                # Rebased-landing backstop (task 2945): a branch whose content
+                # landed on main as a rebased/cherry-picked commit is NOT a literal
+                # ancestor of main (is_ancestor misses above), yet its work is
+                # fully present by patch-id.  patch_content_contained (`git cherry`)
+                # catches this dominant landing mode and kills the guaranteed-no-op
+                # resubmission at the door — NO enqueue, NO merge_queued event, same
+                # already_merged shape as the ancestor arm.  Fail-open: any git
+                # error → False → falls through to the normal coalesce/enqueue path.
+                if resolved_tip is not None and await patch_content_contained(
+                    resolved_tip, orch_config.git.main_branch, git_ops_for_scan
+                ):
+                    return already_merged_response
 
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
         # instantiation configs never call load_config, so _module_configs stays None).
