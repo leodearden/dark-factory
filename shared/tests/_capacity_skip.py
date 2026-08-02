@@ -28,8 +28,24 @@ CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
     'account unavailable',  # narrowed from bare 'unavailable' to avoid generic network errors
     'out of extra usage',
     'usage limit',
-    "you've hit your usage",   # narrowed prefix to avoid matching innocuous "you've hit a snag" phrasing
-    "you've used all",         # narrowed prefix to avoid matching innocuous "you've used the wrong format" phrasing
+    # Production's own prefix, verbatim: invocation_outcome.CAP_HIT_PREFIXES[0].
+    # It was once narrowed to "you've hit your usage" to avoid matching
+    # "You've hit a snag" — but that narrowing was NOT load-bearing ("hit a" is
+    # not "hit your", so the snag phrasing never matched either way) and it
+    # cost every non-'usage' limit variant: weekly, session, 5-hour, Opus.  Do
+    # not re-narrow it; the boundary negative it was meant to guard is pinned
+    # in test_capacity_skip.py and stays green with the broad prefix.
+    "you've hit your",
+    # Lead-in-independent backstops, so a CLI rewording that drops the
+    # "You've hit your" preamble still trips the guard.  The 5-hour variant
+    # needs no marker of its own — it is covered twice over, by the prefix
+    # above and by 'usage limit'.
+    'weekly limit',
+    'session limit',
+    # THIS narrowing IS load-bearing, unlike the "hit" one above: a bare
+    # "you've used" matches the pinned negative "You've used the wrong
+    # format."  Leave it narrow.
+    "you've used all",
 )
 
 
