@@ -684,6 +684,200 @@ class TestMem0BackendScrollCollectionPages:
         )
 
 
+class TestMem0BackendScrollAllByMetadata:
+    """The metadata-addressed full-enumeration generator.
+
+    Same addressing as ``scroll_by_metadata`` (Scope + non-empty filters) and
+    the same per-record shape, but it EXHAUSTS the match set by paging instead
+    of returning one capped list.  ``scroll_by_metadata`` is untouched and
+    keeps its one-shot semantics for callers that want them
+    (``scripts/audit_duplicate_memories.py``).
+    """
+
+    def _make_mock_point(
+        self, point_id: str, created_at: str | None = None, extra_meta: dict | None = None, vector=_UNSET,
+    ):
+        """Reuse the with-vectors suite's double (it models a missing vector)."""
+        return TestMem0BackendScrollByMetadataWithVectors._make_mock_point(
+            self, point_id, created_at, extra_meta, vector,
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolves_collection_name_from_scope_and_prefix(self, backend):
+        """Collection resolution matches scroll_by_metadata's exactly."""
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_all_by_metadata(
+                Scope(project_id='dark_factory'), {'category': 'procedural_knowledge'},
+            ))
+
+        prefix = backend.config.mem0.collection_prefix
+        assert client.scroll.call_args.kwargs['collection_name'] == f'{prefix}_dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_scroll_filter_equals_the_count_filter_for_the_same_filters(self, backend):
+        """ANTI-DRIFT at THIS entry point — the census's reconciliation depends on it.
+
+        census_project COUNTs with count_by_metadata and SCROLLs with this
+        API, then compares the two figures to decide coverage.complete.  If
+        their filters drifted, the reconciliation would compare two different
+        point sets and still report complete coverage.
+        """
+        filters = {'category': 'observations_and_summaries'}
+        scope = Scope(project_id='dark_factory')
+
+        count_client = AsyncMock()
+        count_client.count = AsyncMock(return_value=MagicMock(count=0))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=count_client)):
+            await backend.count_by_metadata(scope=scope, filters=filters)
+
+        scroll_client = _paging_client([([], None)])
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=scroll_client)):
+            await _drain(backend.scroll_all_by_metadata(scope, filters))
+
+        count_filter = count_client.count.call_args.kwargs.get('count_filter')
+        scroll_filter = scroll_client.scroll.call_args.kwargs.get('scroll_filter')
+        assert scroll_filter == count_filter == backend._build_payload_filter(filters)
+
+    @pytest.mark.asyncio
+    async def test_record_shape_is_identical_to_scroll_by_metadata(self, backend):
+        """Element-wise equality between the list API and the stream API.
+
+        Both normalise through the same helper, so the two shapes cannot
+        drift — a caller migrating from one to the other sees byte-identical
+        records.
+        """
+        def _points():
+            return [
+                self._make_mock_point('id-1', '2026-01-01T00:00:00+00:00', {'category': 'x'}),
+                self._make_mock_point('id-2', None, {'category': 'x'}),
+            ]
+
+        filters = {'category': 'x'}
+        scope = Scope(project_id='p')
+
+        list_client = AsyncMock()
+        list_client.scroll = AsyncMock(return_value=(_points(), None))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=list_client)):
+            as_list = await backend.scroll_by_metadata(scope, filters)
+
+        stream_client = _paging_client([(_points(), None)])
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=stream_client)):
+            as_stream = await _drain(backend.scroll_all_by_metadata(scope, filters))
+
+        assert as_stream == as_list
+        assert as_stream[0] == {
+            'id': 'id-1', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {'category': 'x'},
+        }
+        assert as_stream[1]['created_at'] is None, 'a payload with no created_at degrades to None'
+
+    @pytest.mark.asyncio
+    async def test_records_stream_across_page_boundaries_in_order(self, backend):
+        """The whole point: the match set is exhausted, not capped at one page."""
+        pages = [
+            ([self._make_mock_point('id-1'), self._make_mock_point('id-2')], 'off-1'),
+            ([self._make_mock_point('id-3')], None),
+        ]
+        client = _paging_client(pages)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, page_size=2,
+            ))
+
+        assert [r['id'] for r in got] == ['id-1', 'id-2', 'id-3']
+        assert [c.kwargs.get('offset') for c in client.scroll.await_args_list] == [None, 'off-1']
+
+    @pytest.mark.asyncio
+    async def test_with_vectors_lifts_vectors_and_degrades_missing_ones(self, backend):
+        """with_vectors=True adds 'vector'; a vector-less point degrades to None, not dropped."""
+        p_ok = self._make_mock_point('id-ok', vector=[0.1, 0.2])
+        p_missing = self._make_mock_point('id-missing', vector=None)
+        client = _paging_client([([p_ok, p_missing], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, with_vectors=True,
+            ))
+
+        assert client.scroll.call_args.kwargs['with_vectors'] is True
+        assert len(got) == 2, 'a vector-less point must still be returned, not dropped'
+        assert got[0]['vector'] == [0.1, 0.2]
+        assert got[1]['vector'] is None
+
+    @pytest.mark.asyncio
+    async def test_no_vector_key_when_with_vectors_is_false(self, backend):
+        """Default mode must not add a 'vector' key nor pay to transfer vectors."""
+        client = _paging_client([([self._make_mock_point('id-1')], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_all_by_metadata(Scope(project_id='p'), {'category': 'x'}))
+
+        assert client.scroll.call_args.kwargs['with_vectors'] is False
+        assert 'vector' not in got[0], f'got keys {sorted(got[0])}'
+
+    @pytest.mark.asyncio
+    async def test_empty_filters_raises_value_error(self, backend):
+        """Empty filters is rejected — it would enumerate the whole collection."""
+        with pytest.raises(ValueError, match='scroll_all_by_metadata requires at least one filter'):
+            await _drain(backend.scroll_all_by_metadata(Scope(project_id='p'), {}))
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_out_of_the_generator(self, backend):
+        """A timed-out page must never be mistaken for the end of the stream."""
+        client = AsyncMock()
+        client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(TimeoutError),
+        ):
+            await _drain(backend.scroll_all_by_metadata(Scope(project_id='p'), {'category': 'x'}))
+
+    @pytest.mark.asyncio
+    async def test_page_budget_exhaustion_propagates_out_of_the_generator(self, backend):
+        """A truncated enumeration raises rather than ending short."""
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        client = _paging_client([
+            ([self._make_mock_point('id-1')], 'off-1'),
+            ([self._make_mock_point('id-2')], 'off-2'),
+        ])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPageBudgetExhausted),
+        ):
+            await _drain(backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, page_size=1, max_pages=2,
+            ))
+
+    @pytest.mark.asyncio
+    async def test_streams_rather_than_accumulating(self, backend):
+        """Consuming one record fetches ONE page — peak memory is a page, not the corpus.
+
+        This is what a list-returning API structurally cannot offer, and the
+        reason the census can fold a live corpus into counters safely.
+        """
+        client = _paging_client([
+            ([self._make_mock_point('id-1'), self._make_mock_point('id-2')], 'off-1'),
+            ([self._make_mock_point('id-3')], None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            agen = backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, page_size=2,
+            )
+            first = await anext(agen)
+            assert first['id'] == 'id-1'
+            assert client.scroll.await_count == 1, (
+                'consuming one record must not have drained page 2; '
+                f'scroll was awaited {client.scroll.await_count} times'
+            )
+            await agen.aclose()
+
+
 class TestMem0BackendGetPointById:
     """get_point_by_id fetches a single Qdrant point by id, returning its raw payload.
 
