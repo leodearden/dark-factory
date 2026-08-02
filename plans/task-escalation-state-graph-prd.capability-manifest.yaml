@@ -1,0 +1,171 @@
+# Machine-readable twin of task-escalation-state-graph-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract
+# (shared/src/shared/capability_manifest.py CapabilityManifestDoc).
+# task_id values stamped by commit_planning at decompose.
+prd: plans/task-escalation-state-graph-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: null
+    title: "Widen EscalationRef with severity + filing identity; shared pin classifier"
+    capabilities:
+      - name: "pin-classifier-exists-and-severity-aware"
+        binding: "capability→producer (built by α) — home escalation/src/escalation/pins.py; EscalationRef widened at orchestrator/src/orchestrator/task_ground_truth.py:114-120/:478-481"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def classify_pins"
+          paths: ["escalation/src/escalation/"]
+          expect: present
+      - name: "escalation-severity-field-carried"
+        binding: "capability→producer (wired) — escalation/models.py:92 severity field exists today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "severity"
+          paths: ["orchestrator/src/orchestrator/task_ground_truth.py"]
+          expect: present
+  - label: "η0"
+    task_id: null
+    title: "_already_landed_dispatch_gate goes any-level"
+    capabilities:
+      - name: "dispatch-gate-any-level-veto"
+        binding: "rejection-mechanism — test authors pending+L2-only shape and observes the veto fire (harness.py:10137-10142 today L1-only)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "has_open_l1\\(task_id\\)"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+  - label: "β"
+    task_id: null
+    title: "Structured recovery emission + streak escalation"
+    capabilities:
+      - name: "recovery-veto-events-emitted"
+        binding: "capability→producer (built by β) — event pattern harness.py:5503-5514; sites task_ground_truth.py:613-641, harness.py:5560, scheduler.py:5719, harness.py:11759"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "recovery_vetoed"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "γ1"
+    task_id: null
+    title: "Path B merge-entry bail enters bounded escalated-wait"
+    capabilities:
+      - name: "no-steward-less-escalated-exit-at-merge-entry"
+        binding: "capability→producer (built by γ1) — Path A machinery workflow.py:12060-12343 exists; bail workflow.py:3457-3464"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "test_workflow_merge_gating_strand"
+          paths: ["orchestrator/tests/"]
+          expect: present
+  - label: "γ2"
+    task_id: null
+    title: "Merge-phase _mark_blocked carve-out + merge-halt escalate-and-block (halt-token constraints)"
+    capabilities:
+      - name: "halt-rehydration-category-at-level-ge-1"
+        binding: "capability→producer (built by γ2) — rehydration harness.py:9804-9851; unhalt gate harness.py:11928-11935"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "halt-token semantics pinned by γ2's tests (boundary #13/#24); a grep cannot express 'exit path never unhalts'"
+  - label: "γ3"
+    task_id: null
+    title: "Truthful REQUEUED/CANCELLED/infra exits"
+    capabilities:
+      - name: "requeued-exits-write-pending"
+        binding: "capability→producer (built by γ3) — WarmLaneRequeue workflow.py:2853-2901; soft-cancel :14919-14923; infra resume harness.py:12846-12866"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "exit-status truthfulness pinned by γ3's tests; no stable grep"
+  - label: "δ"
+    task_id: null
+    title: "CONVERT_TO_BLOCKED recovery rows + applier (log-mode)"
+    capabilities:
+      - name: "convert-to-blocked-action-exists"
+        binding: "capability→producer (built by δ) — _RECOVERY task_ground_truth.py:533-641; claimant-clear pattern scheduler.py:5726-5735; park-stop deque scheduler.py:2278-2281"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "CONVERT_TO_BLOCKED"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "ζ"
+    task_id: null
+    title: "resume acts on claimant-liveness (W2 B2)"
+    capabilities:
+      - name: "resume-repends-stranded-row"
+        binding: "capability→producer (built by ζ) — cascade harness.py:12789-12917; Table B action_effects.py:107-142; oracle task_claimant.py:106-141"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioral; pinned by boundary #6/#11 tests"
+  - label: "η"
+    task_id: null
+    title: "Veto-site collapse onto classifier + reaper filing-incarnation rule"
+    capabilities:
+      - name: "one-pin-predicate-at-all-sites"
+        binding: "capability→producer α (upstream) + built by η"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "classify_pins"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "θ"
+    task_id: null
+    title: "Tighten _OUTCOME_ALLOWED + loud SM-2 (log-mode)"
+    capabilities:
+      - name: "escalated-allows-blocked-only"
+        binding: "capability→producer (built by θ) — table task_transitions.py:279-330; SM-2 workflow.py:3218-3246; W9 suites orchestrator/tests/test_workflow_state_machine*.py exist"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "table content + gated loudness; asserted by shared/tests/test_task_transitions.py updates, not a grep"
+  - label: "ι"
+    task_id: null
+    title: "Observability projection (burndown split, stranded badge, PINNING chip)"
+    capabilities:
+      - name: "claimant-fields-reach-dashboard"
+        binding: "capability→producer — fields on wire sqlite_task_backend.py:918-937; dropped at dashboard/data/tasks.py:101-111 (ι rewires)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "claimant_run_id"
+          paths: ["dashboard/src/dashboard/"]
+          expect: present
+  - label: "κ"
+    task_id: null
+    title: "Docs alignment (ARCHITECTURE.md, task-authoring.md)"
+    capabilities:
+      - name: "docs-describe-both-escalated-paths-and-conversion"
+        binding: "doc targets verified divergent (spec E13)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "task-escalation-state-spec"
+          paths: ["ARCHITECTURE.md"]
+          expect: present
+  - label: "λ"
+    task_id: null
+    title: "Deploy operator gate (deterministic)"
+    capabilities:
+      - name: "pure-gate-shape-valid"
+        binding: "task_kind=deterministic + always_escalates=true, no before_done (docs/task-authoring.md §5)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "operator gate; nothing to grep"
+  - label: "μ"
+    task_id: null
+    title: "Soak + enforcement flip gate (deterministic)"
+    capabilities:
+      - name: "soak-evidence-sources-upstream"
+        binding: "producer:β (events) + producer:θ (would-violate counter), both upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "operator gate reading soak evidence; nothing to grep"
