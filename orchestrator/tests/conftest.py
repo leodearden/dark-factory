@@ -764,10 +764,17 @@ def make_steward(tmp_path: Path):
     must close over ``tmp_path`` to own the worktree directory; ``mock_orch_config``
     below is the same shape and the precedent for it.
 
-    Worktree ownership: with no ``worktree=`` argument the fixture picks
-    ``tmp_path / 'wt'`` and creates it (plus a ``.task`` subdir), so no caller
-    needs to name a path.  A caller-supplied path is accepted for the
-    two-stewards-in-one-test case.
+    Worktree ownership — an ENFORCED invariant, not a convention: with no
+    ``worktree=`` argument the fixture picks ``tmp_path / 'wt'`` and creates it
+    (plus a ``.task`` subdir), so the common case is structurally safe and no
+    caller needs to name a path.  A caller-supplied path (for the
+    two-stewards-in-one-test case) is asserted to resolve *strictly below*
+    ``tmp_path`` before anything is created, because the steward derives its
+    artifacts root as a SIBLING of the worktree —
+    ``<worktree.parent>/.task-meta/<worktree.name>``, see ``TASK_META_DIRNAME``
+    in ``orchestrator/config.py`` and ``TaskArtifacts.meta_root_for`` in
+    ``orchestrator/artifacts.py`` — so ``worktree=tmp_path`` would put that
+    sibling outside the directory pytest's retention policy reclaims.
 
     Config defaults applied (union of what both former factories set; a caller
     overrides any of them via ``config_overrides``, applied last):
@@ -787,6 +794,19 @@ def make_steward(tmp_path: Path):
 
         if worktree is None:
             worktree = tmp_path / 'wt'
+        else:
+            # Checked BEFORE any mkdir, so a rejected path is never created.
+            resolved, root = worktree.resolve(), tmp_path.resolve()
+            if resolved == root or not resolved.is_relative_to(root):
+                raise AssertionError(
+                    f'make_steward(worktree={worktree!r}) must be strictly below this '
+                    f"test's tmp_path ({tmp_path}). The steward derives its .task-meta "
+                    'artifacts root as <worktree.parent>/.task-meta/<worktree.name> '
+                    '(orchestrator/config.py:TASK_META_DIRNAME, artifacts.meta_root_for), '
+                    'so a worktree AT tmp_path lands them in tmp_path.parent — outside '
+                    'the directory pytest reclaims. Pass a sub-path, or omit the kwarg '
+                    'and let the fixture own the dir.'
+                )
         worktree.mkdir(parents=True, exist_ok=True)
         (worktree / '.task').mkdir(exist_ok=True)
 
