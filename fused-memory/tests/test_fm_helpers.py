@@ -980,12 +980,16 @@ class TestAwaitIndexOperational:
 
         EVERY index on the graph has to be ready; an `any()`-style predicate
         would let a half-built graph through and reinstate the false-green.
+
+        Matches the TIMEOUT path's message: IndexHeaderError also subclasses
+        AssertionError, so a bare `pytest.raises(AssertionError)` would stay
+        green if a regression made the header check fire spuriously here.
         """
         from _fm_helpers import await_index_operational
 
         graph = _FakeIndexGraph([_index_result(_OPERATIONAL, _UNDER_CONSTRUCTION)])
 
-        with pytest.raises(AssertionError):
+        with pytest.raises(AssertionError, match='not OPERATIONAL'):
             await await_index_operational(graph, timeout_s=0.05)
 
     @pytest.mark.asyncio
@@ -998,6 +1002,11 @@ class TestAwaitIndexOperational:
         resolves `status` by name reads the real, still-building value and
         blocks. This is the assertion that stops a FalkorDB column reorder from
         silently turning the barrier into a no-op.
+
+        Matches the TIMEOUT path's message so the case cannot be satisfied by
+        the header-shape path instead: the reordered header DOES contain a
+        `status` column, so reaching IndexHeaderError here would mean the
+        by-name resolution broke, not that the barrier blocked.
         """
         from _fm_helpers import await_index_operational
 
@@ -1009,7 +1018,7 @@ class TestAwaitIndexOperational:
 
         graph = _FakeIndexGraph([_FakeIndexResult(reordered, [row])])
 
-        with pytest.raises(AssertionError):
+        with pytest.raises(AssertionError, match='not OPERATIONAL'):
             await await_index_operational(graph, timeout_s=0.05)
 
     @pytest.mark.asyncio
@@ -1023,16 +1032,24 @@ class TestAwaitIndexOperational:
         timeout message would hide a silent no-op behind a plausible-looking
         timeout, so this must raise on the FIRST query with the observed header
         names in the message — and must never skip.
+
+        Asserts the EXACT type (IndexHeaderError, not the AssertionError it
+        subclasses): the whole point of the distinct type is that a caller can
+        tell the two paths apart, so a test that accepted the base type would
+        stay green if the paths were collapsed back together.
         """
-        from _fm_helpers import await_index_operational
+        from _fm_helpers import IndexHeaderError, await_index_operational
 
         header = [(1, 'label'), (1, 'properties'), (1, 'state')]
         graph = _FakeIndexGraph([_FakeIndexResult(header, [['Entity', ['name'], 'READY']])])
 
-        with pytest.raises(AssertionError) as excinfo:
+        with pytest.raises(IndexHeaderError) as excinfo:
             await await_index_operational(graph, timeout_s=5.0)
 
         message = str(excinfo.value)
+        assert 'not OPERATIONAL' not in message, (
+            f'the header-shape failure must not be dressed up as a timeout: {message!r}'
+        )
         assert 'status' in message
         for name in ('label', 'properties', 'state'):
             assert name in message, f'header name {name!r} missing from {message!r}'
@@ -1067,10 +1084,14 @@ class TestAwaitIndexOperational:
         `all()` over an empty sequence is vacuously True, so without an explicit
         non-empty guard a graph whose index vanished (or was never created)
         would return success having gated nothing.
+
+        Matches the TIMEOUT path's message: the header here is the well-formed
+        live one, so an IndexHeaderError would mean the header check fired
+        spuriously — a bare `pytest.raises(AssertionError)` could not tell.
         """
         from _fm_helpers import await_index_operational
 
         graph = _FakeIndexGraph([_FakeIndexResult(_LIVE_INDEX_HEADER, [])])
 
-        with pytest.raises(AssertionError):
+        with pytest.raises(AssertionError, match='not OPERATIONAL'):
             await await_index_operational(graph, timeout_s=0.05)

@@ -710,9 +710,14 @@ async def poll_until(
 # (no leading underscore) because it is now imported cross-module, matching
 # poll_until / ensure_fresh_collection / collection_vector_size.
 # tests/test_falkor_index_barrier_guard.py enforces that routing.
+#
+# IndexHeaderError is public for the same reason: it is the blessed name a
+# caller catches to tell "FalkorDB changed shape" apart from "the index never
+# became ready". Keeping it module-private would document a distinction across
+# the module boundary that no caller could actually reach.
 # ---------------------------------------------------------------------------
 
-class _IndexHeaderError(AssertionError):
+class IndexHeaderError(AssertionError):
     """``CALL db.indexes()`` did not expose a ``status`` column.
 
     A distinct type from the timeout AssertionError because the two failure
@@ -721,6 +726,12 @@ class _IndexHeaderError(AssertionError):
     column means FalkorDB changed its result shape and the barrier cannot be
     trusted at all. Collapsing the second into a generic timeout message would
     hide a silent no-op behind a plausible-looking timeout.
+
+    Subclasses ``AssertionError`` so a caller that only cares that the barrier
+    failed can still catch the broad type, while a caller that needs to act on
+    the difference has a name to catch. Callers asserting on the *timeout* path
+    specifically should match its message (``'not OPERATIONAL'``) rather than
+    the bare type, which this subclass also satisfies.
     """
 
 
@@ -772,7 +783,7 @@ async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
             budget inside it.
 
     Raises:
-        _IndexHeaderError: ``CALL db.indexes()`` exposed no ``status`` column —
+        IndexHeaderError: ``CALL db.indexes()`` exposed no ``status`` column —
             raised on the first poll, never retried until the deadline.
         AssertionError: Not every index became ``OPERATIONAL`` within
             *timeout_s*; the message carries the last-seen status strings.
@@ -784,7 +795,7 @@ async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
         result = await graph.query('CALL db.indexes()')
         header_names = [col[1] for col in result.header]
         if 'status' not in header_names:
-            raise _IndexHeaderError(
+            raise IndexHeaderError(
                 'CALL db.indexes() has no "status" column; FalkorDB changed its '
                 f'result shape (header={header_names}). The index-readiness '
                 'barrier cannot be trusted until this is re-verified.'
@@ -795,7 +806,7 @@ async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
 
     try:
         await poll_until(_all_operational, timeout=timeout_s, interval=0.05)
-    except _IndexHeaderError:
+    except IndexHeaderError:
         # Shape failure — propagate untouched so it is never reported as (or
         # masked by) a timeout.
         raise
