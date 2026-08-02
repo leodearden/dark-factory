@@ -1116,3 +1116,126 @@ class TestIsCrossRepoTask:
         assert is_cross_repo_task([str(inside)], project_root, None) is False
         # A falsy marker is treated as absent.
         assert is_cross_repo_task([str(inside)], project_root, {'cross_repo': False}) is False
+
+
+class TestParkLockContendedIsNotAHaltResult:
+    """The structural contract that makes task 3060's fix work.
+
+    Because `park_lock_contended` is absent from `_HALT_ADVANCE_RESULTS`,
+    merge_queue's existing plumbing already routes it past the halt path
+    untouched — the explicit mapper branch only upgrades the reason text to
+    structured facts. The fix is therefore safe-by-default: an unhandled new
+    code already means "no halt".
+
+    NOTE: test_merge_queue.py::TestHaltAdvanceResults already asserts EXACT
+    frozenset equality against a literal 5-element set, so that pin passes
+    unchanged and that file needs no edit. This assertion is the explicit,
+    NAMED contract for this code, not a duplicate of it — it records WHY
+    park_lock_contended must stay out.
+    """
+
+    def test_park_lock_contended_is_not_a_halt_result(self) -> None:
+        from orchestrator.merge_queue import _HALT_ADVANCE_RESULTS
+
+        assert 'park_lock_contended' not in _HALT_ADVANCE_RESULTS, (
+            'park_lock_contended must NEVER halt the merge queue — adding it '
+            'here reinstates the 2+/day queue halt task 3060 exists to remove'
+        )
+
+
+@pytest.mark.asyncio
+class TestMapAdvanceFailureParkLockContended:
+    """`park_lock_contended` must be disposed of PER TASK, never as a queue
+    halt — the structural contract that makes task 3060's fix work.
+
+    Contrast `stash_failed` (above): that is a SHARED main-checkout-hygiene
+    fault that recurs identically for every subsequent task, so halting
+    collapses N silent per-task blocks into one loud signal.
+    `park_lock_contended` is the opposite — a FOREIGN git process (dominantly
+    a `git commit --only` holding the index lock across its pre-commit hook)
+    owns project_root's index for a bounded, SELF-CLEARING window. Halting
+    the queue for it is the 2+/day halt this task exists to remove.
+    """
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        # Same gotcha as TestMapAdvanceFailureStashFailed._make_git_ops: a
+        # bare MagicMock auto-vivifies a TRUTHY child attribute, which would
+        # defeat the mapper's `getattr(..., None) or <default>` fallback. Any
+        # side channel not deliberately set must be deleted.
+        del git_ops._last_stash_dirty_files
+        del git_ops._last_park_lock_info
+        return git_ops
+
+    async def test_park_lock_contended_blocks_without_halting(self) -> None:
+        """Per-task 'blocked' with structured facts; halt/unhalt untouched."""
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        git_ops._last_park_lock_info = {
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 301.0,
+            'waited_seconds': 300.0,
+            'dirty_files': [],
+        }
+        halt = MagicMock()
+        unhalt = MagicMock()
+        cas_retries = {'t1': 2}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t1',
+            merge_commit_fallback='deadbeef',
+            halt=halt,
+            unhalt=unhalt,
+            cas_retries=cas_retries,
+        )
+
+        # (1)/(2) The queue is left strictly alone.
+        halt.assert_not_called()
+        unhalt.assert_not_called()
+
+        # (3) Per-task disposition, reusing the existing status.
+        assert outcome.status == 'blocked'
+
+        # (4) The reason carries the SUBSTANTIVE facts an operator needs —
+        # asserted on the path and the numbers, never on prose wording.
+        assert '/p/.git/index.lock' in outcome.reason
+        assert '301' in outcome.reason, (
+            f'reason must report the observed lock age; got {outcome.reason!r}'
+        )
+        assert '300' in outcome.reason, (
+            f'reason must report how long we waited; got {outcome.reason!r}'
+        )
+        assert 'transient' in outcome.reason.lower(), (
+            f'reason must state this is transient/retried; got {outcome.reason!r}'
+        )
+
+        # (5) Terminal-for-this-attempt bookkeeping.
+        assert 't1' not in cas_retries
+
+    async def test_park_lock_contended_survives_an_unset_side_channel(self) -> None:
+        """Defensive: with _last_park_lock_info unset the mapper must still
+        return a per-task 'blocked' without halting, never raise.
+
+        Mirrors the `getattr(git_ops, '_last_stash_dirty_files', None) or []`
+        idiom — a missing side channel degrades the reason's detail, never
+        the disposition.
+        """
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()  # side channel deliberately deleted
+        halt = MagicMock()
+
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t2',
+            merge_commit_fallback='deadbeef',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
