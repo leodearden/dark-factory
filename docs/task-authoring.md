@@ -826,6 +826,18 @@ through that boundary: `task_metadata.enforce` is a red-tier restart-only flag,
 records predate the validator, and not every writer goes through
 `SqliteTaskBackend`.
 
+**Repairing a row that already carries both.** That same always-fatal rule cuts
+the other way once a contradictory row exists — written in warn-mode, or by a
+writer that bypassed `SqliteTaskBackend`. Every later `metadata_mode='merge'`
+`update_task` on it is rejected, including writes with nothing to do with the
+contradiction (`retry_ledger` updates, `files` edits), because the merged whole
+is what gets validated. To unstick such a row, clear the contradiction *in the
+same write*: merge an explicitly falsy `human_curator_gate` (a cleared marker no
+longer contradicts `before_done`), or pass `metadata_mode='replace'` with a blob
+that omits one of the two keys. No task on the live store is in this state today
+— the four rows carrying the marker all have `before_done` absent — so this is a
+forward hazard of a warn→enforce flip, not a live cleanup.
+
 **`metadata.human_curator_adjudicated_at`** (ISO-8601 string) is the required
 content-adjudication signal, stamped via `update_task` (with
 `metadata_mode='merge'`) by whoever actually performed the review.
