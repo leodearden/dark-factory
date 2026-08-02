@@ -3791,7 +3791,10 @@ class TestRunWiring:
             'no cutoff means no ANN query — never a guessed one'
         )
         assert plan['ann_threshold'] is None
-        assert plan['ann_disclosure']['ann_disabled_uncalibrated'] == 1
+        assert plan['ann_disclosure']['ann_disabled_uncalibrated'] == len(
+            _ALL_CATEGORIES,
+        ), 'the counter is now per swept category — every one of them is disabled'
+        assert plan['ann_disclosure']['ann_pooled_fallback_categories'] == 0
         assert plan['clusters_total'] == 1, 'the lexical path still ran'
 
     async def test_plan_json_is_printed_to_stdout(self, monkeypatch, tmp_path, capsys):

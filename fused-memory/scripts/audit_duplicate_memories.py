@@ -53,17 +53,31 @@ Ownership seam: task 3098 authorizes DETECTION of this pattern only. The
 disposition of the specific existing solar_challenge entries is a separate
 human-gated decision on solar_challenge task 99.
 
-The ANN cutoff is READ, never invented
---------------------------------------
-It comes from ``config.write_triage.t_high`` -- a calibration OUTPUT derived
-by ``scripts/calibrate_write_triage.py`` from measured similarity
+The ANN cutoff is READ, never invented -- and read PER CATEGORY
+---------------------------------------------------------------
+It comes from ``config.write_triage`` -- a calibration OUTPUT derived by
+``scripts/calibrate_write_triage.py`` from measured similarity
 distributions, with ``calibration_report_path`` recording its provenance.
-``--ann-threshold`` overrides it for an operator run, and the value actually
-in effect is echoed into the report. When the config is uncalibrated and no
-override is given the ANN path is DISABLED, logged at ERROR and counted as
-``ann_disabled_uncalibrated``; the lexical path still runs. A plausible
-stand-in cutoff would silently mis-cluster the corpus -- and under
-``--apply`` that means wrong deletions.
+Task 3357 made that calibration per-category, so the resolution is too, in
+strict priority per swept category:
+
+  1. ``--ann-threshold``: an explicit operator number, for every category.
+  2. ``config.write_triage.t_high_by_category[category]``: the cutoff
+     measured on THAT category's own labeled pairs.
+  3. ``config.write_triage.t_high``: the POOLED cutoff, used as a disclosed
+     fallback and counted as ``ann_pooled_fallback_categories``. The pooled
+     corpus is overwhelmingly one category, so a fallback category runs on
+     evidence gathered elsewhere -- weaker, hence counted, hence withheld
+     from ``--apply`` deletion (see ``restrict_delete_candidates_for_apply``).
+  4. Nothing: that category is ABSENT from the resolved mapping -- its ANN
+     path is DISABLED, logged at ERROR and counted as
+     ``ann_disabled_uncalibrated``. The lexical path still runs.
+
+A category with no derivable cutoff is a real outcome, not a defect: the
+committed calibration refuses one for a category with no negative pairs to
+separate against, and that refusal is itself the recorded finding. A
+plausible stand-in cutoff would silently mis-cluster the corpus -- and
+under ``--apply`` that means wrong deletions.
 
 Every cap is counted
 --------------------
@@ -71,7 +85,9 @@ The ANN path can lose candidates where a full scan cannot, so each loss is a
 metric rather than invisible recall: ``top_k_saturated``,
 ``below_threshold_dropped``, ``unknown_neighbor_dropped``, ``missing_vector``,
 ``cross_category_dropped``, ``unswept_category_dropped``, ``ann_query_errors``,
-per-category ``scan_truncated``, and ``ann_disabled_uncalibrated``. The
+per-category ``scan_truncated``, ``ann_disabled_uncalibrated``, and
+``ann_pooled_fallback_categories`` (not a lost candidate but a weaker one:
+how many categories ran on a cutoff measured on a different population). The
 liveness path adds ``liveness_snapshot_untasked`` (a recognised snapshot that
 resolves to no subject task, so no group can hold it) and
 ``liveness_snapshot_unfielded`` (point-in-time framing whose live fields could
@@ -165,7 +181,7 @@ import json
 import logging
 import re
 import sys
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -2079,54 +2095,125 @@ async def fetch_procedural_memories(
 # I/O layer: ANN candidate generation (thin, mock-tested)
 # ---------------------------------------------------------------------------
 
+def _calibrated_float(value: Any) -> float | None:
+    """A measured cutoff, or ``None`` if this leaf is not one.
+
+    ``near_duplicate_guard.resolve_near_dup_threshold``'s leaf check, hoisted
+    so the pooled scalar and every per-category map VALUE are screened by one
+    rule. ``bool`` is excluded deliberately (it is an ``int`` subclass, and
+    ``True`` would resolve as a cutoff of 1.0), and so is every non-numeric
+    object — including the attribute an unspecced Mock auto-generates.
+    """
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
 def resolve_ann_threshold(
     memory_service: Any,
     override: float | None = None,
-) -> tuple[float | None, dict[str, int]]:
-    """Resolve the ANN cosine cutoff. READ, never invented.
+    categories: Iterable[str] = (),
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Resolve the ANN cosine cutoff PER CATEGORY. READ, never invented.
 
-    The cutoff comes from ``config.write_triage.t_high`` — a CALIBRATION
-    OUTPUT derived by ``scripts/calibrate_write_triage.py`` from measured
-    similarity distributions over the curator-labeled corpus, with
+    Every cutoff is a CALIBRATION OUTPUT derived by
+    ``scripts/calibrate_write_triage.py`` from measured similarity
+    distributions over the curator-labeled corpus, with
     ``calibration_report_path`` recording its provenance. This detector reads
-    that single home; it never restates the number and never supplies a
+    that single home; it never restates a number and never supplies a
     fallback of its own.
 
-    Follows ``near_duplicate_guard.resolve_near_dup_threshold``'s defensive
-    getattr-at-every-hop shape and its ``isinstance(int | float) and not
-    bool`` leaf check (which also rejects the auto-generated attributes an
-    unspecced Mock would hand back) — but returns ``None`` instead of a
-    module default, because substituting an uncalibrated stand-in here is
-    precisely the invented threshold that is forbidden.
+    Priority per swept category (task 3357):
+
+      1. ``override`` — an explicit operator number, applied to every
+         category, including over a populated per-category map.
+      2. ``config.write_triage.t_high_by_category[category]`` — the cutoff
+         measured on THAT category's own labeled pairs.
+      3. ``config.write_triage.t_high`` — the POOLED cutoff, a DISCLOSED
+         fallback counted in ``ann_pooled_fallback_categories``. It is real
+         evidence, but gathered on a corpus dominated by one category, so a
+         fallback category is additionally withheld from ``--apply``
+         deletion by ``restrict_delete_candidates_for_apply``.
+      4. Neither — the category is ABSENT from the returned mapping. Its ANN
+         path is disabled rather than run on a guess.
+
+    Follows ``resolve_near_dup_threshold``'s defensive getattr-at-every-hop
+    shape and its ``isinstance(int | float) and not bool`` leaf check (see
+    :func:`_calibrated_float`), applied to the map's VALUES too — but returns
+    ABSENCE instead of a module default, because substituting an uncalibrated
+    stand-in here is precisely the invented threshold that is forbidden. A
+    ``t_high_by_category`` that is not a Mapping (an unspecced Mock, a stray
+    scalar) is ignored wholesale rather than probed.
 
     Args:
         memory_service: Live (or mock) MemoryService.
         override: Operator-supplied ``--ann-threshold``. Wins when given,
             including over an uncalibrated config.
+        categories: The categories actually being swept. Nothing is resolved
+            for a category that was not asked for, so an empty iterable
+            yields an empty mapping — the caller passes its swept tuple.
 
     Returns:
-        ``(threshold, disclosure)``. *threshold* is ``None`` when the config
-        is uncalibrated and no override was given — the caller must then
-        DISABLE the ANN path rather than guess. *disclosure* carries
-        ``ann_disabled_uncalibrated`` (0 or 1) so a disabled path is a
-        counted, alarmable metric rather than a silently missing detector.
+        ``({category: threshold}, disclosure)``. A category is present only
+        when a MEASURED cutoff resolved for it; an EMPTY mapping means no
+        category resolved and the caller must DISABLE the ANN path entirely
+        rather than guess. *disclosure* always carries both
+        ``ann_disabled_uncalibrated`` (how many swept categories resolved to
+        nothing) and ``ann_pooled_fallback_categories`` (how many ran on the
+        pooled number), so neither a disabled path nor weaker evidence is a
+        silently missing detector.
     """
-    if isinstance(override, int | float) and not isinstance(override, bool):
-        return float(override), {'ann_disabled_uncalibrated': 0}
+    swept = tuple(categories)
 
-    value = getattr(getattr(memory_service, 'config', None), 'write_triage', None)
-    t_high = getattr(value, 't_high', None)
-    if isinstance(t_high, int | float) and not isinstance(t_high, bool):
-        return float(t_high), {'ann_disabled_uncalibrated': 0}
+    forced = _calibrated_float(override)
+    if forced is not None:
+        return (
+            dict.fromkeys(swept, forced),
+            {'ann_disabled_uncalibrated': 0, 'ann_pooled_fallback_categories': 0},
+        )
 
-    logger.error(
-        'ANN path DISABLED: config.write_triage.t_high is not calibrated '
-        '(got %r) and no --ann-threshold override was given. Refusing to '
-        'invent a similarity cutoff — run scripts/calibrate_write_triage.py, '
-        'or pass --ann-threshold explicitly. The lexical path still runs.',
-        t_high,
-    )
-    return None, {'ann_disabled_uncalibrated': 1}
+    write_triage = getattr(getattr(memory_service, 'config', None), 'write_triage', None)
+    pooled = _calibrated_float(getattr(write_triage, 't_high', None))
+    by_category = getattr(write_triage, 't_high_by_category', None)
+    if not isinstance(by_category, Mapping):
+        by_category = {}
+
+    resolved: dict[str, float] = {}
+    pooled_fallback: list[str] = []
+    uncalibrated: list[str] = []
+    for category in swept:
+        own = _calibrated_float(by_category.get(category))
+        if own is not None:
+            resolved[category] = own
+        elif pooled is not None:
+            resolved[category] = pooled
+            pooled_fallback.append(category)
+        else:
+            uncalibrated.append(category)
+
+    if pooled_fallback:
+        logger.warning(
+            'ANN cutoff for %s falls back to the POOLED '
+            'config.write_triage.t_high (%r): the calibration derived no '
+            'cutoff of their own, so they are gated by a number measured on '
+            'a different population. Weaker evidence — these categories are '
+            'withheld from --apply deletion.',
+            ', '.join(pooled_fallback), pooled,
+        )
+    if uncalibrated:
+        logger.error(
+            'ANN path DISABLED for %s: neither config.write_triage'
+            '.t_high_by_category nor the pooled t_high is calibrated (pooled '
+            'got %r) and no --ann-threshold override was given. Refusing to '
+            'invent a similarity cutoff — run scripts/calibrate_write_triage.py, '
+            'or pass --ann-threshold explicitly. The lexical path still runs.',
+            ', '.join(uncalibrated), getattr(write_triage, 't_high', None),
+        )
+
+    return resolved, {
+        'ann_disabled_uncalibrated': len(uncalibrated),
+        'ann_pooled_fallback_categories': len(pooled_fallback),
+    }
 
 
 _ANN_QUERY_CONCURRENCY = 16
@@ -2354,9 +2441,17 @@ async def _run(args: argparse.Namespace) -> int:
     await memory.initialize()
     try:
         # The ANN cutoff is READ from the calibration (or an explicit
-        # override). None means uncalibrated: the ANN path is disabled and
-        # counted, never run against a guessed threshold.
-        ann_threshold, disclosures = resolve_ann_threshold(memory, args.ann_threshold)
+        # override), PER CATEGORY. An empty mapping means no category is
+        # calibrated: the ANN path is disabled and counted, never run against
+        # a guessed threshold.
+        ann_thresholds, disclosures = resolve_ann_threshold(
+            memory, args.ann_threshold, categories,
+        )
+        # Floor pushed down to Qdrant: the MIN of the resolved cutoffs cannot
+        # drop a candidate any category would have accepted (every cutoff is
+        # >= the min). The authoritative per-category filtering happens in the
+        # pure ann_pairs_from_neighbors.
+        ann_threshold = min(ann_thresholds.values()) if ann_thresholds else None
 
         records, scan_stats = await fetch_memories(
             memory, args.project_id, categories=categories,
