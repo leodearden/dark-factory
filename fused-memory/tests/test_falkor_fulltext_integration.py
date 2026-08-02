@@ -29,12 +29,16 @@ would pass vacuously about a third of the time even if the fix were broken, and
 the upstream-baseline test would flake red and get quarantined.  With the barrier
 the same cases were stable 5/5.
 
+The barrier itself lives in ``_fm_helpers.await_index_operational`` (task 3377
+extracted it out of this file so every live-index module shares one
+implementation); ``tests/test_falkor_index_barrier_guard.py`` enforces that this
+module keeps routing through it and never re-forks a local copy.
+
 Verified against FalkorDB module v41800 (4.18.0).
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import os
 import re
@@ -42,6 +46,7 @@ import uuid
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import await_index_operational
 from falkordb import FalkorDB as _SyncFalkorDB
 from falkordb.asyncio import FalkorDB
 from graphiti_core.driver.falkordb_driver import FalkorDriver
@@ -107,45 +112,6 @@ pytestmark = [
 ]
 
 
-async def _await_index_operational(graph, timeout_s: float = 10.0) -> None:
-    """Block until every index on ``graph`` reports ``OPERATIONAL``.
-
-    See the module docstring: FalkorDB builds full-text indices asynchronously,
-    and querying an under-construction index silently succeeds for queries the
-    parser would otherwise reject.
-
-    The ``status`` column is resolved **by name** from ``result.header`` rather
-    than hardcoded to its current position (7 of 9), so a FalkorDB column reorder
-    fails loudly here instead of silently reading the wrong column and turning
-    the barrier into a no-op.
-
-    Raises on timeout — deliberately.  A never-operational index must be a loud
-    failure; skipping or passing would reintroduce exactly the false-green this
-    barrier exists to remove.
-    """
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    last_statuses: list[str] = []
-    while True:
-        result = await graph.query('CALL db.indexes()')
-        header_names = [col[1] for col in result.header]
-        if 'status' not in header_names:
-            raise AssertionError(
-                'CALL db.indexes() has no "status" column; FalkorDB changed its '
-                f'result shape (header={header_names}). The index-readiness '
-                'barrier cannot be trusted until this is re-verified.'
-            )
-        status_idx = header_names.index('status')
-        last_statuses = [row[status_idx] for row in result.result_set]
-        if last_statuses and all(s == 'OPERATIONAL' for s in last_statuses):
-            return
-        if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError(
-                f'fulltext index not OPERATIONAL within {timeout_s}s '
-                f'(last statuses={last_statuses!r})'
-            )
-        await asyncio.sleep(0.05)
-
-
 @pytest_asyncio.fixture
 async def live_fulltext_graph():
     """Throwaway graph with an OPERATIONAL fulltext index on Entity(name, group_id)."""
@@ -164,7 +130,7 @@ async def live_fulltext_graph():
     )
     # MANDATORY — see module docstring. Without this the tests below are a
     # false-green generator.
-    await _await_index_operational(graph)
+    await await_index_operational(graph)
     try:
         yield graph
     finally:
