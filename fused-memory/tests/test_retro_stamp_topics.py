@@ -1602,6 +1602,7 @@ EXPECTED_BUCKETS = frozenset({
     'topic_underivable',
     'member_not_a_uuid',
     'cluster_without_canonical',
+    'out_of_scope_project',
 })
 
 PROSE_SUPERSEDES = (

@@ -111,6 +111,7 @@ __all__ = [
     'PatchDecision',
     'compute_patch',
     'derive_topic_slug',
+    'filter_plans_to_projects',
     'is_valid_topic_slug',
     'load_calibration_rows',
     'load_topic_registry',
@@ -862,6 +863,54 @@ def plan_gate_clusters(
     return plans, skips
 
 
+def filter_plans_to_projects(
+    plans: list[ClusterPlan],
+    projects: tuple[str, ...],
+) -> tuple[list[ClusterPlan], list[dict]]:
+    """Narrow *plans* to the selected corpora, naming everything dropped.
+
+    Pure.  ``--project`` is the operator's blast-radius bound, so it has to
+    bound EVERY source rather than only the live scroll it happens to be
+    threaded through: a planner that reads its ``project_id`` from a
+    registry entry or a committed manifest is otherwise unaffected by the
+    narrowing, and a run scoped to one corpus writes into the other.
+
+    Two properties this function exists to guarantee:
+
+    * **Named, never silent.** Each drop returns a
+      ``out_of_scope_project`` skip carrying the project, topic and source,
+      so the artifact still states what the narrowing excluded.  A sweep
+      that quietly covers less than its own report implies is the failure
+      mode the whole no-silent-caps rule guards against.
+    * **Not an error.** Deliberate narrowing is a scope statement, so
+      ``out_of_scope_project`` stays OUT of :data:`ERROR_OUTCOMES` and the
+      run still exits 0.
+
+    Order is preserved: this call narrows, it does not re-rank.
+
+    Args:
+        plans: Any planner's output.
+        projects: The selected corpora.  Empty drops everything — which is
+            what an empty selection means — rather than raising.
+
+    Returns:
+        ``(kept, skips)``.
+    """
+    kept: list[ClusterPlan] = []
+    skips: list[dict] = []
+    for plan in plans:
+        if plan.project_id in projects:
+            kept.append(plan)
+            continue
+        skips.append({
+            'reason': 'out_of_scope_project',
+            'project_id': plan.project_id,
+            'topic': plan.topic,
+            'source': plan.source,
+        })
+    return kept, skips
+
+
 # ---------------------------------------------------------------------------
 # Pure core — merging three plan lists into one per-record work list
 # ---------------------------------------------------------------------------
@@ -1178,6 +1227,7 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'topic_underivable',
     'member_not_a_uuid',
     'cluster_without_canonical',
+    'out_of_scope_project',
     # from merge_plans
     'conflicting_topic_claim',
     'canonical_disagreement',
@@ -1286,7 +1336,24 @@ async def run(
     gate_plans, gate_skips = plan_gate_clusters(gate_manifest)
     _record_skips(gate_skips)
 
-    targets, merge_skips = merge_plans(canonical_plans, calibration_plans, gate_plans)
+    # --- the scope bound, applied to ALL THREE sources ----------------------
+    # Before `merge_plans`, not after: once merged, an out-of-scope plan has
+    # already contributed its members to an in-scope topic's union, and
+    # filtering targets at that point would let the excluded corpus decide
+    # what the included one gets stamped with.
+    #
+    # `canonical_plans` goes through too, even though the scroll loop above
+    # already built it per project and it can therefore drop nothing today.
+    # That makes this a chokepoint rather than a coincidence: a fourth
+    # planner wired in ahead of it inherits the bound instead of quietly
+    # re-opening the leak this filter was added to close.
+    scoped: list[list[ClusterPlan]] = []
+    for plan_list in (canonical_plans, calibration_plans, gate_plans):
+        in_scope, out_of_scope = filter_plans_to_projects(plan_list, projects)
+        scoped.append(in_scope)
+        _record_skips(out_of_scope)
+
+    targets, merge_skips = merge_plans(*scoped)
     _record_skips(merge_skips)
 
     results: list[dict] = []
@@ -1504,6 +1571,14 @@ def resolve_projects(args) -> tuple[str, ...]:
     all three — silently widening a sweep whose entire safety argument is
     that it is narrow.  Hence ``default=None`` here and the fallback in one
     named place.
+
+    The selection bounds EVERY source, not only the live canonical scroll
+    it is passed to: ``run`` funnels all three plan lists through
+    :func:`filter_plans_to_projects` before merging them, and names each
+    drop under ``out_of_scope_project``.  Without that, a run narrowed to
+    one corpus still wrote into the other, since the calibration join takes
+    its project from the registry entry and the gate manifest hard-codes
+    ``dark_factory``.
     """
     return tuple(args.projects) if args.projects else DEFAULT_PROJECTS
 
@@ -1523,7 +1598,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--project', dest='projects', action='append', default=None,
         help=f'Project to sweep; repeatable. Replaces the default '
-             f'({", ".join(DEFAULT_PROJECTS)}) rather than extending it.',
+             f'({", ".join(DEFAULT_PROJECTS)}) rather than extending it. '
+             f'Bounds every source — the live scroll, the calibration join '
+             f'and the gate manifest alike — and the report names each '
+             f'plan it excluded under out_of_scope_project.',
     )
     parser.add_argument(
         '--json-out', dest='json_out', default=DEFAULT_JSON_OUT,
