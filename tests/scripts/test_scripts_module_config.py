@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import pathlib
 import shlex
+import tomllib
+from typing import Any
 
 from orchestrator import verify, verify_cmd, verify_plan
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
@@ -77,6 +79,28 @@ _VACUOUS_PASS = (
     'renders that back to None, and verify._run_or_skip_timed turns a None '
     'command into a CheckRun.skipped that is VACUOUSLY PASSING at rc=0'
 )
+
+
+# The two extraPaths entries the declared type gate depends on, and the flat
+# modules that stop resolving without them. Measured, not assumed: at the
+# commit before task 3456 added these entries, `npx pyright scripts/` reported
+# exactly 9 reportMissingImports naming these five modules.
+_REQUIRED_EXTRA_PATHS = ('scripts', 'scripts/legibility')
+_UNRESOLVED_WITHOUT = ('census', 'codebook', 'coder', 'digest', 'inventory')
+
+
+def _load_root_pyright_config() -> dict[str, Any]:
+    """Return the ``[tool.pyright]`` section of the ROOT pyproject.toml, or {}.
+
+    Same shape as ``dashboard/tests/test_pyright_config.py::_load_pyright_config``,
+    pointed at REPO_ROOT instead of a package root — the root table is the one
+    that governs, because the declared type gate runs from the repo root.
+    """
+    toml_path = REPO_ROOT / 'pyproject.toml'
+    assert toml_path.is_file(), f'pyproject.toml not found at {toml_path}'
+    with open(toml_path, 'rb') as fh:
+        config = tomllib.load(fh)
+    return config.get('tool', {}).get('pyright', {})
 
 
 def _discovered() -> dict:
@@ -315,3 +339,54 @@ def test_scripts_diff_is_lint_gated() -> None:
         f'test_commands ARE byte-identical by design — that is a different, '
         'already-recorded issue and is not license to duplicate this one'
     )
+
+
+def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
+    """The ROOT ``[tool.pyright] extraPaths`` must carry scripts/ and scripts/legibility.
+
+    A PRECONDITION for the type gate, not a general pyright-config preference,
+    which is why it lives beside the gate it protects rather than in its own
+    file. The declared ``type_check_command`` is ``npx pyright scripts/``: it
+    runs from the repo root, so it resolves against the ROOT ``[tool.pyright]``
+    table — NOT against any per-package pyproject.toml.
+
+    ``scripts/tests/conftest.py`` inserts BOTH ``scripts/`` and
+    ``scripts/legibility/`` onto sys.path at runtime, so the test modules
+    import flat names (``import census``, ``import digest``) that only resolve
+    for pyright if the same two directories are on extraPaths. Measured at the
+    commit before these entries were added: ``npx pyright scripts/`` reported
+    exactly 9 reportMissingImports naming census/codebook/coder/digest/
+    inventory. The gate would then be RED for reasons unrelated to any diff —
+    an unresolved import is not a finding about the change under review, and a
+    permanently-red gate gets suppressed or ignored, which is how a gate dies.
+
+    Both entries are needed and neither implies the other: ``scripts`` alone
+    makes ``scripts/legibility/`` importable only as a namespace package
+    (``import legibility``), not its contents as bare top-level names — a
+    distinction ``scripts/tests/conftest.py`` records about itself, and the
+    reason it performs two separate sys.path insertions.
+
+    MEMBERSHIP, never list equality or a length pin: adding a future entry is
+    a legitimate change, not a regression, and an equality assertion would
+    reject it with a message accusing the author of removing these two.
+    """
+    pyright_config = _load_root_pyright_config()
+    extra_paths = pyright_config.get('extraPaths', [])
+
+    for required in _REQUIRED_EXTRA_PATHS:
+        assert required in extra_paths, (
+            f'{required!r} missing from ROOT [tool.pyright] extraPaths = '
+            f'{extra_paths!r} in {REPO_ROOT / "pyproject.toml"} (task 3456). '
+            f'The declared type gate for the {MODULE_PREFIX} module runs '
+            f'`npx pyright {MODULE_PREFIX}/` FROM THE REPO ROOT, so it resolves '
+            f'against this root table. Without both '
+            f'{list(_REQUIRED_EXTRA_PATHS)!r} entries, pyright cannot resolve '
+            f'the flat modules {list(_UNRESOLVED_WITHOUT)!r} that '
+            f'{MODULE_PREFIX}/tests/conftest.py puts on sys.path at runtime — '
+            f'measured as exactly 9 reportMissingImports before task 3456 added '
+            f'them. The gate then reports RED for reasons unrelated to any '
+            f'diff, which is how a gate gets suppressed and dies. Note '
+            f'{_REQUIRED_EXTRA_PATHS[0]!r} alone is NOT sufficient: it makes '
+            f'{_REQUIRED_EXTRA_PATHS[1]!r} importable only as a namespace '
+            f'package, not its contents as bare top-level names'
+        )
