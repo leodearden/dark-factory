@@ -527,6 +527,54 @@ async def _check_canonical_uniqueness(
     module-level helper stays decoupled from ``MemoryService`` and trivially
     stubbable.
 
+    SCOPE — THE INVARIANT IS MEM0-SCOPED (3198 amendment, stated because
+    the silence read as coverage).  Both probes go to Mem0/Qdrant payload
+    filters, but this seam deliberately runs BEFORE the
+    ``write_graphiti``/``write_mem0`` branching so that no write path can
+    bypass the vocabulary rules.  The consequence, spelled out rather than
+    left to be discovered: for a Graphiti-primary category
+    (``entities_and_relations``, ``temporal_facts``,
+    ``decisions_and_rationale``) a ``canonical: True`` record never lands
+    in Mem0, so the count cannot see a previously-written Graphiti-primary
+    canonical and the <=1-per-``(project, topic)`` rule does NOT hold for
+    those categories.  This matches the PRD, whose whole vocabulary is
+    framed as the Mem0 metadata vocabulary.
+
+    The probe is nonetheless issued for every canonical write rather than
+    skipped for Graphiti-primary ones, deliberately: ``dual_write`` can
+    route any category into Mem0 too, so a category-based skip would be
+    wrong exactly when it mattered, and a Graphiti-primary canonical that
+    DOES have a Mem0 twin still gets caught.  The cost is one count that
+    can only return 0 on a Graphiti-only canonical write — a rare write on
+    a rare key.  ``TestCanonicalUniquenessAtSeam`` pins this behaviour for
+    ``decisions_and_rationale`` so a later reader cannot mistake it for
+    coverage.  Closing the gap properly needs a Graphiti-side count, which
+    the PRD does not specify — do not fake it here.
+
+    PROBE FAILURE (3198 amendment).  Both probes talk to Qdrant and
+    ``Mem0Backend.count_by_metadata`` propagates a read timeout by
+    contract, so the probe can fail for reasons that have nothing to do
+    with the write — including for a Graphiti-primary write that would
+    never have touched Mem0 at all.  Explicitly decided, not incidental:
+
+    * a failure is ALWAYS censused, under ``code``
+      ``canonical_uniqueness_check_unavailable`` — degradation is loud, and
+      an operator can grep the same census stream they already watch;
+    * ``enforce = False`` (the shipped default) → the write PROCEEDS.  Warn
+      mode's whole contract is "census the violation and let the write
+      through"; failing a valid write because the *complaint machinery* was
+      unavailable would be strictly worse than the duplicate it is trying to
+      prevent, and would contradict this seam's promise that everything but
+      the enforce-raise is best-effort;
+    * ``enforce = True`` → FAIL CLOSED: the original backend error is
+      re-raised.  An operator who turned enforcement on asked for the
+      invariant to hold; admitting an unverifiable canonical would be the
+      silent fail-soft the house norm forbids.  The error surfaces as
+      itself (bare ``raise``, traceback intact) rather than being dressed up
+      as a :class:`CanonicalUniquenessViolation`, because "the store was
+      unreachable" and "a duplicate exists" are different facts and a caller
+      must be able to tell them apart.
+
     Ordering and guards are load-bearing — the ORDINARY write path must
     issue ZERO extra round-trips:
 
@@ -575,10 +623,46 @@ async def _check_canonical_uniqueness(
         return
 
     filters = {'topic': topic, 'canonical': True}
-    if await count_canonical(project_id, filters) == 0:
+
+    def _census(code: str, message: str) -> None:
+        """Emit one uniqueness census line.
+
+        Routed through the SAME ``emit_schema_warnings`` path the shape
+        violations use, so every code this check can produce is
+        grep-anchored in the one census format operators already know
+        (V1: "grep-anchored, never renamed").
+        """
+        emit_schema_warnings(
+            [MetadataViolation(key='canonical', code=code, message=message, fatal=True)],
+            project_id=project_id,
+            agent_id=agent_id,
+        )
+
+    try:
+        if await count_canonical(project_id, filters) == 0:
+            return
+        records = await find_canonical(project_id, filters, limit=1)
+    except Exception as exc:
+        # The PROBE failed, not the write — a Qdrant timeout/outage, which
+        # `count_by_metadata` propagates by contract.  Always censused
+        # (degradation is loud); fail-open under the shipped warn default
+        # because failing a valid write when only the complaint machinery
+        # broke is worse than the duplicate it guards against; fail-closed
+        # under `enforce` because an unverifiable canonical must not be
+        # admitted silently.  Re-raised bare so the caller sees the real
+        # backend error rather than a CanonicalUniquenessViolation that
+        # would assert a duplicate we never actually observed.  Full
+        # reasoning under PROBE FAILURE in the docstring.
+        _census(
+            'canonical_uniqueness_check_unavailable',
+            f'could not verify <=1 canonical per (project, topic) for '
+            f'project_id={project_id!r} topic={topic!r}: '
+            f'{type(exc).__name__}: {exc}',
+        )
+        if config.enforce:
+            raise
         return
 
-    records = await find_canonical(project_id, filters, limit=1)
     incumbent_id = (
         records[0].get('id', _CANONICAL_INCUMBENT_UNKNOWN)
         if records
@@ -594,22 +678,8 @@ async def _check_canonical_uniqueness(
     if config.enforce:
         raise error
 
-    # Warn mode: census the violation and let the write proceed.  Routed
-    # through the SAME emit_schema_warnings path the shape violations use, so
-    # the code is grep-anchored in the one census format operators already
-    # know (V1: "grep-anchored, never renamed").
-    emit_schema_warnings(
-        [
-            MetadataViolation(
-                key='canonical',
-                code='canonical_uniqueness_violation',
-                message=str(error),
-                fatal=True,
-            )
-        ],
-        project_id=project_id,
-        agent_id=agent_id,
-    )
+    # Warn mode: census the violation and let the write proceed.
+    _census('canonical_uniqueness_violation', str(error))
 
 
 def _apply_cycle_summary_metadata_tagging(

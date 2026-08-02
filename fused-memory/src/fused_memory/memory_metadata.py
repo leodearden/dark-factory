@@ -864,7 +864,16 @@ def validate_memory_metadata(
                 f'topic must be a str, got {type(topic).__name__}',
                 fatal=True,
             ))
-        elif not TOPIC_SLUG_RE.match(topic) or len(topic) > TOPIC_SLUG_MAX_LEN:
+        # `is_valid_topic_slug`, NOT an inlined `TOPIC_SLUG_RE.match(...) or
+        # len(...) >` — the predicate is THE shared verdict (D4: one
+        # namespace, one answer), and the config-side validator and the
+        # seam's uniqueness guard both call it.  Re-expressing the rule here
+        # would split the closure the moment the predicate gains a step
+        # (a normalization pass, a reserved-prefix rule): the other two call
+        # sites would get it and the shape validator would not.  The
+        # `isinstance(topic, str)` branch above already separated the type
+        # defect from the shape defect, so both violation codes survive.
+        elif not is_valid_topic_slug(topic):
             violations.append(_violation(
                 'topic',
                 'invalid_topic_slug',

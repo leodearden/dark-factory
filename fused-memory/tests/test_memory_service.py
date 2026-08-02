@@ -9437,12 +9437,37 @@ class TestCanonicalUniquenessAtSeam:
                 metadata={'topic': self._TOPIC, 'canonical': True},
             )
 
+        expected_filters = {'topic': self._TOPIC, 'canonical': True}
+
         service.mem0.count_by_metadata.assert_awaited_once()
         call = service.mem0.count_by_metadata.await_args
         filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
-        assert filters == {'topic': self._TOPIC, 'canonical': True}
+        assert filters == expected_filters
         scope = call.kwargs.get('scope', call.args[0] if call.args else None)
         assert 'dark_factory' in str(scope), f'the count must be project-scoped, got {scope!r}'
+
+        # The follow-up scroll must be scoped IDENTICALLY and bounded.
+        # Unasserted, a regression that dropped `canonical` from these
+        # filters would name a non-canonical record as the incumbent, and
+        # one that dropped the limit would scroll the 1000-row default on
+        # the failing path — both stay green against the stub, which
+        # returns the same record no matter what it is asked for.
+        service.mem0.scroll_by_metadata.assert_awaited_once()
+        scroll = service.mem0.scroll_by_metadata.await_args
+        scroll_filters = scroll.kwargs.get(
+            'filters', scroll.args[1] if len(scroll.args) > 1 else None
+        )
+        assert scroll_filters == expected_filters
+        scroll_scope = scroll.kwargs.get('scope', scroll.args[0] if scroll.args else None)
+        assert 'dark_factory' in str(scroll_scope), (
+            f'the scroll must be project-scoped, got {scroll_scope!r}'
+        )
+        scroll_limit = scroll.kwargs.get(
+            'limit', scroll.args[2] if len(scroll.args) > 2 else None
+        )
+        assert scroll_limit == 1, (
+            f'the incumbent lookup needs exactly one row, got limit={scroll_limit!r}'
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
@@ -9566,3 +9591,130 @@ class TestCanonicalUniquenessAtSeam:
             )
         assert excinfo.value.topic == self._TOPIC
         assert excinfo.value.incumbent_id  # a sentinel, never empty or absent
+
+    # -- the probe itself failing ------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize('failing_probe', ['count', 'scroll'])
+    async def test_probe_outage_does_not_fail_the_write_in_warn_mode(
+        self, service, entry_point, failing_probe, caplog
+    ):
+        """A Qdrant blip must not fail an otherwise-valid canonical write.
+
+        Both probes hit Qdrant and `count_by_metadata` PROPAGATES a read
+        timeout by contract, so without handling, an unrelated Mem0 outage
+        turns a valid write into an error at the MCP boundary — under the
+        SHIPPED default, whose documented contract is "census the
+        violation and let the write proceed". Worse, this seam runs before
+        store routing, so it could fail a Graphiti-primary write that
+        never touches Mem0 at all.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False, 'warn is the shipped default'
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        getattr(service.mem0, f'{failing_probe}_by_metadata').side_effect = TimeoutError(
+            'qdrant read timed out'
+        )
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        codes = _mm_census_codes(caplog)
+        assert 'canonical_uniqueness_check_unavailable' in codes, (
+            'degradation must be LOUD — a swallowed probe failure is '
+            'indistinguishable from a clean uniqueness check'
+        )
+        # It must NOT claim a duplicate it never observed.
+        assert 'canonical_uniqueness_violation' not in codes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize('failing_probe', ['count', 'scroll'])
+    async def test_probe_outage_fails_closed_under_enforce(
+        self, service, entry_point, failing_probe, caplog
+    ):
+        """Under enforce the operator asked for the invariant to HOLD.
+
+        Admitting a canonical whose uniqueness could not be verified would
+        be the silent fail-soft the house norm forbids. The real backend
+        error surfaces as itself rather than as a
+        CanonicalUniquenessViolation — "the store was unreachable" and "a
+        duplicate exists" are different facts.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        getattr(service.mem0, f'{failing_probe}_by_metadata').side_effect = TimeoutError(
+            'qdrant read timed out'
+        )
+
+        with pytest.raises(TimeoutError) as excinfo:
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        assert not isinstance(excinfo.value, CanonicalUniquenessViolation)
+        _mm_backend_mock(service, entry_point).assert_not_called()
+        assert 'canonical_uniqueness_check_unavailable' in _mm_census_codes(caplog)
+
+    # -- scope: the invariant is Mem0-scoped -------------------------------
+
+    @pytest.mark.asyncio
+    async def test_graphiti_primary_canonical_is_only_checked_against_mem0(
+        self, service, caplog
+    ):
+        """PINS the known scope limit so the silence cannot read as coverage.
+
+        Both probes are Qdrant payload filters, but the seam deliberately
+        runs BEFORE the write_graphiti/write_mem0 branching. So for a
+        Graphiti-primary category the probe still runs (dual_write can
+        route any category into Mem0, which is why it is not skipped on
+        category alone) but can only ever see Mem0 rows — a
+        previously-written Graphiti-only canonical is invisible to it and
+        the <=1-per-(project, topic) rule does NOT hold there.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = True
+        # No Mem0 twin: exactly the state a Graphiti-only canonical leaves.
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        await _mm_write(
+            service, 'add_memory',
+            metadata={'topic': self._TOPIC, 'canonical': True},
+            category='decisions_and_rationale',
+        )
+
+        # The probe IS issued even though this write never reaches Mem0...
+        service.mem0.count_by_metadata.assert_awaited_once()
+        # ...and, seeing no Mem0 row, admits the write. Documented residual,
+        # not an oversight: closing it needs a Graphiti-side count the PRD
+        # does not specify. See _check_canonical_uniqueness's SCOPE note.
+        assert 'canonical_uniqueness_violation' not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    async def test_graphiti_primary_canonical_is_rejected_when_a_mem0_twin_exists(
+        self, service
+    ):
+        """POSITIVE CONTROL for the scope test above.
+
+        Without it, "no rejection for decisions_and_rationale" could not
+        distinguish the documented Mem0 scope from the check simply being
+        dead for Graphiti-primary categories.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category='decisions_and_rationale',
+            )

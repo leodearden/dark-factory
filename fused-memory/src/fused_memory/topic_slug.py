@@ -80,11 +80,26 @@ TOPIC_SLUG_MAX_LEN = 100
 def is_valid_topic_slug(value: object) -> bool:
     """Return whether *value* is a well-formed topic slug.
 
-    THE shared predicate — both consumers call this rather than
+    THE shared predicate — every consumer calls this rather than
     re-expressing the regex or the cap inline, so "is this a valid topic"
     has exactly one answer across the memory side and the config side
     (D4).  ``tests/test_topic_slug_namespace.py`` asserts that identity by
-    ``is``, so an inlined copy fails by design.
+    ``is``, so an inlined copy of the *constants* fails by design.
+
+    The call sites, named so the claim above stays checkable (the ``is``
+    tests pin the constants but cannot see an inlined re-expression of the
+    RULE, which is how one crept back in once already — 3198 amendment):
+
+    * ``memory_metadata.validate_memory_metadata`` §2a — the ``topic``
+      shape check;
+    * ``config.schema.ProceduralTopicCluster._validate_topic_id_slug`` —
+      the config-side ``topic_id`` check;
+    * ``services.memory_service._check_canonical_uniqueness`` guard 2 —
+      refuses to build a store query on a malformed key.
+
+    Add a step to this predicate (a normalization pass, a reserved-prefix
+    rule) and all three move together; inline the rule at any of them and
+    they silently diverge.
 
     Takes ``object`` and never raises: both call sites hand it untrusted
     values, and ``TOPIC_SLUG_RE.match(None)`` would turn a rejection into
