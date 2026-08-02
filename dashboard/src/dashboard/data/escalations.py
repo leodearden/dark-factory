@@ -162,7 +162,35 @@ _LEVEL_KEYS = (0, 1, 2)
 _STATUS_KEYS = ('pending', 'resolved', 'dismissed')
 
 
-def _bucket(escalations: list[dict], *, skipped_count: int = 0) -> dict:
+def _load_queue_with_skips(esc_dir: Path) -> tuple[list[dict], list[dict[str, str]]]:
+    """Read one escalation queue dir, returning ``(escalations, skipped)``.
+
+    A FRESH accumulator per call is load-bearing: :func:`load_queue_escalations`
+    **appends** to the list it is handed, so one list shared across
+    :func:`build_escalation_queues`' two call sites would attribute every
+    queue's skips to every subsection — a single corrupt file in one
+    orchestrator's queue would then render as N badges across N unrelated
+    projects, a worse lie than silence.  Owning the allocation here makes that
+    failure mode unwritable by construction instead of comment-enforced at each
+    call site.
+
+    ``path`` is stringified here because this is the boundary between the reader
+    — which deliberately keeps a ``Path`` so callers can take ``.name`` or retry
+    the read — and the payload :func:`build_escalation_queues` hands the API
+    layer, where a ``Path`` reaching ``JSONResponse`` would 500 the endpoint.
+
+    Args:
+        esc_dir: Path to the escalation queue root directory.
+
+    Returns:
+        ``(escalations, [{"path": str, "error": str}, ...])``.
+    """
+    skips: list[dict[str, Any]] = []
+    escs = load_queue_escalations(esc_dir, skipped=skips)
+    return escs, [{'path': str(s['path']), 'error': s['error']} for s in skips]
+
+
+def _bucket(escalations: list[dict], *, skipped_count: int) -> dict:
     """Compute per-subsection summary counts from a list of escalation dicts.
 
     Only ``level`` values in ``{0, 1, 2}`` and ``status`` values in
@@ -176,7 +204,11 @@ def _bucket(escalations: list[dict], *, skipped_count: int = 0) -> dict:
             read, and therefore how short the ``by_level``/``by_status`` counts
             beside it may be.  Passed through verbatim so the annotation lives
             in the same dict as the counts it qualifies, read by the same
-            consumers at the same nesting.
+            consumers at the same nesting.  Required, deliberately: a default of
+            ``0`` would let a future call site that forgot the kwarg report a
+            clean queue it never checked, which is the silent degradation this
+            whole field exists to prevent.  A call site that genuinely has no
+            skips says ``skipped_count=0`` and means it.
 
     Returns:
         ``{"by_level": {0: int, 1: int, 2: int},
@@ -203,6 +235,13 @@ def _merge_summaries(summaries: list[dict]) -> dict:
     there is no second aggregation path to keep in sync (INV-5).  It reports how
     many ``*.json`` files across **all** queues could not be read, and therefore
     how short the merged ``by_level``/``by_status`` counts beside it may be.
+
+    ``skipped_count`` is indexed, not ``.get(..., 0)``-ed, to match the adjacent
+    ``by_level``/``by_status`` handling: a summary dict missing the key is
+    malformed, and defaulting it would turn "this summary was built by a path
+    that forgot to count skips" into a confident "0 unreadable" — precisely the
+    silent-zero the key exists to eliminate.  Fail loud on a ``KeyError``
+    instead (INV-2, ``no-silent-fail-soft``).
     """
     by_level: dict = {k: 0 for k in _LEVEL_KEYS}
     by_status: dict = {k: 0 for k in _STATUS_KEYS}
@@ -212,7 +251,7 @@ def _merge_summaries(summaries: list[dict]) -> dict:
             by_level[k] += s['by_level'].get(k, 0)
         for k in _STATUS_KEYS:
             by_status[k] += s['by_status'].get(k, 0)
-        skipped_count += s.get('skipped_count', 0)
+        skipped_count += s['skipped_count']
     return {'by_level': by_level, 'by_status': by_status, 'skipped_count': skipped_count}
 
 
@@ -270,35 +309,28 @@ def build_escalation_queues(config) -> dict:
             seen.add(root)
             roots_to_visit.append(root)
 
-    # A FRESH `skips` list per call site is load-bearing: load_queue_escalations
-    # APPENDS to the accumulator it is handed, so one list shared across both
-    # call sites would attribute every queue's skips to every subsection — a
-    # single corrupt file in one orchestrator's queue would then render as N
-    # badges across N unrelated projects, which is a worse lie than silence.
+    # `_load_queue_with_skips` owns the per-call accumulator so no call site can
+    # share one list across queues and cross-attribute another queue's skips.
     for root in roots_to_visit:
-        skips: list[dict[str, Any]] = []
-        escs = load_queue_escalations(root / 'data' / 'escalations', skipped=skips)
+        escs, skipped = _load_queue_with_skips(root / 'data' / 'escalations')
         subsections.append({
             'id': str(root),
             'label': root.name,
             'kind': 'orchestrator',
             'escalations': escs,
-            'skipped': [{'path': str(s['path']), 'error': s['error']} for s in skips],
-            'summary': _bucket(escs, skipped_count=len(skips)),
+            'skipped': skipped,
+            'summary': _bucket(escs, skipped_count=len(skipped)),
         })
 
     # Reconciliation subsection (fused-memory queue)
-    recon_skips: list[dict[str, Any]] = []
-    recon_escs = load_queue_escalations(
-        config.reconciliation_escalations_dir, skipped=recon_skips
-    )
+    recon_escs, recon_skipped = _load_queue_with_skips(config.reconciliation_escalations_dir)
     subsections.append({
         'id': 'reconciliation',
         'label': 'fused-memory',
         'kind': 'reconciliation',
         'escalations': recon_escs,
-        'skipped': [{'path': str(s['path']), 'error': s['error']} for s in recon_skips],
-        'summary': _bucket(recon_escs, skipped_count=len(recon_skips)),
+        'skipped': recon_skipped,
+        'summary': _bucket(recon_escs, skipped_count=len(recon_skipped)),
     })
 
     top_summary = _merge_summaries([s['summary'] for s in subsections])
