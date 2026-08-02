@@ -128,10 +128,16 @@ line, no watcher restart needed.
 Since this skill invokes `python -m escalation.watcher` directly — no
 wrapper script owns an exclude-file for you the way the sibling skill's
 does (see below) — name a conventional path yourself:
-`<queue-dir>/.watcher-exclude-recon`, a dotfile the watcher's own
-`esc-*.json` glob (`_snapshot_pending_ids`, `watcher.py:158`) safely
-ignores, mirroring the sibling wrapper's own in-queue-dir dotfile
-convention (`.watcher-rearm-exclude-l2`). Append with `echo <esc-id> >>
+`<queue-dir>/.watcher-exclude-recon`, a dotfile that the watcher's own
+`esc-*.json` glob safely ignores (`_initial_scan`, `watcher.py:85`; the
+same pattern also gates `EscalationQueue`'s own reads,
+`escalation/src/escalation/queue.py:431` and `:509`). The name must also
+not end in `.json`: the dashboard's read-only recon subsection globs the
+broader `*.json` (not `esc-*.json`) over this same directory
+(`dashboard/src/dashboard/data/escalations.py:89`), so a `.json`-suffixed
+name would surface there as a phantom escalation record. The chosen name
+mirrors the sibling wrapper's own in-queue-dir dotfile convention
+(`.watcher-rearm-exclude-l2`). Append with `echo <esc-id> >>
 <path>`: `_read_exclude_file`'s docstring (`watcher.py:128-132`) blesses a
 single short-line append as atomic on POSIX, and a torn multi-write append
 is self-healing on the next poll. The reader is fail-open — a missing or
@@ -146,11 +152,11 @@ even though `escalation.watcher` accepts it as a flag. `_snapshot_pending_ids()`
 (`watcher.py:151-158`) freezes the pending-id set exactly once, at launch,
 strictly before `add_watch` arms the inotify watch (`watcher.py:238` runs
 before `watcher.py:243`) — and unlike `--exclude-file`, that snapshot is
-never re-read afterward (`watcher.py:225`; the code's own comment at
+never re-read afterward (`current_excludes()`, `watcher.py:225`; the code's own comment at
 `watcher.py:227-237` reasons only about the narrower snapshot→`add_watch`
 race, not this one). This loop's handling phase is long — draining,
-handling 31+ parked records, and filing a cockpit DecisionRecord for each
-takes real wall-clock time between one watcher restart and the next — so
+handling dozens of parked records, and filing a cockpit DecisionRecord for
+each takes real wall-clock time between one watcher restart and the next — so
 any escalation recon files *during that window* is already on disk by the
 time the following restart takes its `--baseline` snapshot. That new
 escalation gets folded straight into the snapshot and is excluded from both
