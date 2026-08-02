@@ -438,3 +438,56 @@ class TestMakeStewardFixture:
         assert steward.escalation_queue.get_by_task('42') == []
         assert steward.escalation_queue.get('x') is None
         assert await steward.briefing.build_steward_initial_prompt(steward.task) == 'initial prompt'
+
+    # --- enforcement: a caller-supplied worktree must be strictly below tmp_path ---
+
+    def test_rejects_worktree_equal_to_tmp_path(self, make_steward, tmp_path):
+        """``worktree=tmp_path`` is rejected — it leaks ``.task-meta`` out of the sandbox.
+
+        This is the exact escape hatch task 3366 could only document.  The
+        steward's artifacts root is a SIBLING of the worktree
+        (``<worktree.parent>/.task-meta/<worktree.name>`` — see
+        ``TASK_META_DIRNAME`` in ``orchestrator/config.py`` and
+        ``TaskArtifacts.meta_root_for`` in ``orchestrator/artifacts.py``), so a
+        worktree AT ``tmp_path`` puts that sibling at
+        ``tmp_path.parent/.task-meta/<numbered-root>`` — outside the directory
+        pytest's retention policy reclaims.
+        """
+        with pytest.raises(AssertionError, match='strictly below'):
+            make_steward(worktree=tmp_path)
+
+    def test_rejects_worktree_outside_tmp_path(self, make_steward, tmp_path):
+        """A worktree outside ``tmp_path`` is rejected BEFORE the directory is created.
+
+        The mkdir-ordering half matters: a guard that fired after ``mkdir``
+        would litter the very location it is defending, leaving an unreclaimed
+        directory next to the test's tmp dir on every failure.
+        """
+        escaped = tmp_path.parent / 'escaped-wt'
+        assert not escaped.exists(), f'test precondition: {escaped} must not pre-exist'
+
+        with pytest.raises(AssertionError, match='strictly below'):
+            make_steward(worktree=escaped)
+
+        assert not escaped.exists(), (
+            f'the guard must reject {escaped} BEFORE mkdir — it was created anyway'
+        )
+
+    def test_two_stewards_in_one_test_are_both_accepted(self, make_steward, tmp_path):
+        """Two distinct sub-paths of ``tmp_path`` both pass — the no-false-positive control.
+
+        This case is what ruled out the cheaper module-level approximation
+        ("the worktree must not already exist"): a test that needs two stewards
+        must be able to build both, and a repeat default build must be
+        idempotent rather than tripping over its own ``mkdir``.
+        """
+        a = make_steward(worktree=tmp_path / 'a')
+        b = make_steward(worktree=tmp_path / 'b')
+
+        assert a.worktree != b.worktree
+        assert a.worktree.is_dir() and b.worktree.is_dir()
+
+        first_default = make_steward()
+        second_default = make_steward()
+        assert second_default.worktree == first_default.worktree
+        assert second_default.worktree.is_dir()
