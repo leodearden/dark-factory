@@ -245,6 +245,35 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   immediate re-file on the very next cycle, since the accumulated cycle
   count is already at or past the threshold.
 
+**A note on tiering for these two categories:** the comparison table above
+already says "Tiering | **none** — recon files flat, no levels" — that
+stays architecturally true, but it is tempting to reach for
+`mcp__escalation__promote_to_l2` anyway when a finding feels L2-worthy.
+Doing so from a recon-watch session actually **succeeds**: the recon
+harness builds its 8103 server with the same `create_escalation_server(...)`
+the orchestrator uses
+(`fused-memory/src/fused_memory/reconciliation/harness.py:2016`), so
+`promote_to_l2` is registered there too, and the identity gate
+(`escalation/src/escalation/authority.py:65`) only denies *identified*
+callers outside `PROMOTE_ALLOWED` — a header-less `recon-watch/mcp.json`
+session is never identified, so the call goes through and mints a real L2
+file. **It works, and that is exactly the problem:** nothing automated ever
+consumes it. The orchestrator harness supervises `escalation-watcher-auto`
+as its own subprocess and points it only at
+`self.config.escalation.queue_dir`
+(`orchestrator/src/orchestrator/harness.py:9715-9718` — `data/escalations`
+behind 8100/8102); it never opens `data/reconciliation/escalations`. That
+does **not** mean the recon queue is invisible to humans — the dashboard's
+Escalations tab does render it, as a read-only `reconciliation` subsection
+built from this same directory (`build_escalation_queues`,
+`dashboard/src/dashboard/data/escalations.py`) — the real gap is that a
+promoted record has no automated L2 triage consumer and no L2 cascade
+actor, so it just sits there as extra queue noise nobody is watching for.
+**This watcher is the actual human-facing consumer of recon findings:** the
+sanctioned way to raise one to a human is the cockpit DecisionRecord
+(§"Filing Parked Decisions to the Cockpit Registry (C8)" below), whose C5b
+decision queue is a surface a human actually works — not `promote_to_l2`.
+
 ## Priority Hierarchy
 
 1. **System & infrastructure stability** — never touch anything outside the
