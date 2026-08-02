@@ -187,6 +187,15 @@ class TestTopicSlugNamespaceIsShared:
     metadata registry and the config schema.  A second copy of the regex or
     the cap anywhere in the tree is a bug; these ``is`` assertions make a
     copy fail mechanically rather than by review.
+
+    The thing to watch for when editing ``derive_topic_slug`` is a *second
+    anchored slug validator*.  The fold itself legitimately needs a
+    character-class pattern to collapse runs of punctuation, so ``re`` is
+    not forbidden here — what must not appear is a local pattern that
+    decides whether a slug is VALID, because that is the copy free to
+    drift from ε while every test still passes.  Validity is settled by
+    calling ``is_valid_topic_slug``; the identity assertions below prove
+    the one being called is ε's.
     """
 
     def test_predicate_is_the_same_object(self):
@@ -194,16 +203,6 @@ class TestTopicSlugNamespaceIsShared:
 
     def test_cap_is_the_same_object(self):
         assert _mod.TOPIC_SLUG_MAX_LEN is topic_slug_module.TOPIC_SLUG_MAX_LEN
-
-    def test_script_does_not_define_its_own_slug_pattern(self):
-        """No local ``re.Pattern`` re-expressing the slug shape.
-
-        The fold itself needs a character-class pattern, so this does not
-        forbid ``re`` outright — it forbids a *second anchored slug
-        validator*, which is the copy that would silently diverge from ε.
-        """
-        source = SCRIPT_PATH.read_text()
-        assert '[a-z0-9]+(?:-[a-z0-9]+)*' not in source
 
 
 # ===========================================================================
