@@ -1851,3 +1851,79 @@ async def test_fan_out_list_tickets_failover_on_malformed_result(tmp_path: Path)
         f'Expected 2 mcp_tool_call invocations (both URLs tried), got {mock_mcp.call_count}'
     )
     assert tickets == [], f'Expected empty tickets list, got {tickets}'
+
+
+# ---------------------------------------------------------------------------
+# task 3126: refused is a terminal ticket status and must count toward centiles
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_counts_refused_tickets_in_centiles(tmp_path: Path, config):
+    """A ticket resolved as 'refused' is terminal and must appear in the curator
+    latency centiles.
+
+    The terminal-status allowlist previously read
+    ``('created', 'combined', 'cancelled', 'failed')``, silently excluding
+    refusals — so every deterministic refusal vanished from the curator latency
+    metrics, exactly the decision an operator most wants to see the cost of.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+    from dashboard.data.stats_utils import percentile
+
+    now = datetime.now(UTC)
+    t_base = now - timedelta(minutes=30)
+
+    tickets_path = tmp_path / 'tickets.db'
+    conn_sync = sqlite3.connect(str(tickets_path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    # One ordinary created ticket (100ms) and one refused ticket (400ms).
+    conn_sync.execute(
+        'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
+        (
+            't1', 'proj', 'created',
+            t_base.isoformat(),
+            (t_base + timedelta(milliseconds=100)).isoformat(),
+        ),
+    )
+    conn_sync.execute(
+        'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
+        (
+            't2', 'proj', 'refused',
+            t_base.isoformat(),
+            (t_base + timedelta(milliseconds=400)).isoformat(),
+        ),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    handler = _ListTicketsHandler(count=2)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            result = await _sample_curator(
+                http_client, config, tickets_conn, [runs_conn], now=now,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    assert result is not None
+    # Both samples present: excluding the refusal would collapse every centile
+    # onto the single 100ms create.
+    assert result['p50_active_ms'] == int(percentile([100.0, 400.0], 50))
+    assert result['p90_active_ms'] == int(percentile([100.0, 400.0], 90))
+    assert result['p99_active_ms'] == int(percentile([100.0, 400.0], 99))

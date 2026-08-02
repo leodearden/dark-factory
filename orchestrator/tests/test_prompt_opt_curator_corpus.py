@@ -62,6 +62,36 @@ class TestRecoverRecordedAction:
         assert action == 'drop'
         assert target_id == 'task-5'
 
+    def test_refused_status_recovers_refuse(self) -> None:
+        """task 3126 RED: a deterministic refusal is recoverable eval signal.
+
+        Refusals are the ONE action the corpus can recover unambiguously --
+        drop and combine both persist status='combined' and need result_json to
+        disambiguate, but only the deterministic guards ever emit 'refused'.
+        Skipping the row would drop the refuse decision out of the very corpus
+        that trains the curator on it."""
+        result_json = '{"id": null, "action": "refuse", "created": false, '\
+                      '"justification": "cancelled-premise-blocklist: e: r"}'
+        recovered = recover_recorded_action('refused', result_json, None)
+        assert recovered == ('refuse', None, None)
+
+    def test_refused_status_with_no_result_json_recovers_refuse(self) -> None:
+        """Status alone is sufficient -- 'refused' is unambiguous."""
+        assert recover_recorded_action('refused', None, None) == ('refuse', None, None)
+
+    def test_refuse_is_not_a_proposable_frontier_action(self) -> None:
+        """A frontier model must never be able to PROPOSE a refusal: refusal is
+        an operator-curated deterministic verdict, not a judgement call. This
+        pins that 'refuse' stays out of the frontier label enum even though
+        recover_recorded_action now recovers it from persisted rows."""
+        from orchestrator.evals.prompt_opt.curator_corpus import (
+            _FRONTIER_CURATOR_LABEL_SCHEMA,
+            _parse_frontier_label,
+        )
+
+        assert 'refuse' not in _FRONTIER_CURATOR_LABEL_SCHEMA['properties']['action']['enum']
+        assert _parse_frontier_label({'action': 'refuse', 'justification': 'x'}) is None
+
     def test_failed_status_with_no_result_json_is_unactionable(self) -> None:
         assert recover_recorded_action('failed', None, None) is None
 
