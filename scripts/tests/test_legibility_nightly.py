@@ -97,8 +97,17 @@ def _write_config(
 
 def _encode_cwd(cwd: str) -> str:
     """Mirror inventory.encode_cwd (kept independent -- this is fixture code,
-    not a reuse of the module under test)."""
-    return cwd.replace('/', '-').replace('.', '-')
+    not a reuse of the module under test).
+
+    '/', '.' and '_' all map to '-'. "Independent" means SEPARATELY WRITTEN,
+    not unchecked: test_legibility_inventory.py's TestEncoderLockstep pins
+    this copy to the canonical (orchestrator.session_registry.encode_cwd) and
+    to real on-disk dir names (task 3272, which found this fixture and three
+    production copies all missing the '_' rule at once). Deliberately does
+    NOT import the canonical -- a fixture that calls the code under test
+    moves in lockstep with its bugs, which is exactly how that divergence
+    survived a green suite."""
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
 
 
 def _write_transcript(

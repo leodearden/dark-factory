@@ -1,8 +1,9 @@
 """Tests for scripts/legibility/inventory.py — session enumeration (PRD §5.2 point 2).
 
-``inventory.encode_cwd`` mirrors
-``orchestrator.session_registry.transcript_path_for_cwd``'s cwd encoding
-(both ``/`` and ``.`` map to ``-``). A project's agents span many encoded
+``inventory.encode_cwd`` mirrors ``orchestrator.session_registry.encode_cwd``,
+the canonical cwd encoding (``/``, ``.`` and ``_`` all map to ``-``, and case
+is preserved); ``TestEncoderLockstep`` below holds every in-repo copy of that
+rule to the canonical AND to real on-disk dir names. A project's agents span many encoded
 dirs (57 for dark-factory today: main checkout + ``.worktrees``/
 ``.claude-worktrees`` children), so membership is resolved from the
 session's REAL ``cwd`` (read from a transcript line) via path-component
@@ -17,15 +18,55 @@ mechanics).
 from __future__ import annotations
 
 import gzip
+import importlib.util
 import json
+from collections.abc import Callable
 from datetime import date as dt_date
+from functools import lru_cache
 from pathlib import Path
 
-from legibility import inventory as mod
+from legibility import digest, inventory as mod
+from orchestrator import session_registry
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 WORKTREE_CWD = '/home/leo/src/dark-factory/.worktrees/2573'
 COCKPIT_CWD = '/home/leo/src/dark-factory-cockpit'
+
+# OBSERVED, not guessed (task 3272). Every right-hand side below is a real
+# directory name read off a live ``~/.claude/projects`` tree, or a cwd
+# confirmed against one. The rule was derived empirically from 738
+# (encoded-dir, decoded-cwd) pairs sampled from that tree: the only
+# substitutions observed were ``.`` -> ``-``, ``/`` -> ``-`` and
+# ``_`` -> ``-``, and the only non-alphanumeric characters appearing in ANY
+# sampled cwd were ``- . / _`` — so the three-character rule is complete
+# over the observed domain (it reproduces all 738 pairs; the former
+# two-character ``/``+``.`` rule mismatched 492 of them).
+#
+# These are STRING LITERALS on purpose. They must never be produced by
+# calling ``encode_cwd`` (or any mirror of it): a fixture built with the
+# function under test moves in lockstep with a bug in that function and can
+# never detect it, which is exactly why the missing ``_`` rule survived a
+# fully green suite. See TestEncoderLockstep below.
+REAL_ENCODED_DIR_PAIRS: tuple[tuple[str, str], ...] = (
+    (MAIN_CWD, '-home-leo-src-dark-factory'),
+    (WORKTREE_CWD, '-home-leo-src-dark-factory--worktrees-2573'),
+    (
+        '/home/leo/src/dark-factory/.eval-worktrees/df_task_12/run-5383f6a8',
+        '-home-leo-src-dark-factory--eval-worktrees-df-task-12-run-5383f6a8',
+    ),
+    (
+        '/home/leo/src/reify/.claude/worktrees/printer-design-v01',
+        '-home-leo-src-reify--claude-worktrees-printer-design-v01',
+    ),
+    # Pins CASE PRESERVATION: the encoder does NOT lowercase. This dir name
+    # exists on disk with its capitals intact, ruling out a case-folding step.
+    ('/opt/Auto-Claude/resources/backend', '-opt-Auto-Claude-resources-backend'),
+    (
+        '/home/leo/src/warm-lanes/worktrees/_lane-39',
+        '-home-leo-src-warm-lanes-worktrees--lane-39',
+    ),
+    ('/media/leo/data_lv_1/leo/reify-build', '-media-leo-data-lv-1-leo-reify-build'),
+)
 
 
 class TestEncodeCwd:
@@ -33,8 +74,27 @@ class TestEncodeCwd:
         assert mod.encode_cwd(MAIN_CWD) == '-home-leo-src-dark-factory'
 
     def test_worktrees_child_maps_slash_and_dot(self):
-        # Both '/' and '.' -> '-', mirroring transcript_path_for_cwd exactly.
+        # Two of the three characters; see test_underscore_maps_to_dash for
+        # the third. A leading '.' on a path component yields a doubled '--'
+        # (one dash from the preceding '/', one from the '.').
         assert mod.encode_cwd(WORKTREE_CWD) == '-home-leo-src-dark-factory--worktrees-2573'
+
+    def test_underscore_maps_to_dash(self):
+        # The character the mirror used to miss (task 3272). Two thirds of the
+        # real project dirs sampled contain an underscore.
+        assert mod.encode_cwd('/media/leo/data_lv_1/leo/reify-build') == (
+            '-media-leo-data-lv-1-leo-reify-build'
+        )
+
+    def test_round_trips_real_on_disk_dir_names(self):
+        """Every encoding matches a dir name observed on a live ~/.claude/projects tree.
+
+        Table-driven over REAL_ENCODED_DIR_PAIRS, whose expected values are
+        hard-coded literals rather than encoder output — the only kind of
+        assertion that can catch an encoder which is self-consistently wrong.
+        """
+        for cwd, expected_dir in REAL_ENCODED_DIR_PAIRS:
+            assert mod.encode_cwd(cwd) == expected_dir, cwd
 
     def test_cockpit_sibling_shares_literal_prefix(self):
         # This is exactly why a raw string-prefix match over-includes: the
@@ -43,6 +103,109 @@ class TestEncodeCwd:
         encoded_cockpit = mod.encode_cwd(COCKPIT_CWD)
         assert encoded_cockpit.startswith(encoded_main)
         assert encoded_cockpit != encoded_main
+
+
+def _load_sibling_test_module(name: str):
+    """Import a sibling scripts/tests module by file path.
+
+    ``scripts/tests`` is not on ``sys.path`` (its conftest inserts
+    ``scripts/`` and ``scripts/legibility``, not itself), so a bare
+    ``import test_legibility_nightly`` would not resolve under the suite's
+    ``--import-mode=importlib`` collection. Loading by path is the sanctioned
+    equivalent and avoids restructuring the nightly fixture.
+    """
+    spec = importlib.util.spec_from_file_location(
+        f'_lockstep_{name}', Path(__file__).parent / f'{name}.py'
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@lru_cache(maxsize=1)
+def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
+    """(label, callable) for every in-repo PYTHON copy of the cwd encoding.
+
+    Cached, and resolved ONCE per session rather than per assertion row:
+    naming the nightly mirror requires exec'ing that whole test module, which
+    is not written to be executed repeatedly, and an uncached call inside the
+    ``REAL_ENCODED_DIR_PAIRS`` loop re-exec'd it once per row (growing with
+    the table). Any future module-scope side effect there now costs one
+    execution, not N.
+
+    See :class:`TestEncoderLockstep`'s SCOPE note for the copies deliberately
+    NOT listed here.
+    """
+    nightly_tests = _load_sibling_test_module('test_legibility_nightly')
+    return (
+        ('legibility.inventory.encode_cwd', mod.encode_cwd),
+        ('legibility.digest._encode_cwd', digest._encode_cwd),
+        ('test_legibility_nightly._encode_cwd', nightly_tests._encode_cwd),
+    )
+
+
+class TestEncoderLockstep:
+    """Every in-repo copy of the cwd encoding must agree with the canonical (task 3272).
+
+    The rule is duplicated four times across the repo, and in 3272 ALL FOUR
+    copies were found to be missing the same character (``_`` -> ``-``) at
+    once. The old ``inventory.encode_cwd`` docstring asserted the mirrors were
+    "kept in lockstep with the canonical implementation" — a claim nothing
+    checked, and which was false in fact.
+
+    This class replaces that aspiration with an enforced invariant. Each
+    mirror is asserted equal to BOTH:
+
+      - ``session_registry.encode_cwd``, the canonical — so a mirror that
+        drifts from it fails loudly; and
+      - the hard-coded ``REAL_ENCODED_DIR_PAIRS`` dir names — so the
+        canonical drifting from REALITY fails too.
+
+    The second assertion is the load-bearing one. A mirror-only check would
+    have passed cleanly on the pre-3272 tree, because all four copies were
+    consistently wrong together. The same defect explains why 37 green tests
+    never caught it: every fixture built its session dirs by calling the
+    encoder under test, so the fixtures tracked the bug. Only literals read
+    off a real ``~/.claude/projects`` tree can detect an encoder that is
+    self-consistently wrong.
+
+    SCOPE — what this does NOT cover. TWO copies of the rule sit outside
+    this guard, and as of task 3272 both are still on the old two-character
+    (``/`` + ``.``) rule. Neither is in 3272's file scope, so neither was
+    changed here:
+
+      - ``skills/spawn/spawn-claude.sh``'s ``_encode_cwd`` (bash) — no
+        Python test can import it. Filed as a follow-up.
+      - ``tests/scripts/test_spawn_claude.py``'s inline
+        ``str(tmp_path).replace("/", "-").replace(".", "-")``. This one IS
+        Python and IS importable, but it is deliberately pinned to the BASH
+        copy rather than to the canonical: it names the dir a fake ``claude``
+        creates so that spawn-claude.sh's own started-evidence probe (which
+        computes the lookup key with its ``_encode_cwd``) finds it. Listing
+        it among the mirrors would therefore assert the wrong thing. It must
+        instead move in the SAME commit as the bash fix — pytest ``tmp_path``
+        names routinely contain underscores, so the moment bash starts
+        collapsing ``_`` the fixture's dir name and the probe's lookup key
+        stop agreeing and that test fails.
+
+    Adding a Python mirror here is only ever the DEFAULT place to put a copy
+    of this rule — if you add one elsewhere, add it to :func:`_mirrors` too,
+    and if you add one that is pinned to something OTHER than the canonical
+    (another language, or a fixture mirroring a not-yet-fixed copy), say so
+    in this list rather than letting this docstring imply coverage it lacks.
+    """
+
+    def test_every_mirror_agrees_with_canonical_and_with_reality(self):
+        canonical = session_registry.encode_cwd
+        mirrors = _mirrors()
+        for cwd, expected_dir in REAL_ENCODED_DIR_PAIRS:
+            # The canonical itself must match the real on-disk dir name.
+            assert canonical(cwd) == expected_dir, f'canonical drifted from reality: {cwd}'
+            for label, mirror in mirrors:
+                got = mirror(cwd)
+                assert got == canonical(cwd), f'{label} drifted from canonical: {cwd}'
+                assert got == expected_dir, f'{label} drifted from reality: {cwd}'
 
 
 def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'):
