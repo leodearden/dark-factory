@@ -767,18 +767,11 @@ class TestSoftCancelCoversNewAwait:
         wedged = asyncio.Event()
         release_calls: list[str] = []
 
-        async def _wedge_verify() -> WorkflowOutcome:
-            # A stand-in for a long, non-_await_cancellable-wrapped wait (e.g.
-            # a steward wait) — entered only after _enter_phase(VERIFY).
-            wedged.set()
-            await asyncio.sleep(3600)
-            raise AssertionError('unreachable — soft-cancelled before the sleep returns')
-
         async def _spy_release_lane(task_id: str) -> bool:
             release_calls.append(task_id)
             return True
 
-        workflow._verify_debugfix_loop = _wedge_verify  # type: ignore[method-assign]
+        workflow._verify_debugfix_loop = _make_wedge(wedged)  # type: ignore[method-assign]
         workflow.git_ops.release_lane_for_terminal_task = _spy_release_lane  # type: ignore[method-assign]
 
         run_task = asyncio.create_task(workflow.run())
@@ -789,15 +782,8 @@ class TestSoftCancelCoversNewAwait:
         # Mirrors a human release_workflow / watcher-triggered soft-cancel
         # arriving while wedged on a wait _await_cancellable never sees.
         workflow._cancel_event.set()
-        done, _pending = await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
-        assert run_task in done, f'run() task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
-        assert not run_task.cancelled(), 'CancelledError escaped run() on a soft-cancel'
+        await _assert_cancel_report(run_task, workflow, WorkflowOutcome.SOFT_CANCELLED)
 
-        report = run_task.result()
-        assert isinstance(report, TerminalReport)
-        assert report.outcome == WorkflowOutcome.SOFT_CANCELLED
-        assert workflow.machine.state == WorkflowState.CANCELLED
-        assert report.phase == WorkflowState.CANCELLED
         assert release_calls == ['42'], (
             'kind=soft must release the lane even from a still-working state'
         )
@@ -1231,7 +1217,9 @@ class TestAssertCancelReportHelper:
     async def test_raises_when_run_task_ended_cancelled(self):
         async def _never() -> TerminalReport:
             await asyncio.sleep(3600)
-            raise AssertionError('unreachable — the task must be cancelled before the sleep returns')
+            raise AssertionError(
+                'unreachable — the task must be cancelled before the sleep returns'
+            )
 
         run_task = asyncio.create_task(_never())
         await asyncio.sleep(0)  # let it actually start before cancelling
