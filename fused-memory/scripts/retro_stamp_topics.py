@@ -78,12 +78,15 @@ from fused_memory.memory_metadata import _is_full_uuid, normalize_supersedes
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 
 __all__ = [
+    'CLUSTER_MEMBER_KEYS',
     'TOPIC_SLUG_MAX_LEN',
+    'ClusterPlan',
     'PatchDecision',
     'compute_patch',
     'derive_topic_slug',
     'is_valid_topic_slug',
     'normalize_supersedes',
+    'plan_canonical_clusters',
 ]
 
 
@@ -243,3 +246,146 @@ def compute_patch(
             dispositions.append('supersedes_normalized')
 
     return PatchDecision(patch=patch, dispositions=tuple(dispositions))
+
+
+# ---------------------------------------------------------------------------
+# Pure core — planning source (1): the live `canonical: true` scroll
+# ---------------------------------------------------------------------------
+
+#: The metadata keys a canonical record uses to name the records it absorbed.
+#:
+#: Measured across the six live ``canonical: true`` records (2026-08-02), not
+#: guessed: ``consolidates`` (dark_factory 0929cff6, reify dbc478b8),
+#: ``retires`` + SCALAR ``replaces`` (reify 28cbf1c4), list ``supersedes``
+#: (reify bbc063a7, dbc478b8).  A list-only harvester would silently drop the
+#: scalar ``replaces`` edge.
+#:
+#: A named, ORDERED constant rather than a literal inside the loop: the order
+#: fixes member ordering, so two dry-runs of the same corpus diff cleanly.
+#:
+#: Deliberately excluded: ``replaces_verbatim`` (reify bbc063a7) names the one
+#: record this entry reissues rather than a cluster member, and is already
+#: covered by that record's ``supersedes``.
+CLUSTER_MEMBER_KEYS: tuple[str, ...] = (
+    'consolidates',
+    'retires',
+    'replaces',
+    'supersedes',
+)
+
+
+@dataclass(frozen=True)
+class ClusterPlan:
+    """One cluster to stamp: a topic, its members, and maybe its canonical.
+
+    Attributes:
+        topic: The slug every member (and the canonical) gets.  Always
+            already validated by the planner that built it.
+        project_id: Which corpus the ids live in.  Sources span two
+            projects, so this cannot be a run-level constant.
+        canonical_memory_id: The one record to also stamp ``canonical:
+            true``, or ``None`` when the cluster has no undisputed
+            canonical.  ``None`` is a normal outcome, not a defect.
+        member_memory_ids: Deduplicated, order-stable, never containing
+            ``canonical_memory_id``.
+        source: Which of the three bounded sources produced this plan.
+            Carried into the report so a stamped record is traceable to the
+            enumeration that justified it.
+        canonical_plural: The cluster's end-state has SEVERAL canonical
+            entries (DF gate 3036), so no single record may be stamped.
+        provenance: Free-form audit context (gate task id, cluster id, …).
+    """
+
+    topic: str
+    project_id: str
+    canonical_memory_id: str | None
+    member_memory_ids: tuple[str, ...]
+    source: str
+    canonical_plural: bool = False
+    provenance: dict = field(default_factory=dict)
+
+
+def _harvest_member_ids(
+    metadata: dict, *, memory_id: str, skips: list[dict]
+) -> tuple[str, ...]:
+    """Collect cluster member ids from *metadata*'s member-bearing keys.
+
+    Every value is shaped by :func:`normalize_supersedes` (which tolerates
+    both the scalar and list spellings without coercing members) and then
+    filtered by ``_is_full_uuid``.  A value that survives neither is appended
+    to *skips* rather than dropped: a member the sweep could not resolve is a
+    fact about the cluster, and a report that omitted it would claim a clean
+    pass over membership it never actually determined.
+
+    The record's own id is excluded — a self-reference would otherwise make
+    ``stamp_one`` visit it twice with contradictory ``make_canonical``.
+    """
+    seen: dict[str, None] = {}
+    for key in CLUSTER_MEMBER_KEYS:
+        if key not in metadata:
+            continue
+        for member in normalize_supersedes(metadata[key]):
+            if not _is_full_uuid(member):
+                skips.append({
+                    'reason': 'member_not_a_uuid',
+                    'memory_id': memory_id,
+                    'key': key,
+                    'value': member,
+                })
+                continue
+            if member == memory_id:
+                continue
+            seen.setdefault(member, None)
+    return tuple(seen)
+
+
+def plan_canonical_clusters(
+    records: list[dict], *, project_id: str
+) -> tuple[list[ClusterPlan], list[dict]]:
+    """Plan one cluster per live ``canonical: true`` record.
+
+    Source (1) of the bounded set.  Each record already declares both halves
+    of its cluster: its own id is the canonical, and its member-bearing keys
+    name the records it absorbed.  Nothing here is inferred from content.
+
+    Pure: *records* in, ``(plans, skips)`` out.  No service, no I/O, and
+    *records* is not mutated.
+
+    A record whose ``topic`` cannot be folded to a conforming slug produces
+    NO plan and a ``topic_underivable`` skip.  Not a guessed slug (that would
+    file a whole cluster under a topic nobody chose) and not an empty plan
+    (that would read as a cluster the sweep handled).
+
+    Args:
+        records: Scroll-shaped ``{'id', 'created_at', 'metadata'}`` dicts,
+            exactly as ``get_memories_by_metadata`` returns them.
+        project_id: The corpus *records* were scrolled from.
+
+    Returns:
+        ``(plans, skips)`` — skips are report-ready dicts each carrying a
+        ``reason`` and the ``memory_id`` it concerns.
+    """
+    plans: list[ClusterPlan] = []
+    skips: list[dict] = []
+    for record in records:
+        memory_id = record['id']
+        metadata = record.get('metadata') or {}
+        topic = derive_topic_slug(metadata.get('topic'))
+        if topic is None:
+            skips.append({
+                'reason': 'topic_underivable',
+                'memory_id': memory_id,
+                'project_id': project_id,
+                'raw_topic': metadata.get('topic'),
+            })
+            continue
+        members = _harvest_member_ids(metadata, memory_id=memory_id, skips=skips)
+        plans.append(ClusterPlan(
+            topic=topic,
+            project_id=project_id,
+            canonical_memory_id=memory_id,
+            member_memory_ids=members,
+            source='canonical_scroll',
+            provenance={'raw_topic': metadata.get('topic')},
+        ))
+    return plans, skips
