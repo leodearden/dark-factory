@@ -3403,7 +3403,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 3477: widened wait budgets (below) can approach the 60s pyproject default; thread-mode timeout would os._exit() the xdist worker with --max-worker-restart=0
+@pytest.mark.timeout(300)  # task 3477 amend: 5 sequential waits (2 gates + 2 outcomes + 1 teardown) at MERGE_RESULT_TIMEOUT=45s each is a 225s worst case, plus git fixture setup; 180 was too tight (would itself os._exit() the xdist worker before the loud _await_outcome failure could ever report), so this must clear the widened budget below, not just the pyproject 60s default
 class TestRunnerUnavailableHeadCascade:
     """RUNNER_UNAVAILABLE on the HEAD triggers the head-failure cascade.
 
