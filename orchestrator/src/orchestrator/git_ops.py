@@ -12860,8 +12860,9 @@ class GitOps:
             # so a green-tier reload of git.merge_park_lock_grace_seconds
             # takes effect on the very next advance.  On the clean happy
             # path this costs exactly one stat().
-            cleared, waited = await self._await_index_lock_clear(
-                timeout_s=self.config.merge_park_lock_grace_seconds,
+            grace_s = float(self.config.merge_park_lock_grace_seconds)
+            cleared, waited, initial_age = await self._await_index_lock_clear(
+                timeout_s=grace_s,
                 context=f'advance_main for {branch or merge_sha[:8]}',
             )
             if not cleared:
@@ -12881,10 +12882,23 @@ class GitOps:
                 # no shape branching.  _last_stash_dirty_files is left
                 # untouched, so the stash_failed escalation text is
                 # unaffected.
+                #
+                # 'age_seconds' and 'initial_age_seconds' differ BY DESIGN and
+                # are not interchangeable.  The former is re-probed here, so
+                # it necessarily includes the stand-off (initial + waited +
+                # epsilon) — a true, useful fact for the operator-facing
+                # reason, but useless as a staleness signal because it exceeds
+                # the grace for a 2-second-old live commit exactly as it does
+                # for an hour-old crashed leftover.  The latter predates the
+                # wait and is the only one a staleness verdict may key on.
+                # 'grace_seconds' travels alongside so the downstream mapper
+                # stays a pure function of this dict.
                 self._last_park_lock_info = {
                     'lock_path': str(lock_path),
                     'age_seconds': lock_age,
                     'waited_seconds': waited,
+                    'initial_age_seconds': initial_age,
+                    'grace_seconds': grace_s,
                     'dirty_files': [],
                 }
                 return AdvanceOutcome('park_lock_contended')
@@ -12964,10 +12978,23 @@ class GitOps:
                             'age=%.1fs error=%s',
                             lock_path, lock_age, e,
                         )
+                        # A lock that appeared DURING the park is by
+                        # definition live, not a crashed leftover — the gate
+                        # above probed it absent moments ago.  Reporting the
+                        # freshly observed age as 'initial_age_seconds' (no
+                        # stand-off ran, so it is already a pre-wait value)
+                        # therefore yields a NOT-stale verdict downstream,
+                        # which is the correct answer for this shape: no
+                        # destructive `rm -f` advice for a lock we watched
+                        # appear.
                         self._last_park_lock_info = {
                             'lock_path': str(lock_path),
                             'age_seconds': lock_age,
                             'waited_seconds': 0.0,
+                            'initial_age_seconds': lock_age,
+                            'grace_seconds': float(
+                                self.config.merge_park_lock_grace_seconds,
+                            ),
                             'dirty_files': sorted(dirty_tracked),
                         }
                         return AdvanceOutcome('park_lock_contended')
@@ -13455,10 +13482,18 @@ class GitOps:
 
     async def _await_index_lock_clear(
         self, *, timeout_s: float, context: str,
-    ) -> tuple[bool, float]:
+    ) -> tuple[bool, float, float]:
         """Wait (bounded by *timeout_s*) for project_root's index lock to clear.
 
-        Returns ``(cleared, waited_seconds)``.
+        Returns ``(cleared, waited_seconds, initial_age_seconds)``.
+
+        ``initial_age_seconds`` is the lock's age measured BEFORE the
+        stand-off begins (0.0 when no lock was held).  It is the ONLY age that
+        distinguishes a crashed-git leftover from a live commit, because any
+        age read after the wait necessarily includes the wait: a lock created
+        2s before a 300s stand-off reports 302s afterwards, exactly like an
+        hour-old leftover reports 3900s.  Callers making a staleness judgement
+        must use this value, never the post-wait age.
 
         The happy path — no lock — costs exactly one ``stat``: no subprocess,
         no sleep, no await of anything real, so a clean repo behaves
@@ -13476,8 +13511,12 @@ class GitOps:
         """
         held, age = await self._index_lock_state()
         if not held:
-            return (True, 0.0)
+            return (True, 0.0, 0.0)
 
+        # Bind the pre-wait observation to a local the poll loop cannot
+        # clobber — the loop rebinds `age` on every probe, which is exactly
+        # how this (the only staleness-bearing) measurement used to be lost.
+        initial_age = age
         lock_path = await self._index_lock_path()
         started = time.monotonic()
         deadline = started + max(0.0, timeout_s)
@@ -13503,7 +13542,7 @@ class GitOps:
                     'with advance. lock=%s context=%s',
                     waited, lock_path, context,
                 )
-                return (True, waited)
+                return (True, waited, initial_age)
             now = time.monotonic()
             if now - last_warned >= _INDEX_LOCK_WARN_INTERVAL_S:
                 last_warned = now
@@ -13524,8 +13563,8 @@ class GitOps:
                 'with advance. lock=%s context=%s',
                 waited, lock_path, context,
             )
-            return (True, waited)
-        return (False, waited)
+            return (True, waited, initial_age)
+        return (False, waited, initial_age)
 
     async def _park_wip_on_private_ref(self, label: str) -> None:
         """Park uncommitted WIP in project_root onto MERGE_PARK_REF.
