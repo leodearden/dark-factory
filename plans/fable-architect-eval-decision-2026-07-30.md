@@ -107,10 +107,33 @@ triage note reports 37 `blocked` cells in that wave, of which 29 carry `cost_usd
 **The one fixture never re-run: `df_task_18`.** All 12 of its 07-28 cells (4
 candidates × 3 trials) were inspected individually. Every one carries real cost
 ($2.42-$7.08), real `plan_steps` (10-28) and a real, non-zero `plan_quality`
-(0.65-0.97) — none read as cap-kills. Its 6 `blocked` outcomes of 12
-(`architect-opus-max` 0/3 blocked, `architect-fable-high` 1/3, `architect-opus-high`
-2/3, `architect-sonnet-high` 3/3) are therefore genuine downstream blocks, not cap
-kills, and the fixture did not need re-running.
+(0.65-0.97). Its 6 `blocked` outcomes of 12 (`architect-opus-max` 0/3 blocked,
+`architect-fable-high` 1/3, `architect-opus-high` 2/3, `architect-sonnet-high` 3/3)
+are **architect-invocation failures** (`result.success == False`) — *not* downstream
+blocks. A plan-only cell has no downstream role that could block: `run_architect_eval`
+freezes implementer/debugger/reviewer/verify
+(`orchestrator/src/orchestrator/evals/runner.py:474-495`), initializes `outcome =
+'done'` (`runner.py:586`), and demotes it only via `if not result.success: outcome =
+'blocked'` (`runner.py:651-652`), `TimeoutError → 'timeout'` (`runner.py:675`), or a
+harness exception → `'blocked'` (`runner.py:681`). `blocked` on an architect cell
+means the architect invocation itself did not report success.
+
+**Why those 12 cells are nonetheless not cap kills.** Real cost plus real
+`plan_steps` does **not** discriminate the two hypotheses on its own — that is
+precisely the runner's documented *"transport refusal that still left a plan WITH
+STEPS (a cap landing mid-run, after the architect wrote real steps through
+plan-tools) → NOT tainted"* case (`runner.py:528-533`), which has exactly this
+signature. The evidence that does discriminate is the `plan_quality` values.
+`score_plan_structure` (`judge.py:391`) returns `satisfied_weight / total_weight`
+over the code-owned `PLAN_QUALITY_RUBRIC` (`judge.py:297-317`), whose six criterion
+weights are `2, 2, 1, 1, 1, 1` — total 8. The deterministic floor's entire reachable
+range is therefore the nine multiples of 1/8: {0.0, 0.125, 0.25, 0.375, 0.5, 0.625,
+0.75, 0.875, 1.0}. The 12 `df_task_18` cells record 0.65, 0.68, 0.71, 0.82, 0.88,
+0.93, 0.94, 0.95, 0.97 — **not one is a multiple of 0.125**, so not one came from the
+floor. The LLM plan judge must have run and returned a score on all 12. That rules
+out a cap window covering the judge call, since on a cap the runner skips the judge
+and persists the structural floor instead (`runner.py:528-533`). The fixture did not
+need re-running.
 
 **`cap_tainted` / `invocation_error` fields (task 3118).** These per-cell fields
 exist only on the 2026-07-30 wave, where inspected cells read `cap_tainted: false` /
@@ -143,7 +166,13 @@ the gate record it consumes rather than an unverified copy of it.
 **Metric definitions:**
 
 - `planRate` = fraction of the 18 cells with `plan_steps > 0`.
-- `doneRate` = fraction of the 18 cells with `outcome == 'done'`.
+- `doneRate` = fraction of the 18 cells with `outcome == 'done'`. On a plan-only
+  architect cell this is a property of the **architect invocation**, never of a
+  downstream role (they are frozen): `outcome` starts at `'done'` and is demoted only
+  on `result.success == False`, on invoke timeout, or on a harness exception (§2). It
+  is consequently orthogonal to plan production in both directions — a cell can be
+  `done` with no plan, or `blocked` carrying a good one (task 2863 amendment §1, and
+  §4 below).
 - `meanPQ_all` = mean of the **recorded** `plan_quality` over all 18 cells, whatever
   value the runner recorded — a no-plan cell (`plan_steps == 0`) is **not** coerced to
   0. Eight of the nine no-plan cells in the scored 72 do record `plan_quality: 0.0`,
@@ -233,6 +262,14 @@ _RAW OBSERVATION._
 | `reify_task_12` | 3/3 | 3/3 | 2/3 | 3/3 |
 | `reify_task_27` | 1/3 | 3/3 | 3/3 | 3/3 |
 | `df_task_2430_adv_plan` | 3/3 | 3/3 | 3/3 | 3/3 |
+
+The two tables disagree cell-by-cell, and that is expected rather than anomalous:
+`plan_steps > 0` measures the artifact, while `outcome` measures whether the
+architect *invocation* reported success (§2, §3). `reify_task_27` × `architect-opus-max`
+is the cleanest illustration — 3/3 planned but 1/3 `done`: two of its three cells
+carry a real plan (18 and 14 steps, `plan_quality` 0.95 / 0.93) and still read
+`blocked`, because the invocation hit its budget/turn ceiling *after* the architect
+had written those steps through plan-tools. There is no downstream role involved.
 
 **The metric-definition reconciliation — load-bearing.** esc-2862-1's resolution and
 its own triage note name *different* discriminating fixtures, which reads as a
