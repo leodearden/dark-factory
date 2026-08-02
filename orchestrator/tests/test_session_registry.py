@@ -272,6 +272,7 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
         'manual_boost': 2,
         'state': 'answered',
         'severity': 'critical',
+        'escalations_dir': '/p/data/reconciliation/escalations',
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
@@ -316,6 +317,7 @@ def test_decision_record_defaults() -> None:
     assert d.manual_boost == 0
     assert d.state == sr.DecisionState.OPEN
     assert d.severity == ''
+    assert d.escalations_dir == ''
 
 
 def test_decision_record_to_dict_includes_severity() -> None:
@@ -343,6 +345,54 @@ def test_decision_record_parses_pre_severity_dict_additive() -> None:
     }
     record = sr.DecisionRecord.from_dict(pre_severity)
     assert record.severity == ''
+
+
+def test_decision_record_parses_pre_escalations_dir_dict_additive() -> None:
+    """Every one of the ~300 decision records already on disk predates the
+    escalations_dir field (task 3528). Such a dict must still parse, yielding
+    the '' unset/legacy sentinel that makes the reaper fall back to today's
+    project-only scoping -- the backward-compatibility half of the fix.
+    """
+    pre_queue = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'approve?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+        'escalation_id': 'esc-1',
+        'state': 'open',
+        'severity': 'blocking',
+    }
+    record = sr.DecisionRecord.from_dict(pre_queue)
+    assert record.escalations_dir == ''
+
+
+def test_decision_record_parses_null_escalations_dir_as_empty() -> None:
+    """An explicit JSON null (a hand-edited or third-party-written record)
+    must also collapse to '', not None -- the annotation is `str`, and the
+    reaper's queue guard is a single `if decision_dir and ...` test with no
+    None-vs-''-vs-missing branching. Fail-soft, not a raise.
+    """
+    record = sr.DecisionRecord.from_dict(
+        {
+            'id': 'dec-1',
+            'project': 'df',
+            'text': 'approve?',
+            'filed_at': '2026-07-07T00:00:00+00:00',
+            'escalations_dir': None,
+        }
+    )
+    assert record.escalations_dir == ''
+
+
+def test_decision_record_to_dict_always_includes_escalations_dir() -> None:
+    """The key is emitted unconditionally -- including for a queue-less
+    record -- so a round-tripped record never loses its queue stamp and the
+    cockpit's read-modify-write helpers carry it through untouched.
+    """
+    assert (
+        _make_decision().to_dict()['escalations_dir'] == '/p/data/reconciliation/escalations'
+    )
+    assert 'escalations_dir' in _make_decision(escalations_dir='').to_dict()
 
 
 def test_decision_path_for_id_under_decisions_dir(tmp_path: Path) -> None:
