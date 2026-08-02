@@ -177,6 +177,82 @@ def build_pair_sets(records: list[dict[str, Any]]) -> dict[str, list[dict[str, s
     }
 
 
+def _classify_pair(left: Mapping[str, Any], right: Mapping[str, Any]) -> str:
+    """Name the pair class of one unordered pair — ``build_pair_sets``' rule.
+
+    ``build_pair_sets`` is deliberately left untouched (its three-class
+    return shape is bound by ten-plus tests and its output is the pooled
+    calibration of record, so this task's change stays provably additive).
+    That leaves the rule stated twice, so
+    ``TestPartitionPairsByCategory.test_classification_matches_build_pair_sets_within_a_category``
+    pins the two against each other on the same records: a divergence in
+    what counts as a hard negative fails the suite rather than silently
+    calibrating a category against a different population.
+    """
+    if left['cluster_id'] != right['cluster_id']:
+        return 'unrelated_pairs'
+    if left['label'] in _NEGATIVE_LABELS or right['label'] in _NEGATIVE_LABELS:
+        return 'hard_negative_pairs'
+    return 'true_dup_pairs'
+
+
+def partition_pairs_by_category(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bucket the same three pair classes per Mem0 category.
+
+    A SIBLING of ``build_pair_sets``, not a replacement: the pooled
+    measurement is the current calibration of record and must stay
+    byte-identical, so the per-category evidence is added rather than
+    substituted.
+
+    **Cross-category pairs are excluded, and the exclusion is counted.**
+    ``audit_duplicate_memories.fetch_ann_neighbors`` pushes the querying
+    record's own category into every Qdrant query as a payload filter, so a
+    cross-category ANN pair is structurally impossible rather than merely
+    filtered later. Calibrating a category's cutoff against pairs the
+    consumer can never form would measure the wrong population. The count
+    is emitted as ``cross_category_dropped`` rather than absorbed silently,
+    matching this script's standing rule that every dropped measurement is
+    a reported number.
+
+    A record with a missing or empty ``category`` forms no pair at all: it
+    has no bucket to belong to, and guessing one would invent the very
+    label the calibration is supposed to measure. Those drops are counted
+    the same way.
+
+    Returns ``{'by_category': {category: {<three classes>}},
+    'cross_category_dropped': int}``. Every category present in the input
+    appears in ``by_category`` even when it forms no pairs — omission would
+    read as "not measured" rather than "measured, and empty".
+    """
+    by_category: dict[str, dict[str, list[dict[str, str]]]] = {}
+    for record in records:
+        category = record.get('category')
+        if category:
+            by_category.setdefault(str(category), {
+                'true_dup_pairs': [], 'unrelated_pairs': [], 'hard_negative_pairs': [],
+            })
+
+    cross_category_dropped = 0
+    n = len(records)
+    for i in range(n):
+        left = records[i]
+        left_category = left.get('category')
+        for j in range(i + 1, n):
+            right = records[j]
+            right_category = right.get('category')
+            if not left_category or not right_category or left_category != right_category:
+                cross_category_dropped += 1
+                continue
+            a, b = sorted((str(left['memory_id']), str(right['memory_id'])))
+            by_category[str(left_category)][_classify_pair(left, right)].append(
+                {'a': a, 'b': b},
+            )
+
+    return {'by_category': by_category, 'cross_category_dropped': cross_category_dropped}
+
+
 # ---------------------------------------------------------------------------
 # Similarity + distribution statistics
 # ---------------------------------------------------------------------------
