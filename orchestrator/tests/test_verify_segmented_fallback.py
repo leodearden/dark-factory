@@ -1185,3 +1185,85 @@ class TestSegmentsReachThePersistedSummaryJson:
             entry = self._command_entry(summary, label)
             assert 'segments' in entry, f'{label}: key must be present unconditionally'
             assert entry['segments'] is None
+
+
+class TestMergeRoleFallbackIsNotSegmented:
+    """The merge lane keeps the fail-fast `&&` chain — end to end, at `_run_cmd`.
+
+    `TestRunScopedVerificationOptsFallbackIntoSegmentedTest` (test_verify.py)
+    pins the KEYWORD the fallback branch passes; this pins the OBSERVABLE
+    consequence, one process for the whole chain, through the real
+    `run_verification` with only `_run_cmd` stubbed. Both are needed: the
+    keyword could keep its value while the wiring below it changed.
+
+    Why merge is excluded at all — removing the short-circuit is a trade that
+    inverts here. The per-segment diagnostic exists so a task AGENT can read
+    its own assigned-file result instead of proving an unrelated red unrelated;
+    a merge failure goes straight to a human, who has the whole chain anyway.
+    Meanwhile the cost — seven more suites, up to the full resolved budget, with
+    the queue blocked — lands on the path `_run_or_skip_timed`'s `-n`-cap
+    comment already singles out as latency-critical.
+    """
+
+    @staticmethod
+    async def _run_scoped(tmp_path, *, role):
+        """Drive `run_scoped_verification`'s FALLBACK branch with `_run_cmd` stubbed."""
+        from unittest.mock import patch  # noqa: PLC0415
+
+        from orchestrator import verify as verify_mod  # noqa: PLC0415
+        from orchestrator.config import ModuleConfig, OrchestratorConfig  # noqa: PLC0415
+
+        (tmp_path / 'shared').mkdir(exist_ok=True)
+        (tmp_path / 'shared' / 'thing.py').write_text('x = 1\n', encoding='utf-8')
+        calls: list[dict] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
+            calls.append({'cmd': cmd, 'cwd': cwd})
+            # RED on the first thing it runs: under the `&&` chain the shell
+            # stopped here, and that fail-fast is what the merge lane keeps.
+            return 1, 'FAILED tests/test_thing.py::test_thing', False
+
+        fallback = ModuleConfig(
+            prefix='__fallback__',
+            test_command=_FLEET_TEST_COMMAND,
+            lint_command=None,
+            type_check_command=None,
+        )
+        config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False)
+        with patch('orchestrator.verify._build_fallback_config', return_value=fallback), \
+             patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await verify_mod.run_scoped_verification(
+                tmp_path,
+                config,
+                [],
+                task_files=['shared/thing.py'],
+                max_retries=0,
+                role=role,
+            )
+        return result, [c for c in calls if 'pytest' in c['cmd']]
+
+    @pytest.mark.asyncio
+    async def test_merge_role_runs_the_chain_as_one_process(self, tmp_path):
+        result, test_calls = await self._run_scoped(tmp_path, role='merge')
+
+        assert len(test_calls) == 1, (
+            'the merge lane must keep the single fail-fast `/bin/bash -c` chain; '
+            f'got {len(test_calls)} segment invocations'
+        )
+        assert test_calls[0]['cmd'].endswith(_FLEET_TEST_COMMAND), (
+            'the one process must still receive the WHOLE chain verbatim '
+            '(a cpu-governance/nice prefix may lead it)'
+        )
+        assert result.passed is False
+
+    @pytest.mark.asyncio
+    async def test_task_role_still_runs_every_segment(self, tmp_path):
+        """The control: same red, same fallback — the task lane segments it.
+
+        Without this the merge assertion above would keep passing if the opt-in
+        regressed to OFF everywhere, silently undoing task 3338.
+        """
+        result, test_calls = await self._run_scoped(tmp_path, role='task')
+
+        assert len(test_calls) == len(_fleet_segments())
+        assert result.passed is False

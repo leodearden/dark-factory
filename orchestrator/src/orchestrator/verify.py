@@ -6253,7 +6253,23 @@ async def run_scoped_verification(
                     # unrelated earlier subproject's red skips the clause a
                     # task's OWN assigned files live in — and one rc cannot say
                     # so. This is the ONLY call site that opts in.
-                    segment_chained_test=True,
+                    #
+                    # ...and NOT for role='merge' (amendment). Removing the
+                    # short-circuit is a cost/benefit trade that inverts on the
+                    # merge lane. Benefit: the per-segment diagnostic exists so
+                    # a task AGENT can read its own result instead of proving
+                    # an unrelated red unrelated — but a merge failure goes
+                    # straight to a human, who has the whole chain anyway. Cost:
+                    # a merge verify whose first subproject goes red would now
+                    # run the remaining seven suites, up to the full resolved
+                    # budget, with the queue blocked behind it — on the one path
+                    # this module already treats as latency-critical (see the
+                    # `-n`-cap comment in _run_or_skip_timed: 'merge' is never
+                    # -n-capped for exactly this reason). Budget exhaustion is
+                    # strictly MORE likely once every segment always runs; the
+                    # yaml's measured table already has five of seven segments
+                    # costing 1838.60s.
+                    segment_chained_test=role != 'merge',
                 )
                 fallback_result.plan = plan_dict
                 return fallback_result

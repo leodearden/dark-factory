@@ -5530,11 +5530,18 @@ class TestRunScopedVerificationOptsFallbackIntoSegmentedTest:
     `TestRunScopedVerificationForwardsWorktreeToFallback` enforces) that its
     test double is a fixed `(task_files, config=None, worktree=None)` fake with
     no `**kwargs` catch-all, so any new keyword there breaks task 2344's test.
+
+    `role='merge'` is deliberately EXCLUDED (amendment). The trade inverts on
+    the merge lane: the per-segment diagnostic exists so a task agent can read
+    its own result rather than prove an unrelated red unrelated, but a merge
+    failure goes to a human who has the whole chain anyway — while the cost
+    (running seven more suites, up to the full budget, with the queue blocked)
+    lands on the path this module already treats as latency-critical.
     """
 
-    @pytest.mark.asyncio
-    async def test_fallback_branch_passes_segment_chained_test_true(self, tmp_path: Path) -> None:
-        (tmp_path / 'shared').mkdir()
+    @staticmethod
+    async def _await_kwargs(tmp_path: Path, role) -> dict:
+        (tmp_path / 'shared').mkdir(exist_ok=True)
         (tmp_path / 'shared' / 'thing.py').write_text('x = 1\n')
 
         fallback = ModuleConfig(
@@ -5554,13 +5561,33 @@ class TestRunScopedVerificationOptsFallbackIntoSegmentedTest:
                 OrchestratorConfig(project_root=tmp_path),
                 [],
                 task_files=['shared/thing.py'],
-                role='task',
+                role=role,
             )
 
         assert run_verification_double.await_count == 1
         await_args = run_verification_double.await_args
         assert await_args is not None, 'run_verification was not awaited'
-        assert await_args.kwargs.get('segment_chained_test') is True
+        return await_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_fallback_branch_passes_segment_chained_test_true(self, tmp_path: Path) -> None:
+        assert (await self._await_kwargs(tmp_path, 'task')).get('segment_chained_test') is True
+
+    @pytest.mark.asyncio
+    async def test_merge_role_fallback_keeps_the_fail_fast_chain(self, tmp_path: Path) -> None:
+        """A red merge verify must still stop at the first subproject.
+
+        Not a style preference: without the gate, a merge verify whose first
+        subproject goes red runs the remaining seven suites before reporting,
+        holding the merge queue for up to the full resolved budget (3600s warm /
+        5400s cold) on every red attempt — and budget exhaustion is strictly
+        MORE likely once every segment always runs.
+        """
+        kwargs = await self._await_kwargs(tmp_path, 'merge')
+        assert kwargs.get('segment_chained_test') is False
+        # The gate must key on `role`, not on some other merge-ish signal that
+        # a caller could set independently.
+        assert kwargs.get('role') == 'merge'
 
 
 class TestBuildFallbackConfigDataModule:
