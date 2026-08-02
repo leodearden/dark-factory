@@ -516,3 +516,52 @@ class TestGeneralizedShapesAreReportedByScanDb:
         db_path = make_tasks_db(rows)
 
         assert scan_db(str(db_path)) == []
+
+
+# ---------------------------------------------------------------------------
+# All-unreadable exit-code contract (task 3474)
+#
+# Appended BELOW the task 3083 banner deliberately: that banner's "everything
+# above this line is the pre-existing behavioural contract and must stay green
+# UNMODIFIED" claim is the regression proof for the single-detector promotion,
+# so these later CLI tests are added after it rather than grouped with the
+# other _run_cli tests above.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_every_db_unreadable_exits_3_not_0(tmp_path):
+    """EVERY resolved database failing to open is not a clean sweep.
+
+    Covered here at the layer a cron job actually observes — a process exit
+    status — because that is where the false green did its damage: stdout
+    still reads "no leaked tool-call fragments found" while nothing at all
+    was scanned, so only the exit code can contradict it.
+    """
+    bad1 = tmp_path / "bad1.db"
+    bad2 = tmp_path / "bad2.db"
+    bad1.write_bytes(b"not a sqlite database, just garbage bytes")
+    bad2.write_bytes(b"not a sqlite database, just garbage bytes")
+
+    result = _run_cli("--db", str(bad1), "--db", str(bad2))
+
+    assert result.returncode == 3, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert str(bad1) in result.stderr
+    assert str(bad2) in result.stderr
+    assert "NOTHING was scanned" in result.stderr
+    # The clean-looking report is still printed — that is the false-green
+    # shape the exit code now disagrees with.
+    assert "no leaked tool-call fragments found" in result.stdout
+
+
+def test_cli_one_unreadable_db_beside_a_clean_one_still_exits_0(tmp_path, make_tasks_db):
+    """Partial failure is NOT exit 3: a database was genuinely scanned."""
+    corrupt_db = tmp_path / "corrupt.db"
+    corrupt_db.write_bytes(b"not a sqlite database, just garbage bytes")
+    clean_db = make_tasks_db([{"id": 1, "description": "Nothing wrong here."}])
+
+    result = _run_cli("--db", str(corrupt_db), "--db", str(clean_db))
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "no leaked tool-call fragments found" in result.stdout
+    assert str(corrupt_db) in result.stderr
+    assert "NOTHING was scanned" not in result.stderr
