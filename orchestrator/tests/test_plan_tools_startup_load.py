@@ -15,10 +15,10 @@ plan_tools_mcp_server.  This module asserts RUNTIME behaviour (live initialize
 handshakes) and cross-checks the same no-uv property end-to-end.
 
 Note: ``test_concurrent_startup_no_hang`` is heavyweight (6 real subprocesses).
-It is marked ``@pytest.mark.slow`` so it can be deselected with ``-m "not slow"``
-in fast unit runs.  The ``slow`` marker must be registered in pyproject.toml for
-strict-marker mode; omit ``--strict-markers`` or add the marker to suppress the
-PytestUnknownMarkWarning.
+It is marked ``@pytest.mark.slow`` so it can be deselected with ``-m "not slow
+and not warm_lane_bash"`` in fast unit runs.  The ``slow`` marker is
+registered in orchestrator/pyproject.toml's ``markers`` list (task 3506);
+see that entry for the deselect-composition rationale.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ def worktree(tmp_path: Path) -> Path:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)  # overrides global timeout=60; per-probe anyio deadline is primary
-@pytest.mark.slow  # heavyweight: 6 real subprocesses; deselect with -m "not slow"
+@pytest.mark.slow  # heavyweight: 6 real subprocesses; deselect with -m "not slow and not warm_lane_bash"
 async def test_concurrent_startup_no_hang(orch_project_dir: Path, worktree: Path) -> None:
     """6 concurrent plan-tools servers each complete MCP initialize < 30s each.
 
