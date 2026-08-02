@@ -84,10 +84,16 @@ def _user_turn_text(content: Any) -> str | None:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        # The `isinstance(..., str)` guard already excludes None and non-str at
+        # runtime, but binding it with a walrus is what carries that narrowing
+        # into the element expression — pyright cannot narrow an unbound
+        # `.get()` CALL across the guard, so the un-bound spelling inferred
+        # list[Unknown | None] and rejected the join. Same iteration, same
+        # filter, same values.
         texts = [
-            block.get('text') for block in content
+            block_text for block in content
             if isinstance(block, dict) and block.get('type') == 'text'
-            and isinstance(block.get('text'), str)
+            and isinstance(block_text := block.get('text'), str)
         ]
         if texts:
             return '\n'.join(texts)
@@ -106,8 +112,8 @@ def _content_to_text(content: Any) -> str:
         return content
     if isinstance(content, list):
         parts = [
-            block.get('text') for block in content
-            if isinstance(block, dict) and isinstance(block.get('text'), str)
+            block_text for block in content
+            if isinstance(block, dict) and isinstance(block_text := block.get('text'), str)
         ]
         return '\n'.join(parts)
     return ''
@@ -423,7 +429,12 @@ def find_retry_loops(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     PRD Sec 13.2): no fuzzy string similarity, just "same tool, same
     canonical-JSON input, again".
     """
-    groups: dict[tuple[str, str], list[int]] = {}
+    # `str | None` in the key, not `str`: _iter_tool_use_blocks selects on
+    # `type == 'tool_use'` only, so a malformed block with no 'name' yields a
+    # None here and always has. The declared type is corrected to match rather
+    # than the value coerced, which would change what a nameless block renders
+    # as in the report for no benefit.
+    groups: dict[tuple[str | None, str], list[int]] = {}
     for index, block in _iter_tool_use_blocks(records):
         key = (block.get('name'), _input_signature(block.get('input')))
         groups.setdefault(key, []).append(index)
