@@ -1,5 +1,6 @@
 """Unit tests for Mem0Backend — filter construction and search delegation."""
 
+import asyncio
 import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -463,6 +464,224 @@ class TestMem0BackendPayloadFilterSingleHome:
         """
         with pytest.raises(ValueError, match='at least one filter'):
             backend._build_payload_filter({})
+
+
+def _paging_client(pages: list[tuple[list, object]]) -> AsyncMock:
+    """AsyncMock Qdrant client whose scroll() replays a scripted sequence of
+    ``(points, next_offset)`` pairs."""
+    client = AsyncMock()
+    client.scroll = AsyncMock(side_effect=list(pages))
+    return client
+
+
+async def _drain(agen) -> list:
+    return [item async for item in agen]
+
+
+class TestMem0BackendScrollCollectionPages:
+    """The low-level pager: collection-addressed, raw points, real pagination.
+
+    Ported from ``scripts/census_memory_metadata.py``'s ``scroll_all_payloads``
+    (task 3225), whose whole reason to exist was that the backend discarded
+    ``next_offset`` and so re-read the same head forever.  The loop now lives
+    here — one home for the offset/next_offset walk, the per-page read bound
+    and the page budget — with the census and
+    ``scripts/consolidate_namespace_families.py`` both sitting on top of it.
+
+    Collection-name-addressed (not Scope-addressed) and filter-optional on
+    purpose: consolidate_namespace_families scrolls LEGACY mis-named
+    collections (``reify_reify``, ``fused_dark-factory``) that a Scope
+    structurally cannot produce, with no filter at all.
+    """
+
+    def _make_mock_point(self, point_id: str, created_at: str | None = None, extra_meta: dict | None = None):
+        """Reuse the sibling suite's Qdrant Record/ScoredPoint double."""
+        return TestMem0BackendScrollByMetadata._make_mock_point(self, point_id, created_at, extra_meta)
+
+    @pytest.mark.asyncio
+    async def test_yields_raw_points_across_all_pages_in_order(self, backend):
+        """Raw point objects (not normalised dicts) stream out in page order.
+
+        consolidate_namespace_families' merge_collection reads
+        ``point.id``/``point.vector``/``point.payload`` to build PointStructs,
+        so this layer must not normalise.
+        """
+        p1, p2, p3, p4 = (self._make_mock_point(f'id-{i}') for i in range(1, 5))
+        client = _paging_client([([p1, p2], 'off-1'), ([p3], 'off-2'), ([p4], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_collection_pages('reify_reify', page_size=2))
+
+        assert got == [p1, p2, p3, p4], 'points must stream in order, identity-preserved'
+
+    @pytest.mark.asyncio
+    async def test_passes_previous_next_offset_on_each_subsequent_call(self, backend):
+        """THE defect being fixed: each page is requested at the prior next_offset.
+
+        A non-paging implementation sends offset=None three times and re-reads
+        the same head.
+        """
+        client = _paging_client([
+            ([self._make_mock_point('a')], 'off-1'),
+            ([self._make_mock_point('b')], 'off-2'),
+            ([self._make_mock_point('c')], None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('c', page_size=1))
+
+        offsets = [call.kwargs.get('offset') for call in client.scroll.await_args_list]
+        assert offsets == [None, 'off-1', 'off-2']
+
+    @pytest.mark.asyncio
+    async def test_stops_when_next_offset_is_none(self, backend):
+        client = _paging_client([([self._make_mock_point('a')], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+        assert client.scroll.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_forwards_collection_name_verbatim_and_scroll_kwargs(self, backend):
+        """collection_name is passed through UNCHANGED — never scope-derived.
+
+        ``fused_dark-factory`` is a real legacy collection name from
+        consolidate_namespace_families' COLLECTION_MERGES; prefixing or
+        re-deriving it would address a collection that does not exist.
+        """
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('fused_dark-factory', page_size=25))
+
+        kwargs = client.scroll.await_args_list[0].kwargs
+        assert kwargs['collection_name'] == 'fused_dark-factory'
+        assert kwargs['with_payload'] is True
+        assert kwargs['limit'] == 25
+        assert kwargs['with_vectors'] is False, 'vectors are opt-in, not paid for by default'
+        assert kwargs['scroll_filter'] is None, 'no filter given ⇒ scroll the whole collection'
+
+    @pytest.mark.asyncio
+    async def test_forwards_with_vectors_and_scroll_filter_when_given(self, backend):
+        """Both opt-in kwargs reach Qdrant verbatim."""
+        from qdrant_client.http import models as qmodels
+
+        given_filter = backend._build_payload_filter({'category': 'procedural_knowledge'})
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages(
+                'c', scroll_filter=given_filter, page_size=10, with_vectors=True,
+            ))
+
+        kwargs = client.scroll.await_args_list[0].kwargs
+        assert kwargs['with_vectors'] is True
+        assert isinstance(kwargs['scroll_filter'], qmodels.Filter)
+        assert kwargs['scroll_filter'] == given_filter
+
+    @pytest.mark.asyncio
+    async def test_empty_collection_yields_nothing(self, backend):
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+        assert got == []
+
+    @pytest.mark.asyncio
+    async def test_raises_when_page_budget_exhausted_with_live_next_offset(self, backend):
+        """A truncated stream RAISES, never returns short (INV-2 no-silent-fail).
+
+        A pager with no budget loops forever if Qdrant keeps handing back a
+        live next_offset, so the budget travels with the loop — and exhausting
+        it is an error, not a quiet early return.
+        """
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        client = _paging_client([
+            ([self._make_mock_point('a')], 'off-1'),
+            ([self._make_mock_point('b')], 'off-2'),
+        ])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPageBudgetExhausted) as excinfo,
+        ):
+            await _drain(backend.scroll_collection_pages('fused_reify', page_size=1, max_pages=2))
+
+        message = str(excinfo.value)
+        assert 'fused_reify' in message, 'the message must name the collection'
+        assert '2' in message, 'the message must name the exhausted page count'
+        assert 'off-2' in message, 'the message must name the still-live offset'
+
+    @pytest.mark.asyncio
+    async def test_does_not_raise_when_budget_is_exactly_enough(self, backend):
+        p1, p2 = self._make_mock_point('a'), self._make_mock_point('b')
+        client = _paging_client([([p1], 'off-1'), ([p2], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_collection_pages('c', page_size=1, max_pages=2))
+
+        assert got == [p1, p2]
+
+    @pytest.mark.asyncio
+    async def test_scroll_page_budget_exhausted_is_an_exception(self):
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        assert issubclass(ScrollPageBudgetExhausted, Exception)
+
+    @pytest.mark.asyncio
+    async def test_a_hung_page_request_raises_instead_of_hanging(self, backend):
+        """A wedged socket fails loudly rather than hanging a ~30-page scan forever.
+
+        Same propagate-don't-swallow posture as count_by_metadata /
+        scroll_by_metadata / get_point_by_id.
+        """
+        async def _hang(**kwargs):
+            await asyncio.sleep(3600)
+
+        client = AsyncMock()
+        client.scroll = AsyncMock(side_effect=_hang)
+        backend._read_timeout = 0.01
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(TimeoutError),
+        ):
+            await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+    @pytest.mark.asyncio
+    async def test_timeout_applies_per_page_not_per_scan(self, backend):
+        """Every page gets its OWN full-length bound, not a share of one budget.
+
+        A per-scan bound would abort a long-but-healthy multi-page scan the
+        moment the pages' cumulative time crossed the read timeout.  Asserted
+        by spying on wait_for rather than by sleeping, so it cannot flake
+        under parallel load.
+        """
+        p1, p2, p3 = (self._make_mock_point(c) for c in 'abc')
+        client = _paging_client([([p1], 'off-1'), ([p2], 'off-2'), ([p3], None)])
+        backend._read_timeout = 7.5
+
+        real_wait_for = asyncio.wait_for
+        seen_timeouts: list = []
+
+        async def _spy(awaitable, timeout=None):
+            seen_timeouts.append(timeout)
+            return await real_wait_for(awaitable, timeout)
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            patch('fused_memory.backends.mem0_client.asyncio.wait_for', _spy),
+        ):
+            got = await _drain(backend.scroll_collection_pages('c', page_size=1))
+
+        assert got == [p1, p2, p3]
+        assert seen_timeouts == [7.5, 7.5, 7.5], (
+            'each of the 3 page requests must be wrapped in its own '
+            f'wait_for(timeout=_read_timeout); got {seen_timeouts!r}'
+        )
 
 
 class TestMem0BackendGetPointById:
