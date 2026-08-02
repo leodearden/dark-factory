@@ -72,11 +72,14 @@ Usage
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 
 __all__ = [
     'TOPIC_SLUG_MAX_LEN',
+    'PatchDecision',
+    'compute_patch',
     'derive_topic_slug',
     'is_valid_topic_slug',
 ]
@@ -128,3 +131,83 @@ def derive_topic_slug(value: object) -> str | None:
         return None
     folded = _NON_SLUG_RUN_RE.sub('-', value.strip().lower()).strip('-')
     return folded if is_valid_topic_slug(folded) else None
+
+
+@dataclass(frozen=True)
+class PatchDecision:
+    """What to write to one record, and why.
+
+    Attributes:
+        patch: The metadata patch to hand to ``update_memory``.  **Empty
+            means issue no call at all** — see :func:`compute_patch`.
+        dispositions: Ordered, deduplicated reasons.  Every key considered
+            contributes exactly one, whether or not it produced a write, so
+            the report can distinguish "already correct" from "never looked
+            at" — the two an absent line would otherwise conflate.
+    """
+
+    patch: dict = field(default_factory=dict)
+    dispositions: tuple[str, ...] = ()
+
+
+def compute_patch(
+    existing_metadata: dict,
+    *,
+    target_topic: str,
+    make_canonical: bool,
+) -> PatchDecision:
+    """Decide the minimal metadata patch for one record.
+
+    The idempotence heart of the sweep.  A patch is emitted only for keys
+    that would actually change; when nothing would, ``patch`` is empty and
+    the caller must issue **no** ``update_memory`` — not an update that
+    happens to be a no-op.  That is what makes a second run cost zero writes
+    rather than zero net effect, and it is why ``run``'s "stamped" count is
+    an honest measure of what the corpus gained.
+
+    Pure: takes a plain dict, touches no service, mutates nothing.
+
+    Topic rules
+    -----------
+    * absent -> stamp *target_topic* (``topic_stamped``);
+    * present and folding to *target_topic* already in conforming shape ->
+      no write (``topic_already_present``);
+    * present in a shape that folds TO *target_topic* (the snake_case twin)
+      -> rewrite in place (``topic_normalized``).  This is the normalization
+      ε's enforcement note delegates here, and the precondition for flipping
+      ``memory_metadata.enforce``;
+    * present and folding to something else, or unfoldable -> **refuse**
+      (``conflicting_existing_topic``).  A retro sweep must not be able to
+      destroy a topic a human set.  An unfoldable existing value means no
+      honest comparison is available, which is a reason to refuse rather
+      than a licence to overwrite.
+
+    Args:
+        existing_metadata: The record's current metadata, as read live.
+        target_topic: The slug this cluster resolved to.  Already validated
+            by the planner that produced it.
+        make_canonical: Whether this record is its cluster's undisputed
+            canonical.  Never demotes: ``False`` emits nothing.
+
+    Returns:
+        A :class:`PatchDecision`; ``patch`` may be empty.
+    """
+    patch: dict = {}
+    dispositions: list[str] = []
+
+    existing_topic = existing_metadata.get('topic')
+    if existing_topic is None:
+        patch['topic'] = target_topic
+        dispositions.append('topic_stamped')
+    elif existing_topic == target_topic:
+        dispositions.append('topic_already_present')
+    elif derive_topic_slug(existing_topic) == target_topic:
+        # Same topic, legacy shape (e.g. eval_worktree_plan_tools_missing ->
+        # eval-worktree-plan-tools-missing). Rewriting is normalization, not
+        # reassignment — the fold is what proves they are the same fact.
+        patch['topic'] = target_topic
+        dispositions.append('topic_normalized')
+    else:
+        dispositions.append('conflicting_existing_topic')
+
+    return PatchDecision(patch=patch, dispositions=tuple(dispositions))
