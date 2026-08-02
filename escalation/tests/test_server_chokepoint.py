@@ -4001,3 +4001,229 @@ class TestBoundary9CancelRetire:
         with contextlib.suppress(asyncio.QueueEmpty):
             while True:
                 mq.get_nowait().result.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Task 3103 — the already_merged fast-path must decline a DEGENERATE branch
+# ---------------------------------------------------------------------------
+
+_DEGENERATE_TIP = 'a' * 40
+
+
+async def _run_fast_path_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tip: str = _DEGENERATE_TIP,
+    is_ancestor_result: bool = True,
+    patch_contained: bool = False,
+    metadata: dict[str, Any] | None = None,
+    scheduler_raises: bool = False,
+    with_scheduler: bool = True,
+) -> tuple[dict, asyncio.Queue, list]:
+    """Drive merge_request's submit-time fast path once.
+
+    Returns ``(result, mq, emitted_events)``.  A background worker resolves
+    the future so the fall-through path (no fast-path hit) terminates instead
+    of blocking, letting each test assert on the RESPONSE rather than on a
+    timeout.
+    """
+    import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+    from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+    class _RecordingEventStore:
+        def __init__(self) -> None:
+            self.events: list = []
+
+        def emit(self, event_type, **kwargs) -> None:  # type: ignore[override]
+            self.events.append(event_type)
+
+    recording_event_store = _RecordingEventStore()
+
+    async def _resolve_branch_sha(name: str) -> str:
+        return tip
+
+    async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+        return is_ancestor_result
+
+    async def _find_inflight_merge_worktree(branch: str):
+        return None
+
+    git_ops_stub = types.SimpleNamespace(
+        resolve_branch_sha=_resolve_branch_sha,
+        is_ancestor=_is_ancestor,
+        find_inflight_merge_worktree=_find_inflight_merge_worktree,
+    )
+    harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+    if with_scheduler:
+        async def _get_task(tid: str):
+            if scheduler_raises:
+                raise RuntimeError('scheduler unreachable')
+            return {'metadata': metadata or {}}
+
+        harness_stub.scheduler = types.SimpleNamespace(get_task=_get_task)
+
+    async def _patch_content_contained(head, upstream, git_ops):
+        return patch_contained
+
+    monkeypatch.setattr(
+        orchestrator_merge_queue, 'patch_content_contained', _patch_content_contained,
+    )
+
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    mq: asyncio.Queue = asyncio.Queue()
+    server = create_server(
+        esc_queue,
+        merge_queue=mq,
+        orch_config=_make_orch_config(tmp_path / 'repo'),
+        event_store=recording_event_store,
+        harness=harness_stub,
+        merge_inflight_registry=_make_registry(),
+    )
+
+    async def _worker() -> None:
+        req = await mq.get()
+        req.result.set_result(MergeOutcome('done', reason='test done'))
+        await mq.put(req)   # put it back so tests can assert the enqueue happened
+
+    worker_task = asyncio.create_task(_worker())
+    try:
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='591',
+                branch='591',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                wait_secs=100,
+            ),
+            timeout=5.0,
+        )
+    finally:
+        if not worker_task.done():
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+    return result, mq, recording_event_store.events
+
+
+@pytest.mark.asyncio
+class TestMergeRequestDegenerateBranchFastPath:
+    """merge_request's already_merged fast-path must decline a zero-commit branch.
+
+    A degenerate branch is parked at an OLD main commit, so it IS an ancestor
+    of main — the fast-path's only guard — and answering
+    ``{status:'already_merged', commit:<that foreign SHA>}`` is a phantom done
+    on a WRITE path (the runbooks treat already_merged the same as done and
+    stamp done_provenance from ``result['commit']``).
+    """
+
+    async def test_degenerate_branch_does_not_short_circuit_as_already_merged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        result, mq, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP},
+        )
+
+        assert result['status'] != 'already_merged', (
+            f'Degenerate branch must not fast-path as already_merged: {result}'
+        )
+        assert result.get('commit') != _DEGENERATE_TIP, (
+            f'The parked foreign SHA must not be returned as a commit: {result}'
+        )
+        assert not mq.empty(), 'Expected the request to be enqueued instead'
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event on the fall-through path, got: {events}'
+        )
+
+    async def test_degenerate_branch_also_skips_patch_id_backstop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The non-obvious case: the task-2945 backstop is vacuously True here.
+
+        ``patch_content_contained`` runs ``git cherry <main> <tip>`` and
+        returns True when no ``+`` lines appear — which for a ZERO-COMMIT
+        branch is true VACUOUSLY, because git emits nothing.  Gating only the
+        is_ancestor arm would leak the degenerate branch straight into the
+        backstop and still answer already_merged.  This test is the only
+        thing that catches that.
+        """
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP},
+        )
+
+        assert result['status'] != 'already_merged', (
+            f'Degenerate branch must not reach the patch-id backstop: {result}'
+        )
+        assert not mq.empty(), 'Expected the request to be enqueued instead'
+
+    async def test_non_degenerate_ancestor_branch_still_already_merged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The task-1629 fast-path is preserved for a real merged branch."""
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata={'branch_base_sha': 'b' * 40},   # != tip → non-degenerate
+        )
+
+        assert result == {
+            'status': 'already_merged',
+            'commit': _DEGENERATE_TIP,
+            'reason': '',
+            'conflict_details': '',
+            'push_status': None,
+        }, f'Expected the unchanged already_merged shape, got: {result}'
+        assert mq.empty(), f'Expected no enqueue, qsize={mq.qsize()}'
+
+    async def test_rebased_branch_still_already_merged_via_patch_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The task-2945 backstop is preserved for a real rebased landing.
+
+        A rebased landing has commits beyond its base, so it is non-degenerate
+        by construction and the new guard never fires on it.
+        """
+        result, _, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=True,
+            metadata={'branch_base_sha': 'b' * 40},
+        )
+
+        assert result['status'] == 'already_merged', (
+            f'Rebased landing must still fast-path via patch-id, got: {result}'
+        )
+
+    async def test_scheduler_absent_preserves_legacy_fast_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No .scheduler at all → metadata unavailable → guard skipped.
+
+        Pins the fail-soft direction, and guarantees the many existing
+        chokepoint tests whose harness stub is a bare
+        ``SimpleNamespace(git_ops=...)`` keep working.
+        """
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True, with_scheduler=False,
+        )
+
+        assert result['status'] == 'already_merged', (
+            f'A scheduler-less harness must keep the legacy fast-path: {result}'
+        )
+        assert mq.empty()
+
+    async def test_scheduler_get_task_raises_preserves_fast_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A raising get_task degrades the guard, and merge_request does not raise."""
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True, scheduler_raises=True,
+        )
+
+        assert isinstance(result, dict), 'merge_request must not raise'
+        assert result['status'] == 'already_merged', (
+            f'A scheduler fault must not break submission: {result}'
+        )
+        assert mq.empty()
