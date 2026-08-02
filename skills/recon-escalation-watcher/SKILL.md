@@ -404,12 +404,19 @@ the primary return-triage surface across both watchers:
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
-  [--task-id <task_id>] [--escalation-id <escalation_id>] [--severity <esc.severity>]
+  [--task-id <task_id>] [--escalation-id <escalation_id>] [--severity <esc.severity>] \
+  [--escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations]
 ```
 
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
   escalation id (e.g. `esc-recon-abc-1`) is the natural choice. Re-filing the same id overwrites
   the prior record rather than duplicating it.
+  **INTERIM RULE — check before you overwrite.** Decision ids are fleet-global, so the
+  orchestrator's `escalation-watcher` may already have filed a decision under this id for the same
+  underlying human gate. Before filing, check whether a decision for that id already exists and is
+  still `open`; if it is, do **not** overwrite it — a second watcher observing the same gate must
+  enrich or no-op, never clobber richer context or downgrade an existing record's severity. Park
+  your recon record and append the id to your handled set instead.
 - **`--text`**: the one-line question a human needs to answer.
 - **`--task-id` / `--escalation-id`**: thread through the synthetic `recon-<runid>` task id (if
   any) and the escalation id, so the cockpit can cross-link the decision to its source.
@@ -417,6 +424,14 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
   under stale awaiting-input sessions.
+- **`--escalations-dir`**: the escalation **queue** your `--escalation-id` belongs to — for this
+  watcher, `$DARK_FACTORY_ROOT/data/reconciliation/escalations`. It must name the SAME queue you
+  later pass to `reap-decisions` (below). Decision records are fleet-global while an escalation id
+  is unique only *within* one queue, and this project runs two of them over the same
+  `esc-<taskid>-<n>` namespace, so this is what lets the reaper join a decision back to the right
+  per-queue id namespace instead of matching an unrelated same-named orchestrator escalation.
+  Stored normalized, so any spelling of the same directory works. Omitting it files a queue-less
+  record — see the hazard note below.
 - The verb always files `state=open` and is fail-soft (a registry fault is logged and swallowed,
   never raised) — filing a decision can never crash the watch loop or block the "leave pending"
   action itself.
@@ -438,9 +453,30 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py rea
 
 **Note the queue dir**: recon escalations live under `data/reconciliation/escalations/` (the
 flat recon queue on port 8103), **not** `data/escalations/` (the levelled orchestrator queue that
-`escalation-watcher` reaps). Pointing `--escalations-dir` at `data/escalations` here would make
-the reaper a permanent no-op — it would scan the wrong directory, never find a recon escalation's
-terminal status, and never close a recon-watcher decision.
+`escalation-watcher` reaps). A mis-pointed reaper does **not** merely no-op. Escalation ids
+(`esc-<taskid>-<n>`) are unique only *within* a queue and both queues share that namespace, so
+pointing `--escalations-dir` at `data/escalations` here makes the reaper **falsely close** this
+watcher's decisions against unrelated orchestrator escalations that happen to share an id — the
+decision vanishes from the cockpit queue while its own escalation is still pending. Observed with
+`esc-3036-1` (task 3528): a blocking recon gate was silently closed and sat invisible for ~7 days;
+15 ids were resolved in both queues at time of measurement.
+
+Passing `--escalations-dir` on `write-decision` is what makes the reaper skip cross-queue records:
+it stamps the owning queue on the decision, and a reaper scanning a *different* queue leaves that
+decision alone. Keep the two dirs straight regardless — a queue-less legacy record (filed before
+that flag existed) falls back to project-only scoping and has no such protection.
+
+Two collision modes exist and must not be conflated:
+
+- **MODE 1 — unrelated same-id escalations** (`esc-3036-1`): two different escalations that merely
+  collide in the shared id namespace. Closing across queues here is a straight bug, and the queue
+  stamp is what prevents it.
+- **MODE 2 — same-subject duplicates** (`esc-5914-1`): both queues surfacing the *same* underlying
+  human gate. These must collapse to **ONE** cockpit decision — a human asked the same question
+  twice is its own regression. That is why the queue is recorded as a *field* on the record rather
+  than namespaced into the decision id (`recon:esc-…` / `orch:esc-…` would double-file the same
+  question), and why a second watcher must never downgrade an existing record's severity (see the
+  interim rule under `--id` above).
 
 This closes (`answered`/`dropped`) any `state=open`, `escalation_id`-bearing decision whose
 escalation has since resolved (`resolved` → `answered`) or been dismissed (`dismissed` →
