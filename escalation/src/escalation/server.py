@@ -2395,7 +2395,14 @@ def create_server(
           per-project opt-out) guard 3 is skipped and merge_sha is the branch
           tip; guard 2 still applies.
         - If the branch ref is gone (tip is None): calls ``find_merge_marker``
-          which searches git log for the merge commit subject.
+          which searches git log for the merge commit subject.  On hit, two
+          further guards (task 3103, mirroring the harness marker arm):
+          the marker must NOT predate the recorded ``branch_base_sha`` (else
+          the branch was deleted and recreated under the same id and the
+          marker belongs to a previous incarnation), and
+          ``validate_landing_evidence`` CANDIDATE mode must find the marker's
+          effect still present at main HEAD (the marker's subject match
+          already establishes attribution).
           On hit → state='done', kind='found_on_main',
           merge_sha=<merge-commit SHA on main>.
         Fire-safe: any git failure degrades to the honest Tier-4 unknown
@@ -2498,6 +2505,7 @@ def create_server(
                     # already degrades to the honest Tier-4 unknown via the wrapper below.
                     from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
                         branch_is_degenerate,
+                        is_valid_sha_40,
                         validate_landing_evidence,
                     )
                     if (tip is not None and tip != main_tip
@@ -2562,7 +2570,36 @@ def create_server(
                         # merge_sha = merge-commit SHA on main (via git log scan).
                         marker = await git_ops.find_merge_marker(full_branch)
                         if marker is not None:
-                            return _found_on_main_response(request_id, marker)
+                            metadata = await _git_authority_task_metadata(tid)
+                            branch_base_sha = metadata.get('branch_base_sha')
+                            # Predates-this-incarnation veto (task 3103, mirroring
+                            # the harness marker arm): the branch was deleted and
+                            # recreated under the SAME task id, so a marker older
+                            # than this incarnation's base attributes a previous
+                            # run's merge to the current task.  is_valid_sha_40 sits
+                            # on the LEFT of the `and` so a missing or malformed
+                            # base never reaches is_ancestor with a bad argument.
+                            if not (
+                                is_valid_sha_40(branch_base_sha)
+                                and await git_ops.is_ancestor(marker, branch_base_sha)
+                            ):
+                                # CANDIDATE mode: the marker's subject match already
+                                # establishes attribution, so only the FIX 1'
+                                # effect-present guard remains — closing the
+                                # task-1175 clobber where a reverted merge still
+                                # read as a genuine landing.  No escalation on
+                                # reject (unlike the harness marker path):
+                                # merge_status is a read-only probe with no write
+                                # side, so a reject degrades to Tier-4 unknown.
+                                verdict = await validate_landing_evidence(
+                                    git_ops, tid, full_branch,
+                                    branch_tip_sha=None,
+                                    candidate_sha=marker,
+                                )
+                                if verdict.accepted:
+                                    return _found_on_main_response(
+                                        request_id, verdict.evidence_sha,
+                                    )
                 except Exception:
                     logger.warning(
                         'merge_status: git-authority probe failed, returning unknown',
