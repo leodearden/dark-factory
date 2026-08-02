@@ -1298,9 +1298,13 @@ def test_wait_for_path_scaled_returns_load_scaled_budget_on_loaded_host(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """On a loaded host, the returned budget matches _load_scaled_grace's own
-    output -- used as the oracle rather than a hardcoded expected number, so
-    the floor/scale/clamp/error-safe arithmetic stays pinned exactly once,
-    by the test_load_scaled_grace_* family above.
+    output -- used as the oracle for arg-forwarding (cap_secs in
+    particular), so a change to how arguments reach _load_scaled_grace is
+    pinned here without duplicating its floor/scale/clamp/error-safe
+    arithmetic, already pinned once by the test_load_scaled_grace_* family
+    above. That oracle alone can't catch a bug shared by both functions, so
+    a literal expected value is also pinned below (96.0 loadavg / 32 cores
+    => load-per-core 3.0, base 5 => ceil(5 * 3.0) = 15).
 
     The path already exists, so the call returns immediately: this is what
     makes the policy assertable without ever sleeping.
@@ -1311,9 +1315,9 @@ def test_wait_for_path_scaled_returns_load_scaled_budget_on_loaded_host(
     existing = tmp_path / "already-there"
     existing.touch()
 
-    assert _wait_for_path_scaled(existing, 5) == _load_scaled_grace(
-        5, cap_secs=_READINESS_WAIT_CAP_SECS
-    )
+    budget = _wait_for_path_scaled(existing, 5)
+    assert budget == 15
+    assert budget == _load_scaled_grace(5, cap_secs=_READINESS_WAIT_CAP_SECS)
 
 
 def test_wait_for_path_scaled_idle_host_floors_at_base(
@@ -1337,13 +1341,15 @@ def test_wait_for_path_scaled_enforces_the_scaled_budget_not_the_base(
 ) -> None:
     """Propagation test -- the one property the return value alone cannot
     prove: a buggy implementation could return the scaled number but still
-    pass the raw, unscaled base through to _wait_for_path. Points at a path
-    that never appears so the real enforced timeout is observable both via
-    the raised message and via measured wall-clock.
+    pass the raw, unscaled base (or, for the second case below, a budget
+    without extra_secs) through to _wait_for_path. Points at a path that
+    never appears so the real enforced timeout is observable both via the
+    raised message and via measured wall-clock.
 
-    Deliberately sized at ~2s of real wall-clock (base_secs=1 x load-per-core
-    2.0 => scaled budget 2); a larger base would only make the suite slower
-    without pinning anything further.
+    Deliberately sized at ~2s/~3s of real wall-clock (base_secs=1 x
+    load-per-core 2.0 => scaled budget 2; plus extra_secs=1.0 => 3); a
+    larger base would only make the suite slower without pinning anything
+    further.
     """
     monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 32)
@@ -1357,6 +1363,20 @@ def test_wait_for_path_scaled_enforces_the_scaled_budget_not_the_base(
 
     assert elapsed >= 2.0, (
         f"expected the SCALED budget (2s), not the 1s base, to be enforced; "
+        f"only waited {elapsed:.2f}s"
+    )
+
+    # extra_secs must reach _wait_for_path too, not just the return value --
+    # a buggy impl could compute `scaled + extra_secs` for the return but
+    # pass only `scaled` through to _wait_for_path, which the assertion
+    # above alone (extra_secs defaults to 0.0 there) would not catch.
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match=r"Timed out after 3"):
+        _wait_for_path_scaled(missing, 1, extra_secs=1.0)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 3.0, (
+        f"expected the SCALED budget + extra_secs (3s) to be enforced; "
         f"only waited {elapsed:.2f}s"
     )
 
