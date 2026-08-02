@@ -25,32 +25,53 @@ Background
 ----------
 Prior to task-1659, ``flag_dedup._write_and_confirm_marker`` wrote markers with
 ``metadata.source='stage1_flag_marker'`` but omitted ``metadata.kind``.  Dual-filter
-queries keyed on *both* source and kind silently under-count those markers.  Fix (1) in
-task-1659 adds kind to every new write; this script is Fix (2): a one-time sweep to
-remove the 6 pre-existing orphans so the counts converge immediately.
+queries keyed on *both* source and kind silently under-count those markers.  At the
+time, Fix (1) in task-1659 added ``kind`` to every new write; this script was Fix (2):
+a one-time sweep that removed the 6 pre-existing orphans so the counts converged
+immediately.  (Task 2406 has since retired the write path Fix (1) touched — see
+"Task 2596 background" above; there is no longer a new write for it to apply to.)
 
 Deletion vs backfill
 --------------------
-Orphan markers are deleted (not updated in place) for two reasons:
- 1. Mem0/Qdrant exposes ``delete_memory`` but no payload-update primitive on this path.
- 2. stage1_flag_markers are self-healing: a deleted marker is rewritten with both keys
-    on the next MISS cycle (at most one extra re-escalation, within the existing
-    best-effort-replacement tolerance).
+Mem0/Qdrant now exposes an in-place payload-update primitive: task 3088 shipped
+``MemoryService.update_memory`` (``services/memory_service.py:3947``) over
+``Mem0Backend.set_payload`` (``backends/mem0_client.py:343``), a genuine
+server-side partial merge that preserves the Qdrant point id, ``created_at``,
+and every unnamed sibling key. The old "no payload-update primitive on this
+path" objection no longer applies, so this script's choice to delete rather
+than backfill ``kind`` in place is no longer forced by a missing capability.
+
+Orphan markers are still deleted, not backfilled, for a stronger reason:
+nothing reads them. Task 2406 retired the Mem0 marker write path —
+``flag_dedup`` persists markers only to the ``recon_ledger`` SQLite table, and
+its module docstring (``reconciliation/flag_dedup.py:127-131``) states
+plainly: "Reads in this module NEVER consult Mem0 — the ledger is the sole
+read source." The write path is doubly closed too: there is no ``add_memory``
+call left in ``flag_dedup`` for markers, and a server-side gate
+(``server/tools.py:1710-1725``) independently rejects any ``recon-stage-*``
+write whose metadata carries ``source`` or ``kind`` equal to
+``'stage1_flag_marker'``. So a backfilled ``kind`` on one of these orphans
+would be consulted by nothing — it would restore zero dedup capability,
+because the population it would join has no live reader left, only a deleter
+(see "Task 2596 background" above).
+
+Deletion here is therefore permanent, not self-healing: no code path rewrites
+a Mem0 marker on a later MISS cycle any more (that behavior existed before
+task 2406 and does not exist now). An operator running ``--apply`` should
+read this as an irreversible delete of dead records, not as a correction a
+later cycle will reapply.
 
 Taskless markers (task 2108)
 -----------------------------
 In addition to the missing-``kind`` orphans above, this sweep also purges
 stage1_flag_marker records that carry a valid ``kind`` but lack a usable
 ``task_id`` (missing key, ``None``, or ``''``) — see ``find_taskless_markers``.
-This is safe for the same self-healing reason as above, plus one more:
-``mem0_dedup.find_prior_memories`` filters candidate priors by
-``str(meta.get('task_id', '')) != task_id_str`` (see
-``fused_memory.reconciliation.flag_dedup``), so a marker without a task_id can
-*never* be returned as a dedup prior. It cannot collapse a repeat flag,
-cannot suppress re-escalation, and Stage 2 never sweeps it either — it is
-pure dead weight from the moment it is written. Deleting it therefore loses
-zero dedup capability; if the underlying flag recurs, the next MISS cycle
-writes a fresh marker with both ``kind`` and ``task_id`` set.
+This is safe for the same reason as the missing-``kind`` orphans above:
+nothing reads the Mem0 marker population at all (see "Deletion vs backfill"),
+so a taskless marker is pure dead weight regardless of whether it also
+carries a ``kind``. It cannot collapse a repeat flag, cannot suppress
+re-escalation, and Stage 2 never sweeps it either. Deleting it loses zero
+dedup capability.
 
 Enumeration strategy
 --------------------
