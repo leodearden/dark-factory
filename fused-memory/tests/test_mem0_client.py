@@ -85,8 +85,13 @@ class TestMem0BackendSearch:
 class TestMem0BackendScrollByMetadata:
     """scroll_by_metadata builds a Qdrant payload filter and returns normalised point dicts."""
 
-    def _make_mock_point(self, point_id: str, created_at: str | None, extra_meta: dict | None = None):
-        """Create a MagicMock that mimics a Qdrant Record/ScoredPoint."""
+    @staticmethod
+    def _make_mock_point(point_id: str, created_at: str | None, extra_meta: dict | None = None):
+        """Create a MagicMock that mimics a Qdrant Record/ScoredPoint.
+
+        A staticmethod so sibling suites can reuse it directly rather than
+        borrowing it with a foreign ``self``.
+        """
         payload = {}
         if created_at is not None:
             payload['created_at'] = created_at
@@ -256,8 +261,8 @@ class TestMem0BackendScrollByMetadataWithVectors:
     the unit lane alongside the sibling scroll_by_metadata tests above.
     """
 
+    @staticmethod
     def _make_mock_point(
-        self,
         point_id: str,
         created_at: str | None,
         extra_meta: dict | None = None,
@@ -410,11 +415,16 @@ class TestMem0BackendPayloadFilterSingleHome:
         assert isinstance(built, qmodels.Filter)
         assert isinstance(built.must, list)
         assert len(built.must) == 2
+        # Narrow to FieldCondition up front: qdrant's `Condition` is a union
+        # and only FieldCondition carries `.key`.  The re-length-check is what
+        # keeps this as strong as asserting on the raw list -- a non-FieldCondition
+        # would be filtered out here and caught by the count, not slip through.
+        fields = [c for c in built.must if isinstance(c, qmodels.FieldCondition)]
+        assert len(fields) == 2
         # Dict-insertion order is preserved so the filter is deterministic
         # (two callers passing the same dict produce byte-identical filters).
-        assert [c.key for c in built.must] == ['category', 'kind']
-        for cond, expected in zip(built.must, ['x', 'y'], strict=True):
-            assert isinstance(cond, qmodels.FieldCondition)
+        assert [c.key for c in fields] == ['category', 'kind']
+        for cond, expected in zip(fields, ['x', 'y'], strict=True):
             assert isinstance(cond.match, qmodels.MatchValue)
             assert cond.match.value == expected
 
@@ -494,9 +504,10 @@ class TestMem0BackendScrollCollectionPages:
     structurally cannot produce, with no filter at all.
     """
 
-    def _make_mock_point(self, point_id: str, created_at: str | None = None, extra_meta: dict | None = None):
+    @staticmethod
+    def _make_mock_point(point_id: str, created_at: str | None = None, extra_meta: dict | None = None):
         """Reuse the sibling suite's Qdrant Record/ScoredPoint double."""
-        return TestMem0BackendScrollByMetadata._make_mock_point(self, point_id, created_at, extra_meta)
+        return TestMem0BackendScrollByMetadata._make_mock_point(point_id, created_at, extra_meta)
 
     @pytest.mark.asyncio
     async def test_yields_raw_points_across_all_pages_in_order(self, backend):
@@ -694,12 +705,13 @@ class TestMem0BackendScrollAllByMetadata:
     (``scripts/audit_duplicate_memories.py``).
     """
 
+    @staticmethod
     def _make_mock_point(
-        self, point_id: str, created_at: str | None = None, extra_meta: dict | None = None, vector=_UNSET,
+        point_id: str, created_at: str | None = None, extra_meta: dict | None = None, vector=_UNSET,
     ):
         """Reuse the with-vectors suite's double (it models a missing vector)."""
         return TestMem0BackendScrollByMetadataWithVectors._make_mock_point(
-            self, point_id, created_at, extra_meta, vector,
+            point_id, created_at, extra_meta, vector,
         )
 
     @pytest.mark.asyncio
