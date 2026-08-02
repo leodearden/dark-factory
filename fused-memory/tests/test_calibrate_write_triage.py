@@ -1521,8 +1521,8 @@ def _without_write_triage_block(text: str) -> list[str]:
     return kept
 
 
-def _call(text: str, t_high=0.87, t_low=0.61, path='calibration/r.json') -> str:
-    return _mod().write_triage_config_block(text, t_high, t_low, path)
+def _call(text: str, t_high=0.87, t_low=0.61, path='calibration/r.json', **kwargs) -> str:
+    return _mod().write_triage_config_block(text, t_high, t_low, path, **kwargs)
 
 
 class TestWriteTriageConfigBlock:
@@ -1647,6 +1647,77 @@ class TestWriteTriageConfigBlockSpanScan:
             't_high': 0.87, 't_low': 0.61, 'calibration_report_path': 'calibration/r.json',
         }
         assert '0.11' not in _call(text), 'the stale body must be gone'
+
+
+class TestWriteTriageConfigBlockPerCategory:
+    """The per-category map, written the same surgical way.
+
+    ABSENT means uncalibrated, and that is the ONLY spelling of it. A
+    category present with a null cutoff would give "no evidence for this
+    category" two representations, and the consumer would have to agree with
+    the writer about which one means what — exactly the ambiguity this task
+    exists to remove.
+    """
+
+    BY_CATEGORY = {
+        'procedural_knowledge': 0.8868293243724489,
+        'observations_and_summaries': 0.91,
+    }
+
+    def test_the_map_parses_back_to_exactly_what_was_measured(self) -> None:
+        parsed = yaml.safe_load(_call(WITH_BLOCK, t_high_by_category=self.BY_CATEGORY))
+        assert parsed['write_triage']['t_high_by_category'] == self.BY_CATEGORY
+
+    def test_the_pooled_values_are_still_written_alongside_it(self) -> None:
+        """The pooled cutoff stays the disclosed fallback, not a casualty."""
+        block = yaml.safe_load(_call(WITH_BLOCK, t_high_by_category=self.BY_CATEGORY))[
+            'write_triage'
+        ]
+        assert block['t_high'] == 0.87
+        assert block['t_low'] == 0.61
+        assert block['calibration_report_path'] == 'calibration/r.json'
+
+    @pytest.mark.parametrize('mapping', [None, {}], ids=['none', 'empty'])
+    def test_no_derived_cutoffs_omits_the_key_entirely(self, mapping) -> None:
+        """Never present-with-null: one spelling of 'uncalibrated'."""
+        out = _call(WITH_BLOCK, t_high_by_category=mapping)
+        assert 't_high_by_category' not in yaml.safe_load(out)['write_triage']
+        assert 't_high_by_category' not in out, (
+            'not even as a commented-out stub — a reader must not have to '
+            'decide whether a null means "measured and refused" or "not run"'
+        )
+
+    def test_the_key_order_is_deterministic(self) -> None:
+        """Two runs over the same measurement must produce the same bytes."""
+        out = _call(WITH_BLOCK, t_high_by_category=self.BY_CATEGORY)
+        emitted = [ln.strip().split(':')[0] for ln in out.splitlines()
+                   if ln.startswith('    ') and ':' in ln]
+        assert emitted == sorted(emitted), f'unsorted per-category keys: {emitted}'
+
+    def test_an_uncalibrated_pooled_run_still_refuses_even_with_a_map(self) -> None:
+        """A per-category cutoff never smuggles a null pooled threshold in."""
+        with pytest.raises(ValueError):
+            _call(WITH_BLOCK, t_high=None, t_high_by_category=self.BY_CATEGORY)
+        with pytest.raises(ValueError):
+            _call(WITH_BLOCK, t_low=None, t_high_by_category=self.BY_CATEGORY)
+
+    def test_the_block_names_the_report_that_produced_the_map(self) -> None:
+        """Same provenance link the pooled numbers already carry."""
+        out = _call(WITH_BLOCK, path='calibration/x.json',
+                    t_high_by_category=self.BY_CATEGORY)
+        header = out.split('t_high_by_category:')[0]
+        assert 'calibration/x.json' in header
+
+    @pytest.mark.parametrize(
+        'text',
+        [WITH_BLOCK_THEN_COLUMN0_HEADER, WITH_BLOCK, WITH_BLOCK_AT_EOF],
+        ids=['column0-header', 'indented-comment', 'at-eof'],
+    )
+    def test_the_surrounding_config_survives_the_nested_map(self, text: str) -> None:
+        """The nested map must not widen what the block replacement eats."""
+        out = _call(text, t_high_by_category=self.BY_CATEGORY)
+        assert _without_write_triage_block(out) == _without_write_triage_block(text)
+        assert yaml.safe_load(out)['write_triage']['t_high_by_category'] == self.BY_CATEGORY
 
 
 # ---------------------------------------------------------------------------
