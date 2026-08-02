@@ -761,3 +761,212 @@ class TestPlanCanonicalClusters:
         before = copy.deepcopy(records)
         _mod.plan_canonical_clusters(records, project_id='dark_factory')
         assert records == before
+
+
+# ===========================================================================
+# plan_calibration_clusters — sources (2)-reify and (3), joined
+# ===========================================================================
+
+def _row(
+    cluster_id: str,
+    memory_id: str,
+    label: str,
+    *,
+    gate_id: str = 'esc-5560',
+) -> dict:
+    """Build a 3130 calibration-fixture row (the keys the join reads)."""
+    return {
+        'cluster_id': cluster_id,
+        'memory_id': memory_id,
+        'label': label,
+        'content': f'content of {memory_id}',
+        'category': 'procedural_knowledge',
+        'provenance': {'gate_id': gate_id, 'source': 'add_memory_input'},
+    }
+
+
+def _entry(
+    topic: str,
+    cluster_id: str,
+    *,
+    project_id: str = 'reify',
+) -> object:
+    """Build a minimal registry entry keyed to *cluster_id*."""
+    return _mod.RegistryEntry(
+        topic=topic,
+        project_id=project_id,
+        derived_from='curator_gate',
+        canonical=_mod.Canonical(content_hash='0' * 16, last_known_id=cluster_id),
+        phrasings=(_mod.Phrasing(text=f'what about {topic}'),),
+        provenance={'cluster_id': cluster_id},
+    )
+
+
+def _registry(*entries: object) -> object:
+    return _mod.TopicRegistry(schema_version=1, entries=tuple(entries))
+
+
+CLUSTER_A = '68f19644-c3f3-49d5-af61-c983de358358'
+
+
+class TestPlanCalibrationClusters:
+    """``plan_calibration_clusters(rows, registry)`` — ONE join, two sources.
+
+    3130's labeled fixture supplies memory ids and curator labels; the
+    committed E1 topic registry supplies the hand-authored topic slug, keyed
+    by ``provenance.cluster_id``.  That join resolves both source (3) and the
+    reify half of source (2) at once: the registry's 20 ``curator_gate``
+    entries ARE 3112's reify gate census, already materialized and
+    topic-completed by a human.
+    """
+
+    def test_canonical_row_and_duplicate_rows_form_the_cluster(self):
+        rows = [
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000001', 'canonical'),
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000002', 'duplicate'),
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000003', 'duplicate'),
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000004', 'duplicate'),
+        ]
+        plans, skips = _mod.plan_calibration_clusters(
+            rows, _registry(_entry('architect-plan-files-write-set', CLUSTER_A))
+        )
+        plan = _only(plans)
+        assert plan.topic == 'architect-plan-files-write-set'
+        assert plan.canonical_memory_id == 'aaaaaaaa-0000-4000-8000-000000000001'
+        assert plan.member_memory_ids == (
+            'aaaaaaaa-0000-4000-8000-000000000002',
+            'aaaaaaaa-0000-4000-8000-000000000003',
+            'aaaaaaaa-0000-4000-8000-000000000004',
+        )
+        assert plan.source == 'calibration_registry_join'
+        assert skips == []
+
+    @pytest.mark.parametrize('label', ['distinct', 'pseudo_contradiction'])
+    def test_distinct_and_pseudo_contradiction_rows_are_not_members(
+        self, label: str
+    ):
+        """The curator's own adjudication, reused rather than re-invented.
+
+        ``_derive_curator_gate_candidates`` counts ONLY ``duplicate`` rows as
+        members: ``distinct`` and ``pseudo_contradiction`` are separate claims
+        that merely READ as contradictory.  Stamping them into the cluster
+        would tell every downstream reader a legitimately different answer is
+        contamination — and θ inventing a second, looser notion of "cluster"
+        than the deriver's is exactly how two definitions drift apart.
+        """
+        rows = [
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000001', 'canonical'),
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000002', 'duplicate'),
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000009', label),
+        ]
+        plans, _ = _mod.plan_calibration_clusters(
+            rows, _registry(_entry('architect-plan-files-write-set', CLUSTER_A))
+        )
+        plan = _only(plans)
+        assert plan.member_memory_ids == ('aaaaaaaa-0000-4000-8000-000000000002',)
+
+    def test_cluster_with_no_registry_entry_is_skipped_not_slugified(self):
+        """The join is the whole point — never fall back to a slugified UUID.
+
+        ``_derive_curator_gate_candidates`` falls back to
+        ``_slugify(cluster_id)`` when a row carries no topic, and these rows
+        carry none.  That fallback would mint a slugified UUID as a topic and
+        stamp it across a real cluster.  The registry's hand-authored slugs
+        are the part a machine cannot regenerate; without one there is
+        nothing honest to stamp.
+        """
+        rows = [
+            _row('deadbeef-0000-4000-8000-000000000000',
+                 'aaaaaaaa-0000-4000-8000-000000000001', 'canonical'),
+            _row('deadbeef-0000-4000-8000-000000000000',
+                 'aaaaaaaa-0000-4000-8000-000000000002', 'duplicate'),
+        ]
+        plans, skips = _mod.plan_calibration_clusters(rows, _registry())
+        assert plans == []
+        assert _reasons(skips) == ['no_registry_topic']
+        assert skips[0]['cluster_id'] == 'deadbeef-0000-4000-8000-000000000000'
+
+    def test_cluster_without_a_canonical_row_still_gets_a_topic(self):
+        """Topic-only plan plus a note — a missing canonical is not a blocker.
+
+        The members are still a real cluster and still benefit from a topic;
+        what the sweep must not do is *pick* a canonical for them.
+        """
+        rows = [
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000002', 'duplicate'),
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000003', 'duplicate'),
+        ]
+        plans, skips = _mod.plan_calibration_clusters(
+            rows, _registry(_entry('architect-plan-files-write-set', CLUSTER_A))
+        )
+        plan = _only(plans)
+        assert plan.canonical_memory_id is None
+        assert len(plan.member_memory_ids) == 2
+        assert _reasons(skips) == ['cluster_without_canonical']
+
+    def test_project_id_comes_from_the_registry_entry(self):
+        """Sources span two corpora; project cannot be a run-level constant."""
+        rows = [_row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000002', 'duplicate')]
+        plans, _ = _mod.plan_calibration_clusters(
+            rows,
+            _registry(_entry('architect-plan-files-write-set', CLUSTER_A,
+                             project_id='reify')),
+        )
+        assert _only(plans).project_id == 'reify'
+
+    def test_non_uuid_memory_id_is_reported_not_stamped(self):
+        rows = [
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000001', 'canonical'),
+            _row(CLUSTER_A, 'not-a-uuid', 'duplicate'),
+        ]
+        plans, skips = _mod.plan_calibration_clusters(
+            rows, _registry(_entry('architect-plan-files-write-set', CLUSTER_A))
+        )
+        assert _only(plans).member_memory_ids == ()
+        assert 'member_not_a_uuid' in _reasons(skips)
+
+    def test_is_pure_and_does_not_mutate_its_input(self):
+        import copy
+
+        rows = [_row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000002', 'duplicate')]
+        before = copy.deepcopy(rows)
+        _mod.plan_calibration_clusters(
+            rows, _registry(_entry('architect-plan-files-write-set', CLUSTER_A))
+        )
+        assert rows == before
+
+
+class TestCalibrationJoinAgainstTheRealCommittedFixtures:
+    """The join, run against the two fixtures actually on disk.
+
+    A unit test with hand-built rows proves the join LOGIC; it cannot notice
+    that the two fixtures stopped agreeing on ``cluster_id``.  If a future
+    edit to either file breaks the join, the sweep would quietly plan nothing
+    and report a clean run — so the breakage is caught here instead.
+    """
+
+    def test_fixture_paths_point_at_the_committed_files(self):
+        assert Path(_mod.CALIBRATION_FIXTURE_PATH).is_file()
+        assert Path(_mod.TOPIC_REGISTRY_PATH).is_file()
+
+    def test_real_join_is_non_empty_and_every_topic_is_a_valid_slug(self):
+        rows = _mod.load_calibration_rows(_mod.CALIBRATION_FIXTURE_PATH)
+        registry = _mod.load_topic_registry(_mod.TOPIC_REGISTRY_PATH)
+        assert len(rows) > 0
+        plans, _skips = _mod.plan_calibration_clusters(rows, registry)
+        assert plans, 'the two committed fixtures no longer join on cluster_id'
+        for plan in plans:
+            assert topic_slug_module.is_valid_topic_slug(plan.topic), plan.topic
+            assert plan.source == 'calibration_registry_join'
+
+    def test_registry_is_loaded_through_the_probes_strict_loader(self):
+        """Not a hand-rolled ``json.load``.
+
+        That loader is required-strict and additive-tolerant, and
+        ``RegistryEntry.extra`` exists precisely so this consumer can load a
+        richer entry against it without a fixture rewrite — its docstring
+        names task 3201.
+        """
+        probe = _mod._load_probe_module()
+        assert _mod.load_topic_registry is probe.load_topic_registry
+        assert _mod.RegistryEntry is probe.RegistryEntry
