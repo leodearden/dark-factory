@@ -1,12 +1,23 @@
 """Parity checker for the installed orchestrator systemd units.
 
-Verifies that the seven units committed under ``scripts/`` still agree with
+Verifies that the nine units committed under ``scripts/`` still agree with
 the copies actually installed in ``~/.config/systemd/user/``:
 
     orchestrator-watchdog.service          orchestrator-watchdog.timer
     orchestrator-dark-factory.service      orchestrator-reify.service
     orchestrator-autopilot-video.service   orchestrator-my-solar-challenge.service
     orchestrator-solar-challenge-platform.service
+    orchestrator-know-live.service         orchestrator-pump-web-ui.service
+
+REBASE NOTE (2026-08-06): the two know-live / pump-web-ui entries were added
+when this branch was rebased onto a main that had, in the interim, wired both
+units into ``setup-host.sh`` (task 3641). They are registered here to keep
+the staleness guard below satisfied — a unit the installer copies but this
+registry omits is installed-but-unchecked, the exact silent-drift failure
+this checker exists to catch — but neither has had a parity MEASUREMENT taken
+against this host as part of that rebase. Treat their drift status as
+unknown, not green, until this checker is actually run against
+``~/.config/systemd/user``.
 
 The purpose is narrow and concrete: make it OBSERVABLE when a repo-side unit
 change never reaches the running system.  A unit edit that stays repo-side is
@@ -23,7 +34,7 @@ per-unit ``(section, key)`` registry, because one of its units is RENDERED
 from a template (``__REPO_ROOT__`` / ``__UV_PATH__`` substitution) and an
 unbounded diff there would be a false-positive machine.
 
-That reasoning does not transfer.  ``setup-host.sh`` installs all seven units
+That reasoning does not transfer.  ``setup-host.sh`` installs all nine units
 here by ``cp``-ing them VERBATIM — no substitution at all, not even for the
 host paths, which are hardcoded in the committed files.  So the two sides are
 supposed to be character-identical by construction, every parsed-directive
@@ -54,10 +65,16 @@ Exit codes
     compared, and nothing overrides the units that were)
 1 — drift, OR a committed unit VANISHED (no committed copy, so nothing could
     be verified for it), OR an installed unit carries a drop-in override (so
-    the unit file was compared but the EFFECTIVE configuration was not)
+    the unit file was compared but the EFFECTIVE configuration was not), OR a
+    unit file exists but is UNREADABLE (permissions / not valid UTF-8)
 2 — installed unit absent (no installed copy found for one or more units)
 
-PRECEDENCE: drift (1) DOMINATES absence (2).  With seven units a single run
+Everything on the 1 side is "I found a difference, or I could not verify" and
+is worded APART in the report — ``[drift]`` / ``[vanished]`` / ``[override]``
+/ ``[unreadable]`` — because they share an exit code but send the operator to
+four different places.  Only ``[drift]`` is a directive diff to propagate.
+
+PRECEDENCE: drift (1) DOMINATES absence (2).  With nine units a single run
 can hit both at once, and returning 2 there would let an unrelated
 uninstalled unit mask an actionable finding — ``setup-host.sh`` treats 2 as a
 benign "not installed on this host, skipping" and only 1 as something to act
@@ -88,7 +105,7 @@ diverge from their committed copies and this checker reports drift for them:
   (``orchestrator-reify.service.d/warm-lane.conf``) instead, which is why
   this unit also reports ``[override]``.
 
-DO NOT "fix" that second bullet by running ``setup-host.sh``.  Measured
+DO NOT "fix" that second bullet by forcing an install.  Measured
 2026-08-02: ``/home/leo/src/reify/orchestrator.yaml`` and
 ``/home/leo/src/autopilot-video/orchestrator-config.yaml`` — the paths the
 COMMITTED units name — DO NOT EXIST.  Only the canonical
@@ -98,8 +115,12 @@ ones pointing at absent config files, breaking both orchestrators on their
 next restart.  This is the exact hazard the "no ``--fix``" note below
 describes, and it is live TODAY: for these four units the committed file is
 the thing that is wrong, and it must be corrected in the repo BEFORE any
-install propagates it.  This is also why the setup-host.sh gate is warn-only
-and pre-install: it makes the divergence visible without acting on it.
+install propagates it.  That hazard is why ``setup-host.sh`` runs this check
+PRE-install and, on drift, SKIPS the orchestrator unit install rather than
+merely warning — a warning in a non-interactive ``set -e`` script scrolls
+past and the next line does the overwrite anyway.  An operator who has read
+the report and decided the committed side is right proceeds with
+``DF_INSTALL_ORCH_UNITS=1``.  The gate never aborts the installer itself.
 
 Fixing all five is OWNED by the follow-up filed from task 3424 as ticket
 ``tkt_0RRZWH0V5F9PPG86A1WDJ3NV2R``.  Task 3424 deliberately converged only
@@ -114,6 +135,20 @@ the accidental drift it exists to catch with it — and accepted its own
 red-on-arrival unit only because a named task owned the fix.  That is the
 condition being met here, so the red is OWNED rather than ambient.  The
 repeatable ``--unit`` filter lets an operator scope a run meanwhile.
+
+REBASE NOTE (2026-08-06): the "FOUR disagree on the ExecStart --config path"
+finding above and its "DO NOT fix by forcing an install" warning are dated
+2026-08-02.  Commit 4fcd43eec0 (task 3512, landed 2026-08-04 — after this
+branch's fork point) repointed the reify / autopilot-video / my-solar-challenge
+/ solar-challenge-platform TEMPLATES at the canonical
+``dark-factory-orchestrator.yaml`` and reports reconciling the installed
+copies' RestartSteps=4 and reify's RequiresMountsFor by hand at the same time.
+That means the specific two-direction hazard this section describes may
+already be resolved on this host — but that was not independently
+re-measured as part of this rebase (this checker was not run against the live
+``~/.config/systemd/user`` here, deliberately, per this task's constraints).
+Do not treat the 2026-08-02 numbers above as current; re-run this checker
+against the live host before relying on either bullet.
 
 Design notes
 ------------
@@ -208,14 +243,23 @@ def _render(values: list[str] | None) -> str:
 
     A single-valued directive renders as its bare value (the common case, and
     what an operator expects to see next to a key).  A repeated directive
-    renders as a bracketed list, because systemd APPLIES every occurrence and
-    showing only the first would misreport what is actually in force.
+    renders as a bracketed list of QUOTED occurrences, because systemd APPLIES
+    every occurrence and showing only the first would misreport what is
+    actually in force.
+
+    The quoting is not decoration.  A bare ``, ``-join is ambiguous the moment
+    a value contains a comma — two ``Environment=`` lines could render as
+    ``[OPTS=a,b, X=1]``, where an operator cannot tell where one occurrence
+    ends and the next begins.  Comparison happens on the raw lists, so this
+    could never cause a false negative; but the report IS the deliverable of a
+    checker whose whole value is being believed, and an operator who has to
+    guess at occurrence boundaries has been handed a diff they cannot act on.
     """
     if values is None:
         return _ABSENT
     if len(values) == 1:
         return values[0]
-    return "[" + ", ".join(values) + "]"
+    return "[" + ", ".join(repr(v) for v in values) + "]"
 
 
 def compare_unit(
@@ -346,6 +390,11 @@ UNITS: dict[str, str] = {
     "orchestrator-solar-challenge-platform.service": (
         "scripts/orchestrator-solar-challenge-platform.service"
     ),
+    # Added by this branch's 2026-08-06 rebase onto main: task 3641 wired both
+    # of these into setup-host.sh's cp block after this branch forked. See the
+    # module docstring's REBASE NOTE — neither has a measured parity status.
+    "orchestrator-know-live.service": "scripts/orchestrator-know-live.service",
+    "orchestrator-pump-web-ui.service": "scripts/orchestrator-pump-web-ui.service",
 }
 
 
@@ -391,7 +440,8 @@ def main(argv: Sequence[str]) -> int:
 
     Returns:
         0 — parity (and at least one unit was actually compared)
-        1 — drift, OR a committed unit vanished, OR a drop-in override
+        1 — drift, OR a committed unit vanished, OR a drop-in override, OR a
+            unit file that exists but could not be read
         2 — one or more installed units absent
 
     Drift DOMINATES absence: a run that hits both returns 1.  An absent unit
@@ -409,6 +459,7 @@ def main(argv: Sequence[str]) -> int:
     missing: list[tuple[str, pathlib.Path]] = []
     vanished: list[tuple[str, pathlib.Path]] = []
     overridden: list[tuple[str, list[pathlib.Path]]] = []
+    unreadable: list[tuple[str, pathlib.Path, str]] = []
     # Units that actually reached compare_unit. The success line reports THIS
     # count, not len(selected): a report may only claim what it verified.
     compared: list[str] = []
@@ -434,12 +485,32 @@ def main(argv: Sequence[str]) -> int:
         if dropins:
             overridden.append((name, dropins))
 
+        # is_file() above establishes the files EXIST, not that they can be
+        # read: either side can be mode 000, or not valid UTF-8. Unguarded,
+        # that raises and the whole run dies with a traceback and exit 1 —
+        # which setup-host.sh reports as "drift or unverifiable state, see the
+        # [orchestrator_unit_parity] report above", sending the operator to
+        # look for a directive diff in a report that is a stack trace. Routed
+        # into its own worded-apart bucket instead, for the same reason
+        # [vanished] and [override] are worded apart from [drift]: it shares
+        # exit 1 ("I could not verify") but points somewhere else entirely.
+        #
+        # Read one side at a time so the report names the file that ACTUALLY
+        # failed; a combined try would leave the operator checking permissions
+        # on the wrong copy.
+        try:
+            repo_text = repo_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            unreadable.append((name, repo_path, str(exc)))
+            continue
+        try:
+            installed_text = installed_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            unreadable.append((name, installed_path, str(exc)))
+            continue
+
         compared.append(name)
-        for drift in compare_unit(
-            name,
-            repo_path.read_text(encoding="utf-8"),
-            installed_path.read_text(encoding="utf-8"),
-        ):
+        for drift in compare_unit(name, repo_text, installed_text):
             drifts.append((drift, repo_path, installed_path))
 
     for name, path in missing:
@@ -461,6 +532,19 @@ def main(argv: Sequence[str]) -> int:
             "[vanished] The committed unit is this checker's source of truth. "
             "Check --repo-root, and whether the unit was renamed or moved "
             "(the paths live in UNITS in this script)."
+        )
+
+    if unreadable:
+        _log(
+            f"[unreadable] {len(unreadable)} unit file(s) could not be read — "
+            "nothing was verified for them:"
+        )
+        for name, path, error in unreadable:
+            _log(f"  {name}: {path}: {error}")
+        _log(
+            "[unreadable] The file exists but could not be decoded as UTF-8 or "
+            "opened. Check its permissions and encoding — this is not a "
+            "directive diff, so there is nothing to propagate."
         )
 
     if overridden:
@@ -498,8 +582,11 @@ def main(argv: Sequence[str]) -> int:
             _log(f"      installed {installed_path}: {drift.installed_value}")
         _log(
             "[drift] To propagate the committed units to this host, run: "
-            "scripts/setup-host.sh  (this checker is read-only by design — "
-            "see the module docstring for why there is no --fix)"
+            "DF_INSTALL_ORCH_UNITS=1 bash scripts/setup-host.sh  (a plain run "
+            "runs this same check and DECLINES the unit install on drift, "
+            "because the committed side is not always the correct one — see "
+            "below. This checker is read-only by design; the module docstring "
+            "says why there is no --fix.)"
         )
         # Deliberately NOT phrased as "the installed copy is stale". The
         # report above shows drift, not direction: measured 2026-08-02, some
@@ -514,7 +601,7 @@ def main(argv: Sequence[str]) -> int:
             "RED section of this script's module docstring."
         )
 
-    if drifts or vanished or overridden:
+    if drifts or vanished or overridden or unreadable:
         return 1
 
     if missing:
@@ -523,7 +610,8 @@ def main(argv: Sequence[str]) -> int:
     if not compared:
         # UNREACHABLE BY CONSTRUCTION, kept as defence — not a tested path.
         # Every unit that was not compared took an earlier `continue` into
-        # `vanished` or `missing`, and both return above, so reaching here
+        # `vanished`, `missing` or `unreadable`, and all three return above,
+        # so reaching here
         # requires `selected` itself to be empty: impossible while UNITS is
         # non-empty (`args.unit or sorted(UNITS)`) and argparse `choices`
         # rejects an unknown --unit. (The "compared nothing" TEST reaches

@@ -7,18 +7,29 @@ tests/scripts/test_check_dashboard_unit_parity.py each state in their own
 docstrings.
 
 That rule is load-bearing here for a specific, measured reason rather than
-mere portability. As measured on 2026-08-02, five of the seven registered
-units (the orchestrator-*.service ones) diverge from their committed copies on
-this host, and — importantly — NOT all in the same direction: every installed
-copy lacks ``RestartSteps=4`` (so its ``RestartMaxDelaySec=60`` is silently
-discarded by systemd, and the REPO copy is the correct one), while four have
-an ExecStart ``--config`` path where the INSTALLED copy is the correct one
-(it names the canonical ``dark-factory-orchestrator.yaml``; the committed copy
-still names a legacy filename that, for reify and autopilot-video, does not
-exist at all). Fixing them is owned by a named follow-up task (see the
-checker's module docstring) — so a test asserting parity against the live host
-would be red on landing, and one asserting drift would flip red the moment
-that task lands. Either encodes host state rather than checker behaviour.
+mere portability. As measured on 2026-08-02, five of the (then seven, now
+nine — see the REBASE NOTE below) registered units (the orchestrator-*.service
+ones) diverge from their committed copies on this host, and — importantly —
+NOT all in the same direction: every installed copy lacks ``RestartSteps=4``
+(so its ``RestartMaxDelaySec=60`` is silently discarded by systemd, and the
+REPO copy is the correct one), while four have an ExecStart ``--config`` path
+where the INSTALLED copy is the correct one (it names the canonical
+``dark-factory-orchestrator.yaml``; the committed copy still names a legacy
+filename that, for reify and autopilot-video, does not exist at all). Fixing
+them is owned by a named follow-up task (see the checker's module docstring)
+— so a test asserting parity against the live host would be red on landing,
+and one asserting drift would flip red the moment that task lands. Either
+encodes host state rather than checker behaviour.
+
+REBASE NOTE (2026-08-06): this branch was rebased onto a main that had, in
+the interim, wired orchestrator-know-live.service and
+orchestrator-pump-web-ui.service into setup-host.sh (task 3641) and repointed
+four of the five --config paths above at the canonical filename (task 3512,
+commit 4fcd43eec0, landed 2026-08-04). The two new units are registered below
+to keep the staleness guard satisfied; see
+scripts/check_orchestrator_unit_parity.py's own REBASE NOTE for both — neither
+the two new units nor the 2026-08-02 numbers above were re-measured against
+the live host as part of this rebase.
 
 The only real-tree reads are REPO-side: the committed scripts/*.service and
 *.timer files, and scripts/setup-host.sh, used by the registry staleness guard.
@@ -32,6 +43,7 @@ and it is what the identity guard below needs to be exercising.
 """
 
 import importlib.util
+import os
 import pathlib
 import re
 import subprocess
@@ -180,7 +192,7 @@ def test_dashboard_checker_consumes_the_lifted_parser():
 # The unit registry, and its staleness guard  (step-3 / step-4)
 # ---------------------------------------------------------------------------
 
-# The seven units scripts/setup-host.sh installs by copying VERBATIM. Stated
+# The nine units scripts/setup-host.sh installs by copying VERBATIM. Stated
 # as a literal here so a bug in the shell-parsing helper below cannot make the
 # equality assertion vacuously true against itself.
 _EXPECTED_UNITS = {
@@ -191,6 +203,8 @@ _EXPECTED_UNITS = {
     "orchestrator-autopilot-video.service",
     "orchestrator-my-solar-challenge.service",
     "orchestrator-solar-challenge-platform.service",
+    "orchestrator-know-live.service",
+    "orchestrator-pump-web-ui.service",
 }
 
 # Matches setup-host.sh's install lines, e.g.
@@ -211,8 +225,8 @@ def _units_installed_by_setup_host() -> set[str]:
     )
 
 
-def test_registry_covers_the_seven_verbatim_copied_units():
-    """UNITS registers exactly the seven units setup-host.sh copies verbatim."""
+def test_registry_covers_the_nine_verbatim_copied_units():
+    """UNITS registers exactly the nine units setup-host.sh copies verbatim."""
     checker = _load_checker()
 
     assert set(checker.UNITS) == _EXPECTED_UNITS, (
@@ -436,6 +450,29 @@ def test_changed_occurrence_count_of_a_repeated_directive_is_drift():
     # difference is in the list, and the report must show both lists.
     assert "B=2" in drifts[0].repo_value
     assert drifts[0].installed_value != checker._ABSENT
+
+
+def test_repeated_values_render_with_unambiguous_occurrence_boundaries():
+    """A repeated directive's occurrences must be separable in the report.
+
+    A bare ", "-join is ambiguous the moment a value contains a comma:
+    ``Environment=OPTS=a,b`` next to ``Environment=X=1`` renders as
+    ``[OPTS=a,b, X=1]``, where an operator cannot tell where one occurrence
+    ends. Comparison runs on the raw lists so this can never be a false
+    negative — but the report is the deliverable of a checker whose value is
+    being believed, and a diff you have to guess at is not actionable.
+    """
+    checker = _load_checker()
+
+    repo = "[Service]\nEnvironment=OPTS=a,b\nEnvironment=X=1\n"
+    installed = "[Service]\nEnvironment=OPTS=a\n"
+
+    rendered = checker.compare_unit("u.service", repo, installed)[0].repo_value
+
+    assert rendered == "['OPTS=a,b', 'X=1']", (
+        "Repeated values render ambiguously — an operator cannot tell where "
+        f"one occurrence ends: {rendered}"
+    )
 
 
 def test_same_key_in_different_sections_is_not_conflated():
@@ -751,10 +788,54 @@ def test_cli_vanished_committed_unit_exits_one(tmp_path: pathlib.Path):
     assert "[drift]" not in result.stdout
 
 
+def test_cli_undecodable_installed_unit_reports_unreadable_not_a_traceback(
+    tmp_path: pathlib.Path,
+):
+    """A unit that EXISTS but cannot be decoded => 1 and [unreadable].
+
+    is_file() establishes existence, not readability: a unit can be mode 000
+    or not valid UTF-8. Unguarded, read_text raises and the run dies with a
+    Python traceback and exit 1 — which setup-host.sh reports as "drift or
+    unverifiable state, see the [orchestrator_unit_parity] report above",
+    sending the operator to look for a directive diff in a report that is a
+    stack trace. Worded apart for the same reason [vanished] and [override]
+    are: it shares the exit code, not the remedy.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path)
+    (installed_dir / _REAL_UNIT).write_bytes(b"[Timer]\nOnBootSec=\xff\xfe30\n")
+
+    result = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+
+    assert result.returncode == 1, (
+        f"Expected 1 for an undecodable unit; got {result.returncode}. "
+        f"stdout: {result.stdout} stderr: {result.stderr}"
+    )
+    assert "[unreadable]" in result.stdout, result.stdout
+    assert "Traceback" not in result.stderr, result.stderr
+    # Names the file that ACTUALLY failed, not the other side — an operator
+    # sent to check permissions on the wrong copy learns nothing.
+    assert str(installed_dir / _REAL_UNIT) in result.stdout, result.stdout
+    assert "[drift]" not in result.stdout, result.stdout
+    # A run that could not read a unit never counts it as compared.
+    assert "[ok] parity" not in result.stdout, result.stdout
+
+
+def test_cli_undecodable_repo_unit_names_the_repo_side(tmp_path: pathlib.Path):
+    """The same guard on the committed side, reporting the committed path."""
+    repo_root, installed_dir = _make_trees(tmp_path)
+    (repo_root / _REAL_UNIT_RELPATH).write_bytes(b"[Timer]\nOnBootSec=\xff\xfe30\n")
+
+    result = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+
+    assert result.returncode == 1, result.stdout
+    assert "[unreadable]" in result.stdout, result.stdout
+    assert str(repo_root / _REAL_UNIT_RELPATH) in result.stdout, result.stdout
+
+
 def test_cli_drift_dominates_absence(tmp_path: pathlib.Path):
     """PRECEDENCE: one unit drifted + another absent => 1, not 2.
 
-    With seven units a single run can hit both at once. Returning 2 would let
+    With nine units a single run can hit both at once. Returning 2 would let
     an unrelated uninstalled unit MASK an actionable finding, because
     setup-host.sh treats 2 as a benign skip. The absent unit is still
     reported — dominated, not hidden.
@@ -833,6 +914,41 @@ def _setup_host_text() -> str:
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
 
 
+def _orchestrator_gate_block(text: str) -> str:
+    """Slice the gate's actual `if ... fi` construct out of setup-host.sh.
+
+    Both endpoints are DERIVED, never byte counts. An earlier version of these
+    tests sliced a fixed 1200-character window from the first mention of the
+    checker; measured, that overshot the closing `fi` by ~300 characters into
+    the `cp` lines below it, so a `exit 1` landing anywhere downstream would
+    have failed the gate's own warn-only assertion with a misleading message,
+    and the assertion passed only because an in-block comment happened to
+    capitalise the word. A test that claims a semantic property must not be
+    pinned to incidental file layout.
+
+    Start: the beginning of the line carrying the first mention of the checker
+    script. End: the first column-0 `fi` after it — the gate's own `if` closes
+    there, and every `fi` nested inside it is indented.
+    """
+    mention = text.index("check_orchestrator_unit_parity.py")
+    start = text.rfind("\n", 0, mention) + 1
+    end = text.index("\nfi\n", mention) + len("\nfi\n")
+    return text[start:end]
+
+
+def _orchestrator_install_block(text: str) -> str:
+    """Slice the construct that performs the orchestrator unit `cp`s.
+
+    Derived the same way: from the column-0 `if` preceding the first
+    orchestrator `cp` to the column-0 `fi` that closes it. Empty-ish slices
+    are impossible — the caller asserts the `cp` lines are inside.
+    """
+    first_cp = text.index('cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"')
+    start = text.rindex("\nif ", 0, first_cp) + 1
+    end = text.index("\nfi\n", first_cp) + len("\nfi\n")
+    return text[start:end]
+
+
 def test_setup_host_invokes_the_orchestrator_parity_gate():
     """setup-host.sh actually RUNS the checker, passing both trees.
 
@@ -846,13 +962,13 @@ def test_setup_host_invokes_the_orchestrator_parity_gate():
         "A parity gate that the installer does not run reports nothing."
     )
 
-    invocation_start = text.index("check_orchestrator_unit_parity.py")
-    # The flags must be on the invocation itself, not merely somewhere in the
+    # The flags must be inside the gate construct, not merely somewhere in the
     # file (both appear in the dashboard and fused-memory blocks too).
-    invocation = text[invocation_start : invocation_start + 400]
-    assert '--installed-dir "$UNIT_DIR"' in invocation, invocation
-    assert '--repo-root     "$REPO_ROOT"' in invocation or \
-           '--repo-root "$REPO_ROOT"' in invocation, invocation
+    gate = _orchestrator_gate_block(text)
+    assert "python3 " in gate, gate
+    assert '--installed-dir "$UNIT_DIR"' in gate, gate
+    assert '--repo-root     "$REPO_ROOT"' in gate or \
+           '--repo-root "$REPO_ROOT"' in gate, gate
 
 
 def test_parity_gate_runs_BEFORE_the_units_are_copied():
@@ -889,21 +1005,278 @@ def test_parity_gate_distinguishes_exit_2_from_exit_1():
     branch would make a fresh host look like it had a supervision problem.
     """
     text = _setup_host_text()
-
-    gate_at = text.index("check_orchestrator_unit_parity.py")
-    block = text[gate_at : gate_at + 1200]
+    block = _orchestrator_gate_block(text)
 
     assert "-eq 2" in block, (
         "The orchestrator parity branch does not distinguish exit 2 "
         "(not installed on this host) from exit 1 (actionable drift)."
     )
-    # Warn-only: drift must never abort the install (and five units are
-    # knowingly red on this host today).
-    assert "warn" in block
-    assert "exit 1" not in block, (
-        "The orchestrator parity gate must be warn-only — drift must never "
-        "abort an install."
+    # Non-fatal: the gate reports and declines to install, but must never
+    # abort setup-host.sh itself — five units are knowingly red on this host
+    # today, and killing the run there would take every later section with it.
+    #
+    # Matched as a shell COMMAND (line start, or after a `;`/`&&`/`||`) rather
+    # than as the substring "exit 1", which would also hit the word in a
+    # comment and make this semantic claim hostage to capitalisation.
+    aborts = re.search(r"(?:^|[;&|])[ \t]*exit\b", block, re.MULTILINE)
+    assert aborts is None, (
+        "The orchestrator parity gate runs `exit` at "
+        f"{aborts.start() if aborts else -1} in its own block. It must be "
+        "non-fatal: drift declines the unit install, it does not abort the "
+        "installer.\n" + block
     )
+
+
+# ---------------------------------------------------------------------------
+# The gate is WIRED such that it can actually stop something  (amendment)
+# ---------------------------------------------------------------------------
+#
+# The tests above read setup-host.sh as text. These ones RUN the gate + install
+# section of it, against tmp trees and a stub `systemctl`, because the property
+# at stake is behavioural: on a drifted host the installer must not overwrite
+# the installed units, and it must not do so QUIETLY on the strength of an exit
+# code the checker never produced.
+#
+# Nothing here touches ~/.config/systemd/user or the real systemd: REPO_ROOT
+# and UNIT_DIR are tmp_path trees and `systemctl` is a PATH stub that exits 0.
+
+
+def _installer_section() -> str:
+    """The gate + unit-install section of setup-host.sh, verbatim.
+
+    From the line carrying the first mention of the checker through the `fi`
+    that closes the install construct — endpoints derived, so this follows a
+    reflow of the block instead of pinning one.
+    """
+    text = _setup_host_text()
+    start = text.rfind("\n", 0, text.index("check_orchestrator_unit_parity.py")) + 1
+    first_cp = text.index('cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"')
+    end = text.index("\nfi\n", first_cp) + len("\nfi\n")
+    return text[start:end]
+
+
+def _fake_repo(
+    tmp_path: pathlib.Path, *, checker_body: str | None = None, with_checker: bool = True
+) -> pathlib.Path:
+    """A tmp repo root holding the nine committed units (+ optionally the checker).
+
+    The unit files are copied from the real repo so the comparison under test is
+    the real one; only the TREE is fake.
+    """
+    checker = _load_checker()
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True, exist_ok=True)
+    for relpath in checker.UNITS.values():
+        (repo / relpath).write_text(
+            (REPO_ROOT / relpath).read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    if with_checker:
+        target = repo / "scripts" / "check_orchestrator_unit_parity.py"
+        if checker_body is None:
+            for name in ("check_orchestrator_unit_parity.py", "systemd_unit_parity.py"):
+                (repo / "scripts" / name).write_text(
+                    (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+        else:
+            target.write_text(checker_body, encoding="utf-8")
+    return repo
+
+
+def _run_installer_section(
+    tmp_path: pathlib.Path,
+    repo: pathlib.Path,
+    unit_dir: pathlib.Path,
+    *,
+    env_extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Execute the sliced section under bash with setup-host.sh's own preamble."""
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir(exist_ok=True)
+    systemctl = stub_bin / "systemctl"
+    systemctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    systemctl.chmod(0o755)
+
+    script = tmp_path / "section.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f'REPO_ROOT="{repo}"\n'
+        f'UNIT_DIR="{unit_dir}"\n'
+        'mkdir -p "$UNIT_DIR"\n'
+        "info()  { printf '==> %s\\n' \"$*\"; }\n"
+        "ok()    { printf 'OK %s\\n' \"$*\"; }\n"
+        "warn()  { printf 'WARN %s\\n' \"$*\"; }\n"
+        "fail()  { printf 'FAIL %s\\n' \"$*\"; }\n"
+        + _installer_section(),
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    env["PATH"] = f"{stub_bin}:{env.get('PATH', '')}"
+    env.update(env_extra or {})
+    return subprocess.run(
+        ["bash", str(script)], capture_output=True, text=True, env=env
+    )
+
+
+def _install_all_units(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
+    """Seed *unit_dir* with byte-identical copies of every committed unit."""
+    checker = _load_checker()
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    for name, relpath in checker.UNITS.items():
+        (unit_dir / name).write_text(
+            (repo / relpath).read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+
+def test_installer_copies_the_units_when_the_gate_reports_parity(
+    tmp_path: pathlib.Path,
+):
+    """The happy path still installs — the gate must not block a clean host."""
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "SKIPPING" not in result.stdout, result.stdout
+    assert "installed and enabled" in result.stdout, result.stdout
+
+
+def test_installer_does_not_overwrite_units_the_gate_reported_drift_on(
+    tmp_path: pathlib.Path,
+):
+    """DRIFT => the destructive `cp` block is SKIPPED, not merely warned about.
+
+    A warning is not an intervention point in a non-interactive `set -e`
+    script: it scrolls past and the next line overwrites the installed units.
+    And drift does not mean the installed copy is the stale one — measured
+    2026-08-02, two COMMITTED units name --config paths that do not exist on
+    this host, so an unconditional copy would break those orchestrators on
+    their next restart. The installer must decline to act on an unverified
+    diff.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    drifted = unit_dir / "orchestrator-watchdog.timer"
+    drifted.write_text(
+        drifted.read_text(encoding="utf-8") + "\n[Timer]\nAccuracySec=5s\n",
+        encoding="utf-8",
+    )
+    before = drifted.read_text(encoding="utf-8")
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "The gate must be NON-FATAL — it declines the unit install, it does "
+        f"not abort the installer.\n{result.stdout}\n{result.stderr}"
+    )
+    assert "SKIPPING" in result.stdout, result.stdout
+    assert drifted.read_text(encoding="utf-8") == before, (
+        "The installer overwrote a unit the parity gate reported drift on."
+    )
+
+
+def test_installer_copies_over_drift_when_explicitly_opted_in(
+    tmp_path: pathlib.Path,
+):
+    """DF_INSTALL_ORCH_UNITS=1 is the operator's override.
+
+    The skip is a default, not a lock: an operator who has read the report and
+    decided the committed side is correct must be able to proceed without
+    editing the installer.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    drifted = unit_dir / "orchestrator-watchdog.timer"
+    drifted.write_text(
+        drifted.read_text(encoding="utf-8") + "\n[Timer]\nAccuracySec=5s\n",
+        encoding="utf-8",
+    )
+
+    result = _run_installer_section(
+        tmp_path, repo, unit_dir, env_extra={"DF_INSTALL_ORCH_UNITS": "1"}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "SKIPPING" not in result.stdout, result.stdout
+    assert drifted.read_text(encoding="utf-8") == (
+        repo / "scripts" / "orchestrator-watchdog.timer"
+    ).read_text(encoding="utf-8"), (
+        "DF_INSTALL_ORCH_UNITS=1 must still install the committed units."
+    )
+
+
+def test_a_missing_checker_does_not_read_as_not_installed_here(
+    tmp_path: pathlib.Path,
+):
+    """EXIT-CODE COLLISION: `python3 <missing script>` also exits 2.
+
+    2 is the checker's benign "not installed on this host, installing below".
+    If the checker were renamed or moved, python3's own 2 would land in that
+    same branch and the installer would print a reassuring line and copy the
+    units anyway — a gate reporting green because it never ran, which is the
+    exact silent-drift failure the checker exists to catch, reproduced one
+    level up in its own wiring.
+    """
+    repo = _fake_repo(tmp_path, with_checker=False)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    (unit_dir / "orchestrator-watchdog.timer").write_text(
+        "[Timer]\nOnBootSec=999\n", encoding="utf-8"
+    )
+    before = (unit_dir / "orchestrator-watchdog.timer").read_text(encoding="utf-8")
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "not yet installed" not in result.stdout, (
+        "A missing checker was reported as the benign 'not installed on this "
+        f"host'.\n{result.stdout}"
+    )
+    assert "SKIPPING" in result.stdout, result.stdout
+    assert (unit_dir / "orchestrator-watchdog.timer").read_text(
+        encoding="utf-8"
+    ) == before
+
+
+def test_a_usage_error_does_not_read_as_not_installed_here(
+    tmp_path: pathlib.Path,
+):
+    """SAME COLLISION, second source: argparse exits 2 on any usage error.
+
+    Simulated with a stub checker that exits 2 with argparse-shaped stderr and
+    no [orchestrator_unit_parity] report — what renaming a flag in a future
+    refactor would produce. The tag, not the exit code, is what makes a status
+    believable.
+    """
+    repo = _fake_repo(
+        tmp_path,
+        checker_body=(
+            "import sys\n"
+            "sys.stderr.write('usage: check_orchestrator_unit_parity.py "
+            "[-h]\\nerror: unrecognized arguments: --installed-dir\\n')\n"
+            "sys.exit(2)\n"
+        ),
+    )
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    (unit_dir / "orchestrator-watchdog.timer").write_text(
+        "[Timer]\nOnBootSec=999\n", encoding="utf-8"
+    )
+    before = (unit_dir / "orchestrator-watchdog.timer").read_text(encoding="utf-8")
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "not yet installed" not in result.stdout, result.stdout
+    assert "SKIPPING" in result.stdout, result.stdout
+    assert (unit_dir / "orchestrator-watchdog.timer").read_text(
+        encoding="utf-8"
+    ) == before
 
 
 def test_setup_host_parses_cleanly():

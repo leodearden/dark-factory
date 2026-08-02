@@ -19,6 +19,24 @@ own module surface (and its test suite) stays intact, and
 ``tests/scripts/test_check_orchestrator_unit_parity.py`` asserts the re-export
 is the SAME function object rather than a look-alike.
 
+Why ``check_fused_memory_unit_parity.parse_unit_sections`` is NOT here
+----------------------------------------------------------------------
+That third parser stays where it is, deliberately.  It returns
+``{section: [line, ...]}`` — whole non-comment LINES, unsplit and with
+continuations left unjoined — because its checker asks whole-line membership
+questions (``"Environment=MEM0_TELEMETRY=false" in sections["Service"]``) and
+synthesizes those same literal lines in its ``--fix`` path.  It is not a
+degenerate case of ``parse_unit_directives``: reconstructing a line from a
+``{key: [values]}`` mapping cannot reproduce the original spacing that
+membership check and that rewriter both depend on.  So folding it in would
+mean changing its checker's semantics, not just its imports — a different
+change, in a module this task holds no lock on.  What is shared below is the
+CLASSIFICATION (section headers, ``#``/``;`` comments, blanks, pre-header
+lines), which ``parse_unit_directives`` took from it verbatim and documents as
+such.  If that classification is ever changed here it must be changed there
+too, and vice versa: two parsers is the tolerated cost of two different return
+types, not license for the rules to diverge.
+
 Import mechanics
 ----------------
 Both consumers do a bare ``import systemd_unit_parity``, which resolves in
