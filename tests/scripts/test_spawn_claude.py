@@ -240,7 +240,12 @@ def _write_fake_claude_capturing_prompt_and_writing_result(
 
 
 def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
-    """Poll until *path* exists, raising ``AssertionError`` on timeout."""
+    """Poll until *path* exists, raising ``AssertionError`` on timeout.
+
+    Low-level primitive only -- direct callers should prefer
+    _wait_for_path_scaled (below) for a load-adaptive budget instead of a
+    fixed timeout; this function remains only as its poll implementation.
+    """
     deadline = time.monotonic() + timeout
     while not path.exists():
         if time.monotonic() >= deadline:
@@ -248,6 +253,49 @@ def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
                 f"Timed out after {timeout}s waiting for {path} to appear"
             )
         time.sleep(0.05)
+
+
+# _READINESS_WAIT_CAP_SECS: measured, not guessed -- on this host (nproc 32,
+# /proc/loadavg 100.32 => load-per-core 3.14), whole-test wall for every
+# _wait_for_path-gated test was <= 3.15s (konsole 2.46s, custom-term 1.72s,
+# sibling lanes 0.94-1.16s), and whole-test wall upper-bounds any single gate
+# inside it -- so a 30s ceiling is ~12x the worst observed gate.
+#
+# Deliberately NOT raised to 60 the way _NOT_FLAGGED_GRACE_BASE_SECS (below)
+# uses cap_secs=60: a started-grace is an upper bound the watchdog polls to
+# and the happy path never pays (see the comment above
+# _NOT_FLAGGED_GRACE_BASE_SECS), whereas a readiness-wait cap IS paid in full
+# on the failure path, so it stays tight rather than inheriting that raise.
+#
+# Headroom against the real per-test ceiling: `pytest --collect-only` reports
+# configfile: pyproject.toml (the repo root, which sets no `timeout`); the
+# value that actually governs this file is the --timeout=300 passed by
+# scripts/orchestrator.yaml:17. Worst case in the busiest rewired test is 3
+# budgets x 30s = 90s, comfortably inside 300s.
+_READINESS_WAIT_CAP_SECS = 30
+
+
+def _wait_for_path_scaled(path: pathlib.Path, base_secs: int) -> float:
+    """Wait for *path* with a load-scaled budget, and return the budget used.
+
+    A fixed _wait_for_path timeout races a host-load-dependent subprocess
+    startup chain -- observed once as
+    test_window_close_yields_129_not_hang[konsole] failing at
+    _wait_for_path(pidfile, timeout=5.0) during task 3451's step-7
+    full-suite verify, passing in isolation and on immediate rerun.
+
+    Returning the budget makes the policy assertable on an already-existing
+    path with zero sleeping -- the direct analogue of _set_started_grace
+    returning the int it wrote into env (see below), and the reason no
+    forbidden source-grepping meta-test is needed to pin the fix.
+
+    Floored at base_secs: an idle host (load-per-core <= 1) returns
+    base_secs unchanged, so every rewired call site stays byte-identical to
+    its old fixed pin on an unloaded host.
+    """
+    budget = _load_scaled_grace(base_secs, cap_secs=_READINESS_WAIT_CAP_SECS)
+    _wait_for_path(path, timeout=budget)
+    return budget
 
 
 def _write_foreground_terminal(bin_dir: pathlib.Path, name: str) -> None:
