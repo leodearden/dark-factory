@@ -18,11 +18,13 @@ import pytest
 
 from _capacity_skip import (
     CAPACITY_FAILURE_MARKERS,
+    REAL_CLI_CAP_MESSAGES,
     looks_like_capacity_failure,
     result_looks_like_capacity_failure,
 )
 
 from shared.cli_invoke import AgentResult
+from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 
 # Migrated verbatim from test_cli_invoke_integration.py::TestLooksLikeCapacityFailure.
 # The four leading entries are verbatim Claude CLI cap-hit messages — the actual
@@ -128,6 +130,46 @@ class TestEntryPointsAgree:
         assert (
             result_looks_like_capacity_failure(result)
             is looks_like_capacity_failure(f'{output}\n{stderr}')
+        )
+
+
+class TestNoDriftFromProductionDetector:
+    """The drift guard.
+
+    The skip helper and the production cap detector are two independent
+    implementations of "is this a capacity failure?", and the helper's whole
+    job is to not disagree with reality about a real cap message. A red here
+    means one of the two has been narrowed until they disagree about a
+    message the CLI genuinely emitted — which, at a skip call site, means an
+    integration test fails loudly with a cap message dressed up as a
+    regression (or, in the other direction, skips when it should not).
+
+    Deliberately NOT a snapshot of the expected marker tuple: that pins the
+    strings but not the property, and any future narrowing would be "fixed"
+    by editing the expectation. Cross-checking against production re-fails
+    automatically instead.
+    """
+
+    @pytest.mark.parametrize('message', REAL_CLI_CAP_MESSAGES)
+    def test_skip_guard_accepts_every_real_cap_message(self, message):
+        assert looks_like_capacity_failure(message), (
+            f'skip guard does NOT match a real CLI cap message: {message!r}. '
+            f'The production detector classifies it as a cap; this helper does '
+            f'not, so a capped account will fail its test loudly instead of '
+            f'skipping. Widen CAPACITY_FAILURE_MARKERS in _capacity_skip.py.'
+        )
+
+    @pytest.mark.parametrize('message', REAL_CLI_CAP_MESSAGES)
+    def test_production_detector_accepts_every_real_cap_message(self, message):
+        outcome = classify_invocation(
+            AgentResult(success=False, output=message, stderr=''),
+            strict_confirm=True,
+        )
+        assert isinstance(outcome, (CapHit, NearCap)), (
+            f'production classify_invocation does NOT treat a real CLI cap '
+            f'message as a cap: {message!r} -> {outcome!r}. This is the '
+            f'production-side half of the same divergence — a capped account '
+            f'would not trigger cap-retry at all.'
         )
 
 

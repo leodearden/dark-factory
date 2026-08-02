@@ -33,6 +33,36 @@ CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
 )
 
 
+# Verbatim real-CLI capacity messages, each with recorded provenance.  Used by
+# test_capacity_skip.py's drift guard, which asserts that the skip helper and
+# the PRODUCTION detector (invocation_outcome.classify_invocation) agree these
+# are cap messages.  Add an entry only with a transcript to cite.
+REAL_CLI_CAP_MESSAGES: tuple[str, ...] = (
+    # Observed 2026-08-01, claude CLI 2.1.220, task 3454, during the
+    # cross-account resume probe: account B answered the resumed turn with
+    # this and no model turn ever ran.  Recorded verbatim in the measurement
+    # comment at ``shared/src/shared/cli_invoke.py`` L1435.  This is the ONLY
+    # entry observed as a transcript first-hand.
+    "You've hit your weekly limit · resets Aug 5, 11am",
+    # The four cap-hit / near-cap messages that motivated the marker list.
+    # Their original provenance pointer read "shared.usage_gate inline
+    # comments, lines 64-75"; task 2129 moved those string tables to
+    # ``shared.invocation_outcome`` (CAP_HIT_PREFIXES / CAP_CONFIRM_KEYWORDS /
+    # NEAR_CAP_PREFIXES), so do not go chasing them in usage_gate.py.
+    "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+    "You've used all available credits. Upgrade your plan for more capacity.",
+    "You're out of extra usage for this billing period. Your plan resets in 2h.",
+    "You're close to reaching your usage limit. Your plan resets in 1h.",
+    # DELIBERATELY ABSENT: the session-limit and 5-hour variants.  The
+    # 2026-08-01 observation described a session limit only in prose (see
+    # cli_invoke.py L1445), never verbatim.  Inventing a plausible
+    # "You've hit your session limit · resets ..." and pinning it HERE — the
+    # one place a future engineer will read as ground truth — would put a
+    # fabricated transcript in the record.  Those variants are covered
+    # structurally by the markers instead.
+)
+
+
 def looks_like_capacity_failure(text: str) -> bool:
     """Return True when *text* looks like a Claude CLI capacity / quota failure.
 
