@@ -1080,6 +1080,106 @@ class TestAnnPairsFromNeighbors:
         assert memories == snapshot
 
 
+class TestAnnPairsPerCategoryThreshold:
+    """A hit is gated by the cutoff measured for ITS OWN category (task 3357).
+
+    ``resolve_ann_threshold`` now hands back ``{category: cutoff}``, because
+    one pooled cutoff derived on a corpus that is overwhelmingly
+    procedural_knowledge is not evidence for the other two categories. The
+    Qdrant push-down stays a scalar MIN so no candidate any category wants is
+    lost at the DB layer; THIS pure function does the authoritative filtering,
+    which is what makes the decision unit-testable without a live Qdrant.
+    """
+
+    def _memories(self, categories: list[str]) -> list[dict]:
+        out = []
+        for i, category in enumerate(categories):
+            m = _memory(f'm{i}', f'content {i}', category=category)
+            m['vector'] = [0.1 * i, 0.2]
+            out.append(m)
+        return out
+
+    def test_same_score_is_kept_under_a_loose_cutoff_and_dropped_under_a_tight_one(self):
+        """One score, two categories, two verdicts — the whole point.
+
+        0.89 is a real paraphrase pair in a category cut at 0.85 and mere
+        formulaic similarity in one cut at 0.95. A single pooled number
+        cannot express both.
+        """
+        memories = self._memories([_PK, _PK, _OS, _OS])
+        neighbors = {'m0': [_hit('m1', 0.89)], 'm2': [_hit('m3', 0.89)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(
+            memories, neighbors, {_PK: 0.85, _OS: 0.95},
+        )
+
+        assert pairs == [(0, 1)], 'the tightly-cut category must form no pair'
+        assert disclosure['below_threshold_dropped'] == 1
+
+    def test_category_absent_from_the_mapping_contributes_no_pairs(self):
+        """An UNCALIBRATED category is disabled, not silently cut at zero."""
+        memories = self._memories([_PK, _PK, _OS, _OS])
+        neighbors = {'m0': [_hit('m1', 0.99)], 'm2': [_hit('m3', 0.99)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, {_PK: 0.85})
+
+        assert pairs == [(0, 1)]
+        assert disclosure['uncalibrated_category_dropped'] == 1
+        assert disclosure['below_threshold_dropped'] == 0, (
+            'a hit in a disabled category was never eligible — counting it as '
+            'threshold attrition would misreport WHY the recall was lost'
+        )
+
+    def test_record_with_no_category_is_disabled_not_defaulted(self):
+        memories = self._memories([_PK, _PK])
+        memories[0]['category'] = None
+        neighbors = {'m0': [_hit('m1', 0.99)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, {_PK: 0.85})
+
+        assert pairs == []
+        assert disclosure['uncalibrated_category_dropped'] == 1
+
+    def test_below_the_categorys_own_cutoff_is_still_threshold_attrition(self):
+        memories = self._memories([_OS, _OS])
+        neighbors = {'m0': [_hit('m1', 0.90)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, {_OS: 0.95})
+
+        assert pairs == []
+        assert disclosure['below_threshold_dropped'] == 1
+        assert disclosure['uncalibrated_category_dropped'] == 0
+
+    def test_scalar_threshold_behaves_exactly_as_before(self):
+        """Every pre-3357 caller and test keeps its meaning."""
+        memories = self._memories([_PK, _PK, _OS, _OS])
+        neighbors = {'m0': [_hit('m1', 0.89)], 'm2': [_hit('m3', 0.89)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, 0.85)
+
+        assert pairs == [(0, 1), (2, 3)], 'a scalar cutoff gates every category'
+        assert disclosure['uncalibrated_category_dropped'] == 0
+
+    def test_new_counter_is_always_present_and_zero_filled(self):
+        """A missing key is indistinguishable from "not measured"."""
+        pairs, disclosure = ann_pairs_from_neighbors([], {}, threshold=0.9)
+        assert pairs == []
+        assert set(disclosure) == set(_ANN_DISCLOSURE_KEYS)
+        assert 'uncalibrated_category_dropped' in _ANN_DISCLOSURE_KEYS
+        assert all(v == 0 for v in disclosure.values())
+
+    def test_remains_pure(self):
+        """No I/O, no mutation — the per-category decision stays testable."""
+        memories = self._memories([_PK, _OS])
+        snapshot = [dict(m) for m in memories]
+        mapping = {_PK: 0.85}
+
+        ann_pairs_from_neighbors(memories, {'m0': [_hit('m1', 0.99)]}, mapping)
+
+        assert memories == snapshot
+        assert mapping == {_PK: 0.85}, 'the cutoff mapping must not be mutated'
+
+
 # ===========================================================================
 # The user-observable signal: the ANN path catches a paraphrase the lexical
 # path structurally cannot (task 3210)
