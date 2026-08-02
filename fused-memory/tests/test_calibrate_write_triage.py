@@ -845,6 +845,152 @@ class TestDeriveBands:
 
 
 # ---------------------------------------------------------------------------
+# derive_bands_per_category
+# ---------------------------------------------------------------------------
+
+def _classes(dups: list, unrelated: list, hard: list) -> dict:
+    """One category's three measured score samples, in PAIR_CLASSES keys."""
+    return {'true_dup': dups, 'unrelated': unrelated, 'hard_negative': hard}
+
+
+class TestDeriveBandsPerCategory:
+    """Per-category bands: the SAME derivation, applied per bucket.
+
+    Nothing here re-derives a threshold. Each category delegates to
+    derive_bands, so a per-category cutoff is exactly as evidence-bound as
+    the pooled one — and refuses on the same terms.
+
+    Both refusal paths are reachable from the REAL corpus, not hypothetical:
+    preferences_and_norms has zero negative pairs (one cluster), and
+    observations_and_summaries is thin enough that non-separability is a
+    live outcome. The machinery handles both without predicting either.
+    """
+
+    POOLED_T_HIGH = 0.75
+    POOLED_T_LOW = 0.5
+
+    def _derive(self, by_category: dict, pooled_t_high=POOLED_T_HIGH) -> dict:
+        return _mod().derive_bands_per_category(
+            by_category, pooled_t_high, self.POOLED_T_LOW,
+        )
+
+    def test_a_populated_category_yields_exactly_what_derive_bands_yields(self) -> None:
+        """No second derivation path — delegation, so the two cannot drift."""
+        dups, unrelated, hard = [0.5, 0.6, 0.7, 0.8, 0.9], [0.1, 0.2], [0.55]
+        got = self._derive({'procedural_knowledge': _classes(dups, unrelated, hard)})
+        expected = _mod().derive_bands(dups, unrelated + hard)
+        entry = got['procedural_knowledge']
+        assert (entry['t_high'], entry['t_low'], entry['reason']) == expected
+
+    def test_the_negative_class_is_unrelated_plus_hard_negative(self) -> None:
+        """Same pooling of negatives run_calibration already uses."""
+        got = self._derive({'c': _classes([0.5, 0.9], [0.1], [0.95])})
+        assert got['c']['t_high'] is None, (
+            'a hard negative above every duplicate must block derivation; '
+            'ignoring the hard-negative class would fabricate a cutoff'
+        )
+
+    def test_a_category_with_zero_negatives_refuses_with_empty_class(self) -> None:
+        """The measured preferences_and_norms case: one cluster, no negatives.
+
+        No arithmetic produces a cutoff here. The refusal IS the calibration
+        finding, and it must be machine-readable so the consumer can branch.
+        """
+        got = self._derive({'preferences_and_norms': _classes([0.8, 0.9, 0.95], [], [])})
+        entry = got['preferences_and_norms']
+        assert entry['t_high'] is None and entry['t_low'] is None
+        assert entry['reason'].startswith(_mod().REASON_EMPTY_CLASS), entry['reason']
+
+    def test_a_non_separable_category_refuses_with_not_separable(self) -> None:
+        """The reviewer's observations_and_summaries hypothesis, if it fires.
+
+        Formulaic recaps scoring at or above every confirmed duplicate means
+        no measured value separates the classes. Interpolating one would
+        manufacture the very unevidenced cutoff this task exists to remove.
+        """
+        got = self._derive({
+            'observations_and_summaries': _classes([0.80, 0.85], [0.90], [0.88]),
+        })
+        entry = got['observations_and_summaries']
+        assert entry['t_high'] is None
+        assert entry['reason'].startswith(_mod().REASON_NOT_SEPARABLE), entry['reason']
+
+    def test_an_uncalibrated_category_is_present_with_a_null_t_high_never_omitted(
+        self,
+    ) -> None:
+        """Omission would read as 'not measured' rather than 'measured, refused'.
+
+        That ambiguity is exactly what this task exists to remove, so the
+        report keeps every category and distinguishes the two by reason.
+        """
+        got = self._derive({
+            'procedural_knowledge': _classes([0.5, 0.6, 0.7, 0.8, 0.9], [0.1], [0.2]),
+            'preferences_and_norms': _classes([0.8, 0.9], [], []),
+            'observations_and_summaries': _classes([0.4], [0.9], []),
+        })
+        assert set(got) == {
+            'procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries',
+        }
+        for category, entry in got.items():
+            assert (entry['t_high'] is None) == bool(entry['reason']), (
+                f'{category}: a null t_high must carry a reason and vice versa'
+            )
+
+    def test_every_entry_carries_its_measured_distributions_and_pair_counts(self) -> None:
+        """The evidence that justifies the number — or the refusal."""
+        got = self._derive({'c': _classes([0.5, 0.6, 0.7, 0.8, 0.9], [0.1, 0.2], [0.55])})
+        entry = got['c']
+        assert set(entry['distributions']) == set(_mod().PAIR_CLASSES)
+        assert entry['pair_counts'] == {'true_dup': 5, 'unrelated': 2, 'hard_negative': 1}
+        assert entry['distributions']['true_dup'] == _mod().summarize_distribution(
+            [0.5, 0.6, 0.7, 0.8, 0.9],
+        )
+
+    def test_an_empty_class_reports_n_zero_not_a_measured_zero(self) -> None:
+        got = self._derive({'preferences_and_norms': _classes([0.8, 0.9], [], [])})
+        entry = got['preferences_and_norms']
+        assert entry['pair_counts']['unrelated'] == 0
+        assert entry['distributions']['unrelated']['max'] is None, (
+            'an empty pair class must not report a measured 0.0'
+        )
+
+    # -- the second acceptance disjunct's direct evidence --------------------
+
+    def test_each_entry_counts_its_negatives_admitted_by_the_POOLED_t_high(self) -> None:
+        """Does the pooled cutoff separate THIS category's classes?
+
+        A non-zero count is a measured false-positive rate for the pooled
+        t_high in that category — the direct evidence for (or against) the
+        claim that one cutoff serves all three.
+        """
+        got = self._derive({
+            'observations_and_summaries': _classes([0.6], [0.80, 0.90], [0.99, 0.10]),
+        })
+        assert got['observations_and_summaries']['pooled_t_high_negatives_admitted'] == 3
+
+    def test_negatives_admitted_counts_only_negatives_never_true_duplicates(self) -> None:
+        """A duplicate in the deterministic band is the band working."""
+        got = self._derive({'c': _classes([0.95, 0.96], [0.10], [0.20])})
+        assert got['c']['pooled_t_high_negatives_admitted'] == 0
+
+    def test_a_category_with_no_negatives_admits_none_of_them(self) -> None:
+        got = self._derive({'preferences_and_norms': _classes([0.9], [], [])})
+        assert got['preferences_and_norms']['pooled_t_high_negatives_admitted'] == 0
+
+    def test_an_uncalibrated_pooled_t_high_admits_no_measurement_not_zero(self) -> None:
+        """With no pooled band there is nothing to admit against.
+
+        0 would read as 'measured, and safe' — the same distinction
+        build_report already draws for its false-positive tally.
+        """
+        got = self._derive({'c': _classes([0.9], [0.8], [])}, pooled_t_high=None)
+        assert got['c']['pooled_t_high_negatives_admitted'] is None
+
+    def test_empty_input_yields_no_entries(self) -> None:
+        assert self._derive({}) == {}
+
+
+# ---------------------------------------------------------------------------
 # compute_recall_at_k
 # ---------------------------------------------------------------------------
 
