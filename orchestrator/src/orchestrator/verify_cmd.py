@@ -229,8 +229,8 @@ def _has_shell_grouping_or_substitution(raw: str) -> bool:
     return False
 
 
-def split_top_level_and(raw: str) -> list[str]:
-    """Split *raw* on `&&` at shell quote depth 0, returning segments VERBATIM.
+def _scan_and_chain(raw: str, *, strict: bool) -> 'list[str] | None':
+    """THE `&&`-chain scanner. Splits *raw* at quote depth 0, VERBATIM.
 
     A character-scan state machine tracking single-quote / double-quote state
     and backslash escapes (POSIX rules, matching ``shlex.split``: a backslash
@@ -239,16 +239,39 @@ def split_top_level_and(raw: str) -> list[str]:
     ``-k 'a && b'`` is the real case — not a chain operator, so it is not a
     split point.
 
-    Segments keep every byte between separators, boundary whitespace
-    included, so ``'&&'.join(split_top_level_and(raw)) == raw`` exactly. That
+    Clauses keep every byte between separators, boundary whitespace included,
+    so ``'&&'.join(...) == raw`` exactly in the non-strict mode. That
     losslessness is the point: ``split_chain_tail``'s caller re-emits the tail
-    verbatim rather than re-rendering it, and can only do so safely if the
+    verbatim rather than re-rendering it, and ``split_and_chain_segments``
+    emits each segment as a byte-slice — both are only safe if the
     decomposition consumed nothing but the separators themselves.
+
+    ONE scanner with a mode flag rather than two near-copies (task 3338
+    amendment): the quoting/escaping rules it encodes are the same shell rules
+    for both callers, and two hand-maintained copies of them are two places
+    for a POSIX-quoting fix to be applied to only one.
+
+    *strict* adds what ``split_and_chain_segments`` (the EXECUTION-layer
+    caller) additionally needs, and is the ONLY mode with a refusal path:
+
+    * paren-depth tracking — an `&&` inside a balanced ``( ... )`` group is
+      NOT a split point, so the group stays one atomic clause (the committed
+      fleet chain's cockpit subshell depends on this);
+    * ``None`` on a depth-0 control operator (`;`, `|`, `||`, a lone `&`, a
+      backtick) — each makes a clause's exit status no longer the clause's
+      OWN, so running it as an independent segment would attribute a wrong rc;
+    * ``None`` on an unbalanced quote or paren — a string this cannot even
+      scan was never safely decomposable.
+
+    Non-strict mode has NO refusal path and never returns ``None``: parens,
+    backticks and control operators are ordinary characters to it, exactly as
+    they were before this scanner was unified.
     """
-    segments: list[str] = []
+    clauses: list[str] = []
     start = 0
     i = 0
     quote: str | None = None
+    depth = 0
     n = len(raw)
     while i < n:
         ch = raw[i]
@@ -260,11 +283,34 @@ def split_top_level_and(raw: str) -> list[str]:
                 quote = ch
                 i += 1
                 continue
-            if ch == '&' and raw[i + 1 : i + 2] == '&':
-                segments.append(raw[start:i])
-                i += 2
-                start = i
+            if strict and ch == '(':
+                depth += 1
+                i += 1
                 continue
+            if strict and ch == ')':
+                depth -= 1
+                if depth < 0:
+                    # Unbalanced: a `)` with no opener. Refuse rather than
+                    # slice a construct we have already mis-read.
+                    return None
+                i += 1
+                continue
+            if strict and ch == '`':
+                # Backtick substitution: this scanner does not track its
+                # interior, so an `&&` inside one could become a bogus split.
+                return None
+            if ch == '&' and raw[i + 1 : i + 2] == '&':
+                if depth == 0:
+                    clauses.append(raw[start:i])
+                    start = i + 2
+                i += 2
+                continue
+            if strict and depth == 0 and ch in ('&', ';', '|'):
+                # A lone `&` backgrounds the clause (its rc is the shell's, not
+                # the command's); `;` runs the next clause unconditionally; `|`
+                # and `||` reassign the clause's exit status. All three break
+                # per-segment rc attribution, which is the whole product here.
+                return None
             i += 1
             continue
         # Inside quotes: only a double-quote context honours backslash escapes.
@@ -274,7 +320,27 @@ def split_top_level_and(raw: str) -> list[str]:
         if ch == quote:
             quote = None
         i += 1
-    segments.append(raw[start:])
+    if strict and (quote is not None or depth != 0):
+        # Unbalanced quote or paren at end of scan.
+        return None
+    clauses.append(raw[start:])
+    return clauses
+
+
+def split_top_level_and(raw: str) -> list[str]:
+    """Split *raw* on `&&` at shell quote depth 0, returning segments VERBATIM.
+
+    The LOSSLESS, never-refusing view of :func:`_scan_and_chain`:
+    ``'&&'.join(split_top_level_and(raw)) == raw`` exactly, whatever *raw*
+    contains. ``split_chain_tail``'s caller re-emits the tail verbatim rather
+    than re-rendering it, and can only do so safely under that guarantee.
+    """
+    segments = _scan_and_chain(raw, strict=False)
+    # Non-strict mode has no refusal path (see _scan_and_chain): every `return
+    # None` there is guarded by `strict`. Asserting rather than falling back
+    # keeps a future scanner edit that leaks a refusal into this mode LOUD,
+    # instead of silently changing this helper's lossless contract.
+    assert segments is not None
     return segments
 
 
@@ -695,20 +761,39 @@ def split_and_chain_segments(raw: str) -> list[ChainSegment] | None:
     each emitted segment carries the cwd the shell would have been in when it
     ran. Segment commands are ``strip()``ed byte-slices of *raw*.
 
+    A clause that mutates SHELL STATE for the clauses after it is likewise a
+    REFUSE, not a segment. Each segment runs in its own ``/bin/bash -c``, so
+    an ``export``/``source``/``set -e``/``FOO=1`` clause's effect would be
+    silently DISCARDED and every later segment would run in a different
+    environment than the operator configured — a spurious red (or, for an
+    env-tightening clause, a wrong verdict) with no signal that the command
+    had been reinterpreted. The committed dark-factory chain has none of these
+    shapes, but this helper runs whatever ``test_command`` ANY targeted
+    project's ``dark-factory-orchestrator.yaml`` configures.
+
     REFUSES (``None``) on: an unbalanced quote or paren; a depth-0 `;`, `|`,
-    `||`, lone `&` or backtick; a ``cd`` whose target is not a literal relative
-    path (``$VAR``, ``$(...)``, a glob, a quoted or absolute path, or the wrong
-    argument count); an accumulated cwd normalising above the worktree root;
-    and any chain yielding fewer than 2 runnable clauses — there is no
+    `||`, lone `&` or backtick; a clause whose leading word is a
+    state-mutating builtin (``_STATE_MUTATING_BUILTINS``) or a ``NAME=value``
+    assignment prefix; a ``cd`` whose target is not a literal relative path
+    (``$VAR``, ``$(...)``, a glob, `~`, `-`, a quoted or absolute path, or the
+    wrong argument count); an accumulated cwd normalising above the worktree
+    root; and any chain yielding fewer than 2 runnable clauses — there is no
     short-circuit to fix in a single command.
     """
     segments: list[ChainSegment] = []
     cwd_rel = '.'
-    for clause in _split_top_level_and_chain(raw) or []:
+    for clause in _scan_and_chain(raw, strict=True) or []:
         stripped = clause.strip()
         if not stripped:
             return None
-        is_cd, cd_target = _cd_clause_target(stripped)
+        if _mutates_shell_state(stripped):
+            # State this runner cannot carry across segment boundaries. Checked
+            # BEFORE the `cd` fold on purpose: `FOO=1 cd shared` is not matched
+            # by _literal_cd_target (the assignment prefix hides the `cd`), so
+            # without this guard it would be emitted as a no-op segment and
+            # every LATER segment would silently run at the worktree root.
+            return None
+        is_cd, cd_target = _literal_cd_target(stripped)
         if is_cd and cd_target is None:
             # A `cd` whose target this cannot resolve LITERALLY. Refusing is
             # the only safe disposition: guessing would run every LATER segment
@@ -731,17 +816,59 @@ def split_and_chain_segments(raw: str) -> list[ChainSegment] | None:
     return segments
 
 
+# Leading words that mutate SHELL STATE for every clause AFTER them —
+# environment (`export`/`unset`/`source`/`.`), shell options (`set`/`shopt`),
+# the alias table, traps, the umask, or the directory stack
+# (`pushd`/`popd`, which `_literal_cd_target` deliberately does not model).
+# `split_and_chain_segments` runs each segment in its OWN `/bin/bash -c`, so
+# that state would be silently discarded and every later segment would run in
+# an environment the operator never configured. REFUSING is the honest
+# disposition: the caller then runs the raw chain in one shell, state intact.
+_STATE_MUTATING_BUILTINS = frozenset({
+    '.', 'alias', 'eval', 'export', 'popd', 'pushd', 'set', 'shopt',
+    'source', 'trap', 'umask', 'unset',
+})
+
+# A leading `NAME=value` shell assignment prefix. Two distinct hazards, both
+# fatal to segmentation: alone (`FOO=1 && ...`) it sets a variable for the rest
+# of the chain, and in FRONT of a directory change (`FOO=1 cd shared`) it hides
+# the `cd` from `_literal_cd_target`, which would leave every later segment
+# running at the worktree root instead.
+_ASSIGNMENT_PREFIX_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+
+
+def _mutates_shell_state(clause: str) -> bool:
+    """True if *clause*'s LEADING word changes shell state for later clauses.
+
+    Only the leading word is inspected, which is the point: ``./run.sh`` is a
+    program (not the `.` builtin), ``pytest --export-junit`` is a flag, and a
+    builtin INSIDE a balanced ``( ... )`` group cannot escape its subshell — so
+    a clause starting with `(` is correctly left runnable.
+    """
+    head = clause.split(maxsplit=1)
+    if not head:
+        return False
+    return head[0] in _STATE_MUTATING_BUILTINS or bool(_ASSIGNMENT_PREFIX_RE.match(head[0]))
+
+
 # Characters that make a `cd` argument non-LITERAL: parameter expansion,
-# command substitution, globbing, or quoting. Any of them and the directory
-# this helper would compute is not necessarily the one the shell would enter.
-_CD_HAZARD_CHARS = frozenset('$`*?"\'')
+# command substitution, globbing, quoting, or tilde expansion. Any of them and
+# the directory this helper would compute is not necessarily the one the shell
+# would enter — `~/proj` passed through as a literal `cwd=` path names no
+# directory at all.
+_CD_HAZARD_CHARS = frozenset('$`*?"\'~')
+
+# `cd` arguments that are shell-special despite looking literal: `cd -` goes to
+# $OLDPWD and `cd --` (end-of-options with no operand) goes to $HOME. Both
+# would otherwise be folded in as if they were directory NAMES.
+_CD_NON_PATH_ARGUMENTS = frozenset({'-', '--'})
 
 # A clause whose first word is exactly `cd`. Requires a word boundary so
 # `cdk deploy` is a runnable segment, not a mis-read directory change.
 _CD_CLAUSE_RE = re.compile(r'\s*cd(?:\s|$)')
 
 
-def _cd_clause_target(clause: str) -> tuple[bool, str | None]:
+def _literal_cd_target(clause: str) -> tuple[bool, str | None]:
     """``(is_cd_clause, literal_relative_target)`` for one chain clause.
 
     ``(False, None)`` — not a `cd` at all; the caller emits it as a runnable
@@ -749,12 +876,21 @@ def _cd_clause_target(clause: str) -> tuple[bool, str | None]:
     cwd. ``(True, None)`` — a `cd` whose target cannot be resolved LITERALLY,
     on which the caller REFUSES the whole chain: a mis-resolved cwd would run
     later segments in the WRONG directory, which is worse than not segmenting.
+    Concretely, ``_run_cmd`` swallows the resulting spawn ``OSError`` into
+    ``1, 'Command failed: ...', False``, so a bad fold reads as a subproject's
+    own red rather than as the mis-resolution it is.
+
+    Deliberately named apart from ``verify._cd_clause_target`` (task 3022),
+    which is a DIFFERENT contract in the same subsystem — ``str | None``, with
+    no refusal channel — so a reader landing on either one can tell which is
+    in play. That one is imported by ``tests/scripts/test_fallback_verify_config``
+    and is not this task's to rename.
     """
     if not _CD_CLAUSE_RE.match(clause):
         return False, None
     argument = clause.strip()[len('cd') :].strip()
     if _CD_HAZARD_CHARS & set(argument):
-        # $VAR / $(...) / `...` / globs / quotes — not a literal path.
+        # $VAR / $(...) / `...` / globs / quotes / `~` — not a literal path.
         return True, None
     try:
         tokens = shlex.split(clause)
@@ -765,86 +901,13 @@ def _cd_clause_target(clause: str) -> tuple[bool, str | None]:
         # A bare `cd` goes $HOME and `cd a b` is bash's substitution form —
         # neither is a foldable relative directory change.
         return True, None
+    if tokens[1] in _CD_NON_PATH_ARGUMENTS:
+        # `cd -` / `cd --`: shell-special destinations, not directory names.
+        return True, None
     if tokens[1].startswith('/'):
         # Segments run under `worktree / cwd_rel`; an absolute cwd escapes it.
         return True, None
     return True, tokens[1]
-
-
-def _split_top_level_and_chain(raw: str) -> list[str] | None:
-    """``split_top_level_and`` plus paren-depth awareness; ``None`` on REFUSE.
-
-    Splits on `&&` only at quote depth 0 AND paren depth 0, keeping every other
-    byte, so the segments are verbatim slices exactly as
-    ``split_top_level_and``'s are.
-
-    Refuses on a depth-0 control operator — `;`, `|`, `||`, a lone `&`, a
-    backtick — because each one means a clause's exit status is no longer the
-    clause's OWN, so running it as an independent segment would attribute the
-    wrong rc. Same reject vocabulary ``_NON_AND_CHAIN_TOKENS`` supplies to
-    ``split_chain_tail``, minus its `(`/`)` entries: this helper PROMOTES a
-    balanced paren group from "refuse" to "one atomic segment", which is what
-    keeps the committed fleet chain's cockpit clause intact.
-    """
-    clauses: list[str] = []
-    start = 0
-    i = 0
-    quote: str | None = None
-    depth = 0
-    n = len(raw)
-    while i < n:
-        ch = raw[i]
-        if quote is None:
-            if ch == '\\':
-                i += 2
-                continue
-            if ch in ('"', "'"):
-                quote = ch
-                i += 1
-                continue
-            if ch == '(':
-                depth += 1
-                i += 1
-                continue
-            if ch == ')':
-                depth -= 1
-                if depth < 0:
-                    # Unbalanced: a `)` with no opener. Refuse rather than
-                    # slice a construct we have already mis-read.
-                    return None
-                i += 1
-                continue
-            if ch == '`':
-                # Backtick substitution: this scanner does not track its
-                # interior, so an `&&` inside one could become a bogus split.
-                return None
-            if ch == '&' and raw[i + 1 : i + 2] == '&':
-                if depth == 0:
-                    clauses.append(raw[start:i])
-                    start = i + 2
-                i += 2
-                continue
-            if depth == 0 and ch in ('&', ';', '|'):
-                # A lone `&` backgrounds the clause (its rc is the shell's, not
-                # the command's); `;` runs the next clause unconditionally; `|`
-                # and `||` reassign the clause's exit status. All three break
-                # per-segment rc attribution, which is the whole product here.
-                return None
-            i += 1
-            continue
-        # Inside quotes: only a double-quote context honours backslash escapes.
-        if quote == '"' and ch == '\\':
-            i += 2
-            continue
-        if ch == quote:
-            quote = None
-        i += 1
-    if quote is not None or depth != 0:
-        # Unbalanced quote or paren at end of scan — the string was never
-        # safely decomposable.
-        return None
-    clauses.append(raw[start:])
-    return clauses
 
 
 def parse_config_command(raw: str) -> VerifyCmd:

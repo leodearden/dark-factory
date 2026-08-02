@@ -1967,6 +1967,10 @@ class TestSplitAndChainSegmentsRefuses:
             'cd share? && uv run pytest tests/ && cd ../orchestrator && npx pyright',
             'cd $(cat where.txt) && uv run pytest tests/ && cd ../orchestrator && npx pyright',
             'cd `cat where.txt` && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd - && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd -- && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd ~/proj && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd ~ && uv run pytest tests/ && cd ../orchestrator && npx pyright',
         ],
         ids=[
             'bare-variable',
@@ -1975,6 +1979,10 @@ class TestSplitAndChainSegmentsRefuses:
             'question-glob',
             'command-substitution',
             'backtick-substitution',
+            'dash-oldpwd',
+            'double-dash-home',
+            'tilde-path',
+            'bare-tilde',
         ],
     )
     def test_refuses_non_literal_cd_argument(self, raw):
@@ -1983,8 +1991,85 @@ class TestSplitAndChainSegmentsRefuses:
         Refusing is the only safe disposition: the alternative is expanding the
         shell's own semantics here, which is exactly the parser this helper
         exists to avoid writing.
+
+        The `-` / `--` / `~` cases (task 3338 amendment) are the ones that LOOK
+        literal: bash sends `cd -` to $OLDPWD and `cd --` to $HOME, and no
+        tilde is expanded when a path is handed to ``_run_cmd`` as ``cwd=``.
+        Folding any of them in would spawn every later segment against a
+        non-existent directory, which ``_run_cmd`` swallows into
+        ``1, 'Command failed: ...'`` — a spurious red attributed to the
+        SUBPROJECT rather than to the mis-resolved cwd.
         """
         assert split_and_chain_segments(raw) is None
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'export UV_CACHE_DIR=/tmp/c && cd shared && uv run pytest tests/'
+            ' && cd ../orchestrator && uv run pytest tests/',
+            'source .venv/bin/activate && uv run pytest a/ && uv run pytest b/',
+            '. .venv/bin/activate && uv run pytest a/ && uv run pytest b/',
+            'set -e && uv run pytest a/ && uv run pytest b/',
+            'unset PYTHONPATH && uv run pytest a/ && uv run pytest b/',
+            'shopt -s globstar && uv run pytest a/ && uv run pytest b/',
+            'umask 022 && uv run pytest a/ && uv run pytest b/',
+            'trap cleanup EXIT && uv run pytest a/ && uv run pytest b/',
+            'alias p=pytest && uv run pytest a/ && uv run pytest b/',
+            'eval setup-env && uv run pytest a/ && uv run pytest b/',
+            'pushd shared && uv run pytest a/ && popd && uv run pytest b/',
+            'FOO=1 cd shared && uv run pytest a/ && uv run pytest b/',
+            'UV_CACHE_DIR=/tmp/c uv run pytest a/ && uv run pytest b/',
+        ],
+        ids=[
+            'export', 'source', 'dot-source', 'set', 'unset', 'shopt', 'umask',
+            'trap', 'alias', 'eval', 'pushd', 'assignment-prefix-hiding-a-cd',
+            'assignment-prefix-alone',
+        ],
+    )
+    def test_refuses_clauses_that_mutate_shell_state(self, raw):
+        """State set for LATER clauses cannot survive one-`bash -c`-per-segment.
+
+        Task 3338 amendment. Every segment is spawned in its OWN shell, so an
+        `export`/`source`/`set -e` clause's effect is DISCARDED and each later
+        segment runs in an environment the operator never configured — a
+        spurious red, or (for an env-tightening clause) a wrong verdict, with
+        no signal that the command had been reinterpreted. The committed
+        dark-factory chain has none of these shapes, but ``segment_chained_test``
+        is passed on the generic fallback path, which runs whatever
+        ``test_command`` ANY targeted project's config carries.
+
+        ``FOO=1 cd shared`` is the sharpest case: the assignment prefix hides
+        the `cd` from ``_literal_cd_target``, so without this guard the clause
+        became a no-op SEGMENT and every later segment silently ran at the
+        worktree ROOT instead of ``shared/``.
+        """
+        assert split_and_chain_segments(raw) is None
+
+    def test_state_mutation_inside_a_paren_group_is_not_a_refusal(self):
+        """A subshell's own `export` cannot escape it, so the group stays runnable.
+
+        Guards the leading-word scope of the check: scanning the WHOLE clause
+        text for a builtin would refuse the committed fleet chain's cockpit
+        group on sight, costing the fix for no safety gain.
+        """
+        raw = 'cd shared && uv run pytest a/ && ( export FOO=1 && uv run pytest b/ )'
+        segments = split_and_chain_segments(raw)
+        assert segments is not None
+        assert [s.cwd_rel for s in segments] == ['shared', 'shared']
+        assert segments[1].command == '( export FOO=1 && uv run pytest b/ )'
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            './run-tests.sh && uv run pytest a/ && uv run pytest b/',
+            'cdk deploy && uv run pytest a/ && uv run pytest b/',
+            'uv run pytest a/ --export-junit && uv run pytest b/',
+        ],
+        ids=['dot-slash-script', 'cdk-not-cd', 'export-as-a-flag'],
+    )
+    def test_leading_word_match_is_exact_not_a_prefix(self, raw):
+        """`./run.sh` is not the `.` builtin and `--export-junit` is not `export`."""
+        assert split_and_chain_segments(raw) is not None
 
     @pytest.mark.parametrize(
         'raw',
