@@ -1136,7 +1136,7 @@ OVERLAP_SCORES = {
 }
 
 
-def _report(scores: dict, t_high, t_low, reason=None, recall=None) -> dict:
+def _report(scores: dict, t_high, t_low, reason=None, recall=None, **kwargs) -> dict:
     return _mod().build_report(
         scores_by_class=scores,
         t_high=t_high,
@@ -1144,6 +1144,31 @@ def _report(scores: dict, t_high, t_low, reason=None, recall=None) -> dict:
         reason=reason,
         recall=recall if recall is not None else {'per_k': [], 'canonical_absent': []},
         provenance=dict(_PROVENANCE),
+        **kwargs,
+    )
+
+
+def _per_category(pooled_t_high=0.80, pooled_t_low=0.70) -> dict:
+    """A realistic per-category block: one calibrated, two refused.
+
+    Mirrors the shape the committed fixture actually produces — a category
+    with enough evidence to derive a cutoff, one with zero negatives, and one
+    too thin to separate.
+    """
+    return _mod().derive_bands_per_category(
+        {
+            'procedural_knowledge': {
+                'true_dup': [0.70, 0.80, 0.90], 'unrelated': [0.10], 'hard_negative': [0.55],
+            },
+            'preferences_and_norms': {
+                'true_dup': [0.80, 0.90], 'unrelated': [], 'hard_negative': [],
+            },
+            'observations_and_summaries': {
+                'true_dup': [0.60], 'unrelated': [0.95], 'hard_negative': [],
+            },
+        },
+        pooled_t_high,
+        pooled_t_low,
     )
 
 
@@ -1256,6 +1281,143 @@ class TestBuildReport:
     def test_the_report_is_json_serializable(self) -> None:
         got = _report(OVERLAP_SCORES, 0.80, 0.70)
         assert json.loads(json.dumps(got)) == got
+
+
+class TestBuildReportPerCategory:
+    """The per-category section is ADDITIVE — the pooled report is untouched.
+
+    The pooled t_high remains the calibration of record; this section is the
+    evidence about whether it is warranted per category. Any drift in the
+    pooled numbers would mean this task changed a measurement it was only
+    supposed to explain, so that is asserted directly.
+    """
+
+    POOLED_KEYS = (
+        'chosen_t_high', 'chosen_t_low', 'reason',
+        'deterministic_band_false_positives', 'distributions', 'per_band',
+        'recall_at_k',
+    )
+
+    def test_carries_a_per_category_section(self) -> None:
+        per_category = _per_category()
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=per_category)
+        assert got['per_category'] == per_category
+
+    def test_the_pooled_measurement_is_byte_identical_with_and_without_it(self) -> None:
+        """Additive means additive: same inputs, same pooled numbers."""
+        without = _report(OVERLAP_SCORES, 0.80, 0.70)
+        with_ = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        for key in self.POOLED_KEYS:
+            assert with_[key] == without[key], f'{key} drifted when per_category was added'
+        for key, value in without['provenance'].items():
+            assert with_['provenance'][key] == value, f'provenance[{key!r}] drifted'
+
+    def test_defaults_to_an_empty_section_so_existing_callers_are_unaffected(self) -> None:
+        """Present-and-empty, not missing: 'measured nothing' is still a state."""
+        got = _report(OVERLAP_SCORES, 0.80, 0.70)
+        assert got['per_category'] == {}
+
+    def test_every_category_keeps_its_derived_entry_verbatim(self) -> None:
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        assert set(got['per_category']) == {
+            'procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries',
+        }
+        for category, entry in got['per_category'].items():
+            for key in ('distributions', 't_high', 't_low', 'reason', 'pair_counts',
+                        'pooled_t_high_negatives_admitted'):
+                assert key in entry, f'{category} missing {key!r}'
+
+    def test_an_uncalibrated_category_is_reported_not_dropped(self) -> None:
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        refused = got['per_category']['preferences_and_norms']
+        assert refused['t_high'] is None
+        assert refused['reason'].startswith(_mod().REASON_EMPTY_CLASS)
+
+    def test_an_uncalibrated_POOLED_run_still_emits_the_section(self) -> None:
+        """The pooled refusal does not erase the per-category evidence.
+
+        Those distributions are part of what justifies the pooled refusal.
+        """
+        got = _report(
+            CLEAN_SCORES, None, None, reason='not_separable: ...',
+            per_category=_per_category(pooled_t_high=None, pooled_t_low=None),
+        )
+        assert set(got['per_category']) == {
+            'procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries',
+        }
+        assert got['per_category']['procedural_knowledge'][
+            'pooled_t_high_negatives_admitted'
+        ] is None, 'with no pooled band there is nothing to admit against'
+
+    def test_provenance_records_the_per_category_pair_counts(self) -> None:
+        """Self-describing, exactly as the pooled pair_counts already are."""
+        per_category = _per_category()
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=per_category)
+        assert got['provenance']['per_category_pair_counts'] == {
+            category: entry['pair_counts'] for category, entry in per_category.items()
+        }
+
+    def test_the_report_is_json_serializable_with_the_section(self) -> None:
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        assert json.loads(json.dumps(got)) == got
+
+
+# ---------------------------------------------------------------------------
+# render_markdown
+# ---------------------------------------------------------------------------
+
+class TestRenderMarkdownPerCategory:
+    """The human-readable form of the finding.
+
+    Assertions are on the numbers and the machine-readable reason codes, not
+    on prose wording — a reader must be able to see, without parsing JSON,
+    which categories are calibrated and what the pooled cutoff would admit
+    in the ones that are not.
+    """
+
+    def _md(self, pooled_t_high=0.80, pooled_t_low=0.70) -> str:
+        return _mod().render_markdown(_report(
+            OVERLAP_SCORES, pooled_t_high, pooled_t_low,
+            per_category=_per_category(pooled_t_high, pooled_t_low),
+        ))
+
+    def test_emits_one_row_per_category(self) -> None:
+        md = self._md()
+        for category in ('procedural_knowledge', 'preferences_and_norms',
+                         'observations_and_summaries'):
+            assert len([ln for ln in md.splitlines()
+                        if ln.startswith(f'| {category} |')]) == 1, (
+                f'expected exactly one table row for {category}'
+            )
+
+    def test_a_calibrated_row_shows_its_derived_t_high_and_n(self) -> None:
+        report = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        entry = report['per_category']['procedural_knowledge']
+        row = next(ln for ln in _mod().render_markdown(report).splitlines()
+                   if ln.startswith('| procedural_knowledge |'))
+        assert str(entry['t_high']) in row
+        assert str(entry['pair_counts']['true_dup']) in row
+
+    def test_a_refused_row_shows_its_reason_code_instead_of_a_number(self) -> None:
+        row = next(ln for ln in self._md().splitlines()
+                   if ln.startswith('| preferences_and_norms |'))
+        assert _mod().REASON_EMPTY_CLASS in row, (
+            'a refusal must be readable as a refusal, not as a blank cell'
+        )
+
+    def test_every_row_shows_what_the_POOLED_cutoff_would_admit(self) -> None:
+        """The evidence for or against one cutoff serving every category."""
+        report = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        md = _mod().render_markdown(report)
+        entry = report['per_category']['observations_and_summaries']
+        assert entry['pooled_t_high_negatives_admitted'] == 1, 'sample sanity'
+        row = next(ln for ln in md.splitlines()
+                   if ln.startswith('| observations_and_summaries |'))
+        assert str(entry['pooled_t_high_negatives_admitted']) in row
+
+    def test_a_report_with_no_per_category_section_still_renders(self) -> None:
+        """Older artifacts predate the section; rendering must not crash."""
+        assert _mod().render_markdown(_report(CLEAN_SCORES, 0.70, 0.60))
 
 
 # ---------------------------------------------------------------------------
@@ -1604,6 +1766,122 @@ class TestRunCalibration:
         assert result.get('config_written') is not True, (
             'an uncalibrated run must never reach the config write'
         )
+
+
+def _mixed_category_records() -> list[dict]:
+    """Two categories, one of them sharing a cluster with the other.
+
+    The cross-category pair is the one fetch_ann_neighbors can never form.
+    """
+    records = _e2e_records()
+    records.append(_cat_rec('o1', 'c1', 'duplicate', 'observations_and_summaries'))
+    return records
+
+
+def _mixed_embed():
+    vectors = {
+        'c1': [1.0, 0.0], 'd1': [0.99, 0.14],
+        'c2': [0.0, 1.0], 'd2': [0.14, 0.99],
+        'o1': [0.97, 0.24],
+    }
+    calls: list[str] = []
+
+    def embed(mid: str, content: str) -> list[float]:
+        calls.append(mid)
+        return vectors[mid]
+
+    embed.calls = calls  # type: ignore[attr-defined]
+    return embed
+
+
+class TestRunCalibrationPerCategory:
+    """End-to-end wiring: the same embeddings, measured a second way.
+
+    The per-category evidence must come out of the SAME single embedding
+    pass — re-embedding per category would multiply a real API bill by the
+    number of categories for no new information.
+    """
+
+    def _run_mixed(self, tmp_path: Path, embed=None):
+        return _run(
+            tmp_path,
+            records=_mixed_category_records(),
+            embed=embed if embed is not None else _mixed_embed(),
+            search=_search_fn(hits={'d1': ['c1'], 'd2': ['c2'], 'o1': ['c1']},
+                              present={'c1', 'c2'}),
+        )
+
+    def test_the_report_carries_a_per_category_entry_for_every_category(
+        self, tmp_path: Path,
+    ) -> None:
+        report = self._run_mixed(tmp_path)['report']
+        assert set(report['per_category']) == {
+            'procedural_knowledge', 'observations_and_summaries',
+        }
+
+    def test_the_embed_budget_is_unchanged_at_one_call_per_record(
+        self, tmp_path: Path,
+    ) -> None:
+        embed = _mixed_embed()
+        records = _mixed_category_records()
+        self._run_mixed(tmp_path, embed=embed)
+        assert sorted(embed.calls) == sorted(r['memory_id'] for r in records), (
+            'per-category measurement must reuse the single embedding pass'
+        )
+
+    def test_a_categorys_cutoff_is_bound_to_that_categorys_own_measurements(
+        self, tmp_path: Path,
+    ) -> None:
+        """Derived from its own pairs — not inherited, not interpolated.
+
+        Asserted against the distributions the report itself records, so a
+        report that does not describe the derivation that produced it fails.
+        """
+        entry = self._run_mixed(tmp_path)['report']['per_category'][
+            'procedural_knowledge'
+        ]
+        dup, unrelated = entry['distributions']['true_dup'], entry['distributions']['unrelated']
+        assert dup['n'] == entry['pair_counts']['true_dup']
+        assert entry['t_high'] is not None, 'this category is separable in the sample'
+        assert dup['min'] <= entry['t_high'] <= dup['max'], (
+            't_high must be an order statistic of this category\'s duplicate class'
+        )
+        assert entry['t_high'] > unrelated['max'], (
+            't_high must clear this category\'s OWN highest measured negative'
+        )
+
+    def test_a_category_with_no_pairs_is_present_and_refused(self, tmp_path: Path) -> None:
+        """A lone record forms no pair — 'not derivable' is still a measurement."""
+        entry = self._run_mixed(tmp_path)['report']['per_category'][
+            'observations_and_summaries'
+        ]
+        assert entry['pair_counts'] == {'true_dup': 0, 'unrelated': 0, 'hard_negative': 0}
+        assert entry['t_high'] is None
+        assert entry['reason'].startswith(_mod().REASON_EMPTY_CLASS)
+
+    def test_provenance_records_the_per_category_record_counts(
+        self, tmp_path: Path,
+    ) -> None:
+        prov = self._run_mixed(tmp_path)['report']['provenance']
+        assert prov['per_category_record_counts'] == {
+            'procedural_knowledge': 4, 'observations_and_summaries': 1,
+        }
+
+    def test_provenance_records_the_cross_category_pairs_dropped(
+        self, tmp_path: Path,
+    ) -> None:
+        """A disclosed number, not invisible attrition."""
+        records = _mixed_category_records()
+        prov = self._run_mixed(tmp_path)['report']['provenance']
+        expected = _mod().partition_pairs_by_category(records)['cross_category_dropped']
+        assert expected == 4, 'sample sanity: o1 pairs with each of the four others'
+        assert prov['cross_category_dropped'] == expected
+
+    def test_the_markdown_carries_the_per_category_table(self, tmp_path: Path) -> None:
+        self._run_mixed(tmp_path)
+        md = (tmp_path / 'report.md').read_text()
+        for category in ('procedural_knowledge', 'observations_and_summaries'):
+            assert f'| {category} |' in md, f'{category} missing from the markdown table'
 
 
 class TestCommittedCalibrationIsTraceable:
