@@ -830,6 +830,12 @@ Technical debt or cleanup discovered during development.
 
   if resolve["status"] in ("created", "combined"):
       task_id = resolve["task_id"]
+  elif resolve["status"] == "refused":
+      # Deliberately NOT in the tuple above: a refusal has no task_id.
+      # A deterministic guard rejected the candidate; no task was created.
+      # Record resolve["reason"] in the escalation resolution note.
+      # Do NOT retry and do NOT record a task id.
+      note_refused(resolve["reason"])
   elif resolve["status"] == "failed":
       # Record reason in escalation resolution note; skip this item.
       # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.

@@ -310,7 +310,10 @@ class TicketStore:
         """Return tickets for a project, newest-first, optionally filtered.
 
         ``status`` matches against the status column literal ('pending',
-        'created', 'failed', 'combined'). ``since`` filters by ``created_at``.
+        'created', 'failed', 'combined', 'refused'). A ``refused`` row is
+        terminal and has a NULL ``task_id`` — a deterministic guard rejected
+        the candidate and no task was created. ``since`` filters by
+        ``created_at``.
         Default window when ``since`` is None: last 7 days.
         """
         db = self._require_db()

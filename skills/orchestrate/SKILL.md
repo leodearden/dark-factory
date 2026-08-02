@@ -167,6 +167,11 @@ if resolve["status"] == "created":
     task_id = resolve["task_id"]           # new task
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # merged into existing task — normal, not an error
+elif resolve["status"] == "refused":
+    # A deterministic guard rejected the candidate: no task was created and there
+    # is no task_id. Intended outcome — record resolve["reason"] and move on.
+    # Do NOT retry and do NOT record a task id.
+    note_refused(resolve["reason"])
 elif resolve["status"] == "failed":
     # On `failed`: surface the reason to the user and skip this task (user can
     # resubmit manually after investigating).

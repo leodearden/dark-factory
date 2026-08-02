@@ -238,6 +238,11 @@ if resolve["status"] == "created":
     task_id = resolve["task_id"]           # new task queued successfully
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # folded into existing task — still counts as queued
+elif resolve["status"] == "refused":
+    # A deterministic guard rejected the candidate: no task was created and there
+    # is no task_id. Intended outcome — record resolve["reason"] and move on.
+    # Do NOT retry and do NOT record a task id.
+    note_refused(resolve["reason"])
 elif resolve["status"] == "failed":
     # On `failed`: escalate the reason to the user and skip queuing this non-blocker.
     # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason

@@ -5586,6 +5586,13 @@ def create_mcp_server(
           is the target task's id.
         - ``failed``   — an error occurred; ``reason`` describes it. Common
           reasons: ``timeout``, ``server_restart``, ``expired``.
+        - ``refused``  — a deterministic guard (cancelled-premise blocklist /
+          recon premise registry) rejected the candidate. **NO TASK WAS
+          CREATED and NO ``task_id`` is returned** — the key is absent, not
+          null, so a refusal can never be read as a creation. ``reason``
+          carries the refusal justification. This is terminal and a SUCCESS,
+          not an error: do NOT retry it (a retry re-hits the same
+          deterministic guard) and do NOT record any task id for it.
 
         Callers that receive ``status=failed, reason=timeout`` should either
         retry or report an error.
@@ -5650,7 +5657,9 @@ def create_mcp_server(
         Args:
             project_root: Absolute path to project root.
             status: Optional status filter ('pending', 'created', 'failed',
-                'combined'). When None, all statuses are returned.
+                'combined', 'refused'). 'refused' means a deterministic guard
+                rejected the candidate and no task was created.
+                When None, all statuses are returned.
             since: Optional ISO-8601 timestamp; only tickets with
                 ``created_at >= since`` are returned. Default: now − 7 days.
             limit: Max rows to return. Clamped to [1, 2000].
