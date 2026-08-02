@@ -71,6 +71,8 @@ Usage
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import importlib.util
 import json
 import re
@@ -86,6 +88,8 @@ __all__ = [
     'CALIBRATION_FIXTURE_PATH',
     'CLUSTER_MEMBER_KEYS',
     'DF_CURATOR_GATE_CLUSTERS',
+    'DEFAULT_JSON_OUT',
+    'DEFAULT_MD_OUT',
     'DEFAULT_PROJECTS',
     'ERROR_OUTCOMES',
     'GateCluster',
@@ -93,6 +97,11 @@ __all__ = [
     'SOURCE_DESCRIPTIONS',
     'WRITE_REASON',
     'WRITE_SOURCE',
+    'main',
+    'render_json',
+    'render_markdown',
+    'resolve_exit_code',
+    'resolve_projects',
     'run',
     'stamp_one',
     'TOPIC_REGISTRY_PATH',
@@ -568,7 +577,11 @@ def plan_calibration_clusters(
             if label not in (_CANONICAL_LABEL, _MEMBER_LABEL):
                 continue
             memory_id = row.get('memory_id')
-            if not _is_full_uuid(memory_id):
+            # The isinstance arm is redundant at runtime (`_is_full_uuid`
+            # rejects a non-str) but not to a reader or a type checker: the
+            # row came off a JSONL fixture, so `memory_id` is genuinely
+            # `Any | None` here and the narrowing has to be visible.
+            if not isinstance(memory_id, str) or not _is_full_uuid(memory_id):
                 skips.append({
                     'reason': 'member_not_a_uuid',
                     'cluster_id': cluster_id,
@@ -1329,3 +1342,231 @@ async def run(
         'results': results,
         'skips': skips,
     }
+
+
+# ---------------------------------------------------------------------------
+# Report rendering, exit code, CLI
+# ---------------------------------------------------------------------------
+
+#: Committed artifact paths, beside the census report leaf β already writes
+#: (``census_memory_metadata.py``).  Committed rather than /tmp because the
+#: PRD's θ bullet has to cite this run, and a report that exists only on one
+#: operator's disk cannot be cited.
+DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'retro-topic-stamping-report.json')
+DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'retro-topic-stamping-report.md')
+
+#: The skip keys worth printing inline in a bucket entry, in reading order.
+#: A whitelist rather than a dump of the whole dict: the stamp results that
+#: land in error buckets carry a full ``response`` envelope, which would bury
+#: the four fields that actually identify the record.
+_SKIP_DETAIL_KEYS: tuple[str, ...] = (
+    'gate_task_id', 'cluster_id', 'project_id', 'memory_id', 'topic',
+    'topics', 'canonical_memory_ids', 'incumbent_id', 'raw_topic', 'key',
+    'value', 'error', 'error_type', 'detail', 'note', 'existing_topic',
+    'row_count',
+)
+
+
+def render_json(report: dict) -> str:
+    """The machine-readable artifact.
+
+    ``default=str`` because a report can carry a tuple of dispositions or a
+    datetime that wandered in off a scroll row; a renderer that raised on one
+    would lose the whole run's evidence over a formatting detail.
+    """
+    return json.dumps(report, indent=2, default=str, sort_keys=True)
+
+
+def _render_skip_entry(entry: dict) -> str:
+    parts = [
+        f'{key}={entry[key]!r}'
+        for key in _SKIP_DETAIL_KEYS
+        if entry.get(key) is not None
+    ]
+    # Fall back to the whole dict when no whitelisted key matched, rather
+    # than emitting a bare bullet: an entry the renderer does not recognise
+    # is exactly the one worth showing verbatim.
+    return '- ' + (', '.join(parts) if parts else repr(entry))
+
+
+def render_markdown(report: dict) -> str:
+    """The human-readable artifact.
+
+    Every EMPTY bucket is stated as an explicit ``: 0`` heading rather than
+    omitted.  This is the renderer's most load-bearing rule: an artifact that
+    silently drops empty buckets reads identically whether the sweep skipped
+    nothing or never computed the bucket at all — and the second case is a
+    hole in coverage that, being invisible, nobody ever closes.
+    """
+    mode = 'APPLY' if report.get('apply') else 'DRY RUN'
+    lines: list[str] = [
+        '# Retro topic/canonical stamping — PRD leaf θ (task 3201)',
+        '',
+        f'**Mode:** {mode}',
+        f'**Projects:** {", ".join(report.get("projects") or [])}',
+        (
+            '**Scope:** bounded — every target is addressed by memory id from '
+            'an enumerated source below, never by a corpus scroll.'
+        ),
+        '',
+        '## Sources',
+        '',
+        '| source | plans | counts | description |',
+        '| --- | --- | --- | --- |',
+    ]
+    for name, block in sorted((report.get('sources') or {}).items()):
+        counts = ', '.join(
+            f'{key}={value}' for key, value in sorted(block.items())
+            if key not in ('description', 'plan_count')
+        )
+        lines.append(
+            f'| {name} | {block.get("plan_count", 0)} | {counts} | '
+            f'{block.get("description", "")} |'
+        )
+
+    stamped = report.get('stamped_by_topic') or {}
+    would = report.get('would_stamp_by_topic') or {}
+    lines += [
+        '',
+        '## Stamped by topic',
+        '',
+        '| topic | records stamped | would stamp |',
+        '| --- | --- | --- |',
+    ]
+    for topic in sorted(set(stamped) | set(would)):
+        lines.append(f'| {topic} | {stamped.get(topic, 0)} | {would.get(topic, 0)} |')
+    if not stamped and not would:
+        lines.append('| _none_ | 0 | 0 |')
+    lines += [
+        '',
+        f'**Total stamped:** {report.get("stamped_total", 0)}  ',
+        f'**Total would-stamp:** {report.get("would_stamp_total", 0)}  ',
+        f'**Targets planned:** {report.get("target_count", 0)}',
+        '',
+        '## Outcomes',
+        '',
+    ]
+    outcomes = report.get('outcomes') or {}
+    if outcomes:
+        lines.extend(f'- `{name}`: {count}' for name, count in sorted(outcomes.items()))
+    else:
+        lines.append('- _no targets_')
+
+    lines += ['', '## Skips', '']
+    skips = report.get('skips') or {}
+    # Iterate the CANONICAL bucket order first so a bucket run() forgot to
+    # emit shows up as a 0 line here rather than as an absence, then any
+    # extra bucket a planner invented at runtime.
+    ordered = list(SKIP_BUCKETS) + sorted(set(skips) - set(SKIP_BUCKETS))
+    for bucket in ordered:
+        entries = skips.get(bucket) or []
+        lines += ['', f'### {bucket}: {len(entries)}', '']
+        if not entries:
+            lines.append('_none_')
+            continue
+        lines.extend(_render_skip_entry(entry) for entry in entries)
+    return '\n'.join(lines) + '\n'
+
+
+def resolve_exit_code(report: dict) -> int:
+    """0 on a clean run, 1 when anything did not land as planned.
+
+    Graded off :data:`ERROR_OUTCOMES` — the SAME set ``stamp_one`` and the
+    report use — so the exit code and the artifact can never disagree about
+    whether a run was clean.
+
+    Partial failure is the normal shape of this sweep: the manifest's ids
+    were transcribed weeks before any run and the corpus moved underneath.
+    That makes an honest non-zero the one signal an automated caller can act
+    on; a bare 0 would read as success (the
+    ``strip_leaked_control_keys.py`` convention).
+    """
+    outcomes = report.get('outcomes') or {}
+    return 1 if any(outcomes.get(name) for name in ERROR_OUTCOMES) else 0
+
+
+def resolve_projects(args) -> tuple[str, ...]:
+    """``--project`` REPLACES the default list; it does not extend it.
+
+    ``action='append'`` appends to whatever default argparse holds, so a
+    plain ``default=DEFAULT_PROJECTS`` would turn ``--project reify`` into
+    all three — silently widening a sweep whose entire safety argument is
+    that it is narrow.  Hence ``default=None`` here and the fallback in one
+    named place.
+    """
+    return tuple(args.projects) if args.projects else DEFAULT_PROJECTS
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Bounded retro topic/canonical stamping sweep over known '
+            'consolidated clusters (PRD leaf θ, task 3201).'
+        ),
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='Commit the stamps. Without it the run is a full rehearsal that '
+             'reads and decides everything but writes nothing.',
+    )
+    parser.add_argument(
+        '--project', dest='projects', action='append', default=None,
+        help=f'Project to sweep; repeatable. Replaces the default '
+             f'({", ".join(DEFAULT_PROJECTS)}) rather than extending it.',
+    )
+    parser.add_argument(
+        '--json-out', dest='json_out', default=DEFAULT_JSON_OUT,
+        help=f'Machine-readable report path (default: {DEFAULT_JSON_OUT}).',
+    )
+    parser.add_argument(
+        '--md-out', dest='md_out', default=DEFAULT_MD_OUT,
+        help=f'Human-readable report path (default: {DEFAULT_MD_OUT}).',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Build a live service, run the sweep, write both artifacts, exit graded."""
+    args = _build_parser().parse_args(argv)
+
+    if args.config:
+        import os  # noqa: PLC0415
+
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    async def _run_live() -> dict:
+        # Deferred so importing this module — which the tests do, by path —
+        # never constructs a backend.
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        try:
+            await memory.initialize()
+            return await run(
+                memory, projects=resolve_projects(args), apply=args.apply,
+            )
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+
+    report = asyncio.run(_run_live())
+
+    Path(args.json_out).write_text(render_json(report), encoding='utf-8')
+    Path(args.md_out).write_text(render_markdown(report), encoding='utf-8')
+
+    print(render_markdown(report))
+    print(f'wrote {args.json_out}')
+    print(f'wrote {args.md_out}')
+    if not args.apply:
+        print('DRY RUN — nothing was modified. Re-run with --apply to commit.')
+    return resolve_exit_code(report)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
