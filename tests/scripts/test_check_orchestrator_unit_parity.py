@@ -31,6 +31,8 @@ and it is what the identity guard below needs to be exercising.
 import importlib.util
 import pathlib
 import re
+import subprocess
+import sys
 import types
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
@@ -606,3 +608,202 @@ def test_dropin_over_identical_units_does_not_report_parity(
     )
 
     assert rc == 1, "A drop-in override must not be reported as parity."
+
+
+# ---------------------------------------------------------------------------
+# CLI exit-code contract  (step-9 / step-10)
+# ---------------------------------------------------------------------------
+
+_SECOND_UNIT = "orchestrator-watchdog.service"
+_SECOND_UNIT_RELPATH = "scripts/orchestrator-watchdog.service"
+
+_BASE_SERVICE = """\
+[Unit]
+Description=Orchestrator escalation-MCP health probe
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1800
+ExecStart=/usr/bin/python3 /home/leo/src/dark-factory/scripts/orchestrator-watchdog.py
+"""
+
+# The drifted timer: OnBootSec differs, so exactly one directive disagrees.
+_DRIFTED_TIMER = _BASE_TIMER.replace("OnBootSec=30", "OnBootSec=60")
+
+
+def _run_cli(
+    repo_root: pathlib.Path,
+    installed_dir: pathlib.Path,
+    *units: str,
+) -> subprocess.CompletedProcess:
+    """Invoke the checker as a real subprocess against tmp_path trees.
+
+    Uses sys.executable rather than a bare `python3`: commit 5178360711 fixed
+    exactly that defect in the sibling scanner CLI tests, where a bare python3
+    resolved to a different interpreter than the one running the suite.
+    """
+    argv = [
+        sys.executable,
+        str(CHECKER_PATH),
+        "--installed-dir", str(installed_dir),
+        "--repo-root", str(repo_root),
+    ]
+    for unit in units:
+        argv += ["--unit", unit]
+    return subprocess.run(argv, capture_output=True, text=True)
+
+
+def test_cli_matching_copies_exit_zero(tmp_path: pathlib.Path):
+    """Matching copies => 0, reporting the number actually COMPARED."""
+    checker = _load_checker()
+    repo_root, installed_dir = _make_trees(tmp_path)
+
+    result = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+
+    assert result.returncode == 0, (
+        f"Expected 0 for matching copies; got {result.returncode}. "
+        f"stdout: {result.stdout} stderr: {result.stderr}"
+    )
+    assert "[ok] parity" in result.stdout
+    # The count is what was COMPARED, never what was selected: with 7 units
+    # registered and 1 selected, claiming 7 would overstate the check.
+    assert "1 unit(s)" in result.stdout
+
+    assert checker.main(
+        ["--installed-dir", str(installed_dir), "--repo-root", str(repo_root),
+         "--unit", _REAL_UNIT]
+    ) == 0
+
+
+def test_cli_drifted_copy_exits_one_and_names_the_directive(
+    tmp_path: pathlib.Path,
+):
+    """A drifted copy => 1, with the offending directive named on stdout.
+
+    Asserting on the directive NAME, not just the exit code: an exit code
+    tells an operator something is wrong, the report is what tells them what.
+    """
+    repo_root, installed_dir = _make_trees(
+        tmp_path, installed_text=_DRIFTED_TIMER
+    )
+
+    result = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+
+    assert result.returncode == 1, (
+        f"Expected 1 for a drifted copy; got {result.returncode}. "
+        f"stdout: {result.stdout}"
+    )
+    assert "[drift]" in result.stdout
+    assert "OnBootSec" in result.stdout
+    assert "30" in result.stdout and "60" in result.stdout
+
+
+def test_cli_installed_unit_absent_exits_two(tmp_path: pathlib.Path):
+    """An absent INSTALLED unit => 2 and a [skip] line.
+
+    2 is the benign "not installed on this host" that setup-host.sh treats as
+    a skip rather than something to act on.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path, installed_text=None)
+
+    result = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+
+    assert result.returncode == 2, (
+        f"Expected 2 for an absent installed unit; got {result.returncode}. "
+        f"stdout: {result.stdout}"
+    )
+    assert "[skip]" in result.stdout
+
+
+def test_cli_vanished_committed_unit_exits_one(tmp_path: pathlib.Path):
+    """An absent COMMITTED unit => 1 and [vanished], worded apart from [drift].
+
+    A missing source of truth is not a diff to propagate. Before the sibling
+    checker distinguished these, a typo'd --repo-root compared nothing and
+    still printed "parity — N unit(s) match", silently disarming the check.
+    Telling an operator to hunt for a directive diff here would waste the trip,
+    hence the separate word.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path, repo_text=None)
+
+    result = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+
+    assert result.returncode == 1, (
+        f"Expected 1 for a vanished committed unit; got {result.returncode}. "
+        f"stdout: {result.stdout}"
+    )
+    assert "[vanished]" in result.stdout
+    assert "[drift]" not in result.stdout
+
+
+def test_cli_drift_dominates_absence(tmp_path: pathlib.Path):
+    """PRECEDENCE: one unit drifted + another absent => 1, not 2.
+
+    With seven units a single run can hit both at once. Returning 2 would let
+    an unrelated uninstalled unit MASK an actionable finding, because
+    setup-host.sh treats 2 as a benign skip. The absent unit is still
+    reported — dominated, not hidden.
+    """
+    repo_root, installed_dir = _make_trees(
+        tmp_path, installed_text=_DRIFTED_TIMER
+    )
+    # Second unit: committed but not installed => would be exit 2 alone.
+    (repo_root / _SECOND_UNIT_RELPATH).write_text(_BASE_SERVICE, encoding="utf-8")
+
+    result = _run_cli(repo_root, installed_dir, _REAL_UNIT, _SECOND_UNIT)
+
+    assert result.returncode == 1, (
+        f"Drift must dominate absence; got {result.returncode}. "
+        f"stdout: {result.stdout}"
+    )
+    assert "[drift]" in result.stdout
+    # Dominated, NOT hidden.
+    assert "[skip]" in result.stdout
+    assert _SECOND_UNIT in result.stdout
+
+
+def test_cli_unit_flag_restricts_the_run(tmp_path: pathlib.Path):
+    """--unit scopes the run to the named unit(s).
+
+    The drifted second unit is invisible when only the clean one is selected,
+    which is what lets an operator scope a run around the five
+    orchestrator-*.service units that are knowingly red on this host.
+    """
+    checker = _load_checker()
+    repo_root, installed_dir = _make_trees(tmp_path)
+    (repo_root / _SECOND_UNIT_RELPATH).write_text(_BASE_SERVICE, encoding="utf-8")
+    (installed_dir / _SECOND_UNIT).write_text(
+        _BASE_SERVICE.replace("TimeoutStartSec=1800", "TimeoutStartSec=300"),
+        encoding="utf-8",
+    )
+
+    base = ["--installed-dir", str(installed_dir), "--repo-root", str(repo_root)]
+
+    # Scoped to the clean unit: parity.
+    assert checker.main(base + ["--unit", _REAL_UNIT]) == 0
+    # Scoped to the drifted one: drift.
+    assert checker.main(base + ["--unit", _SECOND_UNIT]) == 1
+    # Unscoped: the drift is found among the rest.
+    assert checker.main(base) == 1
+
+
+def test_cli_run_that_compared_nothing_never_reports_parity(
+    tmp_path: pathlib.Path,
+):
+    """A run that compared ZERO units must never return 0.
+
+    A --repo-root naming a tree with no units compares nothing. Reporting
+    parity there would be a checker that is green precisely because it looked
+    at nothing — the failure mode that silently disarmed the sibling checker
+    before it reported the COMPARED count instead of the SELECTED one.
+    """
+    checker = _load_checker()
+    empty_repo = tmp_path / "empty-repo"
+    (empty_repo / "scripts").mkdir(parents=True)
+    _, installed_dir = _make_trees(tmp_path)
+
+    rc = checker.main(
+        ["--installed-dir", str(installed_dir), "--repo-root", str(empty_repo)]
+    )
+
+    assert rc != 0, "A run that compared zero units must not report parity."
