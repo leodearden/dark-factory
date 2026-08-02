@@ -2030,14 +2030,23 @@ class TaskInterceptor:
 
         Returns the update_task result on success, None on failure (caller
         falls back to create). Combine is implemented via Taskmaster's
-        ``update_task`` with a ``prompt`` that instructs a verbatim replacement
-        plus metadata carrying the combine marker.
+        ``update_task``, writing the curator's rewrite as structured fields
+        and MERGING a three-key combine marker into the target's existing
+        metadata blob (``metadata_mode='merge'``) — it does not replace that
+        blob. See the comment at the write for why (task 3446).
 
         Before writing, verifies the target's fingerprint and status. A
         mismatched fingerprint (curator targeted the wrong task) or terminal
         status (done/cancelled) aborts the write and returns None so the
         caller degrades to ``create`` instead of silently clobbering an
         unrelated task.
+
+        A corrupt *existing* metadata blob on the target now also aborts the
+        combine: ``_merge_metadata`` refuses to merge into unparseable bytes
+        and raises, which the ``except`` below turns into a WARNING plus
+        ``None``. Under the old ``'replace'`` that same row was silently
+        overwritten — combine is not a corrupt-row repair, so refusing is the
+        wanted behaviour (loud over silent).
         """
         if decision.rewritten_task is None or decision.target_id is None:
             return None
@@ -2122,12 +2131,32 @@ class TaskInterceptor:
                     task_id=decision.target_id,
                     project_root=project_root,
                     metadata=combine_metadata,
-                    # Whole-blob overwrite via the explicit replace co-signal —
-                    # NOT a bare append=False (rejected by the task-2180
-                    # metadata-wipe guard in _resolve_metadata_mode). Behaviour-
-                    # preserving: metadata still resolves to 'replace', and the
-                    # details path stays replace since append is now None (falsy).
-                    metadata_mode='replace',
+                    # Combine MERGES its marker keys into the target's blob; it
+                    # does NOT overwrite the blob. Shallow last-write-wins
+                    # ({**old, **new}, sqlite_task_backend._merge_metadata) keeps
+                    # the three keys above authoritative while everything else
+                    # already on the target survives: the escalation-gate stamp
+                    # (execution_class / operational_mode / task_kind /
+                    # always_escalates / gate_escalated_at) plus source,
+                    # spawned_from, candidate_key, milestone, model_overrides, …
+                    #
+                    # Task 3446: under the previous 'replace' this write deleted
+                    # every pre-existing key. Task 3426 ("Human gate: …") was
+                    # combined into, silently lost always_escalates=True, and was
+                    # then dispatched to an architect — a human decision gate
+                    # handed to an agent.
+                    #
+                    # Do NOT "restore" 'replace'. It was never a design choice:
+                    # bc4344db10 (task 2751 step-6) mechanically migrated a legacy
+                    # bare append=False onto the explicit co-signal the task-2180
+                    # metadata-wipe guard demands, annotated "Behaviour-
+                    # preserving" — i.e. it inherited the pre-2180 destructive
+                    # default rather than selecting it.
+                    #
+                    # append stays None, so the task-2180 bare-append=False
+                    # rejection in _resolve_metadata_mode is still satisfied and
+                    # the details path is unaffected (append falsy → replace).
+                    metadata_mode='merge',
                     title=rt.title,
                     description=rt.description,
                     details=details_with_files,
