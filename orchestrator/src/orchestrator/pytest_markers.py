@@ -33,6 +33,10 @@ import tomllib
 from collections.abc import Sequence
 
 
+class _Unsupported(Exception):
+    """A marker-expression node outside this module's deliberately tiny grammar."""
+
+
 def _marker_expr_from_tokens(tokens: Sequence[str]) -> str | None:
     """The LAST ``-m EXPR`` / ``-mEXPR`` value in *tokens*, else None.
 
@@ -217,3 +221,71 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     return frozenset(
         name for name in (_marker_name(element) for element in elements) if name is not None
     )
+
+
+def _kleene(node: ast.expr, marker_names: frozenset[str]) -> bool | None:
+    """Evaluate *node* under Kleene (strong 3-valued) logic; None is UNKNOWN.
+
+    A name in *marker_names* is TRUE (guaranteed present on every item); a name
+    outside it is UNKNOWN, because *marker_names* is only a LOWER BOUND — an
+    individual item may carry additional markers.  Any node outside the tiny
+    allowed grammar raises :class:`_Unsupported`.
+    """
+    if isinstance(node, ast.Name):
+        return True if node.id in marker_names else None
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool):
+            return node.value
+        raise _Unsupported(f'non-boolean constant: {node.value!r}')
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        operand = _kleene(node.operand, marker_names)
+        return None if operand is None else not operand
+    if isinstance(node, ast.BoolOp):
+        values = [_kleene(value, marker_names) for value in node.values]
+        if isinstance(node.op, ast.And):
+            if any(value is False for value in values):
+                return False
+            return None if any(value is None for value in values) else True
+        if isinstance(node.op, ast.Or):
+            if any(value is True for value in values):
+                return True
+            return None if any(value is None for value in values) else False
+    raise _Unsupported(f'unsupported node: {type(node).__name__}')
+
+
+def expression_definitely_deselects(expr: str, marker_names: frozenset[str]) -> bool:
+    """True iff *expr* provably deselects EVERY collected item in the file.
+
+    *marker_names* is the file's guaranteed marker set from
+    :func:`module_level_marker_names` — a LOWER BOUND, so a name outside it is
+    UNKNOWN rather than false.  Evaluating under Kleene logic on that reading
+    means a definite FALSE is "False under EVERY assignment of the unknown
+    names", which is exactly the property needed: no item in the file can be
+    selected.  A naive two-valued eval would be unsound in the non-monotone
+    direction — ``not a or b`` with ``a`` guaranteed reads False, yet an item
+    that also carries ``b`` IS selected.
+
+    Kleene is sound but INCOMPLETE: it evaluates each occurrence of a name
+    independently, so the contradiction ``a and not a`` reads UNKNOWN rather
+    than FALSE.  The incompleteness fails SAFE — no widening, today's
+    FILE_SCOPED behaviour.  It was preferred over brute-forcing all assignments
+    of the free names because it is linear, needs no arity bound, and decides
+    every marker expression live in this repo (``not warm_lane_bash``,
+    ``not integration``, ``not smoke``) exactly.
+
+    The grammar is deliberately tiny: ``Name``, ``BoolOp(And/Or)``,
+    ``UnaryOp(Not)`` and boolean ``Constant``.  Anything richer that pytest
+    itself accepts (``Call``, ``Compare``, keyword-expression forms) bails to
+    False.  A ``SyntaxError``, a ``ValueError`` and an empty *expr* likewise
+    yield False.  Never raises.
+    """
+    if not expr or not expr.strip():
+        return False
+    try:
+        tree = ast.parse(expr, mode='eval')
+    except (SyntaxError, ValueError):
+        return False
+    try:
+        return _kleene(tree.body, marker_names) is False
+    except (_Unsupported, RecursionError):
+        return False
