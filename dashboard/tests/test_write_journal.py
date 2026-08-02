@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -518,3 +519,113 @@ class TestOperationsBreakdownQueryPlan:
             f'created_at must be the seek constraint, got: {plan}'
         )
         assert 'SCAN' not in plan, f'still full-scanning write_ops: {plan}'
+
+
+class TestOperationsBreakdownResultEquivalence:
+    """Characterization guard: the INDEXED BY hint must not change results.
+
+    Honest framing, NOT a red-first test: it passes both before and after
+    step-2's hint by construction, because "the results are unchanged" IS the
+    property under test. Its value is that it goes red if a future edit to
+    OPS_BREAKDOWN_SQL changes semantics rather than just the query plan.
+
+    Reuses the same 500-row / 5-operation fixture as
+    TestOperationsBreakdownQueryPlan, which (verified) happens to tie every
+    operation's count at 100 — exactly the shape that exposes the tie-order
+    hazard: ``GROUP BY`` ties are unspecified by ``ORDER BY cnt DESC``, and the
+    hinted/unhinted plans walk different indexes, so they can (and here, do)
+    emit the tied labels in different orders. Comparing as a dict rather than
+    an ordered list is what makes this test measure the real property instead
+    of flaking on that incidental ordering.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hinted_and_unhinted_agree(self, tmp_path):
+        from dashboard.data.write_journal import OPS_BREAKDOWN_SQL, get_operations_breakdown
+
+        db_path = tmp_path / 'ops_equivalence.db'
+        since = _seed_ops_breakdown_plan_fixture(db_path)
+        fixed_now = datetime.fromisoformat(since) + timedelta(hours=24)
+
+        # Derive the unhinted query from the real constant (rather than
+        # retyping a second copy) so this test cannot silently drift from
+        # what get_operations_breakdown actually runs.
+        unhinted_sql = OPS_BREAKDOWN_SQL.replace(' INDEXED BY idx_wo_created', '')
+        assert unhinted_sql != OPS_BREAKDOWN_SQL, (
+            'hint text not found in OPS_BREAKDOWN_SQL — constant format changed?'
+        )
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            hinted = await get_operations_breakdown(conn, now=fixed_now)
+
+            async with conn.execute(unhinted_sql, (since,)) as cursor:
+                unhinted_rows = await cursor.fetchall()
+        unhinted = {
+            'labels': [r[0] or 'unknown' for r in unhinted_rows],
+            'values': [r[1] for r in unhinted_rows],
+        }
+
+        hinted_counts = dict(zip(hinted['labels'], hinted['values'], strict=True))
+        unhinted_counts = dict(zip(unhinted['labels'], unhinted['values'], strict=True))
+        assert hinted_counts == unhinted_counts, (
+            f'hinted {hinted_counts} != unhinted {unhinted_counts}'
+        )
+        # The live cross-check the task's VERIFY item 2 names: same group count.
+        assert len(hinted['labels']) == len(unhinted['labels'])
+        # The descending-by-count contract must survive the plan change.
+        assert hinted['values'] == sorted(hinted['values'], reverse=True)
+
+
+class TestOperationsBreakdownMissingIndexDegradation:
+    """Pins the ACTUAL observable when idx_wo_created goes missing.
+
+    Genuinely red-before / green-after step-2: before the hint landed, this
+    same index-less DB returned real rows (no dependency on the index
+    existing). After step-2, ``INDEXED BY`` makes the index a hard
+    constraint, so a missing index now degrades the result.
+
+    This corrects the task description's premise that the hint fails loudly
+    (INV-4). It does raise ``sqlite3.OperationalError: no such index``, but
+    ``with_db`` (dashboard/src/dashboard/data/db.py) catches exactly that and
+    returns the default — so the user-visible effect of a missing index is a
+    silently EMPTY operations chart, not an error, with only a WARNING log
+    (carrying ``exc_info=True``, so the traceback does name
+    ``idx_wo_created``) as the diagnostic trail. See the design decision
+    recording why this degradation is accepted rather than special-cased.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_index_degrades_to_empty_default_with_warning(
+        self, tmp_path, caplog,
+    ):
+        from dashboard.data.write_journal import get_operations_breakdown
+
+        db_path = tmp_path / 'ops_missing_index.db'
+        now = datetime.now(UTC)
+        rows = [
+            ('op-1', 'search', 'dark_factory', 'agent-a', 'read',
+             (now - timedelta(hours=1)).isoformat()),
+            ('op-2', 'add_memory', 'dark_factory', 'agent-a', 'write',
+             (now - timedelta(hours=2)).isoformat()),
+        ]
+        _seed_write_ops(db_path, rows)
+
+        # WRITE_OPS_SCHEMA minus idx_wo_created — the coupling breaks here.
+        setup_conn = sqlite3.connect(str(db_path))
+        setup_conn.execute('DROP INDEX idx_wo_created')
+        setup_conn.commit()
+        setup_conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
+                result = await get_operations_breakdown(conn)
+
+        assert result == {'labels': [], 'values': []}, (
+            f'expected the silent default, got: {result}'
+        )
+        assert any(
+            record.name == 'dashboard.data.db' and record.levelno == logging.WARNING
+            for record in caplog.records
+        ), f'expected a WARNING from dashboard.data.db, got: {caplog.record_tuples}'
