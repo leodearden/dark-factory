@@ -14088,3 +14088,105 @@ class TestAdvanceMainIndexLockStandoff:
             'the stash_failed escalation must still name the dirty tracked '
             f'file(s); got {getattr(git_ops, "_last_stash_dirty_files", "<unset>")!r}'
         )
+
+    async def test_side_channel_carries_the_age_seen_BEFORE_the_standoff(
+        self, git_ops: GitOps,
+    ):
+        """The side channel must report the age observed at the FIRST probe.
+
+        `_await_index_lock_clear` probes the lock once before waiting — the
+        only observation that predates the stand-off — and today DISCARDS it,
+        so the gate re-probes afterwards and reports
+        `age_seconds == initial_age + waited + epsilon`.  With grace=300 a
+        live `git commit --only` that started 2s before the advance reports
+        302s, and an hour-old crashed-git leftover reports 3900s: both exceed
+        `waited`, so a downstream staleness test keyed on the post-wait age
+        cannot discriminate them at all.  Only an age measured BEFORE the wait
+        carries the information.
+
+        LIVE-COMMIT SHAPE: a lock created moments ago, whose holder simply
+        outlives the grace.  It must be reported as young.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-initial-age', 'lock_initial_age.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty for initial age\n')
+
+        # A short-but-real grace so the stand-off genuinely runs and
+        # `waited_seconds` is comfortably larger than the lock's ~0s age.
+        git_ops.config.merge_park_lock_grace_seconds = 1.5
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')  # freshly created => initial age ~0
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+
+        info = git_ops._last_park_lock_info
+        assert 'initial_age_seconds' in info, (
+            'the pre-wait observation must reach the side channel; got keys '
+            f'{sorted(info)!r}'
+        )
+        # NOT a tight timing tolerance: a just-created file's age is ~0.00Xs
+        # while `waited_seconds` is >= ~1.0s by construction of the poll loop
+        # — three orders of magnitude apart.  Do not tighten further.
+        assert info['initial_age_seconds'] < 1.0, (
+            'a lock created moments ago must be reported as YOUNG at the '
+            f'first probe; got {info["initial_age_seconds"]!r}'
+        )
+        assert info['initial_age_seconds'] < info['waited_seconds'], (
+            'the first-probe age must not be contaminated by the stand-off — '
+            f'got initial={info["initial_age_seconds"]!r} '
+            f'waited={info["waited_seconds"]!r}'
+        )
+        assert info['grace_seconds'] == 1.5, (
+            'the grace actually applied must travel in the side channel so '
+            'the mapper stays a pure function of it; got '
+            f'{info.get("grace_seconds", "<unset>")!r}'
+        )
+
+    async def test_side_channel_reports_a_crashed_leftover_as_old(
+        self, git_ops: GitOps,
+    ):
+        """CRASHED-LEFTOVER SHAPE: a lock already ancient at the first probe.
+
+        This is the ONLY shape for which destructive `rm -f` recovery advice
+        is defensible, so the side channel must make it distinguishable from
+        the live-commit shape above.  grace=0 (probe-only fail-fast) keeps the
+        test from sleeping.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-stale-age', 'lock_stale_age.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty for stale age\n')
+
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        backdated = time.time() - 1000
+        os.utime(lock_path, (backdated, backdated))
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+
+        info = git_ops._last_park_lock_info
+        assert info['initial_age_seconds'] >= 900, (
+            'a backdated lock must be reported as OLD at the first probe; got '
+            f'{info.get("initial_age_seconds", "<unset>")!r}'
+        )
+        assert info['grace_seconds'] == 0, (
+            'grace=0 must travel through as-is — the fail-fast off-switch is '
+            'still a real, comparable grace downstream; got '
+            f'{info.get("grace_seconds", "<unset>")!r}'
+        )
