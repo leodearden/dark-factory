@@ -30,9 +30,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1062,7 +1063,7 @@ class TestHarnessSyntheticCancelRetirement:
 # (must-raise) cases below are load-bearing, not decorative.
 
 
-def _make_wedge(event: asyncio.Event) -> Callable[[], Awaitable[WorkflowOutcome]]:
+def _make_wedge(event: asyncio.Event) -> Callable[[], Coroutine[Any, Any, WorkflowOutcome]]:
     """Build a stand-in for ``TaskWorkflow._verify_debugfix_loop`` that signals
     *event* and then wedges forever, so a cancel has something to interrupt.
 
