@@ -604,6 +604,7 @@ _ANN_DISCLOSURE_KEYS: tuple[str, ...] = (
     'below_threshold_dropped',
     'unknown_neighbor_dropped',
     'missing_vector',
+    'uncalibrated_category_dropped',
 )
 
 
@@ -756,7 +757,7 @@ def find_liveness_snapshot_recurrences(
 def ann_pairs_from_neighbors(
     memories: list[dict],
     neighbors_by_id: dict[Any, list[dict]],
-    threshold: float,
+    threshold: float | Mapping[str, float],
     *,
     top_k: int | None = None,
 ) -> tuple[list[tuple[int, int]], dict[str, int]]:
@@ -778,7 +779,15 @@ def ann_pairs_from_neighbors(
         neighbors_by_id: ``{memory_id: [{'id': ..., 'score': ...}, ...]}``.
             A record absent from this mapping simply contributes no pairs.
         threshold: Minimum score for a hit to become a candidate pair.
-            INCLUSIVE — a hit exactly at *threshold* is kept.
+            INCLUSIVE — a hit exactly at *threshold* is kept. Either a scalar
+            (one cutoff for every record) or, since task 3357, a
+            ``{category: cutoff}`` mapping from ``resolve_ann_threshold``:
+            each hit is then gated by the cutoff measured for the QUERYING
+            record's own category, and a record whose category is absent from
+            the mapping is UNCALIBRATED — its hits form no pairs at all
+            rather than being gated by a number measured on a different
+            population. This is the authoritative per-category filter; the
+            scalar pushed down to Qdrant is only a MIN-of-cutoffs floor.
         top_k: The per-record neighbour cap the query was issued with. When
             given, a neighbour list filled to the cap is counted as
             ``top_k_saturated``: further matches may have been cut off.
@@ -791,12 +800,20 @@ def ann_pairs_from_neighbors(
           - ``top_k_saturated`` — records whose neighbour list hit the cap.
             A property of the QUERY, so counted regardless of how many hits
             then survived the threshold.
-          - ``below_threshold_dropped`` — hits scored under *threshold*.
+          - ``below_threshold_dropped`` — hits scored under the cutoff that
+            APPLIES to them (the querying record's category cutoff when a
+            mapping was given).
           - ``unknown_neighbor_dropped`` — hits naming a record outside the
             scanned set (excluded by the category filter, or written between
             the scroll and the query); it cannot be clustered, so it is lost.
           - ``missing_vector`` — records with no stored vector to query with,
             so they were never used as a query point.
+          - ``uncalibrated_category_dropped`` — hits on a record whose
+            category has NO cutoff in the mapping (including a record with no
+            category at all). Counted separately from
+            ``below_threshold_dropped`` because the cause and the fix differ:
+            those hits were never eligible, so the recall was lost to missing
+            calibration, not to a cutoff doing its job.
 
         A self-hit is dropped silently: a record is always its own nearest
         neighbour, which is expected rather than a loss.
@@ -816,13 +833,27 @@ def ann_pairs_from_neighbors(
 
         hits = neighbors_by_id.get(memory.get('id')) or []
         if top_k is not None and len(hits) >= top_k:
+            # A property of the QUERY, which was issued regardless of whether
+            # this record's category ended up calibrated.
             disclosure['top_k_saturated'] += 1
+
+        # The cutoff that APPLIES to this record. Absent from a mapping means
+        # UNCALIBRATED for that category — its hits are not eligible at all,
+        # rather than gated by a number measured on another population.
+        cutoff = (
+            threshold.get(memory.get('category'))
+            if isinstance(threshold, Mapping)
+            else threshold
+        )
 
         for hit in hits:
             hit_id = hit.get('id')
             if hit_id == memory.get('id'):
                 continue  # self-hit: expected, not a loss
-            if (hit.get('score') or 0.0) < threshold:
+            if cutoff is None:
+                disclosure['uncalibrated_category_dropped'] += 1
+                continue
+            if (hit.get('score') or 0.0) < cutoff:
                 disclosure['below_threshold_dropped'] += 1
                 continue
             j = index_by_id.get(hit_id)
