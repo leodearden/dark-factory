@@ -2557,6 +2557,7 @@ def create_mcp_server(
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
+        cascade: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a specific memory from a store. IRREVERSIBLE.
@@ -2583,6 +2584,14 @@ def create_mcp_server(
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
+            cascade: Delete this record's CHILDREN too (default False).
+
+        Deleting a Mem0 entry that other records point at via
+        `metadata.parent_id` REFUSES with `ParentHasChildrenError`, listing
+        the child ids, rather than silently orphaning them. `cascade=true`
+        is the explicit opt-in: the children are deleted first, then this
+        record. The alternative is to reparent or delete the children
+        yourself first.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -2620,6 +2629,7 @@ def create_mcp_server(
             session_id=session_id,
             causation_id=causation_id,
             _source=source,
+            cascade=cascade,
         )
 
     @mcp.tool()
