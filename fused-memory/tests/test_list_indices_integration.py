@@ -22,7 +22,7 @@ import uuid
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import await_index_operational
+from _fm_helpers import await_index_operational, poll_until
 from falkordb import FalkorDB as _SyncFalkorDB
 from falkordb.asyncio import FalkorDB
 
@@ -125,17 +125,17 @@ class TestCallDbIndexesOverRoQuery:
         assert result.result_set[0][0] == 'Entity'
 
     @pytest.mark.asyncio
-    async def test_db_indexes_exposes_status_column_reading_operational(self, live_test_graph):
+    async def test_db_indexes_result_shape_matches_the_barriers_assumptions(self):
         """PREMISE PIN for the index-readiness barrier — task 3377.
 
         This is NOT a RED-first TDD test; it is expected to PASS on
-        introduction. A timing race cannot be reliably RED-tested: on this
-        fixture's single-node graph the index build completes before the first
-        poll (measured: 6 of 6 polls already read OPERATIONAL), so an
-        unbarriered fixture passes by luck — which is precisely the false-green
-        mechanism the barrier removes. Manufacturing a reliable RED would mean
-        seeding bulk data to widen the window, producing a slow and inherently
-        flaky test that blows the module's 15s timeout budget.
+        introduction. A timing race cannot be reliably RED-tested: on a
+        single-node graph the index build completes before the first poll
+        (measured: 6 of 6 polls already read OPERATIONAL), so an unbarriered
+        fixture passes by luck — which is precisely the false-green mechanism
+        the barrier removes. Manufacturing a reliable RED would mean seeding
+        bulk data to widen the window, producing a slow and inherently flaky
+        test that blows the module's 15s timeout budget.
 
         Its durable job is different: ``_fm_helpers.await_index_operational``
         resolves the readiness column BY NAME (``status``) from
@@ -145,6 +145,22 @@ class TestCallDbIndexesOverRoQuery:
         into a no-op. This test makes that fail loudly in the integration lane
         instead.
 
+        Deliberately does NOT use the ``live_test_graph`` fixture and does NOT
+        call the barrier. Riding the fixture would make this test a restatement
+        of the fixture's own postcondition: the barrier already raises unless
+        ``status`` is present and every row reads ``'OPERATIONAL'``, so the
+        assertions could never fail without the fixture having errored first —
+        drift would surface as a fixture ERROR on every test in the module
+        rather than as this test's FAIL. It therefore provisions its own
+        throwaway graph and reads ``CALL db.indexes()`` raw.
+
+        The poll below is on the INVERSE condition — "no row is still building"
+        — via the generic :func:`poll_until`, not the barrier's "every row is
+        OPERATIONAL". That separation is what gives this test independent
+        signal: if the ready sentinel were renamed, the barrier would merely
+        hang and time out, while this test settles and then names the new value
+        it found.
+
         Uses ``graph.query`` (not ``ro_query``) deliberately — the same path
         the barrier itself uses; the RO-path acceptance is pinned by the
         sibling test above.
@@ -153,24 +169,79 @@ class TestCallDbIndexesOverRoQuery:
         ['label', 'properties', 'types', 'options', 'language', 'stopwords',
         'entitytype', 'status', 'info'].
         """
-        result = await live_test_graph.query('CALL db.indexes()')
+        client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+        graph = client.select_graph(f'{TEST_GRAPH}_shape_pin')
+        try:
+            await graph.query('CREATE (:Entity {name: $n})', {'n': 'shape-pin'})
+            await graph.query('CREATE INDEX FOR (n:Entity) ON (n.name)')
 
-        header_names = [col[1] for col in result.header]
-        assert 'status' in header_names, (
-            f'CALL db.indexes() has no "status" column (header={header_names}). '
-            f'_fm_helpers.await_index_operational resolves readiness from this '
-            f'column by name; without it the barrier cannot be trusted.'
-        )
+            # (1) Header shape: rows are (type, name) 2-tuples, so the column
+            # NAME is col[1]. The barrier's `[col[1] for col in result.header]`
+            # is meaningless if this ever stops holding.
+            result = await graph.query('CALL db.indexes()')
+            assert result.header, 'CALL db.indexes() returned an empty header'
+            assert all(len(col) == 2 for col in result.header), (
+                f'CALL db.indexes() header rows are no longer (type, name) '
+                f'2-tuples (header={result.header!r}); '
+                f'_fm_helpers.await_index_operational reads the column name as '
+                f'col[1] and can no longer be trusted.'
+            )
 
-        status_idx = header_names.index('status')
-        statuses = [row[status_idx] for row in result.result_set]
-        assert statuses, 'CALL db.indexes() reported zero indices on the fixture graph'
-        assert all(s == 'OPERATIONAL' for s in statuses), (
-            f'fixture returned with a non-OPERATIONAL index (statuses={statuses!r}); '
-            f'the readiness barrier in live_test_graph did not hold. Note the live '
-            f'not-ready value carries a progress prefix, e.g. '
-            f'"[Indexing] N/M: UNDER CONSTRUCTION".'
-        )
+            # (2) A column literally named `status` exists — the barrier
+            # resolves readiness from it by name.
+            header_names = [col[1] for col in result.header]
+            assert 'status' in header_names, (
+                f'CALL db.indexes() has no "status" column (header={header_names}). '
+                f'_fm_helpers.await_index_operational resolves readiness from this '
+                f'column by name; without it the barrier cannot be trusted.'
+            )
+            status_idx = header_names.index('status')
+
+            # (3) The build settles, and its terminal value is EXACTLY
+            # 'OPERATIONAL'. Polled on the inverse ("nothing still building")
+            # so this does not restate the barrier's own exit condition; 8s
+            # leaves headroom inside the module-wide timeout(15) for the
+            # round-trips above and the teardown below.
+            observed: set[str] = set()
+
+            async def _build_settled() -> bool:
+                res = await graph.query('CALL db.indexes()')
+                statuses = [row[status_idx] for row in res.result_set]
+                observed.update(statuses)
+                return bool(statuses) and not any(
+                    'UNDER CONSTRUCTION' in s for s in statuses
+                )
+
+            await poll_until(
+                _build_settled,
+                timeout=8.0,
+                interval=0.05,
+                message=(
+                    f'index build never settled on the shape-pin graph '
+                    f'(statuses seen={sorted(observed)!r})'
+                ),
+            )
+
+            assert observed >= {'OPERATIONAL'}, (
+                f'the index build settled but never reported the exact ready '
+                f'sentinel "OPERATIONAL" (statuses seen={sorted(observed)!r}). '
+                f'_fm_helpers.await_index_operational matches that string exactly '
+                f'and fail-closed, so a renamed sentinel turns the barrier into a '
+                f'permanent timeout. Re-verify the barrier against this FalkorDB '
+                f'version and update its predicate.'
+            )
+            unknown = {s for s in observed if s != 'OPERATIONAL'}
+            assert all('UNDER CONSTRUCTION' in s for s in unknown), (
+                f'CALL db.indexes() reported unrecognised status value(s) '
+                f'{sorted(unknown)!r}. Documented values are the exact '
+                f'"OPERATIONAL" and the progress-prefixed '
+                f'"[Indexing] N/M: UNDER CONSTRUCTION".'
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await graph.delete()
+            with contextlib.suppress(Exception):
+                await client.aclose()
 
 
 class TestBackendListIndicesLive:
