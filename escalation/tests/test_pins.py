@@ -17,6 +17,7 @@ import enum
 import typing
 
 import pytest
+
 from escalation.models import Escalation
 from escalation.pins import PinClass, PinRecord, PinReport, classify_pins
 
