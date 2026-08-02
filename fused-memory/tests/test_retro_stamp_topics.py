@@ -1570,3 +1570,338 @@ class TestStampOne:
         service.update_memory.assert_not_awaited()
         assert result['outcome'] == 'conflicting_existing_topic'
         assert result['existing_topic'] == 'a-different-topic'
+
+
+# ===========================================================================
+# run — the three sources, end to end
+# ===========================================================================
+
+#: Every bucket the report must carry, whether or not anything landed in it.
+#: An absent bucket and an empty one are different claims; only one of them
+#: is "we looked and found nothing".
+EXPECTED_BUCKETS = frozenset({
+    'skipped_no_enumeration',
+    'no_registry_topic',
+    'conflicting_topic_claim',
+    'conflicting_existing_topic',
+    'canonical_disagreement',
+    'canonical_plural',
+    'canonical_uniqueness_blocked',
+    'canonical_probe_failed',
+    'memory_not_found',
+    'update_failed',
+    'supersedes_not_normalizable',
+    'topic_underivable',
+    'member_not_a_uuid',
+    'cluster_without_canonical',
+})
+
+PROSE_SUPERSEDES = (
+    '0d542614 (2026-07-20 07:03) and b5cc4f3c (2026-07-21 11:40), '
+    'both deleted 2026-07-25 during the namespace consolidation'
+)
+
+
+def _scroll_record(memory_id: str, topic: str, **metadata) -> dict:
+    """A ``get_memories_by_metadata({'canonical': True})`` row."""
+    return {
+        'id': memory_id,
+        'created_at': '2026-07-01T00:00:00Z',
+        'metadata': {'topic': topic, 'canonical': True, **metadata},
+    }
+
+
+def _gate(topic: str, *, canonical=None, members=(), **kwargs) -> object:
+    return _mod.GateCluster(
+        gate_task_id=kwargs.pop('gate_task_id', '9999'),
+        topic=topic,
+        canonical_memory_id=canonical,
+        member_memory_ids=members,
+        source_key=('memory_ids',),
+        **kwargs,
+    )
+
+
+def _run_service(scroll_by_project: dict | None = None) -> AsyncMock:
+    """A stateful ``MemoryService`` double: writes are visible to later reads.
+
+    Stateful on purpose — idempotence is the property this suite exists to
+    check, and a stub whose reads ignore its own writes could never fail the
+    idempotence test no matter how the code behaved.  The live-canonical
+    scroll rows also seed the store, because on a real service those rows ARE
+    the records ``get_memory_by_id`` returns.
+    """
+    scroll_by_project = scroll_by_project or {}
+    store: dict[str, dict] = {}
+    for records in scroll_by_project.values():
+        for record in records:
+            store[record['id']] = dict(record['metadata'])
+
+    service = AsyncMock()
+
+    def _scroll(project_id, filters, limit=1000):
+        # The incumbent probe reuses this method with a `topic` filter; only
+        # the bare canonical scroll is the source-(1) enumeration.
+        if 'topic' in filters:
+            return []
+        return list(scroll_by_project.get(project_id, []))
+
+    def _get(*, project_id, memory_id):
+        if memory_id not in store:
+            return None
+        return {'id': memory_id, 'content': 'a fact', 'metadata': dict(store[memory_id])}
+
+    def _update(**kwargs):
+        store.setdefault(kwargs['memory_id'], {}).update(kwargs['metadata_patch'])
+        return {
+            'status': 'updated',
+            'store': 'mem0',
+            'id': kwargs['memory_id'],
+            'content_amended': False,
+            'metadata_patched': True,
+        }
+
+    service.get_memories_by_metadata.side_effect = _scroll
+    service.count_memories_by_metadata.return_value = 0
+    service.get_memory_by_id.side_effect = _get
+    service.update_memory.side_effect = _update
+    # Every planned id exists unless a test says otherwise.
+    service.seed = lambda *ids: [store.setdefault(i, {}) for i in ids]
+    service.store = store
+    return service
+
+
+class TestRun:
+    """``run(memory_service, *, projects, apply, …) -> dict``.
+
+    Drives the three bounded sources through ``merge_plans`` and
+    ``stamp_one``, and assembles the artifact an auditor reads instead of
+    the corpus.  The report's job is to be un-misreadable: a bucket that is
+    genuinely zero must look different from one the code forgot to fill.
+    """
+
+    @pytest.mark.asyncio
+    async def test_live_canonical_scroll_is_read_once_per_project(self):
+        """Source (1), and the reason ``projects`` is a parameter.
+
+        The six live canonical records straddle two corpora (1 in
+        ``dark_factory``, 5 in ``reify``), so a single-project sweep would
+        silently cover a sixth of the source.
+        """
+        service = _run_service()
+        await _mod.run(
+            service,
+            projects=('dark_factory', 'reify'),
+            apply=False,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=(),
+        )
+        scrolls = [
+            call for call in service.get_memories_by_metadata.await_args_list
+            if call.args[1] == {'canonical': True}
+        ]
+        assert [call.args[0] for call in scrolls] == ['dark_factory', 'reify']
+
+    @pytest.mark.asyncio
+    async def test_all_three_sources_join_into_one_work_list(self):
+        """The join is the deliverable — one topic namespace, three inputs."""
+        service = _run_service({
+            'dark_factory': [_scroll_record(C1, 'scrolled_topic', consolidates=[M1])],
+        })
+        service.seed(M1, M2, M3, C2)
+        report = await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=True,
+            calibration_rows=[
+                _row(CLUSTER_A, M2, 'canonical'),
+                _row(CLUSTER_A, M3, 'duplicate'),
+            ],
+            registry=_registry(
+                _entry('joined-topic', CLUSTER_A, project_id='dark_factory')
+            ),
+            gate_manifest=(_gate('gated-topic', canonical=C2),),
+        )
+        assert report['stamped_by_topic'] == {
+            'scrolled-topic': 2, 'joined-topic': 2, 'gated-topic': 1,
+        }
+        assert report['stamped_total'] == 5
+        assert {r['source'] for r in report['results']} == {
+            'canonical_scroll', 'calibration_registry_join', 'df_curator_gate_manifest',
+        }
+
+    @pytest.mark.asyncio
+    async def test_every_skip_bucket_is_present_even_when_empty(self):
+        """A missing bucket reads as "nothing was skipped". It isn't.
+
+        Pre-seeding every bucket is what makes a genuinely-zero bucket
+        distinguishable from one the code never computed — the difference
+        between a clean run and an unnoticed hole in coverage.
+        """
+        report = await _mod.run(
+            _run_service(),
+            projects=('dark_factory',),
+            apply=True,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=(),
+        )
+        assert set(report['skips']) == EXPECTED_BUCKETS
+        assert all(bucket == [] for bucket in report['skips'].values())
+        assert report['stamped_total'] == 0
+        assert report['stamped_by_topic'] == {}
+
+    @pytest.mark.asyncio
+    async def test_the_three_enumerationless_gates_are_named_not_absent(self):
+        """2969 / 2973 / 3016 are declared holes, reported by gate id.
+
+        Measured: those gate tasks carry no id-enumeration metadata key at
+        all.  Coverage the sweep does not have has to be visible in the
+        artifact, or "7 gates in the manifest" reads as "7 gates stamped".
+        """
+        report = await _mod.run(
+            _run_service(),
+            projects=('dark_factory',),
+            apply=False,
+            calibration_rows=[],
+            registry=_registry(),
+        )
+        holes = report['skips']['skipped_no_enumeration']
+        assert {h['gate_task_id'] for h in holes} == {'2969', '2973', '3016'}
+        assert all(h['detail'] for h in holes), f'a hole with no reason: {holes}'
+
+    @pytest.mark.asyncio
+    async def test_plural_canonical_gate_is_reported_with_its_note(self):
+        """Gate 3036's end state has SEVERAL canonicals, so none is stamped.
+
+        The note rides into the report because "topic on all, canonical on
+        none" is a curation question left open, not a finished cluster.
+        """
+        report = await _mod.run(
+            _run_service(),
+            projects=('dark_factory',),
+            apply=False,
+            calibration_rows=[],
+            registry=_registry(),
+        )
+        plural = report['skips']['canonical_plural']
+        topics = {p['topic'] for p in plural}
+        assert 'pyright-worktree-import-resolution' in topics
+        assert all(p['note'] for p in plural), f'a plural cluster with no note: {plural}'
+        assert all(r['make_canonical'] is False for r in report['results']
+                   if r['topic'] in topics)
+
+    @pytest.mark.asyncio
+    async def test_a_second_run_writes_nothing(self):
+        """Idempotence, measured against a store that remembers run one.
+
+        Run two must cost ZERO writes — not zero net change.  This is the
+        property that makes the sweep safe to re-run after a partial
+        failure, and it is why ``compute_patch`` returning an empty patch has
+        to mean "issue no call" rather than "issue a harmless one".
+        """
+        service = _run_service({
+            'dark_factory': [_scroll_record(C1, 'scrolled_topic', consolidates=[M1])],
+        })
+        service.seed(M1)
+        first = await _mod.run(
+            service, projects=('dark_factory',), apply=True,
+            calibration_rows=[], registry=_registry(), gate_manifest=(),
+        )
+        assert first['stamped_total'] == 2
+        writes_after_first = service.update_memory.await_count
+
+        second = await _mod.run(
+            service, projects=('dark_factory',), apply=True,
+            calibration_rows=[], registry=_registry(), gate_manifest=(),
+        )
+        assert service.update_memory.await_count == writes_after_first
+        assert second['stamped_total'] == 0
+        assert second['stamped_by_topic'] == {}
+        assert {r['outcome'] for r in second['results']} == {'already_stamped'}
+
+    @pytest.mark.asyncio
+    async def test_dry_run_writes_nothing_but_reports_everything(self):
+        """The default posture: a full rehearsal with the writes withheld."""
+        service = _run_service({
+            'dark_factory': [_scroll_record(C1, 'scrolled_topic', consolidates=[M1])],
+        })
+        service.seed(M1)
+        report = await _mod.run(
+            service, projects=('dark_factory',), apply=False,
+            calibration_rows=[], registry=_registry(), gate_manifest=(),
+        )
+        service.update_memory.assert_not_awaited()
+        assert report['apply'] is False
+        assert report['stamped_total'] == 0
+        assert report['would_stamp_total'] == 2
+        assert {r['outcome'] for r in report['results']} == {'would_stamp'}
+        assert report['would_stamp_by_topic'] == {'scrolled-topic': 2}
+
+    @pytest.mark.asyncio
+    async def test_report_states_its_own_boundedness(self):
+        """An auditor must see from the ARTIFACT that this was not a sweep.
+
+        "Bounded" is the whole safety argument of this leaf; leaving it as a
+        claim in a docstring puts it exactly where a reader of the output
+        cannot check it.
+        """
+        report = await _mod.run(
+            _run_service(),
+            projects=('dark_factory',),
+            apply=False,
+            calibration_rows=[_row(CLUSTER_A, M1, 'canonical')],
+            registry=_registry(_entry('joined-topic', CLUSTER_A)),
+        )
+        assert report['bounded'] is True
+        assert set(report['sources']) == {
+            'canonical_scroll', 'calibration_registry_join', 'df_curator_gate_manifest',
+        }
+        for name, block in report['sources'].items():
+            assert block['description'], f'source {name} has no description'
+            assert block['plan_count'] >= 0
+        assert report['sources']['df_curator_gate_manifest']['gate_count'] == len(
+            _mod.DF_CURATOR_GATE_CLUSTERS
+        )
+        assert report['sources']['canonical_scroll']['record_count'] == 0
+        assert report['sources']['calibration_registry_join']['cluster_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_error_outcomes_land_in_their_own_buckets(self):
+        """A vanished id and a prose ``supersedes`` are both real, both loud.
+
+        Both are EXPECTED on this corpus — the manifest's ids were
+        transcribed weeks before the run, and two live canonical records
+        carry an English sentence where a uuid list belongs.  Expected is not
+        the same as ignorable.
+        """
+        service = _run_service({
+            'dark_factory': [
+                _scroll_record(C1, 'scrolled_topic', supersedes=PROSE_SUPERSEDES),
+            ],
+        })
+        report = await _mod.run(
+            service, projects=('dark_factory',), apply=True,
+            calibration_rows=[], registry=_registry(),
+            gate_manifest=(_gate('gone-topic', members=(M3,)),),
+        )
+        assert [s['memory_id'] for s in report['skips']['memory_not_found']] == [M3]
+        prose = report['skips']['supersedes_not_normalizable']
+        assert [s['memory_id'] for s in prose] == [C1]
+        assert [s['value'] for s in report['skips']['member_not_a_uuid']] == [
+            PROSE_SUPERSEDES
+        ]
+
+    @pytest.mark.asyncio
+    async def test_outcome_tally_covers_every_result(self):
+        """The tally is a partition of ``results``, not a highlight reel."""
+        service = _run_service({
+            'dark_factory': [_scroll_record(C1, 'scrolled_topic', consolidates=[M1])],
+        })
+        report = await _mod.run(
+            service, projects=('dark_factory',), apply=True,
+            calibration_rows=[], registry=_registry(), gate_manifest=(),
+        )
+        assert sum(report['outcomes'].values()) == len(report['results'])
+        assert report['target_count'] == len(report['results'])
