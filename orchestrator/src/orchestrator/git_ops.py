@@ -204,6 +204,15 @@ def is_wip_safety_commit(subject: str) -> bool:
 MERGE_PARK_REF = 'refs/dark-factory/merge-park'
 
 
+# Poll cadence (seconds) for GitOps._await_index_lock_clear's stand-off on a
+# FOREIGN <git-dir>/index.lock, and how often that wait re-announces itself.
+# Deliberately module constants, not config knobs: the operator-facing budget
+# is the single `git.merge_park_lock_grace_seconds` knob — these only control
+# how finely that budget is sampled and how chatty a long wait is.
+_INDEX_LOCK_POLL_INTERVAL_S = 1.0
+_INDEX_LOCK_WARN_INTERVAL_S = 30.0
+
+
 class MergeParkError(Exception):
     """Base class for failures parking pre-advance WIP on MERGE_PARK_REF.
 
@@ -12879,20 +12888,28 @@ class GitOps:
                     # ends with `read-tree -u --reset HEAD`, which would
                     # clobber the in-flight commit's staged/working state.
                     # Touch nothing and come back later instead.
-                    lock_held, lock_age = await self._index_lock_state()
-                    if lock_held:
+                    # The grace is re-read PER ADVANCE (never captured at
+                    # startup) so a green-tier reload of
+                    # git.merge_park_lock_grace_seconds takes effect on the
+                    # very next advance.
+                    cleared, waited = await self._await_index_lock_clear(
+                        timeout_s=self.config.merge_park_lock_grace_seconds,
+                        context=f'advance_main park for {branch or merge_sha[:8]}',
+                    )
+                    if not cleared:
                         lock_path = await self._index_lock_path()
+                        _, lock_age = await self._index_lock_state()
                         logger.warning(
-                            'Foreign git index lock held in project_root — '
-                            'standing off instead of parking WIP. lock=%s '
-                            'age=%.1fs dirty=%s',
-                            lock_path, lock_age,
+                            'Foreign git index lock still held in project_root '
+                            'after %.1fs — standing off instead of parking '
+                            'WIP. lock=%s age=%.1fs dirty=%s',
+                            waited, lock_path, lock_age,
                             ', '.join(sorted(dirty_tracked)[:10]),
                         )
                         self._last_park_lock_info = {
                             'lock_path': str(lock_path),
                             'age_seconds': lock_age,
-                            'waited_seconds': 0.0,
+                            'waited_seconds': waited,
                             'dirty_files': sorted(dirty_tracked),
                         }
                         return AdvanceOutcome('park_lock_contended')
@@ -13379,6 +13396,80 @@ class GitOps:
             # Unreadable for some other reason — do not invent contention.
             return (False, 0.0)
         return (True, max(0.0, time.time() - mtime))
+
+    async def _await_index_lock_clear(
+        self, *, timeout_s: float, context: str,
+    ) -> tuple[bool, float]:
+        """Wait (bounded by *timeout_s*) for project_root's index lock to clear.
+
+        Returns ``(cleared, waited_seconds)``.
+
+        The happy path — no lock — costs exactly one ``stat``: no subprocess,
+        no sleep, no await of anything real, so a clean repo behaves
+        byte-identically to before this gate existed.
+
+        ``timeout_s == 0`` still PROBES (probe-only fail-fast): the off-switch
+        disables the WAIT, never the classification, because parking through a
+        foreign process's index lock would clobber the in-flight commit's
+        staged/working state.  A long stand-off is loud rather than silent —
+        a WARNING naming the lock path, its current age and *context* is
+        emitted at most every ~30s while waiting.
+
+        Uses a MONOTONIC clock for the deadline so a wall-clock adjustment
+        mid-wait cannot extend or truncate the budget.
+        """
+        held, age = await self._index_lock_state()
+        if not held:
+            return (True, 0.0)
+
+        lock_path = await self._index_lock_path()
+        started = time.monotonic()
+        deadline = started + max(0.0, timeout_s)
+        # Cap the poll interval so a sub-second timeout_s still yields at
+        # least one further probe rather than sleeping past its own deadline.
+        interval = min(_INDEX_LOCK_POLL_INTERVAL_S, max(0.0, timeout_s)) or \
+            _INDEX_LOCK_POLL_INTERVAL_S
+        last_warned = started
+
+        logger.warning(
+            'Foreign git index lock held in project_root — standing off for '
+            'up to %.0fs before giving up. lock=%s age=%.1fs context=%s',
+            max(0.0, timeout_s), lock_path, age, context,
+        )
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+            held, age = await self._index_lock_state()
+            waited = time.monotonic() - started
+            if not held:
+                logger.info(
+                    'Foreign git index lock cleared after %.1fs — proceeding '
+                    'with advance. lock=%s context=%s',
+                    waited, lock_path, context,
+                )
+                return (True, waited)
+            now = time.monotonic()
+            if now - last_warned >= _INDEX_LOCK_WARN_INTERVAL_S:
+                last_warned = now
+                logger.warning(
+                    'Still waiting on a foreign git index lock in '
+                    'project_root after %.1fs (of %.0fs). lock=%s age=%.1fs '
+                    'context=%s',
+                    waited, max(0.0, timeout_s), lock_path, age, context,
+                )
+
+        # Final probe so a lock that cleared inside the last poll interval
+        # is not misreported as still held at the deadline.
+        held, _age = await self._index_lock_state()
+        waited = time.monotonic() - started
+        if not held:
+            logger.info(
+                'Foreign git index lock cleared after %.1fs — proceeding '
+                'with advance. lock=%s context=%s',
+                waited, lock_path, context,
+            )
+            return (True, waited)
+        return (False, waited)
 
     async def _park_wip_on_private_ref(self, label: str) -> None:
         """Park uncommitted WIP in project_root onto MERGE_PARK_REF.
