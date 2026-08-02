@@ -77,20 +77,44 @@ _MODULE_LINT_COMMANDS = {
 # ``DF_CONFIG_PATH``.
 _DF_CONFIG_PATH = Path(__file__).resolve().parents[2] / 'dark-factory-orchestrator.yaml'
 
-# dark-factory-orchestrator.yaml:50
+# FROZEN ILLUSTRATIVE SNAPSHOT, not a live mirror — dark-factory-orchestrator.yaml:lint_command
+# (a key name, not a line number: line numbers drift as the yaml's comment
+# block grows — this constant's old ``:50`` label was accurate at commit
+# c23468f627 and is now off by 48 lines). The live lint_command has drifted
+# further still: it additionally lints ``sampler cockpit`` and checks
+# ``sampler/tests cockpit/tests``. Only _ROOT_TEST_COMMAND is guarded against
+# the committed yaml (TestRootTestCommandLiveConfigDrift below) — re-syncing
+# this one is deliberately deferred because it is not a literal-only edit: it
+# would invalidate the exact-output golden in
+# test_root_lint_chain_scopes_ruff_and_keeps_the_checker. Follow-up:
+# agent-followup-3495 (ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19).
 _ROOT_LINT_COMMAND = (
     'uv run ruff check shared escalation fused-memory orchestrator dashboard'
     ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
     ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
 )
 
-# dark-factory-orchestrator.yaml:51
+# FROZEN ILLUSTRATIVE SNAPSHOT, not a live mirror —
+# dark-factory-orchestrator.yaml:type_check_command (a key name, not a line
+# number: this constant's old ``:51`` label was accurate at commit
+# c23468f627 and is now off by 91 lines). The live type_check_command has
+# drifted further still: it now chains 7 pyright segments (one per
+# subproject), not the 3 below. Only _ROOT_TEST_COMMAND is guarded against
+# the committed yaml (TestRootTestCommandLiveConfigDrift below) — re-syncing
+# this one is deliberately deferred because it is not a literal-only edit: it
+# would turn the ``(_ROOT_TYPE_CHECK_COMMAND, 'pyright', 4, logging.DEBUG)``
+# case in TestDroppedChainClausesAreLogged._DROP_CASES into a different
+# count. Follow-up: agent-followup-3495 (ticket
+# tkt_0RS0C6DZXK29SRSRSZ08CQ4R19).
 _ROOT_TYPE_CHECK_COMMAND = (
     'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
     ' && cd ../dashboard && npx pyright'
 )
 
-# dark-factory-orchestrator.yaml:41
+# dark-factory-orchestrator.yaml:test_command (a key name, not a line number:
+# this constant's old ``:41`` label was accurate at commit c23468f627 and is
+# now off by 31 lines — the label format was itself the drift vector). Kept
+# honest by TestRootTestCommandLiveConfigDrift below.
 _ROOT_TEST_COMMAND = (
     'cd shared && uv run pytest tests/ --timeout=300'
     ' && cd ../escalation && uv run pytest tests/ --timeout=300'
@@ -1227,7 +1251,7 @@ class TestScoperTrailingClausePreservation:
             assert checker in _FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
     def test_root_lint_chain_scopes_ruff_and_keeps_the_checker(self):
-        """dark-factory-orchestrator.yaml:50 — the fallback path's own command."""
+        """dark-factory-orchestrator.yaml:lint_command — the fallback path's own command."""
         scoped = verify._scope_to_keyword(_ROOT_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run ruff check fused-memory/tests/test_harness.py'
@@ -1255,11 +1279,11 @@ class TestScoperTrailingClausePreservation:
     def test_root_type_check_fan_out_still_truncates(self):
         """HAZARD GUARD: a cwd-sequenced same-tool fan-out must NOT keep its tail.
 
-        ``dark-factory-orchestrator.yaml:51`` is ``cd fused-memory && npx
-        pyright && cd ../orchestrator && npx pyright && cd ../dashboard &&
-        npx pyright``. Preserving that tail would (a) run pyright fully
-        UNSCOPED over two more subprojects, defeating scoping entirely, and
-        (b) break correctness — scoping applies ``strip_cwd``, which removes
+        ``dark-factory-orchestrator.yaml:type_check_command`` is ``cd
+        fused-memory && npx pyright && cd ../orchestrator && npx pyright &&
+        cd ../dashboard && npx pyright``. Preserving that tail would (a) run
+        pyright fully UNSCOPED over two more subprojects, defeating scoping
+        entirely, and (b) break correctness — scoping applies ``strip_cwd``, which removes
         the leading ``cd fused-memory``, so a surviving ``cd ../orchestrator``
         would resolve relative to the worktree ROOT and escape the repo.
         """
@@ -1269,7 +1293,17 @@ class TestScoperTrailingClausePreservation:
         assert 'cd ../dashboard' not in scoped
 
     def test_root_test_fan_out_still_truncates(self):
-        """Same hazard for ``dark-factory-orchestrator.yaml:41``'s 8-segment fan-out."""
+        """Same hazard for ``dark-factory-orchestrator.yaml:test_command``'s fan-out.
+
+        Two counts of the SAME chain appear in this module, and they measure
+        different things: the 16 top-level ``&&`` clauses (see
+        ``TestDroppedChainClausesAreLogged``'s ``_DROP_CASES`` comment) fold,
+        via ``split_and_chain_segments``, to 8 cwd-sequenced pytest segments
+        (see test_verify_cmd.py's ``TestSplitAndChainSegmentsLiveConfigDrift``).
+        Scoping to one touched file retains exactly 1 of those 8 segments and
+        drops the other 14 top-level clauses — the ``dropped=14`` entry this
+        module's ``_DROP_CASES`` pins.
+        """
         scoped = verify._scope_to_keyword(_ROOT_TEST_COMMAND, 'pytest', self._FILES)
         assert scoped == 'uv run pytest fused-memory/tests/test_harness.py'
         assert 'cd ../escalation' not in scoped
