@@ -15,6 +15,19 @@ from pydantic_settings import (
 )
 from shared.config_models import UsageCapConfig
 
+# The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
+# stdlib-only leaf, NOT from fused_memory.memory_metadata: that module
+# imports backends.mem0_client, which imports THIS module at module scope,
+# so the direct import raises (measured)
+#   ImportError: cannot import name 'FusedMemoryConfig'
+#                from 'fused_memory.config.schema'
+# and would additionally make config loading require the mem0 SDK.
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    TOPIC_SLUG_RE,
+    is_valid_topic_slug,
+)
+
 # Config path used when the ``CONFIG_PATH`` env var is unset. Single-sourced here
 # so both ``settings_customise_sources`` (the actual loader) and the reload_config
 # MCP tool's ``config_path`` disposition field agree on the file actually read —
@@ -469,11 +482,29 @@ class ProceduralTopicCluster(BaseModel):
     below-cosine-threshold restatement the semantic near-dup guard cannot catch
     (task 2845). ``extra='forbid'`` so a mistyped cluster key fails loud at config
     load/reload, never silently matches nothing.
+
+    ``topic_id`` shares ONE namespace with the ``metadata.topic`` memory
+    vocabulary key (PRD ``docs/prds/memory-metadata-vocabulary.md`` D4):
+    both are validated by the single rule in
+    :mod:`fused_memory.topic_slug`. That is what makes 3135's auto-seed
+    invariant -- ``cluster.topic_id == canonical.metadata.topic`` --
+    expressible at all. A snake_case ``topic_id`` could never equal a
+    validated ``metadata.topic``, so the guard would load cleanly and then
+    match nothing forever; the validator below turns that silent no-op
+    into a config-load failure.
     """
 
     model_config = ConfigDict(extra='forbid')
 
-    topic_id: str = Field(description='Stable identifier for this topic cluster.')
+    topic_id: str = Field(
+        description=(
+            'Stable identifier for this topic cluster. Shares ONE namespace with the '
+            'metadata.topic memory key (PRD D4) and is validated by the same rule '
+            f'({TOPIC_SLUG_RE.pattern}, max {TOPIC_SLUG_MAX_LEN} chars) from '
+            'fused_memory.topic_slug, so a cluster id can equal a canonical '
+            "memory's metadata.topic."
+        ),
+    )
     phrases: list[str] = Field(
         description=(
             'Identifying substring phrases, matched case-insensitively. A write '
@@ -495,6 +526,37 @@ class ProceduralTopicCluster(BaseModel):
             'When empty, the guard substitutes a module-default hint.'
         ),
     )
+
+    @field_validator('topic_id')
+    @classmethod
+    def _validate_topic_id_slug(cls, v: str) -> str:
+        """Reject a ``topic_id`` that is not a well-formed topic slug (PRD D4).
+
+        Fails fast at config load/reload for the same reason
+        ``extra='forbid'`` is on this model: the alternative is a cluster
+        that loads cleanly and then matches nothing, because a snake_case
+        id can never equal a validated ``metadata.topic``. A silent no-op
+        guard is strictly worse than a loud rejection an operator can fix.
+
+        ``is_valid_topic_slug`` is THE shared predicate -- deliberately
+        called rather than re-expressing the regex or the cap inline, so
+        the memory side and the config side cannot drift to two different
+        answers (INV-5; ``tests/test_topic_slug_namespace.py`` asserts the
+        identity by ``is``).
+
+        The message quotes the offending value, the rule, and the module
+        that owns it, so an operator who trips this at load can find the
+        rule without reading the source.
+        """
+        if not is_valid_topic_slug(v):
+            raise ValueError(
+                f'topic_id {v!r} is not a valid topic slug: it must match '
+                f'{TOPIC_SLUG_RE.pattern} and be at most {TOPIC_SLUG_MAX_LEN} '
+                f'characters. topic_id shares one namespace with the '
+                f'metadata.topic memory key (PRD D4); the rule lives in '
+                f'fused_memory.topic_slug.'
+            )
+        return v
 
 
 def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:

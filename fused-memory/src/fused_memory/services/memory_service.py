@@ -11,7 +11,7 @@ import os
 import re
 import time
 import uuid as uuid_mod
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -26,7 +26,10 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
 from fused_memory.memory_metadata import (
+    CanonicalUniquenessViolation,
     MemoryMetadataValidationError,
+    MetadataViolation,
+    is_valid_topic_slug,
     validate_memory_metadata,
 )
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
@@ -411,6 +414,8 @@ async def _apply_memory_metadata_validation(
     config: MemoryMetadataConfig,
     storm_detector: UnknownKeyStormDetector,
     project_root: str,
+    count_canonical: Callable[[str, dict], Awaitable[int]],
+    find_canonical: Callable[..., Awaitable[list[dict]]],
 ) -> None:
     """Validate the Mem0 metadata vocabulary at the write boundary, in place.
 
@@ -459,33 +464,228 @@ async def _apply_memory_metadata_validation(
     violations = validate_memory_metadata(
         meta, enforce_kind_registry=config.enforce_kind_registry
     )
-    if not violations:
+    # NOTE: this is `if violations:`, not an early `return` — the canonical
+    # uniqueness re-check below must still run for metadata that is
+    # perfectly well-formed, which is the overwhelmingly common case for a
+    # canonical write.  An early return here would make the whole check
+    # dead code that still looked wired up.
+    if violations:
+        emit_schema_warnings(violations, project_id=project_id, agent_id=agent_id)
+
+        unknown_keys = [v.key for v in violations if v.code == 'unknown_key']
+        if unknown_keys and storm_detector.record(project_id, agent_id, unknown_keys):
+            if project_root:
+                await asyncio.to_thread(
+                    file_unknown_key_storm_escalation,
+                    project_root,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    keys=unknown_keys,
+                )
+            else:
+                # No configured taskmaster.project_root means no project queue to
+                # file into. The census lines are already out, so the signal is
+                # not lost — only the escalation.
+                logger.debug(
+                    'memory_metadata: unknown-key storm from project_id=%r '
+                    'agent_id=%r but no project_root is configured; not escalating',
+                    project_id, agent_id,
+                )
+
+        if config.enforce and any(v.fatal for v in violations):
+            raise MemoryMetadataValidationError([v for v in violations if v.fatal])
+
+    await _check_canonical_uniqueness(
+        meta,
+        project_id=project_id,
+        agent_id=agent_id,
+        config=config,
+        count_canonical=count_canonical,
+        find_canonical=find_canonical,
+    )
+
+
+#: Returned as the incumbent id when the count says an incumbent exists but
+#: the follow-up scroll comes back empty (a concurrent delete between the two
+#: round-trips).  A structured rejection with an unresolvable id beats an
+#: IndexError on the live write path.
+_CANONICAL_INCUMBENT_UNKNOWN = '<unknown>'
+
+
+async def _check_canonical_uniqueness(
+    meta: dict,
+    *,
+    project_id: str,
+    agent_id: str | None,
+    config: MemoryMetadataConfig,
+    count_canonical: Callable[[str, dict], Awaitable[int]],
+    find_canonical: Callable[..., Awaitable[list[dict]]],
+) -> None:
+    """Enforce <=1 canonical memory per ``(project, topic)`` (PRD V1, INV-3).
+
+    The live half of ``canonical``.  It lives HERE rather than in
+    :func:`~fused_memory.memory_metadata.validate_memory_metadata` because
+    it needs store state, and that validator is pure by construction — the
+    shape half (``canonical_without_topic``) stays there.
+
+    Collaborators are injected as bound callables rather than as ``self``,
+    matching how this seam already takes ``storm_detector``/``config``: the
+    module-level helper stays decoupled from ``MemoryService`` and trivially
+    stubbable.
+
+    SCOPE — THE INVARIANT IS MEM0-SCOPED (3198 amendment, stated because
+    the silence read as coverage).  Both probes go to Mem0/Qdrant payload
+    filters, but this seam deliberately runs BEFORE the
+    ``write_graphiti``/``write_mem0`` branching so that no write path can
+    bypass the vocabulary rules.  The consequence, spelled out rather than
+    left to be discovered: for a Graphiti-primary category
+    (``entities_and_relations``, ``temporal_facts``,
+    ``decisions_and_rationale``) a ``canonical: True`` record never lands
+    in Mem0, so the count cannot see a previously-written Graphiti-primary
+    canonical and the <=1-per-``(project, topic)`` rule does NOT hold for
+    those categories.  This matches the PRD, whose whole vocabulary is
+    framed as the Mem0 metadata vocabulary.
+
+    The probe is nonetheless issued for every canonical write rather than
+    skipped for Graphiti-primary ones, deliberately: ``dual_write`` can
+    route any category into Mem0 too, so a category-based skip would be
+    wrong exactly when it mattered, and a Graphiti-primary canonical that
+    DOES have a Mem0 twin still gets caught.  The cost is one count that
+    can only return 0 on a Graphiti-only canonical write — a rare write on
+    a rare key.  ``TestCanonicalUniquenessAtSeam`` pins this behaviour for
+    ``decisions_and_rationale`` so a later reader cannot mistake it for
+    coverage.  Closing the gap properly needs a Graphiti-side count, which
+    the PRD does not specify — do not fake it here.
+
+    PROBE FAILURE (3198 amendment).  Both probes talk to Qdrant and
+    ``Mem0Backend.count_by_metadata`` propagates a read timeout by
+    contract, so the probe can fail for reasons that have nothing to do
+    with the write — including for a Graphiti-primary write that would
+    never have touched Mem0 at all.  Explicitly decided, not incidental:
+
+    * a failure is ALWAYS censused, under ``code``
+      ``canonical_uniqueness_check_unavailable`` — degradation is loud, and
+      an operator can grep the same census stream they already watch;
+    * ``enforce = False`` (the shipped default) → the write PROCEEDS.  Warn
+      mode's whole contract is "census the violation and let the write
+      through"; failing a valid write because the *complaint machinery* was
+      unavailable would be strictly worse than the duplicate it is trying to
+      prevent, and would contradict this seam's promise that everything but
+      the enforce-raise is best-effort;
+    * ``enforce = True`` → FAIL CLOSED: the original backend error is
+      re-raised.  An operator who turned enforcement on asked for the
+      invariant to hold; admitting an unverifiable canonical would be the
+      silent fail-soft the house norm forbids.  The error surfaces as
+      itself (bare ``raise``, traceback intact) rather than being dressed up
+      as a :class:`CanonicalUniquenessViolation`, because "the store was
+      unreachable" and "a duplicate exists" are different facts and a caller
+      must be able to tell them apart.
+
+    Ordering and guards are load-bearing — the ORDINARY write path must
+    issue ZERO extra round-trips:
+
+    1. not an asserted canonical → return.  Every non-canonical write, i.e.
+       almost all of them, stops here having done no I/O.
+    2. ``topic`` missing or not slug-valid → return.  The shape violation
+       was already reported by the pure validator, and we must never build
+       a query on a malformed key (``count_by_metadata`` also rejects an
+       empty filter).
+    3. count == 0 → return.  The happy path pays exactly one exact Qdrant
+       count and never scrolls.
+    4. otherwise resolve the incumbent's id and reject.
+
+    WHY COUNT THEN SCROLL: V1 contract-fixes ``count_memories_by_metadata``
+    as the INV-3 mechanism, but also requires the error to name the existing
+    canonical's id — which an ``int`` structurally cannot carry.  Counting
+    first honours both, and confines the second round-trip to a path that is
+    already failing the write, where its cost is irrelevant.
+
+    WHY THE EXISTING ``enforce`` FLAG AND NOT A NEW ONE: measured, not
+    assumed.  At the time of writing the live ``dark_factory`` corpus holds
+    exactly ONE ``canonical: true`` record, and its ``topic`` is
+    ``eval_worktree_plan_tools_missing`` — snake_case, which fails
+    ``TOPIC_SLUG_RE``.  Enforcing uniqueness on day one over a topic key
+    whose own live values still only warn would be the census-refuted-premise
+    outage the warn default exists to prevent, and would make uniqueness the
+    single fatal check that ignores the flag every sibling check honours.
+    THE PRECONDITION for flipping ``memory_metadata.enforce`` is leaf θ's
+    retro-stamping sweep normalizing those topics — check that has landed
+    before you flip it.
+
+    RESIDUAL — this check is inherently TOCTOU-windowed: two concurrent
+    first-canonical writes for one topic can both observe 0 and both
+    succeed.  The PRD specifies no locking and Qdrant has no unique
+    constraint, so the window is stated plainly rather than papered over
+    with an implication of atomicity.  ``pick_survivor``
+    (``fused-memory/scripts/audit_duplicate_memories.py``) remains the
+    after-the-fact backstop that resolves a duplicate pair.  Do NOT add
+    locking here — that would be an unreviewed scope expansion.
+    """
+    if meta.get('canonical') is not True:
         return
 
-    emit_schema_warnings(violations, project_id=project_id, agent_id=agent_id)
+    topic = meta.get('topic')
+    if not isinstance(topic, str) or not is_valid_topic_slug(topic):
+        return
 
-    unknown_keys = [v.key for v in violations if v.code == 'unknown_key']
-    if unknown_keys and storm_detector.record(project_id, agent_id, unknown_keys):
-        if project_root:
-            await asyncio.to_thread(
-                file_unknown_key_storm_escalation,
-                project_root,
-                project_id=project_id,
-                agent_id=agent_id,
-                keys=unknown_keys,
-            )
-        else:
-            # No configured taskmaster.project_root means no project queue to
-            # file into. The census lines are already out, so the signal is
-            # not lost — only the escalation.
-            logger.debug(
-                'memory_metadata: unknown-key storm from project_id=%r '
-                'agent_id=%r but no project_root is configured; not escalating',
-                project_id, agent_id,
-            )
+    filters = {'topic': topic, 'canonical': True}
 
-    if config.enforce and any(v.fatal for v in violations):
-        raise MemoryMetadataValidationError([v for v in violations if v.fatal])
+    def _census(code: str, message: str) -> None:
+        """Emit one uniqueness census line.
+
+        Routed through the SAME ``emit_schema_warnings`` path the shape
+        violations use, so every code this check can produce is
+        grep-anchored in the one census format operators already know
+        (V1: "grep-anchored, never renamed").
+        """
+        emit_schema_warnings(
+            [MetadataViolation(key='canonical', code=code, message=message, fatal=True)],
+            project_id=project_id,
+            agent_id=agent_id,
+        )
+
+    try:
+        if await count_canonical(project_id, filters) == 0:
+            return
+        records = await find_canonical(project_id, filters, limit=1)
+    except Exception as exc:
+        # The PROBE failed, not the write — a Qdrant timeout/outage, which
+        # `count_by_metadata` propagates by contract.  Always censused
+        # (degradation is loud); fail-open under the shipped warn default
+        # because failing a valid write when only the complaint machinery
+        # broke is worse than the duplicate it guards against; fail-closed
+        # under `enforce` because an unverifiable canonical must not be
+        # admitted silently.  Re-raised bare so the caller sees the real
+        # backend error rather than a CanonicalUniquenessViolation that
+        # would assert a duplicate we never actually observed.  Full
+        # reasoning under PROBE FAILURE in the docstring.
+        _census(
+            'canonical_uniqueness_check_unavailable',
+            f'could not verify <=1 canonical per (project, topic) for '
+            f'project_id={project_id!r} topic={topic!r}: '
+            f'{type(exc).__name__}: {exc}',
+        )
+        if config.enforce:
+            raise
+        return
+
+    incumbent_id = (
+        records[0].get('id', _CANONICAL_INCUMBENT_UNKNOWN)
+        if records
+        else _CANONICAL_INCUMBENT_UNKNOWN
+    )
+    error = CanonicalUniquenessViolation(
+        project_id=project_id, topic=topic, incumbent_id=incumbent_id
+    )
+
+    # `config.enforce` is read PER CALL off the shared config object, never
+    # captured, so a config edit takes effect on the next write — the same
+    # note this seam already makes about the shape-check enforce flag.
+    if config.enforce:
+        raise error
+
+    # Warn mode: census the violation and let the write proceed.
+    _census('canonical_uniqueness_violation', str(error))
 
 
 def _apply_cycle_summary_metadata_tagging(
@@ -2387,6 +2587,11 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            # Bound methods, not `self`: the module-level helper stays
+            # decoupled from MemoryService and trivially stubbable, matching
+            # how it already takes storm_detector/config as collaborators.
+            count_canonical=self.count_memories_by_metadata,
+            find_canonical=self.get_memories_by_metadata,
         )
 
         write_graphiti = (
@@ -2753,6 +2958,11 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            # Bound methods, not `self`: the module-level helper stays
+            # decoupled from MemoryService and trivially stubbable, matching
+            # how it already takes storm_detector/config as collaborators.
+            count_canonical=self.count_memories_by_metadata,
+            find_canonical=self.get_memories_by_metadata,
         )
 
         mem0_result = None

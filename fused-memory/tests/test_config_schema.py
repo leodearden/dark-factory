@@ -32,6 +32,15 @@ from fused_memory.config.schema import (
 from fused_memory.server.near_duplicate_guard import find_matching_topic_cluster
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
 
+# Imported from the LEAF, not from memory_metadata: this test module asserts
+# the config side's behaviour, and pulling the registry here would drag in
+# mem0 and mask the very import-lightness the extraction bought (task 3198).
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    TOPIC_SLUG_RE,
+    is_valid_topic_slug,
+)
+
 
 class _DummySettings(BaseSettings):
     pass
@@ -1363,6 +1372,119 @@ class TestProceduralTopicClusterModel:
     def test_rejects_min_phrase_hits_below_one(self):
         with pytest.raises(ValidationError):
             ProceduralTopicCluster(topic_id='t', phrases=['a', 'b'], min_phrase_hits=0)
+
+
+class TestProceduralTopicClusterTopicIdSlug:
+    """``topic_id`` shares ONE namespace with ``metadata.topic`` (PRD D4, task 3198).
+
+    Before leaf ε, ``topic_id`` was a bare ``str``: an operator could seed a
+    snake_case cluster id that could never equal any validated
+    ``metadata.topic``, so 3135's auto-seed invariant
+    (``cluster.topic_id == canonical.metadata.topic``) was unenforceable and
+    the guard would silently match nothing. The validator makes that a
+    config-LOAD failure instead.
+    """
+
+    @pytest.mark.parametrize(
+        ('bad_id', 'why'),
+        [
+            ('bad_slug', 'snake_case — the shape 98 of 352 live topics have'),
+            ('Bad-Slug', 'uppercase'),
+            ('bad topic-slug', 'embedded space'),
+            ('-lead', 'leading separator'),
+            ('', 'empty'),
+            ('a' * (TOPIC_SLUG_MAX_LEN + 1), 'over the length cap'),
+        ],
+    )
+    def test_rejects_non_slug_topic_id(self, bad_id, why):
+        with pytest.raises(ValidationError) as excinfo:
+            ProceduralTopicCluster(topic_id=bad_id, phrases=['a', 'b'])
+        message = str(excinfo.value)
+        assert repr(bad_id) in message, f'must quote the offending value ({why})'
+        assert TOPIC_SLUG_RE.pattern in message, 'must name the slug rule'
+        assert 'fused_memory.topic_slug' in message, 'must name the rule/home so it is findable'
+
+    def test_over_length_id_is_rejected_by_length_not_by_the_regex(self):
+        """Pins that the validator applies the CAP, not merely the pattern.
+
+        The regex accepts an over-long run of ``a``s, so without this the
+        over-length case above would pass for the wrong reason and deleting
+        the length clause would go unnoticed.
+        """
+        over = 'a' * (TOPIC_SLUG_MAX_LEN + 1)
+        assert TOPIC_SLUG_RE.match(over), 'the regex alone must NOT reject it'
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(topic_id=over, phrases=['a', 'b'])
+
+    @pytest.mark.parametrize('good_id', ['some-topic', 't', 'x1-2y'])
+    def test_accepts_conforming_topic_id(self, good_id):
+        """Positive control: the shapes the pre-existing tests already use.
+
+        ``'some-topic'`` and ``'t'`` are the exact ids
+        ``TestProceduralTopicClusterModel`` constructs, so this proves the
+        new validator adds a rejection without regressing any existing case.
+        """
+        assert ProceduralTopicCluster(topic_id=good_id, phrases=['a', 'b']).topic_id == good_id
+
+    def test_default_seeded_clusters_all_survive_the_validator(self):
+        """The shipped default config must still LOAD (PRD §10's hard requirement).
+
+        Constructed via ``ReconciliationConfig()`` rather than by copying
+        the ids, so a future seed that breaks the rule fails here rather
+        than at an operator's config load.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert len(clusters) >= 5
+        for cluster in clusters:
+            assert is_valid_topic_slug(cluster.topic_id)
+
+    def test_snake_case_cluster_id_in_yaml_fails_at_config_load(self, tmp_path, monkeypatch):
+        """Operator-facing: the failure lands at LOAD, not silently at match time.
+
+        This is the whole point of validating on the config side. A
+        snake_case ``topic_id`` can never equal a validated
+        ``metadata.topic``, so without this the guard would load cleanly and
+        then match nothing forever — a silent no-op, the failure mode
+        ``extra='forbid'`` is already on this model to prevent.
+        """
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(
+            yaml.dump(
+                {
+                    'reconciliation': {
+                        'procedural_knowledge_topic_guard_clusters': [
+                            {'topic_id': 'eval_worktree_plan_tools_missing', 'phrases': ['a', 'b']},
+                        ],
+                    },
+                },
+            ),
+        )
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+        with pytest.raises(ValidationError) as excinfo:
+            FusedMemoryConfig()
+        assert 'eval_worktree_plan_tools_missing' in str(excinfo.value)
+
+    def test_conforming_cluster_id_in_yaml_loads(self, tmp_path, monkeypatch):
+        """Positive control for the loader path itself.
+
+        Without it, the failure above could be caused by an unrelated YAML
+        or env-var problem rather than by the slug rule.
+        """
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(
+            yaml.dump(
+                {
+                    'reconciliation': {
+                        'procedural_knowledge_topic_guard_clusters': [
+                            {'topic_id': 'eval-worktree-plan-tools-missing', 'phrases': ['a', 'b']},
+                        ],
+                    },
+                },
+            ),
+        )
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+        clusters = FusedMemoryConfig().reconciliation.procedural_knowledge_topic_guard_clusters
+        assert [c.topic_id for c in clusters] == ['eval-worktree-plan-tools-missing']
 
 
 class TestProceduralTopicGuardClustersDefault:
