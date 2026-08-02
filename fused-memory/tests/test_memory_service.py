@@ -9338,3 +9338,129 @@ class TestMemoryMetadataValidationAtSeam:
         service.config.memory_metadata.enforce = True
         with pytest.raises(MemoryMetadataValidationError):
             await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
+
+
+class TestCanonicalUniquenessAtSeam:
+    """<=1 canonical memory per (project, topic) — the live INV-3 re-check.
+
+    Task 3198 (leaf ε). This is the only half of `canonical` that needs
+    live store state, so it lives at the async seam rather than in the
+    pure validator. Every case runs against BOTH entry points: D8/§2 pin
+    enforcement here precisely so `add_system_record` cannot bypass it.
+    """
+
+    _TOPIC = 'some-topic'
+    _INCUMBENT = 'incumbent-uuid-1'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_second_canonical_is_rejected_and_names_the_incumbent(
+        self, service, entry_point
+    ):
+        """V1: the incumbent is NAMED, not merely counted.
+
+        A bare "a canonical already exists" would leave the operator with
+        nothing to go look at; naming the id is the contract-fixed
+        obligation, and the reason the seam scrolls after counting.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        assert self._INCUMBENT in str(excinfo.value)
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        assert excinfo.value.topic == self._TOPIC
+        assert excinfo.value.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_rejection_happens_before_any_persistence(self, service, entry_point):
+        """Nothing may reach the backend once the write is doomed."""
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        _mm_backend_mock(service, entry_point).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejection_leaves_no_pending_mem0_intent(self, service):
+        """A rejected write must leave nothing for `recover_mem0_intents`.
+
+        The write-ahead intent is logged before the backend call, so a
+        check that ran too late would reject the write and STILL leave a
+        pending intent that recovery would later replay — resurrecting
+        precisely the duplicate canonical this rule forbids.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        journal = _mm_install_journal(service)
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        journal.log_mem0_intent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_uniqueness_is_scoped_to_project_and_topic(self, service, entry_point):
+        """INV-3 scoping is exact: the key is (project, topic), not global.
+
+        A filter missing `canonical` would count every memory in the
+        topic; one missing `topic` would make the rule global and reject
+        the SECOND canonical anywhere. Both would pass a laxer assertion
+        that only checked that a count happened.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+
+        service.mem0.count_by_metadata.assert_awaited_once()
+        call = service.mem0.count_by_metadata.await_args
+        filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
+        assert filters == {'topic': self._TOPIC, 'canonical': True}
+        scope = call.kwargs.get('scope', call.args[0] if call.args else None)
+        assert 'dark_factory' in str(scope), f'the count must be project-scoped, got {scope!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_first_canonical_for_a_topic_succeeds(self, service, entry_point):
+        """POSITIVE CONTROL — without it the assert_not_called cases above
+        cannot distinguish "correctly rejected" from "this branch is dead".
+
+        The fixture default is count=0, i.e. no incumbent.
+        """
+        service.config.memory_metadata.enforce = True
+        journal = _mm_install_journal(service)
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+        meta = _mm_backend_meta(service, entry_point)
+        assert meta['canonical'] is True
+        assert meta['topic'] == self._TOPIC
+        if entry_point == 'add_memory':
+            journal.log_mem0_intent.assert_called()
