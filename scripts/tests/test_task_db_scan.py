@@ -425,20 +425,17 @@ def test_run_scan_cli_exits_1_when_the_scan_finds_a_match(tmp_path, capsys):
     assert capsys.readouterr().out.strip() == "rendered:1"
 
 
-def test_run_scan_cli_exits_0_when_every_db_is_unreadable(tmp_path, capsys):
-    """PINS A KNOWN GAP, not a desirable behaviour.
+def test_run_scan_cli_exits_3_when_every_db_is_unreadable(tmp_path, capsys):
+    """Every resolved database failing to open is NOT a clean sweep.
 
-    Every resolved database failing to open still exits 0 — indistinguishable
-    by exit code from a genuinely clean sweep, with only the stderr warnings
-    to tell them apart. That is pre-existing (verified: the pre-extraction
-    main() on 2e85a165df built the same `unreadable` list and never consulted
-    it either) and is deliberately preserved by this pure-extraction task
-    rather than silently changed inside a refactor.
+    Nothing was scanned at all, so exit 3 keeps that outcome distinct from 0
+    per docs/legibility/design-invariants.md's no-silent-fail-soft rule —
+    a cron/CI consumer reading only the exit code must never take a total
+    failure for a clean run. Mirrors audit_wiped_metadata_files.py's exit-3
+    semantics for the same condition.
 
-    Ticket tkt_0RRZ2KVR9ATP756VRBK0RAT5MA proposes returning 3 here, mirroring
-    audit_wiped_metadata_files.py's exit-3 semantics for the same condition.
-    This test exists so that flip is a deliberate, visible edit instead of an
-    unnoticed one — if you are here to make it 3, change the assertion.
+    Contrast the partial-failure sibling below, which stays 0: there at least
+    one database was genuinely scanned and found clean.
     """
     db = tmp_path / "a.db"
     db.write_text("")
@@ -446,18 +443,24 @@ def test_run_scan_cli_exits_0_when_every_db_is_unreadable(tmp_path, capsys):
     def scan(db_path):
         raise sqlite3.Error("file is not a database")
 
-    assert _cli(["--db", str(db)], scan) == 0
+    assert _cli(["--db", str(db)], scan) == 3
 
     captured = capsys.readouterr()
-    assert captured.out.strip() == "rendered:0"  # reads exactly like a clean sweep
-    assert "results below are incomplete" in captured.err  # only stderr disagrees
+    # The report is still printed, so stdout alone STILL reads clean — it is
+    # the exit code plus stderr that now unambiguously disagree with it.
+    assert captured.out.strip() == "rendered:0"
+    assert "results below are incomplete" in captured.err
+    assert "NOTHING was scanned" in captured.err
 
 
 def test_run_scan_cli_exits_0_when_some_dbs_unreadable_and_rest_clean(tmp_path, capsys):
     """Partial failure keeps the sweep going and reports on what WAS readable.
 
-    Unlike the all-unreadable case above, exit 0 here is correct-as-designed:
-    at least one database was genuinely scanned and found clean.
+    Unlike the all-unreadable case above (which exits 3), exit 0 here is
+    correct-as-designed: at least one database was genuinely scanned and found
+    clean. This is also the standing guard against gating exit 3 on "some db
+    was unreadable AND no matches were found" — that condition would wrongly
+    fire here.
     """
     good = tmp_path / "good.db"
     bad = tmp_path / "bad.db"
