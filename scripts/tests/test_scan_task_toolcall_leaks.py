@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 # discover_db_paths is imported from its DEFINING module rather than re-exported
@@ -368,7 +369,7 @@ SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"
 
 def _run_cli(*args, timeout=10):
     return subprocess.run(
-        ["python3", str(SCRIPT), *args],
+        [sys.executable, str(SCRIPT), *args],
         capture_output=True,
         text=True,
         timeout=timeout,
