@@ -69,15 +69,81 @@ def _stub_git_ops(**overrides) -> types.SimpleNamespace:
             is_ancestor=AsyncMock(return_value=True),
         )
         # stub.find_merge_marker is an AsyncMock(return_value=None) by default
+
+    ``find_task_citation_commit`` / ``commit_effect_present_in_main`` are the
+    two sub-methods ``validate_landing_evidence`` calls (task 3103's citation
+    gate).  They MUST be present by default: without them the SimpleNamespace
+    raises AttributeError inside the Tier-3.5 fire-safe wrapper, which
+    swallows it and degrades every ancestor/marker-arm test to a misleading
+    ``unknown`` that looks like a passing guard.  The defaults are the
+    conservative pair — no citation found (so the gate rejects unless a test
+    opts in) and effect present (so the FIX 1' guard is not what a test
+    accidentally trips over).
     """
     stub = types.SimpleNamespace(
         resolve_branch_sha=AsyncMock(return_value=None),
         is_ancestor=AsyncMock(return_value=False),
         find_merge_marker=AsyncMock(return_value=None),
+        find_task_citation_commit=AsyncMock(return_value=None),
+        commit_effect_present_in_main=AsyncMock(return_value=True),
     )
     for name, fn in overrides.items():
         setattr(stub, name, fn)
     return stub
+
+
+def _make_config(
+    tmp_path: Path, *, commit_citation_pattern: str | None = None,
+) -> OrchestratorConfig:  # type: ignore[reportInvalidTypeForm]
+    """Build the standard unit-test OrchestratorConfig rooted at *tmp_path*.
+
+    Wraps the GitConfig literal this module repeated inline.  ``None`` (the
+    default) means "use the built-in DEFAULT_COMMIT_CITATION_PATTERN" and is
+    NOT the opt-out; ``''`` is the documented per-project opt-out that
+    disables the citation check entirely (config.py ``commit_citation_pattern``).
+    """
+    return OrchestratorConfig(
+        project_root=tmp_path,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            commit_citation_pattern=commit_citation_pattern,
+        ),
+    )
+
+
+def _stub_harness(
+    git_ops, *, metadata: dict[str, Any] | None = None, get_task_raises: bool = False,
+) -> types.SimpleNamespace:
+    """Return the standard merge_status harness stub wired to *git_ops*.
+
+    By default the stub has NO ``scheduler`` attribute at all — which is the
+    fail-soft path task 3103's ``_git_authority_task_metadata`` helper is
+    built for (metadata unavailable → skip the degeneracy check → still apply
+    the citation gate), and the shape every pre-existing test in this module
+    already uses.
+
+    Pass ``metadata=`` to attach a ``.scheduler`` whose ``get_task`` resolves
+    to ``{'metadata': metadata}``, or ``get_task_raises=True`` to attach one
+    whose ``get_task`` raises — the scheduler-fault path.
+    """
+    harness = types.SimpleNamespace(
+        _merge_worker=None,
+        _terminal_retention=None,
+        git_ops=git_ops,
+    )
+    if get_task_raises:
+        harness.scheduler = types.SimpleNamespace(
+            get_task=AsyncMock(side_effect=RuntimeError('scheduler unreachable')),
+        )
+    elif metadata is not None:
+        harness.scheduler = types.SimpleNamespace(
+            get_task=AsyncMock(return_value={'metadata': metadata}),
+        )
+    return harness
 
 
 # ---------------------------------------------------------------------------
@@ -154,18 +220,9 @@ class TestMergeStatusGitAuthority:
             is_ancestor=ia,
             find_merge_marker=fmm,
         )
-        stub_harness = types.SimpleNamespace(
-            _merge_worker=None,
-            _terminal_retention=None,
-            git_ops=stub_git,
-        )
+        stub_harness = _stub_harness(stub_git)
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            max_concurrent_tasks=1,
-            git=GitConfig(main_branch='main', branch_prefix='task/', remote='origin',
-                          worktree_dir='.worktrees'),
-        )
+        config = _make_config(tmp_path)
         # NO event_store — durable tiers miss, so Tier-3.5 must fire
         server = create_server(esc_queue, harness=stub_harness, orch_config=config)
 
@@ -206,18 +263,9 @@ class TestMergeStatusGitAuthority:
             is_ancestor=ia,
             find_merge_marker=fmm,
         )
-        stub_harness = types.SimpleNamespace(
-            _merge_worker=None,
-            _terminal_retention=None,
-            git_ops=stub_git,
-        )
+        stub_harness = _stub_harness(stub_git)
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            max_concurrent_tasks=1,
-            git=GitConfig(main_branch='main', branch_prefix='task/', remote='origin',
-                          worktree_dir='.worktrees'),
-        )
+        config = _make_config(tmp_path)
         server = create_server(esc_queue, harness=stub_harness, orch_config=config)
 
         result = await _call_merge_status(server, task_id='456')
@@ -239,17 +287,8 @@ class TestMergeStatusGitAuthority:
     ) -> Any:
         """Helper: create a server with git_ops wired, no event_store."""
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(
-            _merge_worker=None,
-            _terminal_retention=None,
-            git_ops=stub_git,
-        )
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            max_concurrent_tasks=1,
-            git=GitConfig(main_branch='main', branch_prefix='task/', remote='origin',
-                          worktree_dir='.worktrees'),
-        )
+        stub_harness = _stub_harness(stub_git)
+        config = _make_config(tmp_path)
         return create_server(esc_queue, harness=stub_harness, orch_config=config)
 
     async def test_fire_safe_resolve_branch_sha_raises_returns_unknown(
