@@ -427,6 +427,118 @@ class TestMergeStatusGitAuthority:
         # path is not entered
         fmm.assert_not_called()
 
+    # ── task 3103: ancestor-arm degeneracy guard ─────────────────────────────
+
+    async def test_degenerate_ancestor_branch_returns_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """A branch parked at an OLD main commit must return unknown, not done.
+
+        The live 3024/3031 shape (53 of the 64 reify census candidates): a
+        warm-lane CoW seed that faulted, or a task that never committed, sits
+        at a commit that IS an ancestor of main and is NOT main's tip — so
+        both conjuncts of the pre-existing `tip != main_tip and is_ancestor`
+        guard pass and the tier answers a confident `done` against a commit
+        containing none of the task's work.
+
+        branch_tip_sha == branch_base_sha proves zero commits were ever
+        pushed, so the honest answer is Tier-4 unknown.
+        """
+        tip = 'a' * 40
+        main_sha = 'm' * 40
+        stub_git = _stub_git_ops(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b == 'task/3024' else main_sha
+            ),
+            is_ancestor=AsyncMock(return_value=True),
+        )
+        # branch_base_sha == tip → the branch never advanced past creation
+        stub_harness = _stub_harness(stub_git, metadata={'branch_base_sha': tip})
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            esc_queue, harness=stub_harness, orch_config=_make_config(tmp_path),
+        )
+
+        result = await _call_merge_status(server, task_id='3024')
+
+        assert result.get('state') == 'unknown', (
+            f'Degenerate branch must NOT resolve as done, got: {result}'
+        )
+        assert 'hint' in result, f'Expected hint key in unknown response: {result}'
+        # No terminal-shaped keys may leak into the honest unknown
+        assert 'merge_sha' not in result, f'merge_sha leaked into unknown: {result}'
+        assert 'kind' not in result, f'kind leaked into unknown: {result}'
+
+    async def test_degenerate_branch_with_citation_on_main_still_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """Ordering pin: the degeneracy guard runs BEFORE the citation gate.
+
+        The reify-5493 case that triggered the investigation: a degenerate
+        branch whose task nonetheless HAS a citing commit on main (someone
+        landed a `docs(5493): ...` commit directly).  A citation-first — or
+        citation-only — design accepts here and still answers a wrong `done`.
+
+        Asserting find_task_citation_commit is never called is the only
+        assertion that would catch a refactor reordering the two gates.
+        """
+        tip = 'a' * 40
+        main_sha = 'm' * 40
+        citation = 'c' * 40
+        ftcc = AsyncMock(return_value=citation)
+        stub_git = _stub_git_ops(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b == 'task/5493' else main_sha
+            ),
+            is_ancestor=AsyncMock(return_value=True),
+            find_task_citation_commit=ftcc,
+            commit_effect_present_in_main=AsyncMock(return_value=True),
+        )
+        stub_harness = _stub_harness(stub_git, metadata={'branch_base_sha': tip})
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            esc_queue, harness=stub_harness, orch_config=_make_config(tmp_path),
+        )
+
+        result = await _call_merge_status(server, task_id='5493')
+
+        assert result.get('state') == 'unknown', (
+            f'Degenerate branch must stay unknown even with a citation on '
+            f'main, got: {result}'
+        )
+        ftcc.assert_not_called()
+
+    async def test_degenerate_guard_consults_task_metadata_by_bare_id(
+        self, tmp_path: Path
+    ) -> None:
+        """The metadata lookup uses the BARE task id, not the branch ref.
+
+        Entered via the already-prefixed ``branch='task/3024'`` form (the
+        shape the live repro used), the bare id must be derived by stripping
+        the configured prefix — re-prefixing would look up a task that does
+        not exist and silently lose the guard.
+        """
+        tip = 'a' * 40
+        main_sha = 'm' * 40
+        stub_git = _stub_git_ops(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b == 'task/3024' else main_sha
+            ),
+            is_ancestor=AsyncMock(return_value=True),
+        )
+        stub_harness = _stub_harness(stub_git, metadata={'branch_base_sha': tip})
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            esc_queue, harness=stub_harness, orch_config=_make_config(tmp_path),
+        )
+
+        result = await _call_merge_status(server, branch='task/3024')
+
+        assert result.get('state') == 'unknown', (
+            f'Degenerate branch via branch= form must be unknown, got: {result}'
+        )
+        stub_harness.scheduler.get_task.assert_awaited_once_with('3024')
+
 
 # ---------------------------------------------------------------------------
 # Real-git integration test — the canonical 4352 lost-record shape end-to-end
@@ -513,6 +625,71 @@ class TestMergeStatusGitAuthorityIntegration:
         )
         assert len(result['merge_sha']) == 40, (
             f'merge_sha must be a 40-char SHA, got: {result["merge_sha"]!r}'
+        )
+
+    async def test_degenerate_branch_parked_on_old_main_returns_unknown(
+        self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig  # type: ignore[reportInvalidTypeForm]
+    ) -> None:
+        """End-to-end, no stubs: the user-observable false-positive signal.
+
+        Reproduces the live shape behind ~71 non-terminal tasks: a branch
+        created at some main commit that never received a commit, while main
+        moved on.  The branch IS an ancestor of main and is NOT at main's tip
+        — exactly the census preconditions — so before task 3103 merge_status
+        answered done/found_on_main against a foreign commit.
+
+        The advancing commit on main deliberately does NOT cite the task, so
+        the citation gate is not what produces the unknown here; the
+        degeneracy guard is.
+        """
+        tid = '3024'
+        branch = f'task/{tid}'
+
+        # --- Branch created at current main, zero commits pushed to it ---
+        rc, base_raw, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        branch_base_sha = base_raw.strip()
+        rc, _, err = await _run(
+            ['git', 'branch', branch, branch_base_sha], cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'branch create failed: {err!r}'
+
+        # --- main advances with an unrelated, non-citing commit ---
+        (git_ops.project_root / 'unrelated.txt').write_text('someone else\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'chore: unrelated work by another task'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'main advance failed: {err!r}'
+
+        # --- The census preconditions the false positive rode on ---
+        assert await git_ops.is_ancestor(branch, 'main'), (
+            'precondition: the parked branch must be an ancestor of main'
+        )
+        rc, main_tip_raw, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert main_tip_raw.strip() != branch_base_sha, (
+            'precondition: branch tip must differ from main tip'
+        )
+
+        stub_harness = _stub_harness(
+            git_ops, metadata={'branch_base_sha': branch_base_sha},
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            esc_queue, harness=stub_harness, orch_config=orch_config,
+        )
+
+        result = await _call_merge_status(server, task_id=tid)
+
+        assert result.get('state') == 'unknown', (
+            f'A branch parked on an old main commit must return unknown, '
+            f'got: {result}'
         )
 
     async def test_live_branch_merge_sha_is_branch_tip_not_merge_commit(
