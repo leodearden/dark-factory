@@ -9464,3 +9464,105 @@ class TestCanonicalUniquenessAtSeam:
         assert meta['topic'] == self._TOPIC
         if entry_point == 'add_memory':
             journal.log_mem0_intent.assert_called()
+
+    # -- shipped default: warn, do not reject -----------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_warn_mode_censuses_but_does_not_reject(
+        self, service, entry_point, caplog
+    ):
+        """THE regression that protects the live fleet.
+
+        Uniqueness must honour the same `enforce` flag every sibling fatal
+        check honours. The one real `canonical: true` record in
+        dark_factory carries topic `eval_worktree_plan_tools_missing`
+        (snake_case), so a shipped-on enforce would start rejecting
+        canonical writes against a corpus leaf θ has not normalized yet --
+        exactly the census-refuted-premise outage the warn default exists
+        to prevent.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False, 'warn is the shipped default'
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'canonical_uniqueness_violation' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    async def test_enforce_is_read_per_call_not_captured(self, service):
+        """A config edit must take effect on the NEXT write."""
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        meta = {'topic': self._TOPIC, 'canonical': True}
+
+        await _mm_write(service, 'add_memory', metadata=dict(meta))
+        service.config.memory_metadata.enforce = True
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(service, 'add_memory', metadata=dict(meta))
+
+    # -- no wasted I/O on the ordinary path --------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize(
+        ('metadata', 'expected_code'),
+        [
+            ({'topic': 'some-topic'}, None),
+            ({'kind': 'cycle_summary'}, None),
+            ({'canonical': False, 'topic': 'some-topic'}, None),
+            ({'canonical': True}, 'canonical_without_topic'),
+            ({'canonical': True, 'topic': 'bad_slug'}, 'invalid_topic_slug'),
+        ],
+    )
+    async def test_no_round_trip_on_the_ordinary_path(
+        self, service, entry_point, metadata, expected_code, caplog
+    ):
+        """The guards must short-circuit BEFORE any await.
+
+        The last two cases also assert their census code, so "no query
+        issued" is proven to be the guard working rather than the whole
+        check being dead — an assertion that would otherwise pass just as
+        happily against a deleted feature.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await _mm_write(service, entry_point, metadata=dict(metadata))
+
+        service.mem0.count_by_metadata.assert_not_awaited()
+        if expected_code is not None:
+            assert expected_code in _mm_census_codes(caplog)
+
+    # -- race resilience ---------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_count_scroll_race_still_yields_a_structured_rejection(
+        self, service, entry_point
+    ):
+        """Count says 1, scroll comes back empty (concurrent delete).
+
+        The rejection must survive with a sentinel id rather than dying on
+        `records[0]` — an IndexError on the live write path would turn a
+        clean policy rejection into an unhandled crash.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        assert excinfo.value.topic == self._TOPIC
+        assert excinfo.value.incumbent_id  # a sentinel, never empty or absent
