@@ -70,6 +70,49 @@ def _make_qdrant_mock(points: list | None = None) -> AsyncMock:
     return client
 
 
+def _make_backend_pager(
+    pages: list[list] | None = None,
+    *,
+    raise_budget_after: int | None = None,
+    calls: list | None = None,
+) -> MagicMock:
+    """Mem0Backend stand-in whose scroll_collection_pages is an async generator.
+
+    Task 3225 moved the offset/next_offset walk into the backend, so this
+    script no longer touches the raw transport to enumerate a collection --
+    it drives ``backend.scroll_collection_pages`` and the pages are its
+    business.  *pages* is a list of point-lists purely so a test can prove
+    points from page 2+ still arrive; *raise_budget_after* makes the
+    generator raise ``ScrollPageBudgetExhausted`` mid-stream after that many
+    points, modelling a collection larger than the page budget.
+
+    *calls* collects ``(collection, kwargs)`` per scroll.
+    """
+    call_log = calls if calls is not None else []
+    page_list = pages if pages is not None else []
+
+    async def _scroll_collection_pages(collection, **kwargs):
+        call_log.append((collection, dict(kwargs)))
+        emitted = 0
+        for page in page_list:
+            for point in page:
+                if raise_budget_after is not None and emitted >= raise_budget_after:
+                    raise _mod.ScrollPageBudgetExhausted(
+                        f'collection={collection!r} exhausted its page budget',
+                    )
+                yield point
+                emitted += 1
+        if raise_budget_after is not None and emitted >= raise_budget_after:
+            raise _mod.ScrollPageBudgetExhausted(
+                f'collection={collection!r} exhausted its page budget',
+            )
+
+    backend = MagicMock()
+    backend.scroll_collection_pages = _scroll_collection_pages
+    backend._scroll_calls = call_log
+    return backend
+
+
 def _make_point(
     point_id: str,
     payload: dict | None = None,
@@ -1086,56 +1129,106 @@ class TestMergeGraphFamily:
 # ===========================================================================
 
 class TestScrollCollectionPoints:
-    """Tests for async scroll_collection_points(qdrant_client, collection, *, limit)."""
+    """async scroll_collection_points(backend, collection, *, page_size, max_pages)
+    -> (points, capped).
+
+    Task 3225: this used to issue exactly ONE scroll and discard
+    ``next_offset``, so a collection larger than --limit was permanently
+    reported UNRESOLVED and never migrated.  It now drains
+    ``Mem0Backend.scroll_collection_pages``, which pages properly -- a real
+    bug fix, not a refactor.
+
+    ``capped`` can no longer be inferred from ``len(points)`` (a fully-drained
+    multi-page scroll returns any count), so it is RETURNED explicitly.
+    """
 
     @pytest.mark.asyncio
-    async def test_calls_scroll_with_payload_and_vectors(self):
-        """scroll is called with with_payload=True AND with_vectors=True --
-        omitting with_vectors would silently drop embeddings."""
-        client = _make_qdrant_mock([])
+    async def test_returns_every_point_across_multiple_pages(self):
+        """THE bug fix: page 2+ arrives instead of being silently dropped."""
+        p1, p2, p3 = _make_point('p1'), _make_point('p2'), _make_point('p3')
+        backend = _make_backend_pager([[p1, p2], [p3]])
 
-        await _mod.scroll_collection_points(client, 'fused_dark-factory', limit=1000)
+        points, capped = await _mod.scroll_collection_points(
+            backend, 'reify_reify', page_size=2,
+        )
 
-        client.scroll.assert_called_once_with(
-            collection_name='fused_dark-factory',
-            with_payload=True,
-            with_vectors=True,
-            limit=1000,
+        assert points == [p1, p2, p3], 'a 2-page stream must yield all 3 points'
+        assert capped is False
+
+    @pytest.mark.asyncio
+    async def test_requests_vectors_and_forwards_the_page_budget(self):
+        """with_vectors=True is essential -- omitting it drops embeddings from
+        the returned points, which would silently destroy them once re-upserted
+        into the target collection (see merge_collection)."""
+        calls: list = []
+        backend = _make_backend_pager([[_make_point('p1')]], calls=calls)
+
+        await _mod.scroll_collection_points(
+            backend, 'reify_reify', page_size=500, max_pages=7,
+        )
+
+        _collection, kwargs = calls[0]
+        assert kwargs['with_vectors'] is True
+        assert kwargs['page_size'] == 500
+        assert kwargs['max_pages'] == 7
+
+    @pytest.mark.asyncio
+    async def test_passes_the_collection_name_verbatim_unprefixed(self):
+        """COLLECTION_MERGES holds LEGACY mis-named collections
+        ('reify_reify', 'fused_dark-factory') that a Scope structurally cannot
+        produce -- prefixing or re-deriving would address a collection that
+        does not exist."""
+        calls: list = []
+        backend = _make_backend_pager([[]], calls=calls)
+
+        await _mod.scroll_collection_points(backend, 'fused_dark-factory')
+
+        assert calls[0][0] == 'fused_dark-factory'
+
+    @pytest.mark.asyncio
+    async def test_budget_exhaustion_is_caught_and_reported_as_capped(self, caplog):
+        """A ScrollPageBudgetExhausted must NOT propagate out of this call.
+
+        run_consolidation states that a raising sub-operation must never abort
+        the whole run: earlier keys/sections of the same --apply pass may
+        already hold committed mutations.  Budget exhaustion is instead mapped
+        onto the EXISTING capped contract -- points collected so far, capped
+        True -- which the caller turns into UNRESOLVED (no upsert, no source
+        delete, non-zero exit).
+        """
+        p1, p2 = _make_point('p1'), _make_point('p2')
+        backend = _make_backend_pager([[p1, p2], [_make_point('p3')]], raise_budget_after=2)
+
+        with caplog.at_level('WARNING'):
+            points, capped = await _mod.scroll_collection_points(
+                backend, 'reify_reify', page_size=2, max_pages=1,
+            )
+
+        assert capped is True
+        assert points == [p1, p2], 'the points collected before the budget ran out'
+        assert any('reify_reify' in rec.message for rec in caplog.records), (
+            'no-silent-caps: the WARNING must name the collection; got '
+            f'{[r.message for r in caplog.records]}'
         )
 
     @pytest.mark.asyncio
-    async def test_returns_the_points(self):
-        """Returns the points list from the scroll result."""
-        points = [_make_point('p1'), _make_point('p2')]
-        client = _make_qdrant_mock(points)
+    async def test_no_warning_on_a_clean_drain(self):
+        """A fully-drained scroll is not a cap and must not warn."""
+        import logging as _logging
 
-        result = await _mod.scroll_collection_points(client, 'reify_reify', limit=1000)
+        backend = _make_backend_pager([[_make_point('p1')]])
+        records: list = []
+        handler = _logging.Handler()
+        handler.emit = records.append  # type: ignore[method-assign]
+        _mod.logger.addHandler(handler)
+        try:
+            points, capped = await _mod.scroll_collection_points(backend, 'reify_reify')
+        finally:
+            _mod.logger.removeHandler(handler)
 
-        assert result == points
-
-    @pytest.mark.asyncio
-    async def test_warns_when_point_count_hits_limit(self, caplog):
-        """No-silent-caps: hitting the limit logs a WARNING."""
-        points = [_make_point(f'p{i}') for i in range(3)]
-        client = _make_qdrant_mock(points)
-
-        with caplog.at_level('WARNING'):
-            await _mod.scroll_collection_points(client, 'reify_reify', limit=3)
-
-        assert any('limit' in rec.message.lower() for rec in caplog.records), (
-            f'Expected a limit-related WARNING, got: {[r.message for r in caplog.records]}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_no_warning_when_under_limit(self, caplog):
-        """Point count below the limit does not log a WARNING."""
-        points = [_make_point('p1')]
-        client = _make_qdrant_mock(points)
-
-        with caplog.at_level('WARNING'):
-            await _mod.scroll_collection_points(client, 'reify_reify', limit=1000)
-
-        assert caplog.records == []
+        assert capped is False
+        assert len(points) == 1
+        assert [r for r in records if r.levelno >= _logging.WARNING] == []
 
 
 # ===========================================================================
