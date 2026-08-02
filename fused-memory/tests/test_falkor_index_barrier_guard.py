@@ -85,7 +85,9 @@ def _calls_named(tree: ast.Module, name: str) -> list[ast.Call]:
     return found
 
 
-def _local_defs(tree: ast.Module, names: set[str]) -> list[ast.stmt]:
+def _local_defs(
+    tree: ast.Module, names: set[str]
+) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
     """Every (async) function definition in *tree* whose name is in *names*."""
     return [
         node
