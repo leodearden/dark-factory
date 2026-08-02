@@ -12,11 +12,15 @@ orchestrator/src/orchestrator/verify_cmd.py is created (step-2).
 from __future__ import annotations
 
 import dataclasses
+import pathlib
+import re
 import shlex
 
 import pytest
+import yaml
 
 from orchestrator.verify_cmd import (
+    ChainSegment,
     ToolKind,
     VerifyCmd,
     apply_pytest_numprocesses,
@@ -29,11 +33,18 @@ from orchestrator.verify_cmd import (
     reproject,
     scope_to,
     serial_pytest,
+    split_and_chain_segments,
     split_chain_tail,
     split_top_level_and,
     strip_cwd,
     with_junitxml,
 )
+
+# The committed repo-root config, loaded by the drift guard in
+# ``TestSplitAndChainSegmentsLiveConfigDrift``. ``parents[2]`` mirrors
+# ``conftest.REPO_ROOT`` and ``tests/scripts/test_fallback_verify_config.py``'s
+# ``DF_CONFIG_PATH``.
+_DF_CONFIG_PATH = pathlib.Path(__file__).resolve().parents[2] / 'dark-factory-orchestrator.yaml'
 
 # ---------------------------------------------------------------------------
 # Real config command strings, verbatim from the repo's orchestrator configs.
@@ -72,7 +83,7 @@ _ROOT_TEST_COMMAND = (
     ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
     ' && cd ../sampler && uv run pytest tests/ --timeout=300'
     ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ --timeout=300'
+    ' && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
 )
 
 # Not a config in this repo (yet) — the shape task 3218 predicts and must not
@@ -1738,3 +1749,421 @@ class TestDescribeDroppedClauses:
         )
         assert dropped == ('python3 "x.py',)
         assert fan_out is True
+
+
+# ---------------------------------------------------------------------------
+# split_and_chain_segments — the EXECUTION-layer sibling of split_chain_tail
+# (task 3338 / esc-3062-2).
+# ---------------------------------------------------------------------------
+
+# Segment 7 of `_ROOT_TEST_COMMAND`: a balanced `( ... )` group carrying its own
+# `||`, `;` and `&&` INSIDE the parens. It must come back as ONE atomic segment
+# — `tests/scripts/test_fallback_verify_config.py`'s cockpit guard documents at
+# `test_fanout_includes_cockpit_presence_guarded` that a naive `&&`-split breaks
+# exactly here, emitting two unbalanced shell fragments (a spurious RED).
+_COCKPIT_GROUP = '( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
+
+
+class TestSplitAndChainSegments:
+    """split_and_chain_segments(raw) -> list[ChainSegment] | None — the ACCEPT contract.
+
+    Where ``split_chain_tail`` decides WHICH command a scoper renders (the
+    DECISION layer, tasks 3061/3218), this decides HOW an already-decided
+    chain is EXECUTED: as N independently-run commands instead of one
+    shell-short-circuited string. Segments are emitted as verbatim byte-slices
+    of the input — nothing is re-rendered — and literal `cd X` clauses are
+    folded into a running relative cwd rather than executed.
+    """
+
+    def test_root_test_command_yields_one_segment_per_subproject(self):
+        """The committed fleet chain decomposes into its 8 runnable clauses.
+
+        Six `cd <subproject> && pytest` pairs, the cockpit subshell, and the
+        `tests/scripts/` clause — the LAST one, and the one esc-3062-2 reports
+        never ran because an earlier subproject's red short-circuited the shell.
+        """
+        segments = split_and_chain_segments(_ROOT_TEST_COMMAND)
+        assert segments is not None
+        assert len(segments) == 8
+        assert [s.cwd_rel for s in segments] == [
+            'shared',
+            'escalation',
+            'orchestrator',
+            'fused-memory',
+            'dashboard',
+            'sampler',
+            '.',
+            '.',
+        ]
+
+    def test_cockpit_subshell_is_one_atomic_segment(self):
+        """The `( ... )` group is never split on its interior `&&`."""
+        segments = split_and_chain_segments(_ROOT_TEST_COMMAND)
+        assert segments is not None
+        assert segments[6].command == _COCKPIT_GROUP
+        assert segments[6].cwd_rel == '.'
+        # A subshell's own `cd cockpit` never escapes it, so the NEXT segment
+        # is still at the worktree root.
+        assert segments[7].cwd_rel == '.'
+
+    def test_final_tests_scripts_segment_is_recovered_intact(self):
+        """The clause esc-3062-2 is about, addressable on its own."""
+        segments = split_and_chain_segments(_ROOT_TEST_COMMAND)
+        assert segments is not None
+        assert segments[7].command == (
+            'uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
+        )
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_ROOT_TEST_COMMAND, _ROOT_LINT_COMMAND, _ROOT_TYPE_CHECK_COMMAND],
+        ids=['root-test', 'root-lint', 'root-type-check'],
+    )
+    def test_every_command_is_a_verbatim_byte_slice_in_order(self, raw):
+        """No re-rendering: each command occurs VERBATIM in *raw*, in order.
+
+        Leans on ``split_top_level_and``'s documented losslessness — the
+        decomposition consumes nothing but the `&&` separators (and the folded
+        `cd` clauses), so a segment can be handed to the shell exactly as the
+        operator wrote it.
+        """
+        segments = split_and_chain_segments(raw)
+        assert segments is not None
+        cursor = 0
+        for segment in segments:
+            found = raw.find(segment.command, cursor)
+            assert found >= cursor, (
+                f'{segment.command!r} is not a verbatim slice of the input at or '
+                f'after offset {cursor}'
+            )
+            cursor = found + len(segment.command)
+
+    def test_labels_are_unique_and_filename_safe(self):
+        """Labels become per-segment streamed-log filenames, so they must not collide.
+
+        Two segments share cwd `.` here (the cockpit subshell and
+        `tests/scripts/`), so the index suffix is what keeps
+        ``attempt-N.__fallback__.test.<label>.log`` distinct.
+        """
+        segments = split_and_chain_segments(_ROOT_TEST_COMMAND)
+        assert segments is not None
+        labels = [s.label for s in segments]
+        assert labels == [
+            'shared-1',
+            'escalation-2',
+            'orchestrator-3',
+            'fused-memory-4',
+            'dashboard-5',
+            'sampler-6',
+            'root-7',
+            'root-8',
+        ]
+        assert len(set(labels)) == len(labels)
+        for label in labels:
+            assert re.fullmatch(r'[A-Za-z0-9._-]+', label), f'{label!r} is not filename-safe'
+
+    def test_root_lint_command_yields_two_root_cwd_segments(self):
+        """A chain with no `cd` at all still segments — both clauses at the root."""
+        segments = split_and_chain_segments(_ROOT_LINT_COMMAND)
+        assert segments is not None
+        assert [s.cwd_rel for s in segments] == ['.', '.']
+        assert [s.label for s in segments] == ['root-1', 'root-2']
+        assert segments[0].command.startswith('uv run ruff check ')
+        assert segments[1].command.startswith('python3 fused-memory/scripts/')
+
+    def test_root_type_check_command_folds_relative_cds(self):
+        """`cd ../orchestrator` resolves against the accumulated cwd, not the root."""
+        segments = split_and_chain_segments(_ROOT_TYPE_CHECK_COMMAND)
+        assert segments is not None
+        assert [s.cwd_rel for s in segments] == ['fused-memory', 'orchestrator', 'dashboard']
+        assert [s.command for s in segments] == ['npx pyright', 'npx pyright', 'npx pyright']
+
+    def test_chain_segment_is_a_frozen_dataclass(self):
+        """Segments are inert value objects — the runner must not mutate them."""
+        assert dataclasses.is_dataclass(ChainSegment)
+        segment = ChainSegment(cwd_rel='shared', command='uv run pytest tests/', label='shared-1')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            segment.cwd_rel = 'escalation'  # type: ignore[misc]
+
+
+class TestSplitAndChainSegmentsRefuses:
+    """The REFUSE contract — ``None`` on anything not faithfully reproducible.
+
+    Paired with ``TestSplitAndChainSegments`` in the same accept/reject shape
+    ``TestSplitChainTail`` uses, and for the same reason: a REFUSE costs only
+    the status quo (the caller runs the raw chain exactly as today, `&&`
+    short-circuit and all), while a false ACCEPT runs a CORRUPTED command — a
+    spurious RED that is strictly worse than the bug task 3338 fixes.
+
+    Note what is deliberately NOT a refusal: the control operators `||`, `;`
+    and `&&` INSIDE a balanced `( ... )` group, which the committed fleet
+    chain's cockpit clause depends on.
+    """
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'cd shared && uv run pytest "tests/ && cd ../orchestrator && npx pyright',
+            "cd shared && uv run pytest 'tests/ && cd ../orchestrator && npx pyright",
+            'cd shared && ( uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd shared && uv run pytest tests/ ) && cd ../orchestrator && npx pyright',
+        ],
+        ids=[
+            'unbalanced-double-quote',
+            'unbalanced-single-quote',
+            'unbalanced-open-paren',
+            'unbalanced-close-paren',
+        ],
+    )
+    def test_refuses_unbalanced_quote_or_paren(self, raw):
+        """A string this cannot even scan was never safely decomposable."""
+        assert split_and_chain_segments(raw) is None
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'cd shared && uv run pytest a/ ; uv run pytest b/ && cd ../orchestrator && npx pyright',
+            'cd shared && uv run pytest a/ || true && cd ../orchestrator && npx pyright',
+            'cd shared && uv run pytest a/ | tee out.log && cd ../orchestrator && npx pyright',
+            'cd shared && uv run pytest a/ & sleep 1 && cd ../orchestrator && npx pyright',
+        ],
+        ids=['semicolon', 'or-list', 'pipe', 'lone-ampersand-background'],
+    )
+    def test_refuses_depth_zero_control_operators(self, raw):
+        """`;`, `||`, `|` and a lone `&` at depth 0 break per-segment rc attribution.
+
+        Each one means a clause's exit status is no longer the clause's own —
+        so running it as an independent segment would report the wrong verdict.
+        Same reject vocabulary ``_NON_AND_CHAIN_TOKENS`` supplies to
+        ``split_chain_tail``.
+        """
+        assert split_and_chain_segments(raw) is None
+
+    def test_control_operators_inside_a_paren_group_are_not_refusals(self):
+        """The cockpit clause's own `||` and `;` live at depth 1 — accepted, atomic."""
+        raw = f'cd shared && uv run pytest tests/ && cd .. && {_COCKPIT_GROUP}'
+        segments = split_and_chain_segments(raw)
+        assert segments is not None
+        assert [s.cwd_rel for s in segments] == ['shared', '.']
+        assert segments[1].command == _COCKPIT_GROUP
+
+    def test_quoted_control_operators_are_not_refusals(self):
+        """A `|`/`;`/`&&` inside quotes is an ARGUMENT, never an operator."""
+        raw = (
+            "cd shared && uv run pytest tests/ -k 'a|b' && cd ../orchestrator"
+            ' && npx pyright --outputjson "a;b"'
+        )
+        segments = split_and_chain_segments(raw)
+        assert segments is not None
+        assert [s.cwd_rel for s in segments] == ['shared', 'orchestrator']
+        assert segments[0].command == "uv run pytest tests/ -k 'a|b'"
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'cd $SUBPROJECT && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd "$D" && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd shared* && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd share? && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd $(cat where.txt) && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd `cat where.txt` && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd - && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd -- && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd ~/proj && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd ~ && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+        ],
+        ids=[
+            'bare-variable',
+            'quoted-variable',
+            'star-glob',
+            'question-glob',
+            'command-substitution',
+            'backtick-substitution',
+            'dash-oldpwd',
+            'double-dash-home',
+            'tilde-path',
+            'bare-tilde',
+        ],
+    )
+    def test_refuses_non_literal_cd_argument(self, raw):
+        """A cwd this cannot resolve LITERALLY would run a segment in the wrong dir.
+
+        Refusing is the only safe disposition: the alternative is expanding the
+        shell's own semantics here, which is exactly the parser this helper
+        exists to avoid writing.
+
+        The `-` / `--` / `~` cases (task 3338 amendment) are the ones that LOOK
+        literal: bash sends `cd -` to $OLDPWD and `cd --` to $HOME, and no
+        tilde is expanded when a path is handed to ``_run_cmd`` as ``cwd=``.
+        Folding any of them in would spawn every later segment against a
+        non-existent directory, which ``_run_cmd`` swallows into
+        ``1, 'Command failed: ...'`` — a spurious red attributed to the
+        SUBPROJECT rather than to the mis-resolved cwd.
+        """
+        assert split_and_chain_segments(raw) is None
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'export UV_CACHE_DIR=/tmp/c && cd shared && uv run pytest tests/'
+            ' && cd ../orchestrator && uv run pytest tests/',
+            'source .venv/bin/activate && uv run pytest a/ && uv run pytest b/',
+            '. .venv/bin/activate && uv run pytest a/ && uv run pytest b/',
+            'set -e && uv run pytest a/ && uv run pytest b/',
+            'unset PYTHONPATH && uv run pytest a/ && uv run pytest b/',
+            'shopt -s globstar && uv run pytest a/ && uv run pytest b/',
+            'umask 022 && uv run pytest a/ && uv run pytest b/',
+            'trap cleanup EXIT && uv run pytest a/ && uv run pytest b/',
+            'alias p=pytest && uv run pytest a/ && uv run pytest b/',
+            'eval setup-env && uv run pytest a/ && uv run pytest b/',
+            'pushd shared && uv run pytest a/ && popd && uv run pytest b/',
+            'FOO=1 cd shared && uv run pytest a/ && uv run pytest b/',
+            'UV_CACHE_DIR=/tmp/c uv run pytest a/ && uv run pytest b/',
+        ],
+        ids=[
+            'export', 'source', 'dot-source', 'set', 'unset', 'shopt', 'umask',
+            'trap', 'alias', 'eval', 'pushd', 'assignment-prefix-hiding-a-cd',
+            'assignment-prefix-alone',
+        ],
+    )
+    def test_refuses_clauses_that_mutate_shell_state(self, raw):
+        """State set for LATER clauses cannot survive one-`bash -c`-per-segment.
+
+        Task 3338 amendment. Every segment is spawned in its OWN shell, so an
+        `export`/`source`/`set -e` clause's effect is DISCARDED and each later
+        segment runs in an environment the operator never configured — a
+        spurious red, or (for an env-tightening clause) a wrong verdict, with
+        no signal that the command had been reinterpreted. The committed
+        dark-factory chain has none of these shapes, but ``segment_chained_test``
+        is passed on the generic fallback path, which runs whatever
+        ``test_command`` ANY targeted project's config carries.
+
+        ``FOO=1 cd shared`` is the sharpest case: the assignment prefix hides
+        the `cd` from ``_literal_cd_target``, so without this guard the clause
+        became a no-op SEGMENT and every later segment silently ran at the
+        worktree ROOT instead of ``shared/``.
+        """
+        assert split_and_chain_segments(raw) is None
+
+    def test_state_mutation_inside_a_paren_group_is_not_a_refusal(self):
+        """A subshell's own `export` cannot escape it, so the group stays runnable.
+
+        Guards the leading-word scope of the check: scanning the WHOLE clause
+        text for a builtin would refuse the committed fleet chain's cockpit
+        group on sight, costing the fix for no safety gain.
+        """
+        raw = 'cd shared && uv run pytest a/ && ( export FOO=1 && uv run pytest b/ )'
+        segments = split_and_chain_segments(raw)
+        assert segments is not None
+        assert [s.cwd_rel for s in segments] == ['shared', 'shared']
+        assert segments[1].command == '( export FOO=1 && uv run pytest b/ )'
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            './run-tests.sh && uv run pytest a/ && uv run pytest b/',
+            'cdk deploy && uv run pytest a/ && uv run pytest b/',
+            'uv run pytest a/ --export-junit && uv run pytest b/',
+        ],
+        ids=['dot-slash-script', 'cdk-not-cd', 'export-as-a-flag'],
+    )
+    def test_leading_word_match_is_exact_not_a_prefix(self, raw):
+        """`./run.sh` is not the `.` builtin and `--export-junit` is not `export`."""
+        assert split_and_chain_segments(raw) is not None
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'cd && uv run pytest tests/ && cd ../orchestrator && npx pyright',
+            'cd shared orchestrator && uv run pytest tests/ && cd ../x && npx pyright',
+        ],
+        ids=['cd-no-argument', 'cd-two-arguments'],
+    )
+    def test_refuses_cd_with_wrong_arity(self, raw):
+        """A bare `cd` goes $HOME and `cd a b` is a substitution — neither is foldable."""
+        assert split_and_chain_segments(raw) is None
+
+    def test_refuses_absolute_cd(self):
+        """Segments run under ``worktree / cwd_rel``; an absolute cwd escapes it."""
+        raw = 'cd /tmp && uv run pytest tests/ && cd /var && uv run pytest other/'
+        assert split_and_chain_segments(raw) is None
+
+    def test_refuses_cwd_escaping_above_the_worktree_root(self):
+        """The accumulated cwd must never normalise to something above the root."""
+        raw = 'cd shared && uv run pytest tests/ && cd ../.. && uv run pytest elsewhere/'
+        assert split_and_chain_segments(raw) is None
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'uv run pytest tests/ --timeout=300',
+            'cd shared && uv run pytest tests/',
+            "uv run pytest tests/ -k 'a && b'",
+        ],
+        ids=['no-and-at-all', 'one-runnable-clause-after-cd-fold', 'and-only-inside-quotes'],
+    )
+    def test_refuses_fewer_than_two_runnable_segments(self, raw):
+        """Nothing is gained by "segmenting" a single command.
+
+        The whole point is running LATER clauses a red earlier one would skip,
+        so a chain with one runnable clause has no short-circuit to fix and the
+        status quo is already correct. The quoted case doubles as proof that
+        `&&` inside quotes is never a split point.
+        """
+        assert split_and_chain_segments(raw) is None
+
+    def test_refuse_neither_mutates_nor_partially_consumes_the_input(self):
+        """A REFUSE is total and side-effect free — no half-decomposed state.
+
+        Pinned by re-running a REFUSE and then an ACCEPT through the same
+        helper: the reject must leave no residue that changes the next answer.
+        """
+        bad = 'cd shared && uv run pytest a/ ; uv run pytest b/ && cd ../orchestrator && npx pyright'
+        before = str(bad)
+        assert split_and_chain_segments(bad) is None
+        assert bad == before
+        assert split_and_chain_segments(bad) is None
+        good = split_and_chain_segments(_ROOT_TEST_COMMAND)
+        assert good is not None
+        assert len(good) == 8
+
+
+class TestSplitAndChainSegmentsLiveConfigDrift:
+    """The hand-copied corpus constants must keep matching the COMMITTED yaml.
+
+    ``_ROOT_TEST_COMMAND`` is a hand-copy of ``dark-factory-orchestrator.yaml``'s
+    ``test_command`` (machine-verified equal when task 3338 was planned). Without
+    this guard the ACCEPT tests above could keep passing against a stale string
+    while the live chain drifted into a shape the segmenter REFUSES — silently
+    restoring the `&&` short-circuit esc-3062-2 reports.
+    """
+
+    @staticmethod
+    def _live_test_command() -> str:
+        return yaml.safe_load(_DF_CONFIG_PATH.read_text(encoding='utf-8'))['test_command']
+
+    def test_corpus_constant_still_matches_the_committed_yaml(self):
+        assert self._live_test_command() == _ROOT_TEST_COMMAND, (
+            'dark-factory-orchestrator.yaml:test_command has drifted from '
+            '_ROOT_TEST_COMMAND. Re-copy the constant, then re-check that the '
+            'ACCEPT assertions above still describe the live chain.'
+        )
+
+    def test_live_chain_stays_segmentable(self):
+        """A future yaml edit must not return the fallback chain to an opaque one.
+
+        The fallback runs the LIVE string, so this — not the corpus constant —
+        is what pins that a task's own tests can still be reached when an
+        earlier subproject is red.
+        """
+        segments = split_and_chain_segments(self._live_test_command())
+        assert segments is not None, (
+            'dark-factory-orchestrator.yaml:test_command is no longer segmentable, '
+            'so the fallback verify would run it as one &&-chain again and an '
+            "earlier subproject's red would skip every later subproject (task 3338)."
+        )
+        assert len(segments) >= 2
+        assert any('tests/scripts/' in s.command for s in segments), (
+            "the live chain no longer carries a 'tests/scripts/' clause the "
+            'segmenter can run independently (esc-3062-2)'
+        )
