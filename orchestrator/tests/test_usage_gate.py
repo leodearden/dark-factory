@@ -731,7 +731,15 @@ class TestCapRetryRotation:
             gate._open.set()
 
         asyncio.create_task(uncap_b_after_delay())
-        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        # The background task's 0.05s uncap delay can be pushed well past a
+        # tight ceiling when the event loop is starved under full-suite
+        # xdist load (14k+ tests, 16 workers) — this is not a correctness
+        # signal, just scheduling latency. Use a generous, load-tolerant
+        # budget so the assertion is effectively on the rotation OUTCOME
+        # (token-b) rather than wall-clock timing; it still raises
+        # TimeoutError (failing the test) if the timer-reset rotation never
+        # fires at all.
+        token = await asyncio.wait_for(gate.before_invoke(), timeout=30)
 
         assert token is not None
         assert token.token == 'token-b'
