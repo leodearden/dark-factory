@@ -24,8 +24,20 @@ Three record classes:
                       no consumer left, so it does NOT pin recovery (conversion
                       proceeds per spec S4) but DOES still veto a done-flip.
 
-...plus a distinguishable THIRD state, ``store_unavailable`` — see
-:func:`classify_pins`.
+...plus a distinguishable THIRD state, ``store_unavailable``: the escalation
+store could not be READ, which is never collapsed into "no records" because a
+false ``[]`` would route a genuinely-pinned strand into the plain revert
+branch (esc-3163).  See :func:`classify_pins` for the full contract.
+
+The precedence chain, evaluated top to bottom (spec S6; the numbered version
+with its rationale lives above :func:`_classify_record`):
+
+  1. ``severity == 'info'``                -> ``NON_PINNING``
+  2. ``severity`` not in ``KNOWN_SEVERITIES`` -> ``QUEUE_HANDOFF`` (fail-safe)
+  3. ``level != 0``                        -> ``QUEUE_HANDOFF``
+  4. ``level == 0``                        -> filing-incarnation liveness
+                                              (``DEAD_L0`` only when the filer
+                                              is PROVABLY dead)
 
 This task delivers the types + classifier + tests ONLY.  Rewiring the veto
 sites (``task_ground_truth._shape``, the harness reconcile sweeps, the
@@ -237,8 +249,45 @@ def classify_pins(
 ) -> PinReport:
     """Classify *records* — the task's OPEN escalations — into pin classes.
 
-    *records* is ``None`` when the escalation store could not be read (no queue
-    bound, read failed).  See :class:`PinReport` for the buckets.
+    :param task_id: echoed onto the report for structured-emission attribution.
+        Records are NOT filtered against it — the caller owns the read scope.
+    :param records: the task's open escalations, in store order, or ``None``
+        when the store could not be READ (see the store-correctness contract
+        below).  An empty sequence means "read succeeded, no open records" and
+        is a genuinely different answer.
+    :param live_claimant: whether ANY incarnation currently holds the task.
+    :param live_claimant_id: the live incarnation's ``claimant_run_id``, when
+        the caller can resolve it.  Needed to tell "the filer is still live"
+        from "a DIFFERENT incarnation is live" — the single task-level boolean
+        cannot express that distinction, and it is exactly the case the
+        dead-L0 rule exists for.  ``None`` (or an unknown filing identity on
+        the record) fails safe to pinning.
+
+    See the precedence chain above :func:`_classify_record` for the rules, and
+    :class:`PinReport` for the buckets and the two derived predicates.
+
+    STORE-CORRECTNESS CONTRACT (spec ``docs/task-escalation-state-spec.md``
+    S6; esc-3163 lesson).  Two obligations, both on the CALLER:
+
+    1. Bind the read to the task's OWNING orchestrator's escalation store —
+       never the reconciliation store, never "whichever queue is handy".
+       esc-3163 was a wrong-store read that reported no open escalations for a
+       task that had them.
+    2. Pass ``records=None`` when that read could not be performed or failed.
+       Never substitute ``[]``: a false "no records" routes a genuinely-pinned
+       strand into the plain revert branch.  This is why the third state is a
+       field on the returned report rather than an exception — the collapse is
+       structurally impossible, and every consumer inherits one fail-safe
+       disposition instead of writing its own try/except.
+
+    The caller-side pattern this generalises already exists at
+    ``orchestrator/src/orchestrator/scheduler.py`` (the stranded-blocked
+    redispatch sweep's ``escalation_queue is None => never flip`` guard):
+    without the queue a sweep cannot verify "no open escalation", so it must
+    not act.  ``store_unavailable`` makes that guard expressible in the shared
+    predicate; task beta (3535) wires the structured
+    ``recovery_left(reason=escalation_store_unavailable)`` emission to these
+    same semantics rather than re-deriving them.
     """
     if records is None:
         return PinReport((), (), (), store_unavailable=True, task_id=task_id)
