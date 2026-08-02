@@ -677,6 +677,121 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
     )
 
 
+def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: str) -> None:
+    """tab_escalations.jsx must surface the queue files the reader could not parse.
+
+    The ESCALATIONS payload carries per-subsection ``skipped``
+    (``[{path, error}, ...]``) and ``summary.skipped_count``.  A tab that
+    renders one escalation short with nothing saying so is the exact silent
+    degradation INV-2 (``structured-facts-at-failure``) forbids.
+
+    Asserts:
+    (a) a ``data-testid="escalation-skipped"`` notice element exists.
+    (b) the notice names BOTH ``.path`` and ``.error`` — the operator must be
+        told WHICH file and WHY, not just a count.
+    (c) the notice is driven by ``sec.skipped`` and gated on a non-zero length.
+    (d) the notice sits OUTSIDE the ``filteredRows.length === 0`` ternary, so a
+        group whose every row is filtered out still shows it.
+    (e) the notice is NOT gated on the level/status filter chips — a file that
+        could not be parsed has neither field to filter on.
+    (f) the per-subsection group summary carries a skipped badge, beside the
+        existing L1/L2 pips, so it is visible while the group is collapsed.
+    (g) the global controls header renders a ``skipped_count`` pill, gated on > 0.
+    """
+    body = tab_escalations_jsx_body
+
+    # (a) The notice element exists.
+    assert 'data-testid="escalation-skipped"' in body, (
+        'tab_escalations.jsx has no `data-testid="escalation-skipped"` notice — '
+        'add a SkippedNotice component (modelled on tab_memory_evals.jsx::IssuesNotice) '
+        'that renders the subsection\'s unreadable queue files.'
+    )
+
+    # (b) The notice names each file and its cause, not just a count.
+    notice_m = re.search(r'data-testid="escalation-skipped"([\s\S]{0,1200})', body)
+    assert notice_m is not None
+    notice = notice_m.group(1)
+    for field in ('.path', '.error'):
+        assert field in notice, (
+            f'the escalation-skipped notice does not reference `{field}` — a bare count '
+            'tells the operator something is wrong but not what; render one line per '
+            'entry naming the path and the parse error.'
+        )
+
+    # (c) Driven by the subsection field, gated on a non-zero length.
+    assert 'sec.skipped' in body, (
+        'tab_escalations.jsx never reads `sec.skipped` — the notice must be driven by '
+        'the per-subsection payload field, not re-derived or hardcoded.'
+    )
+    assert re.search(r'skipped\.length|skipped\s*\.\s*length', body), (
+        'the escalation-skipped notice is not gated on the skipped list length — '
+        'render nothing when the queue read cleanly.'
+    )
+
+    # (d) The notice sits OUTSIDE the all-rows-filtered empty-state branch.
+    map_m = re.search(r'subsections\.map\(sec\s*=>', body)
+    assert map_m is not None, (
+        'could not locate the `subsections.map(sec =>` body in tab_escalations.jsx'
+    )
+    map_body = body[map_m.start():]
+    skipped_at = map_body.find('sec.skipped')
+    empty_at = map_body.find('filteredRows.length === 0')
+    assert skipped_at != -1 and empty_at != -1
+    assert skipped_at < empty_at, (
+        'the skipped notice is read/mounted inside or after the '
+        '`filteredRows.length === 0` ternary — hoist it above that branch so a group '
+        'rendering "No escalations match current filters" while holding an unreadable '
+        'file still says so.'
+    )
+
+    # (e) Not routed through the level/status filter chips.
+    for gate in ('matchesFilter', 'filter.levels', 'filter.statuses'):
+        assert gate not in notice, (
+            f'the escalation-skipped notice references `{gate}` — a file that could not '
+            'be parsed has no level or status, so routing it through the chips would let '
+            'an arbitrary default decide whether the operator is told about corruption.'
+        )
+    skipped_stmt = map_body[skipped_at:map_body.find('\n', skipped_at)]
+    for gate in ('matchesFilter', 'filter.levels', 'filter.statuses'):
+        assert gate not in skipped_stmt, (
+            f'`sec.skipped` is filtered through `{gate}` before reaching the notice — '
+            'pass the list through unfiltered.'
+        )
+
+    # (f) Per-subsection badge beside the existing L1/L2 pips.
+    frag_m = re.search(r'const summary = \(([\s\S]{0,2000})', map_body)
+    assert frag_m is not None, (
+        'could not locate the per-subsection `const summary = (` fragment'
+    )
+    frag = frag_m.group(1)
+    assert 'L2 ·' in frag, 'window did not cover the existing L1/L2 pips — widen it'
+    assert re.search(r'skipped\.length\s*>\s*0', frag), (
+        'the per-subsection group summary carries no skipped badge — add a '
+        '`{skipped.length > 0 && <span className="pip">…</span>}` badge after the L2 pip '
+        'so the count is visible while the group is collapsed.'
+    )
+    assert 'badge' in frag, (
+        'the skipped badge does not use the `badge` span idiom the L1/L2 pips use'
+    )
+
+    # (g) Global controls-header pill from the top-level summary.
+    assert 'skipped_count' in body, (
+        'tab_escalations.jsx never reads `skipped_count` — add a global pill beside the '
+        'existing `N pending · N L1 · N L2` summary pills.'
+    )
+    pills_at = body.find('L1 · {byLevel[2]')
+    assert pills_at != -1, 'could not locate the global summary-pill span'
+    pills_window = body[pills_at:pills_at + 400]
+    assert 'skipped_count' in pills_window, (
+        'the `skipped_count` pill is not rendered beside the existing pending/L1/L2 '
+        'pills — append it to that same summary span.'
+    )
+    assert re.search(r'skipped_count[^\n]*>\s*0', pills_window), (
+        'the global `skipped_count` pill is not gated on `> 0` — a clean fleet must not '
+        'render a permanent "0 unreadable" pill.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-1 test: EscalationStatStrip is declared, wired to DF_CHARTS/analytics,
 # and mounted at the top of EscalationsTab
