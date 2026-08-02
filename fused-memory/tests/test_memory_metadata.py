@@ -18,6 +18,7 @@ from fused_memory.memory_metadata import (
     KIND_REGISTRY,
     TOPIC_SLUG_MAX_LEN,
     TOPIC_SLUG_RE,
+    MemoryMetadataValidationError,
     normalize_supersedes,
 )
 
@@ -531,7 +532,87 @@ class TestValidateMemoryMetadata:
 
     @pytest.mark.parametrize('good', [True, False])
     def test_bool_canonical_accepted(self, good):
-        assert self._validate({'canonical': good}) == []
+        """A bool ``canonical`` passes the TYPE check (§2b).
+
+        ``True`` is paired with a topic here because task 3198 (leaf ε)
+        additionally makes a bare ``{'canonical': True}`` a shape
+        violation -- see ``TestCanonicalRequiresTopic`` below. Keeping the
+        topic in this case preserves what this test is actually for (the
+        bool type check) instead of letting it double as an assertion that
+        a topic-less canonical is legal, which it no longer is.
+        """
+        meta = {'canonical': good}
+        if good:
+            meta['topic'] = 'a-good-slug'
+        assert self._validate(meta) == []
+
+    # -- canonical requires a topic (task 3198, leaf ε) -------------------
+
+    def test_canonical_true_without_topic_is_fatal(self):
+        """``canonical: true`` is meaningless outside a topic.
+
+        ``canonical`` asserts "this is THE entry for its topic", so
+        without a topic there is no set for it to be canonical OF, and the
+        per-(project, topic) uniqueness rule has no key to check. Caught
+        in the PURE validator because it needs no store access at all.
+        """
+        violations = _by_key(self._validate({'canonical': True}), 'canonical')
+        assert [v.code for v in violations] == ['canonical_without_topic']
+        assert violations[0].fatal is True
+        assert 'topic' in violations[0].message
+        # Asserted via the constant, not a hard-coded literal, so the message
+        # tracks a rename of the registry's advertised location.
+        assert MemoryMetadataValidationError.REGISTRY_LOCATION in violations[0].message
+
+    def test_canonical_false_without_topic_is_legal(self):
+        """Only an ASSERTED canonical is meaningless without a topic.
+
+        Writers that stamp the key uniformly (``canonical: False`` on
+        every record) must keep working -- rejecting an explicit False
+        would break them for no benefit.
+        """
+        assert self._validate({'canonical': False}) == []
+
+    def test_canonical_true_with_a_good_topic_is_legal(self):
+        assert self._validate({'canonical': True, 'topic': 'a-good-slug'}) == []
+
+    def test_malformed_topic_is_not_double_counted_as_missing(self):
+        """A present-but-invalid topic is ONE defect, reported once.
+
+        The ``topic`` key IS present, so §2a's slug violation already
+        describes the problem. Also emitting ``canonical_without_topic``
+        would report one defect twice and imply the writer forgot a key
+        they did supply.
+        """
+        codes = _codes(self._validate({'canonical': True, 'topic': 'bad_slug'}))
+        assert 'invalid_topic_slug' in codes
+        assert 'canonical_without_topic' not in codes
+
+    def test_topic_without_canonical_is_legal(self):
+        """A topic needs no canonical marker; the implication is one-way."""
+        assert self._validate({'topic': 'a-good-slug'}) == []
+
+    def test_validator_does_not_short_circuit_on_canonical(self):
+        """Every applicable violation comes back in ONE pass (contract).
+
+        An int ``canonical`` with no topic is two independent defects. A
+        validator that returned at the first would hide the second, and
+        the caller would fix one, re-submit, and be rejected again.
+        """
+        codes = _codes(self._validate({'canonical': 1}))
+        assert codes == {'invalid_canonical_type'}, (
+            'a non-bool canonical is a TYPE defect; canonical_without_topic is '
+            'reserved for a genuine `is True`, per §2b\'s isinstance-not-truthiness rule'
+        )
+        codes = _codes(
+            self._validate(
+                {'canonical': True, 'kind': 'not_in_registry_xyz'},
+                enforce_kind_registry=True,
+            )
+        )
+        assert codes == {'canonical_without_topic', 'unknown_kind'}, (
+            'unrelated violations must still be reported alongside, in one pass'
+        )
 
     # -- kind ------------------------------------------------------------
 
