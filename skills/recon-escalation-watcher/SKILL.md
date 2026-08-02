@@ -169,15 +169,19 @@ fire the watcher and the next drain re-finds it. And the wait here is
 **unbounded** — this skill's watcher invocation carries no `--timeout`, so
 `deadline` stays `None` and the event loop blocks indefinitely
 (`watcher.py:252-264`), with no expiry to force a restart-and-redrain. Net
-effect: with `--exclude-id` / `--exclude-file`, a deliberately-parked item
-simply fires again at the next watcher start, same as any other pending
-item — normal, expected, and loud. With `--baseline` it can instead vanish
-into a silent, unbounded delay in this queue's **sole closer**.
+effect: with `--exclude-id` / `--exclude-file`, an escalation filed *during
+the handling window* is not on the exclude list, so it fires at the next
+watcher start like any other pending item — normal, expected, and loud.
+With `--baseline` that same new escalation is instead swallowed by the
+launch snapshot into a silent, unbounded delay in this queue's **sole
+closer**.
 
 With PARK now the default disposition for `reconciliation_stale_gate_backlog` /
 `reconciliation_stale_human_operator`, the parked set is structurally large
-(31 records as of 2026-08-02) — hand-listing one `--exclude-id` per record
-does not scale; use `--exclude-file` for it, not `--baseline`. The sibling
+— these two categories make up the *entire* pending queue today (dozens of
+records; see the dated census in the playbook row below for the current
+count) — so hand-listing one `--exclude-id` per record does not scale; use
+`--exclude-file` for it, not `--baseline`. The sibling
 `skills/escalation-watcher/SKILL.md` documents `--baseline` as an available
 flag too, but that is not a counterexample: its Main Loop restarts the
 watcher *first* and drains only after confirming it's up, and its step 7 is
