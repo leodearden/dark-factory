@@ -2934,8 +2934,16 @@ class TestCurateBatchPreDedupCachePollution:
     the first sibling's real LLM decision.  Caching them would overwrite the
     real decision with a degenerate ``action='drop', target_id=None`` entry,
     and a later single-item ``curate()`` hit on that hash would then return
-    the synthetic drop — which ``_process_add_ticket`` cannot safely dispatch
-    and would interpret as "create a duplicate task".
+    the synthetic drop.
+
+    That degenerate shape is still create-degraded on the single path — a
+    targetless ``drop`` is an LLM dedupe that lost its target, so failing OPEN
+    into "create it anyway" is the deliberate behaviour (pinned by
+    ``test_dispatch_targetless_llm_drop_still_fails_open_to_create``).  It is
+    NOT a refusal: a genuine deterministic refusal uses ``action='refuse'``,
+    which creates nothing.  Keeping the two distinct is exactly why the cache
+    must not be polluted here — a create-degraded stale drop silently files a
+    duplicate, which is the harm this test guards.
     """
 
     @pytest.mark.asyncio
