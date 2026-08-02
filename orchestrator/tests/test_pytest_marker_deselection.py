@@ -21,14 +21,21 @@ including the real-config incident golden — at the end.
 """
 from __future__ import annotations
 
-import pytest
+from pathlib import Path
 
+import pytest
+import yaml
+from test_verify_plan import DATA_MODULE_DIFF, ROOT_CONFTEST_DIFF, SOURCE_ONLY_DIFF
+
+from orchestrator.config import ModuleConfig
 from orchestrator.pytest_markers import (
     deselecting_expression_for_targets,
     expression_definitely_deselects,
     module_level_marker_names,
     resolve_marker_expression,
 )
+from orchestrator.verify_cmd import parse_config_command
+from orchestrator.verify_plan import ScopeKind, VerifyPlan, derive_verify_plan
 
 # ---------------------------------------------------------------------------
 # resolve_marker_expression (step-1: RED)
@@ -433,3 +440,222 @@ class TestDeselectingExpressionForTargets:
             'uv run pytest tests/ -m warm_lane_bash',
             read,
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# derive_verify_plan wiring (step-9: RED until step-10)
+# ---------------------------------------------------------------------------
+
+ORCH_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: A module whose addopts deselect ``slow``, mirroring the real orchestrator shape.
+_DESELECTING_PYPROJECT = _pyproject('"-n auto -m \'not slow\'"')
+_PLAIN_PYPROJECT = _pyproject('"-n auto -q"')
+
+_SYNTHETIC_CONTENTS: dict[str, str] = {
+    'mod/pyproject.toml': _DESELECTING_PYPROJECT,
+    'mod/tests/test_a.py': 'import pytest\npytestmark = pytest.mark.slow\n',
+    'mod/tests/test_b.py': 'import pytest\n\n\ndef test_b():\n    pass\n',
+    # 'other' declares no -m at all — the control for "module without a marker
+    # expression is never widened", even with an identically-marked target.
+    'other/pyproject.toml': _PLAIN_PYPROJECT,
+    'other/tests/test_a.py': 'import pytest\npytestmark = pytest.mark.slow\n',
+    # Arms 1-3 controls: each of these prefixes ALSO gets a deselecting
+    # pyproject, so "unchanged" means unchanged in its presence, not its absence.
+    'orchestrator/pyproject.toml': _DESELECTING_PYPROJECT,
+    'shared/pyproject.toml': _DESELECTING_PYPROJECT,
+}
+
+
+def _synthetic_reader(path: str) -> str | None:
+    """Dict-backed stand-in for real file I/O, same seam as ``worktree_reader``."""
+    return _SYNTHETIC_CONTENTS.get(path)
+
+
+def _mc(prefix: str) -> ModuleConfig:
+    """A fully-configured ModuleConfig for *prefix* (all three tool commands set)."""
+    return ModuleConfig(
+        prefix=prefix,
+        test_command=f'uv run --directory {prefix} pytest tests/',
+        lint_command=f'uv run --directory {prefix} ruff check src/ tests/',
+        type_check_command=f'uv run --directory {prefix} pyright src/ tests/',
+    )
+
+
+def _run_for(plan: VerifyPlan, prefix: str, tool_word: str):
+    """The *prefix* PlannedRun whose reason names *tool_word* (e.g. ``'pytest:'``)."""
+    return next(
+        (r for r in plan.runs if r.module_prefix == prefix and r.reason.startswith(tool_word)),
+        None,
+    )
+
+
+class TestDeriveModuleRunsWidensOnFullDeselection:
+    """A fully marker-deselected FILE_SCOPED pytest run widens to the owning FULL_SUITE.
+
+    Without the widening the planned run collects zero items, pytest exits rc=5,
+    and ``verify_classify._classify_opaque`` reds it — a false RED on a diff that
+    touched a real, passing test file.
+    """
+
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    def test_fully_deselected_target_widens_at_both_roles(self, role):
+        """Arm 4 is shared by both roles, so one fix covers both."""
+        mc = _mc('mod')
+        plan = derive_verify_plan(
+            ['mod/tests/test_a.py'], [mc], None, _synthetic_reader, role=role,
+        )
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        # PlannedRun's invariant: scoped_targets is non-empty iff FILE_SCOPED.
+        assert run.scoped_targets == ()
+        assert run.reason.startswith('pytest: ')
+        assert 'not slow' in run.reason
+        assert 'deselected' in run.reason
+
+    def test_widening_does_not_touch_the_other_tool_slots(self):
+        """Marker deselection is a pytest-only concern — lint and pyright stay scoped."""
+        plan = derive_verify_plan(
+            ['mod/tests/test_a.py'], [_mc('mod')], None, _synthetic_reader, role='task',
+        )
+        for tool_word in ('lint:', 'pyright:'):
+            run = _run_for(plan, 'mod', tool_word)
+            assert run is not None, tool_word
+            assert run.scope_kind is ScopeKind.FILE_SCOPED, tool_word
+            assert run.scoped_targets == ('mod/tests/test_a.py',), tool_word
+
+    def test_unmarked_target_keeps_todays_file_scoped_run(self):
+        """CONTROL: a genuinely-vanished test target must still rc=5 RED.
+
+        An unmarked file is SELECTED, so its file-scoped run is not empty by
+        marker deselection.  If it collects nothing anyway, that emptiness is a
+        real defect and must stay visible — nothing here may widen it away.
+        """
+        plan = derive_verify_plan(
+            ['mod/tests/test_b.py'], [_mc('mod')], None, _synthetic_reader, role='task',
+        )
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.reason == 'pytest: file-scoped to touched test file(s)'
+        assert run.scoped_targets == ('mod/tests/test_b.py',)
+
+    def test_mixed_targets_stay_file_scoped_to_both(self):
+        """CONTROL: ALL, not ANY — one selectable target keeps the whole run scoped."""
+        plan = derive_verify_plan(
+            ['mod/tests/test_a.py', 'mod/tests/test_b.py'], [_mc('mod')], None,
+            _synthetic_reader, role='task',
+        )
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == ('mod/tests/test_a.py', 'mod/tests/test_b.py')
+
+    def test_module_without_a_marker_expression_is_never_widened(self):
+        """CONTROL: an identically-marked target under a module declaring no ``-m``."""
+        plan = derive_verify_plan(
+            ['other/tests/test_a.py'], [_mc('other')], None, _synthetic_reader, role='task',
+        )
+        run = _run_for(plan, 'other', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.reason == 'pytest: file-scoped to touched test file(s)'
+
+    def test_arm_1_conftest_is_unchanged(self):
+        """CONTROL: arms 1-3 return above the probe, so they cannot be reached by it."""
+        plan = derive_verify_plan(
+            ROOT_CONFTEST_DIFF, [_mc('orchestrator')], None, _synthetic_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.reason == (
+            'pytest: conftest touched (orchestrator/tests/conftest.py) — full suite required'
+        )
+
+    def test_arm_2_test_data_is_unchanged(self):
+        """CONTROL: the task-1852 golden — the first instance of this defect class."""
+        plan = derive_verify_plan(
+            DATA_MODULE_DIFF, [_mc('shared')], None, _synthetic_reader, role='task',
+        )
+        run = _run_for(plan, 'shared', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.reason == (
+            'pytest: test-data module touched (shared/tests/silent_fallthrough_allowlist.py)'
+            ' — full suite required'
+        )
+
+    def test_arm_3_task_role_production_floor_is_unchanged(self):
+        """CONTROL: the task-3294 floor keeps its own reason, not the new one."""
+        plan = derive_verify_plan(
+            SOURCE_ONLY_DIFF, [_mc('orchestrator')], None, _synthetic_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.reason == (
+            'pytest: source-only diff — owning-module full suite (task role); '
+            'sibling modules NOT run'
+        )
+
+
+class TestWarmLaneBashRealConfigRegression:
+    """The esc-3292-1 incident golden, driven against the REAL repo files.
+
+    Never hand-seeded: the addopts, the suite file's ``pytestmark`` and the
+    ModuleConfig's commands are all read from disk, so this pins the actual
+    shipped configuration rather than a retyped copy of it.  Path resolution
+    uses the ``Path(__file__).resolve().parents[N]`` idiom from
+    test_warm_lane_bash_bucket_placement.py — correct under both the repo-root
+    and the ``orchestrator/``-cwd pytest invocations.
+    """
+
+    #: Non-vacuity guards run FIRST: the golden below must never be able to pass
+    #: because its premise evaporated (the deselection moved, or the marker was
+    #: dropped from the suite file).
+    def test_real_addopts_still_deselects_the_bucket(self):
+        expr = resolve_marker_expression((ORCH_DIR / 'pyproject.toml').read_text(), None)
+        assert expr is not None, 'orchestrator addopts no longer carry a -m expression'
+        assert 'warm_lane_bash' in expr
+
+    def test_real_suite_file_still_declares_the_bucket_at_module_level(self):
+        source = (ORCH_DIR / 'tests' / 'test_warm_lane_bash_suite.py').read_text()
+        assert 'warm_lane_bash' in module_level_marker_names(source)
+
+    @staticmethod
+    def _real_module_config() -> ModuleConfig:
+        """A ModuleConfig whose commands come VERBATIM from orchestrator/orchestrator.yaml."""
+        loaded = yaml.safe_load((ORCH_DIR / 'orchestrator.yaml').read_text())
+        return ModuleConfig(
+            prefix='orchestrator',
+            test_command=loaded['test_command'],
+            lint_command=loaded['lint_command'],
+            type_check_command=loaded['type_check_command'],
+        )
+
+    @staticmethod
+    def _read(path: str) -> str | None:
+        try:
+            return (REPO_ROOT / path).read_text()
+        except OSError:
+            return None
+
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    def test_touching_only_the_warm_lane_suite_widens_to_the_full_suite(self, role):
+        """Before this task, BOTH roles planned a zero-collecting FILE_SCOPED run."""
+        mc = self._real_module_config()
+        plan = derive_verify_plan(
+            ['orchestrator/tests/test_warm_lane_bash_suite.py'], [mc], None, self._read,
+            role=role,
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.scoped_targets == ()
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
