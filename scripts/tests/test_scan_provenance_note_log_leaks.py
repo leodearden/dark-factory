@@ -26,11 +26,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-# discover_db_paths is imported from its DEFINING module rather than re-exported
-# through the scanner: the scanner itself never calls it (run_scan_cli resolves it
-# from _task_db_scan's own namespace), so re-exporting it would be a dead import.
-# Same function object either way — these tests exercise an identical callable.
-from _task_db_scan import discover_db_paths
 from scan_provenance_note_log_leaks import (
     NoteLeakMatch,
     detect_log_leak,
@@ -263,51 +258,6 @@ class TestScanDb:
 
         assert [m.task_id for m in matches] == [3001], matches
         assert matches[0].leak_line.startswith('2026-07-30'), matches[0]
-
-
-class TestDiscoverDbPaths:
-    """Same precedence contract as the 2939 precedent scanner."""
-
-    def test_explicit_dbs_pass_through_existing_only(self, tmp_path):
-        existing = tmp_path / 'a.db'
-        existing.write_text('')
-        missing = tmp_path / 'missing.db'
-
-        result = discover_db_paths(explicit_dbs=[str(existing), str(missing)])
-
-        assert result == [str(existing)]
-
-    def test_project_root_maps_to_taskmaster_tasks_db(self, tmp_path, project_root_with_tasks_db):
-        root = tmp_path / 'proj'
-        root.mkdir()
-        db_file = str(project_root_with_tasks_db(root))
-
-        assert discover_db_paths(project_roots=[str(root)]) == [db_file]
-
-    def test_parses_dashboard_known_project_roots_env(self, tmp_path, project_root_with_tasks_db):
-        root_a, root_b = tmp_path / 'a', tmp_path / 'b'
-        root_a.mkdir()
-        root_b.mkdir()
-        db_a, db_b = str(project_root_with_tasks_db(root_a)), str(project_root_with_tasks_db(root_b))
-
-        # Whitespace padded, with an empty entry (",,") that must be dropped
-        # rather than mapped to a bogus db path.
-        env = {'DASHBOARD_KNOWN_PROJECT_ROOTS': f' {root_a} , {root_b} ,, '}
-
-        assert discover_db_paths(env=env) == [db_a, db_b]
-
-    def test_falls_back_to_dark_factory_default(self, monkeypatch):
-        monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
-
-        assert discover_db_paths() == [
-            '/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db'
-        ]
-
-    def test_skips_project_root_without_tasks_db(self, tmp_path):
-        root = tmp_path / 'empty'
-        root.mkdir()
-
-        assert discover_db_paths(project_roots=[str(root)]) == []
 
 
 class TestFormatting:

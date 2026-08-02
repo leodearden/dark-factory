@@ -23,11 +23,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-# discover_db_paths is imported from its DEFINING module rather than re-exported
-# through the scanner: the scanner itself never calls it (run_scan_cli resolves it
-# from _task_db_scan's own namespace), so re-exporting it would be a dead import.
-# Same function object either way — these tests exercise an identical callable.
-from _task_db_scan import discover_db_paths
 from scan_task_toolcall_leaks import (
     LeakMatch,
     detect_leak,
@@ -227,64 +222,6 @@ def test_scan_db_finds_only_genuine_leaks_and_is_read_only(make_tasks_db):
 def test_scan_db_returns_empty_list_for_clean_db(make_tasks_db):
     db_path = make_tasks_db([{"id": 1, "description": "All clean here."}])
     assert scan_db(str(db_path)) == []
-
-
-# ---------------------------------------------------------------------------
-# discover_db_paths(explicit_dbs, project_roots, env) -> list[str]
-# ---------------------------------------------------------------------------
-
-def test_discover_db_paths_explicit_dbs_passed_through_existing_only(tmp_path):
-    existing = tmp_path / "a.db"
-    existing.write_text("")
-    missing = tmp_path / "missing.db"
-
-    result = discover_db_paths(explicit_dbs=[str(existing), str(missing)])
-
-    assert result == [str(existing)]
-
-
-def test_discover_db_paths_project_root_maps_to_taskmaster_tasks_db(tmp_path, project_root_with_tasks_db):
-    root = tmp_path / "proj"
-    root.mkdir()
-    db_file = project_root_with_tasks_db(root)
-
-    result = discover_db_paths(project_roots=[str(root)])
-
-    assert result == [str(db_file)]
-
-
-def test_discover_db_paths_parses_dashboard_known_project_roots_env(tmp_path, project_root_with_tasks_db):
-    root_a = tmp_path / "a"
-    root_b = tmp_path / "b"
-    root_a.mkdir()
-    root_b.mkdir()
-    db_a = project_root_with_tasks_db(root_a)
-    db_b = project_root_with_tasks_db(root_b)
-
-    # Comma-separated, whitespace padded, with an empty entry (",,") that
-    # must be dropped rather than mapped to a bogus db path.
-    env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": f" {root_a} , {root_b} ,, "}
-
-    result = discover_db_paths(env=env)
-
-    assert result == [str(db_a), str(db_b)]
-
-
-def test_discover_db_paths_falls_back_to_dark_factory_default(monkeypatch):
-    monkeypatch.delenv("DASHBOARD_KNOWN_PROJECT_ROOTS", raising=False)
-
-    result = discover_db_paths()
-
-    assert result == ["/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db"]
-
-
-def test_discover_db_paths_skips_project_root_without_tasks_db(tmp_path):
-    root = tmp_path / "empty_proj"
-    root.mkdir()
-
-    result = discover_db_paths(project_roots=[str(root)])
-
-    assert result == []
 
 
 # ---------------------------------------------------------------------------
