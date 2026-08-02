@@ -144,6 +144,29 @@ class TestResolveMarkerExpression:
         )
         assert resolved == 'not warm_lane_bash'
 
+    # -- the chained-command guard -------------------------------------------
+
+    def test_a_later_chain_clause_cannot_supply_the_marker_expression(self):
+        """``pytest tests/ && python -m mytool`` must not resolve to ``'mytool'``.
+
+        The scan stops at the first chain operator after the ``pytest`` keyword.
+        Without that stop, an unrelated trailing clause would OVERRIDE the real
+        addopts expression and silently suppress a legitimate widening.
+        """
+        resolved = resolve_marker_expression(
+            _pyproject('"-m \'not slow\'"'), 'pytest tests/ && python -m mytool',
+        )
+        assert resolved == 'not slow'
+
+    def test_the_first_pytest_clause_wins_not_the_last(self):
+        """FIRST occurrence — the same clause ``_scope_prefix_to_keyword`` scopes.
+
+        ``head.find('pytest')`` truncates a chained ``test_command`` to its first
+        pytest clause, so the marker probe must read that clause too; reading the
+        last would let the two layers describe different invocations.
+        """
+        assert resolve_marker_expression(None, 'pytest a -m foo && pytest b -m bar') == 'foo'
+
     def test_command_with_no_pytest_token_leaves_the_expression_unchanged(self):
         resolved = resolve_marker_expression(
             _pyproject(f'"{_REAL_ADDOPTS}"'), 'cargo test -m something',
@@ -517,6 +540,22 @@ class TestDeriveModuleRunsWidensOnFullDeselection:
         assert 'not slow' in run.reason
         assert 'deselected' in run.reason
 
+    def test_reason_names_the_files_the_widened_run_still_does_not_execute(self):
+        """The widened run applies the SAME addopts — the trigger files stay unrun.
+
+        FULL_SUITE forbids ``scoped_targets`` (PlannedRun's invariant), so the
+        reason string is the only channel that can record WHICH files went
+        unverified.  Without it the record reads as "the change was verified",
+        which is the silent degradation the repo's design invariants forbid.
+        """
+        plan = derive_verify_plan(
+            ['mod/tests/test_a.py'], [_mc('mod')], None, _synthetic_reader, role='task',
+        )
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert 'mod/tests/test_a.py' in run.reason
+        assert 'NOT executed' in run.reason
+
     def test_widening_does_not_touch_the_other_tool_slots(self):
         """Marker deselection is a pytest-only concern — lint and pyright stay scoped."""
         plan = derive_verify_plan(
@@ -602,6 +641,110 @@ class TestDeriveModuleRunsWidensOnFullDeselection:
             'pytest: source-only diff — owning-module full suite (task role); '
             'sibling modules NOT run'
         )
+
+
+class TestProbeConsultsTheCommandsEffectiveRootdir:
+    """WHERE the probe looks for ``addopts``, and which commands it refuses outright.
+
+    pytest reads ``addopts`` from its ROOTDIR, which follows the command's
+    effective cwd — NOT from ``mc.prefix``.  The two come apart in this repo:
+    ``scripts`` and ``tests/scripts`` both run ``uv run --project shared pytest
+    tests/scripts/ ...`` from the REPO ROOT, so ``<prefix>/pyproject.toml``
+    would be a config pytest never applies.
+
+    Every reader below serves a DESELECTING pyproject at EVERY ``*pyproject.toml``
+    path it is asked for, so a refusal test can never pass vacuously through a
+    missing file: if the guard under test stopped firing, the widening would.
+    """
+
+    #: A marked target under every prefix these tests use.
+    _MARKED = 'import pytest\npytestmark = pytest.mark.slow\n'
+
+    @classmethod
+    def _reader_serving_every_pyproject(cls, reads: list[str]):
+        """A recording reader for which EVERY pyproject path deselects ``slow``."""
+        def read(path: str) -> str | None:
+            reads.append(path)
+            if path.endswith('pyproject.toml'):
+                return _DESELECTING_PYPROJECT
+            return cls._MARKED if path.endswith('.py') else None
+        return read
+
+    def test_repo_root_config_is_read_when_the_command_has_no_directory(self):
+        """The real ``scripts`` shape: ``uv run --project shared pytest ...`` from root."""
+        reads: list[str] = []
+        def read(path: str) -> str | None:
+            reads.append(path)
+            if path == 'pyproject.toml':
+                return _DESELECTING_PYPROJECT
+            # The PREFIX config declares no -m at all: if the probe read this
+            # one instead of the root's, no widening would happen.
+            if path == 'sub/pyproject.toml':
+                return _PLAIN_PYPROJECT
+            return self._MARKED if path.endswith('.py') else None
+
+        mc = ModuleConfig(
+            prefix='sub',
+            test_command='uv run --project shared pytest tests/sub/ --tb=short -q',
+            lint_command='uv run --project shared ruff check sub/',
+        )
+        plan = derive_verify_plan(['sub/tests/test_a.py'], [mc], None, read, role='task')
+        run = _run_for(plan, 'sub', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert 'sub/pyproject.toml' not in reads, 'prefix config is not pytest rootdir here'
+
+    def test_directory_flag_selects_that_directorys_config(self):
+        """``uv run --directory X pytest`` roots at X — the orchestrator/shared shape."""
+        reads: list[str] = []
+        read = self._reader_serving_every_pyproject(reads)
+        plan = derive_verify_plan(
+            ['mod/tests/test_a.py'], [_mc('mod')], None, read, role='task',
+        )
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert 'mod/pyproject.toml' in reads
+        assert 'pyproject.toml' not in reads
+
+    #: ``npx jest`` parses STRUCTURED (ToolKind.NPX, ``raw is None``), so it
+    #: isolates guard 1 — guard 2 cannot also be what refuses it.  ``npm test``
+    #: parses OPAQUE and is refused by either; both are pinned because neither
+    #: is a live config today, which is precisely why an unpinned regression
+    #: here would go unnoticed.
+    @pytest.mark.parametrize('test_command', ['npx jest tests/', 'npm test'])
+    def test_a_non_pytest_test_command_is_never_widened(self, test_command):
+        """GUARD 1: a non-pytest suite never applies a pyproject's addopts."""
+        reads: list[str] = []
+        read = self._reader_serving_every_pyproject(reads)
+        mc = ModuleConfig(prefix='js', test_command=test_command)
+        plan = derive_verify_plan(['js/tests/test_a.py'], [mc], None, read, role='task')
+        run = _run_for(plan, 'js', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.reason == 'pytest: file-scoped to touched test file(s)'
+        assert run.scoped_targets == ('js/tests/test_a.py',)
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
+    def test_a_chained_test_command_is_never_widened(self):
+        """GUARD 2: a raw-retained chain hides both the rootdir and which clause runs.
+
+        ``_scope_prefix_to_keyword`` truncates a chained ``test_command`` to its
+        FIRST pytest clause; rather than risk the probe describing a different
+        invocation than the scoper, the probe refuses the whole shape.
+        """
+        reads: list[str] = []
+        read = self._reader_serving_every_pyproject(reads)
+        mc = ModuleConfig(
+            prefix='mod',
+            test_command='cd mod && uv run pytest tests/ && python3 scripts/check.py mod/tests',
+        )
+        plan = derive_verify_plan(['mod/tests/test_a.py'], [mc], None, read, role='task')
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.reason == 'pytest: file-scoped to touched test file(s)'
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
 
 
 class TestWarmLaneBashRealConfigRegression:

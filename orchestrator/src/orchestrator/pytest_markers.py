@@ -82,14 +82,36 @@ def _addopts_tokens(pyproject_text: str | None) -> list[str] | None:
     return None
 
 
-def _cli_marker_expr(test_command: str | None) -> str | None:
-    """The ``-m`` expression appearing AFTER the ``pytest`` keyword in *test_command*.
+#: Shell chain operators that terminate one clause of a chained command.
+#: Mirrors ``verify_cmd._CHAIN_OPERATOR_TOKENS`` by value, duplicated rather
+#: than imported to keep this module dependency-free (see the module docstring).
+_CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 
-    The post-keyword restriction is LOAD-BEARING: it is what keeps
-    ``python -m pytest tests/`` from being misread as the marker expression
-    ``'pytest'``.  Only tokens following the last token that is ``pytest`` (or
-    ends in ``/pytest``) are scanned; a command with no such token yields None,
-    leaving the addopts expression untouched.
+
+def _cli_marker_expr(test_command: str | None) -> str | None:
+    """The ``-m`` expression of the FIRST ``pytest`` clause in *test_command*.
+
+    Two restrictions, both LOAD-BEARING:
+
+    * only tokens AFTER the ``pytest`` keyword are scanned — this is what keeps
+      ``python -m pytest tests/`` from being misread as the marker expression
+      ``'pytest'``;
+    * the scan STOPS at the first shell chain operator following that keyword,
+      so a chained ``pytest tests/ && python -m mytool`` cannot contribute
+      ``'mytool'``, which would otherwise override the real ``addopts``
+      expression and silently suppress a legitimate widening.
+
+    FIRST-occurrence-then-truncate-at-the-chain-delimiter is deliberately the
+    same semantics ``verify_plan._scope_prefix_to_keyword`` applies when it
+    scopes the very same string (``split_chain_tail`` + ``head.find(keyword)``),
+    so the marker probe and the scoper can never describe DIFFERENT pytest
+    invocations of one chained command.  ``split_chain_tail`` itself is not
+    reusable here: ``'pytest'`` is deliberately off its
+    ``_TAIL_PRESERVING_KEYWORDS`` allowlist (task 3218), so for this keyword it
+    returns the whole string unsplit and would answer no question at all.
+
+    A command with no ``pytest`` keyword yields None, leaving the addopts
+    expression untouched.
     """
     if not test_command:
         return None
@@ -101,9 +123,15 @@ def _cli_marker_expr(test_command: str | None) -> str | None:
     for index, token in enumerate(tokens):
         if token == 'pytest' or token.endswith('/pytest'):
             keyword_index = index
+            break
     if keyword_index is None:
         return None
-    return _marker_expr_from_tokens(tokens[keyword_index + 1:])
+    clause = tokens[keyword_index + 1:]
+    for offset, token in enumerate(clause):
+        if token in _CHAIN_OPERATOR_TOKENS:
+            clause = clause[:offset]
+            break
+    return _marker_expr_from_tokens(clause)
 
 
 def resolve_marker_expression(
@@ -116,7 +144,13 @@ def resolve_marker_expression(
     ``orchestrator/pyproject.toml``'s ``warm_lane_bash`` marker text ("a CLI -m
     overrides the addopts -m, last wins"): the
     ``[tool.pytest.ini_options].addopts`` expression is the base, and a ``-m``
-    appearing after the ``pytest`` keyword in *test_command* replaces it.
+    inside *test_command*'s FIRST ``pytest`` clause replaces it (see
+    :func:`_cli_marker_expr` for why that clause, and only that clause).
+
+    *pyproject_text* is the content of the ini file at pytest's ROOTDIR, which
+    the caller locates from the command's effective cwd — see
+    ``verify_plan._marker_deselecting_expression``.  This function does not and
+    cannot check that the two describe the same invocation.
 
     Never raises — every failure path returns None.
 

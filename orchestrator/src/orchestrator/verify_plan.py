@@ -458,10 +458,45 @@ def _marker_deselecting_expression(
     :mod:`orchestrator.pytest_markers` for the soundness and cost arguments;
     both reads go through the SAME injected *worktree_reader*, so this function
     introduces no filesystem access of its own.
+
+    WHERE the ini file is looked for: pytest reads ``addopts`` from its
+    ROOTDIR, which follows the command's effective cwd — NOT from
+    ``mc.prefix``. The two come apart in this very repo: the ``scripts`` and
+    ``tests/scripts`` modules both run ``uv run --project shared pytest
+    tests/scripts/ ...`` from the REPO ROOT (no ``--directory``), so a
+    ``scripts/pyproject.toml`` would never be the config pytest actually
+    applies. The effective cwd is therefore taken from the parsed command's
+    ``cwd_rel`` (a leading ``cd X &&``, or ``uv run --directory X``), falling
+    back to the repo root when the command carries neither.
+
+    Three guards REFUSE rather than guess. Each is fail-safe — no widening,
+    i.e. exactly the pre-3494 FILE_SCOPED behaviour:
+
+    1. a ``test_command`` that does not parse as PYTEST at all (``npm test``,
+       a shell script): the module's ``addopts`` describe a suite this command
+       never invokes, so consulting them would widen on a false premise;
+    2. a raw-retained command (``cmd.raw is not None`` — OPAQUE, or an ``&&``
+       chain): neither the effective cwd nor which invocation gets scoped is
+       recoverable from it. ``_scope_prefix_to_keyword`` truncates a chained
+       ``test_command`` to its FIRST ``pytest`` clause, so a probe that read a
+       later clause's config would describe a different invocation than the
+       one that runs;
+    3. only ``pyproject.toml`` is consulted. ``pytest.ini`` / ``setup.cfg`` /
+       ``tox.ini`` addopts are invisible here, so a module configured that way
+       simply never widens. A deliberate UNDER-fire, never an over-fire.
     """
+    if not mc.test_command:
+        return None
+    parsed = parse_config_command(mc.test_command)
+    if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None:
+        return None
+    cwd_rel = parsed.cwd_rel
+    config_path = (
+        'pyproject.toml' if not cwd_rel or cwd_rel == '.' else f'{cwd_rel}/pyproject.toml'
+    )
     return deselecting_expression_for_targets(
         collectable_tests,
-        worktree_reader(f'{mc.prefix}/pyproject.toml'),
+        worktree_reader(config_path),
         mc.test_command,
         worktree_reader,
     )
@@ -538,10 +573,23 @@ def _derive_module_runs(
     The probe is FAIL-SAFE in exactly one direction: any unreadable file,
     unparseable expression, or merely-unknown marker yields no widening, i.e.
     precisely the pre-3494 behaviour. Its extra I/O is bounded at one
-    ``worktree_reader`` read of ``<prefix>/pyproject.toml`` per ModuleConfig —
-    through the same content-cached reader used above, so a target already read
-    for STRUCTURAL detection costs nothing further — and ZERO target reads for a
-    module that declares no ``-m`` expression at all.
+    ``worktree_reader`` read of the effective-rootdir ``pyproject.toml`` per
+    ModuleConfig — through the same content-cached reader used above, so a
+    target already read for STRUCTURAL detection costs nothing further — and
+    ZERO target reads for a module that declares no ``-m`` expression at all.
+    See :func:`_marker_deselecting_expression` for where that ini file is
+    looked for and which commands are refused outright.
+
+    The widened run applies the SAME addopts, so the touched file(s) remain
+    deselected in it: the widening converts a false RED into a run of the
+    module's OTHER tests, not into coverage of the changed lines. That is the
+    right trade (a bucketed suite is re-selected by its own dedicated lane, and
+    ``not integration``/``not smoke`` tests are excluded deliberately), but it
+    is degradation, so the emitted ``reason`` names the still-unrun file(s)
+    explicitly rather than reading as "the change was verified".
+
+    The TWIN of this arm in :func:`_derive_fallback_runs` is deliberately NOT
+    wired — see that function's own paragraph for why.
     """
     prefix = mc.prefix + '/'
     scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
@@ -662,11 +710,21 @@ def _derive_module_runs(
             deselecting = _marker_deselecting_expression(mc, collectable_tests, worktree_reader)
             if deselecting is not None:
                 test_cmd = parse_config_command(mc.test_command)
+                # The widened run applies the SAME addopts, so the very files
+                # that triggered the widening stay deselected in it — they are
+                # NOT executed here. FULL_SUITE forbids scoped_targets
+                # (PlannedRun's invariant), so naming them in the reason is the
+                # only channel left for recording which files went unrun; a
+                # bare "ran the owning module's full suite" would read as "the
+                # change was verified" and be exactly the silent degradation
+                # the repo's design invariants forbid.
+                unrun = ', '.join(collectable_tests)
                 runs.append(PlannedRun(
                     mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
-                    f"pytest: every touched test file is deselected by the module's "
-                    f'-m {deselecting!r} — owning-module full suite instead of a '
-                    f'zero-collecting file-scoped run (rc=5)',
+                    f'pytest: touched test file(s) {unrun} are ALL deselected by the '
+                    f"module's -m {deselecting!r} — owning-module full suite instead of a "
+                    f'zero-collecting file-scoped run (rc=5); those file(s) stay '
+                    f'deselected in this run too and are NOT executed by it',
                 ))
             else:
                 test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
@@ -804,6 +862,26 @@ def _derive_fallback_runs(
     does not depend on subproject rescoping, so ``plan`` remains a reliable
     record of *why* a decision was made, but not always of *where*/*how* it
     ran for a subproject-shaped fallback diff.
+
+    MARKER DESELECTION (task 3494) is deliberately NOT wired here, so this
+    branch knowingly retains the pre-3494 behaviour. The bare-default
+    ``collectable_tests`` branch below has the identical "the path says
+    collectable, pytest collects zero" failure mode whenever the repo root
+    carries an ``addopts = "-m 'not X'"`` and the diff touches only
+    X-marked test files — it will still plan a zero-collecting FILE_SCOPED run
+    that rc=5-REDs. It is left open for two reasons. (i) SOUNDNESS: this branch
+    fires only when there are NO registered module_configs, and the "Fidelity
+    caveat" above is exactly why — the run this function records is not
+    necessarily the run that executes. ``_build_fallback_config`` may rescope a
+    fallback diff into a subproject (``cd <sub> && uv run pytest ...``), which
+    moves pytest's rootdir and therefore which ``addopts`` apply, so a probe
+    reading the ROOT ``pyproject.toml`` here could widen on a config the
+    executed command never sees — an over-fire, the one direction task 3494
+    forbids. (ii) REACH: the module path covers every subproject registered in
+    this repo, so the residual exposure is a project with a marker-partitioned
+    root suite and no ``orchestrator.yaml`` anywhere. Closing it properly needs
+    the executed-config reconciliation :func:`_executed_fallback_plan` performs,
+    which is a different layer than this decision function.
 
     This caveat describes THIS function's raw return value only. Its caller
     in :func:`run_scoped_verification` reconciles this gap before attaching
