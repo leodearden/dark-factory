@@ -315,11 +315,13 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   no open level-1 escalation (`maybe_escalate_stalled_tasks`,
   `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).
   Same aging/park shape as `reconciliation_stale_gate_backlog` above —
-  **default: PARK**, file a cockpit DecisionRecord, pass `--exclude-id
-  <esc-id>` on the watcher's next start; see that row above for the
-  mechanism and churn evidence, not repeated here. **Asymmetry to know:**
-  this path dedups on an *un-categorized* `has_open_l1(task_id)` (same
-  module, line 385), so an open `reconciliation_stale_gate_backlog` L1 on
+  **default: PARK**, file a cockpit DecisionRecord, append its esc-id to
+  the exclude file on the watcher's next start (not `--exclude-id` — see
+  that row above for why); see that row above too for the mechanism and
+  churn evidence, not repeated here. **Asymmetry to know:**
+  this path dedups on an *un-categorized* `has_open_l1(task_id)` inside
+  `maybe_escalate_stalled_tasks` (same module, line 385), so an open
+  `reconciliation_stale_gate_backlog` L1 on
   the **same task** CAN suppress a would-be HOR escalation, while the
   reverse can't happen (the gate-backlog lookup is category-scoped).
   Practically: a parked gate-backlog record may be masking a HOR condition
@@ -330,6 +332,17 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   while the task is still flagged `human_operator_required` can cause an
   immediate re-file on the very next cycle, since the accumulated cycle
   count is already at or past the threshold.
+
+**Drain-side shortcut — the exclude file only quiets the watcher, not the
+drain:** Main Loop step 5's `get_pending_escalations()` has no exclusion
+mechanism of its own and returns every pending record each cycle, parked
+or not. For an esc-id you've already parked in a prior cycle, don't
+re-read and re-reason about it from scratch each time: the cockpit
+`--id` is idempotent on the esc-id ("Filing Parked Decisions to the
+Cockpit Registry (C8)" below — re-filing the same id overwrites rather
+than duplicates), so if you recognize you've already filed a decision for
+it, just re-affirm PARK and move on instead of re-deriving the decision
+text.
 
 **A note on tiering for these two categories:** the comparison table above
 already says "Tiering | **none** — recon files flat, no levels" — that
