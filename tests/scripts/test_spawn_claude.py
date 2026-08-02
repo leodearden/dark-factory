@@ -1308,6 +1308,43 @@ def test_wait_for_path_scaled_enforces_the_scaled_budget_not_the_base(
     )
 
 
+def test_wait_for_path_scaled_adds_extra_secs_unscaled(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """extra_secs is added ON TOP of the scaled base, unscaled by load and
+    exempt from the cap -- the one gate shape a bare (path, base_secs)
+    signature cannot express:
+    test_window_close_129_robust_to_delayed_trap_install's readyfile gate,
+    which waits out a deliberately injected, wall-clock-fixed sleep (DELAY)
+    on top of the load-dependent subprocess-startup chain. A `sleep 1.0` in
+    a shell script takes 1.0s regardless of host load, so scaling it would
+    inflate the budget for a component that provably does not stretch; and
+    clamping it would silently eat a delay the test deliberately injected.
+
+    Both cases use an already-existing path so the call returns instantly.
+    """
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    # Loaded host (load-per-core 2.0): extra_secs is added on top of the
+    # scaled base, not folded into the scaling itself.
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+    assert _wait_for_path_scaled(
+        existing, 10, extra_secs=1.0
+    ) == _load_scaled_grace(10, cap_secs=_READINESS_WAIT_CAP_SECS) + 1.0
+
+    # Pathological host: the cap clamps only the scaled part; extra_secs
+    # survives the clamp untouched. Mirrors test_load_scaled_grace_clamps_to_cap
+    # one layer up.
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+    assert (
+        _wait_for_path_scaled(existing, 10, extra_secs=1.0)
+        == _READINESS_WAIT_CAP_SECS + 1.0
+    )
+
+
 # ===========================================================================
 # Task 3451: _set_started_grace -- shared started-grace policy for the
 # "must NOT be flagged failed-to-start" test family
