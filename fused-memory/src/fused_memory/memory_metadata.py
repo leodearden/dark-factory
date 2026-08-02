@@ -79,6 +79,7 @@ __all__ = [
     'BLESSED_METADATA_KEYS',
     'KIND_REGISTRY',
     'MEM0_MANAGED_METADATA_KEYS',
+    'CanonicalUniquenessViolation',
     'MemoryMetadataValidationError',
     'MetadataViolation',
     'RESERVED_VOCABULARY_KEYS',
@@ -685,6 +686,49 @@ class MemoryMetadataValidationError(Exception):
             f'memory metadata rejected ({len(self.violations)} violation(s)): '
             f'{detail} -- the metadata vocabulary is defined in '
             f'{self.REGISTRY_LOCATION}'
+        )
+
+
+class CanonicalUniquenessViolation(Exception):
+    """A second ``canonical`` write for a ``(project, topic)`` already taken.
+
+    V1 contract-fixes this type alongside
+    :class:`MemoryMetadataValidationError`, and requires the message to
+    NAME the incumbent's id -- counting is not enough, because an operator
+    who trips this needs to go look at the record that already holds the
+    topic. That obligation is why the seam counts first and only then
+    scrolls: ``count_memories_by_metadata`` is the contracted INV-3 gate
+    but returns an ``int``, which structurally cannot carry an id.
+
+    Deliberately **NOT** a subclass of
+    :class:`MemoryMetadataValidationError`. The two are separate rejection
+    contracts -- one is "your metadata is malformed", the other is "your
+    metadata is well-formed but collides with live state" -- and a caller
+    must be able to tell them apart at the ``except``. Subclassing would
+    also let the pre-existing
+    ``pytest.raises(MemoryMetadataValidationError)`` sites silently
+    swallow a uniqueness violation, i.e. pass for the wrong reason. The
+    structured fields below satisfy INV-2's structured-rejection
+    obligation without needing inheritance.
+
+    Raised ONLY from
+    :func:`~fused_memory.services.memory_service._apply_memory_metadata_validation`,
+    never from :func:`validate_memory_metadata`: the check needs live
+    store state, and the pure validator structurally cannot perform a
+    store lookup. Look for it at the seam, not in the shape validator.
+    """
+
+    def __init__(self, *, project_id: str, topic: str, incumbent_id: str) -> None:
+        self.project_id = project_id
+        self.topic = topic
+        self.incumbent_id = incumbent_id
+        super().__init__(
+            f'canonical uniqueness violated: memory {incumbent_id} is already '
+            f'canonical for topic {topic!r} in project {project_id!r}; at most '
+            f'one canonical memory is allowed per (project, topic). Update or '
+            f'supersede that memory instead of adding a second canonical -- the '
+            f'metadata vocabulary is defined in '
+            f'{MemoryMetadataValidationError.REGISTRY_LOCATION}'
         )
 
 
