@@ -2041,3 +2041,160 @@ class TestCommittedCalibrationIsTraceable:
         )
         assert block['t_low'] < block['t_high']
         assert report['deterministic_band_false_positives'] == 0
+
+
+class TestCommittedPerCategoryEvidenceIsRecorded:
+    """The per-category evidence must be RECORDED, not merely derivable.
+
+    The machinery added by this task can measure each category
+    separately; that is worth nothing until the measurement is actually
+    run and its outcome committed. These tests read the two tracked
+    artifacts — ``calibration/write_triage_calibration_report.json`` and
+    ``config/config.yaml`` — and pin the end-to-end invariant that a
+    number gating a sweep is a number some run measured.
+
+    The state they exist to make impossible is "used, but not measured":
+    a cutoff applied to a category whose report entry neither derives a
+    value nor records why it could not. Both a derived number and a
+    machine-readable refusal are acceptable answers; silence is not.
+
+    No network, no Qdrant — committed artifacts only.
+    """
+
+    CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
+    REPORT_PATH = (
+        Path(__file__).parent.parent
+        / 'calibration'
+        / 'write_triage_calibration_report.json'
+    )
+
+    # Decorator order is load-bearing — see the sibling class above.
+    @staticmethod
+    @functools.cache
+    def _committed():
+        import yaml  # noqa: PLC0415
+
+        cls = TestCommittedPerCategoryEvidenceIsRecorded
+        block = yaml.safe_load(cls.CONFIG_PATH.read_text()).get('write_triage') or {}
+        assert cls.REPORT_PATH.exists(), f'report missing: {cls.REPORT_PATH}'
+        report = json.loads(cls.REPORT_PATH.read_text())
+        return block, report
+
+    @staticmethod
+    def _refusal_reasons() -> frozenset[str]:
+        """The refusal codes, read from the script rather than restated.
+
+        Binding to the module's constants means renaming a reason code
+        cannot leave this guard silently accepting a stale spelling.
+        """
+        mod = _mod()
+        return frozenset({
+            mod.REASON_EMPTY_CLASS,
+            mod.REASON_NOT_SEPARABLE,
+            mod.REASON_NO_JUDGE_BAND,
+        })
+
+    def test_the_report_covers_every_category_in_the_committed_fixture(
+        self, records: list[dict]
+    ) -> None:
+        _, report = self._committed()
+        fixture_categories = {r.get('category') for r in records if r.get('category')}
+        assert fixture_categories == {
+            'procedural_knowledge',
+            'observations_and_summaries',
+            'preferences_and_norms',
+        }, (
+            'the fixture\'s category mix changed — re-run '
+            'scripts/calibrate_write_triage.py before trusting any committed cutoff'
+        )
+        per_category = report.get('per_category')
+        assert isinstance(per_category, dict), (
+            'the committed report has no per_category section, so the cutoff '
+            'gating three categories was measured on an unknown mix of them'
+        )
+        assert fixture_categories <= set(per_category), (
+            f'measured nothing for {sorted(fixture_categories - set(per_category))} — '
+            'a category the corpus contains but the report omits is the exact '
+            '"used but not measured" state this section exists to remove'
+        )
+
+    def test_each_category_is_either_calibrated_or_refused_with_a_reason(self) -> None:
+        _, report = self._committed()
+        per_category = report.get('per_category') or {}
+        assert per_category, 'no per-category measurement is recorded at all'
+        refusals = self._refusal_reasons()
+        for category, entry in per_category.items():
+            t_high = entry.get('t_high')
+            reason = entry.get('reason')
+            if t_high is None:
+                assert reason in refusals, (
+                    f'{category}: no cutoff and no recognised refusal code '
+                    f'(reason={reason!r}) — "not measured" and "measured, and '
+                    f'refused" must never be indistinguishable'
+                )
+                assert entry.get('t_low') is None, (
+                    f'{category}: refused a t_high but kept a t_low'
+                )
+            else:
+                assert isinstance(t_high, float) and not isinstance(t_high, bool), (
+                    f'{category}: t_high is {t_high!r}, not a measured float'
+                )
+                assert 0.0 <= t_high <= 1.0, (
+                    f'{category}: t_high {t_high} is outside the cosine range'
+                )
+                assert reason is None, (
+                    f'{category}: derived t_high={t_high} AND recorded refusal '
+                    f'{reason!r} — a contradictory entry'
+                )
+
+    def test_every_category_records_how_the_pooled_cutoff_treats_its_negatives(
+        self,
+    ) -> None:
+        """The direct evidence for (or against) one cutoff serving all three."""
+        _, report = self._committed()
+        per_category = report.get('per_category') or {}
+        assert per_category, 'no per-category measurement is recorded at all'
+        for category, entry in per_category.items():
+            assert 'pooled_t_high_negatives_admitted' in entry, (
+                f'{category}: the pooled cutoff\'s effect on this category\'s own '
+                f'negatives is unrecorded, so its cross-category validity is '
+                f'asserted rather than measured'
+            )
+            admitted = entry['pooled_t_high_negatives_admitted']
+            assert admitted is None or isinstance(admitted, int), (
+                f'{category}: pooled_t_high_negatives_admitted={admitted!r}'
+            )
+            assert 'pair_counts' in entry, f'{category}: pair counts unrecorded'
+
+    def test_config_restates_only_numbers_the_report_measured(self) -> None:
+        """INV-5, end to end: config never carries a number the report lacks."""
+        block, report = self._committed()
+        by_category = block.get('t_high_by_category')
+        if by_category is None:
+            pytest.fail(
+                'config has no write_triage.t_high_by_category, so every category '
+                'still runs on the pooled cutoff with no record of whether that '
+                'cutoff is evidenced for it'
+            )
+        per_category = report.get('per_category') or {}
+        for category, value in by_category.items():
+            assert category in per_category, (
+                f'config carries a cutoff for {category} that the report never '
+                f'measured — an invented threshold'
+            )
+            assert value == per_category[category]['t_high'], (
+                f'{category}: config says {value}, the report measured '
+                f'{per_category[category]["t_high"]} — a hand-edited threshold'
+            )
+
+    def test_a_refused_category_is_absent_from_config_not_null(self) -> None:
+        block, report = self._committed()
+        by_category = block.get('t_high_by_category') or {}
+        for category, entry in (report.get('per_category') or {}).items():
+            if entry.get('t_high') is not None:
+                continue
+            assert category not in by_category, (
+                f'{category} was refused a cutoff ({entry.get("reason")!r}) yet '
+                f'appears in config as {by_category[category]!r} — "uncalibrated" '
+                f'must have exactly one spelling: absent'
+            )
