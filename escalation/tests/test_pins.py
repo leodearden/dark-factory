@@ -14,6 +14,9 @@ Covers:
   step-7: the LEVEL rule (L1/L2 always pin) and the DEAD-L0 FILING-INCARNATION
           rule (spec S6 clauses iii and iv) — liveness is judged against the
           incarnation that FILED the record.
+  step-9: the STORE-UNAVAILABLE third state (never collapsed into "no
+          records"), report aggregation, the two derived predicates, and
+          purity.
 """
 
 from __future__ import annotations
@@ -369,3 +372,164 @@ class TestDeadL0FilingIncarnationRule:
             live_claimant_id='run-A/sess-A/pid=2',
         )
         assert bucket == 'dead_l0'
+
+
+# ---------------------------------------------------------------------------
+# step-9 — store-correctness third state, aggregation, derived predicates
+# ---------------------------------------------------------------------------
+
+
+class TestStoreUnavailableThirdState:
+    """Spec S6 store-correctness contract (esc-3163 lesson): "store unavailable"
+    is a DISTINGUISHABLE third result, never collapsed into "no records" — a
+    false ``[]`` would route a genuinely-pinned strand into the plain revert
+    branch."""
+
+    def test_records_none_is_store_unavailable_and_pins(self) -> None:
+        report = classify_pins('42', None, live_claimant=False)
+
+        assert report.store_unavailable is True
+        assert report.dead_l0 == ()
+        assert report.queue_handoff == ()
+        assert report.non_pinning == ()
+        assert report.pins is True
+        assert report.vetoes_done_flip is True
+
+    def test_empty_records_is_store_available_and_does_not_pin(self) -> None:
+        report = classify_pins('42', [], live_claimant=False)
+
+        assert report.store_unavailable is False
+        assert report.dead_l0 == ()
+        assert report.queue_handoff == ()
+        assert report.non_pinning == ()
+        assert report.pins is False
+        assert report.vetoes_done_flip is False
+
+    def test_store_unavailable_is_not_equal_to_no_records(self) -> None:
+        """The regression pin: a false ``[]`` cannot masquerade as a store
+        failure (nor the reverse) — the collapse is structurally impossible,
+        not merely discouraged."""
+        unavailable = classify_pins('42', None, live_claimant=False)
+        empty = classify_pins('42', [], live_claimant=False)
+        assert unavailable != empty
+
+    @pytest.mark.parametrize('live_claimant', [True, False])
+    @pytest.mark.parametrize('live_id', [None, LIVE_ID, ''])
+    def test_none_short_circuits_regardless_of_liveness_arguments(
+        self, live_claimant: bool, live_id: str | None,
+    ) -> None:
+        report = classify_pins(
+            '42', None, live_claimant=live_claimant, live_claimant_id=live_id,
+        )
+        assert report.store_unavailable is True
+
+    def test_store_unavailable_report_echoes_task_id(self) -> None:
+        assert classify_pins('77', None, live_claimant=False).task_id == '77'
+
+
+class TestReportAggregation:
+    """A mixed batch splits into the three buckets, preserving input order."""
+
+    MIXED = [
+        _rec(id='esc-42-1', level=0, severity='info'),
+        _rec(id='esc-42-2', level=0, severity='blocking'),
+        _rec(id='esc-42-3', level=1, severity='blocking'),
+        _rec(id='esc-42-4', level=0, severity='bogus'),
+    ]
+
+    def _report(self) -> PinReport:
+        return classify_pins('42', self.MIXED, live_claimant=False)
+
+    def test_mixed_batch_splits_into_the_three_buckets(self) -> None:
+        report = self._report()
+        assert report.non_pinning == ('esc-42-1',)
+        assert report.dead_l0 == ('esc-42-2',)
+        assert report.queue_handoff == ('esc-42-3', 'esc-42-4')
+
+    def test_queue_handoff_preserves_input_order(self) -> None:
+        reordered = [self.MIXED[3], self.MIXED[2]]
+        report = classify_pins('42', reordered, live_claimant=False)
+        assert report.queue_handoff == ('esc-42-4', 'esc-42-3')
+
+    def test_buckets_are_tuples_of_ids(self) -> None:
+        report = self._report()
+        for bucket in (report.dead_l0, report.queue_handoff, report.non_pinning):
+            assert isinstance(bucket, tuple)
+            assert all(isinstance(item, str) for item in bucket)
+
+    def test_every_record_lands_in_exactly_one_bucket(self) -> None:
+        """No drops, no duplicates."""
+        report = self._report()
+        landed = [*report.dead_l0, *report.queue_handoff, *report.non_pinning]
+        assert len(landed) == len(self.MIXED)
+        assert sorted(landed) == sorted(rec.id for rec in self.MIXED)
+
+    def test_report_echoes_task_id_for_structured_emission(self) -> None:
+        assert self._report().task_id == '42'
+
+    def test_records_are_not_filtered_on_their_own_task_id(self) -> None:
+        """The CALLER owns the read scope; the classifier classifies what it is
+        given (an id-prefix filter here would silently drop rows)."""
+        foreign = _rec(id='esc-999-1', level=1, severity='blocking')
+        report = classify_pins('42', [foreign], live_claimant=False)
+        assert report.queue_handoff == ('esc-999-1',)
+
+
+class TestDerivedPredicates:
+    """``pins`` is the recovery veto; ``vetoes_done_flip`` is the deliberately
+    more conservative MARK_DONE veto (PRD D3)."""
+
+    def _classify(self, records: list[_Rec]) -> PinReport:
+        return classify_pins('42', records, live_claimant=False)
+
+    def test_dead_l0_only_batch_does_not_pin(self) -> None:
+        """PRD boundary row 7: a dead-L0 does not block conversion."""
+        report = self._classify([_rec(id='esc-42-1', level=0, severity='blocking')])
+        assert report.dead_l0 == ('esc-42-1',)
+        assert report.pins is False
+
+    def test_info_only_batch_does_not_pin(self) -> None:
+        """PRD boundary row 8."""
+        report = self._classify([_rec(id='esc-42-1', level=0, severity='info')])
+        assert report.non_pinning == ('esc-42-1',)
+        assert report.pins is False
+
+    def test_queue_handoff_batch_pins(self) -> None:
+        report = self._classify([_rec(id='esc-42-1', level=1, severity='blocking')])
+        assert report.pins is True
+
+    def test_dead_l0_still_vetoes_the_done_flip(self) -> None:
+        """PRD D3: ANY non-info open record still vetoes MARK_DONE —
+        phantom-done protection is the half of the veto that was always right."""
+        report = self._classify([_rec(id='esc-42-1', level=0, severity='blocking')])
+        assert report.vetoes_done_flip is True
+
+    def test_info_only_batch_does_not_veto_the_done_flip(self) -> None:
+        report = self._classify([_rec(id='esc-42-1', level=0, severity='info')])
+        assert report.vetoes_done_flip is False
+
+    def test_queue_handoff_vetoes_the_done_flip(self) -> None:
+        report = self._classify([_rec(id='esc-42-1', level=2, severity='blocking')])
+        assert report.vetoes_done_flip is True
+
+
+class TestPurity:
+    """The classifier mutates nothing and performs no I/O."""
+
+    def test_input_sequence_and_records_are_not_mutated(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=0, severity='blocking', filing=OTHER_ID),
+            _rec(id='esc-42-2', level=1, severity='info'),
+        ]
+        before = [dataclasses.replace(rec) for rec in records]
+
+        classify_pins('42', records, live_claimant=True, live_claimant_id=LIVE_ID)
+
+        assert records == before
+        assert len(records) == 2
+
+    def test_repeated_calls_are_deterministic(self) -> None:
+        records = [_rec(id='esc-42-1', level=0, severity='blocking', filing=OTHER_ID)]
+        first = classify_pins('42', records, live_claimant=False)
+        second = classify_pins('42', records, live_claimant=False)
+        assert first == second
