@@ -21,6 +21,7 @@ import logging
 from pathlib import Path
 
 import pytest
+import yaml
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -69,6 +70,12 @@ _MODULE_LINT_COMMANDS = {
     )
     for module in ('cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared')
 }
+
+# The committed repo-root config, loaded by the drift guard in
+# ``TestRootTestCommandLiveConfigDrift``. ``parents[2]`` mirrors
+# ``conftest.REPO_ROOT`` and ``tests/scripts/test_fallback_verify_config.py``'s
+# ``DF_CONFIG_PATH``.
+_DF_CONFIG_PATH = Path(__file__).resolve().parents[2] / 'dark-factory-orchestrator.yaml'
 
 # dark-factory-orchestrator.yaml:50
 _ROOT_LINT_COMMAND = (
@@ -2494,3 +2501,35 @@ class TestPlanRecordScopedTargets:
         """
         plan = derive_verify_plan(files, [], config, fake_worktree_reader, role=role)
         _assert_scoped_targets_invariant(plan, files, f'{branch_name}/{diff_name}')
+
+
+class TestRootTestCommandLiveConfigDrift:
+    """``_ROOT_TEST_COMMAND`` must keep matching the COMMITTED yaml.
+
+    A sibling of ``test_verify_cmd.py``'s
+    ``TestSplitAndChainSegmentsLiveConfigDrift`` (task 3338, commit
+    8999ad8c93), deliberately duplicated here rather than imported or shared
+    via a conftest helper: a guard only protects the hand-copy that lives in
+    its own module, and each test module keeps its own copy of the root
+    ``test_command`` for its own corpus. That is not a hypothetical — it is
+    why this guard is needed at all. This module's ``_ROOT_TEST_COMMAND``
+    silently drifted out of sync with the live yaml (missing the
+    ``scripts/tests/`` target ``test_command`` gained), while
+    ``test_verify_cmd.py``'s identical constant was re-synced the moment its
+    own guard went red. Leaning on that sibling guard instead of adding this
+    one would leave this module's copy unprotected again.
+    """
+
+    @staticmethod
+    def _live_test_command() -> str:
+        return yaml.safe_load(_DF_CONFIG_PATH.read_text(encoding='utf-8'))['test_command']
+
+    def test_corpus_constant_still_matches_the_committed_yaml(self):
+        assert self._live_test_command() == _ROOT_TEST_COMMAND, (
+            'dark-factory-orchestrator.yaml:test_command has drifted from '
+            '_ROOT_TEST_COMMAND. Re-copy the constant, then re-check that the '
+            "assertions it feeds still describe the live chain: the dropped=14 "
+            "'root-test-fan-out' case in TestDroppedChainClausesAreLogged."
+            '_DROP_CASES, and the truncation golden in '
+            'test_root_test_fan_out_still_truncates.'
+        )
