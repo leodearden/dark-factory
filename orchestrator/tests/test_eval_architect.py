@@ -969,6 +969,68 @@ class TestJudgePlanQuality:
         assert verdict.plan_quality == 0.83
         assert _judge_warnings(caplog) == []
 
+    # -- The hole a bare clamp leaves open: NaN (task 3410) ----------------
+    # min/max are ordering operations and NaN is unordered, so
+    # round(min(max(nan, 0.0), 1.0), 4) is nan — verified by execution. A
+    # clamp alone does NOT keep plan_quality in [0, 1]: a NaN would be
+    # persisted verbatim by runner.py and poison report._mean_plan_quality.
+    # json.loads('{"plan_quality": NaN}') SUCCEEDS in CPython, so this is
+    # reachable through the same schema-bypassing path the rest of this task
+    # is about — not hypothetical.
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    async def test_nan_answer_degrades_to_the_none_sentinel_not_a_nan(
+        self, via, caplog,
+    ):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(float('nan'), via=via)),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        # The existing sentinel run_architect_eval already degrades to the
+        # deterministic structural floor on — never a NaN laundered into a
+        # number a downstream mean could be poisoned by.
+        assert verdict.plan_quality is None
+        # A nonsense answer is a CONTENT failure, never the 3118 infra-refusal
+        # exclusion shape.
+        assert verdict.invocation_error is None
+
+        warnings = _judge_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'df_task_2605' in warnings[0]           # WHICH cell
+        assert 'nan' in warnings[0].lower()            # WHAT was wrong
+
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        pytest.param(float('inf'), 1.0, id='positive-infinity-clamps-high'),
+        pytest.param(float('-inf'), 0.0, id='negative-infinity-clamps-low'),
+    ])
+    async def test_infinity_clamps_because_it_is_orderable_unlike_nan(
+        self, raw, expected,
+    ):
+        """DELIBERATE asymmetry, documented in one place: infinity IS
+        orderable, so the clamp has a defined answer; NaN is not, so it has
+        none.
+        """
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(
+                return_value=_judge_result_scoring(raw, via='structured_output'),
+            ),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality == expected
+
 
 # ---------------------------------------------------------------------------
 # The plan judge REFUSES an unjudgeable artifact (task 3303)
