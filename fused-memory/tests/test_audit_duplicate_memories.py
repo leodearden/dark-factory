@@ -2153,47 +2153,105 @@ class TestLexicalMaxRatioReuseAndBound:
 # Calibrated ANN threshold resolution + the Qdrant query shape (task 3210)
 # ===========================================================================
 
-def _config_double(t_high):
-    """MemoryService double whose config carries a write_triage.t_high."""
+_UNSET = object()
+
+_SWEPT_CATEGORIES = (
+    'procedural_knowledge',
+    'observations_and_summaries',
+    'preferences_and_norms',
+)
+
+
+def _config_double(t_high, t_high_by_category=_UNSET):
+    """MemoryService double whose config carries the write_triage cutoffs.
+
+    ``t_high_by_category`` is left UNSET by default on purpose: an unspecced
+    MagicMock auto-generates a child Mock for that attribute, which is exactly
+    the junk leaf the resolver's isinstance guard has to reject. Every test
+    that does not name a map therefore also exercises that rejection.
+    """
     from unittest.mock import MagicMock  # noqa: PLC0415
 
     service = MagicMock()
     service.config.write_triage.t_high = t_high
+    if t_high_by_category is not _UNSET:
+        service.config.write_triage.t_high_by_category = t_high_by_category
     return service
 
 
 class TestResolveAnnThreshold:
     """The cutoff is READ from the committed calibration output, never invented.
 
-    config.write_triage.t_high is a derived order statistic of a measured
-    similarity distribution (provenance: the calibration report). This script
-    must not carry its own copy or its own fallback — an uncalibrated
-    stand-in would be exactly the invented threshold G6 forbids.
+    ``config.write_triage.t_high`` and ``t_high_by_category`` are derived order
+    statistics of measured similarity distributions (provenance: the
+    calibration report). This script must not carry its own copy or its own
+    fallback — an uncalibrated stand-in would be exactly the invented
+    threshold G6 forbids.
+
+    Task 3357 makes the resolution PER CATEGORY, in strict priority:
+    ``--ann-threshold`` override → ``t_high_by_category[cat]`` → the pooled
+    ``t_high`` as a DISCLOSED fallback → absent (that category disabled).
     """
 
-    def test_reads_t_high_from_config(self):
+    def test_reads_t_high_from_config_for_every_category(self):
         """Point the config at a distinctive value and get that value back.
 
         Asserting a DISTINCT value (not the real 0.8868...) is the point: it
         proves the number came from config rather than from a literal that
-        happens to match.
+        happens to match. With no per-category map, every swept category runs
+        on the POOLED number — which is the status quo this task exists to
+        make visible, so it is counted rather than assumed.
         """
-        resolved, disclosure = resolve_ann_threshold(_config_double(0.4242424242))
-        assert resolved == 0.4242424242
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(0.4242424242, None), categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved == dict.fromkeys(_SWEPT_CATEGORIES, 0.4242424242)
+        assert disclosure['ann_disabled_uncalibrated'] == 0
+        assert disclosure['ann_pooled_fallback_categories'] == 3, (
+            'a category running on a cutoff measured elsewhere must be a '
+            'counted number, not an invisible assumption'
+        )
+
+    def test_per_category_cutoff_wins_over_pooled(self):
+        """A calibrated category uses ITS number; the rest fall back, counted."""
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(
+                0.4242424242, {'observations_and_summaries': 0.9393939393},
+            ),
+            categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved['observations_and_summaries'] == 0.9393939393
+        assert resolved['procedural_knowledge'] == 0.4242424242
+        assert resolved['preferences_and_norms'] == 0.4242424242
+        assert disclosure['ann_pooled_fallback_categories'] == 2
         assert disclosure['ann_disabled_uncalibrated'] == 0
 
-    def test_explicit_override_wins(self):
-        resolved, _ = resolve_ann_threshold(_config_double(0.4242424242), override=0.77)
-        assert resolved == 0.77
+    def test_override_wins_for_every_category(self):
+        """The operator override outranks even a populated per-category map."""
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(
+                0.4242424242, {'observations_and_summaries': 0.9393939393},
+            ),
+            override=0.77,
+            categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved == dict.fromkeys(_SWEPT_CATEGORIES, 0.77)
+        assert disclosure['ann_disabled_uncalibrated'] == 0
+        assert disclosure['ann_pooled_fallback_categories'] == 0, (
+            'an explicit operator number is not a pooled fallback'
+        )
 
     def test_override_wins_even_when_uncalibrated(self):
         """An operator override rescues an uncalibrated deployment."""
-        resolved, disclosure = resolve_ann_threshold(_config_double(None), override=0.77)
-        assert resolved == 0.77
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(None, None), override=0.77,
+            categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved == dict.fromkeys(_SWEPT_CATEGORIES, 0.77)
         assert disclosure['ann_disabled_uncalibrated'] == 0
 
     def test_uncalibrated_disables_ann_and_counts_it(self, caplog):
-        """No t_high and no override: DISABLE the path, log ERROR, count it.
+        """No cutoff anywhere and no override: DISABLE, log ERROR, count it.
 
         Never substitute a plausible-looking number — a wrong cutoff would
         silently mis-cluster the corpus, and under --apply that means wrong
@@ -2202,26 +2260,124 @@ class TestResolveAnnThreshold:
         import logging  # noqa: PLC0415
 
         with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
-            resolved, disclosure = resolve_ann_threshold(_config_double(None))
+            resolved, disclosure = resolve_ann_threshold(
+                _config_double(None, None), categories=_SWEPT_CATEGORIES,
+            )
 
-        assert resolved is None, 'must not fabricate a threshold'
-        assert disclosure['ann_disabled_uncalibrated'] == 1
+        assert resolved == {}, 'must not fabricate a threshold'
+        assert not resolved, (
+            'an empty mapping is how the caller detects "disable the whole '
+            'ANN path" — there is no per-category cutoff to run on'
+        )
+        assert disclosure['ann_disabled_uncalibrated'] == 3
         assert any(r.levelno >= logging.ERROR for r in caplog.records), (
             'an uncalibrated ANN path must be loud, not silent'
+        )
+
+    def test_category_with_no_cutoff_is_absent_not_guessed(self, caplog):
+        """A partially-calibrated config disables ONLY the uncovered category.
+
+        The pooled t_high is absent here, so the one category with its own
+        measured cutoff still runs and the other is simply not in the mapping
+        — never a guessed stand-in, and never silently blended in.
+        """
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_memories'):
+            resolved, disclosure = resolve_ann_threshold(
+                _config_double(None, {'procedural_knowledge': 0.8888}),
+                categories=('procedural_knowledge', 'observations_and_summaries'),
+            )
+
+        assert resolved == {'procedural_knowledge': 0.8888}
+        assert 'observations_and_summaries' not in resolved
+        assert disclosure['ann_disabled_uncalibrated'] == 1
+        assert disclosure['ann_pooled_fallback_categories'] == 0
+
+    def test_pooled_fallback_is_warned_by_name(self, caplog):
+        """The weaker evidence is named in the log, not just tallied."""
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_memories'):
+            resolve_ann_threshold(
+                _config_double(0.42, {'procedural_knowledge': 0.88}),
+                categories=_SWEPT_CATEGORIES,
+            )
+
+        warned = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'observations_and_summaries' in warned
+        assert 'preferences_and_norms' in warned
+        assert 'procedural_knowledge' not in warned, (
+            'a category with its own measured cutoff is not a fallback'
         )
 
     def test_non_numeric_t_high_is_treated_as_uncalibrated(self):
         """A Mock/str/bool leaf must not be accepted as a threshold."""
         for bad in ('0.9', True, object()):
-            resolved, disclosure = resolve_ann_threshold(_config_double(bad))
-            assert resolved is None, f'{bad!r} must not resolve as a threshold'
-            assert disclosure['ann_disabled_uncalibrated'] == 1
+            resolved, disclosure = resolve_ann_threshold(
+                _config_double(bad, None), categories=_SWEPT_CATEGORIES,
+            )
+            assert resolved == {}, f'{bad!r} must not resolve as a threshold'
+            assert disclosure['ann_disabled_uncalibrated'] == 3
+
+    def test_non_numeric_map_values_are_rejected(self):
+        """The isinstance guard applies to map VALUES, not just the pooled leaf.
+
+        A junk per-category value must not gate a sweep; the category falls
+        through to the pooled fallback exactly as if it were absent.
+        """
+        for bad in ('0.9', True, object(), None):
+            resolved, disclosure = resolve_ann_threshold(
+                _config_double(0.4242424242, {'procedural_knowledge': bad}),
+                categories=('procedural_knowledge',),
+            )
+            assert resolved == {'procedural_knowledge': 0.4242424242}, (
+                f'{bad!r} must not resolve as a per-category threshold'
+            )
+            assert disclosure['ann_pooled_fallback_categories'] == 1
+
+    def test_unspecced_mock_map_is_rejected(self):
+        """An auto-generated Mock attribute is not a calibration map."""
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(0.4242424242), categories=('procedural_knowledge',),
+        )
+        assert resolved == {'procedural_knowledge': 0.4242424242}
+        assert disclosure['ann_pooled_fallback_categories'] == 1
+
+    def test_non_mapping_map_is_survived(self):
+        """A scalar where a map belongs degrades to pooled, it does not raise."""
+        resolved, _ = resolve_ann_threshold(
+            _config_double(0.4242424242, 0.99), categories=('procedural_knowledge',),
+        )
+        assert resolved == {'procedural_knowledge': 0.4242424242}
 
     def test_missing_config_hops_are_survived(self):
         """A config without write_triage at all degrades, it does not raise."""
-        resolved, disclosure = resolve_ann_threshold(object())
-        assert resolved is None
-        assert disclosure['ann_disabled_uncalibrated'] == 1
+        resolved, disclosure = resolve_ann_threshold(
+            object(), categories=_SWEPT_CATEGORIES,
+        )
+        assert resolved == {}
+        assert disclosure['ann_disabled_uncalibrated'] == 3
+
+    def test_both_disclosure_keys_are_always_present(self):
+        """Neither counter may be missing — absent reads as "not measured"."""
+        cases = (
+            (_config_double(0.42, None), None),
+            (_config_double(0.42, {'procedural_knowledge': 0.9}), None),
+            (_config_double(None, None), None),
+            (_config_double(None, None), 0.77),
+            (object(), None),
+        )
+        for service, override in cases:
+            _resolved, disclosure = resolve_ann_threshold(
+                service, override, categories=_SWEPT_CATEGORIES,
+            )
+            assert disclosure.keys() >= {
+                'ann_disabled_uncalibrated', 'ann_pooled_fallback_categories',
+            }
+            assert all(isinstance(v, int) for v in disclosure.values())
 
 
 @pytest.mark.asyncio
