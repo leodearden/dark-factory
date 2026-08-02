@@ -862,6 +862,42 @@ this module is deliberately stdlib-only with no intra-orchestrator imports
 Kept in sync by hand with that constant."""
 
 
+def normalize_escalations_dir(value: str | Path) -> str:
+    """The ONE canonical spelling of an escalation-queue path (task 3528).
+
+    Both sides of the (fleet-global decisions <-> per-queue escalations) join
+    run their queue path through this helper: the ``write-decision`` verb
+    stamps the normalized form onto ``DecisionRecord.escalations_dir``, and
+    the ``reap-decisions`` verb normalizes both its own ``--escalations-dir``
+    and the decision's stored value before comparing them. Routing both
+    through one function is what makes ``data/../data/escalations/``, a
+    ``~``-relative spelling and a plain absolute path all compare EQUAL --
+    a raw string compare would silently fail open and reintroduce the
+    cross-queue false-closure bug this scoping exists to prevent.
+
+    Returns ``''`` -- the "unset/legacy queue" sentinel, never a path -- for
+    an empty or whitespace-only *value*, mirroring the sibling
+    ``DecisionRecord.severity`` convention; the reaper reads that sentinel as
+    "fall back to project-only scoping". Otherwise returns
+    ``str(Path(raw).expanduser().resolve())``. ``Path.resolve()`` is
+    non-strict on Python 3.11+, so a well-formed queue path that does not
+    exist yet still normalizes rather than faulting.
+
+    Stdlib-only and fail-soft: never raises. A value the OS cannot resolve
+    (an embedded NUL, an unreadable cwd) degrades to the stripped raw string,
+    which simply matches no real queue -- the fail-OPEN direction, leaving a
+    decision visible to the human rather than risking a false close. Keeps
+    this module's no-intra-orchestrator-imports rule (see module docstring).
+    """
+    raw = str(value).strip()
+    if not raw:
+        return ''
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except (OSError, ValueError, RuntimeError):
+        return raw
+
+
 def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
     """Best-effort read of *escalation_id*'s ``status`` field (Fleet Cockpit C8 reaper).
 
