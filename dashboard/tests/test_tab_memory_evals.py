@@ -75,8 +75,9 @@ def tab_memory_evals_jsx_code(tab_memory_evals_jsx_body):
     payload fields the render code also names.  A bare whole-file substring
     grep is therefore satisfied by a MENTION: delete the render site, leave the
     comment, and the assertion stays green.  That false-pass mode is not
-    hypothetical — it is exactly what `_PARITIES` (below) documents finding for
-    `alarmed_open`/`clear`, where the string existed only in prose.
+    hypothetical: `alarmed_open` and `clear` were once asserted present by a
+    whole-file grep that only ever matched the explanatory prose above
+    `verdictBadge` — the strings occurred nowhere in code.
 
     Field-presence assertions grep this code-only text instead, so a field only
     counts as "rendered" when it appears outside a comment.  Where the render
@@ -168,6 +169,46 @@ def _extract_function_body(src: str, fn_name: str) -> str:
             depth -= 1
             if depth == 0:
                 return src[start : j + 1]
+    return ''
+
+
+# ---------------------------------------------------------------------------
+# Helper: extract a module-scope `const <name> = { ... }` / `[ ... ]` literal
+# ---------------------------------------------------------------------------
+
+
+def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
+    """Return the literal assigned to ``const <name> =``, delimiters included.
+
+    Same depth walk as ``_extract_df_data_block``, re-anchored: that helper
+    only matches the ``key: {`` seed-object form used by data.js and so cannot
+    locate a module-scope ``const`` declaration.  ``open_char`` selects the
+    delimiter pair, so one walk serves both the ``PARITY_REFINEMENT`` object
+    and the ``PARITY_PLAIN`` array.
+
+    Returns the empty string if the declaration is not found — callers assert
+    on that explicitly, because "the declaration was deleted" and "the
+    declaration is empty" are different failures with different fixes.
+
+    Same string-literal caveat as ``_extract_df_data_block``: the walk does not
+    skip delimiters inside quoted strings.  Acceptable here for the same
+    reason — these two declarations hold short identifier keys and plain
+    prose values, neither of which embeds a brace or a bracket.
+    """
+    close_char = {'{': '}', '[': ']'}[open_char]
+    m = re.search(rf'\bconst\s+{re.escape(name)}\s*=\s*{re.escape(open_char)}', src)
+    if m is None:
+        return ''
+    start = m.end() - 1  # index of the opening delimiter
+    depth = 0
+    for i in range(start, len(src)):
+        c = src[i]
+        if c == open_char:
+            depth += 1
+        elif c == close_char:
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
     return ''
 
 
@@ -657,24 +698,118 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
 # The four persisted verdict strings, passed through unmapped by the builder.
 _VERDICTS = ('alarm', 'no_alarm', 'insufficient_data', 'grandfathered')
 
-# The server-derived display states that verdictBadge actually BRANCHES on.
-# memory_evals.py:660-661: `parity` "keeps the UI from re-deriving badge state
-# out of three separate fields, which is where the two sides would drift apart".
-#
-# `alarmed_open` and `clear` are deliberately absent.  verdictBadge has no
-# branch for them by design — they agree with the verdict, so they fall through
-# to the plain verdict badge.  Asserting their string appears in the source
-# only ever matched the explanatory COMMENTS (tab_memory_evals.jsx:84 and :100);
-# the strings occur nowhere in code.  That pinned comment wording in place —
-# rewording it would fail this suite with nothing functionally changed — while
-# giving zero coverage of how those states render.  "Falls through to the plain
-# badge" is a claim about which branch does NOT execute, which a source-
-# substring test structurally cannot make; only a DOM/render test could.
-_PARITIES = (
-    'alarmed_unlinked',
-    'recovered_open',
-    'storm_collapsed',
-)
+# The parity vocabulary is deliberately NOT restated here.  It is imported from
+# the producer (`memory_evals.PARITY_STATES`) inside each test that needs it —
+# a local copy is exactly the rot this suite now exists to prevent, and one
+# lived here until task 3442: a hand-picked three-member tuple that could not
+# notice the six states task 3363 added.  See
+# `test_parity_vocabulary_fully_covered` for the completeness contract, and
+# test_memory_evals_data.py::TestParityVocabularyIsClosedAndExported for the
+# proof that the exported frozenset matches what the builder actually emits.
+
+
+def test_parity_vocabulary_fully_covered(tab_memory_evals_jsx_code: str) -> None:
+    """Every `PARITY_STATES` member is handled, and nothing else is.
+
+    The JSX declares its whole view of the vocabulary in two module-scope
+    names — `PARITY_REFINEMENT` (states whose badge is refined) and
+    `PARITY_PLAIN` (states that deliberately decline refinement) — precisely so
+    this can be checked against the PRODUCER rather than against a subset
+    copied into this file.  Both directions are separate failures:
+
+    * a member in NEITHER declaration is a state the server can emit today and
+      the browser has never been told about;
+    * a declared state OUTSIDE `PARITY_STATES` is a dead branch the producer no
+      longer emits, which no render test would ever reach.
+
+    An explicit opt-out list is what makes the first check possible at all.
+    "Falls through to the plain badge" is otherwise a claim about which branch
+    does NOT execute — unobservable to a source-assertion test, which is why
+    the previous version of this suite simply omitted those states and went
+    blind to six of them.
+    """
+    from dashboard.data.memory_evals import PARITY_STATES
+
+    code = tab_memory_evals_jsx_code
+
+    refinement = _extract_const_object(code, 'PARITY_REFINEMENT')
+    assert refinement, (
+        'tab_memory_evals.jsx must declare `const PARITY_REFINEMENT = {...}` at '
+        'module scope in CODE (not in a comment). It is the one place the file '
+        'says which parity states change the badge, and what this test compares '
+        'against memory_evals.PARITY_STATES.'
+    )
+    plain = _extract_const_object(code, 'PARITY_PLAIN', open_char='[')
+    assert plain, (
+        'tab_memory_evals.jsx must declare `const PARITY_PLAIN = [...]` at '
+        'module scope — the EXPLICIT opt-out list. Without it, a state that is '
+        'merely unhandled is indistinguishable from one deliberately left to '
+        'the plain verdict badge, and this test cannot tell a considered '
+        'decision from an oversight.'
+    )
+
+    entries = re.findall(r'(\w+)\s*:\s*\{([^{}]*)\}', refinement)
+    handled = {key for key, _ in entries}
+    declined = set(re.findall(r"'([^']*)'", plain))
+
+    assert handled, 'PARITY_REFINEMENT is declared but holds no entries.'
+    assert declined, 'PARITY_PLAIN is declared but holds no states.'
+
+    overlap = handled & declined
+    assert overlap == set(), (
+        f'{sorted(overlap)} appear in BOTH PARITY_REFINEMENT and PARITY_PLAIN. '
+        'A state is either refined or deliberately plain; declaring both makes '
+        'the opt-out list stop meaning "considered and declined".'
+    )
+
+    unhandled = PARITY_STATES - (handled | declined)
+    assert unhandled == set(), (
+        f'memory_evals.PARITY_STATES member(s) {sorted(unhandled)} appear in '
+        'neither PARITY_REFINEMENT nor PARITY_PLAIN. The server can emit these '
+        'today and this file has never been told about them, so they render '
+        'through whatever the fall-through happens to be. Add each to the '
+        'table (with the fact its badge should carry) or to the plain list '
+        '(if the verdict badge already says everything there is to say).'
+    )
+
+    dead = (handled | declined) - PARITY_STATES
+    assert dead == set(), (
+        f'{sorted(dead)} are declared here but are not in '
+        'memory_evals.PARITY_STATES — the producer cannot emit them, so they '
+        'are dead branches no render can reach. Delete them, or fix the '
+        'spelling if the producer renamed the state.'
+    )
+
+    # The composition invariant, in its structural form: table values are
+    # SUFFIXES, never whole labels, so there is no expression in this file
+    # capable of returning a label that discards the verdict-derived base.
+    for key, value in entries:
+        keys = set(re.findall(r'(\w+)\s*:', value))
+        assert keys == {'suffix', 'cls'}, (
+            f"PARITY_REFINEMENT['{key}'] must be a {{ suffix, cls }} pair, got "
+            f'keys {sorted(keys)}. Storing a whole label would let a parity '
+            'branch report a state the payload never asserted — `_parity()` '
+            'derives most states from (verdict class, linked?), so the verdict '
+            'must survive into the label.'
+        )
+
+    badge_body = _extract_function_body(code, 'verdictBadge')
+    assert badge_body, 'could not extract the verdictBadge body.'
+    labels = re.findall(r'label\s*:\s*([^,}\n]+)', badge_body)
+    assert labels, 'verdictBadge returns no `label`.'
+    for expr in labels:
+        assert expr.strip().startswith('base'), (
+            f'verdictBadge returns the label {expr.strip()!r}, which does not '
+            'begin with the verdict-derived `base`. Every returned label must '
+            'compose onto it: a fixed label reports a state the payload never '
+            'asserted (for recovered_open that would include a metric which '
+            'was never measured being shown as having recovered).'
+        )
+    assert any('suffix' in e for e in labels), (
+        'no verdictBadge return composes a PARITY_REFINEMENT `suffix` onto '
+        '`base` — the table is declared but never consumed, so every refined '
+        'state renders as the plain verdict badge.'
+    )
 
 
 def test_verdict_badges_driven_by_persisted_verdict(
@@ -709,11 +844,15 @@ def test_verdict_badges_driven_by_persisted_verdict(
             'through unmapped by the builder; there is no client-side '
             'translation table.'
         )
-    for parity in _PARITIES:
+    from dashboard.data.memory_evals import PARITY_STATES
+
+    for parity in sorted(PARITY_STATES):
         assert f"'{parity}'" in code, (
             f"tab_memory_evals.jsx must name the server-derived parity state "
             f"'{parity}' in CODE — the comment block above verdictBadge names "
-            'all of them, so a whole-file grep proves nothing.'
+            'all of them, so a whole-file grep proves nothing. Iterated from '
+            'the PRODUCER, so a state added there fails here rather than '
+            'rendering through an unwritten branch.'
         )
 
     # Existing .badge vocabulary — no new CSS needed for four verdict states.
@@ -726,42 +865,14 @@ def test_verdict_badges_driven_by_persisted_verdict(
     # A null/absent verdict renders its own state, not a defaulted one.
     badge_body = _extract_function_body(code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
-    # (i) THE PARITY SHORT-CIRCUIT. Every parity branch must COMPOSE with the
-    #     verdict-derived label, never replace it.
-    #
-    #     memory_evals.py:706-715 `_parity()` is a two-case lookup: alarm ->
-    #     alarmed_open/alarmed_unlinked, and everything else ->
-    #     `'recovered_open' if escalation else 'clear'`. So `recovered_open` is
-    #     derived for EVERY non-alarm verdict carrying a linked escalation —
-    #     `insufficient_data`, `grandfathered` and a NULL verdict included. A
-    #     parity branch that returned a hard-coded 'recovered ...' label would
-    #     therefore show a metric that was never measured as having recovered.
-    #
-    #     The previous version of this test could not see that: it inspected
-    #     only `badge_body[badge_body.rfind('insufficient_data'):]` — the tail,
-    #     which begins AFTER the parity branches — so a parity short-circuit
-    #     ahead of the verdict branches was structurally invisible to it.
-    #     Anchored per-branch instead, with no reliance on statement order.
-    for parity in _PARITIES:
-        m = re.search(
-            rf"parity\s*===\s*'{parity}'\s*\)\s*\{{\s*return\s*\{{([^}}]*)\}}",
-            badge_body,
-        )
-        assert m, (
-            f"could not locate the '{parity}' parity branch's return in "
-            'verdictBadge.'
-        )
-        label = re.search(r'label\s*:\s*([^,}]+)', m.group(1))
-        assert label, f"the '{parity}' branch's return has no `label`."
-        expr = label.group(1).strip()
-        assert not re.fullmatch(r"'[^']*'|\"[^\"]*\"|`[^`$]*`", expr), (
-            f"the '{parity}' parity branch returns the hard-coded label {expr} "
-            'and discards the verdict. `_parity()` derives this state from '
-            '(verdict, linked?) — for recovered_open that includes '
-            'insufficient_data, grandfathered and a NULL verdict — so a fixed '
-            'label reports a state the payload never asserted. Compose the '
-            'branch label with the verdict-derived base instead.'
-        )
+    # (i) THE PARITY SHORT-CIRCUIT — that no parity branch may discard the
+    #     verdict-derived label — now lives in
+    #     `test_parity_vocabulary_fully_covered`, asserted structurally over
+    #     every `label:` in this body rather than per-branch. Storing suffixes
+    #     in PARITY_REFINEMENT is what makes the stronger form possible: there
+    #     is no longer an expression in the file CAPABLE of returning a label
+    #     that omits `base`, so the invariant holds for states this suite has
+    #     not enumerated as well as for the ones it has.
 
     # (ii) the base label is derived from `verdict`, and an unrecognised
     #      verdict gets its own state rather than a defaulted one.
