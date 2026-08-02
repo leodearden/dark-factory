@@ -229,7 +229,7 @@ def _has_shell_grouping_or_substitution(raw: str) -> bool:
     return False
 
 
-def _scan_and_chain(raw: str, *, strict: bool) -> 'list[str] | None':
+def _scan_and_chain(raw: str, *, strict: bool) -> list[str] | None:
     """THE `&&`-chain scanner. Splits *raw* at quote depth 0, VERBATIM.
 
     A character-scan state machine tracking single-quote / double-quote state

@@ -5567,7 +5567,8 @@ class TestRunScopedVerificationOptsFallbackIntoSegmentedTest:
         assert run_verification_double.await_count == 1
         await_args = run_verification_double.await_args
         assert await_args is not None, 'run_verification was not awaited'
-        return await_args.kwargs
+        # `.kwargs` is a Mapping; copy so the annotation is an honest dict.
+        return dict(await_args.kwargs)
 
     @pytest.mark.asyncio
     async def test_fallback_branch_passes_segment_chained_test_true(self, tmp_path: Path) -> None:
