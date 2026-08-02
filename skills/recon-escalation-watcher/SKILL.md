@@ -100,7 +100,7 @@ a severity, highest **`dedupe_count`** first (recurrence = persistence = signal)
 ```bash
 cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
   --queue-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations \
-  [--exclude-id <esc-id>] [--exclude-file <path>] [--baseline] [...] 2>&1
+  [--exclude-id <esc-id>] [--exclude-file <path>] [...] 2>&1
 ```
 
 Run as a **background task** (`run_in_background`). **No `--level`** — recon
@@ -116,20 +116,77 @@ each item deliberately left pending so the initial scan and event loop skip it.
 `--exclude-id` also suppresses event-loop wakes from dedupe rewrites of those
 files (MOVED_TO events on the excluded file are silently ignored). Pass both the
 bare id (`esc-recon-abc-1`) and `.json`-suffixed forms — both are accepted.
-For a parked set this large, prefer the bulk forms of the same mechanism:
-`--exclude-file <path>` takes a newline-delimited esc-id list and is
-**re-read every poll**, so the parked set can grow mid-run without
-restarting the watcher; `--baseline` snapshots the pending esc-ids at
-launch and fires only on items **not** in that snapshot. `--baseline` is
-safe for this loop specifically because Main Loop step 1 always drains all
-pending escalations before the watcher (re)starts, so everything in the
-snapshot has already been triaged this cycle. With PARK now the default
-disposition for `reconciliation_stale_gate_backlog` /
+For a parked set this large, prefer the bulk form of the same mechanism:
+`--exclude-file <path>` takes a newline-delimited esc-id list, and
+`current_excludes()` (`escalation/src/escalation/watcher.py:224-225`) calls
+`_read_exclude_file` on every invocation — once for the initial scan
+(`watcher.py:246`) and again on every poll of the event loop
+(`watcher.py:269`) — so it excludes only the ids you actually listed, with
+no masking window, and the parked set can grow mid-run just by appending a
+line, no watcher restart needed.
+
+Since this skill invokes `python -m escalation.watcher` directly — no
+wrapper script owns an exclude-file for you the way the sibling skill's
+does (see below) — name a conventional path yourself:
+`<queue-dir>/.watcher-exclude-recon`, a dotfile the watcher's own
+`esc-*.json` glob (`_snapshot_pending_ids`, `watcher.py:158`) safely
+ignores, mirroring the sibling wrapper's own in-queue-dir dotfile
+convention (`.watcher-rearm-exclude-l2`). Append with `echo <esc-id> >>
+<path>`: `_read_exclude_file`'s docstring (`watcher.py:128-132`) blesses a
+single short-line append as atomic on POSIX, and a torn multi-write append
+is self-healing on the next poll. The reader is fail-open — a missing or
+unreadable file yields an empty set, retried next poll
+(`watcher.py:134-140`) — so a lost or not-yet-created exclude file just
+degrades to re-firing on parked items: noisy, never silent. Blank lines and
+`#` comments are skipped (`watcher.py:143-146`), so the file can be
+annotated.
+
+**`--baseline` is NOT safe for this loop — do not reach for it here**,
+despite being listed as an available flag above. `_snapshot_pending_ids()`
+(`watcher.py:151-158`) freezes the pending-id set exactly once, at launch,
+strictly before `add_watch` arms the inotify watch (`watcher.py:238` runs
+before `watcher.py:243`) — and unlike `--exclude-file`, that snapshot is
+never re-read afterward (`watcher.py:225`; the code's own comment at
+`watcher.py:227-237` reasons only about the narrower snapshot→`add_watch`
+race, not this one). This loop's handling phase is long — draining,
+handling 31+ parked records, and filing a cockpit DecisionRecord for each
+takes real wall-clock time between one watcher restart and the next — so
+any escalation recon files *during that window* is already on disk by the
+time the following restart takes its `--baseline` snapshot. That new
+escalation gets folded straight into the snapshot and is excluded from both
+the initial scan (`watcher.py:246`) and the event loop (`watcher.py:269-286`)
+for that run's entire lifetime, despite never having been drained or
+triaged by anyone. It is worse than a one-cycle miss: the snapshot is
+retaken at *every* restart while the item is still pending, so it stays
+masked cycle after cycle until some unrelated, newer escalation happens to
+fire the watcher and the next drain re-finds it. And the wait here is
+**unbounded** — this skill's watcher invocation carries no `--timeout`, so
+`deadline` stays `None` and the event loop blocks indefinitely
+(`watcher.py:252-264`), with no expiry to force a restart-and-redrain. Net
+effect: with `--exclude-id` / `--exclude-file`, a deliberately-parked item
+simply fires again at the next watcher start, same as any other pending
+item — normal, expected, and loud. With `--baseline` it can instead vanish
+into a silent, unbounded delay in this queue's **sole closer**.
+
+With PARK now the default disposition for `reconciliation_stale_gate_backlog` /
 `reconciliation_stale_human_operator`, the parked set is structurally large
 (31 records as of 2026-08-02) — hand-listing one `--exclude-id` per record
-does not scale. `skills/escalation-watcher/SKILL.md` already uses
-`--baseline` for the same purpose, so the vocabulary is consistent across
-both watcher skills.
+does not scale; use `--exclude-file` for it, not `--baseline`. The sibling
+`skills/escalation-watcher/SKILL.md` documents `--baseline` as an available
+flag too, but that is not a counterexample: its Main Loop restarts the
+watcher *first* and drains only after confirming it's up, and its step 7 is
+`Go to 1`, so **every** restart there is immediately followed by a fresh,
+authoritative drain — that skill says as much at its lines 93-94, that the
+fired escalation "is just the wake ... the drain re-finds it (still
+pending) plus anything new." Its documented invocation also passes
+`--timeout 3600` (`skills/escalation-watcher/SKILL.md:133-136`), so even a
+completely quiet queue force-restarts and re-drains at least once an hour.
+Tellingly, that skill's own re-arming guidance for its parked set does not
+reach for `--baseline` either — it routes through a wrapper-owned
+`--exclude-file` instead (`skills/escalation-watcher/SKILL.md:165-175`,
+`scripts/watcher-rearm.sh`, default path
+`<queue-dir>/.watcher-rearm-exclude-l2`). `--exclude-file` — not
+`--baseline` — is what is actually consistent across both watcher skills.
 
 **Process safety:** only stop watcher processes you started via background task
 controls. Never `pkill` by pattern.
