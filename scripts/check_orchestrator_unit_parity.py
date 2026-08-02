@@ -76,20 +76,37 @@ diverge from their committed copies and this checker reports drift for them:
   ``RestartMaxDelaySec=60``.  systemd requires the former for the latter to
   take effect — without it it logs "has RestartMaxDelaySec= but no
   RestartSteps= setting. Ignoring." and DISCARDS the cap — so the restart
-  backoff ceiling those units appear to have is silently inert today.
-- FOUR still name legacy config filenames in ExecStart (``orchestrator.yaml``
-  / ``orchestrator-config.yaml``) where the committed copy names
-  ``dark-factory-orchestrator.yaml``.
+  backoff ceiling those units appear to have is silently inert today.  Here
+  the REPO copy is the correct one.
+- FOUR disagree on the ExecStart ``--config`` path, and in the direction
+  opposite to the one above: the INSTALLED copies name the canonical
+  ``dark-factory-orchestrator.yaml`` that CLAUDE.md requires, while the
+  COMMITTED copies still name legacy ``orchestrator.yaml`` /
+  ``orchestrator-config.yaml``.  Here the INSTALLED copy is the correct one.
 - ``orchestrator-reify.service``'s installed copy lacks
-  ``RequiresMountsFor=/home/leo/src/warm-lanes``.
+  ``RequiresMountsFor=/home/leo/src/warm-lanes`` — but carries a drop-in
+  (``orchestrator-reify.service.d/warm-lane.conf``) instead, which is why
+  this unit also reports ``[override]``.
 
-Fixing those five is OWNED by the follow-up filed from task 3424 as ticket
-``tkt_0RRZWH0V5F9PPG86A1WDJ3NV2R`` ("Bring the five installed
-orchestrator-*.service units to parity with their committed copies").  Task
-3424 deliberately converged only the two watchdog units on the live host:
-reinstalling the other five would repoint LIVE orchestrators at
-``dark-factory-orchestrator.yaml`` paths that may not exist in those repos,
-and needs a restart of the running fleet.
+DO NOT "fix" that second bullet by running ``setup-host.sh``.  Measured
+2026-08-02: ``/home/leo/src/reify/orchestrator.yaml`` and
+``/home/leo/src/autopilot-video/orchestrator-config.yaml`` — the paths the
+COMMITTED units name — DO NOT EXIST.  Only the canonical
+``dark-factory-orchestrator.yaml`` does.  So the ``cp`` block in
+``setup-host.sh`` would overwrite two working installed units with committed
+ones pointing at absent config files, breaking both orchestrators on their
+next restart.  This is the exact hazard the "no ``--fix``" note below
+describes, and it is live TODAY: for these four units the committed file is
+the thing that is wrong, and it must be corrected in the repo BEFORE any
+install propagates it.  This is also why the setup-host.sh gate is warn-only
+and pre-install: it makes the divergence visible without acting on it.
+
+Fixing all five is OWNED by the follow-up filed from task 3424 as ticket
+``tkt_0RRZWH0V5F9PPG86A1WDJ3NV2R``.  Task 3424 deliberately converged only
+the two watchdog units on the live host, and the measurement above is why
+that scoping was right: the five need a per-unit judgement about WHICH side
+is correct (repo for RestartSteps, installed for ExecStart) plus a restart of
+the running fleet — not a blanket copy in either direction.
 
 Naming the owner here is not bookkeeping.  ``check_dashboard_unit_parity.py``
 records that a permanently-red gate gets switched off within a week — taking
@@ -141,6 +158,7 @@ import argparse
 import dataclasses
 import pathlib
 import sys
+from typing import Sequence
 
 from systemd_unit_parity import parse_unit_directives
 
@@ -368,5 +386,158 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# main() and the `if __name__ == "__main__"` tail land in step-10, together
-# with the report vocabulary and the exit-code contract the tests drive.
+def main(argv: Sequence[str]) -> int:
+    """Parse args and run the parity check.
+
+    Returns:
+        0 — parity (and at least one unit was actually compared)
+        1 — drift, OR a committed unit vanished, OR a drop-in override
+        2 — one or more installed units absent
+
+    Drift DOMINATES absence: a run that hits both returns 1.  An absent unit
+    is still reported in that case — dominated, not hidden.  A run that
+    compared ZERO units never reports parity: see the exit-code table in the
+    module docstring.
+    """
+    args = _build_parser().parse_args(argv)
+
+    installed_dir: pathlib.Path = args.installed_dir
+    repo_root: pathlib.Path = args.repo_root
+    selected = args.unit or sorted(UNITS)
+
+    drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
+    missing: list[tuple[str, pathlib.Path]] = []
+    vanished: list[tuple[str, pathlib.Path]] = []
+    overridden: list[tuple[str, list[pathlib.Path]]] = []
+    # Units that actually reached compare_unit. The success line reports THIS
+    # count, not len(selected): a report may only claim what it verified.
+    compared: list[str] = []
+
+    for name in selected:
+        repo_path = repo_root / UNITS[name]
+        installed_path = installed_dir / name
+
+        if not repo_path.is_file():
+            # The committed unit is the source of truth; without it there is
+            # nothing to compare against, so this unit was NOT checked.
+            vanished.append((name, repo_path))
+            continue
+
+        if not installed_path.is_file():
+            missing.append((name, installed_path))
+            continue
+
+        # Checked even when the unit itself is at parity: a drop-in is layered
+        # OVER a matching unit file, so it is invisible to the text
+        # comparison below.
+        dropins = find_dropins(installed_dir, name)
+        if dropins:
+            overridden.append((name, dropins))
+
+        compared.append(name)
+        for drift in compare_unit(
+            name,
+            repo_path.read_text(encoding="utf-8"),
+            installed_path.read_text(encoding="utf-8"),
+        ):
+            drifts.append((drift, repo_path, installed_path))
+
+    for name, path in missing:
+        _log(f"[skip] {name}: installed unit not found: {path} (not installed on this host)")
+
+    if vanished:
+        # Deliberately worded apart from the drift block below. Both exit 1,
+        # but they send the operator to different places: a drift is a
+        # directive diff to propagate, whereas this is "the file I compare
+        # against is gone" — telling them to hunt for a diff would waste the
+        # trip.
+        _log(
+            f"[vanished] {len(vanished)} committed unit(s) not found — "
+            "nothing was verified for them:"
+        )
+        for name, repo_path in vanished:
+            _log(f"  {name}: expected committed copy at {repo_path}")
+        _log(
+            "[vanished] The committed unit is this checker's source of truth. "
+            "Check --repo-root, and whether the unit was renamed or moved "
+            "(the paths live in UNITS in this script)."
+        )
+
+    if overridden:
+        # Worded apart from [drift] for the same reason [vanished] is: this is
+        # not a directive diff to propagate. The unit files may match exactly;
+        # what the run could not establish is that the EFFECTIVE configuration
+        # matches, because systemd merges these over the unit at load time.
+        # It shares exit 1 because "I could not verify" belongs with "I found
+        # a difference", not with the benign "not installed here" that 2
+        # denotes — reporting parity here would overstate what was checked.
+        _log(
+            f"[override] {len(overridden)} unit(s) have drop-in overrides — "
+            "the unit files were compared, but the EFFECTIVE configuration "
+            "was NOT verified:"
+        )
+        for name, dropins in overridden:
+            for dropin in dropins:
+                _log(f"  {name}: {dropin}")
+        _log(
+            "[override] systemd merges these over the unit at load time, so a "
+            "directive set here silently wins over the committed value. "
+            "Inspect with: systemctl --user cat <unit>  (and remove the "
+            "drop-in, or move the setting into the committed unit)."
+        )
+
+    if drifts:
+        _log(
+            f"[drift] {len(drifts)} directive(s) differ between repo and "
+            "installed units:"
+        )
+        for drift, repo_path, installed_path in drifts:
+            _log(f"  {drift.unit} [{drift.section}] {drift.key}")
+            _log(f"      {drift.reason}")
+            _log(f"      repo      {repo_path}: {drift.repo_value}")
+            _log(f"      installed {installed_path}: {drift.installed_value}")
+        _log(
+            "[drift] To propagate the committed units to this host, run: "
+            "scripts/setup-host.sh  (this checker is read-only by design — "
+            "see the module docstring for why there is no --fix)"
+        )
+        # Deliberately NOT phrased as "the installed copy is stale". The
+        # report above shows drift, not direction: measured 2026-08-02, some
+        # of these units have the correct value on the REPO side
+        # (RestartSteps) and others on the INSTALLED side (the ExecStart
+        # --config path, where two committed units name config files that do
+        # not exist). Propagating blindly would break a running orchestrator.
+        _log(
+            "[drift] BUT CHECK DIRECTION FIRST: drift does not mean the "
+            "installed copy is the stale one. Confirm the committed value is "
+            "the one you want on this host before installing — see the KNOWN "
+            "RED section of this script's module docstring."
+        )
+
+    if drifts or vanished or overridden:
+        return 1
+
+    if missing:
+        return 2
+
+    if not compared:
+        # UNREACHABLE BY CONSTRUCTION, kept as defence — not a tested path.
+        # Every unit that was not compared took an earlier `continue` into
+        # `vanished` or `missing`, and both return above, so reaching here
+        # requires `selected` itself to be empty: impossible while UNITS is
+        # non-empty (`args.unit or sorted(UNITS)`) and argparse `choices`
+        # rejects an unknown --unit. (The "compared nothing" TEST reaches
+        # exit 1 through the `vanished` branch, which is the same invariant
+        # enforced one step earlier.) It stays because that invariant — a run
+        # that verified nothing must never report parity — is one a future
+        # early-`continue` could quietly break, and holding it costs three
+        # lines.
+        _log("[error] no units were compared — nothing was verified.")
+        return 1
+
+    _log(f"[ok] parity — {len(compared)} unit(s) match their committed copies.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

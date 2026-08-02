@@ -9,13 +9,16 @@ docstrings.
 That rule is load-bearing here for a specific, measured reason rather than
 mere portability. As measured on 2026-08-02, five of the seven registered
 units (the orchestrator-*.service ones) diverge from their committed copies on
-this host: every installed copy lacks ``RestartSteps=4``, so its
-``RestartMaxDelaySec=60`` is silently discarded by systemd; four still name
-legacy config filenames in ExecStart; reify's lacks RequiresMountsFor. Fixing
-them is owned by a named follow-up task (see the checker's module docstring) —
-so a test asserting parity against the live host would be red on landing, and
-one asserting drift would flip red the moment that task lands. Either encodes
-host state rather than checker behaviour.
+this host, and — importantly — NOT all in the same direction: every installed
+copy lacks ``RestartSteps=4`` (so its ``RestartMaxDelaySec=60`` is silently
+discarded by systemd, and the REPO copy is the correct one), while four have
+an ExecStart ``--config`` path where the INSTALLED copy is the correct one
+(it names the canonical ``dark-factory-orchestrator.yaml``; the committed copy
+still names a legacy filename that, for reify and autopilot-video, does not
+exist at all). Fixing them is owned by a named follow-up task (see the
+checker's module docstring) — so a test asserting parity against the live host
+would be red on landing, and one asserting drift would flip red the moment
+that task lands. Either encodes host state rather than checker behaviour.
 
 The only real-tree reads are REPO-side: the committed scripts/*.service and
 *.timer files, and scripts/setup-host.sh, used by the registry staleness guard.
