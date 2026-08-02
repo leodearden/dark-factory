@@ -101,6 +101,7 @@ window.DF_DATA = {
     summary: {
       by_level: { 0: 0, 1: 0, 2: 0 },
       by_status: { pending: 0, resolved: 0, dismissed: 0 },
+      skipped_count: 0,
     },
   },
   // ESCALATION_ANALYTICS is an object (not a captured top-level array), so it is
