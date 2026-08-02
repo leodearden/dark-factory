@@ -807,8 +807,10 @@ def test_parity_vocabulary_fully_covered(tab_memory_evals_jsx_code: str) -> None
             f'verdictBadge returns the label {expr.strip()!r}, which does not '
             'begin with the verdict-derived `base`. Every returned label must '
             'compose onto it: a fixed label reports a state the payload never '
-            'asserted (for recovered_open that would include a metric which '
-            'was never measured being shown as having recovered).'
+            'asserted. `_parity()` is a three-case lookup over (verdict class, '
+            'linked?) that gives every class its OWN pair of states — a fixed '
+            'label collapses that back, e.g. reporting a metric nothing judged '
+            '(`unjudged_open`, `insufficient_data_open`) as having recovered.'
         )
     assert any('suffix' in e for e in labels), (
         'no verdictBadge return composes a PARITY_REFINEMENT `suffix` onto '
@@ -959,8 +961,9 @@ def test_verdict_badges_driven_by_persisted_verdict(
     parity state, and an absent verdict must render its own explicit state.
 
     Defaulting a null verdict to `no_alarm` would turn "we do not know" into
-    "we checked and it is fine" — the builder itself refuses that at
-    memory_evals.py:847-849, and the UI must not undo it.
+    "we checked and it is fine" — the builder itself refuses that in
+    `memory_evals._verdict_class()`, which buckets an absent value to
+    `unjudged` rather than to a verdict, and the UI must not undo it.
     """
     body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
@@ -1045,10 +1048,10 @@ def test_no_client_side_alarm_derivation(
 ) -> None:
     """THE load-bearing exclusion (PRD section 8 / G6 / INV-5).
 
-    `verdict` and `parity` are the ONLY badge inputs.  memory_evals.py:660-661
-    records why: `parity` exists precisely so "the UI [does not] re-deriv[e]
-    badge state out of three separate fields, which is where the two sides
-    would drift apart".  A browser-side value-vs-limit comparison would be a
+    `verdict` and `parity` are the ONLY badge inputs.  The docstring of
+    `memory_evals._parity()` records why: `parity` exists precisely so "the UI
+    [does not] re-deriv[e] badge state out of three separate fields, which is
+    where the two sides would drift apart".  A browser-side value-vs-limit comparison would be a
     second, divergent alarm rule shipped next to the real one.
 
     Displaying `limits.alpha` is legal.  Comparing against it is the violation.
@@ -1250,15 +1253,17 @@ def test_escalation_links_and_storm_aggregate_banner(
     )
 
     # (c) fingerprints are rendered whole, never parsed.
-    #     memory_evals.py:576-579 — the fingerprint is the producer's private
-    #     construction; the dashboard must not depend on its substructure.
+    #     memory_evals._escalation_projection() — the fingerprint is the
+    #     producer's private construction; the dashboard must not depend on
+    #     its substructure.
     for field in ('dedupe_fingerprint', 'fingerprint'):
         for op in (r'\.split\(', r'\.slice\(', r'\.match\(', r'\.substring\('):
             assert not re.search(rf'{field}\s*{op}', body), (
                 f'`{field}` must be rendered whole — never split/sliced/matched. '
                 'The fingerprint is the producer\'s private construction '
-                '(memory_evals.py:576-579); parsing its substructure here would '
-                'couple the dashboard to a format it does not own.'
+                '(memory_evals._escalation_projection()); parsing its '
+                'substructure here would couple the dashboard to a format it '
+                'does not own.'
             )
 
     # (d) the storm banner reads the TOP-LEVEL block, not an eval row's copy.
@@ -1276,7 +1281,8 @@ def test_escalation_links_and_storm_aggregate_banner(
         r'(payload|MEDF\.MEMORY_EVALS|MEMORY_EVALS)\s*\.\s*storm_escape', body
     ), (
         'the storm banner must read the TOP-LEVEL MEMORY_EVALS.storm_escape '
-        '(memory_evals.py:958-964). The identical object repeated on each eval '
+        '(memory_evals._build_payload() fills it; _empty_payload() declares it '
+        'on every return path). The identical object repeated on each eval '
         "row exists only to explain that row's missing link; electing an "
         'arbitrary eval row to read the banner from would break on a root with '
         'zero eval dirs.'
@@ -1305,7 +1311,7 @@ def test_escalation_links_and_storm_aggregate_banner(
             'Collapsing the three into one undifferentiated "unexplained" list '
             'would fire on escalations that are in fact fully explained and '
             'train operators to ignore the one signal that catches a real '
-            'parity orphan (memory_evals.py:530-534).'
+            'parity orphan (memory_evals._unmatched_projection()).'
         )
     # Distinct wording, not three branches sharing one string.
     #
@@ -1341,7 +1347,7 @@ def test_escalation_links_and_storm_aggregate_banner(
         f'found duplicates in {texts}. Collapsing them into one '
         'undifferentiated "unexplained" list would fire on escalations that '
         'are in fact fully explained and train operators to ignore the one '
-        'signal that catches a real parity orphan (memory_evals.py:530-534).'
+        'signal that catches a real parity orphan (memory_evals._unmatched_projection()).'
     )
     assert all(t.strip() for t in texts), (
         f'every reason wording must be non-empty; found a blank in {texts}.'
@@ -1393,7 +1399,7 @@ def test_limits_provenance_rendered(
 
     # stale_for_latest_run gates a VISIBLE disclosure — provenance stamped at an
     # older run must never be presented as governing a newer displayed run
-    # (memory_evals.py:237-241).
+    # (memory_evals._read_limits() stamps `stale_for_latest_run`).
     assert re.search(r'stale_for_latest_run\s*&&', code), (
         '`limits.stale_for_latest_run` must GATE a visible disclosure, not just '
         'be printed as one more field. Otherwise alpha/baseline provenance '
@@ -1499,7 +1505,7 @@ def test_staleness_empty_states_and_issues_notice(
         r'payload\.root_present\s*&&\s*evals\.length\s*===\s*0\s*&&', code
     ), (
         'root_present === true with zero evals is an empty-but-HEALTHY state '
-        '(memory_evals.py:972-974) and needs its OWN branch, gated on '
+        '(memory_evals._build_payload()) and needs its OWN branch, gated on '
         '`payload.root_present && evals.length === 0` — folding it into the '
         'root-absent message would report a working system as a broken one.'
     )

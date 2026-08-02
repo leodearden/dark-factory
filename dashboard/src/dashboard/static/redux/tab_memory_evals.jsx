@@ -95,7 +95,7 @@ function ageText(seconds) {
 //
 // `verdict` and `parity` are the ONLY badge inputs.  Re-deriving alarm state
 // from value-vs-limit in the browser is forbidden by PRD section 8 (G6/INV-5):
-// memory_evals.py:660-661 says `parity` exists precisely so the UI does not
+// memory_evals._parity() says `parity` exists precisely so the UI does not
 // re-derive badge state "out of three separate fields, which is where the two
 // sides would drift apart".  This function therefore performs string equality
 // only — no arithmetic, no ordering comparison, no limits.
@@ -185,19 +185,28 @@ function verdictBadge(metric) {
   // The plain verdict label is computed FIRST, so that no parity branch below
   // can discard it.
   //
-  // This ordering is load-bearing.  memory_evals.py:706-715 `_parity()` is a
-  // two-case lookup — `if verdict == 'alarm': ...; return 'recovered_open' if
-  // escalation else 'clear'` — so `recovered_open` is derived for EVERY
-  // non-alarm verdict that carries a linked escalation, not just `no_alarm`.
-  // `insufficient_data`, `grandfathered` and a null verdict all reach it.  A
-  // parity branch returning a bare 'recovered' label would therefore tell the
-  // operator that a metric which was never measured had recovered — the same
-  // "we did not measure" -> "we measured and it is fine" substitution the
-  // absent-verdict fall-through exists to prevent, and worse, because it
-  // asserts a recovery rather than merely a clean bill of health.
+  // This ordering is load-bearing.  memory_evals._parity() is a THREE-case
+  // lookup over (verdict class, linked?): `alarm`, then `no_alarm`, then a
+  // per-class fall-through that suffixes `_open` onto the linked variant of
+  // every remaining class.  So every verdict class carries its own pair of
+  // states and the class survives into the parity string — `recovered_open`
+  // and `clear` are NARROWED to the `no_alarm` verdict, and
+  // `insufficient_data`, `grandfathered` and an absent verdict now reach
+  // `insufficient_data_open`, `grandfathered_open` and `unjudged_open` rather
+  // than borrowing the recovery label.
+  //
+  // The producer draws those distinctions precisely so this badge can keep
+  // them, and a parity branch returning a FIXED label would collapse them
+  // right back — telling the operator that a metric nothing judged had
+  // recovered, the same "we did not measure" -> "we measured and it is fine"
+  // substitution the absent-verdict fall-through exists to prevent.  Suffixing
+  // `base` rather than replacing it is what makes that unrepresentable here,
+  // for every one of the nine refined states at once.
   //
   // Absent is absent: a null/unrecognised verdict labels itself, and is NEVER
-  // defaulted to no_alarm (mirrors memory_evals.py:847-849).
+  // defaulted to no_alarm (mirrors memory_evals._verdict_class(), which buckets
+  // an absent value to `unjudged` and an unrecognised one to
+  // `unknown_verdict`).
   let base = 'no verdict';
   let cls = 'badge muted';
   if (verdict === 'alarm') {
@@ -310,7 +319,8 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
             </div>
           )}
         {/* Fingerprints are rendered whole — never parsed. They are the
-            producer's private construction (memory_evals.py:576-579). */}
+            producer's private construction
+            (memory_evals._escalation_projection()). */}
         {m.fingerprint && (
           <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
             fp {m.fingerprint}
@@ -419,7 +429,7 @@ function LimitsProvenance({ ev }) {
       {/* The provenance may have been stamped at an earlier run than the one
           on screen.  Saying so is not optional: listed flatly, an older alpha
           reads as governing the newer displayed run
-          (memory_evals.py:237-241). */}
+          (memory_evals._read_limits() stamps `stale_for_latest_run`). */}
       {lim.stale_for_latest_run && (
         <div className="badge warn" style={{ margin: '4px 0' }}>
           provenance stamped at {lim.run_stamp} — does not govern{' '}
@@ -448,10 +458,11 @@ function LimitsProvenance({ ev }) {
 
 // ── Storm aggregate banner ──
 //
-// Reads the TOP-LEVEL storm_escape block (memory_evals.py:958-964), never the
-// copy repeated on an eval row: the top-level block is the single banner
-// source, so the UI never has to elect a row to read it from and the banner
-// survives a root with zero eval dirs.
+// Reads the TOP-LEVEL storm_escape block — declared on every return path by
+// memory_evals._empty_payload() and filled by memory_evals._build_payload() —
+// never the copy repeated on an eval row: the top-level block is the single
+// banner source, so the UI never has to elect a row to read it from and the
+// banner survives a root with zero eval dirs.
 function StormBanner({ storm, onNavigate }) {
   if (!storm) return null;
   return (
@@ -485,7 +496,7 @@ function StormBanner({ storm, onNavigate }) {
 // Branched on `reason`, with distinct wording per value.  Collapsing the three
 // into one undifferentiated "unexplained" list would fire on escalations that
 // are in fact fully explained and train operators to ignore the one signal
-// that catches a real parity orphan (memory_evals.py:530-534).
+// that catches a real parity orphan (memory_evals._unmatched_projection()).
 function unmatchedReasonText(reason) {
   if (reason === 'no_matching_verdict') return 'no metric row explains this';
   if (reason === 'storm_suppressed') return "explained, but this run's links are collapsed into the aggregate";
@@ -635,7 +646,7 @@ function MemoryEvalsSection({ onNavigate }) {
       )}
       {/* Two DISTINCT empty states. root_present false means the artifact tree
           does not exist yet; root_present true with zero evals is an
-          empty-but-healthy system (memory_evals.py:972-974). Sharing one
+          empty-but-healthy system (memory_evals._build_payload()). Sharing one
           message would report a working system as a broken one. */}
       {!payload.root_present && (
         <div className="col-span-12 empty" data-testid="memory-eval-empty">
