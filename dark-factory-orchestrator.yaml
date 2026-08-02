@@ -78,7 +78,24 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # bare-MagicMock config gate — whole-repo scope on this rare module_config-less
 # fallback path (per-module orchestrator.yaml lint_commands carry the per-package
 # scope; also runs in merge-queue verify; see hooks/project-checks).
-lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
+# task 3397: the ``ruff check`` leg now covers all 7 [tool.uv.workspace].members
+# (added sampler and cockpit — cockpit is on main now), closing the gap where a
+# docs-only or cross-cutting diff (zero .py files touched -> verify._build_
+# fallback_config returns None -> this chain runs verbatim, no per-subproject
+# rescoping) left them never ruff-checked at the gating layer. Enforced by
+# tests/scripts/test_fallback_verify_config.py::TestFleetLintCoversEveryWorkspaceMember.
+# Preserve the existing chain SHAPE when editing either leg — the leading
+# ``uv run ruff check ...`` head plus the ``&& python3 ...`` tail:
+# verify._reproject_str relies on split_chain_tail(cmd, 'uv run') carrying the
+# tail through verbatim; adding target names to the head does not disturb it,
+# restructuring the chain would.
+# The ``check_bare_magicmock_config.py`` tail leg now also covers all 7
+# members' tests/ dirs, for the same reason and via the same workspace-member
+# set as the ruff leg above — a future member is therefore caught by
+# TestFleetLintCoversEveryWorkspaceMember.
+# test_every_present_workspace_member_tests_dir_is_magicmock_checked rather
+# than silently escaping this gate.
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
 # The bare ``npx pyright`` spelling is DELIBERATE and safe (task 3367 /
 # esc-3359-1): every ``cd`` target below pins pyright's own interpreter via
 # ``[tool.pyright] venvPath = ".."`` / ``venv = ".venv"`` in its pyproject.toml,
@@ -93,7 +110,36 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # shared-venv mutator racing the TEST leg's own ``cd X && uv run pytest`` fanout,
 # reintroducing the mutation class tasks 2045/2048 exist to paper over. The
 # pyproject pin is static config: zero mutation, zero concurrency.
-type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
+# task 3397: extended from 3 to all 7 [tool.uv.workspace].members (fused-memory,
+# orchestrator, dashboard, shared, escalation, sampler, cockpit), closing the
+# gap where a docs-only or cross-cutting diff (zero .py files touched ->
+# verify._build_fallback_config returns None -> this chain runs verbatim with
+# no per-subproject rescoping) left 4 of 7 members never type-checked at the
+# gating layer — the same defect class tasks 2361/2368 closed for test_command.
+# cockpit gets a HARD ``cd ../cockpit`` here, deliberately NOT test_command's
+# ``( [ -d cockpit ] || exit 0; cd cockpit && ... )`` presence-guard idiom:
+# cockpit is on main now (unlike when that idiom was written for test_command),
+# and more importantly a subshell clause is unparseable to
+# verify._cd_clause_target, which requires an exact two-token ``cd <dir>``.
+# Splitting a guarded subshell on ``&&`` yields a >2-token first half, which
+# silently STALLS cwd tracking at the previous member for BOTH
+# verify._scope_fallback_tool_to_subproject (task 3022) and
+# TestRootTypeCheckCommandPyrightInterpreterPinned (task 3367) — mis-attributing
+# the trailing ``npx pyright`` clause to the wrong directory. Every clause in
+# this chain must therefore stay a bare ``cd <dir>`` or a bare ``npx pyright``;
+# enforced by tests/scripts/test_fallback_verify_config.py::
+# TestFleetTypeCheckCoversEveryWorkspaceMember, which derives coverage from
+# this same &&-walk (not a substring search), so an unwalkable clause fails
+# loudly as a missing member instead of silently passing.
+# Measured 2026-08-02 in a synced worktree under `env -u VIRTUAL_ENV` (mirrors
+# verify._target_subprocess_env): fused-memory 113s, orchestrator 220s,
+# dashboard 51s, shared 64s, escalation 42s, sampler 11s, cockpit 17s — sum
+# 518s. The full 7-clause chain ran end-to-end in 576s, exit 0, "0 errors" x7,
+# against the 3600s warm / 5400s cold per-command budgets below (6.25x / 9.4x
+# headroom) — see tests/scripts/test_fallback_verify_config.py::
+# MEASURED_FLEET_TYPE_SEGMENT_SECS. A dated snapshot, not a self-maintaining
+# invariant — same honesty as the test_command budget derivation below.
+type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright && cd ../shared && npx pyright && cd ../escalation && npx pyright && cd ../sampler && npx pyright && cd ../cockpit && npx pyright"
 
 # Verification timeouts. verify_command_timeout_secs is a PER-COMMAND budget
 # (skills/orchestrate/references/project-setup.md:150) and the fallback fleet
