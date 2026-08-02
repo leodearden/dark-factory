@@ -99,6 +99,27 @@ def _pyproject_at(rel_dir: str) -> dict:
     return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
+def _workspace_member_dirs() -> list[str]:
+    """Every ``[tool.uv.workspace].members`` entry, discovered at runtime.
+
+    Lifted (task 3397) from what was originally
+    ``TestWorkspacePyrightInterpreterPinned._workspace_member_dirs`` (task
+    3367) to module level, so the fleet TYPE/LINT coverage invariants below
+    discover workspace members from the exact same runtime source as the
+    interpreter-pin invariant rather than a second, independently-maintained
+    list that could silently drift from it. The class method now delegates
+    here.
+    """
+    root = _pyproject_at(".")
+    members = root.get("tool", {}).get("uv", {}).get("workspace", {}).get("members")
+    assert members, (
+        "root pyproject.toml declares no [tool.uv.workspace].members (task "
+        "3367) — the workspace-wide interpreter-pin invariant cannot discover "
+        "its subjects and would pass vacuously"
+    )
+    return list(members)
+
+
 def _assert_pyright_pins_worktree_venv(rel_dir: str, pyright: dict, why: str) -> None:
     """Assert *rel_dir*'s ``[tool.pyright]`` table pins the worktree-root ``.venv``.
 
@@ -537,6 +558,45 @@ def test_nested_module_configs_are_covered_by_the_per_test_timeout_guard() -> No
     )
 
 
+def _pyright_clause_cwds(cmd: str) -> list[str]:
+    """Return, in order, the normalised cwd of each bare-pyright clause in *cmd*.
+
+    Walks the ``&&``-chain tracking cwd through ``cd <dir>`` clauses, using the
+    same PRODUCTION helpers ``verify._AND_CLAUSE_SPLIT_RE`` /
+    ``verify._cd_clause_target`` that ``verify._scope_fallback_tool_to_subproject``
+    (task 3022) itself uses to read this exact command — so this helper cannot
+    drift from how the scoper interprets the chain.
+
+    A "bare" pyright clause mentions ``pyright`` and is not already wrapped in
+    ``uv run --project`` (interpreter-pinned by uv itself, not by
+    ``[tool.pyright]``, so it is excluded from the result).
+
+    Extracted (task 3397) from what was originally inlined in
+    ``TestRootTypeCheckCommandPyrightInterpreterPinned``'s own test method
+    (task 3367), so that test and the fleet TYPE-chain coverage invariant
+    below walk the chain identically and cannot drift apart — the same "must
+    not drift apart" convention ``_assert_pyright_pins_worktree_venv`` already
+    states.
+    """
+    parts = _AND_CLAUSE_SPLIT_RE.split(cmd)
+    cwd = "."
+    cwds: list[str] = []
+    for i in range(0, len(parts), 2):
+        clause = parts[i]
+        cd_target = _cd_clause_target(clause)
+        if cd_target is not None:
+            cwd = os.path.normpath(os.path.join(cwd, cd_target))
+            continue
+        if "pyright" not in clause:
+            continue
+        if "uv run --project" in clause:
+            # Already interpreter-pinned, by uv rather than by [tool.pyright]:
+            # `uv run --project <sub>` selects the workspace venv itself.
+            continue
+        cwds.append(cwd)
+    return cwds
+
+
 class TestRootTypeCheckCommandPyrightInterpreterPinned:
     """Every bare-``pyright`` clause of the fleet chain must be interpreter-pinned.
 
@@ -559,46 +619,28 @@ class TestRootTypeCheckCommandPyrightInterpreterPinned:
 
     def test_every_bare_pyright_clause_runs_in_an_interpreter_pinned_dir(self) -> None:
         cmd = _fleet_type_check_command()
+        checked = _pyright_clause_cwds(cmd)
 
-        # Walk the &&-chain tracking cwd through `cd <dir>` clauses, using the
-        # PRODUCTION helpers verify.py itself uses to read this same command
-        # (task 3022's cwd-relative amendment) so this guard cannot drift from
-        # how the scoper interprets the chain.
-        parts = _AND_CLAUSE_SPLIT_RE.split(cmd)
-        cwd = "."
-        checked: list[str] = []
-        for i in range(0, len(parts), 2):
-            clause = parts[i]
-            cd_target = _cd_clause_target(clause)
-            if cd_target is not None:
-                cwd = os.path.normpath(os.path.join(cwd, cd_target))
-                continue
-            if "pyright" not in clause:
-                continue
-            if "uv run --project" in clause:
-                # Already interpreter-pinned, by uv rather than by [tool.pyright]:
-                # `uv run --project <sub>` selects the workspace venv itself.
-                continue
+        for cwd in checked:
             pyproject = _pyproject_at(cwd)
             pyright = pyproject.get("tool", {}).get("pyright")
             assert pyright is not None, (
-                f"fleet type_check_command clause {clause.strip()!r} runs bare "
-                f"pyright in {cwd!r}, whose pyproject.toml has no [tool.pyright] "
-                "table at all (task 3367, esc-3359-1) — so pyright resolves its "
-                "interpreter from ambient VIRTUAL_ENV/PATH, which "
-                "verify._target_subprocess_env strips"
+                f"fleet type_check_command runs a bare pyright clause in {cwd!r}, "
+                "whose pyproject.toml has no [tool.pyright] table at all (task "
+                "3367, esc-3359-1) — so pyright resolves its interpreter from "
+                "ambient VIRTUAL_ENV/PATH, which verify._target_subprocess_env "
+                "strips"
             )
             _assert_pyright_pins_worktree_venv(
                 cwd,
                 pyright,
                 why=(
-                    f"It is the cwd of fleet type_check_command clause "
-                    f"{clause.strip()!r}, which a DOCS-ONLY diff runs verbatim "
+                    "It is the cwd of a bare-pyright clause in fleet "
+                    "type_check_command, which a DOCS-ONLY diff runs verbatim "
                     "(no .py files -> _build_fallback_config returns None -> no "
                     "rescoping)."
                 ),
             )
-            checked.append(cwd)
 
         # Non-vacuity: if the chain's shape changes such that no bare-pyright
         # clause is found, this guard must fail loudly rather than pass on an
@@ -642,14 +684,7 @@ class TestWorkspacePyrightInterpreterPinned:
     """
 
     def _workspace_member_dirs(self) -> list[str]:
-        root = _pyproject_at(".")
-        members = root.get("tool", {}).get("uv", {}).get("workspace", {}).get("members")
-        assert members, (
-            "root pyproject.toml declares no [tool.uv.workspace].members (task "
-            "3367) — the workspace-wide interpreter-pin invariant cannot discover "
-            "its subjects and would pass vacuously"
-        )
-        return list(members)
+        return _workspace_member_dirs()
 
     def test_every_workspace_member_pyright_config_pins_the_worktree_venv(self) -> None:
         # The root pyproject is checked too: it is the mirror the members' ".."
@@ -689,4 +724,150 @@ class TestWorkspacePyrightInterpreterPinned:
             f"checked: {sorted(checked)}. Either a member was dropped from the "
             f"workspace, or its [tool.pyright] table was removed — both need an "
             f"explicit decision, not a silently shrinking guard"
+        )
+
+
+# Floor for the fleet-chain coverage invariants below (TYPE here; the LINT
+# coverage invariant reuses it — task 3397): proof that runtime discovery
+# from the root pyproject's ``[tool.uv.workspace].members`` still resolves
+# the members the fleet TYPE/LINT chains are expected to cover. NOT the
+# authoritative list — same floor-not-authority convention as
+# KNOWN_PER_MODULE_CONFIG_NAMES and KNOWN_PYRIGHT_PINNED_MEMBERS above, so a
+# newly-added workspace member is auto-covered with no edit here, while a
+# silently SHRINKING members list still fails loudly.
+KNOWN_FLEET_TYPE_MEMBERS = frozenset(
+    {"cockpit", "dashboard", "escalation", "fused-memory", "orchestrator", "sampler", "shared"}
+)
+
+
+# Measured per-member wall-clock of the fleet TYPE chain
+# (dark-factory-orchestrator.yaml type_check_command), in seconds.
+#
+# PROVENANCE: task 3397, measured 2026-08-02 in a synced worktree (`env -u
+# VIRTUAL_ENV uv sync --all-packages`), each member run standalone as
+# `env -u VIRTUAL_ENV bash -c "cd <member> && npx pyright"` — mirrors what
+# verify._target_subprocess_env strips. All seven: exit 0, "0 errors". The
+# full 7-clause chain also ran end-to-end as one command: exit 0, 576s
+# wall-clock — a dated snapshot, not a self-maintaining invariant (same
+# honesty as MEASURED_FLEET_SEGMENT_SECS above).
+MEASURED_FLEET_TYPE_SEGMENT_SECS = {
+    "fused-memory": 113,
+    "orchestrator": 220,
+    "dashboard": 51,
+    "shared": 64,
+    "escalation": 42,
+    "sampler": 11,
+    "cockpit": 17,
+}
+
+
+class TestFleetTypeCheckCoversEveryWorkspaceMember:
+    """The fleet TYPE chain must ``cd`` into and pyright-check every workspace member.
+
+    Task 3397. ``type_check_command`` is, like ``test_command`` above, the
+    FALLBACK chain: ``verify._build_fallback_config`` returns ``None`` for a
+    zero-``.py``-file diff, so a docs-only or cross-cutting diff runs this
+    chain verbatim with no ``_scope_fallback_tool_to_subproject`` rescoping.
+    Before task 3397 the chain covered only 3 of 7
+    ``[tool.uv.workspace].members`` (fused-memory, orchestrator, dashboard),
+    so shared, escalation, sampler and cockpit were never type-checked at
+    this gating layer — the same defect class task 2361/2368 closed for
+    ``test_command``.
+    """
+
+    def test_every_present_workspace_member_is_type_checked(self) -> None:
+        walked = set(_pyright_clause_cwds(_fleet_type_check_command()))
+
+        for member in _workspace_member_dirs():
+            if not (REPO_ROOT / member / "pyproject.toml").is_file():
+                # Mirrors the presence tolerance in
+                # TestWorkspacePyrightInterpreterPinned: a member genuinely
+                # absent from this checkout is skipped rather than failed.
+                continue
+            assert member in walked, (
+                f"fleet type_check_command does not cd into and pyright-check "
+                f"workspace member {member!r} (task 3397) — a docs-only or "
+                "cross-cutting diff (zero .py files touched) runs this chain "
+                f"verbatim with no rescoping, so {member!r} would never be "
+                f"type-checked at the gating layer; walked: {sorted(walked)}"
+            )
+
+        assert walked, (
+            "the fleet type_check_command &&-walk resolved no cwds at all "
+            "(task 3397) — this coverage invariant would pass vacuously"
+        )
+        missing = KNOWN_FLEET_TYPE_MEMBERS - walked
+        assert not missing, (
+            f"fleet type_check_command is missing known workspace member(s) "
+            f"{sorted(missing)} (task 3397) — either a member was dropped from "
+            "the chain, or it was rewritten into a form the &&-walk cannot "
+            "follow (e.g. a subshell-guarded clause, which "
+            "verify._scope_fallback_tool_to_subproject's own cwd tracker also "
+            f"cannot follow); walked: {sorted(walked)}"
+        )
+
+    def test_measured_type_chain_floor_clears_the_verify_budget(self) -> None:
+        """The warm per-command budget must exceed the MEASURED TYPE-chain floor.
+
+        Task 3397. ``verify_command_timeout_secs`` is a PER-COMMAND budget, and
+        TEST/LINT/TYPE are three SEPARATE commands dispatched concurrently in
+        one ``asyncio.gather`` (verify.py:3745-3768, 4201-4207) — each bounded
+        by its own copy of the same ceiling. Extending the TYPE chain from 3 to
+        7 members therefore adds nothing to the TEST floor asserted by
+        ``test_fallback_verify_budget_clears_the_measured_fleet_chain_floor``
+        above; this is TYPE's own equivalent guard, over its own table.
+
+        SCOPE — what this guard does NOT do, mirroring that same test's own
+        scope note. It is a floor-REGRESSION guard: it fails if someone lowers
+        ``verify_command_timeout_secs`` back below the measured 518s lower
+        bound. It is NOT a suite-growth detector, and nothing here re-measures
+        anything. ``MEASURED_FLEET_TYPE_SEGMENT_SECS`` is a frozen literal
+        asserted against a config value; if a member's pyright run doubles
+        tomorrow, the table still reads its 2026-08-02 figure, the floor still
+        reads 518, and this test stays green while the budget is once again
+        unmeasured against the honest green path. Genuine growth detection
+        would have to come from RE-MEASUREMENT, not from a hardcoded table
+        asserting against itself.
+        """
+        budgets = _verify_budgets()
+        warm = budgets["verify_command_timeout_secs"]
+        cold = budgets["verify_cold_command_timeout_secs"]
+        floor = sum(MEASURED_FLEET_TYPE_SEGMENT_SECS.values())
+
+        assert warm > floor, (
+            f"dark-factory-orchestrator.yaml verify_command_timeout_secs={warm} "
+            f"is below the measured fleet TYPE-chain floor of {floor}s (task "
+            "3397) — a per-command ceiling below the honest green path "
+            "manufactures infra_timeout rather than surfacing hangs. Raise the "
+            "budget, or re-measure this table."
+        )
+        # Internal coherence, mirrors test_fallback_verify_budget_clears_the_
+        # measured_fleet_chain_floor's own cold/warm assertion: a cold verify
+        # does strictly MORE work than a warm one, so a warm ceiling above the
+        # cold one is incoherent regardless of what either value is.
+        assert warm <= cold, (
+            f"verify_command_timeout_secs={warm} exceeds "
+            f"verify_cold_command_timeout_secs={cold} (task 3397). A cold "
+            "verify runs the same chains plus the uv sync --all-packages "
+            "preprovision, so it is strictly more expensive; a warm budget "
+            "above the cold one is incoherent by construction"
+        )
+
+    def test_type_chain_table_matches_the_chain_it_measures(self) -> None:
+        """MEASURED_FLEET_TYPE_SEGMENT_SECS must describe exactly the shipped chain.
+
+        Task 3397. Guards against the table silently drifting from the actual
+        ``type_check_command`` — a member added to the chain without adding its
+        measured seconds would silently UNDER-count the floor asserted by
+        ``test_measured_type_chain_floor_clears_the_verify_budget`` above; a
+        member removed from the chain while its stale figure lingers would
+        silently OVER-count it.
+        """
+        walked = set(_pyright_clause_cwds(_fleet_type_check_command()))
+        assert set(MEASURED_FLEET_TYPE_SEGMENT_SECS) == walked, (
+            f"MEASURED_FLEET_TYPE_SEGMENT_SECS keys "
+            f"{sorted(MEASURED_FLEET_TYPE_SEGMENT_SECS)} do not match the fleet "
+            f"type_check_command chain it is meant to cost (task 3397); walked: "
+            f"{sorted(walked)}. Update the table to match whenever the chain "
+            "changes."
         )
