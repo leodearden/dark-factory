@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from escalation.models import Escalation
+from escalation.pins import PinRecord, classify_pins
 from shared.deploy_state import DeployPhase
 
 from orchestrator.artifacts import TaskArtifacts
@@ -88,6 +89,100 @@ class TestFrozenValueObjects:
         ref = EscalationRef(id='esc-1-1', level=1)
         with pytest.raises(dataclasses.FrozenInstanceError):
             ref.level = 2  # type: ignore[misc]
+
+
+class TestEscalationRefCarriesSeverityAndFilingIdentity:
+    """EscalationRef carries severity + filing identity (task 3533).
+
+    Spec ``docs/task-escalation-state-spec.md`` S6: "Severity and level must
+    therefore travel with every escalation reference — a predicate that cannot
+    see severity cannot implement this spec."
+    """
+
+    def test_constructs_with_all_five_fields(self) -> None:
+        ref = EscalationRef(
+            id='esc-1-1',
+            level=0,
+            category='infra_issue',
+            severity='blocking',
+            filing_claimant_run_id='run-A/sess-A/pid=1',
+        )
+        assert ref.id == 'esc-1-1'
+        assert ref.level == 0
+        assert ref.category == 'infra_issue'
+        assert ref.severity == 'blocking'
+        assert ref.filing_claimant_run_id == 'run-A/sess-A/pid=1'
+
+    def test_existing_construction_sites_keep_working(self) -> None:
+        """BACKWARD COMPAT: both new fields are defaulted, so the ~10 existing
+        ``EscalationRef(id=..., level=...)`` sites in this file and in
+        test_stranded_verified_green.py compile and assert unchanged."""
+        ref = EscalationRef(id='esc-1-1', level=1)
+        assert ref.category == ''
+        assert ref.severity == ''
+        assert ref.filing_claimant_run_id is None
+
+    def test_still_frozen_on_the_new_fields(self) -> None:
+        ref = EscalationRef(id='esc-1-1', level=0, severity='blocking')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            ref.severity = 'info'  # type: ignore[misc]
+
+    def test_equality_is_field_wise(self) -> None:
+        base = {'id': 'esc-1-1', 'level': 0, 'category': 'infra_issue'}
+        assert EscalationRef(**base, severity='blocking') == EscalationRef(
+            **base, severity='blocking',
+        )
+
+    def test_refs_differing_only_in_severity_are_unequal(self) -> None:
+        base = {'id': 'esc-1-1', 'level': 0, 'category': 'infra_issue'}
+        assert EscalationRef(**base, severity='blocking') != EscalationRef(
+            **base, severity='info',
+        )
+
+    def test_refs_differing_only_in_filing_identity_are_unequal(self) -> None:
+        base = {'id': 'esc-1-1', 'level': 0, 'severity': 'blocking'}
+        assert EscalationRef(**base, filing_claimant_run_id='run-A/sess-A/pid=1') != (
+            EscalationRef(**base, filing_claimant_run_id='run-B/sess-B/pid=2')
+        )
+
+
+class TestEscalationRefSatisfiesPinRecord:
+    """THE cross-package seam this task exists to create: EscalationRef feeds
+    ``escalation.pins.classify_pins`` directly, with no adapter.
+
+    orchestrator/tests/conftest.py already puts ``escalation/src`` on
+    sys.path, so no new fixture or dependency edit is needed.
+    """
+
+    def test_escalation_ref_is_structurally_a_pin_record(self) -> None:
+        """Checked statically by pyright too — this assignment fails type-check
+        if EscalationRef and PinRecord ever drift."""
+        record: PinRecord = EscalationRef(id='esc-1-1', level=0, severity='blocking')
+        assert record.id == 'esc-1-1'
+        assert record.filing_claimant_run_id is None
+
+    def test_real_refs_classify_into_the_three_buckets(self) -> None:
+        refs = [
+            EscalationRef(
+                id='esc-1-1', level=0, category='infra_issue', severity='blocking',
+                filing_claimant_run_id='run-A/sess-A/pid=1',
+            ),
+            EscalationRef(id='esc-1-2', level=1, category='design_concern', severity='blocking'),
+            EscalationRef(id='esc-1-3', level=0, category='cleanup_needed', severity='info'),
+        ]
+
+        report = classify_pins(
+            '1', refs, live_claimant=True, live_claimant_id='run-B/sess-B/pid=2',
+        )
+
+        # esc-1-1's filing incarnation is not the live one -> convertible.
+        assert report.dead_l0 == ('esc-1-1',)
+        # esc-1-2 is a queue-backed L1 handoff -> pins.
+        assert report.queue_handoff == ('esc-1-2',)
+        # esc-1-3 is info -> never pins.
+        assert report.non_pinning == ('esc-1-3',)
+        assert report.pins is True
+        assert report.vetoes_done_flip is True
 
 
 class TestTruthReportConstruction:
