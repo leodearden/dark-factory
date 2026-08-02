@@ -74,6 +74,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from fused_memory.memory_metadata import _is_full_uuid, normalize_supersedes
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 
 __all__ = [
@@ -82,6 +83,7 @@ __all__ = [
     'compute_patch',
     'derive_topic_slug',
     'is_valid_topic_slug',
+    'normalize_supersedes',
 ]
 
 
@@ -209,5 +211,35 @@ def compute_patch(
         dispositions.append('topic_normalized')
     else:
         dispositions.append('conflicting_existing_topic')
+
+    # Canonical: stamping only. `make_canonical=False` emits NOTHING — not a
+    # `False` (which would be a positive claim θ has no basis for) and not a
+    # deletion. A cluster whose canonical is disputed or plural leaves the
+    # sweep with a topic on every member and an opinion about none.
+    if make_canonical:
+        if existing_metadata.get('canonical') is True:
+            dispositions.append('canonical_already_present')
+        else:
+            patch['canonical'] = True
+            dispositions.append('canonical_stamped')
+
+    # supersedes (PRD D2): fold scalar -> list, but ONLY when every member
+    # would still be a resolvable id afterwards. `normalize_supersedes`
+    # faithfully wraps any scalar — including the English sentences two live
+    # canonical records carry — so folding unconditionally would write a
+    # one-member list that fails `_is_full_uuid`, converting a merely-legacy
+    # shape into an outright validation failure. Both helpers are imported
+    # rather than re-expressed (INV-5).
+    if 'supersedes' in existing_metadata:
+        raw = existing_metadata['supersedes']
+        members = normalize_supersedes(raw)
+        if not all(_is_full_uuid(m) for m in members):
+            dispositions.append('supersedes_not_normalizable')
+        elif isinstance(raw, list):
+            # Already the target shape — no write, so run two stays empty.
+            dispositions.append('supersedes_already_normalized')
+        else:
+            patch['supersedes'] = members
+            dispositions.append('supersedes_normalized')
 
     return PatchDecision(patch=patch, dispositions=tuple(dispositions))
