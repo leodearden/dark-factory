@@ -271,6 +271,34 @@ def compare_unit(
     return drifts
 
 
+def find_dropins(installed_dir: pathlib.Path, unit_name: str) -> list[pathlib.Path]:
+    """Return the ``.conf`` drop-ins systemd would layer over *unit_name*.
+
+    ``systemctl --user edit`` does not modify the unit file; it writes
+    ``<unit>.d/override.conf`` beside it, and systemd merges that over the
+    unit at load time.  Reading only ``<installed-dir>/<unit>`` is therefore
+    blind to it: a drop-in setting ``AccuracySec=1min`` or ``Restart=no``
+    leaves every compared directive matching while the RUNNING configuration
+    is not the committed one — the precise claim this gate exists to make
+    checkable.
+
+    Not hypothetical on this host: no orchestrator unit has a drop-in today,
+    but ``~/.config/systemd/user/orchestrator-reify.service.d/`` exists, so
+    the mechanism is already in live use here.
+
+    Returns the sorted ``.conf`` files, or ``[]`` when the directory is absent
+    or holds none (systemd ignores non-``.conf`` files there, so this counts
+    exactly what would take effect — counting a stray ``override.conf.bak``
+    would report an override that has no effect at all).
+
+    Consulted EVEN WHEN the unit file itself is at parity; see main().
+    """
+    dropin_dir = installed_dir / f"{unit_name}.d"
+    if not dropin_dir.is_dir():
+        return []
+    return sorted(p for p in dropin_dir.glob("*.conf") if p.is_file())
+
+
 # ---------------------------------------------------------------------------
 # The unit registry
 # ---------------------------------------------------------------------------
