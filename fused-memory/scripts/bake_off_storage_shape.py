@@ -2107,10 +2107,20 @@ def write_artifacts(
 
     The mechanism is copied rather than imported because the original is a
     module-private helper of another standalone script.
+
+    Each file is atomic, and so is the PAIR: the markdown is rendered BEFORE
+    either replace, so a raise mid-render aborts with both artifacts still on
+    their previous run.  Writing the JSON first would leave a new JSON beside
+    a stale markdown describing a different run — and `render_markdown`
+    subscripts blocks (`audit_recall['true_dup']`, `protocol['fixtures']`)
+    that `_check_arms` never validates, so that is reachable, not theoretical.
+    The two files are gate eta's decision input and a reader has no way to
+    tell they disagree.
     """
     json_path, md_path = Path(json_out), Path(md_out)
+    markdown = render_markdown(report)
     _atomic_write_text(json_path, json.dumps(report, indent=2) + '\n')
-    _atomic_write_text(md_path, render_markdown(report))
+    _atomic_write_text(md_path, markdown)
     return json_path, md_path
 
 

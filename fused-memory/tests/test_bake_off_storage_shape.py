@@ -2683,6 +2683,60 @@ class TestRenderMarkdown:
         assert 'e2_arm_claims.jsonl' in rendered
 
 
+class TestTheTwoArtifactsAreWrittenAsAPair:
+    """Each file is written atomically; the PAIR has to be atomic too.
+
+    The JSON and the markdown are gate eta's decision input, and a reader has
+    no way to tell they disagree.  Writing the JSON first means any raise
+    inside `render_markdown` leaves a NEW json beside a STALE markdown
+    describing a different run — and `render_markdown` does unguarded
+    subscripting of blocks `_check_arms` never validates, so this is
+    reachable rather than theoretical.
+    """
+
+    def test_a_render_failure_leaves_BOTH_artifacts_untouched(self, tmp_path):
+        mod = _mod()
+        json_path, md_path = tmp_path / 'r.json', tmp_path / 'r.md'
+        json_path.write_text('OLD JSON', encoding='utf-8')
+        md_path.write_text('OLD MD', encoding='utf-8')
+
+        # The shape `_check_arms` does not validate: a report that survives
+        # to write_artifacts but blows up mid-render.
+        broken = _report()
+        del broken['audit_recall']['true_dup']
+
+        with pytest.raises(KeyError):
+            mod.write_artifacts(broken, json_path, md_path)
+
+        assert json_path.read_text(encoding='utf-8') == 'OLD JSON'
+        assert md_path.read_text(encoding='utf-8') == 'OLD MD'
+
+    def test_the_happy_path_still_writes_both(self, tmp_path):
+        mod = _mod()
+        json_path, md_path = tmp_path / 'r.json', tmp_path / 'r.md'
+
+        written = mod.write_artifacts(_report(), json_path, md_path)
+
+        assert written == (json_path, md_path)
+        assert json.loads(json_path.read_text(encoding='utf-8'))['arms']
+        assert md_path.read_text(encoding='utf-8').startswith('# E2 storage')
+
+    def test_the_markdown_on_disk_is_what_the_committed_json_renders_to(
+        self, tmp_path
+    ):
+        """The same pairing invariant the committed-artifact guard asserts,
+        but at the WRITE seam rather than after the fact."""
+        mod = _mod()
+        json_path, md_path = tmp_path / 'r.json', tmp_path / 'r.md'
+        report = _report()
+
+        mod.write_artifacts(report, json_path, md_path)
+
+        assert md_path.read_text(encoding='utf-8') == mod.render_markdown(
+            json.loads(json_path.read_text(encoding='utf-8'))
+        )
+
+
 class TestFixtureProvenance:
     """The blind-authoring audit trail is git history; the report cites it."""
 
