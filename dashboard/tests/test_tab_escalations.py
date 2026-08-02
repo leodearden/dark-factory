@@ -716,9 +716,23 @@ def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: s
     )
 
     # (b) The notice names each file and its cause, not just a count.
-    notice_m = re.search(r'data-testid="escalation-skipped"([\s\S]{0,1200})', body)
-    assert notice_m is not None
-    notice = notice_m.group(1)
+    #
+    # The window is the SkippedNotice component body — sliced from its `function`
+    # declaration to the next top-level one — not a fixed character count.  A
+    # char-count window makes the negative assertions in (e) below depend on how
+    # much unrelated source happens to sit within N characters, so an edit
+    # nowhere near this notice could fail them.
+    comp_m = re.search(r'^function SkippedNotice\(', body, re.MULTILINE)
+    assert comp_m is not None, (
+        'tab_escalations.jsx declares no top-level `function SkippedNotice(` — the '
+        'notice must be a named component, not inlined into the subsection map.'
+    )
+    next_fn = re.search(r'^function ', body[comp_m.end():], re.MULTILINE)
+    notice = body[comp_m.start():comp_m.end() + next_fn.start()] if next_fn else body[comp_m.start():]
+    assert 'data-testid="escalation-skipped"' in notice, (
+        'the `escalation-skipped` testid is not rendered by SkippedNotice — keep the '
+        'notice and its testid in one component so this test window covers it.'
+    )
     for field in ('.path', '.error'):
         assert field in notice, (
             f'the escalation-skipped notice does not reference `{field}` — a bare count '
@@ -743,10 +757,19 @@ def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: s
     )
     map_body = body[map_m.start():]
     skipped_at = map_body.find('sec.skipped')
+    mount_at = map_body.find('<SkippedNotice')
     empty_at = map_body.find('filteredRows.length === 0')
     assert skipped_at != -1 and empty_at != -1
-    assert skipped_at < empty_at, (
-        'the skipped notice is read/mounted inside or after the '
+    # Anchor on the MOUNT site, not the `const skipped = sec.skipped` read: an
+    # implementation that hoisted the read but moved the mount into the
+    # empty-state branch would satisfy a read-position check while silently
+    # reintroducing the exact looks-empty-but-isn't case this asserts against.
+    assert mount_at != -1, (
+        'the subsection map never mounts `<SkippedNotice …>` — the component must be '
+        'rendered inside the group, not merely declared.'
+    )
+    assert mount_at < empty_at, (
+        'the skipped notice is mounted inside or after the '
         '`filteredRows.length === 0` ternary — hoist it above that branch so a group '
         'rendering "No escalations match current filters" while holding an unreadable '
         'file still says so.'
@@ -767,12 +790,22 @@ def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: s
         )
 
     # (f) Per-subsection badge beside the existing L1/L2 pips.
-    frag_m = re.search(r'const summary = \(([\s\S]{0,2000})', map_body)
-    assert frag_m is not None, (
+    #
+    # Bounded structurally — from the `const summary = (` fragment to the group's
+    # own `return (` — rather than by a character count, and anchored on the
+    # `secByLevel[2]` identifier rather than the rendered `L2 ·` label, so a
+    # reformat or a label tweak does not fail this test with a misdirecting
+    # "widen the window" message.
+    frag_start = map_body.find('const summary = (')
+    assert frag_start != -1, (
         'could not locate the per-subsection `const summary = (` fragment'
     )
-    frag = frag_m.group(1)
-    assert 'L2 ·' in frag, 'window did not cover the existing L1/L2 pips — widen it'
+    frag_end = map_body.find('return (', frag_start)
+    frag = map_body[frag_start:frag_end if frag_end != -1 else len(map_body)]
+    assert 'secByLevel[2]' in frag, (
+        'the per-subsection summary fragment no longer renders the L2 pip from '
+        '`secByLevel[2]` — this test anchors the skipped badge beside it.'
+    )
     assert re.search(r'skipped\.length\s*>\s*0', frag), (
         'the per-subsection group summary carries no skipped badge — add a '
         '`{skipped.length > 0 && <span className="pip">…</span>}` badge after the L2 pip '
@@ -787,9 +820,17 @@ def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: s
         'tab_escalations.jsx never reads `skipped_count` — add a global pill beside the '
         'existing `N pending · N L1 · N L2` summary pills.'
     )
-    pills_at = body.find('L1 · {byLevel[2]')
+    # Anchored on the `byLevel[2]` identifier (the global pills; the subsection
+    # pips read `secByLevel[2]`, which does not match) and bounded at the next
+    # structural landmark — the subsection map — rather than by a character
+    # count.  The stated contract is "in the controls header, after the
+    # pending/L1/L2 pills and before the subsection groups", which survives a
+    # reformat or a label change; `'L1 · {byLevel[2]'` pinned exact whitespace
+    # and an interpunct.
+    pills_at = body.find('byLevel[2]')
     assert pills_at != -1, 'could not locate the global summary-pill span'
-    pills_window = body[pills_at:pills_at + 400]
+    pills_end = body.find('subsections.map(', pills_at)
+    pills_window = body[pills_at:pills_end if pills_end != -1 else len(body)]
     assert 'skipped_count' in pills_window, (
         'the `skipped_count` pill is not rendered beside the existing pending/L1/L2 '
         'pills — append it to that same summary span.'
