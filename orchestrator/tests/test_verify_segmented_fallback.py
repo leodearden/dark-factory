@@ -61,8 +61,13 @@ def _test_run_entry(runs_capture: list) -> dict:
 
     Captured off `_persist_attempt_logs`'s argument rather than reconstructed,
     because that list — `[c.to_dict() for c in attempt.checks]` — is exactly
-    what reaches `.task/verify/attempt-N.json` and the review/merge tooling, so
-    it is what the segment facts have to arrive on.
+    what `_build_summary_payload` and the review/merge tooling read, so it is
+    what the segment facts have to arrive on.
+
+    This seam stops at the ARGUMENT. That the facts also survive the whitelist
+    rebuild into the persisted `attempt-N[.<prefix>].summary.json` is pinned
+    separately, by reading the written file, in
+    `TestSegmentsReachThePersistedSummaryJson`.
     """
     assert runs_capture, 'run_verification recorded no runs dict'
     return next(r for r in runs_capture[-1] if r['label'] == 'test')
@@ -147,7 +152,7 @@ class TestRunSegmentedRunsEverySegment:
 
     @pytest.mark.asyncio
     async def test_segment_dicts_carry_the_full_per_segment_shape(self, tmp_path):
-        """The facts a triaging agent reads, and that land in attempt-N.json."""
+        """The facts a triaging agent reads, and that land in the summary JSON."""
         clock = _Clock(cost_per_segment=5.0)
         run_one = _RecordingRunOne(clock, results={2: (1, 'boom', False)})
         segments = _fleet_segments()
@@ -1055,3 +1060,128 @@ class TestRunVerificationSegmentedAcceptance:
                     f'cause_hint must still NAME the unrun segment {entry["label"]!r}; '
                     f'got {result.cause_hint!r}'
                 )
+
+
+class TestSegmentsReachThePersistedSummaryJson:
+    """The segment facts must survive into the FILE, not just the runs dict.
+
+    Every other test in this module spies on ``_persist_attempt_logs``'
+    ARGUMENT. That seam cannot see what happens next: ``_build_summary_payload``
+    rebuilds each ``commands`` entry from an explicit key WHITELIST rather than
+    passing the run dict through, so a new key on ``CheckRun`` reaches the
+    argument and is then silently dropped on the way to disk. ``segments`` was
+    dropped exactly that way until this amendment, leaving the one STRUCTURED
+    record of which segments never ran surviving only as free text inside the
+    aggregated ``.log`` blob — the docstrings claimed the JSON, and the tests
+    asserting the JSON were asserting the argument.
+
+    So these tests read the written
+    ``.task/verify/attempt-1.__fallback__.summary.json`` and run
+    ``_persist_attempt_logs`` for real.
+    """
+
+    @staticmethod
+    async def _run_persisting(tmp_path, *, red_labels=(), blow_budget_after=None):
+        """Drive the fallback path with ``_persist_attempt_logs`` UNPATCHED."""
+        import json  # noqa: PLC0415
+        from unittest.mock import patch  # noqa: PLC0415
+
+        from orchestrator import verify as verify_mod  # noqa: PLC0415
+        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+
+        (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
+        clock = _SegmentedBudgetClock(blow_budget_after)
+
+        def _segment_label(log_path) -> str | None:
+            if log_path is None or '.test.' not in log_path.name:
+                return None
+            return log_path.name.split('.test.', 1)[1].removesuffix('.log')
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
+            label = _segment_label(log_path)
+            if label is None:  # the unsegmented lint / type legs
+                return 0, 'ok', False
+            clock.tick()
+            if label in red_labels:
+                return 1, f'FAILED tests/test_thing.py::test_thing in {label}', False
+            return 0, f'ok {label}', False
+
+        real_run_segmented = verify_mod._run_segmented
+
+        async def clocked_run_segmented(*args, **kwargs):
+            clock.arm(kwargs['budget_secs'])
+            kwargs['now'] = clock
+            return await real_run_segmented(*args, **kwargs)
+
+        config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False)
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+             patch('orchestrator.verify._run_segmented', side_effect=clocked_run_segmented):
+            result = await verify_mod.run_verification(
+                tmp_path,
+                config,
+                TestRunVerificationSegmentChainedTestWiring._fallback_config(
+                    _FLEET_TEST_COMMAND,
+                ),
+                attempt_id=1,
+                task_id='3338',
+                max_retries=0,
+                segment_chained_test=True,
+            )
+        # The fallback ModuleConfig's `__fallback__` prefix is the filename
+        # infix _persist_attempt_logs inserts to keep concurrent per-subproject
+        # runs from clobbering one another.
+        summary_path = tmp_path / '.task' / 'verify' / 'attempt-1.__fallback__.summary.json'
+        assert summary_path.exists(), (
+            f'run_verification persisted no summary JSON at {summary_path}; '
+            f'wrote {sorted(p.name for p in (tmp_path / ".task" / "verify").glob("*"))}'
+        )
+        return result, json.loads(summary_path.read_text(encoding='utf-8'))
+
+    @staticmethod
+    def _command_entry(summary: dict, label: str) -> dict:
+        return next(c for c in summary['commands'] if c['label'] == label)
+
+    @pytest.mark.asyncio
+    async def test_the_written_summary_json_carries_every_segment(self, tmp_path):
+        """A triaging agent reading the persisted artifact sees the per-segment facts."""
+        _result, summary = await self._run_persisting(tmp_path, red_labels={'orchestrator-3'})
+
+        segments = self._command_entry(summary, 'test')['segments']
+        assert segments is not None, (
+            '_build_summary_payload rebuilds each command entry from a key '
+            'whitelist; `segments` must be in it or the facts never reach disk'
+        )
+        assert [s['label'] for s in segments] == [s.label for s in _fleet_segments()]
+        by_label = {s['label']: s for s in segments}
+        assert by_label['orchestrator-3']['status'] == 'failed'
+        # The fact the old &&-chain could never write down: the LAST clause ran
+        # anyway, and the persisted artifact says so on its own evidence.
+        assert by_label['root-8']['status'] == 'passed'
+
+    @pytest.mark.asyncio
+    async def test_unrun_segments_are_readable_from_the_file_not_only_the_log_text(
+        self, tmp_path,
+    ):
+        """`rc=None` + a skip_reason is the unconflatable encoding — structurally, on disk."""
+        _result, summary = await self._run_persisting(tmp_path, blow_budget_after=3)
+
+        segments = self._command_entry(summary, 'test')['segments']
+        assert [s['status'] for s in segments] == ['passed'] * 3 + ['not_run'] * 5
+        for entry in segments:
+            if entry['status'] == 'not_run':
+                assert entry['rc'] is None, 'a segment that never ran must not read as rc 0'
+                assert entry['skip_reason']
+
+    @pytest.mark.asyncio
+    async def test_unsegmented_checks_persist_segments_as_null(self, tmp_path):
+        """`None`, not an absent key — the same absent-vs-null contract `to_dict` keeps.
+
+        A conditionally-present key would leave a consumer unable to tell "this
+        artifact predates segments" from "this check was not segmented".
+        """
+        _result, summary = await self._run_persisting(tmp_path)
+
+        for label in ('lint', 'type'):
+            entry = self._command_entry(summary, label)
+            assert 'segments' in entry, f'{label}: key must be present unconditionally'
+            assert entry['segments'] is None

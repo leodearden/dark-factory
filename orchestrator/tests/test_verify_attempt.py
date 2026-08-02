@@ -127,8 +127,12 @@ class TestCheckRunSegments:
     (esc-3062-2). The fix runs each segment separately, which produces per-
     segment facts that have to reach the triaging agent. They ride on the
     existing `CheckRun`, so `runs = [c.to_dict() for c in attempt.checks]`
-    already persists them to `.task/verify/attempt-N.json` with no change to
-    `_persist_attempt_logs`/`_build_summary_payload`.
+    carries them with no change to `_persist_attempt_logs`. Landing them in
+    the persisted `attempt-N[.<prefix>].summary.json` did take one change:
+    `_build_summary_payload` rebuilds each command entry from an explicit key
+    whitelist rather than passing the run dict through, so `segments` had to
+    be added there too (amendment; `test_verify_segmented_fallback
+    .TestSegmentsReachThePersistedSummaryJson` reads the written file).
 
     `segments` is emitted UNCONDITIONALLY (as `None` when the check was not
     run segmented). A conditionally-present key would leave a consumer unable

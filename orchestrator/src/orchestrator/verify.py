@@ -1505,6 +1505,15 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
     across tools that may use different rc scales.  Downstream readers should
     treat top-level metadata as "the loudest raw exit code" and 'category' as
     "the highest-severity classification".
+
+    Each ``commands`` entry also carries ``segments`` (task 3338): the
+    per-segment execution facts when that check ran as a SEGMENTED `&&` chain,
+    ``None`` when it did not.  ``.get`` rather than ``[]`` because this helper
+    also takes hand-built run dicts (the remote merge-verify path in
+    ``verify_runner``), which predate the key.  Without it the entry rebuild
+    below — an explicit key whitelist, not a passthrough — silently DROPPED
+    the one structured record of which segments never ran, leaving those facts
+    only as free text inside the aggregated ``output`` blob.
     """
     active_runs = [r for r in runs if r.get('cmd') is not None]
     if active_runs:
@@ -1529,6 +1538,7 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
                 'timed_out': r['timed_out'],
                 'started_at': r['started_at'],
                 'duration_secs': r['duration_secs'],
+                'segments': r.get('segments'),
             }
             for r in active_runs
         ],
@@ -3727,7 +3737,10 @@ async def _run_segmented(
       the return statement.
     * ``segments`` is one flat JSON-native dict per segment
       (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason),
-      which rides to ``.task/verify/attempt-N.json`` on ``CheckRun.segments``.
+      which rides on ``CheckRun.segments`` into the persisted
+      ``.task/verify/attempt-N[.<prefix>].summary.json`` (via ``to_dict`` ->
+      ``_build_summary_payload``'s per-command entries) and into the aggregated
+      ``.log`` text.
 
     *run_one* is INJECTED rather than calling ``_run_cmd`` directly, so this
     aggregator is unit-testable with a recording fake and spawns no
