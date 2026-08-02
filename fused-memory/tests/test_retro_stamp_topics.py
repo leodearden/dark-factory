@@ -970,3 +970,151 @@ class TestCalibrationJoinAgainstTheRealCommittedFixtures:
         probe = _mod._load_probe_module()
         assert _mod.load_topic_registry is probe.load_topic_registry
         assert _mod.RegistryEntry is probe.RegistryEntry
+
+
+# ===========================================================================
+# DF_CURATOR_GATE_CLUSTERS — source (2), dark_factory half
+# ===========================================================================
+
+#: The seven dark_factory curator gates PRD D11 enumerates.
+DF_GATE_IDS = {'2969', '2973', '3011', '3016', '3036', '3063', '3092'}
+
+#: The three whose member ids exist ONLY in title prose — measured against
+#: ``.taskmaster/tasks/tasks.db`` on 2026-08-02, not assumed.
+DF_GATES_WITHOUT_ENUMERATION = {'2969', '2973', '3016'}
+
+#: Gate 3036's ``metadata.memory_ids``, transcribed verbatim.
+GATE_3036_MEMORY_IDS = (
+    '19705df4-3f01-41cb-8eab-41624a160a00',
+    '8ef8cf8d-4bd7-45ff-b99a-4f2e0d1d4855',
+    '9cf1e664-8a27-4e1e-9d3d-c6c210476142',
+    'ae4a759a-2405-4f9d-875d-9ac2433c87c7',
+    'b3d4d44e-1906-45dc-b156-f894264f3b25',
+    'adcfa20b-7d2a-4eb1-9d83-8f6a5c871f25',
+    '8fcdafbc-6776-4875-bc29-3ce3724dc794',
+    '4a74ed20-6076-41a2-b967-7e339883e800',
+)
+
+
+def _manifest_by_gate() -> dict:
+    return {e.gate_task_id: e for e in _mod.DF_CURATOR_GATE_CLUSTERS}
+
+
+class TestDfCuratorGateManifest:
+    """The committed manifest IS the artifact, so its shape is contract.
+
+    Its ids were transcribed from live gate-task metadata rather than read at
+    run time: the seven gates' enumeration keys are genuinely heterogeneous
+    (``memory_ids``, ``cited_memories``, ``stale_cluster_memory_ids`` +
+    ``canonical_fact_memory_ids``, ``legacy_cluster_candidates_resolved``),
+    a live read would need a task-backend dependency this script otherwise
+    does not have, and it would still hit the same three-gate hole.  Pinning
+    the table here makes the hole VISIBLE instead of turning "covered 4 of 7
+    gates" into silence.
+    """
+
+    def test_covers_exactly_the_seven_prd_gates(self):
+        """A dropped gate fails a test instead of vanishing from the sweep."""
+        assert {e.gate_task_id for e in _mod.DF_CURATOR_GATE_CLUSTERS} == DF_GATE_IDS
+
+    def test_every_topic_is_a_valid_slug(self):
+        for entry in _mod.DF_CURATOR_GATE_CLUSTERS:
+            assert topic_slug_module.is_valid_topic_slug(entry.topic), entry
+
+    def test_every_entry_targets_dark_factory(self):
+        for entry in _mod.DF_CURATOR_GATE_CLUSTERS:
+            assert entry.project_id == 'dark_factory'
+
+    @pytest.mark.parametrize('gate_id', sorted(DF_GATES_WITHOUT_ENUMERATION))
+    def test_the_three_unenumerated_gates_declare_the_hole(self, gate_id: str):
+        """Measured: these three carry NO id list in metadata at all.
+
+        Their member ids live only in title prose (2969's are even 8-hex
+        prefixes, not uuids), which no parser should be asked to mine.
+        ``None`` plus a stated reason is how the gap stays legible; an empty
+        tuple would read as "a gate with no members", which is a different
+        and false claim.
+        """
+        entry = _manifest_by_gate()[gate_id]
+        assert entry.member_memory_ids is None
+        assert entry.no_enumeration_reason
+        assert isinstance(entry.no_enumeration_reason, str)
+
+    def test_gate_3036_is_plural_canonical_with_its_eight_measured_ids(self):
+        """The task's own rule: "canonical ENTRIES", plural, so canonical none.
+
+        Topic on every member and ``canonical`` on none.  This composes with
+        ε's <=1-canonical-per-topic invariant the safe way round: refusing to
+        pick can never violate uniqueness, whereas picking can.
+        """
+        entry = _manifest_by_gate()['3036']
+        assert entry.canonical_plural is True
+        assert entry.canonical_memory_id is None
+        assert entry.member_memory_ids == GATE_3036_MEMORY_IDS
+        assert entry.source_key == ('memory_ids',)
+
+    def test_every_enumerated_entry_names_the_key_its_ids_came_from(self):
+        """So an auditor can re-derive the transcription without trusting it."""
+        for entry in _mod.DF_CURATOR_GATE_CLUSTERS:
+            if entry.member_memory_ids is None:
+                assert entry.source_key == ()
+                continue
+            assert entry.source_key
+            assert all(isinstance(k, str) and k for k in entry.source_key)
+
+    def test_every_transcribed_id_is_a_full_uuid(self):
+        """A truncated 8-hex prefix (gate 3063's ``mem0_entry``) is not an id.
+
+        Transcribing one would produce a lookup that can never resolve, and
+        a ``memory_not_found`` line indistinguishable from a genuinely
+        consolidated-away record.
+        """
+        for entry in _mod.DF_CURATOR_GATE_CLUSTERS:
+            for memory_id in entry.member_memory_ids or ():
+                assert _mod._is_full_uuid(memory_id), (entry.gate_task_id, memory_id)
+            if entry.canonical_memory_id is not None:
+                assert _mod._is_full_uuid(entry.canonical_memory_id), entry
+
+    def test_no_memory_id_is_claimed_by_two_gates(self):
+        seen: dict[str, str] = {}
+        for entry in _mod.DF_CURATOR_GATE_CLUSTERS:
+            ids = list(entry.member_memory_ids or ())
+            if entry.canonical_memory_id:
+                ids.append(entry.canonical_memory_id)
+            for memory_id in ids:
+                assert memory_id not in seen, (memory_id, seen.get(memory_id))
+                seen[memory_id] = entry.gate_task_id
+
+
+class TestPlanGateClusters:
+    """``plan_gate_clusters(manifest)`` — manifest rows to cluster plans."""
+
+    def test_emits_one_plan_per_enumerated_gate(self):
+        plans, _ = _mod.plan_gate_clusters(_mod.DF_CURATOR_GATE_CLUSTERS)
+        assert len(plans) == len(DF_GATE_IDS) - len(DF_GATES_WITHOUT_ENUMERATION)
+        assert all(p.source == 'df_curator_gate_manifest' for p in plans)
+        assert all(p.project_id == 'dark_factory' for p in plans)
+
+    def test_the_three_holes_are_a_named_bucket_not_silence(self):
+        """no-silent-caps: a gate the sweep cannot cover says so, by name."""
+        _, skips = _mod.plan_gate_clusters(_mod.DF_CURATOR_GATE_CLUSTERS)
+        no_enum = [s for s in skips if s['reason'] == 'skipped_no_enumeration']
+        assert {s['gate_task_id'] for s in no_enum} == DF_GATES_WITHOUT_ENUMERATION
+        assert all(s['detail'] for s in no_enum)
+
+    def test_canonical_plural_is_propagated_to_the_plan(self):
+        plans, _ = _mod.plan_gate_clusters(_mod.DF_CURATOR_GATE_CLUSTERS)
+        by_gate = {p.provenance['gate_task_id']: p for p in plans}
+        assert by_gate['3036'].canonical_plural is True
+        assert by_gate['3036'].canonical_memory_id is None
+        assert by_gate['3036'].member_memory_ids == GATE_3036_MEMORY_IDS
+
+    def test_plan_provenance_carries_the_gate_and_its_source_keys(self):
+        plans, _ = _mod.plan_gate_clusters(_mod.DF_CURATOR_GATE_CLUSTERS)
+        for plan in plans:
+            assert plan.provenance['gate_task_id'] in DF_GATE_IDS
+            assert plan.provenance['source_key']
+
+    def test_every_planned_topic_is_a_valid_slug(self):
+        plans, _ = _mod.plan_gate_clusters(_mod.DF_CURATOR_GATE_CLUSTERS)
+        assert all(topic_slug_module.is_valid_topic_slug(p.topic) for p in plans)
