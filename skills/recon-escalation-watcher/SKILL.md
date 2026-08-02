@@ -188,6 +188,41 @@ Both archive the record. Be specific in the note — it is the only audit trail.
 - **`dependency_discovered`** — if a real prerequisite task exists, note it; else
   file-a-real-task. Then resolve.
 - **`cleanup_needed`** — file-a-real-task (two-phase), then resolve.
+- **`reconciliation_stale_gate_backlog`** (blocking) — a task has sat
+  `blocked` on a human-gated milestone gate for 48h+ (Stage 1's aging
+  detector, `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).
+  **Default: PARK.** Leave it pending, file a cockpit DecisionRecord via
+  `write-decision` (see "Filing Parked Decisions to the Cockpit Registry
+  (C8)" below), and pass `--exclude-id <esc-id>` on the watcher's next
+  (re)start (see "Re-arming over deliberately-pending items" above).
+  **Why park, not resolve:** recon files a fresh gate-backlog escalation for
+  a task only when `has_open_l1(task_id,
+  category='reconciliation_stale_gate_backlog')` is false
+  (`maybe_escalate_stalled_gate_backlog`, same module, lines 483-492) — the
+  open pending record itself IS the dedup. Resolving it re-arms the filing
+  rule, and if the task is still `blocked` with a `metadata.gate_escalated_at`
+  stamp older than 48h, recon re-files `esc-<task>-N+1` on the very next
+  Stage 1 cycle (`extract_stalled_gate_backlog_task_ids`, same module, lines
+  198-237). This is not theoretical: resolving-to-tidy causes measured
+  re-file churn, so do **not** resolve this category just to shrink the
+  queue. Observed in `data/reconciliation/escalations/archive/` (as of
+  2026-08-02): `esc-650-1` resolved 2026-07-25T12:58Z → `esc-650-2` filed
+  and resolved by 2026-07-25T17:03Z the same day (~4h round trip);
+  `esc-646-1` dismissed 2026-08-01T14:10Z → `esc-646-2` filed and still
+  pending now; `esc-3361-1` resolved 2026-08-02T10:40Z → `esc-3361-2` filed
+  and still pending now. As of that same date the pending queue holds 31
+  records, 100% this category, with only one (`esc-648-1`) ever
+  triage-stamped. **Resolve only** when the underlying task will genuinely
+  stop qualifying for re-selection — you completed the gate and can close
+  the task, or recon will reconcile the task to a terminal status next
+  cycle regardless. **You cannot drive the gate itself terminal from
+  here:** the gate is a born-at-L2 `milestone_gate` escalation filed on the
+  *target project's own* orchestrator queue, not this one — resolving the
+  recon surfacing changes nothing about the gate or the task. If you find a
+  satisfied-but-unclosable gate (the work is done but you have no path to
+  close the task), say so explicitly in the cockpit decision text as a
+  NO-OP marker, so the next human triaging the queue doesn't have to
+  re-derive that conclusion.
 
 ## Priority Hierarchy
 
