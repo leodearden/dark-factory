@@ -689,7 +689,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 40,
+    """All /static/redux/*?v= cache-busters must share a single version >= 41,
     and graph_layout.js / prd_grouping.js / task_status_counts.js /
     runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
     must all be among the versioned assets.
@@ -700,8 +700,9 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     addition; 37 proved the bump for task 3332's `const API` collision fix
     (esc_flow_layout.js / graph_layout.js renamed to ESC_FLOW_LAYOUT_API /
     GRAPH_LAYOUT_API); 38 was task 3216's memory-evals floor; 39 proved the
-    bump for task 3436's null-sample fix; 40 proves the bump for task 3516's
-    split of the merged "N active" pip.
+    bump for task 3436's null-sample fix; 40 was task 3516's split of the
+    merged "N active" pip; 41 proves the bump for task 3442's parity-badge
+    change.
 
     Each of those raises matter more than a usual bump, for the same reason:
     an already-open browser holds a cached copy of the BROKEN file, so without
@@ -709,7 +710,11 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     keeps drawing missing samples as measured zeros at the chart floor. For
     3516 the cached tab_tasks.jsx?v=39 keeps rendering the single merged pip
     — i.e. keeps showing operators the exact number that triggered the
-    2026-07-30 false alarm.
+    2026-07-30 false alarm. For 3442 the cached tab_memory_evals.jsx?v=40
+    renders every `*_open` parity state as a plain badge with no sign that an
+    escalation is open, and — worse — renders `unknown_verdict` as the muted
+    'no verdict' badge, reporting a present-but-unreadable verdict as an
+    absent one.
     """
     versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
     assert len(versions) == 1, (
@@ -717,15 +722,17 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = int(next(iter(versions)))
-    assert v >= 40, (
-        f'index.html cache-buster version is {v}, expected >= 40 (proves the '
-        "uniform bump for task 3516's split of the merged \"N active\" pip "
-        'actually reaches already-open browsers, which otherwise keep the '
-        'cached tab_tasks.jsx?v=39 that renders the single merged number — the '
-        'exact number that triggered the 2026-07-30 cap-breach false alarm; the '
-        "previous floors were 39 for task 3436's null-sample fix, 38 for task "
-        "3216's memory-evals work and 37 for task 3332's `const API` collision "
-        'fix).'
+    assert v >= 41, (
+        f'index.html cache-buster version is {v}, expected >= 41 (proves the '
+        "uniform bump for task 3442's parity-badge change actually reaches "
+        'already-open browsers, which otherwise keep the cached '
+        'tab_memory_evals.jsx?v=40: it shows no `escalation open` affordance '
+        'on any `*_open` state but recovered_open, and renders an '
+        "unrecognised verdict as the muted 'no verdict' badge — reporting a "
+        'verdict that IS present but unreadable as one that was never made; '
+        "the previous floors were 40 for task 3516's split of the merged \"N "
+        "active\" pip, 39 for task 3436's null-sample fix, 38 for task 3216's "
+        "memory-evals work and 37 for task 3332's `const API` collision fix)."
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
