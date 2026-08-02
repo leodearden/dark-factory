@@ -342,6 +342,18 @@ class DecisionRecord:
         filer doesn't supply one or the record predates this field; ''
         falls back to the scoring defaults.severity weight rather than
         raising or coercing to a recognized value.
+    escalations_dir: the source escalation QUEUE this record's
+        ``escalation_id`` belongs to, stored as a normalized absolute path
+        (see normalize_escalations_dir). Needed because DecisionRecords are
+        FLEET-GLOBAL while an escalation id (``esc-<taskid>-<n>``) is unique
+        only WITHIN one queue, and a single project can run more than one --
+        dark_factory runs ``data/escalations`` and
+        ``data/reconciliation/escalations`` over the same id namespace, so
+        without this second axis the reap-decisions reaper can close one
+        watcher's decision against an unrelated same-named escalation in the
+        other queue (task 3528). Defaults to '' (unknown/legacy -- a record
+        filed before this field existed, or by a caller that didn't supply
+        it), which makes the reaper fall back to project-only scoping.
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
@@ -367,6 +379,7 @@ class DecisionRecord:
     manual_boost: int = field(default=0, kw_only=True)
     state: str = field(default=DecisionState.OPEN, kw_only=True)
     severity: str = field(default='', kw_only=True)
+    escalations_dir: str = field(default='', kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -381,6 +394,7 @@ class DecisionRecord:
             'manual_boost': self.manual_boost,
             'state': str(self.state),
             'severity': self.severity,
+            'escalations_dir': self.escalations_dir,
         }
 
     @classmethod
@@ -397,6 +411,11 @@ class DecisionRecord:
             manual_boost=data.get('manual_boost', 0),
             state=data.get('state', DecisionState.OPEN),
             severity=data.get('severity', ''),
+            # `or ''` (not a plain .get default): a missing key AND an
+            # explicit null both collapse to the one falsy sentinel, so the
+            # `str` annotation stays honest against a hand-edited record and
+            # the reaper's queue guard needs no None-vs-''-vs-missing branch.
+            escalations_dir=data.get('escalations_dir') or '',
         )
 
     def to_json(self) -> str:
