@@ -85,6 +85,8 @@ from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 __all__ = [
     'CALIBRATION_FIXTURE_PATH',
     'CLUSTER_MEMBER_KEYS',
+    'DF_CURATOR_GATE_CLUSTERS',
+    'GateCluster',
     'TOPIC_REGISTRY_PATH',
     'TOPIC_SLUG_MAX_LEN',
     'ClusterPlan',
@@ -97,6 +99,7 @@ __all__ = [
     'normalize_supersedes',
     'plan_calibration_clusters',
     'plan_canonical_clusters',
+    'plan_gate_clusters',
 ]
 
 #: This script lives at ``<repo>/fused-memory/scripts/``.
@@ -588,6 +591,238 @@ def plan_calibration_clusters(
             provenance={
                 'cluster_id': cluster_id,
                 'gate_ids': (getattr(entry, 'provenance', None) or {}).get('gate_ids'),
+            },
+        ))
+    return plans, skips
+
+
+# ---------------------------------------------------------------------------
+# Committed manifest — source (2), dark_factory half
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GateCluster:
+    """One dark_factory curator gate, transcribed for review.
+
+    Attributes:
+        gate_task_id: The gate task these ids were read from.
+        topic: Hand-authored slug.  A machine cannot invent this — the gate
+            tasks carry no topic field.
+        member_memory_ids: Transcribed ids, or ``None`` when the gate carries
+            NO id enumeration at all.  ``None`` and ``()`` mean different
+            things: the former is "we could not enumerate", the latter would
+            be "a gate with no members", which is false.
+        canonical_memory_id: The one undisputed canonical, if the gate names
+            one.
+        canonical_plural: The gate's own end-state has SEVERAL canonicals.
+        source_key: The gate-task metadata key(s) the ids came from, so an
+            auditor can re-derive the transcription instead of trusting it.
+            Empty exactly when ``member_memory_ids is None``.
+        no_enumeration_reason: Why no ids could be transcribed.  Required
+            when ``member_memory_ids is None``; this is what turns "covered
+            4 of 7 gates" from silence into a report line.
+        note: Anything else a reader needs to judge the row — most often
+            that the transcription is narrower than the gate's title claims.
+    """
+
+    gate_task_id: str
+    topic: str
+    project_id: str = 'dark_factory'
+    member_memory_ids: tuple[str, ...] | None = None
+    canonical_memory_id: str | None = None
+    canonical_plural: bool = False
+    source_key: tuple[str, ...] = ()
+    no_enumeration_reason: str | None = None
+    note: str | None = None
+
+
+#: The seven dark_factory curator-gate clusters PRD D11 enumerates.
+#:
+#: A committed, reviewable table rather than a live task-store read — the
+#: same human-reviewable-constants convention ``consolidate_namespace_families
+#: .py`` documents for its alias maps.  Three reasons it is not read live:
+#: the seven gates' enumeration keys are genuinely heterogeneous, a live read
+#: would need a task-backend dependency this script otherwise does not have,
+#: and it would still hit the same three-gate hole.
+#:
+#: Ids transcribed 2026-08-02 from ``.taskmaster/tasks/tasks.db``.  A
+#: transcription is not a corroboration: ``stamp_one`` re-reads every record
+#: before writing and reports ``memory_not_found`` for ids consolidated away
+#: since the gate ran (INV-3).  Measured example — gate 3036's
+#: ``19705df4`` no longer resolves.
+DF_CURATOR_GATE_CLUSTERS: tuple[GateCluster, ...] = (
+    # 2969 [done] "Human-gated merge: consolidate duplicate systemctl-fixture
+    # procedural_knowledge memories (e3ca4270 + 93720d2b)".
+    # The two ids appear ONLY in the title, as 8-hex prefixes — not resolvable
+    # ids, and not in metadata at all.
+    GateCluster(
+        gate_task_id='2969',
+        topic='systemctl-fixture-duplicates',
+        no_enumeration_reason=(
+            'gate task carries no id-enumeration metadata key; the two members '
+            'appear only in the title as 8-hex prefixes (e3ca4270, 93720d2b), '
+            'which are not resolvable memory ids'
+        ),
+    ),
+    # 2973 [done] "Human gate: consolidate ~9-10 duplicate 'architect
+    # plan-revalidation after requeue/lock' procedural_knowledge entries".
+    GateCluster(
+        gate_task_id='2973',
+        topic='architect-plan-revalidation-after-requeue',
+        no_enumeration_reason=(
+            'gate task carries no id-enumeration metadata key, and the title '
+            'names no ids at all — only an approximate count ("~9-10")'
+        ),
+    ),
+    # 3011 [done] "Human gate: consolidate 12-entry duplicate 'architect
+    # report_task_already_done requires main-reachable commit'
+    # procedural_knowledge cluster (subcase-tagged)".
+    GateCluster(
+        gate_task_id='3011',
+        topic='report-task-already-done-main-reachable-commit',
+        source_key=('cited_memories',),
+        member_memory_ids=(
+            '742651f0-eccd-4cb7-bc4f-9db2d980d9c3',
+            'e584c016-8914-4c86-8296-97e48e1c3502',
+            'b99c3c8b-c5b4-4f4d-810d-2096ff31b270',
+        ),
+        note=(
+            'PARTIAL: the title states a 12-entry cluster but metadata '
+            'enumerates 3. Only the enumerated ids are stamped; the other 9 '
+            'are not silently claimed as covered'
+        ),
+    ),
+    # 3016 [done] "Human gate: consolidate 3-entry duplicate
+    # pooled-worktree-lane .venv EXDEV procedural_knowledge cluster".
+    GateCluster(
+        gate_task_id='3016',
+        topic='pooled-worktree-lane-venv-exdev',
+        no_enumeration_reason=(
+            'gate task carries no id-enumeration metadata key, and the title '
+            'names no ids — only a count ("3-entry")'
+        ),
+    ),
+    # 3036 [done] "Human gate: consolidate 7-entry duplicate
+    # pyright-worktree-import-resolution procedural_knowledge cluster into
+    # package/precondition-tagged canonical ENTRIES" — plural in the gate's
+    # own words, so topic on all and canonical on none.
+    GateCluster(
+        gate_task_id='3036',
+        topic='pyright-worktree-import-resolution',
+        source_key=('memory_ids',),
+        canonical_plural=True,
+        member_memory_ids=(
+            '19705df4-3f01-41cb-8eab-41624a160a00',
+            '8ef8cf8d-4bd7-45ff-b99a-4f2e0d1d4855',
+            '9cf1e664-8a27-4e1e-9d3d-c6c210476142',
+            'ae4a759a-2405-4f9d-875d-9ac2433c87c7',
+            'b3d4d44e-1906-45dc-b156-f894264f3b25',
+            'adcfa20b-7d2a-4eb1-9d83-8f6a5c871f25',
+            '8fcdafbc-6776-4875-bc29-3ce3724dc794',
+            '4a74ed20-6076-41a2-b967-7e339883e800',
+        ),
+        note=(
+            'the gate resolved to SEVERAL package/precondition-tagged canonical '
+            'entries, so no single record may be stamped canonical'
+        ),
+    ),
+    # 3063 [cancelled] "Human gate: confirm task 3053 cancellation was
+    # deliberate + decide fate of stale merge_request branch-arg Mem0 cluster
+    # (d1e1b490 + ~10 legacy repeats)".
+    # Members are the VALUES of `legacy_cluster_candidates_resolved` (a
+    # short-prefix -> full-uuid map); `legacy_cluster_candidates_unverified`
+    # is empty. `mem0_entry` is the 8-hex prefix 'd1e1b490' and is deliberately
+    # NOT transcribed — a truncated prefix is not an id, and stamping one
+    # would produce a memory_not_found line indistinguishable from a genuinely
+    # consolidated-away record.
+    # The topic matches reify canonical dbc478b8's: same claim, two corpora,
+    # one namespace (D4).
+    GateCluster(
+        gate_task_id='3063',
+        topic='merge-request-bare-task-id-branch-arg',
+        source_key=('legacy_cluster_candidates_resolved', 'canonical_corrected_entry'),
+        canonical_memory_id='6e7b0075-f50a-490e-9ab5-9fae07bedb18',
+        member_memory_ids=(
+            '9e36e654-6bff-4a2a-aa5b-8bc41db52f3b',
+            'bcd24aae-923b-4215-b4d8-502d3acf3784',
+            'fe97780b-c1ee-487e-b0dd-dbf417dae039',
+            '70f59809-874e-4cd3-a104-c6e7aaa24ba0',
+            '46f68b53-21f1-4e22-a446-7aca40ce653f',
+            'd0fb45c7-3f6d-46d8-a159-f5d0cebf7e03',
+            'c7be9c72-ab31-4b72-974e-9f542069eafe',
+            '20d3db17-12cb-4e3c-b5a8-bda5cc6d1563',
+            '12b1f775-ac45-48f9-9ca1-25cdfc55d7f7',
+            '90cdfe97-adc8-4785-8518-7a56183565e3',
+        ),
+        note=(
+            'gate task is cancelled, but its cluster and its corrected '
+            "canonical were both identified; the 8-hex 'mem0_entry' prefix "
+            'is deliberately not transcribed'
+        ),
+    ),
+    # 3092 [blocked] "Human gate: consolidate 7-entry stale
+    # pre-commit-pyright-timeout procedural_knowledge cluster (superseded by
+    # task 2551)".
+    # THREE ids carry the canonical fact, so — same rule as 3036 — every id
+    # gets the topic and none gets `canonical`.
+    GateCluster(
+        gate_task_id='3092',
+        topic='pre-commit-pyright-timeout',
+        source_key=('stale_cluster_memory_ids', 'canonical_fact_memory_ids'),
+        canonical_plural=True,
+        member_memory_ids=(
+            '39b84e1d-0849-46f9-a8d5-dfbae412ec80',
+            'f63e5a50-324f-48d9-81d6-a256d437c9ea',
+            '56c00b29-0a18-4a74-ab11-149eaae0c91e',
+            'ae49326e-9e62-4356-be03-8dfd94ca6b4b',
+            'edf1a3e9-87e9-4315-98d6-718cbd2a6852',
+            '3efcef36-88cd-4479-ba91-cc7087daba67',
+            '5fbc3cc5-22d5-4a4c-84e2-1569d0ad4694',
+            'e559d60f-c325-40da-83ac-6f56c41dc7ad',
+            '175daec6-a4e5-4b54-89bd-ceb134f25334',
+            '1109af2a-9b99-449f-a842-592ce65b9f40',
+        ),
+        note=(
+            'the first 7 are the stale cluster, the last 3 carry the canonical '
+            'fact — three canonicals means none may be stamped'
+        ),
+    ),
+)
+
+
+def plan_gate_clusters(
+    manifest: tuple[GateCluster, ...],
+) -> tuple[list[ClusterPlan], list[dict]]:
+    """Turn the committed gate manifest into cluster plans.
+
+    Pure.  A gate declaring ``member_memory_ids is None`` produces NO plan and
+    a ``skipped_no_enumeration`` entry naming the gate and the reason — the
+    no-silent-caps rule.  An empty plan would look like a gate the sweep
+    handled; an absent line would look like a gate that did not exist.
+    """
+    plans: list[ClusterPlan] = []
+    skips: list[dict] = []
+    for entry in manifest:
+        if entry.member_memory_ids is None:
+            skips.append({
+                'reason': 'skipped_no_enumeration',
+                'gate_task_id': entry.gate_task_id,
+                'topic': entry.topic,
+                'detail': entry.no_enumeration_reason or '',
+            })
+            continue
+        plans.append(ClusterPlan(
+            topic=entry.topic,
+            project_id=entry.project_id,
+            canonical_memory_id=entry.canonical_memory_id,
+            member_memory_ids=entry.member_memory_ids,
+            source='df_curator_gate_manifest',
+            canonical_plural=entry.canonical_plural,
+            provenance={
+                'gate_task_id': entry.gate_task_id,
+                'source_key': list(entry.source_key),
+                'note': entry.note,
             },
         ))
     return plans, skips
