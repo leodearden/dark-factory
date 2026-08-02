@@ -43,24 +43,27 @@ function chartForKind(kind) {
 //
 // The array is handed on UNMODIFIED — dropping a hole would shift this
 // metric's points against every other metric's, since all series share the
-// run_stamps x-axis.  But charts.jsx's primitives cannot REPRESENT a hole:
-// `Sparkline` (:42-53) and `StepSpark` (:66-90) have no null handling at all —
-// `Math.max(...values, 1)`, `Math.min(...values, 0)` and
-// `y = height - ((v - min) / range) * height` all coerce `null` to 0 — so a
-// hole would be drawn as a real data point at value 0, connected by a line
-// segment to its neighbours.  For a `proportion` metric sitting at 0.95 that
-// is a plunge to the chart floor and back, visually identical to a genuine
-// regression to zero.  Nor is "the baseline" even a safe place for it: 0 is
-// the floor only when `min` happens to be 0; with any negative value in the
-// series the fabricated point lands mid-chart.
+// run_stamps x-axis.
 //
-// So a holed series is NOT DRAWN (see `plottable` below) and the gap count is
-// disclosed in text instead.  This is the same invariant `dash()` states for
-// scalars — a synthetic zero reads as a measured zero — applied to the trend
-// column.  Teaching the shared primitives to skip nulls is the systemically
-// better fix, but it is untestable in this toolchain (JSX, CDN Babel, no
-// node_modules) and they are on five other tabs' render paths; that repair is
-// filed as a separate follow-up.
+// HISTORY: charts.jsx's primitives originally could not REPRESENT a hole.
+// `Sparkline` and `StepSpark` did their own arithmetic inline with no null
+// handling, coercing a `null` to 0, so a hole was drawn as a real data point
+// at value 0 connected by line segments to its neighbours — for a `proportion`
+// metric sitting at 0.95, a plunge to the chart floor and back, visually
+// identical to a genuine regression to zero.  That is fixed: the scale/path
+// math now lives in /static/redux/spark_path.js (task 3436), which excludes
+// non-finite samples from the extrema and breaks the path at every hole, and
+// is behaviourally tested under `node --test`
+// (dashboard/tests/js/spark_path.test.mjs).
+//
+// The local suppression below is nonetheless RETAINED for now: a holed series
+// is NOT DRAWN (see `plottable`) and the gap count is disclosed in text
+// instead.  This is the same invariant `dash()` states for scalars — a
+// synthetic zero reads as a measured zero — applied to the trend column.
+// Re-enabling this trend chart now that the primitive is hole-aware is a
+// product decision with its own test churn
+// (test_tab_memory_evals.py::test_trend_holes_are_never_handed_to_a_chart_primitive
+// pins the current behaviour), and is filed as separate follow-up work.
 function trendGaps(values) {
   if (!values) return 0;
   let gaps = 0;
