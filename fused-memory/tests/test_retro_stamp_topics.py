@@ -1916,6 +1916,221 @@ class TestRun:
 
 
 # ===========================================================================
+# --project must bound EVERY source, not only the live scroll
+# ===========================================================================
+
+
+class TestProjectScopeFiltering:
+    """``--project`` narrows the whole sweep, and says what it excluded.
+
+    Only source (1) was ever gated by ``projects``: the scroll loop passes
+    it to ``get_memories_by_metadata``, and nothing else consulted it.
+    ``plan_calibration_clusters`` takes ``project_id`` from the registry
+    entry (defaulting to ``reify``) and ``plan_gate_clusters`` from the
+    manifest (always ``dark_factory``), so ``--project dark_factory
+    --apply`` still issued live writes into ``reify``.
+
+    That is worse than an unimplemented flag.  An operator narrows scope
+    precisely to bound blast radius before an ``--apply``; an unannounced
+    write into the corpus they excluded defeats the only safety argument
+    the flag makes, and contradicts both its help text and
+    ``resolve_projects``'s own docstring about not "silently widening a
+    sweep whose entire safety argument is that it is narrow".
+
+    The filter is a chokepoint, not a coincidence: it runs over all three
+    plan lists (including the already-per-project canonical plans, which
+    can drop nothing today) and BEFORE ``merge_plans``, so an out-of-scope
+    plan can never contribute a member to an in-scope topic's union.
+    Deliberate narrowing is a scope statement, not a failure — every drop
+    is named in the artifact, and the exit code stays 0.
+    """
+
+    # --- (a) the pure helper -------------------------------------------
+
+    def test_in_scope_plans_are_kept_unchanged(self):
+        keep = _plan('kept-topic', project_id='dark_factory', members=(M1,))
+        kept, skips = _mod.filter_plans_to_projects([keep], ('dark_factory',))
+        assert kept == [keep]
+        assert skips == []
+
+    def test_out_of_scope_plan_is_dropped_and_named(self):
+        """Dropped-and-named — never silently absent."""
+        drop = _plan(
+            'reify-topic', project_id='reify', members=(M2,),
+            source='calibration_registry_join',
+        )
+        kept, skips = _mod.filter_plans_to_projects([drop], ('dark_factory',))
+        assert kept == []
+        assert skips == [{
+            'reason': 'out_of_scope_project',
+            'project_id': 'reify',
+            'topic': 'reify-topic',
+            'source': 'calibration_registry_join',
+        }]
+
+    def test_empty_projects_selection_drops_everything_without_raising(self):
+        plans = [_plan('a'), _plan('b', project_id='reify')]
+        kept, skips = _mod.filter_plans_to_projects(plans, ())
+        assert kept == []
+        assert [s['reason'] for s in skips] == ['out_of_scope_project'] * 2
+
+    def test_a_project_no_plan_carries_is_not_an_error(self):
+        plans = [_plan('a'), _plan('b', project_id='reify')]
+        kept, skips = _mod.filter_plans_to_projects(plans, ('nonesuch',))
+        assert kept == []
+        assert {s['project_id'] for s in skips} == {'dark_factory', 'reify'}
+
+    def test_kept_order_is_preserved(self):
+        """The filter narrows; it must not also reorder.
+
+        ``merge_plans`` sorts its OUTPUT, but plan order still decides
+        which source's provenance a merged topic reads as coming from.
+        """
+        plans = [_plan(name) for name in ('one', 'two', 'three')]
+        plans.insert(1, _plan('skipped', project_id='reify'))
+        kept, _ = _mod.filter_plans_to_projects(plans, ('dark_factory',))
+        assert [p.topic for p in kept] == ['one', 'two', 'three']
+
+    # --- (b) the regression: a narrowed run must not write out of scope --
+
+    @pytest.mark.asyncio
+    async def test_narrowing_to_dark_factory_excludes_reify_targets(self):
+        service = _run_service({
+            'dark_factory': [_scroll_record(C1, 'kept_topic', consolidates=[M1])],
+        })
+        service.seed(M1, M2, M3)
+        report = await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=True,
+            calibration_rows=[
+                _row(CLUSTER_A, M2, 'canonical'),
+                _row(CLUSTER_A, M3, 'duplicate'),
+            ],
+            registry=_registry(_entry('reify-only-topic', CLUSTER_A)),
+            gate_manifest=(),
+        )
+        assert report['results'], 'the in-scope half must still be swept'
+        assert {r['project_id'] for r in report['results']} == {'dark_factory'}
+
+    @pytest.mark.asyncio
+    async def test_no_write_is_issued_against_an_excluded_project(self):
+        """The write is the actual harm, so it is asserted directly."""
+        service = _run_service({
+            'dark_factory': [_scroll_record(C1, 'kept_topic', consolidates=[M1])],
+        })
+        service.seed(M1, M2, M3)
+        await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=True,
+            calibration_rows=[
+                _row(CLUSTER_A, M2, 'canonical'),
+                _row(CLUSTER_A, M3, 'duplicate'),
+            ],
+            registry=_registry(_entry('reify-only-topic', CLUSTER_A)),
+            gate_manifest=(),
+        )
+        written_projects = {
+            call.kwargs['project_id']
+            for call in service.update_memory.await_args_list
+        }
+        assert 'reify' not in written_projects, (
+            f'a sweep narrowed to dark_factory wrote into {written_projects}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_excluded_topics_are_named_in_the_artifact(self):
+        service = _run_service({
+            'dark_factory': [_scroll_record(C1, 'kept_topic', consolidates=[M1])],
+        })
+        service.seed(M1, M2, M3)
+        report = await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=True,
+            calibration_rows=[
+                _row(CLUSTER_A, M2, 'canonical'),
+                _row(CLUSTER_A, M3, 'duplicate'),
+            ],
+            registry=_registry(_entry('reify-only-topic', CLUSTER_A)),
+            gate_manifest=(),
+        )
+        excluded = report['skips']['out_of_scope_project']
+        assert excluded, 'an excluded corpus that leaves no trace is a silent cap'
+        assert {s['topic'] for s in excluded} == {'reify-only-topic'}
+        assert {s['project_id'] for s in excluded} == {'reify'}
+
+    # --- (c) the mirror: the manifest half is filtered too ---------------
+
+    @pytest.mark.asyncio
+    async def test_narrowing_to_reify_excludes_the_whole_gate_manifest(self):
+        """Proves the filter is a chokepoint, not a registry-only patch."""
+        service = _run_service({
+            'reify': [_scroll_record(C1, 'reify_topic', consolidates=[M1])],
+        })
+        service.seed(M1)
+        report = await _mod.run(
+            service,
+            projects=('reify',),
+            apply=True,
+            calibration_rows=[],
+            registry=_registry(),
+        )
+        assert {r['project_id'] for r in report['results']} == {'reify'}
+        excluded = report['skips']['out_of_scope_project']
+        assert excluded, 'the dark_factory gate manifest was silently swept'
+        assert {s['project_id'] for s in excluded} == {'dark_factory'}
+        assert {s['source'] for s in excluded} == {'df_curator_gate_manifest'}
+        # Every enumerated gate — the three enumeration-less ones never
+        # became plans, so they stay in their own bucket.
+        assert 'pyright-worktree-import-resolution' in {s['topic'] for s in excluded}
+
+    # --- (d) an unnarrowed sweep proves it excluded nothing --------------
+
+    @pytest.mark.asyncio
+    async def test_the_default_selection_excludes_nothing(self):
+        """The filter must not silently shrink a sweep nobody narrowed."""
+        service = _run_service({
+            'dark_factory': [_scroll_record(C1, 'kept_topic', consolidates=[M1])],
+        })
+        report = await _mod.run(
+            service,
+            projects=_mod.DEFAULT_PROJECTS,
+            apply=False,
+            calibration_rows=[
+                _row(CLUSTER_A, M2, 'canonical'),
+                _row(CLUSTER_A, M3, 'duplicate'),
+            ],
+            registry=_registry(_entry('reify-only-topic', CLUSTER_A)),
+        )
+        assert report['skips']['out_of_scope_project'] == []
+        assert {r['project_id'] for r in report['results']} == {
+            'dark_factory', 'reify',
+        }
+
+    # --- (e) narrowing is not a partial failure --------------------------
+
+    def test_out_of_scope_skips_alone_still_exit_zero(self):
+        """An operator bounding blast radius did not fail; exit 0."""
+        assert _mod.resolve_exit_code(_report(
+            skips={
+                **{bucket: [] for bucket in _mod.SKIP_BUCKETS},
+                'out_of_scope_project': [
+                    {'reason': 'out_of_scope_project', 'project_id': 'reify',
+                     'topic': 'reify-only-topic', 'source': 'x'},
+                ],
+            },
+            outcomes={'stamped': 3},
+        )) == 0
+
+    def test_the_bucket_is_pre_seeded_so_zero_is_distinguishable(self):
+        """Present-and-empty and never-computed must not look alike."""
+        assert 'out_of_scope_project' in _mod.SKIP_BUCKETS
+        assert 'out_of_scope_project' not in _mod.ERROR_OUTCOMES
+
+
+# ===========================================================================
 # render_markdown / render_json / resolve_exit_code / the parser
 # ===========================================================================
 
