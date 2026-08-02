@@ -2306,6 +2306,7 @@ def _run_write_decision(
     escalation_id: str | None,
     session_id: str | None,
     severity: str = '',
+    escalations_dir: str = '',
 ) -> None:
     """Run the ``write-decision`` verb (Fleet Cockpit C8: park-to-registry).
 
@@ -2321,6 +2322,14 @@ def _run_write_decision(
     critical|urgent) onto the record so the cockpit decision queue can
     weight this ask (Fleet Cockpit F7 fix 1); defaults to '' when the
     caller doesn't supply one.
+
+    ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
+    to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
+    passes the SAME queue dir it later reaps with, so this fleet-global
+    decision can be joined back to the right per-queue escalation-id
+    namespace: ids are unique only within one queue, and a project may run
+    several (task 3528). Omitting it stores '' and keeps today's
+    project-only-scoped reaper behaviour, so no existing caller breaks.
 
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
@@ -2344,6 +2353,7 @@ def _run_write_decision(
         escalation_id=escalation_id,
         session_id=session_id,
         severity=severity,
+        escalations_dir=normalize_escalations_dir(escalations_dir),
     )
     if write_decision(record):
         print(record.id)
@@ -2447,6 +2457,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default='',
         help='escalation severity to weight this ask (info|blocking|critical|urgent)',
     )
+    write_decision_p.add_argument(
+        '--escalations-dir',
+        default='',
+        help=(
+            "the escalation queue dir this decision's --escalation-id belongs to; "
+            'scopes the reaper (see reap-decisions)'
+        ),
+    )
 
     reap_decisions_p = sub.add_parser(
         'reap-decisions',
@@ -2497,6 +2515,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.escalation_id,
                 args.session_id,
                 args.severity,
+                args.escalations_dir,
             )
         elif args.verb == 'reap-decisions':
             _run_reap_decisions(args.project, args.escalations_dir)
