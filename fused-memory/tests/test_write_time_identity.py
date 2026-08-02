@@ -380,7 +380,7 @@ class TestEnsureEntityNode:
         ]
         result = await backend.ensure_entity_node('dark_factory:2500', group_id='reify')
         assert result == 'u-1'
-        backend._test_graph.query.assert_not_called()
+        backend._test_graph.query.assert_not_awaited()
         backend.merge_entities.assert_not_awaited()
 
     @pytest.mark.asyncio
