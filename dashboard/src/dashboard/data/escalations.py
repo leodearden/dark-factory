@@ -162,7 +162,7 @@ _LEVEL_KEYS = (0, 1, 2)
 _STATUS_KEYS = ('pending', 'resolved', 'dismissed')
 
 
-def _bucket(escalations: list[dict]) -> dict:
+def _bucket(escalations: list[dict], *, skipped_count: int = 0) -> dict:
     """Compute per-subsection summary counts from a list of escalation dicts.
 
     Only ``level`` values in ``{0, 1, 2}`` and ``status`` values in
@@ -170,9 +170,18 @@ def _bucket(escalations: list[dict]) -> dict:
     silently ignored (the escalation is still present in the subsection's
     ``escalations`` list).
 
+    Args:
+        escalations: The escalations this subsection actually loaded.
+        skipped_count: How many ``*.json`` files in this queue could **not** be
+            read, and therefore how short the ``by_level``/``by_status`` counts
+            beside it may be.  Passed through verbatim so the annotation lives
+            in the same dict as the counts it qualifies, read by the same
+            consumers at the same nesting.
+
     Returns:
         ``{"by_level": {0: int, 1: int, 2: int},
-           "by_status": {"pending": int, "resolved": int, "dismissed": int}}``
+           "by_status": {"pending": int, "resolved": int, "dismissed": int},
+           "skipped_count": int}``
     """
     by_level: dict = {k: 0 for k in _LEVEL_KEYS}
     by_status: dict = {k: 0 for k in _STATUS_KEYS}
@@ -183,19 +192,28 @@ def _bucket(escalations: list[dict]) -> dict:
         st = esc.get('status')
         if st in by_status:
             by_status[st] += 1
-    return {'by_level': by_level, 'by_status': by_status}
+    return {'by_level': by_level, 'by_status': by_status, 'skipped_count': skipped_count}
 
 
 def _merge_summaries(summaries: list[dict]) -> dict:
-    """Merge a list of per-subsection summary dicts into one aggregate."""
+    """Merge a list of per-subsection summary dicts into one aggregate.
+
+    ``skipped_count`` aggregates here alongside the level/status counts, so the
+    top-level rollup comes free from the one call this function already has —
+    there is no second aggregation path to keep in sync (INV-5).  It reports how
+    many ``*.json`` files across **all** queues could not be read, and therefore
+    how short the merged ``by_level``/``by_status`` counts beside it may be.
+    """
     by_level: dict = {k: 0 for k in _LEVEL_KEYS}
     by_status: dict = {k: 0 for k in _STATUS_KEYS}
+    skipped_count = 0
     for s in summaries:
         for k in _LEVEL_KEYS:
             by_level[k] += s['by_level'].get(k, 0)
         for k in _STATUS_KEYS:
             by_status[k] += s['by_status'].get(k, 0)
-    return {'by_level': by_level, 'by_status': by_status}
+        skipped_count += s.get('skipped_count', 0)
+    return {'by_level': by_level, 'by_status': by_status, 'skipped_count': skipped_count}
 
 
 def build_escalation_queues(config) -> dict:
@@ -214,8 +232,15 @@ def build_escalation_queues(config) -> dict:
             "kind":       str,        # "orchestrator" | "reconciliation"
             "escalations": list[dict],
             "skipped":    [{"path": str, "error": str}, ...],
-            "summary":    {"by_level": {0,1,2}, "by_status": {pending,resolved,dismissed}},
+            "summary":    {"by_level": {0,1,2}, "by_status": {pending,resolved,dismissed},
+                           "skipped_count": int},
         }
+
+    ``summary.skipped_count`` is ``len(skipped)`` — how many ``*.json`` files in
+    this queue could not be read, and therefore how short the ``by_level`` /
+    ``by_status`` counts beside it may be.  It is always present (an absent key
+    would read as "unknown" and force every consumer into a ``.get(..., 0)``
+    guess).
 
     ``skipped`` names the ``*.json`` files in this subsection's queue directory
     that :func:`load_queue_escalations` could not read or parse — one record per
@@ -259,7 +284,7 @@ def build_escalation_queues(config) -> dict:
             'kind': 'orchestrator',
             'escalations': escs,
             'skipped': [{'path': str(s['path']), 'error': s['error']} for s in skips],
-            'summary': _bucket(escs),
+            'summary': _bucket(escs, skipped_count=len(skips)),
         })
 
     # Reconciliation subsection (fused-memory queue)
@@ -273,7 +298,7 @@ def build_escalation_queues(config) -> dict:
         'kind': 'reconciliation',
         'escalations': recon_escs,
         'skipped': [{'path': str(s['path']), 'error': s['error']} for s in recon_skips],
-        'summary': _bucket(recon_escs),
+        'summary': _bucket(recon_escs, skipped_count=len(recon_skips)),
     })
 
     top_summary = _merge_summaries([s['summary'] for s in subsections])
