@@ -3894,6 +3894,100 @@ class MemoryService:
             truncated=len(child_ids) < child_count,
         )
 
+    async def _cascade_delete_children(
+        self,
+        memory_id: str,
+        *,
+        project_id: str,
+        agent_id: str | None,
+        session_id: str | None,
+        causation_id: str | None,
+        _source: str,
+        visited: set[str] | None,
+    ) -> list[str]:
+        """Delete *memory_id*'s children, depth-first, and return their ids.
+
+        CHILDREN FIRST, parent last — the caller deletes the parent only
+        after this returns.  Parent-first would re-open precisely the orphan
+        window this gate closes: a crash between the two leaves live
+        children pointing at a dead uuid, still recognised as children,
+        still suppressed from grouped search, content unreachable while
+        remaining in Qdrant.  Children-first fails safe: the surviving state
+        is "parent alive, some children gone", which the refusal gate still
+        protects and an operator can retry.
+
+        Each child is deleted by RE-ENTERING :meth:`delete_memory` rather
+        than by a local ``mem0.delete`` loop, so every child gets its own
+        write-journal row, its own reconciliation event and its own child
+        gate for free — no second, unguarded delete implementation to drift
+        (INV-5).
+
+        The ``await`` loop is SEQUENTIAL on purpose: an ``asyncio.gather``
+        would destroy the ordering the contract depends on (and trip the
+        repo's gather-convention guard).
+
+        *visited* terminates self-parent records and parent cycles: it is
+        seeded with the parent id and carries every id the chain has
+        committed to deleting, so a cycle's second visit is filtered out
+        instead of recursing.  The loop re-scrolls until a pass yields
+        nothing unvisited, so a fan-out wider than ``_CHILD_SCAN_LIMIT`` is
+        fully covered — the id LISTING is bounded, the cascade is not.
+
+        Then CORROBORATE (INV-3, after acting): re-count the children and
+        raise rather than delete the parent if any survived.  Survivors are
+        measured against the ENCLOSING frames' in-flight set only, never
+        against the ids this frame just deleted — otherwise a child whose
+        delete silently did not take would be filtered out as "already
+        handled", which is exactly the partial-failure this re-read exists
+        to catch.  Without it the operation reports success while leaving
+        an orphan behind.
+        """
+        # Records an ENCLOSING frame is already committed to deleting. They
+        # are excluded from the corroboration below — an ancestor still in
+        # flight is not an orphan-to-be. Ids THIS frame deletes are
+        # deliberately NOT added here, so a delete that silently did not
+        # take resurfaces as a survivor instead of being explained away.
+        in_flight = set(visited) if visited else set()
+        in_flight.add(memory_id)
+        visited = set(in_flight)
+        deleted: list[str] = []
+
+        while await self._count_children(memory_id, project_id=project_id):
+            child_ids = await self._list_children(memory_id, project_id=project_id)
+            fresh = [cid for cid in child_ids if cid not in visited]
+            if not fresh:
+                break
+            for child_id in fresh:
+                visited.add(child_id)
+                await self.delete_memory(
+                    memory_id=child_id,
+                    store='mem0',
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=_source,
+                    cascade=True,
+                    _visited=visited,
+                    _cascade_parent=memory_id,
+                )
+                deleted.append(child_id)
+
+        if await self._count_children(memory_id, project_id=project_id):
+            survivors = [
+                cid
+                for cid in await self._list_children(
+                    memory_id, project_id=project_id
+                )
+                if cid not in in_flight
+            ]
+            if survivors:
+                raise ParentHasChildrenError(
+                    parent_id=memory_id, child_ids=survivors
+                )
+
+        return deleted
+
     async def delete_memory(
         self,
         memory_id: str,
@@ -3903,6 +3997,10 @@ class MemoryService:
         session_id: str | None = None,
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
+        *,
+        cascade: bool = False,
+        _visited: set[str] | None = None,
+        _cascade_parent: str | None = None,
     ) -> dict:
         """Delete a memory from the specified store.
 
@@ -3934,13 +4032,20 @@ class MemoryService:
         paid only when there is something to list, because the error
         contract needs the child *ids* and a count cannot supply them.
 
+        ``cascade=True`` is the caller's explicit opt-in: it deletes the
+        CHILDREN FIRST and the parent last, then re-checks.  See
+        :meth:`_cascade_delete_children`.
+
         Raises:
             ParentHasChildrenError: the target still has children and
-                ``cascade`` was not requested.
+                ``cascade`` was not requested — or a child SURVIVED a
+                requested cascade, in which case the parent is left in
+                place too.
         """
         scope = Scope(project_id=project_id)
         source = SourceStore(store)
         write_op_id = str(uuid_mod.uuid4())
+        cascaded_child_ids: list[str] = []
 
         if source == SourceStore.graphiti:
             await self._journaled_backend_call(
@@ -3957,7 +4062,18 @@ class MemoryService:
             # event, so a refused delete leaves no trace claiming a
             # deletion. `parent_id` is a Mem0 payload key, which is why this
             # is in the mem0 arm only.
-            await self._refuse_if_children(memory_id, project_id=project_id)
+            if cascade:
+                cascaded_child_ids = await self._cascade_delete_children(
+                    memory_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=_source,
+                    visited=_visited,
+                )
+            else:
+                await self._refuse_if_children(memory_id, project_id=project_id)
 
             del_result = await self._journaled_backend_call(
                 write_op_id=write_op_id,
@@ -3968,6 +4084,8 @@ class MemoryService:
                 coro=self.mem0.delete(memory_id, scope),
             )
             result = {'status': 'deleted', 'store': 'mem0', 'id': memory_id, **del_result}
+            if cascaded_child_ids:
+                result['cascaded_child_ids'] = cascaded_child_ids
 
         if self._write_journal:
             await self._write_journal.log_write_op(
@@ -3978,7 +4096,16 @@ class MemoryService:
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'memory_id': memory_id, 'store': store},
+                params={
+                    'memory_id': memory_id,
+                    'store': store,
+                    'cascade': cascade,
+                    # Whose cascade took this record. Without it a cascaded
+                    # delete is indistinguishable from a direct one in the
+                    # journal, and the PRD's "children deleted too,
+                    # journalled" signal is only half legible.
+                    'cascade_parent_id': _cascade_parent,
+                },
                 result_summary=result,
                 success=True,
             )
@@ -3989,7 +4116,13 @@ class MemoryService:
             source=EventSource.agent,
             project_id=project_id,
             timestamp=datetime.now(UTC),
-            payload={'memory_id': memory_id, 'store': store},
+            payload={
+                'memory_id': memory_id,
+                'store': store,
+                'cascade': cascade,
+                'cascade_parent_id': _cascade_parent,
+                'cascaded_child_ids': cascaded_child_ids,
+            },
         ))
 
         return result

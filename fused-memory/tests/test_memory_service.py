@@ -11151,29 +11151,37 @@ class TestDeleteMemoryCascade:
     async def test_partial_cascade_refuses_the_parent(self, service):
         """Corroborate AFTER acting.
 
-        A child that survives the cascade — one that raced in, or a delete
-        that did not take — must stop the parent's deletion. Without this
-        re-read the operation reports success while leaving an orphan, which
-        is the exact silent partial-failure class INV-3 exists to close.
+        A child delete that DID NOT TAKE — the backend reported success and
+        the record is still there — must stop the parent's deletion.
+        Without this re-read the operation reports success while leaving an
+        orphan, the exact silent partial-failure class INV-3 exists to
+        close.
+
+        Note the survivor is a child this cascade already TRIED to delete.
+        A corroboration that excluded everything the cascade touched would
+        explain this away as "already handled" and find nothing — which is
+        why survivors are measured against the enclosing frames' in-flight
+        set only. (A child that merely raced in AFTER the cascade started
+        needs no refusal: the re-scroll loop picks it up and deletes it.)
         """
         from fused_memory.memory_metadata import ParentHasChildrenError
 
         graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
 
-        async def delete_then_a_new_child_appears(memory_id, scope):
-            result = await graph.delete(memory_id, scope)
+        async def delete_that_silently_does_not_take(memory_id, scope):
+            graph.deleted.append(memory_id)
             if memory_id == _DM_CHILD_A:
-                graph.edges[_DM_PARENT].append('late-arriving-child')
-            return result
+                return {'message': 'deleted'}  # ...but the record survives
+            return await graph.delete(memory_id, scope)
 
-        service.mem0.delete = AsyncMock(side_effect=delete_then_a_new_child_appears)
+        service.mem0.delete = AsyncMock(side_effect=delete_that_silently_does_not_take)
 
         with pytest.raises(ParentHasChildrenError) as excinfo:
             await service.delete_memory(
                 memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
             )
 
-        assert excinfo.value.child_ids == ['late-arriving-child']
+        assert excinfo.value.child_ids == [_DM_CHILD_A]
         assert _DM_PARENT not in graph.deleted
 
     @pytest.mark.asyncio
