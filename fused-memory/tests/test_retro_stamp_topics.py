@@ -15,6 +15,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1279,3 +1280,287 @@ class TestMergePlans:
     def test_empty_input_is_an_empty_work_list_not_an_error(self):
         assert _mod.merge_plans() == ([], [])
         assert _mod.merge_plans([], []) == ([], [])
+
+
+# ===========================================================================
+# stamp_one — the single I/O boundary
+# ===========================================================================
+
+
+def _target(
+    *,
+    memory_id: str = M1,
+    topic: str = 'topic-one',
+    make_canonical: bool = False,
+    project_id: str = 'dark_factory',
+    source: str = 'canonical_scroll',
+) -> object:
+    return _mod.StampTarget(
+        project_id=project_id,
+        memory_id=memory_id,
+        topic=topic,
+        make_canonical=make_canonical,
+        source=source,
+    )
+
+
+def _record(memory_id: str = M1, **metadata) -> dict:
+    """A ``get_memory_by_id`` response — ``{'id', 'content', 'metadata'}``."""
+    return {'id': memory_id, 'content': 'some remembered fact', 'metadata': dict(metadata)}
+
+
+def _service(
+    *,
+    record: dict | None = None,
+    count: int = 0,
+    incumbent: str | None = None,
+) -> AsyncMock:
+    """An injected ``MemoryService`` double.
+
+    Children are configured through ``.return_value`` rather than reassigned
+    to fresh ``AsyncMock``s, because a reassigned child stops propagating into
+    the parent's ``mock_calls`` — and the ORDER of the probe relative to the
+    write is one of the things this suite has to pin.
+    """
+    service = AsyncMock()
+    service.get_memory_by_id.return_value = _record() if record is None else record
+    service.count_memories_by_metadata.return_value = count
+    service.get_memories_by_metadata.return_value = (
+        [{'id': incumbent}] if incumbent else []
+    )
+    service.update_memory.side_effect = lambda **kwargs: {
+        'status': 'updated',
+        'store': 'mem0',
+        'id': kwargs['memory_id'],
+        'content_amended': False,
+        'metadata_patched': True,
+    }
+    return service
+
+
+def _call_names(service: AsyncMock) -> list[str]:
+    """The service methods that were called, in call order."""
+    return [name for name, _args, _kwargs in service.mock_calls if name]
+
+
+class TestStampOne:
+    """``stamp_one(memory_service, target, *, apply) -> dict``.
+
+    The one function in the script that talks to a store.  Everything it
+    refuses to do is as load-bearing as what it does: it never re-embeds
+    content, never writes an empty patch, and never stamps ``canonical``
+    it could not first prove unique.
+    """
+
+    @pytest.mark.asyncio
+    async def test_happy_path_writes_a_metadata_only_merge_patch(self):
+        """One ``update_memory``, metadata-only, merge mode, attributed.
+
+        The kwargs asserted here ARE the in-place-update contract
+        (``plans/mem0-in-place-update-decision.md`` §3): passing ``content``
+        would re-embed the record and rewrite ``updated_at`` for what is a
+        purely cosmetic tag, and passing ``metadata_delete_keys`` alongside
+        the patch would flip the service off its ``set_payload`` fast path
+        onto a read-modify-overwrite of the WHOLE payload.  Neither is
+        wanted, so both are asserted absent rather than merely not passed.
+        """
+        service = _service(record=_record())
+        result = await _mod.stamp_one(service, _target(), apply=True)
+
+        assert service.update_memory.await_count == 1
+        kwargs = service.update_memory.await_args.kwargs
+        assert kwargs['memory_id'] == M1
+        assert kwargs['project_id'] == 'dark_factory'
+        assert kwargs['metadata_patch'] == {'topic': 'topic-one'}
+        assert kwargs['metadata_mode'] == 'merge'
+        assert kwargs['_source'] == 'retro_stamp_topics'
+        assert 'content' not in kwargs, (
+            f'a content argument would re-embed the record: {kwargs}'
+        )
+        assert 'metadata_delete_keys' not in kwargs, (
+            f'delete keys would leave the set_payload fast path: {kwargs}'
+        )
+        assert result['outcome'] == 'stamped'
+        assert result['memory_id'] == M1
+        # Point-id stability, read straight off the response envelope — the
+        # service docstring echoes `id` precisely so a caller need not refetch.
+        assert result['response']['id'] == M1
+
+    @pytest.mark.asyncio
+    async def test_already_stamped_record_issues_no_write(self):
+        """Run two costs ZERO writes, not zero net effect.
+
+        An ``update_memory`` that happens to be a no-op still journals a
+        write op and still trips the amendment storm counters, so "the patch
+        is empty" has to mean "no call" — which is also what makes the
+        report's stamped count an honest measure of what the corpus gained.
+        """
+        service = _service(record=_record(topic='topic-one'))
+        result = await _mod.stamp_one(service, _target(), apply=True)
+
+        service.update_memory.assert_not_awaited()
+        assert result['outcome'] == 'already_stamped'
+        assert 'topic_already_present' in result['dispositions']
+
+    @pytest.mark.asyncio
+    async def test_missing_record_is_reported_not_written(self):
+        """A consolidated-away member is a fact, not a failure to swallow.
+
+        The manifest and the live cluster keys both point at ids that were
+        already merged away (measured: gate 3036's ``19705df4`` no longer
+        resolves), so this is an expected outcome — but it must reach the
+        report, because a silently-dropped id reads as a stamped one.
+        """
+        service = _service(record=None)
+        result = await _mod.stamp_one(service, _target(), apply=True)
+
+        service.update_memory.assert_not_awaited()
+        assert result['outcome'] == 'memory_not_found'
+
+    @pytest.mark.asyncio
+    async def test_update_memory_error_envelope_is_not_counted_as_a_stamp(self):
+        """``{'error_type': ...}`` is a REJECTION, and returns 200-shaped.
+
+        ``update_memory`` reports a not-found by returning a structured
+        envelope rather than raising, so a caller that only catches
+        exceptions would count a refused write as a successful stamp.
+        """
+        service = _service(record=_record())
+        service.update_memory.side_effect = None
+        service.update_memory.return_value = {
+            'error': 'Memory does not exist in mem0',
+            'error_type': 'MemoryNotFound',
+            'store': 'mem0',
+            'id': M1,
+        }
+        result = await _mod.stamp_one(service, _target(), apply=True)
+
+        assert service.update_memory.await_count == 1
+        assert result['outcome'] == 'update_failed'
+        assert result['error_type'] == 'MemoryNotFound'
+
+    @pytest.mark.asyncio
+    async def test_canonical_uniqueness_is_probed_before_the_write(self):
+        """The probe runs FIRST, with ε's exact filter.
+
+        ``update_memory`` never reaches
+        ``_apply_memory_metadata_validation``, so this script is the only
+        layer standing between a plan and a second ``canonical: true`` for
+        one ``(project, topic)``.  A probe issued after the write would
+        observe the violation it was meant to prevent.
+        """
+        service = _service(record=_record())
+        await _mod.stamp_one(service, _target(make_canonical=True), apply=True)
+
+        service.count_memories_by_metadata.assert_awaited_once_with(
+            'dark_factory', {'topic': 'topic-one', 'canonical': True},
+        )
+        names = _call_names(service)
+        assert names.index('count_memories_by_metadata') < names.index('update_memory')
+        assert service.update_memory.await_args.kwargs['metadata_patch'] == {
+            'topic': 'topic-one', 'canonical': True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_incumbent_canonical_blocks_the_write(self):
+        """A different incumbent means the plan was wrong — refuse it whole.
+
+        Not "stamp the topic and skip the canonical": if two records claim
+        one topic's canonical, which cluster this record belongs to is
+        exactly what is in doubt.  The incumbent's id is named so the report
+        line is actionable without a follow-up query.
+        """
+        service = _service(record=_record(), count=1, incumbent=C1)
+        result = await _mod.stamp_one(service, _target(make_canonical=True), apply=True)
+
+        service.update_memory.assert_not_awaited()
+        assert result['outcome'] == 'canonical_uniqueness_blocked'
+        assert result['incumbent_id'] == C1
+
+    @pytest.mark.asyncio
+    async def test_when_the_incumbent_is_the_target_itself_the_stamp_proceeds(self):
+        """Finding ourselves is not a conflict.
+
+        The probe cannot exclude the record being written, so a re-run over a
+        partially-stamped corpus sees its own row come back — treating that
+        as a violation would make the sweep unable to finish what it started.
+        """
+        service = _service(record=_record(), count=1, incumbent=M1)
+        result = await _mod.stamp_one(service, _target(make_canonical=True), apply=True)
+
+        assert result['outcome'] == 'stamped'
+        assert service.update_memory.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_zero_count_proceeds_without_a_second_round_trip(self):
+        """The happy path pays exactly one count and never scrolls.
+
+        Same guard order ``_check_canonical_uniqueness`` documents: the
+        incumbent-naming scroll is confined to the path that is already
+        refusing the write.
+        """
+        service = _service(record=_record(), count=0)
+        result = await _mod.stamp_one(service, _target(make_canonical=True), apply=True)
+
+        assert result['outcome'] == 'stamped'
+        service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_probe_timeout_fails_closed_and_stamps_nothing(self):
+        """Fail CLOSED — the opposite of the service seam's warn-mode default.
+
+        ``_check_canonical_uniqueness`` fails open under warn mode because
+        failing a valid write when only the complaint machinery broke is
+        worse than the duplicate.  Here the calculus inverts: this script IS
+        the enforcement layer, it is writing canonicals in bulk unattended,
+        and a re-run is free.  Reported under its own outcome rather than
+        folded into ``canonical_uniqueness_blocked``, because "the store was
+        unreachable" and "a duplicate exists" are different facts.
+        """
+        service = _service(record=_record())
+        service.count_memories_by_metadata.side_effect = TimeoutError('qdrant timeout')
+        result = await _mod.stamp_one(service, _target(make_canonical=True), apply=True)
+
+        service.update_memory.assert_not_awaited()
+        assert result['outcome'] == 'canonical_probe_failed'
+        assert 'TimeoutError' in result['error']
+
+    @pytest.mark.asyncio
+    async def test_a_non_canonical_target_never_probes(self):
+        """Guard 1: almost every target is a plain member and pays no probe."""
+        service = _service(record=_record())
+        await _mod.stamp_one(service, _target(make_canonical=False), apply=True)
+
+        service.count_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_reads_and_decides_but_never_writes(self):
+        """``apply=False`` is a real rehearsal, not a different code path.
+
+        The read and the decision still happen, so the dry-run report states
+        what an apply would actually do — including the probe verdict, which
+        is where a plan-level surprise would surface.
+        """
+        service = _service(record=_record())
+        result = await _mod.stamp_one(service, _target(make_canonical=True), apply=False)
+
+        service.update_memory.assert_not_awaited()
+        service.get_memory_by_id.assert_awaited_once()
+        service.count_memories_by_metadata.assert_awaited_once()
+        assert result['outcome'] == 'would_stamp'
+        assert result['patch'] == {'topic': 'topic-one', 'canonical': True}
+
+    @pytest.mark.asyncio
+    async def test_a_conflicting_human_topic_refuses_the_whole_write(self):
+        """A retro sweep must not be able to destroy a topic a human set.
+
+        And it must not stamp ``canonical`` either: ``canonical`` is scoped
+        BY topic, so asserting it on a record filed under a different topic
+        would put the wrong record at the head of the wrong cluster.
+        """
+        service = _service(record=_record(topic='a-different-topic'))
+        result = await _mod.stamp_one(service, _target(make_canonical=True), apply=True)
+
+        service.update_memory.assert_not_awaited()
+        assert result['outcome'] == 'conflicting_existing_topic'
+        assert result['existing_topic'] == 'a-different-topic'
