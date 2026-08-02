@@ -12,6 +12,7 @@ positive misattributes a local fact — the same bug in the opposite direction.
 
 Mirrors tests/test_task_naming.py, whose leaf-module shape this module copies.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -25,9 +26,7 @@ from fused_memory.utils.cross_project_refs import (
 # The incident that motivated task 3335: a reify-group episode mentioning a
 # dark_factory task by qualified id, alongside a bare mention of a DIFFERENT
 # local task number.
-INCIDENT_CONTENT = (
-    'Reify task 5181 was cancelled; its work was rerouted to dark_factory:2500.'
-)
+INCIDENT_CONTENT = 'Reify task 5181 was cancelled; its work was rerouted to dark_factory:2500.'
 
 
 class TestFindCrossProjectTaskRefsMatches:
@@ -175,10 +174,8 @@ class TestNoFalsePositives:
             'a:1 is not a project',
             # A colon-chained token is not a qualifier.
             'foo:bar:3 is not a project ref',
-            # Prose colon followed by a number.
-            'Total: 42 items',
             # A qualifier glued to a preceding word character.
-            'xdark_factory:2500',
+            '2500dark_factory:2500',
         ],
     )
     def test_noise_yields_no_refs(self, content):
@@ -186,15 +183,40 @@ class TestNoFalsePositives:
         assert scan.refs == []
         assert scan.ambiguous == []
 
-    def test_path_shaped_qualifier_is_skipped_not_normalized(self):
+    def test_path_shaped_qualifier_never_reaches_canonicalization(self):
         """A path-shaped qualifier must never be silently canonicalized into a
-        new, wrong project key (PathShapedProjectIdError / RCA §4) — the
-        candidate is dropped instead."""
-        scan = find_cross_project_task_refs(
-            'see /home/leo/src/dark-factory:2500', group_id='reify'
-        )
+        new, wrong project key (PathShapedProjectIdError / RCA §4). The
+        lookbehind rejects the candidate before canonicalization ever sees it,
+        so the scan reports nothing rather than raising into the write path."""
+        scan = find_cross_project_task_refs('see /home/leo/src/dark-factory:2500', group_id='reify')
         assert scan.refs == []
         assert scan.ambiguous == []
+
+    def test_path_shaped_group_id_yields_an_empty_scan(self):
+        """Without a trustworthy local project id, local and foreign refs
+        cannot be told apart — repair nothing rather than guess."""
+        scan = find_cross_project_task_refs('see dark_factory:2500', group_id='-home-leo-src-reify')
+        assert scan.refs == []
+        assert scan.ambiguous == []
+
+
+class TestShapeValidProseMatchesRelyOnDownstreamGuards:
+    """Prose that happens to have the '<word>: <number>' shape DOES match — the
+    scanner is deliberately whitespace-tolerant, because that is how humans
+    write a qualified reference. Precision for these comes from the consumer's
+    decisive guard: it splits only when the episode ALSO touched a node named
+    'Task N', which a stray 'Total: 42' essentially never coincides with (and,
+    when a known-projects registry is wired, from the allowlist as well)."""
+
+    def test_prose_colon_number_matches_shape_only(self):
+        scan = find_cross_project_task_refs('Total: 42 items', group_id='reify')
+        assert [r.entity_name for r in scan.refs] == ['total:42']
+
+    def test_allowlist_removes_the_prose_match(self):
+        scan = find_cross_project_task_refs(
+            'Total: 42 items', group_id='reify', known_project_ids={'dark_factory'}
+        )
+        assert scan.refs == []
 
 
 class TestKnownProjectIdsAllowlist:
@@ -220,9 +242,7 @@ class TestKnownProjectIdsAllowlist:
         """Mirrors validate_known_project_id's documented empty-registry mode:
         an unavailable registry must NOT silently disable the protection."""
         content = 'blocked on dark_factory:2500 and stepping:3'
-        scan = find_cross_project_task_refs(
-            content, group_id='reify', known_project_ids=allowlist
-        )
+        scan = find_cross_project_task_refs(content, group_id='reify', known_project_ids=allowlist)
         assert [r.entity_name for r in scan.refs] == [
             'dark_factory:2500',
             'stepping:3',
@@ -288,9 +308,7 @@ class TestDeterministicAndDeduplicated:
         first = find_cross_project_task_refs(content, group_id='reify')
         second = find_cross_project_task_refs(content, group_id='reify')
         assert [r.entity_name for r in first.refs] == ['dark_factory:2500', 'stepping:7']
-        assert [r.entity_name for r in first.refs] == [
-            r.entity_name for r in second.refs
-        ]
+        assert [r.entity_name for r in first.refs] == [r.entity_name for r in second.refs]
 
     def test_ambiguous_refs_are_deduplicated_too(self):
         content = 'dark_factory:2500 blocks task 2500; dark_factory:2500 again'
