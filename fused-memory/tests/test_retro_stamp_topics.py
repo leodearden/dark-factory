@@ -1309,9 +1309,15 @@ def _record(memory_id: str = M1, **metadata) -> dict:
     return {'id': memory_id, 'content': 'some remembered fact', 'metadata': dict(metadata)}
 
 
+#: Distinguishes "caller did not specify a record" from "the record is
+#: genuinely absent" — ``None`` is a meaningful ``get_memory_by_id`` answer
+#: here (a consolidated-away member), so it cannot double as the default.
+_UNSET = object()
+
+
 def _service(
     *,
-    record: dict | None = None,
+    record: dict | None = _UNSET,  # type: ignore[assignment]
     count: int = 0,
     incumbent: str | None = None,
 ) -> AsyncMock:
@@ -1323,7 +1329,7 @@ def _service(
     write is one of the things this suite has to pin.
     """
     service = AsyncMock()
-    service.get_memory_by_id.return_value = _record() if record is None else record
+    service.get_memory_by_id.return_value = _record() if record is _UNSET else record
     service.count_memories_by_metadata.return_value = count
     service.get_memories_by_metadata.return_value = (
         [{'id': incumbent}] if incumbent else []

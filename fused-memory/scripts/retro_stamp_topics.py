@@ -86,7 +86,11 @@ __all__ = [
     'CALIBRATION_FIXTURE_PATH',
     'CLUSTER_MEMBER_KEYS',
     'DF_CURATOR_GATE_CLUSTERS',
+    'ERROR_OUTCOMES',
     'GateCluster',
+    'WRITE_REASON',
+    'WRITE_SOURCE',
+    'stamp_one',
     'TOPIC_REGISTRY_PATH',
     'TOPIC_SLUG_MAX_LEN',
     'ClusterPlan',
@@ -958,3 +962,169 @@ def merge_plans(*plan_lists: list[ClusterPlan]) -> tuple[list[StampTarget], list
 
     targets.sort(key=lambda t: (t.project_id, t.topic, t.memory_id))
     return targets, skips
+
+
+# ---------------------------------------------------------------------------
+# The single I/O boundary
+# ---------------------------------------------------------------------------
+
+#: Written to every ``update_memory`` so the write journal attributes each
+#: stamp to this sweep rather than to a generic ``mcp_tool``.  The amendment
+#: storm alarm reads this field; a bulk run under the default source would
+#: look exactly like the runaway rewrite that alarm exists to catch.
+WRITE_SOURCE = 'retro_stamp_topics'
+
+#: Recorded on the write journal row beside the patch.
+WRITE_REASON = 'PRD leaf θ retro topic/canonical stamping (task 3201)'
+
+#: Outcomes that mean the corpus did not get what the plan intended.  Named
+#: once, here, so :func:`resolve_exit_code` and the report agree on what
+#: "clean" means instead of each keeping its own list.
+ERROR_OUTCOMES: frozenset[str] = frozenset({
+    'memory_not_found',
+    'update_failed',
+    'canonical_uniqueness_blocked',
+    'canonical_probe_failed',
+    'conflicting_existing_topic',
+})
+
+
+async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict:
+    """Stamp one record, or report precisely why it was not stamped.
+
+    The only function here that touches a store.  Order is load-bearing:
+
+    1. **live re-read** (``get_memory_by_id``).  The plan's ids come from a
+       committed manifest and fixtures transcribed weeks earlier, so the
+       record may have been consolidated away since (measured: gate 3036's
+       ``19705df4`` no longer resolves).  Reading first is also what turns a
+       vanished id into a report line instead of a Qdrant ``set_payload``
+       that acknowledges a write to nothing.
+    2. **decide** (:func:`compute_patch`).  An empty patch ends the call: a
+       no-op ``update_memory`` would still journal a write op and still
+       count toward the content-amendment storm alarm, and would inflate the
+       report's stamped count with records that gained nothing.
+    3. **canonical-uniqueness probe**, only when the patch would actually set
+       ``canonical`` — one ``count_memories_by_metadata`` and, only on a
+       non-zero count, one bounded ``get_memories_by_metadata(limit=1)`` to
+       name the incumbent.  The same two-probe shape as
+       ``services.memory_service._check_canonical_uniqueness``, re-expressed
+       here for the measured reason that ``update_memory`` never reaches
+       that seam (see the module docstring's INV-5 note).
+    4. **write**, metadata-only and merge-mode.
+
+    FAIL CLOSED on a probe error, inverting the service seam's warn-mode
+    default.  There the calculus is that failing a valid interactive write
+    because the complaint machinery broke is worse than the duplicate it
+    guards; here this script *is* the enforcement layer, it writes canonicals
+    in bulk unattended, and a re-run costs nothing — so an unverifiable
+    canonical is refused.  It gets its own outcome rather than being folded
+    into ``canonical_uniqueness_blocked`` because "the store was unreachable"
+    and "a duplicate exists" are different facts an operator must be able to
+    tell apart.
+
+    Args:
+        memory_service: Anything with the four ``MemoryService`` coroutines
+            used below.  Injected rather than constructed so the tests never
+            stand up a backend.
+        target: One :class:`StampTarget` from :func:`merge_plans`.
+        apply: ``False`` (the default posture) performs every read and the
+            full decision, then stops short of the write — so a dry-run
+            report states what an apply would really do, probe verdict
+            included, rather than what the plan hoped.
+
+    Returns:
+        A report-ready dict always carrying ``outcome``, plus whatever that
+        outcome needs to be actionable without a follow-up query
+        (``incumbent_id``, ``error``, ``existing_topic``, …).
+    """
+    base = {
+        'project_id': target.project_id,
+        'memory_id': target.memory_id,
+        'topic': target.topic,
+        'source': target.source,
+        'make_canonical': target.make_canonical,
+    }
+
+    record = await memory_service.get_memory_by_id(
+        project_id=target.project_id, memory_id=target.memory_id,
+    )
+    if record is None:
+        return {**base, 'outcome': 'memory_not_found', 'patch': {}, 'dispositions': ()}
+
+    metadata = dict(record.get('metadata') or {})
+    decision = compute_patch(
+        metadata, target_topic=target.topic, make_canonical=target.make_canonical,
+    )
+    result = {**base, 'patch': dict(decision.patch), 'dispositions': decision.dispositions}
+
+    # An existing topic that is neither ours nor a legacy spelling of ours
+    # means the plan put this record in the wrong cluster. Refuse the WHOLE
+    # write — including any `canonical`, which is scoped by topic and would
+    # otherwise head a cluster this record does not belong to.
+    if 'conflicting_existing_topic' in decision.dispositions:
+        return {
+            **result,
+            'outcome': 'conflicting_existing_topic',
+            'existing_topic': metadata.get('topic'),
+            'patch': {},
+        }
+
+    if not decision.patch:
+        return {**result, 'outcome': 'already_stamped'}
+
+    if decision.patch.get('canonical') is True:
+        filters = {'topic': target.topic, 'canonical': True}
+        try:
+            count = await memory_service.count_memories_by_metadata(
+                target.project_id, filters,
+            )
+            incumbents = (
+                await memory_service.get_memories_by_metadata(
+                    target.project_id, filters, limit=1,
+                )
+                if count
+                else []
+            )
+        except Exception as exc:
+            return {
+                **result,
+                'outcome': 'canonical_probe_failed',
+                'error': f'{type(exc).__name__}: {exc}',
+            }
+        incumbent_id = incumbents[0].get('id') if incumbents else None
+        # Finding OURSELVES is not a conflict: the probe cannot exclude the
+        # record being written, so a re-run over a partially-stamped corpus
+        # sees its own row. Treating that as a violation would leave the
+        # sweep unable to finish what it started.
+        if count and incumbent_id != target.memory_id:
+            return {
+                **result,
+                'outcome': 'canonical_uniqueness_blocked',
+                'incumbent_id': incumbent_id,
+                'patch': {},
+            }
+
+    if not apply:
+        return {**result, 'outcome': 'would_stamp'}
+
+    response = await memory_service.update_memory(
+        memory_id=target.memory_id,
+        project_id=target.project_id,
+        metadata_patch=dict(decision.patch),
+        metadata_mode='merge',
+        reason=WRITE_REASON,
+        _source=WRITE_SOURCE,
+    )
+    # `update_memory` reports a not-found by RETURNING a structured envelope
+    # rather than raising, so a caller that only guarded against exceptions
+    # would score a refused write as a stamp.
+    if isinstance(response, dict) and response.get('error_type'):
+        return {
+            **result,
+            'outcome': 'update_failed',
+            'error_type': response.get('error_type'),
+            'error': response.get('error'),
+            'response': response,
+        }
+    return {**result, 'outcome': 'stamped', 'response': response}
