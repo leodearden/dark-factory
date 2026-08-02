@@ -35,6 +35,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import MERGE_RESULT_TIMEOUT
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
@@ -127,6 +128,44 @@ def _make_request(
         result=future,
         lane=lane,
     )
+
+
+async def _await_outcome(
+    fut: asyncio.Future[MergeOutcome],
+    *,
+    label: str,
+    timeout: float = MERGE_RESULT_TIMEOUT,
+) -> MergeOutcome:
+    """Await a ``MergeRequest.result`` future, failing LOUDLY -- by name --
+    on deadline instead of letting a real timeout masquerade as ``None``
+    (task 3477).
+
+    The shape this replaces --
+    ``with contextlib.suppress(TimeoutError): outcome = await
+    asyncio.wait_for(fut, timeout=N)`` followed by
+    ``assert outcome is not None and outcome.status == ...`` -- converts a
+    genuine pipeline hang or a missing cascade into a confusing
+    ``outcome is None`` assertion failure. That shape is exactly what
+    flaked in TestRunnerUnavailableHeadCascade and
+    TestCascadeFiresRemoteCancel: under load, the fixed real-time deadline
+    was reached before the merge pipeline resolved, TimeoutError was
+    swallowed, and the next hard assertion fired on a still-None outcome --
+    reporting a timeout as if it were a wrong-value bug.
+
+    The default *timeout* (45s) is ``_orch_helpers.MERGE_RESULT_TIMEOUT``
+    (task 2376's shared, never-narrow merge-pipeline result-wait ceiling),
+    not a fresh literal -- so callers inherit the same generous,
+    load-tolerant budget already established for test_merge_queue.py,
+    test_merge_speculation.py and test_concurrent_verify_boundary.py.
+    """
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except TimeoutError:
+        pytest.fail(
+            f'{label}: MergeOutcome never resolved within {timeout}s -- '
+            f'the merge pipeline never completed this request. This is a '
+            f'real hang or a genuinely missing cascade, NOT a None outcome.'
+        )
 
 
 # ---------------------------------------------------------------------------
