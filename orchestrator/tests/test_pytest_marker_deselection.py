@@ -59,8 +59,20 @@ class TestResolveMarkerExpression:
         assert resolve_marker_expression(text, None) == 'not integration'
 
     def test_attached_form_dash_m_expr(self):
-        """``-mnot slow`` — the attached spelling pytest also accepts."""
-        assert resolve_marker_expression(_pyproject('"-mnot slow"'), None) == 'not slow'
+        """``-mnot slow`` — the attached spelling pytest also accepts.
+
+        Spelled so the attached form survives as ONE token: a ``str`` addopts is
+        shlex-split (pytest splits it the same way), so a bare ``-mnot slow``
+        would legitimately become ``['-mnot', 'slow']`` — argparse would then
+        read the expression as ``'not'`` and treat ``slow`` as a positional.
+        The inner quotes are what make it a single attached argument.
+        """
+        assert resolve_marker_expression(_pyproject('"-m\'not slow\'"'), None) == 'not slow'
+
+    def test_attached_form_in_a_toml_list_is_one_token(self):
+        """The list form needs no quoting — each element is already one token."""
+        text = '[tool.pytest.ini_options]\naddopts = ["-n", "auto", "-mnot slow"]\n'
+        assert resolve_marker_expression(text, None) == 'not slow'
 
     def test_later_dash_m_in_addopts_wins(self):
         text = _pyproject('"-m \'not slow\' -q -m \'not integration\'"')
