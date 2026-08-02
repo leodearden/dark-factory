@@ -5,11 +5,13 @@ resolve.** It covers both halves of that invariant *within the current run*, so
 there is one owner rather than two mechanisms that can drift. The closed-run
 half lives next door — see "Where this module stops" below.
 
-Half 1 — recon-report citations (task 2978). ``verify_cited_memories`` walks
-each finding's ``cited_memories`` list and re-resolves every cited Mem0 id
-against the live store, so a finding's claim can never be silently backed by an
-id that does not (or no longer) exist. Its stats carry the ``stage1_`` prefix
-because ``MemoryConsolidator.run()`` merges them into ``report.stats``.
+Half 1 — recon-report citations (task 2978, hoisted in 2979).
+``verify_cited_memories`` walks each finding's ``cited_memories`` list and
+re-resolves every cited Mem0 id against the live store, so a finding's claim can
+never be silently backed by an id that does not (or no longer) exist. Its stats
+carry a caller-supplied ``stageN_`` prefix (``STAGE_STAT_PREFIX``, defaulting to
+``stage1``) because ``BaseStage.run()`` merges them into the running stage's own
+flat ``report.stats`` — for all three stages, not just Stage 1.
 
 Half 2 — task-metadata citations (task 3108). ``find_citation_occurrences`` /
 ``find_live_citation_occurrences`` / ``repoint_metadata`` /
@@ -65,10 +67,21 @@ import logging
 from typing import Any
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.task_filter import INACTIVE_TASK_STATUSES
 from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
+
+# Which ``stageN_`` prefix each stage's citation counters carry when
+# ``BaseStage.run()`` merges them into that stage's flat ``report.stats``
+# (task 2979). The verifier owns its own stat vocabulary, so the map lives
+# beside the function that emits the names rather than in ``stages/base.py``.
+STAGE_STAT_PREFIX: dict[StageId, str] = {
+    StageId.memory_consolidator: 'stage1',
+    StageId.task_knowledge_sync: 'stage2',
+    StageId.integrity_check: 'stage3',
+}
 
 # The recon-stage caller identity the repoint writes are attributed to.
 # Matches the `recon-stage-` prefix that recon_write_policy scopes on — see
@@ -88,6 +101,8 @@ async def verify_cited_memories(
     findings: list[dict[str, Any]],
     memory_service: Any,
     project_id: str,
+    *,
+    stat_prefix: str = 'stage1',
 ) -> dict[str, int]:
     """Verify each finding's cited Mem0 memories still resolve; drop phantoms.
 
@@ -109,7 +124,20 @@ async def verify_cited_memories(
     false-flag every graphiti citation as a phantom).
 
     Mirrors ``standing_decision_writer.resolve_evidence_refs``'s found/None
-    branching. Returns ``stage1_*`` stats for ``report.stats``.
+    branching.
+
+    Returns three counters for the calling stage's ``report.stats``, named
+    ``<stat_prefix>_phantom_citations_dropped`` / ``_citations_verified`` /
+    ``_citation_verification_errors``. ``stat_prefix`` is caller-supplied
+    because ``BaseStage.run()`` runs this pass for EVERY stage and merges the
+    result into that stage's own flat stats block, where an unprefixed (or
+    wrongly-prefixed) name would collide across stages — pass
+    ``STAGE_STAT_PREFIX[stage_id]``. It defaults to ``'stage1'`` so the
+    Stage-1 key names, and every consumer and assertion pinned to them, stay
+    byte-identical to the task-2978 shape.
+
+    All three keys are ALWAYS present, on every path, so consumers never need
+    a ``.get(..., 0)`` fallback.
     """
     # Why re-verify at all, at report-assembly time? Two root causes this pass
     # closes that a cite-time check cannot:
@@ -121,11 +149,12 @@ async def verify_cited_memories(
     #       the cite-time-only check structurally cannot catch (it validates at
     #       cite-time, not at report-assembly-time). This run()-time
     #       re-verification is the only check that closes it.
-    stats = {
-        'stage1_phantom_citations_dropped': 0,
-        'stage1_citations_verified': 0,
-        'stage1_citation_verification_errors': 0,
-    }
+    # Bind the three prefixed key names once, so the increment sites below stay
+    # as readable as the hard-coded literals they replace.
+    dropped_key = f'{stat_prefix}_phantom_citations_dropped'
+    verified_key = f'{stat_prefix}_citations_verified'
+    errors_key = f'{stat_prefix}_citation_verification_errors'
+    stats = {dropped_key: 0, verified_key: 0, errors_key: 0}
     for finding in findings:
         cited = finding.get('cited_memories') or []
         if not cited:
@@ -171,16 +200,16 @@ async def verify_cited_memories(
                         'error_type': type(exc).__name__,
                     },
                 )
-                stats['stage1_citation_verification_errors'] += 1
+                stats[errors_key] += 1
                 continue
             if record:
                 kept.append(entry)
-                stats['stage1_citations_verified'] += 1
+                stats[verified_key] += 1
             else:
                 finding.setdefault('citation_failures', []).append(
                     {'memory_id': memory_id, 'store': store, 'reason': 'memory_not_found'},
                 )
-                stats['stage1_phantom_citations_dropped'] += 1
+                stats[dropped_key] += 1
         finding['cited_memories'] = kept
     return stats
 
@@ -568,11 +597,14 @@ async def repoint_task_citations(
     project would need ``list_tags()`` aggregation. Out of scope here.
 
     Returns a stats dict whose keys are ALWAYS present, on every path. Scalar
-    counters carry the module's ``stage1_*`` prefix (as
-    :func:`verify_cited_memories`'s do), because they are merged into the same
-    flat Stage-1 stats block where an unprefixed name would collide; the
-    detail LISTS (``terminal_citations``, ``unrepointed``) are consumed
-    structurally by the delete gate and stay unprefixed.
+    counters carry a HARD-CODED ``stage1_*`` prefix, because they are merged
+    into the flat Stage-1 stats block where an unprefixed name would collide.
+    Unlike :func:`verify_cited_memories` — which is now per-stage and takes a
+    ``stat_prefix`` — this sweep is genuinely Stage-1-only: it runs from the
+    ``delete_memory`` MCP tool handler's citation-repoint gate, never from any
+    stage's ``run()``, so there is no second stage for it to serve. The detail
+    LISTS (``terminal_citations``, ``unrepointed``) are consumed structurally
+    by the delete gate and stay unprefixed.
     """
     log = log or logger
     stats: dict[str, Any] = {
