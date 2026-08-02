@@ -3728,3 +3728,66 @@ class TestRecoveryEmissionConfig:
                 'register the whole submodel via _submodel_leaf_paths so new '
                 'leaves are covered automatically'
             )
+# ---------------------------------------------------------------------------
+# task 3060: git.merge_park_lock_grace_seconds — the advance_main index-lock
+# stand-off knob
+# ---------------------------------------------------------------------------
+
+
+class TestMergeParkLockGraceSeconds:
+    """`GitConfig.merge_park_lock_grace_seconds` bounds how long
+    `advance_main` waits for a FOREIGN `<git-dir>/index.lock` in project_root
+    to clear before giving up and returning `park_lock_contended`.
+
+    The 300s default matches this repo's documented pre-commit budget
+    (CLAUDE.md instructs `timeout: 300000` because the hook runs pyright), so
+    an ordinary docs-direct-commit-on-main — which holds the index lock for
+    the entire hook run — is waited out rather than halting the merge queue.
+    """
+
+    def test_default_is_300_seconds(self):
+        """Default 300.0s == the documented 5-minute pre-commit budget."""
+        from orchestrator.config import GitConfig
+
+        assert GitConfig().merge_park_lock_grace_seconds == 300.0
+
+    def test_round_trips_override(self):
+        """An explicit override round-trips verbatim."""
+        from orchestrator.config import GitConfig
+
+        assert GitConfig(merge_park_lock_grace_seconds=42.5).merge_park_lock_grace_seconds == 42.5
+
+    def test_zero_is_accepted_as_probe_only_off_switch(self):
+        """0 is VALID (`ge=0`, not `gt=0`): it disables only the WAIT.
+
+        The lock is still probed and a held lock is still classified as
+        `park_lock_contended` — the off-switch can never restore the
+        data-loss risk of parking through a foreign process's index lock,
+        and it must never become a silent fail-soft.
+        """
+        from orchestrator.config import GitConfig
+
+        assert GitConfig(merge_park_lock_grace_seconds=0).merge_park_lock_grace_seconds == 0
+
+    def test_rejects_negative(self):
+        """A negative grace is nonsensical — `ge=0` must reject it."""
+        from orchestrator.config import GitConfig
+
+        with pytest.raises(ValidationError):
+            GitConfig(merge_park_lock_grace_seconds=-1)
+
+    def test_is_green_tier_reloadable(self):
+        """Green-tier: an operator can retune the stand-off live via
+        `mcp__escalation__reload_config`, like its `git.offline_lane_*`
+        leaf neighbours. The value is re-read per advance, not captured at
+        startup, so a leaf mutation takes effect on the very next advance.
+
+        NOTE: `GitConfig` has no whole-submodel `_submodel_leaf_paths` group
+        in RELOADABLE_FIELDS (`git.main_branch` is asserted ABSENT above), so
+        this membership requires an EXPLICIT registration line.
+        """
+        assert 'git.merge_park_lock_grace_seconds' in RELOADABLE_FIELDS, (
+            'git.merge_park_lock_grace_seconds must be a member of '
+            'RELOADABLE_FIELDS (green-tier hot-reloadable, explicitly '
+            'registered beside the git.offline_lane_* leaves)'
+        )
