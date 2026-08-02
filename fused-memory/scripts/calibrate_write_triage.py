@@ -593,6 +593,7 @@ def write_triage_config_block(
     t_high: float | None,
     t_low: float | None,
     report_path: str,
+    t_high_by_category: Mapping[str, float] | None = None,
 ) -> str:
     """Return *yaml_text* with only its ``write_triage:`` block replaced.
 
@@ -601,15 +602,36 @@ def write_triage_config_block(
     would strip config.yaml's extensive explanatory comments, which are
     load-bearing for operators.
 
-    Raises when either threshold is ``None`` — an uncalibrated run must
-    never put a null threshold into config. The input string is never
-    mutated, so a refusal leaves no partial block behind.
+    Raises when either POOLED threshold is ``None`` — an uncalibrated run
+    must never put a null threshold into config, and a per-category map
+    never licenses one. The input string is never mutated, so a refusal
+    leaves no partial block behind.
+
+    ``t_high_by_category`` carries only the categories whose band was
+    actually DERIVED. A category with no derived cutoff is ABSENT from the
+    map, and that is the only spelling of it: emitting it with a null would
+    give "no evidence for this category" two representations that the
+    reader would then have to disambiguate. An empty map omits the key
+    entirely for the same reason. Keys are sorted, so two runs over the
+    same measurement produce the same bytes.
     """
     if t_high is None or t_low is None:
         raise ValueError(
             f'refusing to write an uncalibrated threshold into config '
             f'(t_high={t_high!r}, t_low={t_low!r}). Leave the section absent so '
             'triage fails open to `stored`.',
+        )
+
+    by_category = ''
+    if t_high_by_category:
+        by_category = (
+            '  # Per-category cutoffs, measured the same way over each category\'s\n'
+            '  # OWN pairs. A category ABSENT here has no derived cutoff — see the\n'
+            "  # report's per_category section for the refusal and its reason.\n"
+            '  t_high_by_category:\n'
+        ) + ''.join(
+            f'    {category}: {t_high_by_category[category]}\n'
+            for category in sorted(t_high_by_category)
         )
 
     block = (
@@ -624,6 +646,7 @@ def write_triage_config_block(
         f'  t_high: {t_high}\n'
         f'  t_low: {t_low}\n'
         f'  calibration_report_path: {report_path}\n'
+        f'{by_category}'
     )
 
     lines = yaml_text.splitlines(keepends=True)
@@ -946,12 +969,33 @@ async def _run(args: Any) -> int:
         config_path = Path(args.config) if args.config else (
             Path(__file__).parent.parent / 'config' / 'config.yaml'
         )
+        # Only the categories whose band was actually DERIVED. A refused one
+        # is left ABSENT rather than written as a null, so the consumer reads
+        # "uncalibrated for this category" from one unambiguous signal.
+        derived_by_category = {
+            category: entry['t_high']
+            for category, entry in result['report']['per_category'].items()
+            if entry['t_high'] is not None
+        }
+        refused = sorted(
+            set(result['report']['per_category']) - set(derived_by_category),
+        )
+        if refused:
+            logger.warning(
+                'No per-category cutoff derived for %s — left ABSENT from '
+                't_high_by_category; see the report per_category section for '
+                'each refusal reason.', ', '.join(refused),
+            )
         updated = write_triage_config_block(
             config_path.read_text(), result['t_high'], result['t_low'],
             package_relative(args.report_path),
+            t_high_by_category=derived_by_category,
         )
         config_path.write_text(updated)
-        logger.info('Wrote write_triage block to %s', config_path)
+        logger.info(
+            'Wrote write_triage block to %s (per-category cutoffs: %s)',
+            config_path, ', '.join(sorted(derived_by_category)) or 'none',
+        )
         return 0
     finally:
         await memory.close()
