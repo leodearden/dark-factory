@@ -537,18 +537,27 @@ grace produces exactly that: a blocked merge, **no** recovery advice, and
 **nothing for you to do** — it is retried on re-dispatch.
 
 There is exactly one genuine operator action, and it is triggered by the
-lock having **already been older than a full grace the moment the merge
-worker first observed it** — not by the age in the line above. That
-post-wait age necessarily exceeds the grace whenever we waited the grace
-out (it is the initial age *plus* the wait), so it says nothing about
-staleness; the 301s example above is a perfectly live commit. The
-distinguishing sentence is spelled out in the reason and simply does not
-appear otherwise:
+lock having **already been older, the moment the merge worker first
+observed it, than the staleness floor** — not by the age in the line
+above. That post-wait age necessarily exceeds the grace whenever we
+waited the grace out (it is the initial age *plus* the wait), so it says
+nothing about staleness; the 301s example above is a perfectly live
+commit. The distinguishing sentence is spelled out in the reason and
+simply does not appear otherwise:
 
 > `… The lock was ALREADY 3600s old when the merge worker FIRST observed
-> it — older than the entire 300s grace — so it is likely a crashed-git
+> it — older than the 300s staleness floor (max of the configured 300s
+> grace and the 300s pre-commit budget) — so it is likely a crashed-git
 > leftover rather than a live commit: confirm no git process is running
 > in project_root, then clear it with rm -f /…/.git/index.lock.`
+
+The floor is `max(git.merge_park_lock_grace_seconds, 300s)`, **not** the
+configured grace alone. Tuning the grace *down* (including to `0`, the
+probe-only fail-fast off-switch) shortens how long the worker **waits**;
+it must never widen what counts as a crashed leftover, or a live
+half-second-old `git commit --only` would be reported as one. Tuning the
+grace *up* does raise the bar — an operator who allows longer hooks has
+declared locks that old to be normal.
 
 Only when you see that sentence should you clear the lock by hand, and
 only after confirming no git process is running in `project_root`. The

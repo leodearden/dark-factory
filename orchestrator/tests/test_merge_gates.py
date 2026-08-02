@@ -1339,6 +1339,109 @@ class TestMapAdvanceFailureParkLockContended:
             f'process is running in project_root first; got {outcome.reason!r}'
         )
 
+    async def test_zero_grace_young_lock_gets_no_destructive_advice(self) -> None:
+        """grace=0 must not turn EVERY lock into a "crashed leftover".
+
+        `git.merge_park_lock_grace_seconds` is tunable to 0 — a blessed,
+        documented probe-only fail-fast off-switch (GitConfig's docstring
+        and test_zero_is_accepted_as_probe_only_off_switch).  A staleness
+        test keyed on the grace ALONE (`initial_age > grace`) makes every
+        non-zero age exceed it, so an ordinary live `git commit --only`
+        whose lock is half a second old gets told to `rm -f` it — deleting
+        a live commit's index.lock and corrupting that in-flight commit.
+
+        Staleness must therefore clear max(grace, _STALE_LOCK_FLOOR_S):
+        how the operator tuned the WAIT carries no information about
+        whether the lock's owner is alive.
+        """
+        for initial_age in (0.5, 2.0, 299.0):
+            outcome, halt = await self._map({
+                'lock_path': '/p/.git/index.lock',
+                'age_seconds': initial_age,
+                'waited_seconds': 0.0,
+                'initial_age_seconds': initial_age,
+                'grace_seconds': 0.0,
+                'dirty_files': [],
+            })
+
+            halt.assert_not_called()
+            assert outcome.status == 'blocked'
+            assert 'rm -f' not in outcome.reason, (
+                f'a {initial_age}s-old lock under a grace=0 off-switch is a '
+                'live commit, not a crashed leftover, and must never be '
+                f'offered destructive lock removal; got {outcome.reason!r}'
+            )
+            assert 'crashed' not in outcome.reason.lower(), (
+                f'a {initial_age}s-old lock must not be described as a '
+                f'crashed leftover; got {outcome.reason!r}'
+            )
+            # Suppressing the ADVICE must not suppress the DIAGNOSIS.
+            assert '/p/.git/index.lock' in outcome.reason
+
+    async def test_zero_grace_still_reaches_the_floor_for_a_real_leftover(
+        self,
+    ) -> None:
+        """The floor SUPPRESSES false positives; it must not suppress the
+        one true positive.  An hour-old lock is a crashed-git leftover
+        whatever the grace is tuned to — including the grace=0 off-switch.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3600.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 0.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'rm -f /p/.git/index.lock' in outcome.reason, (
+            'an hour-old leftover must still carry actionable recovery even '
+            f'when the wait is switched off; got {outcome.reason!r}'
+        )
+        assert 'no git process' in outcome.reason.lower(), (
+            'destructive advice must remain paired with the liveness check; '
+            f'got {outcome.reason!r}'
+        )
+
+    async def test_a_grace_above_the_floor_still_governs(self) -> None:
+        """The floor is a FLOOR, not a replacement.  With a grace tuned
+        ABOVE the floor, a lock older than the floor but younger than the
+        grace is still an ordinary slow pre-commit hook, not a leftover.
+        """
+        outcome, _halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 400.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 400.0,   # > 300s floor, < 900s grace
+            'grace_seconds': 900.0,
+            'dirty_files': [],
+        })
+
+        assert 'rm -f' not in outcome.reason, (
+            'an operator who RAISED the grace has declared hooks that long '
+            f'to be normal; got {outcome.reason!r}'
+        )
+
+    async def test_floor_matches_the_documented_pre_commit_budget(self) -> None:
+        """The floor is a literal (orchestrator.config is TYPE_CHECKING-only
+        in merge_gates), so pin it against the config default it mirrors —
+        otherwise the two drift silently.
+
+        (`async` only to satisfy this module's global asyncio pytestmark.)
+        """
+        from orchestrator.config import GitConfig
+        from orchestrator.merge_gates import _STALE_LOCK_FLOOR_S
+
+        assert _STALE_LOCK_FLOOR_S == pytest.approx(
+            GitConfig().merge_park_lock_grace_seconds
+        ), (
+            '_STALE_LOCK_FLOOR_S must track '
+            'GitConfig.merge_park_lock_grace_seconds\'s default (this repo\'s '
+            'documented pre-commit budget)'
+        )
+
     async def test_missing_staleness_keys_default_to_no_advice(self) -> None:
         """Absent evidence of staleness is not evidence of staleness.
 

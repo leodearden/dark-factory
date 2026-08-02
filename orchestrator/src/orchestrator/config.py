@@ -1788,7 +1788,11 @@ class GitConfig(BaseModel):
             'fail-fast): the lock is still probed and a held lock is still '
             'classified as `park_lock_contended` — never a silent fail-soft, '
             'because parking through a foreign process\'s index lock would '
-            'clobber the in-flight commit\'s staged/working state.'
+            'clobber the in-flight commit\'s staged/working state. This knob '
+            'governs the WAIT only: the crashed-leftover verdict that offers '
+            'an operator destructive `rm -f <lock>` recovery keys on '
+            'max(this, merge_gates._STALE_LOCK_FLOOR_S), so lowering it (0 '
+            'included) never widens what counts as a stale lock.'
         ),
     )
     offline_lane_red_advances_before_blocker: int = Field(

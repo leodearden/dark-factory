@@ -919,19 +919,33 @@ async def _map_advance_failure(
         # auto-vivified attribute would make the comparison raise TypeError.
         # The dict is the whole input, by the same discipline as the
         # `getattr(git_ops, '_last_park_lock_info', None) or {}` read above.
+        #
+        # And the bar is max(grace, _STALE_LOCK_FLOOR_S), never the grace
+        # alone: grace is tunable to 0 (the blessed probe-only fail-fast
+        # off-switch), at which value EVERY age exceeds it and a live
+        # half-second-old commit would be handed `rm -f`.  See
+        # _STALE_LOCK_FLOOR_S for the full rationale.
         initial_age = info.get('initial_age_seconds')
         grace = info.get('grace_seconds')
+        threshold = (
+            max(float(grace), _STALE_LOCK_FLOOR_S)
+            if isinstance(grace, int | float) and not isinstance(grace, bool)
+            else None
+        )
         stale = (
             isinstance(initial_age, int | float)
-            and isinstance(grace, int | float)
-            and initial_age > grace
+            and not isinstance(initial_age, bool)
+            and threshold is not None
+            and initial_age > threshold
         )
         recovery = (
             f' The lock was ALREADY {initial_age:.0f}s old when the merge '
-            f'worker FIRST observed it — older than the entire {grace:.0f}s '
-            f'grace — so it is likely a crashed-git leftover rather than a '
-            f'live commit: confirm no git process is running in project_root, '
-            f'then clear it with `rm -f {lock_path}`.'
+            f'worker FIRST observed it — older than the {threshold:.0f}s '
+            f'staleness floor (max of the configured {grace:.0f}s grace and '
+            f'the {_STALE_LOCK_FLOOR_S:.0f}s pre-commit budget) — so it is '
+            f'likely a crashed-git leftover rather than a live commit: '
+            f'confirm no git process is running in project_root, then clear '
+            f'it with `rm -f {lock_path}`.'
             if stale else ''
         )
         return MergeOutcome(
@@ -1769,6 +1783,24 @@ async def _check_post_merge_equivalence(
 # the overlap status unknowable.  Any non-empty list causes the caller to
 # re-verify (fail-CLOSED policy).
 _OVERLAP_GIT_ERROR_SENTINEL = ['<git-error: re-verify required>']
+
+# Floor (seconds) an index.lock's PRE-wait age must clear before
+# `_map_advance_failure` will call it a crashed-git leftover and offer the
+# destructive `rm -f <lock>` recovery (task 3060, step-19).
+#
+# The threshold CANNOT be the configured grace alone.  `git.merge_park_lock_
+# grace_seconds` is operator-tunable all the way down to 0 — a blessed,
+# documented probe-only fail-fast off-switch (see GitConfig.merge_park_lock_
+# grace_seconds and test_zero_is_accepted_as_probe_only_off_switch) — and at
+# grace=0 EVERY age exceeds the grace, so a keyed-on-grace-alone test hands
+# `rm -f` advice to a live 0.5s-old `git commit --only`.  Deleting a live
+# commit's index.lock corrupts that in-flight commit, so staleness keys on
+# max(grace, this floor): a lock older than this repo's documented pre-commit
+# budget is the only defensible crashed-leftover signal, INDEPENDENT of how
+# the operator tuned the WAIT.  Kept equal to the GitConfig default (pinned by
+# test_floor_matches_the_documented_pre_commit_budget) rather than imported,
+# because orchestrator.config is a TYPE_CHECKING-only import here.
+_STALE_LOCK_FLOOR_S = 300.0
 
 
 async def _rebase_delta_touched_overlap(
