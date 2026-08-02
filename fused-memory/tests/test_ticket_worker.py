@@ -258,7 +258,11 @@ async def test_worker_processes_combine_decision(
     # Sentinel: track whether _execute_combine ran (it runs under write_lock)
     execute_combine_calls = []
 
-    async def fake_execute_combine(project_root, decision):
+    # **_kwargs absorbs the keyword-only arguments the real _execute_combine
+    # takes (candidate_metadata, task 3446). This stub is a write-lock
+    # sentinel, not a signature pin — asserting on the call shape here would
+    # duplicate test_task_interceptor.py's combine coverage.
+    async def fake_execute_combine(project_root, decision, **_kwargs):
         execute_combine_calls.append({'project_root': project_root, 'decision': decision})
         return {'updated': True, 'target_id': decision.target_id}
 

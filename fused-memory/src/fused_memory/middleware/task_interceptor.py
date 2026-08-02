@@ -112,6 +112,15 @@ logger = logging.getLogger(__name__)
 # for zero lines against schema-clean metadata.
 _METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 
+# The escalation-gate stamp, named once so the readers and the writers stay
+# greppably coupled. WRITERS:
+# ``operational_routing_guard.inject_operational_routing`` (the declared
+# execution_class='operational'|'decision' boundary coercion) and
+# ``TaskInterceptor._inject_deterministic_pure_gate`` (the curator's
+# route_deterministic fallback), which between them set every key below.
+# READER: ``TaskInterceptor._is_gate_metadata`` — see task 3446.
+_GATE_MARKER_KEYS = ('execution_class', 'operational_mode', 'task_kind', 'always_escalates')
+
 
 def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
     """Best-effort parse of *metadata* into a raw dict.
@@ -2025,6 +2034,8 @@ class TaskInterceptor:
         self,
         project_root: str,
         decision: CuratorDecision,
+        *,
+        candidate_metadata: Any = None,
     ) -> dict | None:
         """Apply a curator combine decision to the target task.
 
@@ -2040,6 +2051,13 @@ class TaskInterceptor:
         status (done/cancelled) aborts the write and returns None so the
         caller degrades to ``create`` instead of silently clobbering an
         unrelated task.
+
+        A third abort condition joins those two: *candidate_metadata*
+        declaring an escalation gate while the live target does not. The
+        candidate's own metadata is never written anywhere by this path, so
+        such a combine would silently strip a human decision gate — the
+        target-side ``'merge'`` above cannot help. Refusing degrades to
+        ``create``, which files the gate as its own task (task 3446).
 
         A corrupt *existing* metadata blob on the target now also aborts the
         combine: ``_merge_metadata`` refuses to merge into unparseable bytes
@@ -2093,6 +2111,37 @@ class TaskInterceptor:
                 decision.target_id,
                 target_title[:80],
                 (decision.target_fingerprint or '')[:80],
+            )
+            return None
+
+        # ── Guard: never absorb a gated CANDIDATE into an ungated target ──
+        # metadata_mode='merge' fixes the target-side loss only; the
+        # candidate's metadata is never written anywhere by this path, so a
+        # human decision gate folded into ordinary agent work would still
+        # lose its gate status and be dispatched to an architect.
+        #
+        # Refuse rather than propagate the candidate's markers onto the
+        # target: the pure-gate stamp is task_kind='deterministic' +
+        # always_escalates=True with before_done DELETED, but under shallow
+        # merge a before_done already on the target SURVIVES (the incoming
+        # blob carries no such key), so propagation could construct exactly
+        # the combination deterministic_task_guard invariant 6 rejects.
+        # Degrading to create files the gate as its own task, which is the
+        # right conservative outcome for a duplicate human gate.
+        #
+        # Placed before _append_combine_audit so a refusal writes no audit
+        # record, matching the fingerprint and terminal-status guards above.
+        if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
+            target.get('metadata')
+        ):
+            candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
+            declared = {k: candidate_meta[k] for k in _GATE_MARKER_KEYS if k in candidate_meta}
+            logger.warning(
+                'combine-guard: candidate declares an escalation gate (%s) but target '
+                '%s does not — aborting combine; a human decision gate must not be '
+                'absorbed into an ungated task. Degrading to create.',
+                declared,
+                decision.target_id,
             )
             return None
 
@@ -2225,6 +2274,34 @@ class TaskInterceptor:
         if warnings:
             _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
         return parsed
+
+    @staticmethod
+    def _is_gate_metadata(metadata: Any) -> bool:
+        """True when *metadata* declares an escalation gate (task 3446).
+
+        Normalises through :meth:`_extract_metadata_dict` so a JSON-string
+        blob, a dict, and ``None`` are all handled by the one shared shape
+        policy — never a hand-rolled ``json.loads``. Unparseable or non-dict
+        metadata answers False (ungated): the shape WARNING is already emitted
+        by the helper, and the permissive answer keeps a malformed blob from
+        turning into a hard failure of the combine path.
+
+        The test is VALUE-sensitive, mirroring
+        :mod:`deterministic_task_guard`'s own strictness — it uses
+        ``always_escalates is True`` precisely so non-bool truthy values
+        (``'false'``, ``1``) do NOT satisfy the gate, since ``bool('false')``
+        is True and would silently accept the opposite of the caller's
+        intent. Reading the same keys loosely here would let a task the guard
+        considers ungated be treated as gated (and vice versa).
+        """
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if not meta:
+            return False
+        return (
+            meta.get('always_escalates') is True
+            or meta.get('operational_mode') == 'gate'
+            or meta.get('execution_class') == 'operational'
+        )
 
     @staticmethod
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
@@ -3248,7 +3325,14 @@ class TaskInterceptor:
         if decision is not None and decision.action == 'combine' and decision.target_id:
             # Combine: rewrite target task under write_lock, spawn reembed background task.
             async with self._write_lock(project_id):
-                combine_result = await self._execute_combine(project_root, decision)
+                # candidate_metadata is this ticket's post-inject_operational_routing
+                # submission metadata — the same object stamped by
+                # _inject_deterministic_pure_gate and serialised into tm.add_task
+                # below. _execute_combine reads it to refuse absorbing a gated
+                # candidate into an ungated target (task 3446).
+                combine_result = await self._execute_combine(
+                    project_root, decision, candidate_metadata=metadata,
+                )
             if combine_result is not None:
                 if decision.rewritten_task is not None and curator is not None:
                     rt_candidate = CandidateTask.from_rewritten_task(decision.rewritten_task)
