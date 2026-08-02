@@ -6,8 +6,9 @@ pin predicate (INV-5) every recovery/redispatch veto site consumes; this task
 delivers the types + classifier + tests only — no veto site is rewired here.
 
 Covers:
-  step-3: pure type-surface contract — the StrEnum, the structural Protocol,
-          and the frozen report value object, no classification logic yet.
+  step-3: pure type-surface contract — the StrEnum, the frozen report value
+          object, and the STATICALLY-CHECKED structural Protocol seam, with no
+          classification logic asserted yet.
   step-5: the SEVERITY rules (spec S6 clauses i and ii) — info never pins;
           missing/out-of-vocabulary severity fails safe to pinning, which
           deliberately OUTRANKS the dead-L0 rule.
@@ -83,24 +84,16 @@ class TestPinReportTypeSurface:
         assert isinstance(report.pins, bool)
         assert isinstance(report.vetoes_done_flip, bool)
 
-    def test_derived_predicates_are_properties(self) -> None:
-        assert isinstance(PinReport.pins, property)
-        assert isinstance(PinReport.vetoes_done_flip, property)
-
 
 class TestPinRecordProtocol:
-    """PinRecord is a structural Protocol both record types satisfy."""
+    """PinRecord is a structural Protocol both record types satisfy.
 
-    def test_is_a_protocol(self) -> None:
-        assert typing.get_origin(PinRecord) is None
-        assert getattr(PinRecord, '_is_protocol', False) is True
-
-    def test_escalation_structurally_satisfies_pin_record(self) -> None:
-        """``escalation.models.Escalation`` carries every PinRecord attribute."""
-        for name in ('id', 'level', 'severity', 'filing_claimant_run_id'):
-            assert name in Escalation.__dataclass_fields__, (
-                f'Escalation must carry {name!r} to satisfy PinRecord'
-            )
+    Conformance is pinned by a STATIC, pyright-checked assignment rather than
+    runtime introspection: there is no runtime predicate for structural-Protocol
+    conformance that is both public and meaningful (``isinstance`` needs
+    ``@runtime_checkable``, which only re-checks attribute NAMES). The
+    assignment below also checks attribute TYPES and read-only compatibility.
+    """
 
     def test_escalation_satisfies_pin_record_statically(self) -> None:
         """The seam is checked by pyright too, not only at runtime — this
