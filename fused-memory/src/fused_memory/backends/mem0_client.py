@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 from mem0 import AsyncMemory
@@ -30,6 +31,27 @@ def _extract_payload_text(payload: dict[str, Any]) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+#: Default cap on how many pages a single full-enumeration scroll may walk.
+#: A pager with no budget loops forever if Qdrant keeps handing back a live
+#: ``next_offset``, so the budget travels with the loop.  THE single home for
+#: this number: ``scripts/census_memory_metadata.DEFAULT_MAX_PAGES`` aliases
+#: it rather than restating 200 (INV-5).
+DEFAULT_SCROLL_MAX_PAGES = 200
+
+
+class ScrollPageBudgetExhausted(RuntimeError):
+    """A paged scroll consumed *max_pages* with ``next_offset`` still live.
+
+    The stream is TRUNCATED, so the pager raises rather than ending short —
+    a caller that folded a short stream into counters would under-report with
+    no error surface (INV-2 no-silent-fail-soft).
+
+    ``scripts/census_memory_metadata.CensusScanIncomplete`` is a module-level
+    ALIAS of this class (not a subclass): the census's ``except
+    CensusScanIncomplete`` must catch exactly what the backend raises.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +927,94 @@ class Mem0Backend:
             offset = next_offset
 
         return {'matches': matches, 'scanned': scanned, 'truncated': truncated}
+
+    async def scroll_collection_pages(
+        self,
+        collection_name: str,
+        *,
+        scroll_filter: Any = None,
+        page_size: int = 1000,
+        max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+        with_vectors: bool = False,
+    ) -> AsyncIterator[Any]:
+        """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
+
+        THE single home for the offset/next_offset walk (INV-5).  Both
+        full-enumeration callers sit on top of it:
+        :meth:`scroll_all_by_metadata` (Scope+filter-addressed, normalised
+        records — what ``scripts/census_memory_metadata.py`` drives) and
+        ``scripts/consolidate_namespace_families.scroll_collection_points``
+        (raw points, no filter — which enters at THIS layer).
+
+        Deliberately collection-name-addressed rather than
+        :class:`~fused_memory.models.scope.Scope`-addressed, and
+        filter-OPTIONAL, because consolidate_namespace_families scrolls
+        LEGACY mis-named collections (``fused_dark-factory``, ``reify_reify``,
+        ``autopilot_video_autopilot_video``) that a Scope structurally cannot
+        produce, with no filter at all.  Raw points are yielded, not
+        normalised records, because its ``merge_collection`` reads
+        ``point.id``/``point.vector``/``point.payload`` to rebuild
+        ``PointStruct``s.
+
+        Points are yielded one at a time (never accumulated) so a caller
+        folding them into counters holds one page in memory regardless of
+        collection size.
+
+        Args:
+            collection_name: The Qdrant collection, passed through VERBATIM.
+            scroll_filter: Optional pre-built payload ``Filter`` (see
+                :meth:`_build_payload_filter`).  ``None`` scrolls the whole
+                collection — safe here, unlike at the metadata-addressed APIs,
+                because the caller named the collection explicitly.
+            page_size: Points requested per page (Qdrant ``limit``).
+            max_pages: Page budget; exhausting it raises rather than
+                truncating.
+            with_vectors: Fetch each point's stored vector.  Costs bandwidth,
+                so it is opt-in.
+
+        Yields:
+            Raw Qdrant point objects, in page order.
+
+        Raises:
+            ScrollPageBudgetExhausted: If *max_pages* is consumed while
+                ``next_offset`` is still live — the stream is truncated, so it
+                raises instead of ending short.
+            TimeoutError: If a single page request exceeds ``_read_timeout``.
+                PROPAGATED, never swallowed into an empty stream — same
+                posture as :meth:`count_by_metadata` /
+                :meth:`scroll_by_metadata` / :meth:`get_point_by_id`, so a
+                timed-out read is never mistaken for an empty collection.
+        """
+        client = await self._get_async_qdrant()
+        offset: Any = None
+        pages = 0
+        while True:
+            # Bound each PAGE, not the whole scan: a per-scan bound would
+            # abort a long-but-healthy multi-page enumeration.
+            points, next_offset = await asyncio.wait_for(
+                client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=scroll_filter,
+                    with_payload=True,
+                    with_vectors=with_vectors,
+                    limit=page_size,
+                    offset=offset,
+                ),
+                timeout=self._read_timeout,
+            )
+            pages += 1
+            for point in points:
+                yield point
+
+            if next_offset is None:
+                return
+            if pages >= max_pages:
+                raise ScrollPageBudgetExhausted(
+                    f'scroll of collection={collection_name!r} exhausted its page budget '
+                    f'after {pages} page(s) of {page_size} with next_offset={next_offset!r} '
+                    f'still live — the scan is truncated. Raise max_pages or page_size.',
+                )
+            offset = next_offset
 
     async def get_point_by_id(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
         """Direct Qdrant point-fetch by id (non-semantic) → raw payload dict, or None.
