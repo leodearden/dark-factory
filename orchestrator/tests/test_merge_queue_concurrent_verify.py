@@ -3394,6 +3394,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 3477: widened wait budgets (below) can approach the 60s pyproject default; thread-mode timeout would os._exit() the xdist worker with --max-worker-restart=0
 class TestRunnerUnavailableHeadCascade:
     """RUNNER_UNAVAILABLE on the HEAD triggers the head-failure cascade.
 
@@ -3483,9 +3484,6 @@ class TestRunnerUnavailableHeadCascade:
             config=config, result=loop.create_future(), lane='normal',
         )
 
-        outcome_a: MergeOutcome | None = None
-        outcome_b: MergeOutcome | None = None
-
         with patch('orchestrator.merge_queue.run_scoped_verification', _local_verify_side_effect):
             worker_task = asyncio.create_task(worker.run())
 
@@ -3494,8 +3492,11 @@ class TestRunnerUnavailableHeadCascade:
 
             # Wait for N's local verify to enter AND N+1's remote verify to enter.
             # This confirms both are in-flight simultaneously.
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # NOTE (task 3477): widened from 15.0s -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention even though the
+            # underlying cascade logic is correct (timing flake, not a bug).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
 
             # Both verifies are now in-flight.  Release N's gate → RunnerUnavailable.
             # _finalize_inflight(N) returns False → head-failure cascade fires:
@@ -3508,19 +3509,20 @@ class TestRunnerUnavailableHeadCascade:
             # can unblock even if cancel() arrives slightly late.
             gate_b_release.set()
 
-            # Wait for both to resolve.
-            with contextlib.suppress(TimeoutError):
-                outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            # Wait for both to resolve. A real timeout now fails loudly by
+            # name (task 3477) instead of leaving outcome_X as a confusing
+            # None that the assertions below would misreport.
+            outcome_a = await _await_outcome(req_a.result, label='N (RUNNER_UNAVAILABLE head)')
+            outcome_b = await _await_outcome(req_b.result, label='N+1 (speculative downstream)')
 
             await worker.stop()
 
+        # NOTE (task 3477): widened from 5.0s, matching the gate/outcome waits above.
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            await asyncio.wait_for(worker_task, timeout=45.0)
 
         # ── N (RUNNER_UNAVAILABLE head): must land 'done' after re-dispatch ──
-        assert outcome_a is not None and outcome_a.status == 'done', (
+        assert outcome_a.status == 'done', (
             f'Expected N (RUNNER_UNAVAILABLE head) to resolve "done" after '
             f're-merge re-dispatch, got {outcome_a!r}. '
             'The head-failure cascade should re-merge N onto actual main '
@@ -3528,7 +3530,7 @@ class TestRunnerUnavailableHeadCascade:
         )
 
         # ── N+1 (speculative downstream): must land 'done' after cascade ─────
-        assert outcome_b is not None and outcome_b.status == 'done', (
+        assert outcome_b.status == 'done', (
             f'Expected N+1 (speculative downstream) to resolve "done" after '
             f'cascade re-merge re-dispatch, got {outcome_b!r}. '
             'If the cascade did not fire, N+1 would stay in _inflight with a '
