@@ -290,8 +290,14 @@ class TestMergeStatusGitAuthority:
 
         # find_merge_marker called with full ref 'task/456'
         fmm.assert_called_once_with('task/456')
-        # is_ancestor must NOT be called when tip is None
+        # is_ancestor must NOT be called when tip is None.  This stub harness
+        # has no .scheduler, so metadata resolves {} and the task-3103
+        # predates-this-incarnation veto is skipped before its is_ancestor call.
         ia.assert_not_called()
+        # ...but the CANDIDATE-mode effect-present gate DOES run, against the
+        # marker.  Pinned explicitly so the guard is not merely incidentally
+        # satisfied by _stub_git_ops's permissive default.
+        stub_git.commit_effect_present_in_main.assert_awaited_once_with(marker)
 
     # ── step-5: fire-safety + negatives + guards ──────────────────────────────
 
@@ -762,6 +768,126 @@ class TestMergeStatusGitAuthority:
         assert isinstance(result, dict), 'merge_status must not raise'
         assert result.get('state') == expected_state, (
             f'Expected {expected_state} with a raising scheduler, got: {result}'
+        )
+
+    # ── task 3103: marker-arm veto + CANDIDATE-mode landing evidence ─────────
+
+    def _marker_arm_server(
+        self,
+        tmp_path: Path,
+        *,
+        marker: str,
+        marker_predates_base: bool = False,
+        effect_present: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[Any, types.SimpleNamespace]:
+        """Build a server on the deleted-branch (tip=None) marker arm."""
+        stub_git = _stub_git_ops(
+            resolve_branch_sha=AsyncMock(return_value=None),   # branch ref gone
+            is_ancestor=AsyncMock(return_value=marker_predates_base),
+            find_merge_marker=AsyncMock(return_value=marker),
+            commit_effect_present_in_main=AsyncMock(return_value=effect_present),
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            esc_queue,
+            harness=_stub_harness(stub_git, metadata=metadata),
+            orch_config=_make_config(tmp_path),
+        )
+        return server, stub_git
+
+    async def test_marker_predating_branch_base_sha_returns_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """A marker older than this incarnation's base belongs to a PREVIOUS run.
+
+        The branch was deleted and recreated under the same task id, so a
+        merge marker on main that PREDATES the recorded branch_base_sha
+        attributes a previous incarnation's merge to the current task.
+        Mirrors the harness's marker-arm veto.
+
+        The veto must short-circuit BEFORE CANDIDATE-mode validation, so the
+        effect-present probe is never run.
+        """
+        marker = 'd' * 40
+        server, stub_git = self._marker_arm_server(
+            tmp_path, marker=marker, marker_predates_base=True,
+            metadata={'branch_base_sha': 'b' * 40},
+        )
+
+        result = await _call_merge_status(server, task_id='800')
+
+        assert result.get('state') == 'unknown', (
+            f'A marker predating branch_base_sha must be unknown, got: {result}'
+        )
+        stub_git.commit_effect_present_in_main.assert_not_called()
+
+    async def test_marker_not_predating_base_returns_done(
+        self, tmp_path: Path
+    ) -> None:
+        """The task-1748 / reify-4352 deleted-branch case must not regress."""
+        marker = 'd' * 40
+        server, _ = self._marker_arm_server(
+            tmp_path, marker=marker, marker_predates_base=False,
+            effect_present=True, metadata={'branch_base_sha': 'b' * 40},
+        )
+
+        result = await _call_merge_status(server, task_id='801')
+
+        assert result.get('state') == 'done', f'Expected done, got: {result}'
+        assert result.get('kind') == 'found_on_main', f'Expected found_on_main: {result}'
+        assert result.get('merge_sha') == marker, (
+            f'Expected merge_sha={marker!r}, got: {result.get("merge_sha")!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [{}, {'branch_base_sha': 'abc'}, {'branch_base_sha': 'A' * 40},
+         {'branch_base_sha': 12345}],
+        ids=['absent', 'too_short', 'uppercase', 'non_str'],
+    )
+    async def test_marker_with_unusable_branch_base_sha_skips_veto(
+        self, tmp_path: Path, metadata: dict[str, Any]
+    ) -> None:
+        """An absent or malformed base fails OPEN out of the veto.
+
+        is_valid_sha_40 sits on the LEFT of the veto's ``and`` so a bad value
+        never reaches is_ancestor — the same short-circuit ordering as the
+        harness.  The CANDIDATE-mode effect-present gate still applies.
+        """
+        marker = 'd' * 40
+        server, stub_git = self._marker_arm_server(
+            tmp_path, marker=marker, marker_predates_base=True,  # would veto if reached
+            effect_present=True, metadata=metadata,
+        )
+
+        result = await _call_merge_status(server, task_id='802')
+
+        assert result.get('state') == 'done', (
+            f'An unusable branch_base_sha must skip the veto, got: {result}'
+        )
+        assert result.get('merge_sha') == marker
+        stub_git.is_ancestor.assert_not_called()
+
+    async def test_marker_effect_absent_returns_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """FIX 1' on the marker arm: a reverted merge must not read as done.
+
+        The task-1175 clobber — the marker's subject match establishes
+        attribution, but a later commit on main may have reverted exactly the
+        paths it touched.
+        """
+        server, _ = self._marker_arm_server(
+            tmp_path, marker='d' * 40, marker_predates_base=False,
+            effect_present=False, metadata={'branch_base_sha': 'b' * 40},
+        )
+
+        result = await _call_merge_status(server, task_id='803')
+
+        assert result.get('state') == 'unknown', (
+            f'A marker whose effect is absent at main HEAD must be unknown, '
+            f'got: {result}'
         )
 
 
