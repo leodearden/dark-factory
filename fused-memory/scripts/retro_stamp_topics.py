@@ -86,10 +86,14 @@ __all__ = [
     'CALIBRATION_FIXTURE_PATH',
     'CLUSTER_MEMBER_KEYS',
     'DF_CURATOR_GATE_CLUSTERS',
+    'DEFAULT_PROJECTS',
     'ERROR_OUTCOMES',
     'GateCluster',
+    'SKIP_BUCKETS',
+    'SOURCE_DESCRIPTIONS',
     'WRITE_REASON',
     'WRITE_SOURCE',
+    'run',
     'stamp_one',
     'TOPIC_REGISTRY_PATH',
     'TOPIC_SLUG_MAX_LEN',
@@ -1128,3 +1132,200 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
             'response': response,
         }
     return {**result, 'outcome': 'stamped', 'response': response}
+
+
+# ---------------------------------------------------------------------------
+# The run — three sources in, one auditable report out
+# ---------------------------------------------------------------------------
+
+#: The two corpora the six live ``canonical: true`` records straddle (1 in
+#: ``dark_factory``, 5 in ``reify``).  A single-project default would silently
+#: cover a sixth of source (1).
+DEFAULT_PROJECTS: tuple[str, ...] = ('dark_factory', 'reify')
+
+#: Every bucket the report carries, PRE-SEEDED TO EMPTY.  Seeding is the
+#: point: an absent bucket reads as "nothing was skipped", which is a
+#: different claim from "we looked and found nothing".  A hole in coverage
+#: that never reaches the artifact is a hole nobody closes.
+SKIP_BUCKETS: tuple[str, ...] = (
+    # from the planners
+    'skipped_no_enumeration',
+    'no_registry_topic',
+    'topic_underivable',
+    'member_not_a_uuid',
+    'cluster_without_canonical',
+    # from merge_plans
+    'conflicting_topic_claim',
+    'canonical_disagreement',
+    'canonical_plural',
+    # from stamp_one
+    'conflicting_existing_topic',
+    'canonical_uniqueness_blocked',
+    'canonical_probe_failed',
+    'memory_not_found',
+    'update_failed',
+    'supersedes_not_normalizable',
+)
+
+#: What each source IS, in the artifact rather than only in this docstring.
+#: The boundedness argument is this leaf's whole safety case; stating it
+#: only in the source puts it where a reader of the output cannot check it.
+SOURCE_DESCRIPTIONS: dict[str, str] = {
+    'canonical_scroll': (
+        'source (1): the live `canonical: true` scroll, per project — each '
+        "record's own consolidates/retires/replaces/supersedes uuid lists "
+        'name its members'
+    ),
+    'calibration_registry_join': (
+        "source (3) and the reify half of source (2): 3130's labeled "
+        'calibration fixture joined to the committed E1 topic registry on '
+        'cluster_id (the registry supplies the hand-authored slug a machine '
+        'cannot regenerate)'
+    ),
+    'df_curator_gate_manifest': (
+        'source (2), dark_factory half: the committed DF_CURATOR_GATE_CLUSTERS '
+        'manifest, transcribed from the seven PRD-D11 curator gates'
+    ),
+}
+
+
+async def run(
+    memory_service,
+    *,
+    projects: tuple[str, ...] = DEFAULT_PROJECTS,
+    apply: bool = False,
+    calibration_rows: list[dict] | None = None,
+    registry: object | None = None,
+    gate_manifest: tuple[GateCluster, ...] = DF_CURATOR_GATE_CLUSTERS,
+) -> dict:
+    """Plan all three bounded sources, stamp them, and report what happened.
+
+    Sequential awaits throughout.  The target count is bounded in the low
+    hundreds, so concurrency would buy little — and it would complicate the
+    one ordering that matters: two concurrent canonical stamps for the same
+    topic could both observe a zero count and both write, re-opening exactly
+    the TOCTOU window ``_check_canonical_uniqueness`` documents as its
+    residual risk.  Bounded work does not need a lock it cannot have.
+
+    Args:
+        memory_service: Injected; see :func:`stamp_one`.
+        projects: Which corpora to scroll for source (1).
+        apply: ``False`` (default) rehearses every read and decision and
+            withholds only the writes.
+        calibration_rows: 3130's rows.  ``None`` loads the committed fixture;
+            tests inject their own so they never depend on fixture drift.
+        registry: The E1 topic registry.  ``None`` loads the committed one
+            through the probe's own strict loader.
+        gate_manifest: The DF gate table.  Defaults to the committed one.
+
+    Returns:
+        The report dict — rendered by :func:`render_markdown` /
+        :func:`render_json` and graded by :func:`resolve_exit_code`.
+    """
+    if calibration_rows is None:
+        calibration_rows = load_calibration_rows(CALIBRATION_FIXTURE_PATH)
+    if registry is None:
+        registry = load_topic_registry(TOPIC_REGISTRY_PATH)
+
+    skips: dict[str, list[dict]] = {bucket: [] for bucket in SKIP_BUCKETS}
+
+    def _record_skips(entries: list[dict]) -> None:
+        """File each skip under its own reason, loudly if it is a new one.
+
+        An unknown reason is appended to a bucket created on the spot rather
+        than dropped: a reason this function has not heard of is precisely
+        the kind of thing that must not vanish between the planner that
+        raised it and the artifact.
+        """
+        for entry in entries:
+            skips.setdefault(entry.get('reason', 'unclassified'), []).append(entry)
+
+    # --- source (1): the live canonical scroll, per project ----------------
+    canonical_plans: list[ClusterPlan] = []
+    scrolled_records = 0
+    for project_id in projects:
+        records = await memory_service.get_memories_by_metadata(
+            project_id, {'canonical': True},
+        )
+        scrolled_records += len(records)
+        plans, source_skips = plan_canonical_clusters(records, project_id=project_id)
+        canonical_plans.extend(plans)
+        _record_skips(source_skips)
+
+    # --- sources (3) + (2)-reify: one join on cluster_id --------------------
+    calibration_plans, calibration_skips = plan_calibration_clusters(
+        calibration_rows, registry,
+    )
+    _record_skips(calibration_skips)
+
+    # --- source (2), dark_factory half: the committed manifest --------------
+    gate_plans, gate_skips = plan_gate_clusters(gate_manifest)
+    _record_skips(gate_skips)
+
+    targets, merge_skips = merge_plans(canonical_plans, calibration_plans, gate_plans)
+    _record_skips(merge_skips)
+
+    results: list[dict] = []
+    stamped_by_topic: dict[str, int] = {}
+    would_stamp_by_topic: dict[str, int] = {}
+    outcomes: dict[str, int] = {}
+    for target in targets:
+        result = await stamp_one(memory_service, target, apply=apply)
+        results.append(result)
+        outcome = result['outcome']
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if outcome == 'stamped':
+            stamped_by_topic[target.topic] = stamped_by_topic.get(target.topic, 0) + 1
+        elif outcome == 'would_stamp':
+            would_stamp_by_topic[target.topic] = (
+                would_stamp_by_topic.get(target.topic, 0) + 1
+            )
+        if outcome in skips:
+            skips[outcome].append(result)
+        # A record can be stamped AND carry a note — a legacy `supersedes`
+        # this sweep declined to fold is a fact about the record whether or
+        # not its topic landed, so it rides alongside the outcome rather
+        # than competing with it.
+        if 'supersedes_not_normalizable' in result.get('dispositions', ()):
+            skips['supersedes_not_normalizable'].append({
+                'reason': 'supersedes_not_normalizable',
+                'memory_id': result['memory_id'],
+                'project_id': result['project_id'],
+                'topic': result['topic'],
+            })
+
+    return {
+        'apply': apply,
+        # The safety claim, stated where the artifact's reader can check it.
+        'bounded': True,
+        'projects': list(projects),
+        'sources': {
+            'canonical_scroll': {
+                'description': SOURCE_DESCRIPTIONS['canonical_scroll'],
+                'record_count': scrolled_records,
+                'plan_count': len(canonical_plans),
+            },
+            'calibration_registry_join': {
+                'description': SOURCE_DESCRIPTIONS['calibration_registry_join'],
+                'row_count': len(calibration_rows),
+                'cluster_count': len({
+                    row.get('cluster_id') for row in calibration_rows
+                    if row.get('cluster_id')
+                }),
+                'plan_count': len(calibration_plans),
+            },
+            'df_curator_gate_manifest': {
+                'description': SOURCE_DESCRIPTIONS['df_curator_gate_manifest'],
+                'gate_count': len(gate_manifest),
+                'plan_count': len(gate_plans),
+            },
+        },
+        'target_count': len(targets),
+        'stamped_total': sum(stamped_by_topic.values()),
+        'stamped_by_topic': stamped_by_topic,
+        'would_stamp_total': sum(would_stamp_by_topic.values()),
+        'would_stamp_by_topic': would_stamp_by_topic,
+        'outcomes': outcomes,
+        'results': results,
+        'skips': skips,
+    }
