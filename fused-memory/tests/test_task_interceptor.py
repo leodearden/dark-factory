@@ -11966,3 +11966,102 @@ async def test_dispatch_drop_decision_unaffected_by_pure_gate_stamping(
     assert status == 'combined'
     assert task_id == '99'
     taskmaster.add_task.assert_not_awaited()
+
+
+# ── task 3126 step-3 RED: refuse -> dispatch chokepoint creates NOTHING ──
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuse_creates_nothing(interceptor, taskmaster):
+    """(a) THE FIX. A deterministic refusal must resolve status='refused' with
+    NO task_id and must never reach tm.add_task. Before this, the guards emitted
+    action='drop', target_id=None, which matched neither guarded drop branch and
+    fell through to the create path — creating the very candidate the guard's own
+    justification said to refuse."""
+    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(
+            action='refuse',
+            target_id=None,
+            justification='cancelled-premise-blocklist: x: y',
+        ),
+        kwargs={'title': 'Convert FIX C relay-flag deletion'},
+        metadata=None,
+        curator=None,
+    )
+
+    taskmaster.add_task.assert_not_awaited()
+    assert status == 'refused', f'expected refused, got {status!r} (reason={reason!r})'
+    assert task_id is None, f'a refusal must carry no task_id; got {task_id!r}'
+    # `reason` is the only legibility channel that reaches an MCP caller
+    # (_format_ticket_result deliberately does not expose result_json), so it
+    # must itself say that nothing was created and carry the justification.
+    assert reason is not None
+    assert 'refused' in reason
+    assert 'no task created' in reason
+    assert 'cancelled-premise-blocklist: x: y' in reason
+    assert result_dict is not None
+    assert result_dict.get('created') is False, result_dict
+    assert result_dict.get('id') is None, result_dict
+    assert result_dict.get('action') == 'refuse', result_dict
+    assert degrade is None, f'expected no curator_degrade_reason; got {degrade!r}'
+
+
+@pytest.mark.asyncio
+async def test_dispatch_targetless_llm_drop_still_fails_open_to_create(
+    interceptor, taskmaster,
+):
+    """(b) FAIL-OPEN REGRESSION. This locks the deliberately-rejected
+    'minimum viable alternative' of treating any targetless drop as a refusal.
+    A targetless 'drop' is an LLM dedupe that LOST its target, not a refusal —
+    silently discarding it would trade the bug being fixed for task loss in the
+    opposite direction. It must still create."""
+    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(
+            action='drop',
+            target_id=None,
+            justification='duplicate of an unresolvable sibling',
+        ),
+        kwargs={'title': 'Some ordinary candidate'},
+        metadata=None,
+        curator=None,
+    )
+
+    taskmaster.add_task.assert_awaited_once()
+    assert status == 'created', f'expected created, got {status!r} (reason={reason!r})'
+    assert task_id == '2'
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuse_precedes_drop_even_with_stray_target(
+    interceptor, taskmaster,
+):
+    """(c) BRANCH ORDER. A refusal carrying a stray target_id must still refuse.
+    The refuse branch precedes the drop branch, so a refusal can never be
+    shadowed into the dedupe path and silently reported as 'combined'."""
+    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(
+            action='refuse',
+            target_id='99',
+            justification='recon-premise-refuted: x: y',
+        ),
+        kwargs={'title': 'Fix a premise that live source refutes'},
+        metadata=None,
+        curator=None,
+    )
+
+    taskmaster.add_task.assert_not_awaited()
+    assert status == 'refused', f'expected refused, got {status!r} (reason={reason!r})'
+    assert task_id is None, f'a refusal must carry no task_id; got {task_id!r}'
+    assert reason is not None and 'recon-premise-refuted: x: y' in reason
