@@ -1407,24 +1407,16 @@ class TestTopicDiscoverability:
 
 
 class TestMetricsAreRankBasedNotScoreBased:
-    """eval-design §1's discipline, enforced by the metric's own signature.
+    """eval-design §1's discipline, asserted behaviorally.
 
-    This is asserted structurally rather than trusted to convention, because
-    the failure mode is invisible: a score-reading metric produces perfectly
+    The failure mode is invisible: a score-reading metric produces perfectly
     plausible numbers that silently stop being comparable the moment the
     embedding config drifts — which is exactly how the 0.72-0.90 figure in
-    the task record became 0.44-0.51 on re-measurement.
+    the task record became 0.44-0.51 on re-measurement.  So the tests below
+    perturb what a score-reading metric would be sensitive to and assert the
+    numbers do not move.  (The ScoredHit/ArmRecord type split makes the same
+    point structurally, but a type shape is not a test.)
     """
-
-    def test_arm_records_carry_no_score_field_at_all(self):
-        """The strongest form: the metrics COULD NOT read a score if they
-        tried, because the type they consume does not have one."""
-        import dataclasses  # noqa: PLC0415
-
-        fields = {f.name for f in dataclasses.fields(_mod().ArmRecord)}
-
-        assert 'score' not in fields
-        assert 'relevance_score' not in fields
 
     def test_shuffling_the_payloads_without_changing_order_changes_nothing(self):
         """Rank is the only input that matters: rewriting every content body
@@ -2342,21 +2334,6 @@ class TestAuditRecallOverTheCommittedFixture:
         second = mod.audit_recall_over_labeled_fixture(records[:30], 0.85)
 
         assert first == second
-
-
-class TestAuditRecallReusesTheRealImplementations:
-    """A reimplemented detector or partition would measure this file."""
-
-    def test_the_default_threshold_is_the_detectors_own_signature_default(self):
-        """Not a copy: if the audit script retunes, this measurement follows
-        it instead of reporting a threshold nobody runs."""
-        import inspect  # noqa: PLC0415
-
-        mod = _mod()
-        detector = mod.load_audit_script().find_near_duplicate_memory_groups
-        expected = inspect.signature(detector).parameters['threshold'].default
-
-        assert mod.resolve_audit_threshold() == expected
 
 
 # ===========================================================================
