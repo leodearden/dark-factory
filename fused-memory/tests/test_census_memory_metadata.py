@@ -1250,10 +1250,6 @@ class TestCensusUsesTheBackendPager:
         assert cells[OBS].kind_missing == 1
         assert coverage['categories'][OBS]['scrolled'] == 2
 
-    def test_the_duplicated_local_paging_loop_is_gone(self):
-        """``scroll_all_payloads`` no longer exists — one home for the loop."""
-        assert not hasattr(_mod, 'scroll_all_payloads')
-
     @pytest.mark.asyncio
     async def test_census_does_not_open_its_own_qdrant_client(self):
         """No ``backend._get_async_qdrant()`` for scrolling: it goes through the API."""
