@@ -248,8 +248,11 @@ def _plan_quality_score(
     The persisted score is DISCARDED on the ``0.0`` path, and loudly: a nonzero
     ``plan_quality`` beside ``plan_steps=0`` IS the two-scorer disagreement
     (Graphiti e2066ec6 — ``score_plan_structure`` floors a stepless plan to 0.0
-    as an anti-fabrication guard while the LLM judge has no such guard), and
-    correcting it silently would hide the very cells an operator needs to see.
+    as an anti-fabrication guard; the LLM judge used to have no such guard,
+    until task 3303 closed that gap at the instrument), and this read-time
+    floor still has to defend the 2026-07-27 / 07-29 corpus already on disk
+    carrying the old, unguarded shape — correcting it silently would hide the
+    very cells an operator needs to see.
 
     *where* names the cell (``"fixture x config"``) for that warning; the metrics
     dict carries neither, so the caller — which holds the ``EvalResult`` — passes

@@ -202,13 +202,14 @@ def produced_a_plan(metrics: dict[str, Any]) -> bool:
     ``report._has_plan_quality_score`` was written to close).
 
     **Why not ``plan_quality > 0``** (the rule this replaces everywhere, task
-    3302): the two plan scorers disagree exactly on a stepless artifact.
+    3302): the two plan scorers disagreed exactly on a stepless artifact.
     :func:`judge.score_plan_structure` returns ``0.0`` for one as a deliberate
-    ANTI-FABRICATION guard, while the LLM plan judge has no such guard and can
-    score the same artifact nonzero (Graphiti episode e2066ec6). So a nonzero
-    ``plan_quality`` is not evidence a plan exists, and a zero one is not
-    evidence it does not — the number is the thing being decided, not the
-    evidence for it.
+    ANTI-FABRICATION guard; the LLM plan judge used to have no such guard and
+    could score the same artifact nonzero (Graphiti episode e2066ec6) — closed
+    at the instrument by task 3303, which gave ``judge_plan_quality`` the same
+    floor. Regardless of which scorer produced it, a nonzero ``plan_quality``
+    is not evidence a plan exists, and a zero one is not evidence it does not
+    — the number is the thing being decided, not the evidence for it.
 
     **Why not ``outcome == 'done'``** (task 2863 AMENDMENT §1): done-without-a-plan
     and blocked-with-a-good-plan cells both occur, so the workflow outcome
