@@ -2363,14 +2363,43 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     """Run the ``reap-decisions`` verb (Fleet Cockpit C8: close-on-resolve driver).
 
     Builds the production ``escalation_status`` closure for
-    reap_answered_decisions: a decision belonging to a DIFFERENT project is
-    left alone (returns None -- unresolved), since DecisionRecords are
-    fleet-global (``~/.claude/fleet/decisions/``) but escalations are
-    per-project (``<project_root>/data/escalations``); otherwise defers to
-    read_escalation_status against *escalations_dir*. Project-scoping this
-    way makes the (global decisions <-> per-project escalations) join
-    correct without fragile project_id -> path auto-discovery. Root
+    reap_answered_decisions. The (fleet-global decisions <-> per-queue
+    escalations) join is scoped on TWO axes, and a decision failing either
+    one is left alone (returns None -- unresolved):
+
+    1. PROJECT. DecisionRecords are fleet-global
+       (``~/.claude/fleet/decisions/``) but escalations are per-project
+       (``<project_root>/data/escalations``), so a decision belonging to a
+       DIFFERENT project is skipped. Scoping this way keeps the join correct
+       without fragile project_id -> path auto-discovery.
+    2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
+       only WITHIN one queue, and a project can run several: dark_factory
+       runs ``data/escalations`` (orchestrator) and
+       ``data/reconciliation/escalations`` (recon watcher) over the SAME id
+       namespace. Project scoping alone therefore let either watcher's
+       reaper resolve the OTHER watcher's decisions against its own queue --
+       observed with ``esc-3036-1``, where an unrelated resolved
+       orchestrator escalation silently closed a still-pending recon
+       blocking gate, which then sat invisible in the cockpit for ~7 days
+       (15 ids were resolved in both queues at time of measurement). So a
+       decision stamped with a queue OTHER than *escalations_dir* is
+       skipped. Both sides go through normalize_escalations_dir, including
+       the decision's own stored value, so equivalent spellings match and a
+       hand-written record is compared honestly rather than fail-open.
+
+    A decision carrying NO queue (``escalations_dir == ''`` -- every record
+    filed before that field existed) falls back to axis 1 alone, keeping
+    today's exact behaviour for the existing population rather than changing
+    it under the human; the two watchers stamp the queue on newly-filed
+    decisions, so the unprotected set only shrinks. Otherwise the closure
+    defers to read_escalation_status against *escalations_dir*. Root
     resolves via $CLAUDE_FLEET_ROOT, same as every other verb.
+
+    Both guards are fail-OPEN: on any doubt the decision stays OPEN and
+    visible in the cockpit queue, matching reap_answered_decisions' contract
+    that any status not in DECISION_CLOSE_MAP leaves a decision OPEN. The
+    asymmetry of harm is the reason -- an over-held decision is a
+    human-triageable row, while a falsely closed one is invisible.
 
     A watcher runs this once per Main Loop cycle (SKILL.md "Closing parked
     decisions on resolve") so a decision it (or anyone -- /unblock, an L2
@@ -2378,6 +2407,7 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     resolved/dismissed. Prints one ``f'{id} {new_state}'`` line per closed
     decision, mirroring `write-decision` printing the filed id.
     """
+    reaper_dir = normalize_escalations_dir(escalations_dir)
 
     def _status(decision: DecisionRecord) -> str | None:
         if decision.project != project:
@@ -2390,6 +2420,17 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
             # call below (typed to take a `str`) and stays correct if this
             # closure is ever invoked from elsewhere.
             return None
+        # Axis 2: normalize the decision's OWN stored value at compare time
+        # too, not just at write time -- a raw compare would fail open for
+        # any record write-decision did not produce (hand-repaired, migrated
+        # between checkouts, or written by a future caller), and a false
+        # NON-match is how silent divergence creeps back in.
+        decision_dir = normalize_escalations_dir(decision.escalations_dir)
+        if decision_dir and decision_dir != reaper_dir:
+            return None
+        # RAW escalations_dir here, deliberately: only the comparison needs a
+        # canonical spelling; the read keeps using exactly what the caller
+        # passed.
         return read_escalation_status(escalations_dir, decision.escalation_id)
 
     for reaped in reap_answered_decisions(escalation_status=_status):
