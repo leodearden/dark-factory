@@ -1171,6 +1171,34 @@ class TestMakeWedgeHelper:
             await asyncio.wait({t_b}, timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
 
 
+async def _assert_cancel_report(
+    run_task: asyncio.Task,
+    workflow,
+    expected_outcome: WorkflowOutcome,
+) -> TerminalReport:
+    """Await a just-cancelled ``run()`` task and pin the shared cancel
+    contract: run() RETURNED a ``TerminalReport`` of *expected_outcome*
+    instead of letting ``CancelledError`` escape, and both the machine and
+    the report landed on ``WorkflowState.CANCELLED``.
+
+    Returns the report so the caller can add its own site-specific tail
+    assertions.  The barrier is deliberately not parameterised — see the
+    never-narrow guard at ``test_cancel_scope_barrier_timeout_never_narrowed``.
+    """
+    done, _pending = await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+    assert run_task in done, f'run() task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
+    assert not run_task.cancelled(), (
+        'CancelledError escaped run() instead of being translated into '
+        f'a TerminalReport(outcome={expected_outcome.name})'
+    )
+    report = run_task.result()
+    assert isinstance(report, TerminalReport), f'expected TerminalReport, got {report!r}'
+    assert report.outcome == expected_outcome
+    assert workflow.machine.state == WorkflowState.CANCELLED
+    assert report.phase == WorkflowState.CANCELLED
+    return report
+
+
 def _done_task(result: object) -> asyncio.Task:
     """A Task that resolves to *result* almost immediately.
 
