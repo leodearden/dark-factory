@@ -4974,3 +4974,57 @@ class TestFakeVerifyResultFidelity:
             f'_extract_failing_tests_and_candidate_files joins '
             f'(cause_hint, test_output) and str.join rejects a non-str item.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3477 step-5: _await_outcome loud-timeout contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAwaitOutcomeHelper:
+    """`_await_outcome` must report a real timeout AS a timeout.
+
+    The previous shape in this file --
+    ``with contextlib.suppress(TimeoutError): outcome = await
+    asyncio.wait_for(fut, timeout=N)`` followed by
+    ``assert outcome is not None and outcome.status == ...`` -- converts a
+    genuine pipeline hang into a confusing ``outcome is None`` assertion
+    failure, hiding whether the pipeline actually hung or the cascade never
+    fired. ``_await_outcome`` closes that gap by failing loudly, by name,
+    at the deadline instead.
+    """
+
+    async def test_await_outcome_returns_resolved_outcome(self) -> None:
+        """An already-resolved future's value is returned unchanged."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        sentinel = object()
+        fut.set_result(sentinel)
+
+        result = await _await_outcome(fut, label='N (already resolved)')
+
+        assert result is sentinel, (
+            f'Expected _await_outcome to return the resolved future value '
+            f'unchanged, got {result!r}.'
+        )
+
+    async def test_await_outcome_fails_loudly_on_deadline(self) -> None:
+        """A future that never resolves must pytest.fail -- by name, with
+        the deadline -- rather than let the caller observe a bare None.
+
+        RED (pre task-3477 step-6): NameError: name '_await_outcome' is not
+        defined.
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+
+        with pytest.raises(pytest.fail.Exception, match='cascade-N-await') as exc_info:
+            await _await_outcome(fut, label='cascade-N-await', timeout=0.05)
+
+        assert '0.05' in str(exc_info.value), (
+            f'Expected the failure message to name the deadline (0.05s), '
+            f'got {exc_info.value!r}. A real timeout must report AS a '
+            f'timeout -- naming the label and the deadline -- not surface '
+            f'as a confusing `outcome is None`.'
+        )
