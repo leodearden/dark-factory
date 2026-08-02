@@ -55,12 +55,25 @@ pure vocabulary rather than a running subsystem.
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
+# Re-exported, NOT redefined (task 3198, leaf ε).  These are bound to the
+# *same objects* the leaf module defines, so this registry remains the
+# advertised import site for the vocabulary while ``config/schema.py`` —
+# which cannot import this module without the measured
+# ``ImportError: cannot import name 'FusedMemoryConfig'`` cycle — validates
+# through the identical rule.  Per INV-5 there is one copy of the pattern
+# and the cap in the tree; ``tests/test_topic_slug_namespace.py`` asserts
+# that by ``is``, so retyping either here fails by design.
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    TOPIC_SLUG_RE,
+    is_valid_topic_slug,
+)
 
 __all__ = [
     'BLESSED_METADATA_KEYS',
@@ -73,6 +86,7 @@ __all__ = [
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
     'classify_unknown_keys',
+    'is_valid_topic_slug',
     'normalize_supersedes',
     'validate_memory_metadata',
 ]
@@ -83,20 +97,6 @@ __all__ = [
 #: it is experimenting should be able to say so without manufacturing census
 #: noise.
 EXPERIMENTAL_KEY_PREFIX = 'x_'
-
-
-#: Shared ``topic`` slug shape (PRD D4 — one namespace for
-#: ``ProceduralTopicCluster.topic_id`` and ``metadata.topic``).
-#:
-#: Lowercase alphanumeric segments joined by single hyphens.  Anchored at
-#: both ends with ``\Z`` rather than ``$`` so a trailing newline cannot
-#: sneak past (``$`` matches before a final ``\n``).
-TOPIC_SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*\Z')
-
-#: Maximum ``topic`` slug length.  See the module docstring for the
-#: measured basis (longest conforming live topic 69, longest seeded
-#: cluster id 52 — 100 has headroom and rejects nothing observed).
-TOPIC_SLUG_MAX_LEN = 100
 
 
 def normalize_supersedes(value: Any) -> list[Any]:
