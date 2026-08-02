@@ -100,7 +100,7 @@ a severity, highest **`dedupe_count`** first (recurrence = persistence = signal)
 ```bash
 cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
   --queue-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations \
-  [--exclude-id <esc-id>] [...] 2>&1
+  [--exclude-id <esc-id>] [--exclude-file <path>] [--baseline] [...] 2>&1
 ```
 
 Run as a **background task** (`run_in_background`). **No `--level`** — recon
@@ -116,6 +116,20 @@ each item deliberately left pending so the initial scan and event loop skip it.
 `--exclude-id` also suppresses event-loop wakes from dedupe rewrites of those
 files (MOVED_TO events on the excluded file are silently ignored). Pass both the
 bare id (`esc-recon-abc-1`) and `.json`-suffixed forms — both are accepted.
+For a parked set this large, prefer the bulk forms of the same mechanism:
+`--exclude-file <path>` takes a newline-delimited esc-id list and is
+**re-read every poll**, so the parked set can grow mid-run without
+restarting the watcher; `--baseline` snapshots the pending esc-ids at
+launch and fires only on items **not** in that snapshot. `--baseline` is
+safe for this loop specifically because Main Loop step 1 always drains all
+pending escalations before the watcher (re)starts, so everything in the
+snapshot has already been triaged this cycle. With PARK now the default
+disposition for `reconciliation_stale_gate_backlog` /
+`reconciliation_stale_human_operator`, the parked set is structurally large
+(31 records as of 2026-08-02) — hand-listing one `--exclude-id` per record
+does not scale. `skills/escalation-watcher/SKILL.md` already uses
+`--baseline` for the same purpose, so the vocabulary is consistent across
+both watcher skills.
 
 **Process safety:** only stop watcher processes you started via background task
 controls. Never `pkill` by pattern.
