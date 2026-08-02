@@ -2816,7 +2816,7 @@ def test_report_merge_idle_degrades_to_unknown_when_drain_check_raises(
     that dropped the WARNING, would otherwise pass CI.
     """
     wdog = _load_watchdog()
-    import drain_check  # pyright: ignore[reportMissingImports]
+    import drain_check
 
     commit_epoch = 1_800_000_000
     now = 2_000_000_000.0
