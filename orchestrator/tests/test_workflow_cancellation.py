@@ -83,12 +83,15 @@ def _make_recording_on_terminal(
     """
     entries: list[tuple[str, Callable[[str | None], Awaitable[None]]]] = []
     for name in names:
+
         async def _fn(kind: str | None, _name: str = name) -> None:
             if delay:
                 await asyncio.sleep(delay)
             log.append((_name, kind))
+
         entries.append((name, _fn))
     return entries
+
 
 # ---------------------------------------------------------------------------
 # step-01: WorkflowCancelled construct/raise/catch/read contract
@@ -416,7 +419,11 @@ class TestRunSingleCatchHardCancel:
     """
 
     async def test_hard_cancel_mid_verify_returns_cancelled_report(
-        self, config, git_ops, task_assignment, monkeypatch,
+        self,
+        config,
+        git_ops,
+        task_assignment,
+        monkeypatch,
     ):
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
@@ -443,9 +450,7 @@ class TestRunSingleCatchHardCancel:
         # registered slot task).
         run_task.cancel()
         done, _pending = await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
-        assert run_task in done, (
-            f'run() task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
-        )
+        assert run_task in done, f'run() task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
 
         assert not run_task.cancelled(), (
             'CancelledError escaped run() instead of being translated into '
@@ -508,7 +513,10 @@ class TestCancelFromMergeDeferred:
         self._wire_cleanup_spies(workflow)
 
     async def test_hard_cancel_from_merge_deferred_returns_cancelled_report(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
@@ -527,7 +535,10 @@ class TestCancelFromMergeDeferred:
         assert report.phase == WorkflowState.CANCELLED
 
     async def test_soft_cancel_from_merge_deferred_returns_soft_cancelled_report(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
@@ -605,7 +616,10 @@ class TestOnTerminalCleanups:
             await fn(kind)
 
     async def test_ordering_with_kind_none_and_done_state(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         """A genuine DONE exit (kind=None): all five run, in order, release fires."""
         stub = AgentStub()
@@ -617,12 +631,18 @@ class TestOnTerminalCleanups:
         await self._run_cleanups(workflow, None)
 
         assert calls == [
-            'stop_claimant_heartbeat', 'stop_steward', 'cleanup_done_worktree',
-            'release_lane', 'cleanup_config_dir',
+            'stop_claimant_heartbeat',
+            'stop_steward',
+            'cleanup_done_worktree',
+            'release_lane',
+            'cleanup_config_dir',
         ]
 
     async def test_ordering_with_kind_none_and_cancelled_state(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         """The authoritative-cancel exit (kind=None, state already CANCELLED
         via _handle_cancelled_terminal_exit) also releases — row @263's
@@ -636,12 +656,18 @@ class TestOnTerminalCleanups:
         await self._run_cleanups(workflow, None)
 
         assert calls == [
-            'stop_claimant_heartbeat', 'stop_steward', 'cleanup_done_worktree',
-            'release_lane', 'cleanup_config_dir',
+            'stop_claimant_heartbeat',
+            'stop_steward',
+            'cleanup_done_worktree',
+            'release_lane',
+            'cleanup_config_dir',
         ]
 
     async def test_kind_hard_skips_lane_release_but_other_four_still_run(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         """kind='hard' skips release EVEN when state is already terminal —
         the branch must survive the teardown regardless of state."""
@@ -655,12 +681,17 @@ class TestOnTerminalCleanups:
 
         assert 'release_lane' not in calls
         assert calls == [
-            'stop_claimant_heartbeat', 'stop_steward', 'cleanup_done_worktree',
+            'stop_claimant_heartbeat',
+            'stop_steward',
+            'cleanup_done_worktree',
             'cleanup_config_dir',
         ]
 
     async def test_kind_soft_releases_lane_even_from_a_working_state(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         """kind='soft' releases even mid-flight (state is VERIFY, not yet
         terminal) — boundary row 15's key property."""
@@ -675,7 +706,10 @@ class TestOnTerminalCleanups:
         assert 'release_lane' in calls
 
     async def test_kind_none_with_working_state_skips_release(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         """kind=None (a normal _drive() return) with a non-terminal state
         is not a genuine terminal exit — skip release."""
@@ -690,7 +724,10 @@ class TestOnTerminalCleanups:
         assert 'release_lane' not in calls
 
     async def test_worktree_external_skips_release_for_every_kind(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         """Eval mode (_worktree_external=True) never releases, regardless
         of kind."""
@@ -737,7 +774,11 @@ class TestSoftCancelCoversNewAwait:
     """
 
     async def test_soft_cancel_during_unwrapped_await_returns_soft_cancelled_report(
-        self, config, git_ops, task_assignment, monkeypatch,
+        self,
+        config,
+        git_ops,
+        task_assignment,
+        monkeypatch,
     ):
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
@@ -769,12 +810,8 @@ class TestSoftCancelCoversNewAwait:
         # arriving while wedged on a wait _await_cancellable never sees.
         workflow._cancel_event.set()
         done, _pending = await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
-        assert run_task in done, (
-            f'run() task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
-        )
-        assert not run_task.cancelled(), (
-            'CancelledError escaped run() on a soft-cancel'
-        )
+        assert run_task in done, f'run() task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
+        assert not run_task.cancelled(), 'CancelledError escaped run() on a soft-cancel'
 
         report = run_task.result()
         assert isinstance(report, TerminalReport)
@@ -827,7 +864,10 @@ class TestAwaitCancellableRaisesWorkflowCancelled:
     never orphaned."""
 
     async def test_hook_called_future_not_cancelled_and_raises(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         """cancel-win with an on_soft_cancel hook: hook fires exactly once,
         the future is left untouched (registry.detach owns it instead), and
@@ -847,7 +887,10 @@ class TestAwaitCancellableRaisesWorkflowCancelled:
         assert not fut.cancelled(), 'future must NOT be cancelled when hook is provided'
 
     async def test_no_hook_future_is_cancelled_and_raises(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         """cancel-win with no hook (default None): the blanket fut.cancel()
         orphan-avoidance still fires, and WorkflowCancelled('soft') is raised."""
@@ -864,7 +907,10 @@ class TestAwaitCancellableRaisesWorkflowCancelled:
         assert fut.cancelled(), 'future must be cancelled when no hook is provided'
 
     async def test_future_resolves_first_returns_normally_no_raise(
-        self, config, git_ops, task_assignment,
+        self,
+        config,
+        git_ops,
+        task_assignment,
     ):
         """Same-window race: the awaitable's result wins over a set cancel
         event — no WorkflowCancelled, no hook call (unaffected by step-12)."""
@@ -959,7 +1005,9 @@ class TestHarnessSyntheticCancelRetirement:
     def test_task_report_construction_rejects_synthetic_cancel_kwarg(self):
         with pytest.raises(TypeError):
             TaskReport(
-                task_id='42', title='t', outcome=WorkflowOutcome.CANCELLED,
+                task_id='42',
+                title='t',
+                outcome=WorkflowOutcome.CANCELLED,
                 synthetic_cancel=True,  # type: ignore[call-arg]
             )
 
@@ -976,11 +1024,14 @@ class TestHarnessSyntheticCancelRetirement:
         h = _make_harness_for_run_slot()
         tid = '42'
         assignment = TaskAssignment(
-            task_id=tid, task={'title': 'wedged task'}, modules=[],
+            task_id=tid,
+            task={'title': 'wedged task'},
+            modules=[],
         )
         sem = asyncio.Semaphore(0)
 
         with patch('orchestrator.harness.build_workflow') as mock_wf_cls:
+
             async def _wedge() -> None:
                 await asyncio.sleep(3600)
 
@@ -1006,7 +1057,9 @@ class TestHarnessSyntheticCancelRetirement:
 
             h.hard_cancel_workflow(tid)
 
-            done, _pending = await asyncio.wait({wrapper_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+            done, _pending = await asyncio.wait(
+                {wrapper_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT
+            )
             assert wrapper_task in done, (
                 f'wrapper_task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
             )
