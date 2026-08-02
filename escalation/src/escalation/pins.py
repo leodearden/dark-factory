@@ -159,6 +159,18 @@ class PinReport:
 # ---------------------------------------------------------------------------
 
 
+def _norm_id(value: str | None) -> str | None:
+    """Normalise a claimant identity to ``None`` (unknown) or an exact string.
+
+    Only ``None``/blank collapse to unknown — the value itself is NEVER parsed
+    or partially matched (see link 4).
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _classify_record(
     record: PinRecord,
     *,
@@ -182,8 +194,37 @@ def _classify_record(
     if sev not in KNOWN_SEVERITIES:
         return PinClass.QUEUE_HANDOFF
 
-    # Links 3 and 4 land in step-8; until then every known non-info severity
-    # fails safe to pinning.
+    # Link 3 — spec S6: L1/L2 are QUEUE-BACKED handoffs whose consumers (the
+    # auto-watcher, a human) are supervised and outlive any one workflow
+    # incarnation, so they pin regardless of liveness.  Written `!= 0` rather
+    # than `>= 1` on purpose: a corrupt / out-of-range / negative level then
+    # also fails safe to pinning instead of falling into the conversion-
+    # eligible L0 branch below.
+    if record.level != 0:
+        return PinClass.QUEUE_HANDOFF
+
+    # Link 4 — the filing-incarnation rule (spec S6): an L0 is a live handoff
+    # ONLY while the incarnation that FILED it lives.  Liveness is judged
+    # against that filer, never against "some workflow for this task is alive".
+    if not live_claimant:
+        # No incarnation is live at all, so the filing one is necessarily dead
+        # — identity-independent.  This branch alone covers the 2026-08-02
+        # strand shape (7 of 9 tasks pinned by their own dead-steward L0).
+        return PinClass.DEAD_L0
+
+    filed_by = _norm_id(record.filing_claimant_run_id)
+    live_id = _norm_id(live_claimant_id)
+    if filed_by is not None and live_id is not None and filed_by != live_id:
+        # A claimant is live, but it is NOT the one that filed this record:
+        # "a newer incarnation never keeps a prior incarnation's unconsumed L0
+        # alive" (spec S6).  Exact-string comparison — `shared.task_claimant`
+        # ships a composer and deliberately no parser, so a differing `pid=`
+        # suffix is a DIFFERENT incarnation.
+        return PinClass.DEAD_L0
+
+    # Either the identities MATCH (a genuinely live handoff) or one of them is
+    # unknown.  On unknown, the classifier may only convert when it can PROVE
+    # the filing incarnation is dead — it cannot, so it fails safe to pinning.
     return PinClass.QUEUE_HANDOFF
 
 
