@@ -22,6 +22,7 @@ import uuid
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import await_index_operational
 from falkordb import FalkorDB as _SyncFalkorDB
 from falkordb.asyncio import FalkorDB
 
@@ -76,6 +77,21 @@ async def live_test_graph():
     graph = client.select_graph(TEST_GRAPH)
     await graph.query("CREATE (:Entity {name: $n})", {'n': 'test'})
     await graph.query("CREATE INDEX FOR (n:Entity) ON (n.name)")
+    # MANDATORY (task 3377) — do NOT drop this when copying this fixture; it is
+    # the repo's template for live-FalkorDB tests. FalkorDB builds RANGE indices
+    # asynchronously too, not just fulltext ones: measured on a 200k-node graph,
+    # CALL db.indexes() read '[Indexing] N/200000: UNDER CONSTRUCTION' for 40
+    # consecutive polls without ever reaching OPERATIONAL. Querying an
+    # under-construction index silently succeeds for queries the engine would
+    # otherwise reject, so without this barrier the tests below are a
+    # false-green generator (measured 2 of 6 false successes on the sibling
+    # fulltext module before the barrier landed).
+    #
+    # On this fixture's single-node graph the build finishes before the first
+    # poll, so the barrier costs one CALL db.indexes() round-trip in practice.
+    # If this fixture is ever widened to seed bulk data, raise the module-wide
+    # @pytest.mark.timeout(15) alongside it — the barrier's own budget is 10s.
+    await await_index_operational(graph)
     try:
         yield graph
     finally:
