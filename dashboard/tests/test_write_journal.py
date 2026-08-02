@@ -26,6 +26,19 @@ CREATE TABLE IF NOT EXISTS write_ops (
     session_id TEXT,
     kind TEXT NOT NULL DEFAULT 'write'
 );
+-- Mirrors the real six-index set fused-memory creates on write_ops, so
+-- query-plan assertions against this fixture (see
+-- TestOperationsBreakdownQueryPlan) exercise the same planner choices as the
+-- live journal. Copied from the `SCHEMA_SQL` constant in
+-- fused_memory/services/write_journal.py (cited by FILE + CONSTANT NAME, not
+-- line number: fused-memory/tests/test_write_journal.py:718-724 records that a
+-- line-number cross-package citation already went stale once).
+CREATE INDEX IF NOT EXISTS idx_wo_causation ON write_ops(causation_id);
+CREATE INDEX IF NOT EXISTS idx_wo_project_time ON write_ops(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
+CREATE INDEX IF NOT EXISTS idx_wo_kind_time ON write_ops(kind, created_at);
+CREATE INDEX IF NOT EXISTS idx_wo_agent_time ON write_ops(agent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);
 """
 
 
