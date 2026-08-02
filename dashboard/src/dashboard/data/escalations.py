@@ -283,10 +283,10 @@ def build_escalation_queues(config) -> dict:
 
     ``skipped`` names the ``*.json`` files in this subsection's queue directory
     that :func:`load_queue_escalations` could not read or parse — one record per
-    file, ``path`` stringified here because this function's return value is the
-    payload the API layer serves (the reader deliberately leaves ``path`` a
-    ``Path`` and defers the coercion to its caller; a ``Path`` reaching
-    ``JSONResponse`` would 500 the endpoint).  It exists because a queue that
+    file, ``path`` stringified by :func:`_load_queue_with_skips` because this
+    function's return value is the payload the API layer serves (the reader
+    deliberately leaves ``path`` a ``Path`` and defers the coercion to its
+    caller; a ``Path`` reaching ``JSONResponse`` would 500 the endpoint).  It exists because a queue that
     reports fewer escalations than it holds must say so in the payload, not only
     in a WARNING line a human tailing stderr may never see (INV-2,
     ``structured-facts-at-failure``).
