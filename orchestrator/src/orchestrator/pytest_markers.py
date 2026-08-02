@@ -27,6 +27,7 @@ silently destroy the ENTIRE plan record.
 """
 from __future__ import annotations
 
+import ast
 import shlex
 import tomllib
 from collections.abc import Sequence
@@ -127,3 +128,92 @@ def resolve_marker_expression(
     if tokens is None:
         return None
     return _marker_expr_from_tokens(tokens)
+
+
+def _is_pytestmark_target(node: ast.expr) -> bool:
+    """True iff *node* is the bare name ``pytestmark``."""
+    return isinstance(node, ast.Name) and node.id == 'pytestmark'
+
+
+def _pytestmark_value(statement: ast.stmt) -> ast.expr | None:
+    """The value *statement* binds to ``pytestmark``, else None.
+
+    Covers both the plain ``pytestmark = ...`` and the annotated
+    ``pytestmark: list = ...`` spellings; an annotation with no value binds
+    nothing.
+    """
+    if isinstance(statement, ast.Assign):
+        if any(_is_pytestmark_target(target) for target in statement.targets):
+            return statement.value
+        return None
+    if isinstance(statement, ast.AnnAssign) and _is_pytestmark_target(statement.target):
+        return statement.value
+    return None
+
+
+def _marker_name(element: ast.expr) -> str | None:
+    """The marker name in a ``pytest.mark.NAME`` / ``pytest.mark.NAME(...)`` element.
+
+    Anything else — a bare constant, a local name, an unrelated attribute chain —
+    yields None and is skipped silently, without suppressing its siblings.
+    """
+    if isinstance(element, ast.Call):
+        element = element.func
+    if not isinstance(element, ast.Attribute):
+        return None
+    owner = element.value
+    if (
+        isinstance(owner, ast.Attribute)
+        and owner.attr == 'mark'
+        and isinstance(owner.value, ast.Name)
+        and owner.value.id == 'pytest'
+    ):
+        return element.attr
+    return None
+
+
+def module_level_marker_names(source: str | None) -> frozenset[str]:
+    """Marker names a module-level ``pytestmark`` applies to EVERY item in *source*.
+
+    THE LOAD-BEARING CONTRACT: the return value is a **LOWER BOUND** on every
+    collected item's marker set.  A module-level ``pytestmark`` is the only
+    static form that provably applies to all of them, so per-function and
+    per-class ``@pytest.mark.X`` decorators are deliberately NOT collected — a
+    decorator sweep would have to reason about ``pytest.param(marks=...)``,
+    parametrize, dynamically generated items, test classes imported from another
+    module, and ``pytest_collection_modifyitems`` hooks, each a way for an
+    unmarked (hence SELECTED) item to exist in a file that "looks" fully marked.
+
+    A name ABSENT from this set is therefore UNKNOWN, not absent — which is
+    precisely what makes :func:`expression_definitely_deselects`' Kleene
+    treatment sound.  Excluding decorators makes the detector under-fire on some
+    genuinely-deselected files, which is the safe direction.
+
+    Accepted value shapes: a bare ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)``
+    call, or a list/tuple of either.  Only ``tree.body`` is walked (never
+    ``ast.walk``), so a ``pytestmark`` bound inside a class or function body does
+    not count.  If the module rebinds ``pytestmark`` more than once, the LAST
+    assignment wins, mirroring Python's own semantics.
+
+    ``source is None``, a ``SyntaxError``, or a ``ValueError`` yields an empty
+    set.  Never raises.
+    """
+    if not source:
+        return frozenset()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return frozenset()
+
+    value: ast.expr | None = None
+    for statement in tree.body:
+        bound = _pytestmark_value(statement)
+        if bound is not None:
+            value = bound
+    if value is None:
+        return frozenset()
+
+    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
+    return frozenset(
+        name for name in (_marker_name(element) for element in elements) if name is not None
+    )
