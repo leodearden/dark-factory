@@ -376,7 +376,8 @@ def _run_cli(*args, env=None, timeout=30):
 
 
 class TestCli:
-    """Exit codes: 0 = clean, 1 = leak found, 2 = no tasks.db resolvable."""
+    """Exit codes: 0 = clean, 1 = leak found, 2 = no tasks.db resolvable,
+    3 = every resolved tasks.db was unreadable so NOTHING was scanned."""
 
     def test_clean_db_exits_0_with_no_leaks_message(self, make_tasks_db):
         db_path = str(make_tasks_db([{'id': 1, 'metadata': _provenance('merged', commit='abc')}]))
@@ -432,3 +433,49 @@ class TestCli:
         assert '2902' in result.stdout
         assert 'corrupt.db' in result.stderr
         assert 'incomplete' in result.stderr
+
+    def test_every_db_unreadable_exits_3_not_0(self, tmp_path):
+        """EVERY resolved database failing to open is not a clean sweep.
+
+        Covered at the layer a cron job actually observes — a process exit
+        status — because that is where the false green did its damage: stdout
+        still reads "no leaked log lines" while nothing at all was scanned.
+        """
+        bad1 = tmp_path / 'bad1.db'
+        bad2 = tmp_path / 'bad2.db'
+        bad1.write_text('this is not a sqlite database at all')
+        bad2.write_text('neither is this')
+
+        result = _run_cli(
+            '--db', str(bad1), '--db', str(bad2),
+            env={'DASHBOARD_KNOWN_PROJECT_ROOTS': ''},
+        )
+
+        assert result.returncode == 3, result.stderr
+        assert str(bad1) in result.stderr
+        assert str(bad2) in result.stderr
+        assert 'NOTHING was scanned' in result.stderr
+        # The clean-looking report is still printed — that is the false-green
+        # shape the exit code now disagrees with.
+        assert 'no leaked log lines' in result.stdout
+
+    def test_one_unreadable_db_beside_a_clean_one_still_exits_0(
+        self, tmp_path, make_tasks_db
+    ):
+        """Partial failure is NOT exit 3: a database was genuinely scanned."""
+        corrupt = tmp_path / 'corrupt.db'
+        corrupt.write_text('this is not a sqlite database at all')
+        clean = str(make_tasks_db(
+            [{'id': 1, 'metadata': _provenance('merged', commit='abc')}],
+            name='clean.db',
+        ))
+
+        result = _run_cli(
+            '--db', str(corrupt), '--db', clean,
+            env={'DASHBOARD_KNOWN_PROJECT_ROOTS': ''},
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert 'no leaked log lines' in result.stdout
+        assert 'corrupt.db' in result.stderr
+        assert 'NOTHING was scanned' not in result.stderr
