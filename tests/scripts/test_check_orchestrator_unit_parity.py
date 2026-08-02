@@ -810,3 +810,96 @@ def test_cli_run_that_compared_nothing_never_reports_parity(
     )
 
     assert rc != 0, "A run that compared zero units must not report parity."
+
+
+# ---------------------------------------------------------------------------
+# setup-host.sh wiring contract  (step-13 / step-14)
+# ---------------------------------------------------------------------------
+
+
+def _setup_host_text() -> str:
+    return SETUP_HOST_PATH.read_text(encoding="utf-8")
+
+
+def test_setup_host_invokes_the_orchestrator_parity_gate():
+    """setup-host.sh actually RUNS the checker, passing both trees.
+
+    Without this the checker could ship fully tested and never execute — a
+    gate that exists only in the test suite reports nothing about the host.
+    """
+    text = _setup_host_text()
+
+    assert "check_orchestrator_unit_parity.py" in text, (
+        "scripts/setup-host.sh never invokes check_orchestrator_unit_parity.py. "
+        "A parity gate that the installer does not run reports nothing."
+    )
+
+    invocation_start = text.index("check_orchestrator_unit_parity.py")
+    # The flags must be on the invocation itself, not merely somewhere in the
+    # file (both appear in the dashboard and fused-memory blocks too).
+    invocation = text[invocation_start : invocation_start + 400]
+    assert '--installed-dir "$UNIT_DIR"' in invocation, invocation
+    assert '--repo-root     "$REPO_ROOT"' in invocation or \
+           '--repo-root "$REPO_ROOT"' in invocation, invocation
+
+
+def test_parity_gate_runs_BEFORE_the_units_are_copied():
+    """ORDERING: the gate must run before the `cp` block overwrites the host.
+
+    This is a semantic claim, not a style pin. Once the installer has copied
+    the committed units over the installed ones, there is no drift left to
+    observe — a post-install-only check would report green on exactly the
+    divergence this task exists to surface. setup-host.sh already learned
+    this for the dashboard units, which is why it carries both a pre-install
+    gate and a post-install sanity check there.
+    """
+    text = _setup_host_text()
+
+    gate_at = text.index("check_orchestrator_unit_parity.py")
+    first_cp_at = text.index(
+        'cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"'
+    )
+
+    assert gate_at < first_cp_at, (
+        "check_orchestrator_unit_parity.py is invoked at offset "
+        f"{gate_at}, AFTER the first orchestrator unit `cp` at "
+        f"{first_cp_at}. A parity check that runs after the install can no "
+        "longer observe host drift — it would report green on precisely the "
+        "divergence it exists to surface."
+    )
+
+
+def test_parity_gate_distinguishes_exit_2_from_exit_1():
+    """The branch treats 2 (not installed here) apart from 1 (actionable).
+
+    Matching the existing fused-memory and dashboard blocks: 2 is a benign
+    "not installed on this host, skipping", and collapsing it into the drift
+    branch would make a fresh host look like it had a supervision problem.
+    """
+    text = _setup_host_text()
+
+    gate_at = text.index("check_orchestrator_unit_parity.py")
+    block = text[gate_at : gate_at + 1200]
+
+    assert "-eq 2" in block, (
+        "The orchestrator parity branch does not distinguish exit 2 "
+        "(not installed on this host) from exit 1 (actionable drift)."
+    )
+    # Warn-only: drift must never abort the install (and five units are
+    # knowingly red on this host today).
+    assert "warn" in block
+    assert "exit 1" not in block, (
+        "The orchestrator parity gate must be warn-only — drift must never "
+        "abort an install."
+    )
+
+
+def test_setup_host_parses_cleanly():
+    """`bash -n scripts/setup-host.sh` — the added block must not break the script."""
+    result = subprocess.run(
+        ["bash", "-n", str(SETUP_HOST_PATH)], capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, (
+        f"bash -n rejected {SETUP_HOST_PATH}: {result.stderr}"
+    )
