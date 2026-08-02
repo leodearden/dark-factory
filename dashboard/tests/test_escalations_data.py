@@ -556,6 +556,135 @@ class TestBuildEscalationQueuesSubsections:
             assert 'escalations' in sub
             assert isinstance(sub['escalations'], list)
 
+    def test_orchestrator_subsection_reports_skipped_files(self, tmp_path):
+        """A corrupt queue file is reported in the subsection's ``skipped`` list.
+
+        INV-2 (``structured-facts-at-failure``): a queue that reports fewer
+        escalations than it holds must say so in the payload, not only in a
+        WARNING line a human tailing stderr may never see.
+        """
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good'))
+        (esc_dir / 'esc-bad.json').write_text('{not json')
+        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+
+        config = self._make_config(tmp_path, primary)
+        result = build_escalation_queues(config)
+
+        primary_sub = next(s for s in result['subsections'] if s['id'] == str(primary.resolve()))
+
+        assert 'skipped' in primary_sub, (
+            'each subsection must carry a `skipped` list — pass a fresh accumulator '
+            'to load_queue_escalations and stringify its records into the subsection'
+        )
+        assert isinstance(primary_sub['skipped'], list)
+        assert len(primary_sub['skipped']) == 1, (
+            f"expected exactly one skip record, got {primary_sub['skipped']!r}"
+        )
+
+        entry = primary_sub['skipped'][0]
+        assert set(entry.keys()) == {'path', 'error'}, (
+            "skip records keep the reader's own {'path', 'error'} shape — no "
+            'renamed or extra fields'
+        )
+        assert isinstance(entry['path'], str), (
+            '`path` must be stringified at this payload boundary — a Path reaching '
+            'JSONResponse would 500 the endpoint'
+        )
+        assert entry['path'].endswith('esc-bad.json'), (
+            'the record must name the FILE that was dropped, not its directory'
+        )
+        assert isinstance(entry['error'], str) and entry['error'], (
+            '`error` must be a non-empty str naming why the file could not be read'
+        )
+
+        # A skip must not drop readable records.
+        assert [e['id'] for e in primary_sub['escalations']] == ['esc-good'], (
+            'the good escalation must still be returned alongside the skip report'
+        )
+
+    def test_skipped_is_per_subsection_not_shared(self, tmp_path):
+        """Each subsection gets its OWN skipped list — no shared accumulator.
+
+        ``load_queue_escalations`` **appends** to the accumulator it is handed,
+        so one list shared across every call site would attribute every queue's
+        skips to every subsection: a single corrupt file in one orchestrator's
+        queue would render as N badges across N unrelated projects.  That is a
+        worse lie than the current silence.
+        """
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        primary.mkdir()
+        reify.mkdir()
+
+        primary_esc = primary / 'data' / 'escalations'
+        primary_esc.mkdir(parents=True)
+        _write_esc(primary_esc, 'esc-p1.json', _esc('esc-p1'))
+        (primary_esc / 'esc-bad.json').write_text('{not json')
+
+        reify_esc = reify / 'data' / 'escalations'
+        reify_esc.mkdir(parents=True)
+        _write_esc(reify_esc, 'esc-r1.json', _esc('esc-r1'))
+
+        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
+        recon_dir.mkdir(parents=True)
+        _write_esc(recon_dir, 'esc-rc1.json', _esc('esc-rc1'))
+
+        config = self._make_config(tmp_path, primary, [reify])
+        result = build_escalation_queues(config)
+
+        primary_id = str(primary.resolve())
+        primary_sub = next(s for s in result['subsections'] if s['id'] == primary_id)
+        others = [s for s in result['subsections'] if s['id'] != primary_id]
+
+        assert len(others) == 2, 'expected the reify + reconciliation subsections'
+        assert len(primary_sub['skipped']) == 1
+        assert primary_sub['skipped'][0]['path'].endswith('esc-bad.json')
+        for sub in others:
+            assert sub['skipped'] == [], (
+                f"subsection {sub['id']!r} must not inherit another queue's skips — "
+                'pass a FRESH list per load_queue_escalations call site'
+            )
+
+    def test_reconciliation_subsection_reports_skipped_files(self, tmp_path):
+        """The reconciliation queue reports its own skips, one entry per file."""
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-p1.json', _esc('esc-p1'))
+
+        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
+        recon_dir.mkdir(parents=True)
+        (recon_dir / 'esc-bad-1.json').write_text('{not json')
+        (recon_dir / 'esc-bad-2.json').write_text('also not json')
+
+        config = self._make_config(tmp_path, primary)
+        result = build_escalation_queues(config)
+
+        recon_sub = next(s for s in result['subsections'] if s['id'] == 'reconciliation')
+        orch_subs = [s for s in result['subsections'] if s['kind'] == 'orchestrator']
+
+        assert len(recon_sub['skipped']) == 2, (
+            'one skip record per unreadable file, not one per queue'
+        )
+        assert {Path(e['path']).name for e in recon_sub['skipped']} == {
+            'esc-bad-1.json', 'esc-bad-2.json',
+        }
+        for sub in orch_subs:
+            assert sub['skipped'] == [], (
+                "an orchestrator subsection must not inherit the reconciliation queue's skips"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Tests for build_escalation_queues — summary counts (step 9)
