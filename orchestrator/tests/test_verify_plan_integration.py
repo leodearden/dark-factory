@@ -301,7 +301,7 @@ class TestVerifyCmdRoundTrip:
         producer<->runner scope agreement and remain the always-run portion.
         The `slow` marker is registered in orchestrator/pyproject.toml's
         `markers` list as of task 3506 — see that entry for the deselect-
-        composition rationale (why plain ``-m "not slow"`` is insufficient).
+        composition rationale.
         """
         probe = tmp_path / 'test_verify_cmd_scope_probe.py'
         probe.write_text('def test_probe_passes():\n    assert True\n')
