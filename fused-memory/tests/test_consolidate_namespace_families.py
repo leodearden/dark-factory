@@ -2165,9 +2165,11 @@ class TestRunApply:
 
         report = await _mod.run(_run_args(apply=True), memory_service, limit=2)
 
-        assert len(merge_calls) == 1
-        merged_client, source, merged_points, capped = merge_calls[0]
-        assert source == 'fused_dark-factory'
+        # Every COLLECTION_MERGES entry is visited (the other three are empty
+        # in this fixture); the one under test is fused_dark-factory.
+        dark_factory_merges = [c for c in merge_calls if c[1] == 'fused_dark-factory']
+        assert len(dark_factory_merges) == 1
+        merged_client, source, merged_points, capped = dark_factory_merges[0]
         assert merged_client is qdrant_client, (
             'merge_collection still takes the RAW client -- the upsert/delete '
             'path is unchanged and still needs it'

@@ -892,8 +892,12 @@ async def run(
     # --- 2. Qdrant collection merges ----------------------------------------
     collection_items: list[dict] = []
     for source, target in COLLECTION_MERGES.items():
-        points = await scroll_collection_points(qdrant_client, source, limit=limit)
-        capped = len(points) >= limit
+        # The backend pages; --limit is this scroll's PAGE SIZE. `capped` is
+        # the flag the scroll returns, NOT len(points) >= limit -- a
+        # fully-drained multi-page scroll can return any count.
+        points, capped = await scroll_collection_points(
+            memory_service.mem0, source, page_size=limit,
+        )
         canonical_user_id = canonical_user_id_for(target)
         item = {
             'source': source,
@@ -1011,12 +1015,15 @@ def main() -> int:
     )
     parser.add_argument(
         '--limit', type=int, default=1000,
-        help='Maximum rows/points fetched in a SINGLE page per item (default: '
-             '1000 -- no further pages are fetched). Must exceed the true '
-             'row/point count of the largest graph/collection being '
-             'migrated, or that item is permanently reported UNRESOLVED. '
-             'Increase if the dry-run report logs a scroll/limit-cap '
-             'WARNING; memory scales with this value.',
+        help='Page/row size (default: 1000). For the GRAPH enumerations it is '
+             'a single-page row cap: it must exceed the true row count of the '
+             'largest graph being migrated, or that item is permanently '
+             'reported UNRESOLVED. For the COLLECTION scroll it is the PAGE '
+             'SIZE -- pages are followed to exhaustion, so a collection larger '
+             'than this now migrates fully instead of being permanently '
+             f'UNRESOLVED; the page budget ({DEFAULT_SCROLL_MAX_PAGES} pages) '
+             'bounds the total. Increase if the dry-run report logs a '
+             'row-cap or page-budget WARNING; memory scales with this value.',
     )
     parser.add_argument(
         '--config', default=None,
