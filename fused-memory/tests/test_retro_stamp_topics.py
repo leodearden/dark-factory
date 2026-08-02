@@ -12,6 +12,7 @@ is a plain unit test; the single I/O boundary (an injected
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -1905,3 +1906,169 @@ class TestRun:
         )
         assert sum(report['outcomes'].values()) == len(report['results'])
         assert report['target_count'] == len(report['results'])
+
+
+# ===========================================================================
+# render_markdown / render_json / resolve_exit_code / the parser
+# ===========================================================================
+
+
+def _report(**overrides) -> dict:
+    """A report skeleton with every bucket seeded, as ``run`` returns one."""
+    report = {
+        'apply': True,
+        'bounded': True,
+        'projects': ['dark_factory'],
+        'sources': {
+            name: {'description': f'source {name}', 'plan_count': 0}
+            for name in _mod.SOURCE_DESCRIPTIONS
+        },
+        'target_count': 0,
+        'stamped_total': 0,
+        'stamped_by_topic': {},
+        'would_stamp_total': 0,
+        'would_stamp_by_topic': {},
+        'outcomes': {},
+        'results': [],
+        'skips': {bucket: [] for bucket in _mod.SKIP_BUCKETS},
+    }
+    report.update(overrides)
+    return report
+
+
+class TestReportRenderAndCli:
+    """The artifact and the entry point.  Pure — no service, no network.
+
+    A sweep like this is judged almost entirely on its output: nobody reads
+    352 corpus records to check it.  So the renderer's job is to be
+    impossible to misread, and the exit code's job is to be impossible to
+    ignore.
+    """
+
+    def test_markdown_carries_a_per_topic_stamped_count_table(self):
+        rendered = _mod.render_markdown(_report(
+            stamped_total=5,
+            stamped_by_topic={'topic-one': 3, 'topic-two': 2},
+            target_count=5,
+        ))
+        assert 'topic-one' in rendered
+        assert 'topic-two' in rendered
+        assert '| topic-one | 3 |' in rendered
+        assert '| topic-two | 2 |' in rendered
+
+    def test_every_empty_bucket_is_stated_as_an_explicit_zero(self):
+        """The single most important line in the renderer.
+
+        Omitting empty buckets makes an artifact that reads "nothing was
+        skipped" whether the sweep skipped nothing or never computed the
+        bucket at all.  A reader cannot tell those apart, and the second one
+        is a hole in coverage nobody closes.
+        """
+        rendered = _mod.render_markdown(_report())
+        for bucket in _mod.SKIP_BUCKETS:
+            assert f'### {bucket}: 0' in rendered, (
+                f'empty bucket {bucket!r} was omitted from the report'
+            )
+
+    def test_a_non_empty_bucket_gets_its_own_section_with_entries(self):
+        rendered = _mod.render_markdown(_report(skips={
+            **{bucket: [] for bucket in _mod.SKIP_BUCKETS},
+            'memory_not_found': [{'reason': 'memory_not_found', 'memory_id': M1,
+                                  'topic': 'topic-one'}],
+            'skipped_no_enumeration': [{'reason': 'skipped_no_enumeration',
+                                        'gate_task_id': '2969',
+                                        'detail': 'no enumeration key'}],
+        }))
+        assert '### memory_not_found: 1' in rendered
+        assert M1 in rendered
+        assert '### skipped_no_enumeration: 1' in rendered
+        assert '2969' in rendered
+        assert 'no enumeration key' in rendered
+
+    def test_markdown_states_the_mode_and_the_boundedness(self):
+        """Both facts a reader needs before believing any number below them."""
+        applied = _mod.render_markdown(_report(apply=True))
+        rehearsed = _mod.render_markdown(_report(apply=False))
+        assert 'APPLY' in applied
+        assert 'DRY RUN' in rehearsed
+        assert 'bounded' in applied.lower()
+
+    def test_render_json_round_trips(self):
+        report = _report(stamped_by_topic={'topic-one': 1}, stamped_total=1)
+        assert json.loads(_mod.render_json(report))['stamped_by_topic'] == {
+            'topic-one': 1
+        }
+
+    def test_exit_code_is_zero_on_a_clean_run(self):
+        assert _mod.resolve_exit_code(_report(
+            outcomes={'stamped': 4, 'already_stamped': 2}
+        )) == 0
+        assert _mod.resolve_exit_code(_report(outcomes={'would_stamp': 9})) == 0
+
+    @pytest.mark.parametrize('outcome', [
+        'memory_not_found', 'canonical_uniqueness_blocked', 'update_failed',
+        'canonical_probe_failed', 'conflicting_existing_topic',
+    ])
+    def test_exit_code_is_non_zero_on_any_error_outcome(self, outcome: str):
+        """An automated caller must not read a bare 0 as success.
+
+        Partial failure is the normal shape of this run — ids transcribed
+        weeks ago, a corpus that moved underneath — so the ONE signal a cron
+        or a follow-up task can act on has to be honest.
+        """
+        assert _mod.resolve_exit_code(_report(
+            outcomes={'stamped': 3, outcome: 1}
+        )) != 0
+
+    def test_exit_code_and_the_report_share_one_definition_of_clean(self):
+        """``ERROR_OUTCOMES`` is the single home (INV-5).
+
+        Two lists of "what counts as a failure" is how an exit code and a
+        report come to disagree about the same run.
+        """
+        for outcome in _mod.ERROR_OUTCOMES:
+            assert _mod.resolve_exit_code(_report(outcomes={outcome: 1})) != 0
+
+    def test_parser_defaults_to_a_dry_run(self):
+        """Nothing mutates without ``--apply`` being typed.
+
+        The default posture for a script that writes to the live corpus
+        unattended; ``consolidate_namespace_families.py`` sets the same one.
+        """
+        args = _mod._build_parser().parse_args([])
+        assert args.apply is False
+        assert args.projects is None
+        assert args.json_out == _mod.DEFAULT_JSON_OUT
+        assert args.md_out == _mod.DEFAULT_MD_OUT
+
+    def test_apply_alone_enables_only_apply(self):
+        """A flag that quietly turns on a second behaviour is a trap."""
+        default = _mod._build_parser().parse_args([])
+        applied = _mod._build_parser().parse_args(['--apply'])
+        assert applied.apply is True
+        assert {k: v for k, v in vars(applied).items() if k != 'apply'} == {
+            k: v for k, v in vars(default).items() if k != 'apply'
+        }
+
+    def test_project_flag_replaces_the_default_rather_than_appending(self):
+        """The ``action='append'`` default footgun, pinned.
+
+        argparse APPENDS to a list default, so a naive ``default=['a','b']``
+        would turn ``--project reify`` into all three — silently widening a
+        sweep whose entire safety argument is that it is narrow.
+        """
+        parser = _mod._build_parser()
+        assert _mod.resolve_projects(parser.parse_args([])) == _mod.DEFAULT_PROJECTS
+        assert _mod.resolve_projects(
+            parser.parse_args(['--project', 'reify'])
+        ) == ('reify',)
+        assert _mod.resolve_projects(
+            parser.parse_args(['--project', 'reify', '--project', 'dark_factory'])
+        ) == ('reify', 'dark_factory')
+
+    def test_parser_exposes_the_artifact_paths(self):
+        args = _mod._build_parser().parse_args(
+            ['--json-out', '/tmp/x.json', '--md-out', '/tmp/x.md']
+        )
+        assert args.json_out == '/tmp/x.json'
+        assert args.md_out == '/tmp/x.md'
