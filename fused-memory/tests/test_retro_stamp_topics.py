@@ -1118,3 +1118,164 @@ class TestPlanGateClusters:
     def test_every_planned_topic_is_a_valid_slug(self):
         plans, _ = _mod.plan_gate_clusters(_mod.DF_CURATOR_GATE_CLUSTERS)
         assert all(topic_slug_module.is_valid_topic_slug(p.topic) for p in plans)
+
+
+# ===========================================================================
+# merge_plans — three planners -> one per-record work list
+# ===========================================================================
+
+M1 = 'aaaaaaaa-0000-4000-8000-000000000001'
+M2 = 'aaaaaaaa-0000-4000-8000-000000000002'
+M3 = 'aaaaaaaa-0000-4000-8000-000000000003'
+C1 = 'cccccccc-0000-4000-8000-00000000000a'
+C2 = 'cccccccc-0000-4000-8000-00000000000b'
+
+
+def _plan(
+    topic: str,
+    *,
+    canonical: str | None = None,
+    members: tuple[str, ...] = (),
+    source: str = 'canonical_scroll',
+    project_id: str = 'dark_factory',
+    canonical_plural: bool = False,
+    provenance: dict | None = None,
+) -> object:
+    return _mod.ClusterPlan(
+        topic=topic,
+        project_id=project_id,
+        canonical_memory_id=canonical,
+        member_memory_ids=members,
+        source=source,
+        canonical_plural=canonical_plural,
+        provenance=provenance or {},
+    )
+
+
+class TestMergePlans:
+    """``merge_plans(*plan_lists) -> (targets, skips)``.
+
+    Flattens the three sources into the per-record work list ``run``
+    executes.  Everything ambiguous is reported rather than resolved: an
+    ambiguous cluster is a curation question, and letting iteration order
+    answer it would make the outcome depend on which planner ran first.
+    """
+
+    def test_same_topic_from_two_sources_merges_into_one(self):
+        """Overlap between sources is EXPECTED, not an error.
+
+        The live canonical scroll and the E1 registry both cover
+        ``eval-worktree-plan-tools-missing``; two sources agreeing is the
+        normal case and must not produce duplicate work or a false conflict.
+        """
+        targets, skips = _mod.merge_plans(
+            [_plan('eval-worktree-plan-tools-missing', canonical=C1, members=(M1,))],
+            [_plan('eval-worktree-plan-tools-missing', canonical=C1, members=(M2,),
+                   source='calibration_registry_join')],
+        )
+        assert skips == []
+        assert {t.memory_id for t in targets} == {C1, M1, M2}
+        assert [t.topic for t in targets] == ['eval-worktree-plan-tools-missing'] * 3
+        assert [t.make_canonical for t in targets].count(True) == 1
+
+    def test_one_id_claimed_by_two_topics_is_reported_not_guessed(self):
+        """No stamp for the disputed id, and both topics named in the skip.
+
+        Iteration order deciding which topic wins would make the corpus
+        depend on planner ordering — and the wrong answer would be invisible.
+        """
+        targets, skips = _mod.merge_plans(
+            [_plan('topic-one', members=(M1, M2))],
+            [_plan('topic-two', members=(M2, M3))],
+        )
+        assert {t.memory_id for t in targets} == {M1, M3}
+        conflicts = [s for s in skips if s['reason'] == 'conflicting_topic_claim']
+        assert len(conflicts) == 1
+        assert conflicts[0]['memory_id'] == M2
+        assert sorted(conflicts[0]['topics']) == ['topic-one', 'topic-two']
+
+    def test_disagreeing_canonicals_stamp_the_topic_but_no_canonical(self):
+        """Same conservative rule as the plural case.
+
+        Two sources naming different canonicals for one topic is a genuine
+        disagreement.  Picking one would risk stamping the wrong record —
+        and, since the loser keeps no marker, would erase the evidence that
+        anything was ever in doubt.
+        """
+        targets, skips = _mod.merge_plans(
+            [_plan('topic-one', canonical=C1, members=(M1,))],
+            [_plan('topic-one', canonical=C2, members=(M2,),
+                   source='df_curator_gate_manifest')],
+        )
+        assert all(t.make_canonical is False for t in targets)
+        assert {t.memory_id for t in targets} == {C1, C2, M1, M2}
+        disputes = [s for s in skips if s['reason'] == 'canonical_disagreement']
+        assert len(disputes) == 1
+        assert sorted(disputes[0]['canonical_memory_ids']) == sorted([C1, C2])
+        assert disputes[0]['topic'] == 'topic-one'
+
+    def test_at_most_one_canonical_per_project_topic(self):
+        """ε's <=1-canonical-per-topic invariant, pinned at PLAN level.
+
+        Checked before any write, because ``update_memory`` never reaches the
+        service-side uniqueness probe — so a plan that violated this would
+        reach Qdrant unchallenged.
+        """
+        targets, _ = _mod.merge_plans(
+            [_plan('topic-one', canonical=C1, members=(M1,)),
+             _plan('topic-two', canonical=C2, members=(M2,))],
+            [_plan('topic-one', canonical=C1, members=(M3,))],
+            [_plan('topic-one', canonical=C1, project_id='reify')],
+        )
+        seen: dict[tuple[str, str], int] = {}
+        for target in targets:
+            if target.make_canonical:
+                key = (target.project_id, target.topic)
+                seen[key] = seen.get(key, 0) + 1
+        assert seen == {
+            ('dark_factory', 'topic-one'): 1,
+            ('dark_factory', 'topic-two'): 1,
+            ('reify', 'topic-one'): 1,
+        }
+
+    def test_canonical_plural_contributes_topic_only_targets(self):
+        targets, skips = _mod.merge_plans(
+            [_plan('pyright-worktree-import-resolution', members=(M1, M2),
+                   canonical_plural=True, source='df_curator_gate_manifest',
+                   provenance={'gate_task_id': '3036', 'note': 'several canonicals'})],
+        )
+        assert all(t.make_canonical is False for t in targets)
+        plural = [s for s in skips if s['reason'] == 'canonical_plural']
+        assert len(plural) == 1
+        assert plural[0]['topic'] == 'pyright-worktree-import-resolution'
+        assert plural[0]['note'] == 'several canonicals'
+
+    def test_output_order_is_deterministic(self):
+        """Two runs produce byte-comparable reports.
+
+        A report whose ordering wobbles cannot be diffed, which is most of
+        what a dry-run is for.
+        """
+        lists = (
+            [_plan('topic-two', canonical=C2, members=(M3, M1))],
+            [_plan('topic-one', canonical=C1, members=(M2,), project_id='reify')],
+        )
+        targets, _ = _mod.merge_plans(*lists)
+        assert [(t.project_id, t.topic, t.memory_id) for t in targets] == sorted(
+            (t.project_id, t.topic, t.memory_id) for t in targets
+        )
+        again, _ = _mod.merge_plans(*lists)
+        assert targets == again
+
+    def test_a_canonical_is_never_also_a_member_target(self):
+        targets, _ = _mod.merge_plans(
+            [_plan('topic-one', canonical=C1, members=(C1, M1))],
+        )
+        assert len(targets) == len({t.memory_id for t in targets})
+        canonical_targets = [t for t in targets if t.memory_id == C1]
+        assert len(canonical_targets) == 1
+        assert canonical_targets[0].make_canonical is True
+
+    def test_empty_input_is_an_empty_work_list_not_an_error(self):
+        assert _mod.merge_plans() == ([], [])
+        assert _mod.merge_plans([], []) == ([], [])
