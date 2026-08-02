@@ -3427,3 +3427,159 @@ async def test_a_live_two_cluster_run_reports_completely_and_leaves_nothing(
     finally:
         client.close()
     assert live.isdisjoint(collections)
+
+
+# ===========================================================================
+# step-23 — the committed artifact, asserted as DATA
+# ===========================================================================
+#
+# `plans/e2-storage-shape-bakeoff-report.{json,md}` is this task's
+# user-observable signal and gate leaf η's input, so it is guarded as data
+# rather than described in prose: a decision table nobody parses is a
+# decision table that can rot in place.
+#
+# Pins NO metric value, rate or bound (G6).  What it pins is COMPLETENESS —
+# every arm present, every metric measured rather than `—`, both artifacts
+# agreeing — because that is the difference between "the run said C wins"
+# and "the run half-failed and the blank cells read as a tie".
+#
+# Pure file reads.  No network, no Qdrant, no key: this runs in the merge
+# lane on every commit, which is the point.
+
+
+@functools.cache
+def _committed_report() -> dict:
+    path = _mod().DEFAULT_REPORT_JSON
+    assert path.exists(), (
+        f'{path} is missing. It is the artifact gate eta reads; regenerate '
+        f'it with `uv run python fused-memory/scripts/bake_off_storage_shape.py`.'
+    )
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+class TestCommittedReportJson:
+    """The machine-readable half."""
+
+    def test_it_parses_and_declares_its_schema_version(self):
+        report = _committed_report()
+
+        assert report['schema_version'] == _mod().REPORT_SCHEMA_VERSION
+
+    def test_every_arm_variant_has_a_row(self):
+        report = _committed_report()
+
+        assert list(report['arms']) == list(_mod().ARM_VARIANTS)
+
+    @pytest.mark.parametrize('metric,keys', [
+        ('claim_recall', ('at_5', 'at_10')),
+        ('discoverability', ('canonical_in_top_5_rate',)),
+        ('tokens_per_query', ('mean',)),
+        # Both halves: the rank-based one and the flagged threshold replay.
+        ('guard_adequacy', ('candidate_present_rate', 'guard_matched_rate')),
+    ])
+    def test_every_arm_measured_every_metric(self, metric, keys):
+        """`None` is a legitimate value in the pipeline — "measured, no
+        denominator" — but in a FULL committed run it means the arm was never
+        asked, and the markdown renders it as `—` next to real numbers."""
+        report = _committed_report()
+
+        for arm, measurement in report['arms'].items():
+            for key in keys:
+                assert measurement[metric][key] is not None, f'{arm}.{metric}.{key}'
+
+    def test_the_guard_column_is_flagged_as_a_threshold_replay_on_every_arm(self):
+        """Carried per-arm so a reader who copies one row out of the table
+        cannot lose the flag (eval-design §1's one sanctioned exception)."""
+        report = _committed_report()
+
+        for measurement in report['arms'].values():
+            assert measurement['guard_adequacy']['threshold_replay'] is True
+            assert measurement['guard_adequacy']['threshold'] is not None
+
+    def test_the_d10_block_carries_its_recall_and_its_band_split(self):
+        """D10 is a second, independent deliverable, not a footnote of E2."""
+        audit = _committed_report()['audit_recall']
+        true_dup = audit['true_dup']
+
+        assert true_dup['recall'] is not None
+        assert true_dup['pairs'] == (
+            true_dup['lexical_band']['pairs'] + true_dup['paraphrase_band']['pairs']
+        )
+        assert audit['hard_negative']['pairs'] > 0
+        assert audit['unrelated']['pairs'] > 0
+
+    def test_the_protocol_block_says_how_the_numbers_were_produced(self):
+        """An arbitration artifact whose provenance is not in it cannot be
+        re-read in six months by somebody who was not in the room."""
+        mod = _mod()
+        protocol = _committed_report()['protocol']
+
+        for key in mod._REQUIRED_PROTOCOL_KEYS:
+            assert protocol[key] is not None
+        assert 'blind' in protocol['blind_authoring'].lower()
+        assert protocol['token_estimator'] in (
+            mod.TIKTOKEN_ESTIMATOR_NAME, mod.CHAR_PROXY_ESTIMATOR_NAME,
+        )
+        assert protocol['distractor_slab_size'] > 0
+
+    def test_it_records_the_fixture_commits_the_blind_protocol_rests_on(self):
+        """The claim "no metric code existed when the arms were authored" is
+        only checkable if the artifact says which commits to go and look at."""
+        fixtures = _committed_report()['protocol']['fixtures']
+
+        paths = {entry['path'] for entry in fixtures}
+        assert any(path.endswith('e2_arm_claims.jsonl') for path in paths)
+        assert any(path.endswith('e2_query_set.jsonl') for path in paths)
+        for entry in fixtures:
+            assert not entry['path'].startswith('/')  # repo-relative, reproducible
+            assert entry['commit'], f"{entry['path']} is not committed"
+
+    def test_the_run_measured_the_whole_fixture_not_a_smoke_subset(self):
+        """A `--clusters 2` artifact would read exactly like a full one."""
+        protocol = _committed_report()['protocol']
+
+        assert protocol['clusters_measured'] == len(_mod().load_calibration_clusters())
+        assert protocol['queries_measured'] == len(_mod().load_query_set())
+        assert protocol['distractor_slab_size'] == len(_mod().load_distractor_slab())
+
+
+class TestCommittedReportMarkdown:
+    """The operator-facing half, and its agreement with the JSON."""
+
+    def test_the_decision_table_has_exactly_one_row_per_arm_in_the_json(self):
+        """The two artifacts are written from one `build_report` result; this
+        is what makes it impossible for them to disagree unnoticed."""
+        rendered = _mod().DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+
+        rows = _decision_table_rows(rendered)
+        arms = list(_committed_report()['arms'])
+        assert len(rows) == len(arms)
+        for arm in arms:
+            assert sum(1 for row in rows if row.startswith(f'| {arm} |')) == 1
+
+    def test_the_table_header_is_the_pinned_column_set(self):
+        mod = _mod()
+
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        header = next(
+            line for line in rendered.splitlines() if line.startswith('| arm ')
+        )
+
+        assert header == '| ' + ' | '.join(mod.DECISION_TABLE_COLUMNS) + ' |'
+
+    def test_no_cell_in_the_committed_table_is_a_missing_measurement(self):
+        """`—` means "never measured", and next to real numbers it reads as a
+        tie.  A committed table must not contain one."""
+        rendered = _mod().DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+
+        for row in _decision_table_rows(rendered):
+            assert '—' not in row
+
+    def test_it_renders_byte_identically_from_the_committed_json(self):
+        """The markdown is a pure function of the JSON, so the two cannot have
+        been edited apart — and a rerun's diff stays signal."""
+        mod = _mod()
+
+        assert mod.render_markdown(_committed_report()) == (
+            mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        )
