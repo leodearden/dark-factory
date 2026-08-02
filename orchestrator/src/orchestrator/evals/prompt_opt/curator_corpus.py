@@ -100,7 +100,11 @@ def recover_recorded_action(
     disambiguate them -- only the embedded action can. Falls back to
     ``status == 'created' -> 'create'`` when *result_json* carries no
     recoverable action (the real add_task-result JSON has no ``'action'``
-    key). ``target_id`` prefers ``result_json['id']`` (or the less common
+    key), and to ``status == 'refused' -> 'refuse'``. Refusal is the one
+    action that IS unambiguous from status alone: only the deterministic
+    guards (cancelled-premise blocklist, recon premise registry) ever emit
+    it, and it carries no target. ``target_id`` prefers ``result_json['id']``
+    (or the less common
     ``result_json['target_id']``), falling back to the ticket row's own
     *task_id* column when neither is present -- but only for drop/combine,
     since 'create' has no "target being combined into".
@@ -145,6 +149,14 @@ def recover_recorded_action(
 
     if action is None and status == 'created':
         action = 'create'
+
+    if action is None and status == 'refused':
+        # Unlike drop/combine, 'refused' needs no result_json to disambiguate:
+        # only the deterministic guards ever emit it, so the status alone is
+        # unambiguous. Note 'refuse' is deliberately NOT in _RECOVERABLE_ACTIONS
+        # -- that tuple also drives _FRONTIER_CURATOR_LABEL_SCHEMA, and a
+        # frontier model must never be able to PROPOSE a refusal.
+        action = 'refuse'
 
     if action is None:
         return None

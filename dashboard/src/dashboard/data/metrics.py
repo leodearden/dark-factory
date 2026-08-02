@@ -403,9 +403,16 @@ async def _sample_curator(
     if tickets_db is not None:
         cutoff = (effective_now - timedelta(hours=1)).isoformat()
         try:
+            # This IN-list is the terminal-status allowlist and must track the
+            # resolve_ticket status vocabulary. 'refused' is terminal too: a
+            # deterministic guard rejected the candidate and no task was
+            # created — that work still cost curator latency, so it belongs in
+            # the centiles. Omitting a status here silently erases it from the
+            # metric rather than failing loudly.
             async with tickets_db.execute(
                 'SELECT created_at, resolved_at FROM tickets '
-                "WHERE resolved_at >= ? AND status IN ('created', 'combined', 'cancelled', 'failed')",
+                'WHERE resolved_at >= ? AND status IN '
+                "('created', 'combined', 'cancelled', 'failed', 'refused')",
                 (cutoff,),
             ) as cur:
                 ticket_rows = await cur.fetchall()

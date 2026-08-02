@@ -343,6 +343,13 @@ class TicketStore:
         but the explicit guard belts-and-braces against future renames). Rows
         are ordered by ``resolved_at`` so the oldest failure escalates first.
 
+        ``status='refused'`` is DELIBERATELY excluded and must stay excluded.
+        A refusal is a successful, intended outcome of an operator-authored
+        policy (the cancelled-premise blocklist / recon premise registry) —
+        not an error. Sweeping refusals into the janitor's failure path would
+        page a steward every time the blocklist did its job, training
+        operators to ignore the signal. Do not "fix" this omission.
+
         Args:
             project_id: When set, restrict to a single project. Default None
                 returns all projects (the janitor groups across projects).
