@@ -2501,16 +2501,10 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     env = _hermetic_environ()
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env["CLAUDE_SPAWN_BACKEND"] = "tmux"
-    # Task 3486 audit: deliberately NOT routed through _wait_for_path_scaled
-    # -- and holds no _wait_for_path call at all. (This task's own brief
-    # misattributed a _wait_for_path(capture_file, timeout=5.0) gate to this
-    # test; that gate actually lives in _run_sibling_capture_spawn, below.)
-    # SPAWN_LAUNCH_GRACE_SECS="2" and the timeout=10 below stay FIXED on
-    # purpose: with no tmux binary and no terminal emulator on PATH, the
-    # availability guard fails immediately, so the rc==126 verdict is
-    # load-INSENSITIVE -- no amount of host load can turn it into a slow
-    # success, and load-scaling would only make a genuine regression take
-    # longer to report. Measured: 0.05s whole-test wall at load-per-core 3.14.
+    # Task 3486 audit: SPAWN_LAUNCH_GRACE_SECS="2" and timeout=10 below stay
+    # FIXED on purpose -- rc==126 is load-INSENSITIVE (no tmux/emulator on
+    # PATH fails the availability guard immediately; load-scaling would only
+    # make a genuine regression take longer to report). Measured: 0.05s.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
     env.pop("CLAUDE_TERMINAL_CMD", None)
 
