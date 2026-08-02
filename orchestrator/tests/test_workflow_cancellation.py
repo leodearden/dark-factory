@@ -1096,6 +1096,24 @@ class TestHarnessSyntheticCancelRetirement:
 # (must-raise) cases below are load-bearing, not decorative.
 
 
+def _make_wedge(event: asyncio.Event) -> Callable[[], Awaitable[WorkflowOutcome]]:
+    """Build a stand-in for ``TaskWorkflow._verify_debugfix_loop`` that signals
+    *event* and then wedges forever, so a cancel has something to interrupt.
+
+    Assign it with ``workflow._verify_debugfix_loop = _make_wedge(ev)``: the
+    real method is entered only after ``_enter_phase(VERIFY)`` (workflow.py,
+    just above the real ``_verify_debugfix_loop()`` call), so by the time
+    *event* is set ``workflow.machine.state`` is already VERIFY.
+    """
+
+    async def _wedge_verify() -> WorkflowOutcome:
+        event.set()
+        await asyncio.sleep(3600)
+        raise AssertionError('unreachable — the wedge must be cancelled before the sleep returns')
+
+    return _wedge_verify
+
+
 @pytest.mark.asyncio
 class TestMakeWedgeHelper:
     """Contract tests for the ``_make_wedge`` factory helper.
