@@ -715,7 +715,7 @@ async def _map_advance_failure(
 
     Handles ``wip_overlap``, ``pop_conflict``, ``unmerged_state``,
     ``pop_conflict_no_advance``, ``not_descendant``, ``contaminated``,
-    and ``stash_failed``.
+    ``stash_failed``, and ``park_lock_contended``.
 
     ``stash_failed`` (task 2758) HALTS the queue and returns a distinct
     ``stash_failed`` outcome — it is a SHARED main-checkout-hygiene fault
@@ -726,6 +726,21 @@ async def _map_advance_failure(
     remain per-branch, per-task ``blocked`` with no halt — they are content
     problems specific to one branch that do NOT recur for other tasks (same
     reasoning as the ``conflict_markers`` per-branch → no-halt branch).
+
+    ``park_lock_contended`` (task 3060) does **NOT** halt, and its absence
+    from ``merge_queue._HALT_ADVANCE_RESULTS`` is deliberate.  The
+    superficial similarity to ``stash_failed`` (both mean "advance_main
+    could not safely touch project_root") hides the distinction that
+    matters: ``stash_failed`` reports a shared main-checkout-hygiene fault
+    that PERSISTS until a human cleans up, so every subsequent task would
+    fail identically; ``park_lock_contended`` reports a foreign git process
+    transiently owning project_root's index — dominantly a
+    ``git commit --only`` holding the lock across its pre-commit hook —
+    which SELF-CLEARS in seconds-to-minutes.  advance_main has already stood
+    off for the whole ``git.merge_park_lock_grace_seconds`` budget before
+    returning it, and modified nothing, so the correct disposition is a
+    per-task ``blocked`` that retries on re-dispatch.  Halting the queue for
+    it is exactly the recurring halt task 3060 removed.
 
     Does **not** handle ``cas_failed``
     (per-worker retry orchestration is a preserved difference) or the
@@ -865,6 +880,51 @@ async def _map_advance_failure(
                 f'(task {task_id})'
             ),
             dirty_files=dirty,
+        )
+
+    if result == 'park_lock_contended':
+        # TRANSIENT foreign-process contention (task 3060) — deliberately NOT
+        # a halt, and deliberately absent from merge_queue._HALT_ADVANCE_
+        # RESULTS.  Contrast stash_failed above: that is a shared
+        # main-checkout-HYGIENE fault that recurs identically for every
+        # subsequent task until a human intervenes, so collapsing it to one
+        # halt is right.  This one is a bounded, SELF-CLEARING window — a
+        # foreign `git commit --only <path>` holds project_root's index lock
+        # across its pre-commit hook — and advance_main already stood off for
+        # the whole configured grace before giving up, having modified
+        # NOTHING.  Halting the queue for it produced the 2+/day halt this
+        # branch exists to remove.
+        cas_retries.pop(task_id, None)
+        info = getattr(git_ops, '_last_park_lock_info', None) or {}
+        lock_path = info.get('lock_path') or '<unknown>'
+        age = info.get('age_seconds')
+        waited = info.get('waited_seconds')
+        age_txt = f'{age:.0f}s' if isinstance(age, int | float) else 'unknown'
+        waited_txt = f'{waited:.0f}s' if isinstance(waited, int | float) else 'unknown'
+        stale = (
+            isinstance(age, int | float)
+            and isinstance(waited, int | float)
+            and waited > 0
+            and age > waited
+        )
+        recovery = (
+            f' The lock is OLDER ({age_txt}) than the stand-off we waited '
+            f'({waited_txt}), so it may be a crashed-git leftover rather than '
+            f'a live commit: confirm no git process is running in '
+            f'project_root, then clear it with `rm -f {lock_path}`.'
+            if stale else ''
+        )
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'advance_main stood off: a foreign git process held '
+                f'{lock_path} for {age_txt} (waited {waited_txt}). The merge '
+                f'did NOT land and NOTHING in project_root was modified. This '
+                f'is the docs-direct-commit-on-main window — a '
+                f'`git commit --only` holding the index lock across its '
+                f'pre-commit hook — which is transient and will be retried on '
+                f're-dispatch.{recovery} (task {task_id})'
+            ),
         )
 
     # not_descendant / contaminated — per-branch permanent failure (no halt)

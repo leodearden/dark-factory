@@ -688,6 +688,18 @@ abandoned request" early-out as ``unmerged_state``/``pop_conflict_no_advance``
 (see the abandoned-request handling below), otherwise the mapper would
 engage a halt with no workflow coroutine to own it (an orphan halt).
 
+``park_lock_contended`` (task 3060) is DELIBERATELY EXCLUDED — do not
+"helpfully" add it.  It reports a foreign git process transiently holding
+project_root's ``index.lock`` (dominantly a ``git commit --only`` holding it
+across its pre-commit hook), which self-clears; ``advance_main`` has already
+stood off for the whole ``git.merge_park_lock_grace_seconds`` budget and
+modified nothing before returning it, so it maps to a per-task
+``MergeOutcome('blocked')`` that retries on re-dispatch.  Adding it here
+would reinstate the 2+/day queue halt task 3060 exists to remove — and would
+also fail ``test_merge_queue.py::TestHaltAdvanceResults::
+test_contains_expected_results``, which asserts EXACT frozenset equality
+against a literal 5-element set.
+
 Shared between :class:`SpeculativeMergeWorker` and the retired serial
 worker's test-local reference (see :class:`_TrainMergeHost`) to avoid
 silent divergence: if the set of halt-triggering results ever changes,
