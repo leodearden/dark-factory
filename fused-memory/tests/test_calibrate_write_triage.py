@@ -460,6 +460,190 @@ class TestBuildPairSets:
 
 
 # ---------------------------------------------------------------------------
+# Per-category partition
+# ---------------------------------------------------------------------------
+
+def _cat_rec(mid: str, cluster: str, label: str, category: str | None) -> dict:
+    """A minimal record with an explicit category (possibly absent/empty)."""
+    record = _rec(mid, cluster, label)
+    if category is None:
+        record.pop('category')
+    else:
+        record['category'] = category
+    return record
+
+
+class TestPartitionPairsByCategory:
+    """Per-category buckets using build_pair_sets' own classification rule.
+
+    A per-category cutoff has to be measured on the population the consumer
+    can actually form. fetch_ann_neighbors pushes the querying record's own
+    category into the Qdrant query as a payload filter, so a cross-category
+    ANN pair is structurally impossible — including such pairs would
+    calibrate a threshold against pairs it will never be applied to.
+    """
+
+    def test_returns_the_three_classes_per_category(self) -> None:
+        got = _mod().partition_pairs_by_category([
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+        ])
+        assert 'procedural_knowledge' in got['by_category']
+        for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs'):
+            assert key in got['by_category']['procedural_knowledge'], f'missing {key!r}'
+
+    def test_classification_matches_build_pair_sets_within_a_category(self) -> None:
+        """Same rule, applied per bucket — not a second, divergent one."""
+        records = [
+            _cat_rec('c1', 'c1', 'canonical', 'preferences_and_norms'),
+            _cat_rec('d1', 'c1', 'duplicate', 'preferences_and_norms'),
+            _cat_rec('x1', 'c1', 'distinct', 'preferences_and_norms'),
+            _cat_rec('c2', 'c2', 'canonical', 'preferences_and_norms'),
+            _cat_rec('p1', 'c2', 'pseudo_contradiction', 'preferences_and_norms'),
+        ]
+        bucket = _mod().partition_pairs_by_category(records)['by_category'][
+            'preferences_and_norms'
+        ]
+        pooled = _mod().build_pair_sets(records)
+        for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs'):
+            assert _keys(bucket[key]) == _keys(pooled[key]), key
+
+    def test_a_cross_category_pair_lands_in_no_bucket(self) -> None:
+        """fetch_ann_neighbors filters by category, so this pair cannot form."""
+        got = _mod().partition_pairs_by_category([
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('o1', 'c1', 'duplicate', 'observations_and_summaries'),
+        ])
+        for bucket in got['by_category'].values():
+            for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs'):
+                assert _keys(bucket[key]) == set(), (
+                    'a cross-category pair must reach no bucket'
+                )
+        assert got['cross_category_dropped'] == 1, (
+            'the exclusion must be a disclosed number, not invisible attrition'
+        )
+
+    def test_a_mixed_cluster_keeps_only_its_same_category_pairs(self) -> None:
+        """2 of the 20 committed clusters are category-mixed."""
+        got = _mod().partition_pairs_by_category([
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+            _cat_rec('o1', 'c1', 'duplicate', 'observations_and_summaries'),
+        ])
+        assert _keys(got['by_category']['procedural_knowledge']['true_dup_pairs']) == {
+            ('c1', 'd1'),
+        }
+        assert got['cross_category_dropped'] == 2
+        obs = got['by_category']['observations_and_summaries']
+        assert all(len(obs[k]) == 0 for k in obs), 'a lone record forms no pair'
+
+    def test_a_record_with_no_or_empty_category_contributes_no_pairs(self) -> None:
+        for missing in (None, ''):
+            got = _mod().partition_pairs_by_category([
+                _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+                _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+                _cat_rec('u1', 'c1', 'duplicate', missing),
+            ])
+            formed = {
+                tuple(sorted((p['a'], p['b'])))
+                for bucket in got['by_category'].values()
+                for key in bucket for p in bucket[key]
+            }
+            assert formed == {('c1', 'd1')}, f'category={missing!r} formed {formed}'
+            assert got['cross_category_dropped'] == 2
+
+    def test_the_partition_is_total_and_loses_nothing_silently(self) -> None:
+        records = [
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+            _cat_rec('x1', 'c1', 'distinct', 'procedural_knowledge'),
+            _cat_rec('c2', 'c2', 'canonical', 'observations_and_summaries'),
+            _cat_rec('p1', 'c2', 'pseudo_contradiction', 'observations_and_summaries'),
+            _cat_rec('u1', 'c3', 'duplicate', None),
+        ]
+        got = _mod().partition_pairs_by_category(records)
+        bucketed = sum(
+            len(bucket[key])
+            for bucket in got['by_category'].values()
+            for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs')
+        )
+        pooled = sum(len(v) for v in _mod().build_pair_sets(records).values())
+        assert bucketed + got['cross_category_dropped'] == pooled, (
+            'buckets plus disclosed drops must equal the pooled pair total'
+        )
+
+    def test_every_category_present_in_the_input_appears_in_the_output(self) -> None:
+        """Even a single-record category — absence would read as 'not measured'."""
+        got = _mod().partition_pairs_by_category([
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+            _cat_rec('o1', 'o1', 'canonical', 'observations_and_summaries'),
+        ])
+        assert set(got['by_category']) == {
+            'procedural_knowledge', 'observations_and_summaries',
+        }
+
+    def test_empty_input_yields_no_categories_and_no_drops(self) -> None:
+        got = _mod().partition_pairs_by_category([])
+        assert got['by_category'] == {}
+        assert got['cross_category_dropped'] == 0
+
+
+class TestCommittedFixtureIsDerivablePerCategory:
+    """Pin the per-category derivability facts this task turns on.
+
+    Measured from the committed fixture, not assumed. Pinning them makes a
+    future fixture edit force a re-measurement rather than silently
+    invalidating the recorded per-category calibration.
+    """
+
+    EXPECTED = {
+        'procedural_knowledge': (242, 3316, 12),
+        'observations_and_summaries': (4, 45, 6),
+        'preferences_and_norms': (28, 0, 0),
+    }
+
+    def test_measured_pair_counts_per_category(self, records: list[dict]) -> None:
+        got = _mod().partition_pairs_by_category(records)['by_category']
+        assert set(got) == set(self.EXPECTED)
+        for category, (dup, unrelated, hard) in self.EXPECTED.items():
+            bucket = got[category]
+            assert (
+                len(bucket['true_dup_pairs']),
+                len(bucket['unrelated_pairs']),
+                len(bucket['hard_negative_pairs']),
+            ) == (dup, unrelated, hard), category
+
+    def test_preferences_and_norms_has_zero_negatives(self, records: list[dict]) -> None:
+        """All 8 records sit in ONE cluster, so no cutoff is derivable.
+
+        The refusal is itself the calibration finding — this is the fact
+        that makes the task's second acceptance disjunct unreachable.
+        """
+        clusters = {
+            r['cluster_id'] for r in records
+            if r.get('category') == 'preferences_and_norms'
+        }
+        assert len(clusters) == 1
+        bucket = _mod().partition_pairs_by_category(records)['by_category'][
+            'preferences_and_norms'
+        ]
+        assert len(bucket['unrelated_pairs']) == 0
+        assert len(bucket['hard_negative_pairs']) == 0
+
+    def test_cross_category_pairs_are_dropped_and_counted(self, records: list[dict]) -> None:
+        got = _mod().partition_pairs_by_category(records)
+        assert got['cross_category_dropped'] == 1703
+        pooled = sum(len(v) for v in _mod().build_pair_sets(records).values())
+        bucketed = sum(
+            len(bucket[key])
+            for bucket in got['by_category'].values()
+            for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs')
+        )
+        assert bucketed + got['cross_category_dropped'] == pooled
+
+
+# ---------------------------------------------------------------------------
 # cosine_similarity / summarize_distribution
 # ---------------------------------------------------------------------------
 
