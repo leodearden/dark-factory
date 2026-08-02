@@ -274,8 +274,10 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   detector, `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).
   **Default: PARK.** Leave it pending, file a cockpit DecisionRecord via
   `write-decision` (see "Filing Parked Decisions to the Cockpit Registry
-  (C8)" below), and pass `--exclude-id <esc-id>` on the watcher's next
-  (re)start (see "Re-arming over deliberately-pending items" above).
+  (C8)" below), and append its esc-id to the exclude file
+  (`<queue-dir>/.watcher-exclude-recon`) so the watcher's next (re)start
+  skips it — not `--exclude-id`, which does not scale at this queue's size
+  (see "Re-arming over deliberately-pending items" above).
   **Why park, not resolve:** recon files a fresh gate-backlog escalation for
   a task only when `has_open_l1(task_id,
   category='reconciliation_stale_gate_backlog')` is false
@@ -291,9 +293,12 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   and resolved by 2026-07-25T17:03Z the same day (~4h round trip);
   `esc-646-1` dismissed 2026-08-01T14:10Z → `esc-646-2` filed and still
   pending now; `esc-3361-1` resolved 2026-08-02T10:40Z → `esc-3361-2` filed
-  and still pending now. As of that same date the pending queue holds 31
+  and still pending now. As of 2026-08-02 the pending queue holds 32
   records, 100% this category, with only one (`esc-648-1`) ever
-  triage-stamped. **Resolve only** when the underlying task will genuinely
+  triage-stamped — treat the exact count as a snapshot, not a fixture: it
+  moves with every filing/resolve cycle, so re-census
+  `data/reconciliation/escalations/` yourself if the number matters to your
+  decision. **Resolve only** when the underlying task will genuinely
   stop qualifying for re-selection — you completed the gate and can close
   the task, or recon will reconcile the task to a terminal status next
   cycle regardless. **You cannot drive the gate itself terminal from
