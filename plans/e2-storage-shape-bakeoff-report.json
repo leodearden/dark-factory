@@ -13,15 +13,15 @@
       },
       {
         "path": "fused-memory/tests/fixtures/e2_arm_claims.jsonl",
-        "commit": "e522235a82b0117a264ad497e480045f5c761c6d"
+        "commit": "f1fe9cf040dca324e3bd8cb4c13bf2e65da02620"
       },
       {
         "path": "fused-memory/tests/fixtures/e2_query_set.jsonl",
-        "commit": "32193693932db83bf4753f1d62331bf5209f2db6"
+        "commit": "9c48f3d10c2ee63aeb54443769903740d931aa4c"
       },
       {
         "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl",
-        "commit": "8563918d31bc01aad597000e8472151796d6cd78"
+        "commit": "5c4a617265ae0de673825a5b2b881c45bef976ca"
       }
     ],
     "token_estimator": "char-proxy:4-chars-per-token",
@@ -53,11 +53,13 @@
       },
       "discoverability": {
         "canonical_in_top_5_rate": 0.538135593220339,
-        "median_canonical_rank": 2.0,
-        "canonical_found_count": 127
+        "median_canonical_rank": 3.0,
+        "canonical_found_count": 171,
+        "canonical_candidates": 236,
+        "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 3832.6949152542375,
+        "mean": 3832.8050847457625,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -66,6 +68,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
+        "max_observed_score": 0.89916354,
         "probes": 15
       }
     },
@@ -80,11 +83,13 @@
       },
       "discoverability": {
         "canonical_in_top_5_rate": 0.538135593220339,
-        "median_canonical_rank": 2.0,
-        "canonical_found_count": 127
+        "median_canonical_rank": 3.0,
+        "canonical_found_count": 171,
+        "canonical_candidates": 236,
+        "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 3832.6949152542375,
+        "mean": 3832.8050847457625,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -93,6 +98,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
+        "max_observed_score": 0.89916354,
         "probes": 15
       }
     },
@@ -107,11 +113,13 @@
       },
       "discoverability": {
         "canonical_in_top_5_rate": 0.5042372881355932,
-        "median_canonical_rank": 2.0,
-        "canonical_found_count": 119
+        "median_canonical_rank": 3.0,
+        "canonical_found_count": 154,
+        "canonical_candidates": 236,
+        "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 1181.2881355932204,
+        "mean": 1179.3093220338983,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -120,13 +128,14 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
+        "max_observed_score": 0.8663155,
         "probes": 15
       }
     },
     "c_peers+pin": {
       "pin": {
         "enabled": true,
-        "window_changed_rate": 0.0
+        "window_changed_rate": 0.004106776180698152
       },
       "claim_recall": {
         "at_5": 0.9364406779661016,
@@ -134,11 +143,13 @@
       },
       "discoverability": {
         "canonical_in_top_5_rate": 0.5042372881355932,
-        "median_canonical_rank": 2.0,
-        "canonical_found_count": 119
+        "median_canonical_rank": 3.0,
+        "canonical_found_count": 154,
+        "canonical_candidates": 236,
+        "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 1181.2881355932204,
+        "mean": 1179.3093220338983,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -147,6 +158,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
+        "max_observed_score": 0.8663155,
         "probes": 15
       }
     },
@@ -162,10 +174,12 @@
       "discoverability": {
         "canonical_in_top_5_rate": 0.9745762711864406,
         "median_canonical_rank": 1.0,
-        "canonical_found_count": 230
+        "canonical_found_count": 232,
+        "canonical_candidates": 236,
+        "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 1195.7415254237287,
+        "mean": 1195.25,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -174,6 +188,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
+        "max_observed_score": 0.86626136,
         "probes": 15
       }
     },
@@ -189,10 +204,12 @@
       "discoverability": {
         "canonical_in_top_5_rate": 0.9745762711864406,
         "median_canonical_rank": 1.0,
-        "canonical_found_count": 230
+        "canonical_found_count": 232,
+        "canonical_candidates": 236,
+        "canonical_rank_window": 10
       },
       "tokens_per_query": {
-        "mean": 1202.0211864406779,
+        "mean": 1201.5296610169491,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -201,6 +218,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
+        "max_observed_score": 0.86626136,
         "probes": 15
       }
     }

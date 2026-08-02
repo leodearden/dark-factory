@@ -10,18 +10,20 @@ The ONE exception is the last column.  `guard matched (replay)` is a **threshold
 
 A `—` cell is **no measurement**, not a measured zero.
 
+`median canonical rank` carries its denominator as `(n=found/candidates)`.  The median is over the queries where the canonical surfaced AT ALL, so without that suffix an arm that almost never finds the canonical prints the best rank in the table — scored on the handful of queries where it did.  Rank is measured over the full fetch depth, not the k=5 read window, so "outside top-5" and "absent entirely" stay distinguishable.
+
 `pin changed window` is the diagnostic that makes the `+pin` rows readable.  Every variant is scored over a window of the SAME size (k), so an additive pin can only pay off where a read-side transform left headroom in that budget — under grouping, which collapses the window.  A `+pin` row identical to its twin at `0.00` means the pin never fired, which is a different finding from "the pin does not help".  `—` on a pin-off row means the question was never asked.
 
 ## Decision table
 
 | arm | claim recall@5 | claim recall@10 | canonical in top-5 | median canonical rank | tokens/query | guard candidate present | guard matched (replay) | pin changed window |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| status_quo | 0.78 | 0.90 | 0.54 | 2.00 | 3832.7 | 1.00 | 0.00 | — |
-| status_quo+pin | 0.78 | 0.90 | 0.54 | 2.00 | 3832.7 | 1.00 | 0.00 | 0.00 |
-| c_peers | 0.94 | 0.97 | 0.50 | 2.00 | 1181.3 | 0.93 | 0.00 | — |
-| c_peers+pin | 0.94 | 0.97 | 0.50 | 2.00 | 1181.3 | 0.93 | 0.00 | 0.00 |
-| b_grouped | 0.98 | 0.99 | 0.97 | 1.00 | 1195.7 | 0.93 | 0.00 | — |
-| b_grouped+pin | 0.98 | 0.99 | 0.97 | 1.00 | 1202.0 | 0.93 | 0.00 | 0.06 |
+| status_quo | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3832.8 | 1.00 | 0.00 | — |
+| status_quo+pin | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3832.8 | 1.00 | 0.00 | 0.00 |
+| c_peers | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1179.3 | 0.93 | 0.00 | — |
+| c_peers+pin | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1179.3 | 0.93 | 0.00 | 0.00 |
+| b_grouped | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1195.2 | 0.93 | 0.00 | — |
+| b_grouped+pin | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1201.5 | 0.93 | 0.00 | 0.06 |
 
 Token counts come from the `char-proxy:4-chars-per-token` estimator (recorded because a substituted estimator would otherwise be indistinguishable from a measured one).  Guard threshold: 0.92.  Distractor slab: 300 records, identical in every arm.
 
@@ -65,6 +67,6 @@ The **paraphrase band** is the positive pairs no character-level threshold can r
 | --- | --- |
 | `fused-memory/tests/fixtures/write_triage_calibration.jsonl` | 55e242a2c8681fb8a60fdb34e3d5194109781e87 |
 | `fused-memory/tests/fixtures/memory_eval_topic_registry.json` | 02886ef290cde99ce88426cd1d3b5565a551e293 |
-| `fused-memory/tests/fixtures/e2_arm_claims.jsonl` | e522235a82b0117a264ad497e480045f5c761c6d |
-| `fused-memory/tests/fixtures/e2_query_set.jsonl` | 32193693932db83bf4753f1d62331bf5209f2db6 |
-| `fused-memory/tests/fixtures/e2_distractor_slab.jsonl` | 8563918d31bc01aad597000e8472151796d6cd78 |
+| `fused-memory/tests/fixtures/e2_arm_claims.jsonl` | f1fe9cf040dca324e3bd8cb4c13bf2e65da02620 |
+| `fused-memory/tests/fixtures/e2_query_set.jsonl` | 9c48f3d10c2ee63aeb54443769903740d931aa4c |
+| `fused-memory/tests/fixtures/e2_distractor_slab.jsonl` | 5c4a617265ae0de673825a5b2b881c45bef976ca |
