@@ -6824,6 +6824,19 @@ async def run_main_tip_sweep(
 # always-on.
 _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
 
+#: Generous per-test timeout (seconds) injected into the main-tip-sweep
+#: CONFIRM gate's isolated re-run command via ``_with_pytest_timeout_str``.
+#: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` /
+#: ``_SWEEP_PREFILTER_TIMEOUT_SECS``: the serial recovery's ``-o addopts=``
+#: clears pyproject ``addopts`` but NOT the
+#: ``[tool.pytest.ini_options] timeout=60`` default, so without this
+#: explicit override a still-loaded host can starve the isolated confirm
+#: run into a false "still fails" verdict — and unlike the merge gate
+#: (which only holds a merge), a false verdict HERE files a red-main L1.
+#: Kept as a SEPARATE constant from the pre-filter's and the merge gate's
+#: so the three are retuned on their own signals.
+_SWEEP_CONFIRM_TIMEOUT_SECS: int = 300
+
 
 async def _run_isolated_confirm_group(
     worktree: Path,
@@ -7096,9 +7109,18 @@ async def confirm_main_tip_failure_is_real(
     esc-main-sweep-ea2bd3c95e33-2 and the 2026-07-09 park_stop/symlink-loop
     incidents. This function is the harness's confirm-before-alarm gate: it
     extracts the named failing pytest node-ids from *failing_result*, and
-    re-runs JUST those tests, in ISOLATION (serial, addopts cleared — the
-    exact task-2045 recovery), in a FRESH probe worktree pinned at
-    *main_sha* — never the sweep's own contended worktree.
+    re-runs JUST those tests, in ISOLATION (scoped + forced-serial + addopts
+    cleared — the exact task-2045 recovery — plus an explicit generous
+    ``--timeout``), in a FRESH probe worktree pinned at *main_sha* — never
+    the sweep's own contended worktree.
+
+    The ``--timeout`` (``_SWEEP_CONFIRM_TIMEOUT_SECS``, task 3290) is not
+    cosmetic: ``-o addopts=`` clears pyproject's ``addopts`` but NOT its
+    ``[tool.pytest.ini_options] timeout=60`` default, so without the
+    override a still-loaded host could starve this confirmation into a
+    false "still fails" verdict — which here means filing a red-main L1
+    escalation for a flake, the exact false positive this gate exists to
+    prevent.
 
     Returns:
         ``False`` (suppress the alarm) ONLY when every named failing test
@@ -7218,8 +7240,11 @@ async def confirm_main_tip_failure_is_real(
         # re-run. ALL groups must confirm green to suppress.
         for prefix, group_node_ids in groups.items():
             mc = module_configs[prefix]
-            scoped_cmd = _serial_pytest_str(
-                _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+            scoped_cmd = _with_pytest_timeout_str(
+                _serial_pytest_str(
+                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                ),
+                _SWEEP_CONFIRM_TIMEOUT_SECS,
             )
             scoped_mc = replace(
                 mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
