@@ -13896,3 +13896,65 @@ class TestAdvanceMainIndexLockStandoff:
             cwd=git_ops.project_root,
         )
         assert rc != 0, f'expected {MERGE_PARK_REF} to be absent after advance'
+
+    async def test_clean_tree_race_is_gated_too(self, git_ops: GitOps):
+        """The stand-off must key on `is_on_main`, NOT on `dirty_tracked`.
+
+        With a CLEAN project_root tree the code skips the park entirely,
+        advances the ref, and then syncs the working tree with
+        `git read-tree -u --reset HEAD`. That sync's failure is only LOGGED
+        while the outcome still reports 'advanced' — so under a foreign lock
+        main LANDS with a stale project_root tree, and the NEXT advance then
+        reads the whole old-main→new-main delta as "dirty" WIP, cascading
+        into wip_overlap/park damage.
+
+        A gate placed inside `if dirty_tracked:` would leave that hole wide
+        open, because no park is attempted on this path at all.
+        """
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        merge_result = await self._make_merge(
+            git_ops, 'clean-tree-race', 'clean_tree_race.py',
+        )
+
+        # Deliberately leave project_root free of TRACKED modifications, so
+        # advance_main's `dirty_tracked` set is empty and no park is ever
+        # attempted. (An untracked-only `?? .worktrees/` entry is expected
+        # here and deliberately does NOT arm the park — untracked entries
+        # survive read-tree without conflict.)
+        _, unstaged, _ = await _run(
+            ['git', 'diff', '--name-only'], cwd=git_ops.project_root,
+        )
+        _, staged, _ = await _run(
+            ['git', 'diff', '--name-only', '--cached'], cwd=git_ops.project_root,
+        )
+        assert unstaged.strip() == '' and staged.strip() == '', (
+            'this test requires NO tracked modifications in project_root; got '
+            f'unstaged={unstaged!r} staged={staged!r}'
+        )
+
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended', (
+            'a foreign index lock must gate the CLEAN-tree path too — the '
+            'post-advance read-tree sync writes project_root just as the '
+            f'park does; got {result.result!r}'
+        )
+
+        # main must NOT have moved: landing it here is precisely the silent
+        # stale-tree failure described above.
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
