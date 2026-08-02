@@ -554,16 +554,20 @@ async def repoint_task_citations(
     Known limitation: ``get_tasks`` defaults to a single tag, so a multi-tag
     project would need ``list_tags()`` aggregation. Out of scope here.
 
-    Returns a stats dict whose keys are ALWAYS present, on every path.
+    Returns a stats dict whose keys are ALWAYS present, on every path. Scalar
+    counters carry the module's ``stage1_*`` prefix (as
+    :func:`verify_cited_memories`'s do), because they are merged into the same
+    flat Stage-1 stats block where an unprefixed name would collide; the
+    detail LISTS (``terminal_citations``, ``unrepointed``) are consumed
+    structurally by the delete gate and stay unprefixed.
     """
     log = log or logger
     stats: dict[str, Any] = {
-        'citation_tasks_scanned': 0,
-        'citations_repointed': 0,
-        'citation_tasks_repointed': 0,
-        'citation_repoint_failures': 0,
-        'terminal_citations_reported': 0,
-        'repointed_task_ids': [],
+        'stage1_citation_tasks_scanned': 0,
+        'stage1_citations_repointed': 0,
+        'stage1_citation_tasks_repointed': 0,
+        'stage1_citation_repoint_failures': 0,
+        'stage1_terminal_citations_reported': 0,
         'terminal_citations': [],
         'unrepointed': [],
     }
@@ -579,7 +583,7 @@ async def repoint_task_citations(
     for task in tasks:
         if not isinstance(task, dict):
             continue
-        stats['citation_tasks_scanned'] += 1
+        stats['stage1_citation_tasks_scanned'] += 1
         metadata = task.get('metadata')
         # LIVE occurrences only: the tombstone ledger names dead ids by design,
         # so scanning it would make an already-repointed task a citer forever.
@@ -597,7 +601,7 @@ async def repoint_task_citations(
             stats['terminal_citations'].append(
                 {'task_id': task_id, 'status': status, 'paths': paths},
             )
-            stats['terminal_citations_reported'] += 1
+            stats['stage1_terminal_citations_reported'] += 1
             continue
 
         try:
@@ -658,7 +662,7 @@ async def repoint_task_citations(
                     '%d occurrence(s) survive the rewrite at %s',
                     task_id, memory_id, replacement_id, len(residual), residual,
                 )
-                stats['citation_repoint_failures'] += 1
+                stats['stage1_citation_repoint_failures'] += 1
                 stats['unrepointed'].append({
                     'task_id': task_id,
                     'status': status,
@@ -686,7 +690,7 @@ async def repoint_task_citations(
                 'citation repoint failed for task %s (%s -> %s): %s',
                 task_id, memory_id, replacement_id, exc,
             )
-            stats['citation_repoint_failures'] += 1
+            stats['stage1_citation_repoint_failures'] += 1
             stats['unrepointed'].append({
                 'task_id': task_id,
                 'status': status,
@@ -697,16 +701,15 @@ async def repoint_task_citations(
             continue
 
         if interceptor_write_succeeded(resp):
-            stats['citation_tasks_repointed'] += 1
-            stats['citations_repointed'] += count
-            stats['repointed_task_ids'].append(task_id)
+            stats['stage1_citation_tasks_repointed'] += 1
+            stats['stage1_citations_repointed'] += count
         else:
             # A REFUSAL, not an exception — see the docstring.
             log.warning(
                 'citation repoint rejected for task %s (%s -> %s): %s',
                 task_id, memory_id, replacement_id, resp,
             )
-            stats['citation_repoint_failures'] += 1
+            stats['stage1_citation_repoint_failures'] += 1
             stats['unrepointed'].append({
                 'task_id': task_id,
                 'status': status,
