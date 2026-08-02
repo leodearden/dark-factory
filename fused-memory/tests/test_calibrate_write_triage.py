@@ -869,7 +869,9 @@ class TestDeriveBandsPerCategory:
     POOLED_T_HIGH = 0.75
     POOLED_T_LOW = 0.5
 
-    def _derive(self, by_category: dict, pooled_t_high=POOLED_T_HIGH) -> dict:
+    def _derive(
+        self, by_category: dict, pooled_t_high: float | None = POOLED_T_HIGH
+    ) -> dict:
         return _mod().derive_bands_per_category(
             by_category, pooled_t_high, self.POOLED_T_LOW,
         )
@@ -1148,7 +1150,9 @@ def _report(scores: dict, t_high, t_low, reason=None, recall=None, **kwargs) -> 
     )
 
 
-def _per_category(pooled_t_high=0.80, pooled_t_low=0.70) -> dict:
+def _per_category(
+    pooled_t_high: float | None = 0.80, pooled_t_low: float | None = 0.70
+) -> dict:
     """A realistic per-category block: one calibrated, two refused.
 
     Mirrors the shape the committed fixture actually produces — a category
@@ -1521,7 +1525,13 @@ def _without_write_triage_block(text: str) -> list[str]:
     return kept
 
 
-def _call(text: str, t_high=0.87, t_low=0.61, path='calibration/r.json', **kwargs) -> str:
+def _call(
+    text: str,
+    t_high: float | None = 0.87,
+    t_low: float | None = 0.61,
+    path='calibration/r.json',
+    **kwargs,
+) -> str:
     return _mod().write_triage_config_block(text, t_high, t_low, path, **kwargs)
 
 
@@ -2098,7 +2108,7 @@ class TestCommittedPerCategoryEvidenceIsRecorded:
         self, records: list[dict]
     ) -> None:
         _, report = self._committed()
-        fixture_categories = {r.get('category') for r in records if r.get('category')}
+        fixture_categories = {c for r in records if (c := r.get('category'))}
         assert fixture_categories == {
             'procedural_knowledge',
             'observations_and_summaries',

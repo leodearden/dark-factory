@@ -839,9 +839,12 @@ def ann_pairs_from_neighbors(
 
         # The cutoff that APPLIES to this record. Absent from a mapping means
         # UNCALIBRATED for that category — its hits are not eligible at all,
-        # rather than gated by a number measured on another population.
+        # rather than gated by a number measured on another population. A
+        # record carrying no category (or a non-string one) is uncalibrated by
+        # the same rule: there is no category whose cutoff could apply to it.
+        category = memory.get('category')
         cutoff = (
-            threshold.get(memory.get('category'))
+            (threshold.get(category) if isinstance(category, str) else None)
             if isinstance(threshold, Mapping)
             else threshold
         )

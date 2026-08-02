@@ -1793,9 +1793,12 @@ class TestWriteTriageConfig:
         """
         from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
 
-        assert WriteTriageConfig(t_high='0.9').t_high == 0.9
+        # The numeric strings are deliberately off-type: the declared fields are
+        # float / dict[str, float], and what this asserts is precisely that
+        # pydantic coerces the YAML-scalar spelling the same way for both.
+        assert WriteTriageConfig(t_high='0.9').t_high == 0.9  # pyright: ignore[reportArgumentType]
         assert WriteTriageConfig(
-            t_high_by_category={'procedural_knowledge': '0.9'},
+            t_high_by_category={'procedural_knowledge': '0.9'},  # pyright: ignore[reportArgumentType]
         ).t_high_by_category == {'procedural_knowledge': 0.9}
 
     def test_one_bad_entry_rejects_the_whole_map(self):
