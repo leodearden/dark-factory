@@ -243,11 +243,11 @@ def run_scan_cli(
 
     Exit codes: 0 = clean, 1 = at least one match found, 2 = no tasks.db could
     be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS /
-    the dark-factory default.
+    the dark-factory default, 3 = every resolved database was unreadable, so
+    NOTHING was scanned (never treat 3 as a clean run).
 
-    Note that 0 also covers "every resolved database was unreadable" — see the
-    KNOWN GAP comment at the ``_unreadable`` discard below before relying on
-    this exit code in cron/CI.
+    A SINGLE unreadable database among several is not exit 3: it stays a
+    warn-and-continue skip, and the readable remainder decides 0 vs 1.
 
     *render* receives the collected matches and the parsed Namespace and
     returns the exact text to print — that is where each scanner's
@@ -260,25 +260,25 @@ def run_scan_cli(
         print(NO_DB_RESOLVED_MESSAGE, file=sys.stderr)
         return 2
 
-    # KNOWN GAP, PRE-EXISTING — deliberately preserved by this extraction.
-    # `unreadable` is dropped, so when EVERY resolved database fails to open
-    # the scanner still exits 0, indistinguishable from a genuinely clean
-    # sweep (the stderr warnings are the only signal). That reads as a
-    # no-silent-fail-soft violation against
-    # docs/legibility/design-invariants.md — the very rule cited in this
-    # module's docstring as why audit_wiped_metadata_files.py keeps a distinct
-    # exit 3 for the same condition.
-    #
-    # NOT fixed here on purpose: task 3336 is a pure extraction whose
-    # contract is "no behaviour change", checkable by diffing these bodies
-    # against the pre-extraction copies. Verified the base branch behaved
-    # identically (2e85a165df:scripts/scan_task_toolcall_leaks.py built the
-    # same `unreadable` list and likewise never consulted it), so changing
-    # the exit code here would be a silent behaviour change smuggled into a
-    # refactor. Filed instead as ticket tkt_0RRZ2KVR9ATP756VRBK0RAT5MA, which
-    # proposes returning 3 and lists the tests that pin the status quo.
-    matches, _unreadable = sweep_databases(db_paths, scan_fn)
+    matches, unreadable = sweep_databases(db_paths, scan_fn)
 
     print(render(matches, args))
+
+    # Gate on the COUNT, not on "unreadable and not matches": the second
+    # element here is MATCHES, not successfully-scanned databases (unlike
+    # audit_wiped_metadata_files.py's `audits`, whose condition does not port
+    # verbatim). One unreadable db beside a readable CLEAN one yields
+    # matches=[] too, and that partial failure must stay 0. db_paths is
+    # non-empty by the early return above, and every path either succeeds or
+    # lands in `unreadable`, so this equality is exactly "every resolved
+    # database was unreadable".
+    if len(unreadable) == len(db_paths):
+        # Nothing was scanned at all — never report that as a clean sweep.
+        print(
+            "error: every resolved database was unreadable; NOTHING was "
+            "scanned (this is not a clean result)",
+            file=sys.stderr,
+        )
+        return 3
 
     return 1 if matches else 0
