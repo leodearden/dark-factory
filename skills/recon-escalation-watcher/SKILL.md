@@ -100,7 +100,7 @@ a severity, highest **`dedupe_count`** first (recurrence = persistence = signal)
 ```bash
 cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
   --queue-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations \
-  [--exclude-id <esc-id>] [...] 2>&1
+  [--exclude-id <esc-id>] [--exclude-file <path>] [...] 2>&1
 ```
 
 Run as a **background task** (`run_in_background`). **No `--level`** — recon
@@ -116,6 +116,87 @@ each item deliberately left pending so the initial scan and event loop skip it.
 `--exclude-id` also suppresses event-loop wakes from dedupe rewrites of those
 files (MOVED_TO events on the excluded file are silently ignored). Pass both the
 bare id (`esc-recon-abc-1`) and `.json`-suffixed forms — both are accepted.
+For a parked set this large, prefer the bulk form of the same mechanism:
+`--exclude-file <path>` takes a newline-delimited esc-id list, and
+`current_excludes()` (`escalation/src/escalation/watcher.py:224-225`) calls
+`_read_exclude_file` on every invocation — once for the initial scan
+(`watcher.py:246`) and again on every poll of the event loop
+(`watcher.py:269`) — so it excludes only the ids you actually listed, with
+no masking window, and the parked set can grow mid-run just by appending a
+line, no watcher restart needed.
+
+Since this skill invokes `python -m escalation.watcher` directly — no
+wrapper script owns an exclude-file for you the way the sibling skill's
+does (see below) — name a conventional path yourself:
+`<queue-dir>/.watcher-exclude-recon`, a dotfile that the watcher's own
+`esc-*.json` glob safely ignores (`_initial_scan`, `watcher.py:85`; the
+same pattern also gates `EscalationQueue`'s own reads,
+`escalation/src/escalation/queue.py:431` and `:509`). The name must also
+not end in `.json`: the dashboard's read-only recon subsection globs the
+broader `*.json` (not `esc-*.json`) over this same directory
+(`dashboard/src/dashboard/data/escalations.py:89`), so a `.json`-suffixed
+name would surface there as a phantom escalation record. The chosen name
+mirrors the sibling wrapper's own in-queue-dir dotfile convention
+(`.watcher-rearm-exclude-l2`). Append with `echo <esc-id> >>
+<path>`: `_read_exclude_file`'s docstring (`watcher.py:128-132`) blesses a
+single short-line append as atomic on POSIX, and a torn multi-write append
+is self-healing on the next poll. The reader is fail-open — a missing or
+unreadable file yields an empty set, retried next poll
+(`watcher.py:134-140`) — so a lost or not-yet-created exclude file just
+degrades to re-firing on parked items: noisy, never silent. Blank lines and
+`#` comments are skipped (`watcher.py:143-146`), so the file can be
+annotated.
+
+**`--baseline` is NOT safe for this loop — do not reach for it here**,
+even though `escalation.watcher` accepts it as a flag. `_snapshot_pending_ids()`
+(`watcher.py:151-158`) freezes the pending-id set exactly once, at launch,
+strictly before `add_watch` arms the inotify watch (`watcher.py:238` runs
+before `watcher.py:243`) — and unlike `--exclude-file`, that snapshot is
+never re-read afterward (`current_excludes()`, `watcher.py:225`; the code's own comment at
+`watcher.py:227-237` reasons only about the narrower snapshot→`add_watch`
+race, not this one). This loop's handling phase is long — draining,
+handling dozens of parked records, and filing a cockpit DecisionRecord for
+each takes real wall-clock time between one watcher restart and the next — so
+any escalation recon files *during that window* is already on disk by the
+time the following restart takes its `--baseline` snapshot. That new
+escalation gets folded straight into the snapshot and is excluded from both
+the initial scan (`watcher.py:246`) and the event loop (`watcher.py:269-286`)
+for that run's entire lifetime, despite never having been drained or
+triaged by anyone. It is worse than a one-cycle miss: the snapshot is
+retaken at *every* restart while the item is still pending, so it stays
+masked cycle after cycle until some unrelated, newer escalation happens to
+fire the watcher and the next drain re-finds it. And the wait here is
+**unbounded** — this skill's watcher invocation carries no `--timeout`, so
+`deadline` stays `None` and the event loop blocks indefinitely
+(`watcher.py:252-264`), with no expiry to force a restart-and-redrain. Net
+effect: with `--exclude-id` / `--exclude-file`, an escalation filed *during
+the handling window* is not on the exclude list, so it fires at the next
+watcher start like any other pending item — normal, expected, and loud.
+With `--baseline` that same new escalation is instead swallowed by the
+launch snapshot into a silent, unbounded delay in this queue's **sole
+closer**.
+
+With PARK now the default disposition for `reconciliation_stale_gate_backlog` /
+`reconciliation_stale_human_operator`, the parked set is structurally large
+— these two categories make up the *entire* pending queue today (dozens of
+records; see the dated census in the playbook row below for the current
+count) — so hand-listing one `--exclude-id` per record does not scale; use
+`--exclude-file` for it, not `--baseline`. The sibling
+`skills/escalation-watcher/SKILL.md` documents `--baseline` as an available
+flag too, but that is not a counterexample: its Main Loop restarts the
+watcher *first* and drains only after confirming it's up, and its step 7 is
+`Go to 1`, so **every** restart there is immediately followed by a fresh,
+authoritative drain — that skill says as much at its lines 93-94, that the
+fired escalation "is just the wake ... the drain re-finds it (still
+pending) plus anything new." Its documented invocation also passes
+`--timeout 3600` (`skills/escalation-watcher/SKILL.md:133-136`), so even a
+completely quiet queue force-restarts and re-drains at least once an hour.
+Tellingly, that skill's own re-arming guidance for its parked set does not
+reach for `--baseline` either — it routes through a wrapper-owned
+`--exclude-file` instead (`skills/escalation-watcher/SKILL.md:165-175`,
+`scripts/watcher-rearm.sh`, default path
+`<queue-dir>/.watcher-rearm-exclude-l2`). `--exclude-file` — not
+`--baseline` — is what is actually consistent across both watcher skills.
 
 **Process safety:** only stop watcher processes you started via background task
 controls. Never `pkill` by pattern.
@@ -188,6 +269,111 @@ Both archive the record. Be specific in the note — it is the only audit trail.
 - **`dependency_discovered`** — if a real prerequisite task exists, note it; else
   file-a-real-task. Then resolve.
 - **`cleanup_needed`** — file-a-real-task (two-phase), then resolve.
+- **`reconciliation_stale_gate_backlog`** (blocking) — a task has sat
+  `blocked` on a human-gated milestone gate for 48h+ (Stage 1's aging
+  detector, `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).
+  **Default: PARK.** Leave it pending, file a cockpit DecisionRecord via
+  `write-decision` (see "Filing Parked Decisions to the Cockpit Registry
+  (C8)" below), and append its esc-id to the exclude file
+  (`<queue-dir>/.watcher-exclude-recon`) so the watcher's next (re)start
+  skips it — not `--exclude-id`, which does not scale at this queue's size
+  (see "Re-arming over deliberately-pending items" above).
+  **Why park, not resolve:** recon files a fresh gate-backlog escalation for
+  a task only when `has_open_l1(task_id,
+  category='reconciliation_stale_gate_backlog')` is false
+  (`maybe_escalate_stalled_gate_backlog`, same module, lines 483-492) — the
+  open pending record itself IS the dedup. Resolving it re-arms the filing
+  rule, and if the task is still `blocked` with a `metadata.gate_escalated_at`
+  stamp older than 48h, recon re-files `esc-<task>-N+1` on the very next
+  Stage 1 cycle (`extract_stalled_gate_backlog_task_ids`, same module, lines
+  198-237). This is not theoretical: resolving-to-tidy causes measured
+  re-file churn, so do **not** resolve this category just to shrink the
+  queue. Observed in `data/reconciliation/escalations/archive/` (as of
+  2026-08-02): `esc-650-1` resolved 2026-07-25T12:58Z → `esc-650-2` filed
+  and resolved by 2026-07-25T17:03Z the same day (~4h round trip);
+  `esc-646-1` dismissed 2026-08-01T14:10Z → `esc-646-2` filed and still
+  pending now; `esc-3361-1` resolved 2026-08-02T10:40Z → `esc-3361-2` filed
+  and still pending now. As of 2026-08-02 the pending queue holds 32
+  records, 100% this category, with only one (`esc-648-1`) ever
+  triage-stamped — treat the exact count as a snapshot, not a fixture: it
+  moves with every filing/resolve cycle, so re-census
+  `data/reconciliation/escalations/` yourself if the number matters to your
+  decision. **Resolve only** when the underlying task will genuinely
+  stop qualifying for re-selection — you completed the gate and can close
+  the task, or recon will reconcile the task to a terminal status next
+  cycle regardless. **You cannot drive the gate itself terminal from
+  here:** the gate is a born-at-L2 `milestone_gate` escalation filed on the
+  *target project's own* orchestrator queue, not this one — resolving the
+  recon surfacing changes nothing about the gate or the task. If you find a
+  satisfied-but-unclosable gate (the work is done but you have no path to
+  close the task), say so explicitly in the cockpit decision text as a
+  NO-OP marker, so the next human triaging the queue doesn't have to
+  re-derive that conclusion.
+- **`reconciliation_stale_human_operator`** (blocking) — a task has stayed
+  flagged `human_operator_required` for `STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD`
+  = 5 Stage 1 cycles that survived dedup, filed once per task while it has
+  no open level-1 escalation (`maybe_escalate_stalled_tasks`,
+  `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).
+  Same aging/park shape as `reconciliation_stale_gate_backlog` above —
+  **default: PARK**, file a cockpit DecisionRecord, append its esc-id to
+  the exclude file on the watcher's next start (not `--exclude-id` — see
+  that row above for why); see that row above too for the mechanism and
+  churn evidence, not repeated here. **Asymmetry to know:**
+  this path dedups on an *un-categorized* `has_open_l1(task_id)` inside
+  `maybe_escalate_stalled_tasks` (same module, line 385), so an open
+  `reconciliation_stale_gate_backlog` L1 on
+  the **same task** CAN suppress a would-be HOR escalation, while the
+  reverse can't happen (the gate-backlog lookup is category-scoped).
+  Practically: a parked gate-backlog record may be masking a HOR condition
+  on that same task — don't read "no pending HOR record for this task" as
+  "no HOR condition for this task". **Same resolve-to-tidy trap as above,
+  for a different reason:** the stall marker that counts cycles never
+  resets (same module docstring, lines 48-59) — resolving a HOR escalation
+  while the task is still flagged `human_operator_required` can cause an
+  immediate re-file on the very next cycle, since the accumulated cycle
+  count is already at or past the threshold.
+
+**Drain-side shortcut — the exclude file only quiets the watcher, not the
+drain:** Main Loop step 5's `get_pending_escalations()` has no exclusion
+mechanism of its own and returns every pending record each cycle, parked
+or not. For an esc-id you've already parked in a prior cycle, don't
+re-read and re-reason about it from scratch each time: the cockpit
+`--id` is idempotent on the esc-id ("Filing Parked Decisions to the
+Cockpit Registry (C8)" below — re-filing the same id overwrites rather
+than duplicates), so if you recognize you've already filed a decision for
+it, just re-affirm PARK and move on instead of re-deriving the decision
+text.
+
+**A note on tiering for these two categories:** the comparison table above
+already says "Tiering | **none** — recon files flat, no levels" — that
+stays architecturally true, but it is tempting to reach for
+`mcp__escalation__promote_to_l2` anyway when a finding feels L2-worthy.
+Doing so from a recon-watch session actually **succeeds**: the recon
+harness builds its 8103 server with the same `create_escalation_server(...)`
+the orchestrator uses
+(`fused-memory/src/fused_memory/reconciliation/harness.py:2016`), so
+`promote_to_l2` is registered there too, and the identity gate
+(`escalation/src/escalation/authority.py:65`) only denies *identified*
+callers outside `PROMOTE_ALLOWED` — a header-less `recon-watch/mcp.json`
+session is never identified, so the call goes through and mints a real L2
+file. **It works, and that is exactly the problem:** nothing automated ever
+consumes it. The orchestrator harness supervises `escalation-watcher-auto`
+as its own subprocess (`_start_watcher_supervisor`,
+`orchestrator/src/orchestrator/harness.py:10572`), and the rotation prompt
+it builds binds the watched dir to `self.config.escalation.queue_dir`
+(`_run_watcher_rotation`, `harness.py:10618`, queue-dir line at `:10645`
+— `data/escalations` behind 8100/8102); it never opens
+`data/reconciliation/escalations`. That
+does **not** mean the recon queue is invisible to humans — the dashboard's
+Escalations tab does render it, as a read-only `reconciliation` subsection
+built from this same directory (`build_escalation_queues`,
+`dashboard/src/dashboard/data/escalations.py`) — the real gap is that a
+promoted record has no automated L2 triage consumer and no L2 cascade
+actor, so it just sits there as extra queue noise nobody is watching for.
+**This watcher is the actual human-facing consumer of recon findings:** the
+sanctioned way to raise one to a human is the cockpit DecisionRecord
+(§"Filing Parked Decisions to the Cockpit Registry (C8)" below), whose C5b
+decision queue is a surface a human actually works — not `promote_to_l2`.
 
 ## Priority Hierarchy
 
