@@ -21,7 +21,7 @@ including the real-config incident golden — at the end.
 """
 from __future__ import annotations
 
-from orchestrator.pytest_markers import resolve_marker_expression
+from orchestrator.pytest_markers import module_level_marker_names, resolve_marker_expression
 
 # ---------------------------------------------------------------------------
 # resolve_marker_expression (step-1: RED)
@@ -142,3 +142,94 @@ class TestResolveMarkerExpression:
             _pyproject(f'"{_REAL_ADDOPTS}"'), "uv run pytest tests/ -m 'unbalanced",
         )
         assert resolved == 'not warm_lane_bash'
+
+
+# ---------------------------------------------------------------------------
+# module_level_marker_names (step-3: RED)
+# ---------------------------------------------------------------------------
+
+#: The real shape at orchestrator/tests/test_warm_lane_bash_suite.py:231-235,
+#: validated by AST against the live file before any assertion here was written.
+_REAL_PYTESTMARK_SOURCE = """\
+import pytest
+
+PYTEST_TIMEOUT = 960
+
+pytestmark = [
+    pytest.mark.warm_lane_bash,
+    pytest.mark.timeout(PYTEST_TIMEOUT),
+    pytest.mark.xdist_group('warm_lane_bash'),
+]
+"""
+
+
+class TestModuleLevelMarkerNames:
+    """``module_level_marker_names(source) -> frozenset[str]``.
+
+    Returns a LOWER BOUND on every collected item's marker set: only a
+    module-level ``pytestmark`` provably applies to every item in the file, so
+    per-function/class decorators are deliberately excluded.  A name absent from
+    the result is UNKNOWN, not absent — which is exactly what makes the Kleene
+    treatment in ``expression_definitely_deselects`` sound.
+    """
+
+    def test_bare_attribute_assignment(self):
+        assert module_level_marker_names('pytestmark = pytest.mark.slow') == frozenset({'slow'})
+
+    def test_real_warm_lane_list_shape(self):
+        """The incident fixture's own module-level pytestmark."""
+        assert module_level_marker_names(_REAL_PYTESTMARK_SOURCE) == frozenset(
+            {'warm_lane_bash', 'timeout', 'xdist_group'},
+        )
+
+    def test_tuple_form_collects_like_the_list_form(self):
+        source = 'import pytest\npytestmark = (pytest.mark.slow, pytest.mark.timeout(5))\n'
+        assert module_level_marker_names(source) == frozenset({'slow', 'timeout'})
+
+    def test_annotated_assignment(self):
+        source = 'import pytest\npytestmark: list = [pytest.mark.slow]\n'
+        assert module_level_marker_names(source) == frozenset({'slow'})
+
+    def test_module_without_pytestmark_is_empty(self):
+        assert module_level_marker_names('import pytest\n\n\ndef test_a():\n    pass\n') == (
+            frozenset()
+        )
+
+    def test_per_function_decorators_are_not_collected(self):
+        """THE CONSERVATISM PIN.
+
+        A decorator does not provably cover every collected item — the sibling
+        ``test_b`` here is unmarked and would still be selected.  Collecting
+        decorator markers would make the detector unsound in the widening
+        direction; excluding them only makes it under-fire, which is safe.
+        """
+        source = (
+            'import pytest\n\n\n'
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n\n\n'
+            'def test_b():\n    pass\n'
+        )
+        assert module_level_marker_names(source) == frozenset()
+
+    def test_pytestmark_inside_a_class_body_is_not_module_level(self):
+        source = 'import pytest\n\n\nclass TestThing:\n    pytestmark = pytest.mark.slow\n'
+        assert module_level_marker_names(source) == frozenset()
+
+    def test_pytestmark_inside_a_function_body_is_not_module_level(self):
+        source = 'import pytest\n\n\ndef configure():\n    pytestmark = pytest.mark.slow\n'
+        assert module_level_marker_names(source) == frozenset()
+
+    def test_an_unrelated_module_level_name_is_ignored(self):
+        assert module_level_marker_names('import pytest\nothermark = pytest.mark.slow\n') == (
+            frozenset()
+        )
+
+    def test_a_non_marker_element_does_not_suppress_its_siblings(self):
+        source = 'import pytest\nSOME_CONST = 1\npytestmark = [SOME_CONST, pytest.mark.slow]\n'
+        assert module_level_marker_names(source) == frozenset({'slow'})
+
+    def test_syntax_error_is_empty_not_a_raise(self):
+        assert module_level_marker_names('def broken(:\n') == frozenset()
+
+    def test_none_source_is_empty(self):
+        assert module_level_marker_names(None) == frozenset()
