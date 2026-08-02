@@ -230,12 +230,7 @@ WantedBy=default.target
 
 
 def test_find_drift_detects_missing_restart_directives():
-    """find_drift flags all four restart-relevant directives when absent.
-
-    RED until REQUIRED_SERVICE_DIRECTIVES grows to include Restart=on-failure,
-    RestartSec=5, TimeoutStartSec=300, and TimeoutStopSec=90 — today it only
-    lists MEM0_TELEMETRY + WatchdogSec, so find_drift returns [] here.
-    """
+    """find_drift flags all four restart-relevant directives when absent."""
     mod = _load_checker()
     drift = mod.find_drift(_MISSING_RESTART_DIRECTIVES_UNIT)
     assert "Restart=on-failure" in drift
