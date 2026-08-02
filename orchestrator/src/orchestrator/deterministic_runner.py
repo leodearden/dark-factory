@@ -881,8 +881,17 @@ class DeterministicRunner:
 
             <script> <args>
             __rc=$?
-            if [ "$__rc" -ne 0 ]; then <escalation submit …>; fi
+            if [ "$__rc" -ne 0 ]; then <escalation submit …>; __esc=$?
+              if [ "$__esc" -ne 0 ]; then echo "RP-4: …" >&2; exit 97; fi
+            fi
             exit "$__rc"
+
+        A FAILING ``escalation submit`` is no longer swallowed (task 3404): it
+        exits ``proc_supervision.RP4_ESCALATION_SUBMIT_FAILED_RC`` with an
+        ``RP-4: on-failure escalation submit failed rc=… (payload rc=…)`` line
+        on stderr, so an unfiled L2 is both visible in journald and
+        machine-distinguishable.  When the submit succeeds the wrapper still
+        exits the payload's own code, so journald keeps the real restart cause.
 
         Why not a separate ``OnFailure=`` handler unit?  ``systemd-run`` has no
         register-without-start mode — registering a companion handler transient
@@ -955,13 +964,23 @@ class DeterministicRunner:
         #
         # If `escalation` is nonetheless unimportable, the OnFailure branch
         # itself fails and no L2 is filed — the task is already marked
-        # done=scheduled at this point, so the failure would be silently lost.
-        # `RestartPlan._execute_detached_systemd_run` now WARNs at registration
-        # time when it can prove that in-process (the `escalation.submit`
-        # canary).  Operators can verify the same thing directly with:
+        # done=scheduled at this point, so nothing downstream would notice.
+        # That loss is reported twice over, at both ends of the deferral:
+        #
+        #  - At REGISTRATION time, `RestartPlan._execute_detached_systemd_run`
+        #    WARNs as soon as it can prove the import fails in-process (the
+        #    `escalation.submit` canary, task 3453) — while a human is still
+        #    watching the deploy.
+        #  - At FIRE time, the loss is no longer SILENT either (task 3404): the
+        #    fired unit exits the reserved
+        #    proc_supervision.RP4_ESCALATION_SUBMIT_FAILED_RC and prints an
+        #    `RP-4: on-failure escalation submit failed rc=… (payload rc=…)`
+        #    line, so journald carries both the fact and the cause.
+        #
+        # Operators can still verify the same thing directly, ahead of a deploy:
         #   <sys.executable> -c "import escalation"
-        # before deploying.  A marker-file fallback is intentionally not
-        # implemented here to keep the failure path auditable via journald.
+        # A marker-file fallback is intentionally not implemented here to keep
+        # the failure path auditable via journald.
         #
         # End-to-end coverage of this branch lives in
         # test_deterministic_runner.py's TestDefaultScheduleDetachedRestart,

@@ -799,17 +799,20 @@ class RestartPlan:
         on_active_secs = max(int(self.on_active_secs), 5)
         payload = ' '.join(shlex.quote(p) for p in [str(self.script), *self.args])
         if self.on_failure_escalation is not None:
-            # Registration-time canary. The deferred on-failure branch cannot
-            # report its own import failure: the wrapper's trailing
-            # `exit "$__rc"` returns the PAYLOAD's code, so a submit that dies
-            # on ImportError at fire time leaves the transient unit's exit
-            # status unchanged and files NO L2 — invisible except in journald.
-            # This process runs the same interpreter the child will, so it can
-            # prove the invariant here for free (find_spec on an
+            # Registration-time canary. A submit that dies on ImportError at
+            # fire time is NOT silent any more — the wrapper below exits
+            # RP4_ESCALATION_SUBMIT_FAILED_RC and prints an `RP-4:` line (task
+            # 3404) — but that evidence only ever lands in journald, minutes
+            # later, on a unit nobody is watching, and the L2 is still never
+            # filed. This process runs the same interpreter the child will, so
+            # it can prove the invariant here for free (find_spec on an
             # already-imported package is a dict lookup, and this branch runs
             # at most once per scheduled restart) and say so while a human is
-            # still watching the deploy.  The test suite preflights the same
-            # invariant one layer out, against a real child interpreter, in
+            # still watching the deploy. The two reports are complementary,
+            # not redundant: this one is early and in-process, the wrapper's is
+            # authoritative about what actually happened at fire time.  The
+            # test suite preflights the same invariant one layer out, against a
+            # real child interpreter, in
             # test_deterministic_runner.py::_assert_submit_cli_invokable
             # (task 3404).
             try:
@@ -824,29 +827,31 @@ class RestartPlan:
                     'proc_supervision: `escalation.submit` is NOT importable '
                     'from %s (%s) — the deferred /bin/sh -c on-failure branch '
                     'for %s will exit non-zero at fire time and file NO L2 '
-                    'escalation; the wrapper returns the payload rc, so that '
-                    'loss is invisible in the transient unit exit status',
+                    'escalation; the wrapper will report that by exiting %d '
+                    'with an `RP-4: on-failure escalation submit failed` line, '
+                    'but only into journald, long after this deploy',
                     sys.executable, probe_detail, self.transient_unit,
+                    RP4_ESCALATION_SUBMIT_FAILED_RC,
                 )
             on_failure_argv = self.on_failure_escalation.to_submit_argv(sys.executable)
             on_failure = ' '.join(shlex.quote(p) for p in on_failure_argv)
-            # Byte-for-byte reuse of deterministic_runner.py:439-445's wrapper
-            # shape (`_default_schedule_detached_restart`) — same three-part
-            # `payload; __rc=$?; if [ "$__rc" -ne 0 ]; then on_failure; fi;
-            # exit "$__rc"` shell. This IS intentional interim duplication,
-            # not an oversight: task 2237 (this module) is scoped OUT of
-            # deterministic_runner.py — that file belongs to task 2237's
-            # sibling, delta — so until delta lands, this wrapper and
-            # EscalationSpec.to_submit_argv's submit argv are TWO independent
-            # copies of the same shape that must be kept byte-identical by
-            # hand/convention, pinned only by
-            # TestDetachedWrapperExactnessAndRegistrationFailure (step-13)
-            # here and its deterministic_runner.py counterpart. Tracked as a
-            # follow-up (filed as a non-blocking escalation alongside this
-            # comment) for delta to make DeterministicRunner's two mechanisms
-            # delegate to this one helper (EscalationSpec.to_submit_argv /
-            # RestartPlan) instead, retiring the hand-kept-identical coupling
-            # with no behaviour delta.
+            # This is the SINGLE source of truth for the RP-4 wrapper. Both
+            # detached-restart entry points delegate here and build no wrapper
+            # of their own: `deterministic_runner._default_schedule_detached_
+            # restart` and `service_restart.schedule_detached_systemd_restart`
+            # are thin RestartPlan callers (a repo-wide grep for `__rc=$?`
+            # outside tests finds this builder plus one docstring illustration
+            # in deterministic_runner.py, nothing else).
+            #
+            # History (resolved, not an open follow-up): under task 2237 this
+            # wrapper WAS one of two hand-kept-byte-identical copies, because
+            # deterministic_runner.py was scoped out to task 2237's sibling
+            # delta. Task 2238/delta landed and collapsed them, retiring that
+            # coupling. The byte-exact pin lives in test_proc_supervision.py's
+            # TestDetachedWrapperExactnessAndRegistrationFailure, backed there
+            # by two behavioural tests that execute the real wrapper — the
+            # byte pin alone cannot catch a semantic error, since it is built
+            # with this same f-string (task 3404).
             # The on_failure branch's OWN rc is captured into `__esc` and acted
             # on (task 3404). It previously was not: `__rc` came from the
             # payload only and the trailing `exit "$__rc"` re-exited it, so a
