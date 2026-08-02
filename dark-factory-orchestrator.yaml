@@ -95,7 +95,68 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # TestFleetLintCoversEveryWorkspaceMember.
 # test_every_present_workspace_member_tests_dir_is_magicmock_checked rather
 # than silently escaping this gate.
-lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
+#
+# NON-MEMBER TARGETS ADDED DELIBERATELY (task 3485).
+#
+# `conftest.py`, `df_pytest_isolation.py` and `skills` are NOT workspace
+# members; they are named here because before this task they were linted by
+# NOTHING, on checks reporting green. This command targeted only the 7
+# [tool.uv.workspace].members; scripts/orchestrator.yaml targets scripts/;
+# tests/scripts/orchestrator.yaml targets tests/scripts/. Nothing covered
+# these three paths — the same vacuous-gate class tasks 3350 and 3445 closed
+# for tests/scripts/ and scripts/. `skills` is written bare, matching the
+# existing targets' style; ruff traverses the directory.
+#
+# MEASUREMENT: at base main 1f83dbed15, `uv run --project shared ruff check
+# --select E,F,UP,B,SIM,I --ignore E501 --line-length 100 conftest.py
+# df_pytest_isolation.py skills/` returned exactly 2 findings, both SIM105
+# (`try`/`except ImportError`/`pass`) in conftest.py at lines 40 and 45;
+# df_pytest_isolation.py 0, skills/ 0. Both were FIXED — by hand, with
+# contextlib.suppress, in the commit immediately preceding this one — rather
+# than the command being weakened with an exclude or a narrowed target (task
+# 3350's precedent). Fix-and-declare stays atomic: at no point does a declared
+# target carry a finding. That matters because verify.run_full_verification
+# asyncio-gathers over ALL module_configs.values(), not just those a diff
+# touches, and this file sets merge_verify_breadth: "full" — so a red
+# lint_command here blocks every merge, review checkpoint and main-tip sweep
+# repo-wide, on branches with no defect.
+#
+# RULE-SET / LANDING-ORDER NOTE. The measurement above passes the members'
+# rule set as EXPLICIT --select flags because task 3457's root [tool.ruff]
+# table is NOT on main at this base (verified two ways: 5a286fcc36 is not an
+# ancestor of HEAD, and `ruff check --show-settings conftest.py` enables only
+# E401/E402/E7xx/E9/F). So TODAY this command checks these three paths under
+# ruff's BUILT-IN defaults, and widens automatically to E,F,UP,B,SIM,I the
+# moment 3457 lands. Both states are green, deliberately: the fix was measured
+# under the WIDE set, and the built-in defaults are a strict SUBSET of it, so
+# 3457 landing cannot retroactively red-wall main. Do not "simplify" the guard
+# to read the resolved config — that would make it silently weaker today and
+# change meaning later.
+#
+# WHY THE ROOT COMMAND IS THE ONLY LEVER FOR THE TWO ROOT FILES.
+# _discover_module_configs SKIPS a root-level config (prefix == '.'), so
+# conftest.py and df_pytest_isolation.py can never belong to a module config,
+# no matter what orchestrator.yaml is added where. Widening this head is
+# therefore mandatory for them; once made, it covers `skills` through the same
+# lever at zero routing risk (see the WHY NOT skills/orchestrator.yaml block
+# below).
+#
+# SCOPE HONESTY — what this widening does and does not buy. This command runs
+# on the module-config-less path (verify._build_fallback_config). There,
+# verify_plan._scope_to_keyword NARROWS the ruff head to the touched .py
+# files, so a conftest.py-only diff was already ruff'd before this change. The
+# widening bites on the VERBATIM (unscoped) form, which is what runs when a
+# touched file classifies STRUCTURAL — conftest.py is itself such a trigger —
+# or on a docs-only / zero-.py diff. It does NOT run inside
+# run_full_verification's gather, which iterates module_configs.values() only;
+# recorded here rather than left invisible, and carried by the follow-up cited
+# in the block below.
+#
+# Guarded by tests/scripts/test_root_lint_covers_nonmember_py.py.
+# Production code is cited BY SYMBOL throughout this block and never by
+# file:line — task 3445's explicit correction of the convention task 3350
+# established, after every line pin copied forward had already rotted at HEAD.
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
 # The bare ``npx pyright`` spelling is DELIBERATE and safe (task 3367 /
 # esc-3359-1): every ``cd`` target below pins pyright's own interpreter via
 # ``[tool.pyright] venvPath = ".."`` / ``venv = ".venv"`` in its pyproject.toml,
