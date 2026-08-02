@@ -85,36 +85,65 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # finding set there, which is outside this task's locks.
 lint_command: "uv run --project shared ruff check scripts/"
 
-# TYPE IS DELIBERATELY NOT DECLARED YET — the gap is measured, not overlooked
-# (task 3445; follow-up 3456 carries the burn-down).
+# TYPE IS NOW DECLARED — task 3456 closed the gap task 3445 recorded here.
 #
-# The same vacuous-pass mechanism described above applies to
-# type_check_command — verify_plan._derive_module_runs emits the identical
-# reasoned SKIPPED for a falsy type_check_command a few lines below the lint
-# one — so TYPE currently passes at rc=0 for every scripts/-confined diff
-# without pyright running. That is a real, open gap. It is stated here rather
-# than left as a silent absence.
+# The same vacuous-pass mechanism the LINT block above describes applies
+# verbatim to type_check_command: verify_plan._derive_module_runs emits the
+# identical reasoned SKIPPED for a falsy type_check_command a few lines below
+# the lint one. Until this line existed, TYPE passed at rc=0 for every
+# scripts/-confined diff without pyright running. Symbol citations, not
+# file:line, for the reason the LINT block gives.
 #
-# It was not closed in the same task because the debt is roughly 50x task
-# 3350's 4-fix precedent: `npx pyright scripts/` returns 206 errors across 14
-# files (162 in scripts/tests/test_legibility_census.py alone; 20 in non-test
-# production scripts, genuine str|None / Optional-narrowing defects).
+# THE 206 -> 395 RISE THIS TASK CAUSED IS EXPECTED, NOT A REGRESSION, and the
+# previous version of this block read as a warning against it — so it is
+# corrected rather than deleted. 3445 measured `npx pyright scripts/` at 206
+# errors / 14 files, then measured 395 after adding "scripts" +
+# "scripts/legibility" to the root pyproject.toml [tool.pyright] extraPaths,
+# and reverted. 3456 added those two entries BACK and kept them: 9 of the
+# original 206 were reportMissingImports for the flat modules
+# census/codebook/coder/digest/inventory, and resolving them is what lets
+# pyright check against real signatures instead of Unknown. The extra 189 were
+# always latent; they were merely invisible. Two of the 206 were the reverse
+# symptom — `import config` in scripts/legibility/census.py resolving to the
+# WRONG module — and the extraPaths entries fixed those for free.
 #
-# The obvious "it is only unresolved imports" hypothesis was TESTED AND
-# DISPROVED — do not repeat the experiment blind. 9 of the errors are
-# reportMissingImports for census/codebook/coder/digest/inventory, flat
-# modules that scripts/tests/conftest.py puts on sys.path at runtime and
-# pyright cannot see. Adding "scripts" + "scripts/legibility" to the root
-# pyproject.toml [tool.pyright] extraPaths made it WORSE, not better:
-# 206 -> 395 errors (test_legibility_census.py alone 162 -> 350), because
-# resolving the imports lets pyright check against the real signatures and
-# surfaces a much larger latent mismatch surface. The experiment was reverted.
-# Plan against 395, not 206.
+# WHY `npx pyright scripts/` AND NOT A NARROWER FORM. It matches the sibling
+# tests/scripts/ invocation style exactly, and it runs FROM THE REPO ROOT, so
+# it resolves against the ROOT [tool.pyright] table — which is why those two
+# extraPaths entries are load-bearing for this command rather than a general
+# config preference, and why they are pinned by
+# tests/scripts/test_scripts_module_config.py::
+# test_root_pyright_extrapaths_resolves_scripts_imports. Remove either entry
+# and this gate goes red for reasons unrelated to any diff, which is how a
+# gate gets suppressed and dies. This command is guarded by
+# test_scripts_diff_is_type_gated in that same file.
 #
-# Declaring `type_check_command: "npx pyright scripts/"` before that tree is
-# clean is not a transiently-red gate, it is a fleet-wide outage — see the
-# run_full_verification / merge_verify_breadth reasoning above. The burn-down
-# and the declaration must land in one atomic commit.
+# THE BURN-DOWN, measured. 395 errors was 98 distinct (file, line) sites, not
+# 395 edit sites — pyright re-reports a union-typed expression once per union
+# member per use, so the raw count over-reports the edit surface by 4-5x. 350
+# of the 395 sat on 63 lines of scripts/tests/test_legibility_census.py, and a
+# single missing return annotation on its _run_census_kwargs helper generated
+# most of them. Cleared with 121 inserted / 23 deleted lines across 12 files,
+# ZERO `# type: ignore`, ZERO `# pyright: ignore` and ZERO --exclude flags —
+# the same fix-don't-exclude precedent tasks 3350 and 3445 set for lint, and
+# a property test_scripts_diff_is_type_gated asserts on the command directly.
+# The production-module fixes were annotation and narrowing ONLY (bind a
+# comprehension guard's value to a local, narrow a field, narrow a signature);
+# no runtime assert or raise-on-None was added, because every one of those
+# sites was a pyright narrowing limitation rather than a reachable None-path,
+# and a runtime guard would have changed behaviour on an unreachable path.
+#
+# NEW SIDE EFFECT, recorded so it is not rediscovered as a surprise: this
+# declaration is what makes scripts/ diffs read file CONTENT at all.
+# verify_plan._derive_module_runs computes need_structural from
+# bool(mc.type_check_command), so a diff touching a module that defines a
+# TypedDict or Protocol — scripts/repair_wiped_metadata_files.py is the one
+# such module here — widens pyright from FILE_SCOPED to the unscoped
+# FULL_SUITE form. MEASURED at declaration time on this host, two runs of the
+# unscoped `npx pyright scripts/`: 46.3s and 42.1s, both at 0 errors / 0
+# warnings / 0 informations (3445 measured 57s on the same command against the
+# pre-burn-down tree).
+type_check_command: "npx pyright scripts/"
 
 # verify_command_timeout_secs is deliberately left UNSET here, which means this
 # module inherits the repo-root whole-fleet ceiling (3600s) for each of its

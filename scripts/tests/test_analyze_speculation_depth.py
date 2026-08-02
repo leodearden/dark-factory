@@ -146,11 +146,17 @@ class TestComputeCalibrationF2:
 class TestComputePerDepth:
     def test_pass_total_per_depth(self):
         per_depth = mod.compute_per_depth(F3_MERGE_VERIFY)
+        # compute_per_depth returns dict | None — the None is REAL (it is
+        # format_report's CONFOUNDED runner-split trigger), so it is narrowed
+        # here rather than narrowed away in the signature. These fixtures all
+        # carry usable depths, so None is unreachable in this class.
+        assert per_depth is not None
         counts = {d: (v['pass'], v['total']) for d, v in per_depth.items()}
         assert counts == {0: (2, 2), 1: (1, 2), 2: (0, 1)}
 
     def test_rate_per_depth(self):
         per_depth = mod.compute_per_depth(F3_MERGE_VERIFY)
+        assert per_depth is not None
         rates = {d: v['rate'] for d, v in per_depth.items()}
         assert rates == {0: 1.0, 1: 0.5, 2: 0.0}
 
@@ -159,6 +165,7 @@ class TestComputePerDepth:
         # so a real event can carry depth as the string "1".
         events = [_mv('s', True, depth='1')]
         per_depth = mod.compute_per_depth(events)
+        assert per_depth is not None
         assert set(per_depth) == {1}
         assert per_depth[1]['pass'] == 1
         assert per_depth[1]['total'] == 1
@@ -166,6 +173,7 @@ class TestComputePerDepth:
     def test_none_depth_excluded(self):
         events = [_mv('n', True, depth=None), _mv('z', True, depth=0)]
         per_depth = mod.compute_per_depth(events)
+        assert per_depth is not None
         assert set(per_depth) == {0}
 
     def test_missing_depth_key_excluded(self):

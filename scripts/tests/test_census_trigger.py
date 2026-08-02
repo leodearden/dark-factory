@@ -284,6 +284,8 @@ def test_load_census_state_valid_file_is_ok_with_no_warning(tmp_path, caplog):
         status, data = ct.load_census_state(path)
 
     assert status == "ok"
+    # tuple[str, dict | None] — None only for the missing/malformed statuses.
+    assert data is not None
     assert data["last_census_at"] == "2026-07-01T00:00:00+00:00"
     assert data["last_census_report"] == "plans/confusion-census-2026-07-01.md"
     assert data["last_census_done_count"] == 500

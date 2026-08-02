@@ -103,6 +103,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import overload
 
 import yaml
 
@@ -112,10 +113,24 @@ from legibility.config import Census as _LegibilityCensus
 logger = logging.getLogger("legibility.census_trigger")
 
 
+@overload
+def _as_utc(value: datetime) -> datetime: ...
+
+
+@overload
+def _as_utc(value: None) -> None: ...
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     """Normalize a datetime to timezone-aware UTC. A naive datetime (e.g.
     parsed from a bare `YYYY-MM-DD` codebook date) is assumed to already be
-    UTC. `None` passes through unchanged."""
+    UTC. `None` passes through unchanged.
+
+    Overloaded because the pass-through is exactly correlated with the input:
+    the plain `datetime | None -> datetime | None` signature discarded that,
+    so `evaluate`'s `now` (declared non-Optional) came back Optional and made
+    every subsequent arithmetic on it a type error. The overloads state what
+    the body already does; the runtime implementation is unchanged."""
     if value is None:
         return None
     if value.tzinfo is None:

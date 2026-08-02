@@ -160,10 +160,12 @@ def _assistant_text(record: dict[str, Any]) -> str:
     content = _message_content(record)
     if not isinstance(content, list):
         return ''
+    # Walrus-bound so the isinstance narrowing reaches the element expression;
+    # see the note in digest.py's _first_text_block. Filtering is unchanged.
     parts = [
-        block.get('text') for block in content
+        block_text for block in content
         if isinstance(block, dict) and block.get('type') == 'text'
-        and isinstance(block.get('text'), str)
+        and isinstance(block_text := block.get('text'), str)
     ]
     return '\n'.join(parts).lower()
 
@@ -348,9 +350,9 @@ def _first_user_turn_text(record: dict[str, Any] | None) -> str:
         return content
     if isinstance(content, list):
         parts = [
-            block.get('text') for block in content
+            block_text for block in content
             if isinstance(block, dict) and block.get('type') == 'text'
-            and isinstance(block.get('text'), str)
+            and isinstance(block_text := block.get('text'), str)
         ]
         return '\n'.join(parts)
     return ''

@@ -32,11 +32,13 @@ import sys
 from pathlib import Path
 
 # Both modules live in <repo>/scripts, which tests/scripts/conftest.py puts on
-# sys.path at collection time. scripts/ is a flat script directory, not a
-# package src root, so it is deliberately absent from [tool.pyright] extraPaths
-# in the root pyproject.toml — hence the targeted ignore, matching the same
-# convention at tests/scripts/test_reviewer_redundancy_diagnostic.py:6.
-from audit_wiped_metadata_files import (  # pyright: ignore[reportMissingImports]
+# sys.path at collection time. As of task 3456, scripts/ and scripts/legibility/
+# are ALSO listed in [tool.pyright] extraPaths in the root pyproject.toml — a
+# precondition for the `scripts` module's own declared type gate — so these
+# imports resolve statically too and need no ignore. This comment previously
+# asserted the opposite ("deliberately absent from extraPaths"); 3456 falsified
+# it. Same correction in tests/scripts/test_migrate_metadata_modules_to_files.py.
+from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
     AuditCoverage,
     CONFIRMED_NULL_SHA_DONE_PATH,
@@ -48,7 +50,7 @@ from audit_wiped_metadata_files import (  # pyright: ignore[reportMissingImports
     WipeCandidate,
 )
 
-from repair_wiped_metadata_files import (  # pyright: ignore[reportMissingImports]
+from repair_wiped_metadata_files import (
     CLIENT_NAME,
     EXIT_NOTHING_SCANNED,
     EXIT_NO_ROOT,
@@ -1338,7 +1340,7 @@ def test_repair_client_does_not_restate_the_parents_handshake():
     defect present. The assertion message below says what to do about that, so
     nobody reaches for the one bad way out of the pair.
     """
-    from migrate_metadata_modules_to_files import (  # pyright: ignore[reportMissingImports]
+    from migrate_metadata_modules_to_files import (
         FusedMemoryClient,
     )
 
@@ -1373,7 +1375,7 @@ def test_repair_handshake_is_the_parents_with_only_the_name_substituted():
     ``test_make_client_is_attributable_to_this_repair_not_the_migration`` exists
     for.
     """
-    from migrate_metadata_modules_to_files import (  # pyright: ignore[reportMissingImports]
+    from migrate_metadata_modules_to_files import (
         FusedMemoryClient,
     )
 

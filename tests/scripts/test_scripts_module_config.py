@@ -1,18 +1,22 @@
-"""Routing contract: the ``scripts/`` module config must actually GATE lint.
+"""Routing contract: the ``scripts/`` module config must actually GATE lint and type.
 
 Task 3445. ``scripts/orchestrator.yaml`` declared only ``test_command``, so
 every diff confined to ``scripts/`` cleared the LINT check without ruff ever
 running — 71 tracked ``.py`` files (operator tooling, the ``scripts/legibility/``
-monitors, 40 test modules) gated by nothing.
+monitors, 40 test modules) gated by nothing. Task 3456 closed the identical
+TYPE gap, which 3445 measured and recorded in that yaml as knowingly-open
+rather than leaving it a silent absence; the burn-down had to land first,
+because declaring a red command here is a fleet-wide outage, not a transient
+failure.
 
-Omitting ``lint_command`` does not leave a fallback in place, it DELETES the
-gate: ``verify_plan._derive_module_runs`` emits an explicit
-``ScopeKind.SKIPPED`` PlannedRun with ``cmd=None`` for a falsy
-``lint_command``; ``verify._executed_module_configs_from_plan`` renders that
-SKIPPED slot back to ``None``; ``verify._run_or_skip_timed`` turns a None
-command into a ``CheckRun.skipped`` that is VACUOUSLY PASSING at rc=0. This is
-the same gap task 3350 closed for ``tests/scripts/``, against whose comment
-block ``scripts/`` was measured.
+Omitting ``lint_command`` or ``type_check_command`` does not leave a fallback
+in place, it DELETES the gate: ``verify_plan._derive_module_runs`` emits an
+explicit ``ScopeKind.SKIPPED`` PlannedRun with ``cmd=None`` for a falsy
+command; ``verify._executed_module_configs_from_plan`` renders that SKIPPED
+slot back to ``None``; ``verify._run_or_skip_timed`` turns a None command into
+a ``CheckRun.skipped`` that is VACUOUSLY PASSING at rc=0. This is the same gap
+task 3350 closed for ``tests/scripts/``, against whose comment block
+``scripts/`` was measured.
 
 Cited by SYMBOL, deliberately never by file:line. This guard's first draft
 pinned line numbers — adapted from the sibling guard's own pins, which had
@@ -47,6 +51,8 @@ from __future__ import annotations
 
 import pathlib
 import shlex
+import tomllib
+from typing import Any
 
 from orchestrator import verify, verify_cmd, verify_plan
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
@@ -73,10 +79,74 @@ SAMPLE_TOUCHED_FILE = 'scripts/tests/test_census_trigger.py'
 # originally carried were all stale at HEAD and sent readers to unrelated code.
 _VACUOUS_PASS = (
     'verify_plan._derive_module_runs emits a SKIPPED PlannedRun with cmd=None '
-    'for a falsy lint_command, verify._executed_module_configs_from_plan '
-    'renders that back to None, and verify._run_or_skip_timed turns a None '
-    'command into a CheckRun.skipped that is VACUOUSLY PASSING at rc=0'
+    'for a falsy lint_command or type_check_command, '
+    'verify._executed_module_configs_from_plan renders that back to None, and '
+    'verify._run_or_skip_timed turns a None command into a CheckRun.skipped '
+    'that is VACUOUSLY PASSING at rc=0'
 )
+
+
+# The two extraPaths entries the declared type gate depends on, and the flat
+# modules that stop resolving without them. Measured, not assumed: at the
+# commit before task 3456 added these entries, `npx pyright scripts/` reported
+# exactly 9 reportMissingImports naming these five modules.
+_REQUIRED_EXTRA_PATHS = ('scripts', 'scripts/legibility')
+_UNRESOLVED_WITHOUT = ('census', 'codebook', 'coder', 'digest', 'inventory')
+
+
+def _load_root_pyright_config() -> dict[str, Any]:
+    """Return the ``[tool.pyright]`` section of the ROOT pyproject.toml, or {}.
+
+    Same shape as ``dashboard/tests/test_pyright_config.py::_load_pyright_config``,
+    pointed at REPO_ROOT instead of a package root — the root table is the one
+    that governs, because the declared type gate runs from the repo root.
+    """
+    toml_path = REPO_ROOT / 'pyproject.toml'
+    assert toml_path.is_file(), f'pyproject.toml not found at {toml_path}'
+    with open(toml_path, 'rb') as fh:
+        config = tomllib.load(fh)
+    return config.get('tool', {}).get('pyright', {})
+
+
+# The two ROOT [tool.pyright] keys that carve paths back out of a run without
+# the command line changing at all: `exclude` drops the files from analysis
+# entirely, `ignore` keeps analysing them but suppresses every diagnostic they
+# produce. Either one naming scripts/ un-gates it while the declared
+# `npx pyright scripts/` stays byte-identical and still exits 0 — the same
+# reports-green failure mode as a None command, reached a different way.
+_CARVE_OUT_KEYS = ('exclude', 'ignore')
+
+
+def _root_carve_outs_naming(segment: str) -> list[str]:
+    """Root ``[tool.pyright]`` exclude/ignore entries that can reach INTO ``<segment>/``.
+
+    Component-wise and ROOT-ANCHORED, not substring, for the same reason
+    ``_targets`` tests exact-element membership: ``'scripts'`` is a substring of
+    ``'tests/scripts'``, and these entries are resolved relative to the repo
+    root. An entry is reported only when it can match a path under
+    ``<segment>/`` — either it is rooted there (``scripts``, ``./scripts``,
+    ``scripts/tests/**``) or it opens with the recursive wildcard and names
+    *segment* later (``**/scripts/**``).
+
+    Deliberately NOT reported: ``tests/scripts`` (rooted in the SIBLING tree —
+    excluding it un-gates that module, not this one, and reporting it here
+    would mis-diagnose which gate is affected) and ``**/node_modules`` and
+    friends (pyright's own defaults, which name nothing under scripts/).
+    """
+    config = _load_root_pyright_config()
+    found: list[str] = []
+    for key in _CARVE_OUT_KEYS:
+        entries = config.get(key, [])
+        if isinstance(entries, str):
+            entries = [entries]
+        for entry in entries:
+            raw = str(entry).replace('\\', '/').split('/')
+            parts = [p for p in raw if p not in ('', '.')]
+            if not parts:
+                continue
+            if parts[0] == segment or (parts[0] == '**' and segment in parts[1:]):
+                found.append(f'{key}={entry!r}')
+    return found
 
 
 def _discovered() -> dict:
@@ -105,8 +175,49 @@ def _executed_for_touched(files: list[str]):
     return executed[0]
 
 
-def _ruff_segment(cmd: str) -> str:
-    """The ``&&``-chained segment of *cmd* that actually invokes ``ruff check``.
+# The two checker spellings these helpers understand, keyed by the phrase that
+# identifies the invoking segment. The ANCHOR — the last whitespace-separated
+# token of the keyword — is the token after which positional targets begin, and
+# it is what makes one implementation serve both CLIs: ruff's is
+# `ruff check <targets>`, so the anchor is its `check` SUBCOMMAND; pyright's is
+# `pyright <targets>` with no subcommand at all, so the anchor is the program
+# name itself. Nothing else about the two invocations differs for these
+# purposes.
+_RUFF = 'ruff check'
+_PYRIGHT = 'pyright'
+
+# Flag PREFIXES that narrow what a directory-wide target actually gets checked,
+# per checker. Prefix-matched, so each entry covers both the `--flag value` and
+# the `--flag=value` spelling.
+#
+# ruff's three exclude spellings are real. PYRIGHT'S SET IS NOT THE SAME, and an
+# earlier draft of this table simply copied ruff's across. Measured against
+# `pyright --help` (v1.1.408): pyright has NO `--exclude` and NO `--ignore` —
+# those two are pyproject `[tool.pyright]` KEYS, not CLI flags, and that vector
+# is checked where it actually lives, by `_root_carve_outs_naming` in assertion
+# (d) below. `--ignoreexternal` does exist but applies only to `--verifytypes`,
+# so it cannot narrow a normal run. Listing flags a CLI does not have is not
+# free defence: it reads as coverage while leaving the real vectors unchecked.
+#
+# The two spellings that genuinely narrow a `pyright <dir>` run:
+#   --skip*       `--skipunannotated` drops every unannotated function from
+#                 analysis. Prefix-matched so a future `--skip<x>` is caught.
+#   -p/--project  points pyright at a DIFFERENT config file, which can relax
+#                 typeCheckingMode, add excludes, or drop extraPaths wholesale.
+#                 Invisible to assertion (c): `_targets` discards every
+#                 `-`-prefixed token, so `pyright -p /tmp/lax.json scripts/`
+#                 still lists 'scripts/' among its targets and satisfies (c)
+#                 while checking almost nothing. Both spellings are listed
+#                 because neither is a prefix of the other, and neither is a
+#                 prefix of pyright's `--python*` flags (those begin `--p`).
+_NARROWING_FLAGS = {
+    _RUFF: ('--exclude', '--extend-exclude', '--force-exclude'),
+    _PYRIGHT: ('--skip', '-p', '--project'),
+}
+
+
+def _segment(cmd: str, keyword: str) -> str:
+    """The ``&&``-chained segment of *cmd* that actually invokes *keyword*.
 
     Reuses the production splitter (``verify_cmd.split_top_level_and``, which
     is quote-aware) rather than a naive ``str.split('&&')``.
@@ -114,42 +225,60 @@ def _ruff_segment(cmd: str) -> str:
     Chaining is an ESTABLISHED pattern here, not a hypothetical:
     ``verify_plan._scope_prefix_to_keyword``'s own docstring records that
     "every subproject's lint_command chains a ``python3 .../check_*.py <dir>``
-    gate after ``ruff check``". Extracting the ruff segment first is what lets
-    the target assertions below stay true if this module later adopts that
-    shape — tokenising the whole chain would otherwise read ``&&``, ``python3``
-    and the checker's own arguments as ruff lint targets.
+    gate after ``ruff check``". Extracting the checker's own segment first is
+    what lets the target assertions below stay true if this module later adopts
+    that shape — tokenising the whole chain would otherwise read ``&&``,
+    ``python3`` and the checker's own arguments as lint/type targets.
     """
     segments = verify_cmd.split_top_level_and(cmd)
-    ruff_segments = [s for s in segments if 'ruff check' in s]
-    assert len(ruff_segments) == 1, (
-        f'expected exactly one `ruff check` segment in {cmd!r}, got '
-        f'{ruff_segments!r}'
+    matching = [s for s in segments if keyword in s]
+    assert len(matching) == 1, (
+        f'expected exactly one `{keyword}` segment in {cmd!r}, got {matching!r}'
     )
-    return ruff_segments[0]
+    return matching[0]
 
 
-def _ruff_targets(cmd: str) -> list[str]:
-    """The positional path arguments the ``ruff check`` segment of *cmd* lints.
+def _targets(cmd: str, keyword: str) -> list[str]:
+    """The positional path arguments *keyword*'s segment of *cmd* checks.
 
-    Substring checks alone cannot carry assertion (5): ``'scripts/'`` is a
-    substring of ``'tests/scripts/'``, so a copy-pasted sibling command would
-    satisfy a naive ``'scripts/' in cmd``. Splitting out the actual targets and
-    testing LIST MEMBERSHIP (exact-element, so ``'tests/scripts/'`` does not
-    match) is what makes the anti-copy-paste assertion real.
+    Substring checks alone cannot carry the anti-copy-paste assertions:
+    ``'scripts/'`` is a substring of ``'tests/scripts/'``, so a copy-pasted
+    sibling command would satisfy a naive ``'scripts/' in cmd`` for BOTH the
+    lint and the type command. Splitting out the actual targets and testing
+    LIST MEMBERSHIP (exact-element, so ``'tests/scripts/'`` does not match) is
+    what makes those assertions real.
     """
-    tokens = shlex.split(_ruff_segment(cmd))
-    assert 'check' in tokens, f'no ruff `check` subcommand in {cmd!r}'
-    tail = tokens[tokens.index('check') + 1:]
+    anchor = keyword.split()[-1]
+    tokens = shlex.split(_segment(cmd, keyword))
+    assert anchor in tokens, (
+        f'no `{anchor}` token in the `{keyword}` segment of {cmd!r}, so the '
+        'positional targets cannot be located'
+    )
+    tail = tokens[tokens.index(anchor) + 1:]
     return [t for t in tail if not t.startswith('-')]
 
 
-def _ruff_exclude_flags(cmd: str) -> list[str]:
-    """Any ``--exclude`` / ``--extend-exclude`` / ``--force-exclude`` flags.
+def _narrowing_flag_args(cmd: str, keyword: str) -> list[str]:
+    """Any flag in *keyword*'s segment that carves files back out of the target.
 
     Both spellings are caught: ``--exclude foo`` and ``--exclude=foo``.
     """
-    prefixes = ('--exclude', '--extend-exclude', '--force-exclude')
-    return [t for t in shlex.split(_ruff_segment(cmd)) if t.startswith(prefixes)]
+    prefixes = _NARROWING_FLAGS[keyword]
+    return [t for t in shlex.split(_segment(cmd, keyword)) if t.startswith(prefixes)]
+
+
+# Thin ruff-spelling wrappers, kept so test_scripts_diff_is_lint_gated below is
+# untouched by the task-3456 generalization above.
+def _ruff_segment(cmd: str) -> str:
+    return _segment(cmd, _RUFF)
+
+
+def _ruff_targets(cmd: str) -> list[str]:
+    return _targets(cmd, _RUFF)
+
+
+def _ruff_exclude_flags(cmd: str) -> list[str]:
+    return _narrowing_flag_args(cmd, _RUFF)
 
 
 def test_scripts_diff_is_lint_gated() -> None:
@@ -314,4 +443,240 @@ def test_scripts_diff_is_lint_gated() -> None:
         f'other and its own files are gated by nothing. Note the two '
         f'test_commands ARE byte-identical by design — that is a different, '
         'already-recorded issue and is not license to duplicate this one'
+    )
+
+
+def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
+    """The ROOT ``[tool.pyright] extraPaths`` must carry scripts/ and scripts/legibility.
+
+    A PRECONDITION for the type gate, not a general pyright-config preference,
+    which is why it lives beside the gate it protects rather than in its own
+    file. The declared ``type_check_command`` is ``npx pyright scripts/``: it
+    runs from the repo root, so it resolves against the ROOT ``[tool.pyright]``
+    table — NOT against any per-package pyproject.toml.
+
+    ``scripts/tests/conftest.py`` inserts BOTH ``scripts/`` and
+    ``scripts/legibility/`` onto sys.path at runtime, so the test modules
+    import flat names (``import census``, ``import digest``) that only resolve
+    for pyright if the same two directories are on extraPaths. Measured at the
+    commit before these entries were added: ``npx pyright scripts/`` reported
+    exactly 9 reportMissingImports naming census/codebook/coder/digest/
+    inventory. The gate would then be RED for reasons unrelated to any diff —
+    an unresolved import is not a finding about the change under review, and a
+    permanently-red gate gets suppressed or ignored, which is how a gate dies.
+
+    Both entries are needed and neither implies the other: ``scripts`` alone
+    makes ``scripts/legibility/`` importable only as a namespace package
+    (``import legibility``), not its contents as bare top-level names — a
+    distinction ``scripts/tests/conftest.py`` records about itself, and the
+    reason it performs two separate sys.path insertions.
+
+    TWO module gates depend on these entries, not one. The ``tests/scripts``
+    module config next door declares its own ``npx pyright tests/scripts/``,
+    which also runs from the repo root against this same root table, and five
+    of its modules import flat ``scripts/`` names. Those imports used to carry
+    ``# pyright: ignore[reportMissingImports]``; task 3456 dropped the pragmas
+    precisely BECAUSE the extraPaths entries made them resolve, so the masking
+    is gone and the dependency is now live. RE-MEASURED at the branch tip by
+    deleting both entries and re-running each command: ``pyright scripts/`` ->
+    23 errors, 9 of them reportMissingImports; ``pyright tests/scripts/`` -> 8
+    errors, ALL reportMissingImports, naming migrate_metadata_modules_to_files,
+    drain_check, audit_wiped_metadata_files, repair_wiped_metadata_files,
+    reviewer_redundancy_diagnostic and trial_module_tagger_haiku. Removing an
+    entry is therefore a two-gate outage; this test failing alone would
+    under-report it.
+
+    MEMBERSHIP, never list equality or a length pin: adding a future entry is
+    a legitimate change, not a regression, and an equality assertion would
+    reject it with a message accusing the author of removing these two.
+    """
+    pyright_config = _load_root_pyright_config()
+    extra_paths = pyright_config.get('extraPaths', [])
+
+    for required in _REQUIRED_EXTRA_PATHS:
+        assert required in extra_paths, (
+            f'{required!r} missing from ROOT [tool.pyright] extraPaths = '
+            f'{extra_paths!r} in {REPO_ROOT / "pyproject.toml"} (task 3456). '
+            f'The declared type gate for the {MODULE_PREFIX} module runs '
+            f'`npx pyright {MODULE_PREFIX}/` FROM THE REPO ROOT, so it resolves '
+            f'against this root table. Without both '
+            f'{list(_REQUIRED_EXTRA_PATHS)!r} entries, pyright cannot resolve '
+            f'the flat modules {list(_UNRESOLVED_WITHOUT)!r} that '
+            f'{MODULE_PREFIX}/tests/conftest.py puts on sys.path at runtime — '
+            f'measured as exactly 9 reportMissingImports before task 3456 added '
+            f'them. The gate then reports RED for reasons unrelated to any '
+            f'diff, which is how a gate gets suppressed and dies. Note '
+            f'{_REQUIRED_EXTRA_PATHS[0]!r} alone is NOT sufficient: it makes '
+            f'{_REQUIRED_EXTRA_PATHS[1]!r} importable only as a namespace '
+            f'package, not its contents as bare top-level names. '
+            f'BLAST RADIUS IS TWO GATES, NOT ONE: the {SIBLING_PREFIX} module '
+            f'config declares its own `npx pyright {SIBLING_PREFIX}/`, which '
+            f'also runs from the repo root against this same table, and task '
+            f'3456 dropped the `# pyright: ignore[reportMissingImports]` '
+            f'pragmas that were masking its five modules\' flat '
+            f'{MODULE_PREFIX}/ imports. Re-measured at the branch tip with '
+            f'both entries deleted: `pyright {MODULE_PREFIX}/` -> 23 errors '
+            f'(9 reportMissingImports), `pyright {SIBLING_PREFIX}/` -> 8 '
+            f'errors, ALL reportMissingImports. Restoring these entries is the '
+            f'fix for BOTH; re-adding pragmas to {SIBLING_PREFIX} is not'
+        )
+
+
+def test_scripts_diff_is_type_gated() -> None:
+    """A diff confined to scripts/ must actually run pyright over scripts/.
+
+    The TYPE half of the same contract ``test_scripts_diff_is_lint_gated``
+    above pins for LINT, and it has the same failure mode: task 3445 declared
+    only ``test_command`` and ``lint_command`` here, so every diff confined to
+    ``scripts/`` cleared the TYPE check without pyright ever running. That was
+    stated in ``scripts/orchestrator.yaml`` as a known-open gap rather than
+    left silent, and task 3456 closed it — burning the tree down to zero
+    FIRST, because declaring a red command is a fleet-wide outage rather than a
+    transient failure (``verify.run_full_verification`` asyncio-gathers over
+    ALL ``module_configs.values()``, and the repo root sets
+    ``merge_verify_breadth: full``).
+
+    The routing PRECONDITIONS — discovery, prefix, lock_depth reachability,
+    derive_modules resolution — are asserted once by the lint test and are not
+    restated here; they are properties of the module config, not of either
+    command, and duplicating them would double the maintenance surface for no
+    added coverage. What is NOT shared is asserted below.
+
+    (a)/(b) are the two forms the command takes in production and both must
+    hold: (a) the FILE_SCOPED render a normal scripts/-only diff executes, and
+    (b) the DECLARED value, which runs VERBATIM and unscoped under merge-role
+    ``merge_verify_breadth=full`` and on STRUCTURAL diffs. Note the type leg
+    reaches FULL_SUITE more readily than the lint leg does:
+    ``verify_plan._derive_module_runs`` sets ``need_structural`` from
+    ``bool(mc.type_check_command)``, so declaring this command is what makes
+    scripts/ diffs read file CONTENT at all, and a diff touching a module that
+    defines a TypedDict or Protocol widens pyright to the unscoped form.
+
+    (c) is the anti-copy-paste half. It cannot live on the executed value for
+    the same reason the lint test's assertion (4) records:
+    ``_scope_prefix_to_keyword`` REPLACES the declared targets with the touched
+    file list, so a config carrying the sibling's ``pyright tests/scripts/``
+    renders byte-identically to the correct one for a scripts/ diff. Only the
+    DECLARED value can carry it, and only as exact-element membership —
+    ``'scripts/'`` is a SUBSTRING of ``'tests/scripts/'``, so a substring check
+    is satisfied by the wrong command.
+
+    (d) is the fix-don't-exclude half. The 395 findings this gate's declaration
+    waited on were FIXED — by annotation and narrowing, with zero ``# type:
+    ignore`` and zero ``# pyright: ignore`` added — not suppressed and not
+    carved out of the target, following the precedent tasks 3350 and 3445 set
+    for the lint gate. It is asserted in TWO parts because there are two
+    carve-out vectors and the command string only exposes one: the CLI flags
+    (``--skip*``, and ``-p``/``--project``, which redirects pyright at another
+    config entirely and is invisible to (c)), and the ROOT ``[tool.pyright]``
+    table's ``exclude``/``ignore`` keys, which narrow the run with the declared
+    command left byte-identical. pyright's flag set is NOT ruff's — it has no
+    ``--exclude`` and no ``--ignore`` at all — so this half cannot be written
+    by copying the lint test's; see ``_NARROWING_FLAGS``.
+
+    Cited by SYMBOL, never by file:line, for the reason the module docstring
+    records.
+    """
+    discovered = _discovered()
+    mc = discovered[MODULE_PREFIX]
+
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE])
+
+    # (a) THE GATE ITSELF, on the FILE_SCOPED render. A None command here is
+    # not "type-checking deferred to some other config" — it is TYPE DELETED,
+    # and it reports green.
+    assert (
+        executed.type_check_command is not None
+        and 'pyright' in executed.type_check_command
+    ), (
+        f'executed type_check_command is {executed.type_check_command!r} for a '
+        f'{MODULE_PREFIX}/-only diff (task 3456). Declaring only test_command '
+        f'and lint_command on this module config downgrades TYPE to a '
+        f'vacuously-passing CheckRun.skipped at rc=0: {_VACUOUS_PASS}. Every '
+        f'.py file under {MODULE_PREFIX}/ is then type-checked by nothing, on a '
+        'check that reports green. The repo-root type_check_command does not '
+        'cover it either'
+    )
+
+    # (b) THE DECLARED VALUE, which runs VERBATIM under merge-role
+    # merge_verify_breadth=full and on STRUCTURAL diffs.
+    assert mc.type_check_command is not None and 'pyright' in mc.type_check_command, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares type_check_command='
+        f'{mc.type_check_command!r} (task 3456). Under merge-role '
+        f'merge_verify_breadth=full this value runs VERBATIM and unscoped, so '
+        f'an absent or non-pyright command leaves the merge path ungated too: '
+        f'{_VACUOUS_PASS}'
+    )
+
+    # (c) ANTI-COPY-PASTE, part 1 — exact-element target membership. Membership
+    # rather than list equality so that a legitimate strengthening (an
+    # &&-chained additional gate, an extra target) is not rejected with a
+    # message accusing the author of narrowing the gate.
+    targets = _targets(mc.type_check_command, _PYRIGHT)
+    assert f'{MODULE_PREFIX}/' in targets, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares type_check_command='
+        f'{mc.type_check_command!r}, whose pyright targets are {targets!r} — '
+        f'{MODULE_PREFIX + "/"!r} is not among them (task 3456). The gate must '
+        f'be the DIRECTORY-WIDE form: narrowing it to a file list, or leaving a '
+        f'copy-pasted {SIBLING_PREFIX}/ target in place, leaves {MODULE_PREFIX}/ '
+        f'ungated under merge full-verify behind a check that reports green — '
+        f'{_VACUOUS_PASS}. Exact-element membership is deliberate: '
+        f'{MODULE_PREFIX + "/"!r} is a SUBSTRING of {SIBLING_PREFIX + "/"!r}, so '
+        'a substring check would pass for the sibling command'
+    )
+
+    # (d) NOTHING CARVED OUT of the directory-wide target — part 1, the COMMAND
+    # LINE. See _NARROWING_FLAGS for why pyright's set is not ruff's, and why
+    # -p/--project belongs here rather than being caught by (c).
+    narrowing = _narrowing_flag_args(mc.type_check_command, _PYRIGHT)
+    assert not narrowing, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares type_check_command='
+        f'{mc.type_check_command!r}, which narrows what is actually checked '
+        f'with {narrowing!r} (task 3456). The findings measured at declaration '
+        f'time were FIXED by annotation and narrowing — zero `# type: ignore`, '
+        f'zero `# pyright: ignore`, zero excludes — per the task 3350/3445 '
+        f'fix-don\'t-exclude precedent; any of these silently un-gates what it '
+        f'names while the check still reports green. `-p`/`--project` is the '
+        f'sharpest of them: it redirects pyright at another config file, and '
+        f'assertion (c) above cannot see it because _targets discards every '
+        '`-`-prefixed token'
+    )
+
+    # (d) part 2 — the OTHER carve-out vector, which NO inspection of the
+    # command can reach. `npx pyright scripts/` runs from the repo root, so it
+    # resolves against the ROOT [tool.pyright] table — the same table
+    # test_root_pyright_extrapaths_resolves_scripts_imports pins, read here
+    # through the same _load_root_pyright_config helper. An `exclude` or
+    # `ignore` entry added there narrows the run while this module config, and
+    # every assertion above it, stays byte-for-byte unchanged.
+    carved = _root_carve_outs_naming(MODULE_PREFIX)
+    assert not carved, (
+        f'ROOT [tool.pyright] in {REPO_ROOT / "pyproject.toml"} carves '
+        f'{MODULE_PREFIX} back out with {carved!r} (task 3456). '
+        f'`{mc.type_check_command}` runs from the repo root and resolves '
+        f'against that table, so an `exclude` there drops those files from '
+        f'analysis and an `ignore` suppresses their diagnostics — either way '
+        f'the gate keeps exiting 0 over a tree it is no longer checking, which '
+        f'is the same reports-green failure as {_VACUOUS_PASS}, reached '
+        f'without touching the command. The findings were FIXED, not excluded; '
+        'if a future finding genuinely cannot be fixed, suppress it at the '
+        'single site with a justified inline pragma, where a reader of that '
+        'code can see it — not repo-wide from a config table nothing in '
+        f'{MODULE_PREFIX}/ mentions'
+    )
+
+    # (c) ANTI-COPY-PASTE, part 2 — the sibling comparison. These two
+    # directories are distinct trees.
+    sibling = discovered.get(SIBLING_PREFIX)
+    assert sibling is not None, (
+        f'{SIBLING_PREFIX}/orchestrator.yaml is no longer discovered, so the '
+        'anti-copy-paste comparison below cannot be made (task 3456)'
+    )
+    assert mc.type_check_command != sibling.type_check_command, (
+        f'{MODULE_PREFIX} and {SIBLING_PREFIX} declare a BYTE-IDENTICAL '
+        f'type_check_command {mc.type_check_command!r} (task 3456). A shared '
+        f'command means one of them is type-checking the other and its own '
+        f'files are gated by nothing. Note the two test_commands ARE '
+        'byte-identical by design — that is a different, already-recorded issue '
+        'and is not license to duplicate this one'
     )
