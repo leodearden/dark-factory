@@ -104,6 +104,7 @@ AdvanceResult = Literal[
     'stash_failed', 'wip_overlap', 'pop_conflict',
     'unmerged_state', 'pop_conflict_no_advance',
     'rebased_pending_reverify', 'conflict_markers',
+    'park_lock_contended',
 ]
 
 
@@ -208,10 +209,32 @@ class MergeParkError(Exception):
 
     Raised by :meth:`GitOps._park_wip_on_private_ref` when the ``git stash
     create`` / ``git update-ref`` infra sequence itself fails (not a
-    contention condition — see :class:`MergeParkContentionError` for that).
+    contention condition — see :class:`MergeParkContentionError` and
+    :class:`MergeParkLockContentionError` for those).
     ``advance_main`` catches this and returns the existing
     ``AdvanceResult 'stash_failed'`` code (loud CRITICAL log + permanent
     halt to prevent code loss).
+    """
+
+
+class MergeParkLockContentionError(MergeParkError):
+    """Raised when the park failed because a FOREIGN git process holds
+    project_root's ``<git-dir>/index.lock``.
+
+    Transient, never a queue halt: ``advance_main`` maps this to the
+    ``AdvanceResult 'park_lock_contended'`` code, which is DELIBERATELY
+    absent from ``merge_queue._HALT_ADVANCE_RESULTS``.  The dominant cause is
+    a concurrent ``git commit --only <path>`` in project_root, which holds
+    the index lock for the ENTIRE pre-commit hook run — self-clearing, unlike
+    the shared-hygiene fault that ``'stash_failed'`` reports.
+
+    Classification MUST be by positive lock-FILE detection, never by stderr
+    matching: verified on git 2.43.0, ``git stash create`` under a held
+    ``index.lock`` exits **rc=1 with EMPTY stdout AND EMPTY stderr** (while
+    ``git status --porcelain`` and ``git diff --name-only`` both still
+    succeed with rc=0).  There is simply no stderr text to classify on — which
+    is also why the resulting halt escalation used to read
+    ``rc=1, stdout='', stderr=''``.  See :meth:`GitOps._index_lock_state`.
     """
 
 
@@ -12541,6 +12564,19 @@ class GitOps:
           existed — a stale or contended ref that is never overwritten
           (:class:`MergeParkContentionError`).  Permanent; halt merge to
           prevent code loss.  See :meth:`GitOps._park_wip_on_private_ref`.
+        * ``'park_lock_contended'`` — a FOREIGN git process holds
+          project_root's ``<git-dir>/index.lock``, so this advance stood off
+          and touched NOTHING (no ref move, no tree write, no park, and the
+          foreign lock left strictly alone).  TRANSIENT and retryable —
+          explicitly CONTRASTED with ``'stash_failed'``: that code reports a
+          shared-hygiene fault needing a human, while this one reports a
+          self-clearing condition whose dominant cause is a concurrent
+          ``git commit --only`` holding the index lock across its pre-commit
+          hook.  Accordingly it is DELIBERATELY absent from
+          ``merge_queue._HALT_ADVANCE_RESULTS`` and maps to a per-task
+          ``MergeOutcome('blocked')``, never a queue halt.  The stand-off
+          budget is ``git.merge_park_lock_grace_seconds`` (default 300s,
+          matching the documented pre-commit budget).
         * ``'pop_conflict_no_advance'`` — CAS ``update-ref`` failed AND the
           subsequent stash pop conflicted.  The merge did NOT land.  WIP is
           preserved on a ``wip/recovery-*`` branch; routes to a human-level
@@ -12832,6 +12868,34 @@ class GitOps:
                 # (??) entries survive read-tree without conflict — parking
                 # them risks spurious apply failures (e.g. .worktrees/).
                 if dirty_tracked:
+                    # ── Foreign index-lock stand-off ─────────────────────
+                    # A concurrent `git commit --only <path>` in
+                    # project_root holds <git-dir>/index.lock for the ENTIRE
+                    # pre-commit hook run.  Under that lock `git stash
+                    # create` exits rc=1 with EMPTY stdout AND stderr
+                    # (verified, git 2.43.0), so the park below would fail
+                    # and return the queue-HALTING 'stash_failed'.  Never
+                    # park through a foreign lock: _park_wip_on_private_ref
+                    # ends with `read-tree -u --reset HEAD`, which would
+                    # clobber the in-flight commit's staged/working state.
+                    # Touch nothing and come back later instead.
+                    lock_held, lock_age = await self._index_lock_state()
+                    if lock_held:
+                        lock_path = await self._index_lock_path()
+                        logger.warning(
+                            'Foreign git index lock held in project_root — '
+                            'standing off instead of parking WIP. lock=%s '
+                            'age=%.1fs dirty=%s',
+                            lock_path, lock_age,
+                            ', '.join(sorted(dirty_tracked)[:10]),
+                        )
+                        self._last_park_lock_info = {
+                            'lock_path': str(lock_path),
+                            'age_seconds': lock_age,
+                            'waited_seconds': 0.0,
+                            'dirty_files': sorted(dirty_tracked),
+                        }
+                        return AdvanceOutcome('park_lock_contended')
                     try:
                         await self._park_wip_on_private_ref(branch or merge_sha[:8])
                     except MergeParkContentionError as e:
@@ -13259,6 +13323,62 @@ class GitOps:
             self.config.main_branch, self.config.remote, rc, err,
         )
         return 'error'
+
+    async def _index_lock_path(self) -> Path:
+        """Resolve project_root's ``<git-dir>/index.lock`` path, memoised.
+
+        Fast path: when ``<project_root>/.git`` is a real DIRECTORY (the
+        ordinary layout) the answer is ``<project_root>/.git/index.lock``
+        with no subprocess at all — this sits on advance_main's hot path and
+        must not cost a fork on the clean happy path.  Fallback: for the
+        ``.git``-FILE layout (a linked worktree / submodule) ask git itself
+        via ``rev-parse --absolute-git-dir``.
+
+        Memoised on the instance because a repository's git-dir does not move
+        under a live GitOps.
+        """
+        cached = getattr(self, '_index_lock_path_cache', None)
+        if cached is not None:
+            return cached
+
+        dot_git = self.project_root / '.git'
+        if dot_git.is_dir():
+            resolved = dot_git / 'index.lock'
+        else:
+            rc, git_dir, _ = await _run(
+                ['git', 'rev-parse', '--absolute-git-dir'],
+                cwd=self.project_root,
+            )
+            if rc == 0 and git_dir.strip():
+                resolved = Path(git_dir.strip()) / 'index.lock'
+            else:
+                # Last resort: assume the ordinary layout rather than
+                # raising.  A wrong path degrades to "no lock detected",
+                # i.e. exactly today's behaviour — never worse.
+                resolved = dot_git / 'index.lock'
+
+        self._index_lock_path_cache: Path = resolved
+        return resolved
+
+    async def _index_lock_state(self) -> tuple[bool, float]:
+        """Return ``(present, age_seconds)`` for project_root's index lock.
+
+        ``age_seconds`` is derived from the lock file's mtime and is what
+        distinguishes an in-flight pre-commit hook (young) from a crashed-git
+        leftover (older than the configured grace) in the operator-facing
+        reason.  Returns ``(False, 0.0)`` when absent; a ``stat`` race (the
+        lock vanishing between ``exists`` and ``stat``) is treated as absent,
+        which is the truth a moment later anyway.
+        """
+        lock_path = await self._index_lock_path()
+        try:
+            mtime = lock_path.stat().st_mtime
+        except (FileNotFoundError, NotADirectoryError):
+            return (False, 0.0)
+        except OSError:
+            # Unreadable for some other reason — do not invent contention.
+            return (False, 0.0)
+        return (True, max(0.0, time.time() - mtime))
 
     async def _park_wip_on_private_ref(self, label: str) -> None:
         """Park uncommitted WIP in project_root onto MERGE_PARK_REF.
