@@ -176,7 +176,11 @@ async def _await_outcome(
 # before the loud _await_outcome failure this task added could ever report. The
 # class mark MUST clear the full 225s budget, not just the pyproject 60s default.
 # Derived, not literal, so the two marks cannot drift apart the way they just did.
-CASCADE_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
+# task 3492: generalized CASCADE_TEST_TIMEOUT -> HEAVY_BARRIER_TEST_TIMEOUT --
+# this same derived ceiling also covers the non-cascade heavy-barrier classes
+# audited by 3492, whose worst per-method budget is 205s
+# (TestCascadeErrorContainment), still comfortably under the 300s value below.
+HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
 
 
 # ---------------------------------------------------------------------------
@@ -3414,7 +3418,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(CASCADE_TEST_TIMEOUT)  # task 3477 amend: see CASCADE_TEST_TIMEOUT -- derived so this cannot drift from TestCascadeFiresRemoteCancel's identical wait profile
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3477 amend: see HEAVY_BARRIER_TEST_TIMEOUT -- derived so this cannot drift from TestCascadeFiresRemoteCancel's identical wait profile
 class TestRunnerUnavailableHeadCascade:
     """RUNNER_UNAVAILABLE on the HEAD triggers the head-failure cascade.
 
@@ -3954,7 +3958,7 @@ class TestStopDrainFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(CASCADE_TEST_TIMEOUT)  # task 3477 amend: see CASCADE_TEST_TIMEOUT -- derived so this cannot drift from TestRunnerUnavailableHeadCascade's identical wait profile (was a bare 180, too tight for the 225s worst case below)
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3477 amend: see HEAVY_BARRIER_TEST_TIMEOUT -- derived so this cannot drift from TestRunnerUnavailableHeadCascade's identical wait profile (was a bare 180, too tight for the 225s worst case below)
 class TestCascadeFiresRemoteCancel:
     """_verifier_loop head-failure cascade fires remote cancel BEFORE task.cancel().
 
