@@ -199,89 +199,18 @@ def _log(message: str, *, stream=None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _join_continuations(text: str) -> list[str]:
-    """Return *text*'s lines with backslash continuations joined into one line.
-
-    While a line ends in ``\\``, the backslash is dropped and the NEXT line's
-    stripped form is appended after a single space.  Mirrors ``_logical_exec_start``
-    in tests/scripts/test_dashboard_service_template.py, generalised from "the
-    ExecStart line" to "every line".
-
-    Joining happens BEFORE comment classification, which matches systemd's own
-    behaviour: a comment line ending in ``\\`` continues, and its continuation
-    is part of the comment.  Both real dashboard units rely on this — the
-    watchdog service quotes the old inline-shell ExecStart across two ``#``
-    lines joined by a backslash, and classifying first would leave the second
-    half of that quote looking like a directive.
-    """
-    joined: list[str] = []
-    pending: str | None = None
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
-        continued = line.endswith("\\")
-        if continued:
-            line = line[:-1].rstrip()
-        piece = line if pending is None else f"{pending} {line.strip()}"
-        if continued:
-            pending = piece
-            continue
-        joined.append(piece)
-        pending = None
-    if pending is not None:
-        # Trailing backslash on the final line — keep what we have rather than
-        # silently dropping the directive.
-        joined.append(pending)
-    return joined
-
-
-def parse_unit_directives(text: str) -> dict[str, dict[str, list[str]]]:
-    """Parse a systemd unit into ``{section: {key: [value, ...]}}``.
-
-    Classification rules are taken verbatim from the precedent's
-    ``parse_unit_sections`` (scripts/check_fused_memory_unit_parity.py):
-
-    - ``[X]`` opens section X.
-    - Lines starting with ``#`` or ``;`` are comments — skipped.
-    - Blank lines are skipped.
-    - Lines before the first section header are DROPPED, not attributed.
-
-    Two deliberate divergences from that precedent, each required here:
-
-    1. **key → values LIST, not a flat line list.**  This checker compares
-       directives BY KEY, which a flat list of lines cannot express, and it
-       needs the several ``Environment=`` lines of a unit addressable as a
-       group rather than as unrelated strings.
-    2. **Backslash continuations are JOINED.**  ``parse_unit_sections``
-       documents that it does not join them, which is harmless for its exact
-       whole-line membership checks.  It is fatal here: the dashboard
-       ExecStart spans four physical lines, so without joining every uvicorn
-       flag task 3306 added lives on a line the parser never associates with
-       ``ExecStart`` — the checker would report parity on a command it never
-       actually read.
-
-    Each surviving line is split on the FIRST ``=`` only, so
-    ``Environment=A=1`` yields key ``Environment`` and value ``A=1``.  A line
-    with no ``=`` is skipped (systemd has no valueless directives).
-    """
-    sections: dict[str, dict[str, list[str]]] = {}
-    current: str | None = None
-    for joined_line in _join_continuations(text):
-        line = joined_line.strip()
-        if not line:
-            continue
-        if line.startswith("#") or line.startswith(";"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            current = line[1:-1]
-            sections.setdefault(current, {})
-            continue
-        if current is None:
-            continue
-        key, sep, value = line.partition("=")
-        if not sep:
-            continue
-        sections[current].setdefault(key.strip(), []).append(value.strip())
-    return sections
+# The parser lives in scripts/systemd_unit_parity.py and is RE-EXPORTED here
+# deliberately. A second consumer appeared (check_orchestrator_unit_parity.py),
+# and duplicating ~90 lines of parser into it is how the two copies drift until
+# one silently stops catching the defect -- inside the tooling built to catch
+# exactly that. Re-exporting rather than rewriting call sites keeps the module
+# surface this script's test suite reads (mod.parse_unit_directives,
+# mod._join_continuations) intact, so that suite is the extraction's own
+# regression net.
+from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
+    _join_continuations,  # noqa: F401  (re-exported: read by the test suite)
+    parse_unit_directives,
+)
 
 
 # ---------------------------------------------------------------------------
