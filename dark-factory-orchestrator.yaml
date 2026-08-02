@@ -38,7 +38,38 @@ max_concurrent_tasks: 24
 # NOTE: any pytest segment added to this chain in the future must also carry
 # --timeout>60 — enforced by
 # tests/scripts/test_fallback_verify_config.py::test_fallback_verify_raises_per_test_timeout.
-test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ --timeout=300"
+# task 3384: this segment also runs ``scripts/tests/`` together with
+# ``tests/scripts/`` above — a near-homograph but DIFFERENT directory (~30
+# modules testing scripts/legibility/*, scripts/*.py census / trickle /
+# codebook / worktree-lifecycle tooling, e.g. test_census_trigger.py and
+# test_legibility_census.py). Neither the 5 subprojects' own tests/ dirs nor
+# tests/scripts/ itself ever collect scripts/tests/ (it is not a workspace
+# member and sits outside every subproject prefix), so it is folded into the
+# same ``--project shared`` pytest invocation (scripts/tests/ imports no
+# first-party package, and shared is the member declaring pytest;
+# collection across the two directories' few shared basenames is safe
+# because the root pyproject.toml sets addopts = "--import-mode=importlib"
+# and neither directory has an __init__.py). Measured green standalone:
+# 1184 passed in ~113s (lowest of local runs) — see the fleet-chain budget
+# accounting below for how this feeds verify_command_timeout_secs; the
+# combined-directories figure is recorded in project memory for task 3460
+# rather than duplicated here.
+#
+# DEFENCE-IN-DEPTH ONLY: this whole chain is built by
+# ``_build_fallback_config``, which ``run_scoped_verification``
+# (orchestrator/verify.py) reaches only past its ``if module_configs:``
+# check — i.e. only when NO module config is discovered at all.
+# ``_discover_module_configs`` DOES register a ``scripts`` module config,
+# and ``derive_modules`` -> ``OrchestratorConfig.for_module``'s
+# longest-prefix walk resolves every scripts/** path
+# (scripts/legibility/digest.py, scripts/census_trigger.py,
+# scripts/tests/test_codebook.py, ...) to prefix ``scripts`` — so a
+# scripts/** diff routes to scripts/orchestrator.yaml's own test_command
+# instead, and this segment never executes for it. The real, still-open
+# gate is scripts/orchestrator.yaml's test_command, which targets only
+# tests/scripts/ under FULL_SUITE / merge-role merge_verify_breadth="full";
+# task 3460 owns closing that gap there — do not re-close it here.
+test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
 # this to a single touched file for root-level changes) emits a bare ``ruff
@@ -66,12 +97,12 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 
 # Verification timeouts. verify_command_timeout_secs is a PER-COMMAND budget
 # (skills/orchestrate/references/project-setup.md:150) and the fallback fleet
-# chain above is ONE shell command, so this single ceiling bounds all seven
+# chain above is ONE shell command, so this single ceiling bounds all eight
 # suites together.
 #
 # The "full warm verify here is ~2 min" premise these were originally sized
 # against is STALE by an order of magnitude — it predates the monorepo growing
-# to 8 chained suites. It is deleted rather than softened, because a stale
+# to 9 chained suites. It is deleted rather than softened, because a stale
 # justification is worse than none. MEASURED per-segment durations (task 3062
 # attempt-2, .task/verify/attempt-2.__fallback__.{summary.json,test.log}, run
 # started 2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`, surfaced as
@@ -83,7 +114,7 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 #     fused-memory   123.87   (8658 passed)
 #     tests/scripts  105.00   (lowest of four independent runs, 105-127s)
 #                   -------
-#                   1838.60s   <- five of seven segments; already > the old 1800
+#                   1838.60s   <- five of eight segments; already > the old 1800
 #
 # dashboard, sampler and cockpit are absent because the run timed out at
 # 1800.66s before dashboard even started, so 1838.60 is a hard measured LOWER
@@ -92,11 +123,13 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # on the honest green path, after already passing 25,536 tests with zero
 # failures. A structural overrun, not a hang.
 #
-# Raised to 3600s warm / 5400s cold. All seven segments accounted for — the five
+# Raised to 3600s warm / 5400s cold. All eight segments accounted for — the six
 # measured plus the three unmeasured ones estimated rather than silently costed
 # at zero:
 #
 #     measured floor (five segments, above)       1838.60
+#     + scripts/tests (task 3384, lowest of local
+#                   runs, 1184 passed)                ~113
 #     + dashboard  1393 collected @ ~0.137 s/test  ~190
 #     + sampler                                     ~60
 #     + cockpit     321 collected @ ~0.137 s/test   ~44   (conditional: the
@@ -104,14 +137,18 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 #                   costs 0 on a checkout where cockpit is absent — but it IS
 #                   present here, so budget for it)
 #                                                 -------
-#     honest green path                            ~2133
+#     honest green path                            ~2246
 #
 # The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s; dashboard
 # and cockpit both run serial (no pytest-xdist, per this file's own fanout
-# comment). 3600s leaves ~1.7x headroom over that path, covering the load
+# comment). 3600s leaves ~1.6x headroom over that path, covering the load
 # variance the two same-day orchestrator measurements demonstrate (1157.62s vs
-# 1366.23s, ~18%). Cold gets 5400s because it additionally pays the ~180s
-# `uv sync --all-packages` preprovision plus uv sync across 6 subprojects.
+# 1366.23s, ~18%) plus scripts/tests' own load sensitivity (task 3384 measured
+# it between ~113s idle and, combined with tests/scripts/, up to ~505s wall
+# under contention — see the task-3384 comment above and project memory for
+# the combined-directories figures). Cold gets 5400s because it additionally
+# pays the ~180s `uv sync --all-packages` preprovision plus uv sync across 6
+# subprojects.
 #
 # It also un-starves the `orchestrator` module's OWN verify, which at 1366.23s
 # was consuming 76% of the old per-command ceiling.
