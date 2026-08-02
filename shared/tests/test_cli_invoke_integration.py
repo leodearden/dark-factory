@@ -140,15 +140,15 @@ class TestCrossAccountResume:
         The ZEPPELIN assertion is retained deliberately and must not be weakened:
         it is the only signal that would distinguish outcome (a) from (b).
 
-        KNOWN MISLEADING FAILURE.  When account B is capped, the CLI answers the
-        resumed turn with e.g. "You've hit your weekly limit · resets Aug 5,
-        11am".  ``_looks_like_capacity_failure`` does NOT match that text (its
-        marker is "you've hit your usage"), so this test does not skip — it
-        fails the assertion below with a cap message as the "output", which is
-        indistinguishable at a glance from genuine context loss.  Check the
-        reported output for a limit message before reading a red run as a
-        regression.  (The marker list is intentionally left alone here; it is
-        owned by the task that narrowed it.)
+        READING A RED RUN.  A capped account now SKIPS: the guard is
+        ``_capacity_skip.result_looks_like_capacity_failure``, pinned (task
+        3483) against the verbatim weekly text observed here — "You've hit
+        your weekly limit · resets Aug 5, 11am" — which the guard previously
+        did not match, so a capped account used to fail the assertion below
+        with a cap message dressed up as lost context.  The remaining reason
+        to read a red run carefully is a cap message the guard has never seen:
+        check the reported output for a limit message before concluding
+        regression, and if it is one, add it to ``REAL_CLI_CAP_MESSAGES``.
         """
         _name_a, token_a = _AVAILABLE_TOKENS[0]
         _name_b, token_b = _AVAILABLE_TOKENS[1]
