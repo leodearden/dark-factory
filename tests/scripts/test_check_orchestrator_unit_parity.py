@@ -30,6 +30,7 @@ and it is what the identity guard below needs to be exercising.
 
 import importlib.util
 import pathlib
+import re
 import types
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
@@ -156,3 +157,109 @@ def test_dashboard_checker_consumes_the_lifted_parser():
 
     assert dashboard.parse_unit_directives is systemd_unit_parity.parse_unit_directives
     assert dashboard._join_continuations is systemd_unit_parity._join_continuations
+
+
+# ---------------------------------------------------------------------------
+# The unit registry, and its staleness guard  (step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+# The seven units scripts/setup-host.sh installs by copying VERBATIM. Stated
+# as a literal here so a bug in the shell-parsing helper below cannot make the
+# equality assertion vacuously true against itself.
+_EXPECTED_UNITS = {
+    "orchestrator-watchdog.service",
+    "orchestrator-watchdog.timer",
+    "orchestrator-dark-factory.service",
+    "orchestrator-reify.service",
+    "orchestrator-autopilot-video.service",
+    "orchestrator-my-solar-challenge.service",
+    "orchestrator-solar-challenge-platform.service",
+}
+
+# Matches setup-host.sh's install lines, e.g.
+#   cp "$REPO_ROOT/scripts/orchestrator-reify.service"   "$UNIT_DIR/"
+# Anchored on BOTH endpoints (the scripts/ source and the $UNIT_DIR
+# destination) so an unrelated `cp` elsewhere in the installer cannot be
+# mistaken for a unit install.
+_CP_UNIT_RE = re.compile(
+    r'cp\s+"\$REPO_ROOT/scripts/(?P<unit>[^"]+\.(?:service|timer))"\s+"\$UNIT_DIR/?"'
+)
+
+
+def _units_installed_by_setup_host() -> set[str]:
+    """Extract the unit names setup-host.sh `cp`s verbatim into $UNIT_DIR."""
+    return set(
+        m.group("unit")
+        for m in _CP_UNIT_RE.finditer(SETUP_HOST_PATH.read_text(encoding="utf-8"))
+    )
+
+
+def test_registry_covers_the_seven_verbatim_copied_units():
+    """UNITS registers exactly the seven units setup-host.sh copies verbatim."""
+    checker = _load_checker()
+
+    assert set(checker.UNITS) == _EXPECTED_UNITS, (
+        "check_orchestrator_unit_parity.UNITS does not match the expected set.\n"
+        f"  missing from UNITS: {sorted(_EXPECTED_UNITS - set(checker.UNITS))}\n"
+        f"  unexpected in UNITS: {sorted(set(checker.UNITS) - _EXPECTED_UNITS)}"
+    )
+
+
+def test_every_registered_unit_has_a_committed_copy():
+    """Every registry entry's committed repo path exists under scripts/.
+
+    A registry entry naming a path that does not exist is not a harmless
+    typo: the checker reports it as ``[vanished]`` on every run, which is
+    indistinguishable from a real "the file I compare against is gone" and
+    spends the gate's credibility on nothing.
+    """
+    checker = _load_checker()
+
+    for name, relpath in checker.UNITS.items():
+        assert (REPO_ROOT / relpath).is_file(), (
+            f"UNITS registers {name} -> {relpath}, but "
+            f"{REPO_ROOT / relpath} does not exist."
+        )
+
+
+def test_registry_matches_setup_host_cp_lines():
+    """STALENESS GUARD: the registry equals setup-host.sh's own `cp` unit set.
+
+    This is the load-bearing test of the three. A hand-curated registry has
+    exactly the failure shape this whole checker exists to kill: add a unit to
+    the installer's `cp` block and it becomes installed-but-UNCHECKED —
+    silently, forever, while the gate still reports green. That is the same
+    silent-drift defect one level up, reproduced inside the tool built to
+    catch it.
+
+    Asserting set equality in BOTH directions makes the registry
+    self-maintaining: a unit added to the installer fails here until it is
+    registered, and a unit dropped from the installer fails here until it is
+    deregistered. The derivation deliberately lives in the TEST and not in the
+    checker — the runtime registry stays an explicit literal, so a bug in the
+    shell parsing below can never disarm the checker itself.
+    """
+    checker = _load_checker()
+    installed_by_setup_host = _units_installed_by_setup_host()
+
+    # Guard the guard: if the regex silently matched nothing, the equality
+    # assertion below would still fail, but with a message pointing at the
+    # registry rather than at the parsing.
+    assert installed_by_setup_host, (
+        f"Parsed ZERO `cp` unit lines out of {SETUP_HOST_PATH}. The installer's "
+        "cp idiom has changed and _CP_UNIT_RE no longer matches it — fix the "
+        "regex, do not weaken this test."
+    )
+
+    assert installed_by_setup_host == set(checker.UNITS), (
+        "The unit registry and the installer disagree about which units are "
+        "installed by verbatim copy.\n"
+        f"  copied by {SETUP_HOST_PATH} but NOT registered in "
+        f"scripts/check_orchestrator_unit_parity.py UNITS: "
+        f"{sorted(installed_by_setup_host - set(checker.UNITS))}\n"
+        f"  registered in UNITS but NOT copied by {SETUP_HOST_PATH}: "
+        f"{sorted(set(checker.UNITS) - installed_by_setup_host)}\n"
+        "A unit the installer copies but the registry omits is "
+        "installed-but-unchecked: it can drift forever while this gate "
+        "reports green."
+    )
