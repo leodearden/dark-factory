@@ -124,11 +124,20 @@ SCRIPT_COVERAGE = {
 #: durable lane record and added 28 asserts (Block S + Block A's A10), so the
 #: floor moved 170 → 198.  It moved because the count was RE-MEASURED, not to
 #: make a red run green.
+#:
+#: Dark-factory task 3292 then wired ``warm-lane-gc.sh``'s PROTECT_GLOB default
+#: to ``lib_lane_state.sh``'s ``lane_protect_glob`` (deleting the hand-mirrored
+#: literal) and added Block X's 16 asserts, so the floor moved 198 → 214 — again
+#: RE-MEASURED against the suite, not raised to absorb a red.  Block X carries no
+#: skip guard, so 214 is both its floor and its measured count on any host that
+#: satisfies ``REQUIRED_HOST_TOOLS``: X-degrade reaches the bridge's degrade
+#: branch by RELOCATING a copy of gc.sh (its resolved repo root then carries no
+#: dark-factory checkout), which needs no python3 and no network.
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 62,
     'test_warm_lane_degenerate_ref.sh': 70,
     'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 198,  # 170 + 28 (Block S 23 + A10 3 + S9b/S10b)
+    'test_warm_lane_gc.sh': 214,  # 198 + 16 (Block X: X-band 7 + X-degrade 9)
     'test_warm_lane_gc_sweep.sh': 86,
     'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,

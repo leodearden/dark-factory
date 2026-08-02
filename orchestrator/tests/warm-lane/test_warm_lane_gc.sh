@@ -90,6 +90,17 @@
 #       S-toctou pins PLACEMENT — a lane assigned MID-PASS is still preserved,
 #       so the read cannot be hoisted into an up-front classification pass
 #       without going RED (GREEN on arrival, like Block R)
+#   X — the DEFAULT protect-glob is RENDERED from dark-factory's
+#       PROTECTED_PREFIXES via lib_lane_state.sh's lane_protect_glob, not
+#       hand-mirrored as a literal (task 3292). X-band pins the observable
+#       payoff — the interactive band is config-driven, so
+#       REIFY_WARM_LANE_IACT_PREFIX moves which band is protected, asserted in
+#       BOTH directions (the renamed band survives, the stock `_iact-*` one
+#       does not); X-degrade pins the `||` fallback in situ, driving a
+#       RELOCATED copy of gc.sh whose resolved repo root carries no
+#       dark-factory checkout, so the bridge fails and gc.sh must degrade to
+#       LANE_PROTECT_GLOB_FALLBACK — loudly (exactly one [warn]) and without
+#       aborting its own `set -euo pipefail` sweep
 #
 # The former Tier-3 blocks I/J/L (terminal-task reclaim + Pass-2 boundary,
 # task 5167) were deleted when task 5326 collapsed the Pass-1 gate to the
@@ -112,6 +123,19 @@ SCRIPT="$WARM_LANE_SCRIPTS_DIR/warm-lane-gc.sh"
 }
 # shellcheck source=tests/infra/test_helpers.sh
 source "$SCRIPT_DIR/test_helpers.sh"
+
+# The SHIPPED lane-state lib, sourced for ONE value: $LANE_PROTECT_GLOB_FALLBACK
+# (see the BRIDGE-COST SEAM comment above run_helper). Reading it from here
+# rather than writing the glob literal into this file is deliberate — a literal
+# would be a fresh hand-maintained mirror of dark-factory's PROTECTED_PREFIXES,
+# the exact INV-5 lockstep-duplication class task 3292 deletes from
+# warm-lane-gc.sh, and it would sit OUTSIDE the drift gate
+# (orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift) that
+# already covers this constant. Sourcing costs nothing: the lib does pure path
+# arithmetic at source time and no python work, and it carries its own
+# double-source guard.
+# shellcheck source=orchestrator/scripts/warm-lane/lib_lane_state.sh
+source "$WARM_LANE_SCRIPTS_DIR/lib_lane_state.sh"
 
 echo "=== scripts/warm-lane-gc.sh hermetic tests (task 4717) ==="
 
@@ -138,15 +162,61 @@ init_isolated_lane_root test-gc
 ERR_FILE="$(mktemp /tmp/test-warm-lane-gc-err-XXXXXX)"
 _TMPDIRS+=("$ERR_FILE")
 
-# ── run_helper ─────────────────────────────────────────────────────────────────
-# Invokes warm-lane-gc.sh, capturing OUT (stdout), ERR_OUT (stderr), RC.
-run_helper() {
+# ── run_helper / run_helper_live_default ──────────────────────────────────────
+# Both invoke warm-lane-gc.sh, capturing OUT (stdout), ERR_OUT (stderr), RC.
+# ONE capture site (_run_gc) so the two wrappers cannot drift apart.
+#
+# BRIDGE-COST SEAM (task 3292)
+# ----------------------------
+# gc.sh's PROTECT_GLOB default is no longer a hardcoded literal: it renders
+# dark-factory's PROTECTED_PREFIXES through lib_lane_state.sh's
+# lane_protect_glob, which starts a python3 and imports orchestrator.git_ops
+# (and transitively pydantic) ONCE PER INVOCATION — measured 1.9-5.6s per
+# invocation on the development host, against the ~22 invocations in this file
+# that reach glob resolution. That is tens of seconds of added wall-clock for a
+# resolution almost none of those blocks is asserting anything about.
+#
+# run_helper therefore PINS the glob to the shipped static fallback through
+# gc.sh's own already-documented REIFY_WARM_LANE_GC_PROTECT_GLOB knob, which
+# gc.sh's `[ -n "$PROTECT_GLOB" ] ||` default short-circuits BEFORE the bridge
+# runs. No new production surface is added for the tests' benefit: this is the
+# knob gc.sh already ships and documents. The pin is an inline command prefix,
+# NEVER an `export`, so the test shell's own environment stays clean for every
+# other call site (same idiom as K4's PATH prefix and O-env's).
+#
+# The pin is behaviour-NEUTRAL, not merely believed to be. $LANE_PROTECT_GLOB_FALLBACK
+# is a strict SUPERSET of what gc.sh renders by default: the same bands, plus
+# `_merge-verify` (already covered by `_merge-*`) and `.lane-state`/`.task-meta`
+# (dot-prefixed, and gc.sh's candidate loop is `"$WORKTREES_DIR"/*/` with no
+# `shopt -s dotglob` anywhere, so neither can ever match an enumerated entry).
+# If pinning ever MOVES an existing assert, that superset argument has broken
+# and the seam — not the assert — is what needs revisiting.
+#
+# >>> A BLOCK THAT ASSERTS WHAT THE **DEFAULT** PROTECTS MUST CALL
+# >>> run_helper_live_default, OR IT SILENTLY TESTS THE PIN INSTEAD OF THE
+# >>> DEFAULT. Current users: M, N-default, O (both sub-cases), X-band.
+_run_gc() {
+    local mode="$1"; shift
     local rc=0
     > "$ERR_FILE"
-    OUT="$(bash "$SCRIPT" "$@" 2>"$ERR_FILE")" || rc=$?
+    if [ "$mode" = "pin" ]; then
+        OUT="$(REIFY_WARM_LANE_GC_PROTECT_GLOB="$LANE_PROTECT_GLOB_FALLBACK" \
+            bash "$SCRIPT" "$@" 2>"$ERR_FILE")" || rc=$?
+    else
+        OUT="$(bash "$SCRIPT" "$@" 2>"$ERR_FILE")" || rc=$?
+    fi
     ERR_OUT="$(cat "$ERR_FILE")"
     RC=$rc
 }
+
+# Pinned — the default for every block that is NOT asserting the protect glob.
+run_helper() { _run_gc pin "$@"; }
+
+# Unpinned — gc.sh resolves its PROTECT_GLOB default exactly as dark-factory's
+# ε reclaim call site does (git_ops.py _run_warm_lane_gc_reclaim passes --mount
+# and nothing else). Use this, and only this, when the assertion is about what
+# the DEFAULT protects.
+run_helper_live_default() { _run_gc live "$@"; }
 
 # ── git repo factory ───────────────────────────────────────────────────────────
 # make_repo DIR  — create a bare-minimum git repo at DIR with one initial commit.
@@ -1222,7 +1292,9 @@ chmod +x "$M_SEED_STUB"
 export SEED_LOG="$M_SEED_LOG"
 
 # DF-faithful invocation: --mount only, NO --protect-glob (exercises the DEFAULT).
-run_helper reclaim \
+# run_helper_live_default, not run_helper: this block asserts what the DEFAULT
+# protects, so it must NOT be pinned to the static fallback (task 3292 seam).
+run_helper_live_default reclaim \
     --mount "$M_WORKTREES" \
     --seed-script "$M_SEED_STUB"
 
@@ -1297,7 +1369,8 @@ STUB_EOF
 chmod +x "$N_SEED_STUB"
 export SEED_LOG="$N_SEED_LOG"
 
-run_helper reclaim \
+# run_helper_live_default: N-default asserts the DEFAULT protect set (3292 seam).
+run_helper_live_default reclaim \
     --mount "$N_WORKTREES" \
     --seed-script "$N_SEED_STUB"
 
@@ -1421,7 +1494,9 @@ STUB_EOF
 chmod +x "$O_SEED_STUB"
 export SEED_LOG="$O_SEED_LOG"
 
-run_helper reclaim \
+# run_helper_live_default: O7 asserts the DEFAULT set is still active ALONGSIDE
+# the additive flag, so the default must be really resolved here (3292 seam).
+run_helper_live_default reclaim \
     --worktrees-dir "$O_WORKTREES" \
     --base-target "$O_BASE/target" \
     --seed-script "$O_SEED_STUB" \
@@ -1486,7 +1561,9 @@ STUB_EOF
 chmod +x "$OE_SEED_STUB"
 export SEED_LOG="$OE_SEED_LOG"
 
-REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB="_lane-9" run_helper reclaim \
+# run_helper_live_default: O-env5 counts the DEFAULT-protected _mainsweep-x
+# alongside the env-driven one, so the default must be really resolved (3292).
+REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB="_lane-9" run_helper_live_default reclaim \
     --worktrees-dir "$OE_WORKTREES" \
     --base-target "$OE_BASE/target" \
     --seed-script "$OE_SEED_STUB" \
@@ -2325,6 +2402,178 @@ assert "S22: ...and preserved for the RIGHT reason (the record, read at gate tim
     bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: assigned to task 5334"' _ "$ERR_OUT"
 assert "S23: summary reset=1 with the preserve attributed to the record gate" \
     bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 .*preserved_assigned=1"' _ "$OUT"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block X — the PROTECT_GLOB default is RENDERED from dark-factory's registry
+# (task 3292)
+#
+# Until now gc.sh's default protect-glob was a hardcoded literal carrying a
+# comment that admitted it mirrored PROTECTED_PREFIXES by hand — an INV-5
+# lockstep duplication whose failure mode is silent: a band added to the
+# registry that nobody mirrors here becomes a live managed worktree Pass 2 will
+# happily `git worktree remove --force`. lib_lane_state.sh's lane_protect_glob
+# shipped the faithful render ahead of any consumer; this block pins gc.sh
+# actually consuming it.
+#
+# Two sub-cases, covering the two halves of lane_protect_glob's contract:
+#
+#   X-band    — the OBSERVABLE PAYOFF. The interactive band is the one registry
+#               key that is not a constant (it is dark-factory's `git.iact_prefix`
+#               config field), so a deployment that renamed it had a hardcoded
+#               `_iact-*` protecting a band it never mints while OMITTING the
+#               band it does — the dangerous direction. With
+#               REIFY_WARM_LANE_IACT_PREFIX honoured, the rendered glob tracks
+#               the deployment. Asserted in BOTH directions: the renamed band is
+#               protected AND the stock `_iact-*` band is no longer.
+#   X-degrade — the `||` FALLBACK, pinned in situ rather than as a contract
+#               claim. lane_protect_glob fails LOUD (one [warn], empty stdout,
+#               non-zero) and gc.sh runs `set -euo pipefail`, so a caller that
+#               omitted the `||` would ABORT a reclaim sweep instead of
+#               degrading it. Driving a relocated copy — from which the repo
+#               root resolves to `/`, which carries no dark-factory checkout —
+#               is what makes the degrade branch reachable hermetically.
+# ──────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "--- Block X: PROTECT_GLOB default rendered from the registry (task 3292) ---"
+
+# ── X-band: REIFY_WARM_LANE_IACT_PREFIX moves the protected interactive band ──
+# DF-faithful invocation (--mount only, no --protect-glob) via
+# run_helper_live_default, because this sub-case is ABOUT the default.
+XB_ROOT="$(mktemp -d /tmp/test-gc-xb-XXXXXX)"
+_TMPDIRS+=("$XB_ROOT")
+
+XB_REPO="$XB_ROOT/repo"
+XB_WORKTREES="$XB_ROOT/worktrees"
+XB_BASE="$XB_ROOT/base"
+mkdir -p "$XB_WORKTREES" "$XB_BASE"
+
+make_repo "$XB_REPO"
+
+mkdir -p "$XB_BASE/target.gen.1"
+touch "$XB_BASE/target.gen.1.lock"
+ln -sfn "$XB_BASE/target.gen.1" "$XB_BASE/target"
+
+# _myiact-live — an interactive worktree of THIS deployment's renamed band.
+# Clean and landed, i.e. indistinguishable from a cold orphan to every gate
+# EXCEPT the protect glob: only the rendered band can explain its survival.
+git -C "$XB_REPO" worktree add -q "$XB_WORKTREES/_myiact-live"
+touch "$XB_WORKTREES/_myiact-live/PROTECTED_MARKER"
+
+# _iact-stale — the STOCK band this deployment does not mint. The old hardcoded
+# default protected it; a faithful render for this deployment must not.
+git -C "$XB_REPO" worktree add -q "$XB_WORKTREES/_iact-stale"
+
+XB_SEED_LOG="$XB_ROOT/seed_calls.log"
+XB_SEED_STUB="$XB_ROOT/seed_stub.sh"
+_seed_stub_body > "$XB_SEED_STUB"
+chmod +x "$XB_SEED_STUB"
+export SEED_LOG="$XB_SEED_LOG"
+
+# Inline command prefix, not an `export`: the band override must reach gc.sh's
+# child (and through it lane_protect_glob's python) for THIS call only, leaving
+# the test shell's environment clean for every later block.
+REIFY_WARM_LANE_IACT_PREFIX="_myiact-" run_helper_live_default reclaim \
+    --mount "$XB_WORKTREES" \
+    --seed-script "$XB_SEED_STUB"
+
+assert "X-band1: exit 0" test "$RC" -eq 0
+assert "X-band2: _myiact-live preserved (the deployment's OWN interactive band is protected)" \
+    test -d "$XB_WORKTREES/_myiact-live"
+assert "X-band3: _myiact-live PROTECTED_MARKER intact" \
+    test -f "$XB_WORKTREES/_myiact-live/PROTECTED_MARKER"
+assert "X-band4: _iact-stale removed (the band this deployment never mints is NOT protected)" \
+    bash -c '[ ! -d "$1" ]' _ "$XB_WORKTREES/_iact-stale"
+assert "X-band5: _iact-stale absent from git worktree list" \
+    bash -c '! git -C "$1" worktree list | grep -q "_iact-stale"' _ "$XB_REPO"
+assert "X-band6: summary shows preserved=1 (only the renamed band)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "preserved=1"' _ "$OUT"
+assert "X-band7: summary shows removed=1 (the stale stock band)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "removed=1"' _ "$OUT"
+
+# ── X-degrade: a failed render degrades to the fallback, LOUDLY, without ──────
+# ── aborting the sweep ────────────────────────────────────────────────────────
+# Fixture idiom is A9/A10's (copy the shipped script plus selected siblings into
+# a temp dir), aimed differently: A9/A10 WITHHOLD a lib to reach gc.sh's own
+# sourcing guard, whereas this relocates the copy so lib_lane_state.sh's
+# environment-free root arithmetic (`<lib dir>/../../..`) lands on `/`, whose
+# missing orchestrator/src/orchestrator/git_ops.py witness makes the bridge
+# return non-zero. gc.sh does NOT source lib_portable.sh (that is
+# warm-lane-audit.sh's), so the two siblings copied here are exactly the two it
+# needs.
+#
+# The mount is deliberately MINIMAL — one protected entry, one control orphan,
+# no pool lanes and no .lane-state records — so that the bridge is the only
+# thing in the run that can emit a [warn], which is what makes "exactly one"
+# an assertion about the degrade rather than about arithmetic.
+#
+# NOTE: no REIFY_WARM_LANE_GC_PROTECT_GLOB pin here, and $SCRIPT is not used, so
+# run_helper is not applicable — the point is to reach the resolution path in a
+# relocated copy, with its own rc/stderr capture.
+XD_DIR="$(mktemp -d /tmp/test-gc-x-XXXXXX)"
+_TMPDIRS+=("$XD_DIR")
+cp "$SCRIPT" "$XD_DIR/warm-lane-gc.sh"
+cp "$WARM_LANE_SCRIPTS_DIR/lib_live_refs.sh" "$XD_DIR/lib_live_refs.sh"
+cp "$WARM_LANE_SCRIPTS_DIR/lib_lane_state.sh" "$XD_DIR/lib_lane_state.sh"
+
+assert "X-degrade: fixture — both siblings gc.sh sources are present (so no sourcing guard fires)" \
+    bash -c '[ -f "$1/lib_live_refs.sh" ] && [ -f "$1/lib_lane_state.sh" ]' _ "$XD_DIR"
+assert "X-degrade: fixture — no dark-factory checkout at the relocated copy's resolved root (the bridge MUST degrade)" \
+    bash -c '[ ! -f "$(cd "$1/../../.." && pwd)/orchestrator/src/orchestrator/git_ops.py" ]' _ "$XD_DIR"
+
+XD_ROOT="$(mktemp -d /tmp/test-gc-xd-XXXXXX)"
+_TMPDIRS+=("$XD_ROOT")
+
+XD_REPO="$XD_ROOT/repo"
+XD_WORKTREES="$XD_ROOT/worktrees"
+XD_BASE="$XD_ROOT/base"
+mkdir -p "$XD_WORKTREES" "$XD_BASE"
+
+make_repo "$XD_REPO"
+
+mkdir -p "$XD_BASE/target.gen.1"
+touch "$XD_BASE/target.gen.1.lock"
+ln -sfn "$XD_BASE/target.gen.1" "$XD_BASE/target"
+
+# _merge-verify — covered by the FALLBACK (both as `_merge-*` and by name).
+# Its survival is what proves the fallback was substituted rather than an EMPTY
+# glob: an empty glob returned with a zero exit reads downstream as "nothing is
+# protected", the silent widening lib_lane_state.sh's contract exists to block.
+git -C "$XD_REPO" worktree add -q "$XD_WORKTREES/_merge-verify"
+touch "$XD_WORKTREES/_merge-verify/PROTECTED_MARKER"
+
+# Control orphan — must still be removed, proving the sweep RAN to completion
+# rather than aborting early under `set -euo pipefail`.
+git -C "$XD_REPO" worktree add -q "$XD_WORKTREES/task-7777"
+
+XD_SEED_LOG="$XD_ROOT/seed_calls.log"
+XD_SEED_STUB="$XD_ROOT/seed_stub.sh"
+_seed_stub_body > "$XD_SEED_STUB"
+chmod +x "$XD_SEED_STUB"
+export SEED_LOG="$XD_SEED_LOG"
+
+XD_ERR_FILE="$(mktemp /tmp/test-gc-xd-err-XXXXXX)"
+_TMPDIRS+=("$XD_ERR_FILE")
+XD_RC=0
+bash "$XD_DIR/warm-lane-gc.sh" reclaim \
+    --mount "$XD_WORKTREES" \
+    --seed-script "$XD_SEED_STUB" \
+    >/dev/null 2>"$XD_ERR_FILE" || XD_RC=$?
+XD_ERR="$(cat "$XD_ERR_FILE")"
+
+assert "X-degrade1: exit 0 — the || degraded the failed render instead of aborting under set -e" \
+    test "$XD_RC" -eq 0
+assert "X-degrade2: stderr carries EXACTLY ONE [warn] line" \
+    bash -c '[ "$(printf "%s\n" "$1" | grep -c "\[warn\]")" -eq 1 ]' _ "$XD_ERR"
+assert "X-degrade3: ...and it is the lane_protect_glob DEGRADED warning (fail LOUD, not silent)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "lane_protect_glob DEGRADED"' _ "$XD_ERR"
+assert "X-degrade4: _merge-verify preserved (LANE_PROTECT_GLOB_FALLBACK substituted, not an empty glob)" \
+    test -d "$XD_WORKTREES/_merge-verify"
+assert "X-degrade5: _merge-verify PROTECTED_MARKER intact" \
+    test -f "$XD_WORKTREES/_merge-verify/PROTECTED_MARKER"
+assert "X-degrade6: control orphan task-7777 removed (the sweep completed, it did not exit early)" \
+    bash -c '[ ! -d "$1" ]' _ "$XD_WORKTREES/task-7777"
+assert "X-degrade7: control orphan task-7777 absent from git worktree list" \
+    bash -c '! git -C "$1" worktree list | grep -q "task-7777"' _ "$XD_REPO"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Block TRASH: shared-trash litter guard (task 5612). Two asserts, deliberately
