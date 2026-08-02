@@ -21,6 +21,10 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.reconciliation.citation_verifier import (
+    STAGE_STAT_PREFIX,
+    verify_cited_memories,
+)
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE_REPORT_SCHEMA,
     recon_config_base_dir,
@@ -337,12 +341,42 @@ class BaseStage:
                 )
 
         report_data = stage_result.report
+        _flagged = report_data.get('flagged_items', [])
+        _stats = report_data.get('stats', {})
+
+        # ── Phantom-citation verification (task 2978, hoisted here by 2979) ───
+        # Re-resolve every flagged finding's cited Mem0 memories against the live
+        # store and strip any that no longer exist, so a finding is never
+        # silently backed by an id that never existed (or whose queued
+        # add_memory write later failed).
+        #
+        # Why the BASE class and not each stage's run() override: task 2978 put
+        # this in MemoryConsolidator.run() alone, and Stages 2 and 3 silently
+        # inherited ZERO protection — a per-stage override is exactly the
+        # failure mode task 2979 fixes. Every stage calls super().run() first,
+        # so this is the one placement a new stage cannot skip by forgetting to
+        # add it. Do not move it back into a subclass.
+        #
+        # Placing it HERE — on the shared items_flagged assembly, immediately
+        # before the StageReport is built — also converges BOTH citation paths:
+        # the RRS-assembled report AND the structured-output JSON fallback,
+        # whose flagged_items reach items_flagged without ever passing
+        # recon_report.cite_memory's cite-time existence check. And because it
+        # precedes every subclass's post-processing (including Stage 1's
+        # remediation early-return), full and remediation passes alike are
+        # verified and the citation stats are always present on report.stats.
+        _cite_stats = await verify_cited_memories(
+            _flagged, self.memory, self.project_id,
+            stat_prefix=STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value),
+        )
+        _stats.update(_cite_stats)
+
         stage_report = StageReport(
             stage=self.stage_id,
             started_at=started,
             completed_at=completed,
-            items_flagged=report_data.get('flagged_items', []),
-            stats=report_data.get('stats', {}),
+            items_flagged=_flagged,
+            stats=_stats,
             llm_calls=stage_result.llm_calls,
             tokens_used=stage_result.tokens_used,
         )

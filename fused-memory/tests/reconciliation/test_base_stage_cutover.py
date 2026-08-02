@@ -268,7 +268,17 @@ class TestReconStateFallbackToEmpty:
             report = await stage.run([], watermark, [], run_id='run-none')
 
         assert report.items_flagged == [], 'items_flagged must be empty on None assembled'
-        assert report.stats == {}, 'stats must be empty on None assembled'
+        # stats carries ONLY the citation-verification triple, all zero. Task
+        # 2979 hoisted verify_cited_memories into BaseStage.run()'s shared
+        # assembly, and it sets its three counters unconditionally (the
+        # explicit-zero convention) so downstream consumers never need a
+        # .get(..., 0) fallback — including on this empty-report path, where
+        # there are no findings to verify.
+        assert report.stats == {
+            'stage1_phantom_citations_dropped': 0,
+            'stage1_citations_verified': 0,
+            'stage1_citation_verification_errors': 0,
+        }, 'stats must carry only the zeroed citation triple on None assembled'
 
     @pytest.mark.asyncio
     async def test_timestamps_still_set_on_none_assembled(self):

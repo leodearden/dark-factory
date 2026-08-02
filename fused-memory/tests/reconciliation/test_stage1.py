@@ -3797,24 +3797,35 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
 
 
 class TestMemoryConsolidatorCitationVerificationWiring:
-    """MemoryConsolidator.run() must re-verify each flagged finding's cited
-    Mem0 memories (verify_cited_memories) AFTER super().run() and BEFORE the
-    remediation early-return, so a phantom (non-resolving) mem0 citation is
-    stripped + marked, and the stage1_* citation stats are always present on
+    """A Stage-1 run must re-verify each flagged finding's cited Mem0 memories
+    (verify_cited_memories), so a phantom (non-resolving) mem0 citation is
+    stripped + marked and the stage1_* citation stats are always present on
     report.stats (task 2978).
 
     Driven through the remediation path: its early-return fires immediately
-    after the verifier, isolating the verifier wiring from the full-path
-    filter chain AND proving the check runs BEFORE that early-return (so both
-    full and remediation passes are covered). RED until step-8 wires
-    verify_cited_memories into run().
+    after super().run() returns, isolating the verifier wiring from the
+    full-path filter chain AND proving the check runs BEFORE that early-return
+    (so both full and remediation passes are covered).
+
+    Seam note (task 2979): this test used to stub ``BaseStage.run`` itself.
+    Task 2979 HOISTED verify_cited_memories out of MemoryConsolidator.run()
+    into BaseStage.run()'s shared items_flagged assembly, so stubbing
+    BaseStage.run now stubs out the code under test and the assertions below
+    could never hold. It patches ``base.run_stage_via_cli`` instead — one layer
+    lower — which keeps the real assembly path executing while still
+    hermetically controlling the stage's "LLM" output. Same assertions, live
+    code path. Do not migrate it back.
     """
 
     @pytest.mark.asyncio
     async def test_phantom_citation_stripped_and_marked_via_run(self):
+        from unittest.mock import patch as _patch
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
         stage = _make_consolidator(project_root='/tmp/reify')
-        # Remediation mode: run() early-returns right after the verifier, before
-        # the full-path filter chain.
+        # Remediation mode: run() early-returns right after super().run(),
+        # before the full-path filter chain.
         stage.remediation_findings = [{'description': 'remediation'}]
 
         async def _get(project_id, memory_id):
@@ -3834,15 +3845,24 @@ class TestMemoryConsolidatorCitationVerificationWiring:
                 {'memory_id': 'phantom-id', 'store': 'mem0'},
             ],
         }
-        base_report = StageReport(
-            stage=StageId.memory_consolidator,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[finding],
-            stats={},
+        # recon_report_state is unset on this stage, so BaseStage.run takes the
+        # structured-output JSON fallback and builds items_flagged straight from
+        # this report — the path that bypasses cite_memory's existence check.
+        cli_result = StageResult(
+            report={'summary': '', 'stats': {}, 'flagged_items': [finding]},
+            llm_calls=1,
+            tokens_used=10,
+            model='test-model',
+            success=True,
         )
 
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+        with (
+            _patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=cli_result),
+            ),
+            _patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+        ):
             report = await stage.run(
                 events=[],
                 watermark=Watermark(project_id='test_project'),
@@ -3853,9 +3873,9 @@ class TestMemoryConsolidatorCitationVerificationWiring:
         verified_finding = report.items_flagged[0]
         # The phantom is stripped; the resolving id remains.
         assert [c['memory_id'] for c in verified_finding['cited_memories']] == ['good-id'], (
-            'run() must strip the non-resolving mem0 citation via verify_cited_memories; '
-            f'got cited_memories={verified_finding.get("cited_memories")!r}. '
-            'RED: verify_cited_memories is not yet wired into run().'
+            'the Stage-1 run must strip the non-resolving mem0 citation via '
+            f'verify_cited_memories; got cited_memories='
+            f'{verified_finding.get("cited_memories")!r}.'
         )
         # The dropped phantom is named on the finding.
         assert verified_finding.get('citation_failures') == [
@@ -3866,6 +3886,57 @@ class TestMemoryConsolidatorCitationVerificationWiring:
         assert report.stats['stage1_phantom_citations_dropped'] == 1
         assert 'stage1_citations_verified' in report.stats
         assert 'stage1_citation_verification_errors' in report.stats
+
+    @pytest.mark.asyncio
+    async def test_stage1_citation_stats_are_not_double_counted(self):
+        """Exactly ONE verification pass runs per Stage-1 run.
+
+        Task 2979 deleted MemoryConsolidator.run()'s own call when it hoisted
+        the pass into BaseStage.run(). Re-adding one there would double every
+        stage1_* counter and double the get_memory_by_id load — this pins that
+        it stays deleted.
+        """
+        from unittest.mock import patch as _patch
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.remediation_findings = [{'description': 'remediation'}]
+
+        assert stage.memory is not None
+        stage.memory.get_memory_by_id = AsyncMock(return_value=None)  # type: ignore[union-attr]
+
+        finding = {
+            'description': 'a stage-1 finding',
+            'severity': 'medium',
+            'cited_memories': [{'memory_id': 'phantom-id', 'store': 'mem0'}],
+        }
+        cli_result = StageResult(
+            report={'summary': '', 'stats': {}, 'flagged_items': [finding]},
+            success=True,
+        )
+
+        with (
+            _patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=cli_result),
+            ),
+            _patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-citation-no-double-count',
+            )
+
+        # One drop counted, one lookup awaited — not two of either.
+        assert report.stats['stage1_phantom_citations_dropped'] == 1
+        stage.memory.get_memory_by_id.assert_awaited_once()  # type: ignore[union-attr]
+        # And exactly one failure marker on the finding, not a duplicate pair.
+        assert report.items_flagged[0]['citation_failures'] == [
+            {'memory_id': 'phantom-id', 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
 
 
 # ---------------------------------------------------------------------------
