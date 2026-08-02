@@ -3761,6 +3761,55 @@ class TestCommittedReportJson:
             for key in keys:
                 assert measurement[metric][key] is not None, f'{arm}.{metric}.{key}'
 
+    def test_every_arm_carries_the_pin_diagnostic(self):
+        """Both keys on all six rows. A `+pin` row identical to its twin is
+        unreadable without it: "the pin never fired" and "the pin does not
+        help" are different findings, and the artifact has to say which."""
+        report = _committed_report()
+
+        for arm, measurement in report['arms'].items():
+            assert 'pin' in measurement, arm
+            assert measurement['pin']['enabled'] is arm.endswith('+pin'), arm
+            assert 'window_changed_rate' in measurement['pin'], arm
+
+    def test_a_pin_off_row_reports_no_rate_rather_than_a_measured_zero(self):
+        """The question was never asked there. A 0.0 would claim it was."""
+        report = _committed_report()
+
+        for arm, measurement in report['arms'].items():
+            if not arm.endswith('+pin'):
+                assert measurement['pin']['window_changed_rate'] is None, arm
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers', 'b_grouped'])
+    def test_a_pin_column_differs_from_its_twin_only_where_the_pin_fired(self, shape):
+        """The reviewer's finding, stated as an invariant over the artifact.
+
+        A `+pin` variant is measured over a window of the SAME size as its
+        pin-off twin, so it can only score differently when the pin actually
+        CHANGED that window. If it changed nothing, every metric block must be
+        byte-identical to the twin's; and wherever any block differs, the
+        diagnostic must show the pin firing. Anything else is a column bought
+        with a bigger budget rather than earned.
+
+        Pins no value, rate or bound (G6/D10) — only the two-way agreement
+        between the diagnostic and the metrics it explains.
+        """
+        arms = _committed_report()['arms']
+        off, on = arms[shape], arms[f'{shape}+pin']
+        blocks = ('claim_recall', 'discoverability', 'tokens_per_query',
+                  'guard_adequacy')
+        identical = all(on[block] == off[block] for block in blocks)
+        rate = on['pin']['window_changed_rate']
+
+        if rate == 0.0:
+            for block in blocks:
+                assert on[block] == off[block], f'{shape}+pin.{block}'
+        if not identical:
+            assert rate is not None and rate > 0, (
+                f'{shape}+pin differs from its twin while the pin changed no '
+                f'window — the difference is an unequal measurement, not a result'
+            )
+
     def test_the_guard_column_is_flagged_as_a_threshold_replay_on_every_arm(self):
         """Carried per-arm so a reader who copies one row out of the table
         cannot lose the flag (eval-design §1's one sanctioned exception)."""
