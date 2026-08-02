@@ -33,6 +33,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 from escalation.models import Escalation
 from escalation.pins import PinRecord, classify_pins
+from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
 
 from orchestrator.artifacts import TaskArtifacts
@@ -448,7 +449,7 @@ def _make_ground_truth(
     *,
     git_ops: MagicMock | None = None,
     scheduler: MagicMock | None = None,
-    escalation_queue: MagicMock | None = None,
+    escalation_queue: MagicMock | EscalationQueue | None = None,
     worktree_resolver=None,
     now_fn=None,
     heartbeat_ttl: timedelta | None = None,
@@ -1003,8 +1004,12 @@ class TestDeriveTruthRemainingFields:
         report = await resolver.derive_truth('20')
 
         assert report.open_escalations == [
-            EscalationRef(id='esc-20-1', level=1, category='scope_violation'),
-            EscalationRef(id='esc-20-2', level=0, category='cleanup_needed'),
+            EscalationRef(
+                id='esc-20-1', level=1, category='scope_violation', severity='blocking',
+            ),
+            EscalationRef(
+                id='esc-20-2', level=0, category='cleanup_needed', severity='info',
+            ),
         ]
         escalation_queue.get_by_task.assert_called_once_with('20', status='pending')
 
@@ -1014,6 +1019,117 @@ class TestDeriveTruthRemainingFields:
         report = await resolver.derive_truth('21')
 
         assert report.open_escalations == []
+
+    # -----------------------------------------------------------------------
+    # step-13 — REAL-queue round-trip: severity + filing identity survive JSON
+    # serialisation, the atomic file write, and from_dict rehydration.
+    # -----------------------------------------------------------------------
+
+    def _real_queue(self, tmp_path: Path) -> EscalationQueue:
+        return EscalationQueue(tmp_path / 'escalations')
+
+    async def test_refs_round_trip_severity_and_filing_identity_via_real_queue(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = self._real_queue(tmp_path)
+        queue.submit(Escalation(
+            id='esc-30-1', task_id='30', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s1', level=0,
+            filing_claimant_run_id='run-A/sess-A/pid=1',
+        ))
+        queue.submit(Escalation(
+            id='esc-30-2', task_id='30', agent_role='implementer',
+            severity='info', category='cleanup_needed', summary='s2', level=1,
+        ))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('30')
+
+        assert sorted(report.open_escalations, key=lambda r: r.id) == [
+            EscalationRef(
+                id='esc-30-1', level=0, category='infra_issue', severity='blocking',
+                filing_claimant_run_id='run-A/sess-A/pid=1',
+            ),
+            EscalationRef(
+                id='esc-30-2', level=1, category='cleanup_needed', severity='info',
+                filing_claimant_run_id=None,
+            ),
+        ]
+
+    async def test_legacy_on_disk_record_without_filing_identity_resolves_to_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """ZERO MIGRATION through a real queue: a pre-3533 JSON file on disk
+        has no filing_claimant_run_id key at all."""
+        queue = self._real_queue(tmp_path)
+        (queue.queue_dir / 'esc-31-1.json').write_text(json.dumps({
+            'id': 'esc-31-1', 'task_id': '31', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'infra_issue', 'summary': 'legacy',
+            'status': 'pending', 'level': 0,
+            # NOTE: filing_claimant_run_id intentionally absent
+        }))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('31')
+
+        assert report.open_escalations == [
+            EscalationRef(
+                id='esc-31-1', level=0, category='infra_issue', severity='blocking',
+                filing_claimant_run_id=None,
+            ),
+        ]
+
+    async def test_null_severity_on_disk_normalises_to_empty_string(
+        self, tmp_path: Path,
+    ) -> None:
+        """A null severity resolves to '' — the classifier's fail-safe branch,
+        not an exception, governs."""
+        queue = self._real_queue(tmp_path)
+        (queue.queue_dir / 'esc-32-1.json').write_text(json.dumps({
+            'id': 'esc-32-1', 'task_id': '32', 'agent_role': 'implementer',
+            'severity': None, 'category': 'infra_issue', 'summary': 'null severity',
+            'status': 'pending', 'level': 0,
+        }))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('32')
+
+        assert report.open_escalations == [
+            EscalationRef(id='esc-32-1', level=0, category='infra_issue', severity=''),
+        ]
+
+    async def test_end_to_end_real_queue_refs_classify_through_classify_pins(
+        self, tmp_path: Path,
+    ) -> None:
+        """The full producer-to-predicate path this task delivers: real
+        Escalation records -> real queue -> derive_truth -> EscalationRefs ->
+        classify_pins."""
+        queue = self._real_queue(tmp_path)
+        queue.submit(Escalation(
+            id='esc-30-1', task_id='30', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s1', level=0,
+            filing_claimant_run_id='run-A/sess-A/pid=1',
+        ))
+        queue.submit(Escalation(
+            id='esc-30-2', task_id='30', agent_role='implementer',
+            severity='info', category='cleanup_needed', summary='s2', level=1,
+        ))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('30')
+        pins = classify_pins(
+            '30',
+            sorted(report.open_escalations, key=lambda r: r.id),
+            live_claimant=False,
+        )
+
+        assert pins.dead_l0 == ('esc-30-1',)
+        assert pins.non_pinning == ('esc-30-2',)
+        assert pins.queue_handoff == ()
+        # The dead L0 does not block conversion...
+        assert pins.pins is False
+        # ...but a non-info open record still vetoes a done-flip (PRD D3).
+        assert pins.vetoes_done_flip is True
 
     async def test_deploy_phase_from_present_deploy_state_slice(self) -> None:
         task = {
