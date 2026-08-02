@@ -6844,6 +6844,83 @@ class TestDefaultScheduleDetachedRestart:
         )
         assert filed[0].level == 2, f'wrapper output: {out!r}'
 
+    async def test_fired_wrapper_reports_a_failed_escalation_submit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A submit that DIES must be loud end-to-end, through the real caller.
+
+        The sibling pins in test_proc_supervision.py exercise ``RestartPlan``
+        directly; this one drives ``_default_schedule_detached_restart``, so the
+        DELEGATION seam is covered too — if deterministic_runner ever stops
+        delegating to RestartPlan and reintroduces a wrapper of its own, this
+        catches it and those cannot.
+
+        ``sys.executable`` is patched to a stub exiting 9 before the wrapper is
+        built, so the on-failure ``to_submit_argv(sys.executable)`` branch
+        genuinely fails when the wrapper is later fired for real.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
+
+        queue = EscalationQueue(tmp_path / 'q')
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        fail_script = tmp_path / 'deploy-fail.sh'
+        fail_script.write_text('#!/bin/sh\nexit 7\n')
+        fail_script.chmod(0o755)
+        before_done = {
+            'script': str(fail_script),
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        # A stub interpreter that ignores argv and dies — stands in for a
+        # service that is down, a bad argv, or an interpreter that cannot
+        # import `escalation`.  Patched BEFORE the call, because the wrapper
+        # string is built (and reads sys.executable) at scheduling time.
+        stub_python = tmp_path / 'stub-python'
+        stub_python.write_text('#!/bin/sh\nexit 9\n')
+        stub_python.chmod(0o755)
+        monkeypatch.setattr(sys, 'executable', str(stub_python))
+
+        captured: dict = {}
+
+        async def fake_exec(*argv, **kwargs):
+            captured['argv'] = argv
+            return self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-902.service',
+                on_active_secs=1,
+                task_id='902',
+            )
+
+        wrapped = captured['argv'][-1]
+        wrapper_rc, out = await _run_wrapper_payload(wrapped)
+
+        assert wrapper_rc == RP4_ESCALATION_SUBMIT_FAILED_RC, (
+            f'a failed on-failure submit must exit the reserved '
+            f"{RP4_ESCALATION_SUBMIT_FAILED_RC}, not the payload's own code; "
+            f'got {wrapper_rc}. Wrapper output: {out!r}'
+        )
+        assert 'RP-4' in out, (
+            f'missing the RP-4 diagnostic marker; wrapper output: {out!r}'
+        )
+        assert 'rc=9' in out, (
+            f"missing the failed submit's own rc; wrapper output: {out!r}"
+        )
+        assert 'payload rc=7' in out, (
+            f"missing the payload's rc; wrapper output: {out!r}"
+        )
+        assert queue.get_by_task('902') == [], (
+            f'the submit died, so nothing can have been filed — the point is '
+            f'that this is now VISIBLE; wrapper output: {out!r}'
+        )
+
     async def test_argv_contains_escalation_submit_cli(self, tmp_path: Path):
         """escalation submit CLI must appear in the spawn argv for OnFailure handling."""
         from unittest.mock import patch
@@ -7063,7 +7140,14 @@ class TestWrapperPayloadHarness:
         at production filing logic while the real diagnosis sat unread in a
         discarded pipe.  Deterministic in any environment — the stub stands in
         for an interpreter that cannot run `-m escalation submit`.
+
+        The message must also state the PRODUCTION consequence, so the two
+        halves of task 3404 are explained in the one place a developer with a
+        broken environment actually looks: an operator who greps journald for
+        the reserved exit code lands on the same explanation this test prints.
         """
+        from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
+
         stub = tmp_path / 'broken-python'
         stub.write_text(
             "#!/bin/sh\nprintf 'NO-ESCALATION-MODULE-3404\\n' >&2\nexit 1\n"
@@ -7079,6 +7163,14 @@ class TestWrapperPayloadHarness:
         )
         assert 'NO-ESCALATION-MODULE-3404' in message, (
             f"the child's stderr must be quoted in the message: {message!r}"
+        )
+        assert str(RP4_ESCALATION_SUBMIT_FAILED_RC) in message, (
+            f'the message must name the reserved exit code a fired RP-4 unit '
+            f'would use, so it is greppable in journald: {message!r}'
+        )
+        assert 'RP-4: on-failure escalation submit failed' in message, (
+            f'the message must quote the journald signature an operator would '
+            f'actually see on this failure: {message!r}'
         )
 
     async def test_assert_submit_cli_invokable_passes_for_the_real_interpreter(self):
