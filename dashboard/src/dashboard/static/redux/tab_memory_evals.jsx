@@ -125,22 +125,37 @@ function ageText(seconds) {
 // Keys are QUOTED: they are the producer's vocabulary strings, looked up by
 // string, not JS identifiers — and quoting keeps them greppable in the same
 // form PARITY_PLAIN and the payload use.
+// EVERY `_open` member renders the same 'escalation open' affordance, in the
+// same words.  `_parity()` suffixes `_open` onto the linked variant of every
+// non-alarm verdict class, so these all assert one fact — an escalation is
+// filed and still live — and the operator should read one marker rather than
+// learn six.  Without it the badge is identical to the same verdict with
+// nothing filed, which is precisely the distinction parity exists to draw.
+//
+// Severity follows the VERDICT, not the linkage: an open escalation on a
+// metric nothing judged alarming is a warn-level parity fact, not a healthy
+// one and not an alarm.  `alarmed_open` keeps `badge bad` and pairs
+// symmetrically with `alarmed_unlinked` — "alarm · escalation open" vs
+// "alarm · no escalation" — where an unsuffixed alarm badge was ambiguous
+// between "escalation linked" and "state nobody handled".
 const PARITY_REFINEMENT = {
-  'recovered_open':   { suffix: 'escalation open', cls: 'badge warn' },
-  'alarmed_unlinked': { suffix: 'no escalation',   cls: 'badge bad' },
-  'storm_collapsed':  { suffix: 'storm-collapsed', cls: 'badge bad' },
+  'alarmed_open':           { suffix: 'escalation open', cls: 'badge bad' },
+  'alarmed_unlinked':       { suffix: 'no escalation',   cls: 'badge bad' },
+  'storm_collapsed':        { suffix: 'storm-collapsed', cls: 'badge bad' },
+  'recovered_open':         { suffix: 'escalation open', cls: 'badge warn' },
+  'insufficient_data_open': { suffix: 'escalation open', cls: 'badge warn' },
+  'grandfathered_open':     { suffix: 'escalation open', cls: 'badge warn' },
+  'unjudged_open':          { suffix: 'escalation open', cls: 'badge warn' },
+  'unknown_verdict_open':   { suffix: 'escalation open', cls: 'badge warn' },
 };
+// Reserved for states where the verdict badge already says everything there is
+// to say: nothing is filed, and the verdict names itself.
 const PARITY_PLAIN = [
-  'alarmed_open',
   'clear',
   'insufficient_data',
-  'insufficient_data_open',
   'grandfathered',
-  'grandfathered_open',
   'unjudged',
-  'unjudged_open',
   'unknown_verdict',
-  'unknown_verdict_open',
 ];
 function verdictBadge(metric) {
   const verdict = metric.verdict;
