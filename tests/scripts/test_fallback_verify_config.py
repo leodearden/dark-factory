@@ -733,14 +733,24 @@ class TestWorkspacePyrightInterpreterPinned:
 
 
 # Floor for the fleet-chain coverage invariants below (TYPE here; the LINT
-# coverage invariant reuses it — task 3397): proof that runtime discovery
-# from the root pyproject's ``[tool.uv.workspace].members`` still resolves
-# the members the fleet TYPE/LINT chains are expected to cover. NOT the
-# authoritative list — same floor-not-authority convention as
-# KNOWN_PER_MODULE_CONFIG_NAMES and KNOWN_PYRIGHT_PINNED_MEMBERS above, so a
-# newly-added workspace member is auto-covered with no edit here, while a
-# silently SHRINKING members list still fails loudly.
-KNOWN_FLEET_TYPE_MEMBERS = frozenset(
+# coverage invariant reuses the same frozenset — task 3397, named for what it
+# is: the workspace members every fleet chain must cover, not just TYPE's).
+# NOT the authoritative list.
+#
+# UNLIKE KNOWN_PER_MODULE_CONFIG_NAMES / KNOWN_PYRIGHT_PINNED_MEMBERS above,
+# this floor is NOT proof that runtime discovery from
+# ``[tool.uv.workspace].members`` still resolves these members: the sets it
+# is subtracted from below (``walked`` / ``targets``) are parsed from the
+# CONFIG COMMAND strings themselves (``type_check_command`` /
+# ``lint_command``), not from ``_workspace_member_dirs()``. Removing an entry
+# from the root pyproject's members list would therefore NOT fail either
+# guard below on its own. What this floor DOES catch: the fleet TYPE/LINT
+# chain STRINGS silently shrinking — a ``cd``/``npx pyright`` pair, or a
+# ruff/magicmock target, dropped from the yaml. A newly-added workspace
+# member is still auto-covered with no edit here, because the per-member
+# loops just above each of these assertions discover members from
+# ``_workspace_member_dirs()`` at runtime.
+KNOWN_FLEET_MEMBERS = frozenset(
     {"cockpit", "dashboard", "escalation", "fused-memory", "orchestrator", "sampler", "shared"}
 )
 
@@ -801,7 +811,7 @@ class TestFleetTypeCheckCoversEveryWorkspaceMember:
             "the fleet type_check_command &&-walk resolved no cwds at all "
             "(task 3397) — this coverage invariant would pass vacuously"
         )
-        missing = KNOWN_FLEET_TYPE_MEMBERS - walked
+        missing = KNOWN_FLEET_MEMBERS - walked
         assert not missing, (
             f"fleet type_check_command is missing known workspace member(s) "
             f"{sorted(missing)} (task 3397) — either a member was dropped from "
@@ -878,45 +888,47 @@ class TestFleetTypeCheckCoversEveryWorkspaceMember:
         )
 
 
-def _ruff_leg_targets(cmd: str) -> list[str]:
-    """Return the whitespace-tokenized positional targets of *cmd*'s ruff-check leg.
+def _lint_leg_targets(cmd: str, marker: str) -> list[str]:
+    """Return the positional targets of *cmd*'s ``&&``-leg identified by *marker*.
 
     *cmd* is the fleet ``lint_command``, an ``&&``-chain of two legs: a ``ruff
     check <targets...>`` leg and a ``check_bare_magicmock_config.py
-    <targets...>`` sibling-checker leg (covered separately by
-    ``TestFleetLintCoversEveryWorkspaceMember.
-    test_every_present_workspace_member_tests_dir_is_magicmock_checked``).
-    The ruff leg is identified by the substring ``"ruff check"`` after a
-    plain ``&&`` split — unlike the TYPE chain, this command has no ``cd``
-    clauses to walk (every target is an explicit repo-root-relative path),
-    so the production ``_AND_CLAUSE_SPLIT_RE``/``_cd_clause_target``
-    cwd-tracking walk does not apply here.
+    <targets...>`` sibling-checker leg. *marker* selects which leg — pass
+    ``"ruff check"`` or ``"check_bare_magicmock_config.py"`` — by substring
+    after a plain ``&&`` split (unlike the TYPE chain, this command has no
+    ``cd`` clauses to walk: every target is an explicit repo-root-relative
+    path, so the production ``_AND_CLAUSE_SPLIT_RE``/``_cd_clause_target``
+    cwd-tracking walk does not apply here).
 
-    Returns ``shlex.split`` TOKENS, not the raw leg string, so callers
-    compare whole path tokens against member names. A substring check like
-    ``"shared" in cmd`` is already true via the OTHER leg's ``shared/tests``
-    argument, so it would pass vacuously for a member this leg never
-    actually checks.
+    Returns only the tokens AFTER *marker* itself (``shlex.split(marker)``
+    located as a contiguous window in the leg's own ``shlex.split`` tokens,
+    matching the last window token by suffix so a marker like
+    ``"check_bare_magicmock_config.py"`` still matches the full invoked path
+    ``fused-memory/scripts/check_bare_magicmock_config.py``) — NOT
+    ``shlex.split(leg)`` over the whole leg. The whole-leg split always
+    contains the command's own tokens (``uv``, ``run``, ``ruff``, ``check`` /
+    ``python3``, ``<script>.py``), so an ``assert targets`` non-vacuity guard
+    over it can never fire empty even if every positional target were
+    deleted; trimming to the tail after *marker* keeps that guard live.
+
+    Callers must compare whole path TOKENS (as returned here) against member
+    names, never substring-match the raw command — ``"shared" in cmd`` is
+    already true via the OTHER leg's ``shared/tests`` argument, so it would
+    pass vacuously for a member a given leg never actually checks.
     """
+    marker_tokens = shlex.split(marker)
+    n = len(marker_tokens)
     for leg in cmd.split("&&"):
-        if "ruff check" in leg:
-            return shlex.split(leg)
-    return []
-
-
-def _magicmock_leg_targets(cmd: str) -> list[str]:
-    """Return the whitespace-tokenized positional targets of *cmd*'s bare-MagicMock leg.
-
-    Sibling to :func:`_ruff_leg_targets`: identifies the fleet
-    ``lint_command``'s ``check_bare_magicmock_config.py`` leg by substring
-    after a plain ``&&`` split, then ``shlex.split``s it so callers compare
-    whole path tokens rather than substring-matching the raw command (the
-    same "in cmd" vacuity trap ``_ruff_leg_targets`` avoids — e.g. a member
-    named only in the OTHER leg's arguments).
-    """
-    for leg in cmd.split("&&"):
-        if "check_bare_magicmock_config.py" in leg:
-            return shlex.split(leg)
+        if marker not in leg:
+            continue
+        tokens = shlex.split(leg)
+        for i in range(len(tokens) - n + 1):
+            window = tokens[i : i + n]
+            if window == marker_tokens or (
+                n == 1 and window[0].endswith(marker_tokens[0])
+            ):
+                return tokens[i + n :]
+        return []
     return []
 
 
@@ -935,7 +947,7 @@ class TestFleetLintCoversEveryWorkspaceMember:
 
     def test_every_present_workspace_member_is_ruff_checked(self) -> None:
         cmd = _fleet_lint_command()
-        targets = _ruff_leg_targets(cmd)
+        targets = _lint_leg_targets(cmd, "ruff check")
 
         for member in _workspace_member_dirs():
             if not (REPO_ROOT / member / "pyproject.toml").is_file():
@@ -956,15 +968,28 @@ class TestFleetLintCoversEveryWorkspaceMember:
             "targets at all (task 3397) — this coverage invariant would pass "
             "vacuously"
         )
-        missing = KNOWN_FLEET_TYPE_MEMBERS - set(targets)
+        missing = KNOWN_FLEET_MEMBERS - set(targets)
         assert not missing, (
             f"fleet lint_command's ruff-check leg is missing known workspace "
             f"member(s) {sorted(missing)} (task 3397); targets: {targets}"
         )
 
+        # A typo'd or stale target (e.g. "sampler/test", "cocpit") is invisible
+        # to the two assertions above — they only catch a KNOWN member being
+        # MISSING, not a bogus EXTRA one — yet it would make `ruff check` exit
+        # non-zero on every fallback/merge-queue verify. Catch it here instead
+        # of at the gating layer.
+        for target in targets:
+            assert (REPO_ROOT / target).exists(), (
+                f"fleet lint_command's ruff-check leg names {target!r}, which "
+                f"does not exist under {REPO_ROOT} (task 3397) — this would "
+                "make `ruff check` exit non-zero on every fallback/merge-queue "
+                f"verify; targets: {targets}"
+            )
+
     def test_every_present_workspace_member_tests_dir_is_magicmock_checked(self) -> None:
         cmd = _fleet_lint_command()
-        targets = _magicmock_leg_targets(cmd)
+        targets = _lint_leg_targets(cmd, "check_bare_magicmock_config.py")
 
         for member in _workspace_member_dirs():
             if not (REPO_ROOT / member / "tests").is_dir():
@@ -987,3 +1012,14 @@ class TestFleetLintCoversEveryWorkspaceMember:
             "no positional targets at all (task 3397) — this coverage "
             "invariant would pass vacuously"
         )
+
+        # Same typo-blind-spot rationale as the ruff-leg assertion above: a
+        # bogus extra target (not merely a missing known one) would make this
+        # leg exit non-zero on every fallback/merge-queue verify.
+        for target in targets:
+            assert (REPO_ROOT / target).exists(), (
+                f"fleet lint_command's check_bare_magicmock_config.py leg "
+                f"names {target!r}, which does not exist under {REPO_ROOT} "
+                "(task 3397) — this would make the script exit non-zero on "
+                f"every fallback/merge-queue verify; targets: {targets}"
+            )
