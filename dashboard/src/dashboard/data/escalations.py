@@ -213,8 +213,19 @@ def build_escalation_queues(config) -> dict:
             "label":      str,        # root.name for orchestrators; "fused-memory"
             "kind":       str,        # "orchestrator" | "reconciliation"
             "escalations": list[dict],
+            "skipped":    [{"path": str, "error": str}, ...],
             "summary":    {"by_level": {0,1,2}, "by_status": {pending,resolved,dismissed}},
         }
+
+    ``skipped`` names the ``*.json`` files in this subsection's queue directory
+    that :func:`load_queue_escalations` could not read or parse — one record per
+    file, ``path`` stringified here because this function's return value is the
+    payload the API layer serves (the reader deliberately leaves ``path`` a
+    ``Path`` and defers the coercion to its caller; a ``Path`` reaching
+    ``JSONResponse`` would 500 the endpoint).  It exists because a queue that
+    reports fewer escalations than it holds must say so in the payload, not only
+    in a WARNING line a human tailing stderr may never see (INV-2,
+    ``structured-facts-at-failure``).
 
     The top-level return value also carries an aggregated ``summary`` block.
 
@@ -234,23 +245,34 @@ def build_escalation_queues(config) -> dict:
             seen.add(root)
             roots_to_visit.append(root)
 
+    # A FRESH `skips` list per call site is load-bearing: load_queue_escalations
+    # APPENDS to the accumulator it is handed, so one list shared across both
+    # call sites would attribute every queue's skips to every subsection — a
+    # single corrupt file in one orchestrator's queue would then render as N
+    # badges across N unrelated projects, which is a worse lie than silence.
     for root in roots_to_visit:
-        escs = load_queue_escalations(root / 'data' / 'escalations')
+        skips: list[dict[str, Any]] = []
+        escs = load_queue_escalations(root / 'data' / 'escalations', skipped=skips)
         subsections.append({
             'id': str(root),
             'label': root.name,
             'kind': 'orchestrator',
             'escalations': escs,
+            'skipped': [{'path': str(s['path']), 'error': s['error']} for s in skips],
             'summary': _bucket(escs),
         })
 
     # Reconciliation subsection (fused-memory queue)
-    recon_escs = load_queue_escalations(config.reconciliation_escalations_dir)
+    recon_skips: list[dict[str, Any]] = []
+    recon_escs = load_queue_escalations(
+        config.reconciliation_escalations_dir, skipped=recon_skips
+    )
     subsections.append({
         'id': 'reconciliation',
         'label': 'fused-memory',
         'kind': 'reconciliation',
         'escalations': recon_escs,
+        'skipped': [{'path': str(s['path']), 'error': s['error']} for s in recon_skips],
         'summary': _bucket(recon_escs),
     })
 
