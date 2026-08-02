@@ -254,7 +254,7 @@ Labels are PRD-local; task IDs assigned at decompose.
 > this endpoint) and needs its own row — do not silently widen α to chase it.
 
 | **ε** | `/healthz`: whole-handler deadline, deliverable budget | `dashboard/src/dashboard/app.py`, `dashboard/tests/` | — | With a DB made unresponsive, `/healthz` returns **503 `degraded` within its stated budget (< 5s)** instead of hanging (measured today: 50.6s); `conn.execute` is covered by the deadline, not just `fetchone` |
-| **ζ** | write_journal growth alarm (no pruning) | `fused-memory/`, `dashboard/` | α | When `write_journal.db` exceeds the configured size/growth threshold, a loud WARNING **and** an escalation appear naming the measured size (today 6.5 GB / 16.3M rows, ~50 MB/day) |
+| **ζ** | write_journal growth alarm (no pruning) | `fused-memory/`, `dashboard/` | α | When `write_journal.db` exceeds the configured size/growth threshold, a loud WARNING **and** an escalation appear naming the measured size (today 6.6 GB / 16.7M rows; **~221 MB/day trailing-7d** — see the growth-rate correction below, *not* the ~50 MB/day lifetime mean this row originally quoted) |
 | **η** | Dashboard unit-file parity check (in-repo vs installed) | `scripts/`, `dashboard/tests/` | γ, δ | Script exits non-zero and names the drifting directive when the installed unit differs from the repo copy (today: `DASHBOARD_KNOWN_PROJECT_ROOTS` = 9 roots installed vs 1 in repo) |
 | **θ** | Fix `No [object Object] tasks` empty state | `dashboard/static/redux/tabs.jsx` | — | With all three orchestrator filters off, the table reads a plain-English empty state; the string `[object Object]` appears nowhere in rendered output |
 
@@ -263,6 +263,32 @@ Labels are PRD-local; task IDs assigned at decompose.
 α, β, γ, δ, ε, ζ, η. It is the batch's terminal gate: it re-arms the timer
 only after the preconditions it already enumerates are met, and carries the
 `disable --now` fallback if they will not be.
+
+**Follow-on: α's residual is now owned (added 2026-08-02).** Task 3304's
+amended details flagged — deliberately without filing — that the index
+leaves `get_operations_breakdown` unimproved on an endpoint polled every
+3s, and handed that residual to this PRD's owner. It is now task **3519**,
+wired as a prerequisite of **3289** (whose acceptance includes the
+`memory-graphs < 2s` check, previously unreachable).
+
+The "**remains `SCAN` by design**" wording in row α's correction is
+accurate only for the *unhinted* query. Re-measured on the live DB
+2026-08-02 (24h window; all variants return identical results, 19 groups):
+
+| Variant | Plan | Time |
+|---|---|---|
+| baseline, as shipped | `SCAN idx_wo_operation` | 22.01s |
+| `INDEXED BY idx_wo_created` | `SEARCH idx_wo_created` | **0.64s** |
+| subquery pre-filter, **no** hint | `SCAN` — SQLite flattens it | 18.12s |
+| subquery **+** hint inside | `SEARCH idx_wo_created` | 0.49s |
+| rowid pre-filter, no hint | `SCAN` + scalar subquery | 2.63s |
+
+So the planner will not choose the date index unaided — consistent with the
+architect's post-`ANALYZE` and covering-index findings — but an explicit
+`INDEXED BY` hint takes the query from 22.01s to 0.64s (34×). Note this
+**refutes** the "restructure to pre-filter on a `created_at` subquery"
+option floated in esc-3304-2: SQLite flattens that subquery straight back
+to the same plan. The hint is load-bearing; 3519 adopts it.
 
 **G7 walk (docs/legibility/design-invariants.md).** No unwaived hits.
 γ is the direct remedy for the INV-4 violation that caused the incident (a
@@ -304,9 +330,26 @@ no new contract, no fail-soft path.
    `.py`. State persistence across oneshot ticks and the `escalation submit`
    call argue for Python (`scripts/orchestrator-watchdog.py` precedent).
    **Suggested resolution:** Python. Decide in γ.
-3. **Exact ζ thresholds.** Absolute size vs growth-rate. **Suggested
+3. ~~**Exact ζ thresholds.** Absolute size vs growth-rate. **Suggested
    resolution:** both — absolute (e.g. 10 GB) and a daily-delta ceiling
-   anchored on the measured ~50 MB/day. Decide in ζ.
+   anchored on the measured ~50 MB/day. Decide in ζ.~~
+   **CORRECTED 2026-08-02 — the suggested anchor was wrong and would have
+   self-defeated.** The ~50 MB/day figure was a **lifetime mean**
+   (total size ÷ 114 days) for a series that is strongly **accelerating**.
+   Measured trailing-7d on the live DB: **~221 MB/day** (3.9×), with the
+   preceding weeks at 402,700 / 336,900 / 137,700 rows/day (d7-14 /
+   d14-21 / d21-28) against 520,700 rows/day in the trailing week. A
+   daily-delta ceiling anchored on ~50 MB/day would have been **in breach
+   the moment the alarm deployed** — a threshold derived from a bad
+   baseline is worse than none, because it fires immediately and then gets
+   disabled. Task **3311**'s planner caught this independently
+   (esc-3311-2 / esc-3311-3) and re-anchored on measured figures:
+   **10 GiB absolute / 300 MiB/day**. At the measured rate the absolute
+   ceiling is expected ~10-13 days after deploy — **by design**, since the
+   alarm exists to trigger the follow-on retention decision.
+   *Generalisation for future PRDs: state the measurement **window**
+   beside any rate, and never anchor a threshold on a lifetime mean
+   without first checking the trend.*
 4. ~~**Whether η should also assert the two unit copies' `Environment=` values
    agree**, given the installed copy legitimately carries 9 project roots.~~
    **RESOLVED in η (task 3312).** Presence-and-shape everywhere would have
