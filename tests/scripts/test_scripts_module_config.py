@@ -1,18 +1,22 @@
-"""Routing contract: the ``scripts/`` module config must actually GATE lint.
+"""Routing contract: the ``scripts/`` module config must actually GATE lint and type.
 
 Task 3445. ``scripts/orchestrator.yaml`` declared only ``test_command``, so
 every diff confined to ``scripts/`` cleared the LINT check without ruff ever
 running — 71 tracked ``.py`` files (operator tooling, the ``scripts/legibility/``
-monitors, 40 test modules) gated by nothing.
+monitors, 40 test modules) gated by nothing. Task 3456 closed the identical
+TYPE gap, which 3445 measured and recorded in that yaml as knowingly-open
+rather than leaving it a silent absence; the burn-down had to land first,
+because declaring a red command here is a fleet-wide outage, not a transient
+failure.
 
-Omitting ``lint_command`` does not leave a fallback in place, it DELETES the
-gate: ``verify_plan._derive_module_runs`` emits an explicit
-``ScopeKind.SKIPPED`` PlannedRun with ``cmd=None`` for a falsy
-``lint_command``; ``verify._executed_module_configs_from_plan`` renders that
-SKIPPED slot back to ``None``; ``verify._run_or_skip_timed`` turns a None
-command into a ``CheckRun.skipped`` that is VACUOUSLY PASSING at rc=0. This is
-the same gap task 3350 closed for ``tests/scripts/``, against whose comment
-block ``scripts/`` was measured.
+Omitting ``lint_command`` or ``type_check_command`` does not leave a fallback
+in place, it DELETES the gate: ``verify_plan._derive_module_runs`` emits an
+explicit ``ScopeKind.SKIPPED`` PlannedRun with ``cmd=None`` for a falsy
+command; ``verify._executed_module_configs_from_plan`` renders that SKIPPED
+slot back to ``None``; ``verify._run_or_skip_timed`` turns a None command into
+a ``CheckRun.skipped`` that is VACUOUSLY PASSING at rc=0. This is the same gap
+task 3350 closed for ``tests/scripts/``, against whose comment block
+``scripts/`` was measured.
 
 Cited by SYMBOL, deliberately never by file:line. This guard's first draft
 pinned line numbers — adapted from the sibling guard's own pins, which had
@@ -75,9 +79,10 @@ SAMPLE_TOUCHED_FILE = 'scripts/tests/test_census_trigger.py'
 # originally carried were all stale at HEAD and sent readers to unrelated code.
 _VACUOUS_PASS = (
     'verify_plan._derive_module_runs emits a SKIPPED PlannedRun with cmd=None '
-    'for a falsy lint_command, verify._executed_module_configs_from_plan '
-    'renders that back to None, and verify._run_or_skip_timed turns a None '
-    'command into a CheckRun.skipped that is VACUOUSLY PASSING at rc=0'
+    'for a falsy lint_command or type_check_command, '
+    'verify._executed_module_configs_from_plan renders that back to None, and '
+    'verify._run_or_skip_timed turns a None command into a CheckRun.skipped '
+    'that is VACUOUSLY PASSING at rc=0'
 )
 
 
@@ -129,8 +134,29 @@ def _executed_for_touched(files: list[str]):
     return executed[0]
 
 
-def _ruff_segment(cmd: str) -> str:
-    """The ``&&``-chained segment of *cmd* that actually invokes ``ruff check``.
+# The two checker spellings these helpers understand, keyed by the phrase that
+# identifies the invoking segment. The ANCHOR — the last whitespace-separated
+# token of the keyword — is the token after which positional targets begin, and
+# it is what makes one implementation serve both CLIs: ruff's is
+# `ruff check <targets>`, so the anchor is its `check` SUBCOMMAND; pyright's is
+# `pyright <targets>` with no subcommand at all, so the anchor is the program
+# name itself. Nothing else about the two invocations differs for these
+# purposes.
+_RUFF = 'ruff check'
+_PYRIGHT = 'pyright'
+
+# Flags that carve files back OUT of a directory-wide target, per checker.
+# ruff's three exclude spellings; for pyright, the shapes that narrow what is
+# actually checked (`--skipunannotated`, `--ignoreexternal` both match by
+# prefix, and both genuinely reduce coverage).
+_NARROWING_FLAGS = {
+    _RUFF: ('--exclude', '--extend-exclude', '--force-exclude'),
+    _PYRIGHT: ('--exclude', '--ignore', '--skip'),
+}
+
+
+def _segment(cmd: str, keyword: str) -> str:
+    """The ``&&``-chained segment of *cmd* that actually invokes *keyword*.
 
     Reuses the production splitter (``verify_cmd.split_top_level_and``, which
     is quote-aware) rather than a naive ``str.split('&&')``.
@@ -138,42 +164,60 @@ def _ruff_segment(cmd: str) -> str:
     Chaining is an ESTABLISHED pattern here, not a hypothetical:
     ``verify_plan._scope_prefix_to_keyword``'s own docstring records that
     "every subproject's lint_command chains a ``python3 .../check_*.py <dir>``
-    gate after ``ruff check``". Extracting the ruff segment first is what lets
-    the target assertions below stay true if this module later adopts that
-    shape — tokenising the whole chain would otherwise read ``&&``, ``python3``
-    and the checker's own arguments as ruff lint targets.
+    gate after ``ruff check``". Extracting the checker's own segment first is
+    what lets the target assertions below stay true if this module later adopts
+    that shape — tokenising the whole chain would otherwise read ``&&``,
+    ``python3`` and the checker's own arguments as lint/type targets.
     """
     segments = verify_cmd.split_top_level_and(cmd)
-    ruff_segments = [s for s in segments if 'ruff check' in s]
-    assert len(ruff_segments) == 1, (
-        f'expected exactly one `ruff check` segment in {cmd!r}, got '
-        f'{ruff_segments!r}'
+    matching = [s for s in segments if keyword in s]
+    assert len(matching) == 1, (
+        f'expected exactly one `{keyword}` segment in {cmd!r}, got {matching!r}'
     )
-    return ruff_segments[0]
+    return matching[0]
 
 
-def _ruff_targets(cmd: str) -> list[str]:
-    """The positional path arguments the ``ruff check`` segment of *cmd* lints.
+def _targets(cmd: str, keyword: str) -> list[str]:
+    """The positional path arguments *keyword*'s segment of *cmd* checks.
 
-    Substring checks alone cannot carry assertion (5): ``'scripts/'`` is a
-    substring of ``'tests/scripts/'``, so a copy-pasted sibling command would
-    satisfy a naive ``'scripts/' in cmd``. Splitting out the actual targets and
-    testing LIST MEMBERSHIP (exact-element, so ``'tests/scripts/'`` does not
-    match) is what makes the anti-copy-paste assertion real.
+    Substring checks alone cannot carry the anti-copy-paste assertions:
+    ``'scripts/'`` is a substring of ``'tests/scripts/'``, so a copy-pasted
+    sibling command would satisfy a naive ``'scripts/' in cmd`` for BOTH the
+    lint and the type command. Splitting out the actual targets and testing
+    LIST MEMBERSHIP (exact-element, so ``'tests/scripts/'`` does not match) is
+    what makes those assertions real.
     """
-    tokens = shlex.split(_ruff_segment(cmd))
-    assert 'check' in tokens, f'no ruff `check` subcommand in {cmd!r}'
-    tail = tokens[tokens.index('check') + 1:]
+    anchor = keyword.split()[-1]
+    tokens = shlex.split(_segment(cmd, keyword))
+    assert anchor in tokens, (
+        f'no `{anchor}` token in the `{keyword}` segment of {cmd!r}, so the '
+        'positional targets cannot be located'
+    )
+    tail = tokens[tokens.index(anchor) + 1:]
     return [t for t in tail if not t.startswith('-')]
 
 
-def _ruff_exclude_flags(cmd: str) -> list[str]:
-    """Any ``--exclude`` / ``--extend-exclude`` / ``--force-exclude`` flags.
+def _narrowing_flag_args(cmd: str, keyword: str) -> list[str]:
+    """Any flag in *keyword*'s segment that carves files back out of the target.
 
     Both spellings are caught: ``--exclude foo`` and ``--exclude=foo``.
     """
-    prefixes = ('--exclude', '--extend-exclude', '--force-exclude')
-    return [t for t in shlex.split(_ruff_segment(cmd)) if t.startswith(prefixes)]
+    prefixes = _NARROWING_FLAGS[keyword]
+    return [t for t in shlex.split(_segment(cmd, keyword)) if t.startswith(prefixes)]
+
+
+# Thin ruff-spelling wrappers, kept so test_scripts_diff_is_lint_gated below is
+# untouched by the task-3456 generalization above.
+def _ruff_segment(cmd: str) -> str:
+    return _segment(cmd, _RUFF)
+
+
+def _ruff_targets(cmd: str) -> list[str]:
+    return _targets(cmd, _RUFF)
+
+
+def _ruff_exclude_flags(cmd: str) -> list[str]:
+    return _narrowing_flag_args(cmd, _RUFF)
 
 
 def test_scripts_diff_is_lint_gated() -> None:
@@ -390,3 +434,128 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
             f'{_REQUIRED_EXTRA_PATHS[1]!r} importable only as a namespace '
             f'package, not its contents as bare top-level names'
         )
+
+
+def test_scripts_diff_is_type_gated() -> None:
+    """A diff confined to scripts/ must actually run pyright over scripts/.
+
+    The TYPE half of the same contract ``test_scripts_diff_is_lint_gated``
+    above pins for LINT, and it has the same failure mode: task 3445 declared
+    only ``test_command`` and ``lint_command`` here, so every diff confined to
+    ``scripts/`` cleared the TYPE check without pyright ever running. That was
+    stated in ``scripts/orchestrator.yaml`` as a known-open gap rather than
+    left silent, and task 3456 closed it — burning the tree down to zero
+    FIRST, because declaring a red command is a fleet-wide outage rather than a
+    transient failure (``verify.run_full_verification`` asyncio-gathers over
+    ALL ``module_configs.values()``, and the repo root sets
+    ``merge_verify_breadth: full``).
+
+    The routing PRECONDITIONS — discovery, prefix, lock_depth reachability,
+    derive_modules resolution — are asserted once by the lint test and are not
+    restated here; they are properties of the module config, not of either
+    command, and duplicating them would double the maintenance surface for no
+    added coverage. What is NOT shared is asserted below.
+
+    (a)/(b) are the two forms the command takes in production and both must
+    hold: (a) the FILE_SCOPED render a normal scripts/-only diff executes, and
+    (b) the DECLARED value, which runs VERBATIM and unscoped under merge-role
+    ``merge_verify_breadth=full`` and on STRUCTURAL diffs. Note the type leg
+    reaches FULL_SUITE more readily than the lint leg does:
+    ``verify_plan._derive_module_runs`` sets ``need_structural`` from
+    ``bool(mc.type_check_command)``, so declaring this command is what makes
+    scripts/ diffs read file CONTENT at all, and a diff touching a module that
+    defines a TypedDict or Protocol widens pyright to the unscoped form.
+
+    (c) is the anti-copy-paste half. It cannot live on the executed value for
+    the same reason the lint test's assertion (4) records:
+    ``_scope_prefix_to_keyword`` REPLACES the declared targets with the touched
+    file list, so a config carrying the sibling's ``pyright tests/scripts/``
+    renders byte-identically to the correct one for a scripts/ diff. Only the
+    DECLARED value can carry it, and only as exact-element membership —
+    ``'scripts/'`` is a SUBSTRING of ``'tests/scripts/'``, so a substring check
+    is satisfied by the wrong command.
+
+    (d) is the fix-don't-exclude half. The 395 findings this gate's declaration
+    waited on were FIXED — by annotation and narrowing, with zero ``# type:
+    ignore`` and zero ``# pyright: ignore`` added — not suppressed and not
+    carved out of the target, following the precedent tasks 3350 and 3445 set
+    for the lint gate.
+
+    Cited by SYMBOL, never by file:line, for the reason the module docstring
+    records.
+    """
+    discovered = _discovered()
+    mc = discovered[MODULE_PREFIX]
+
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE])
+
+    # (a) THE GATE ITSELF, on the FILE_SCOPED render. A None command here is
+    # not "type-checking deferred to some other config" — it is TYPE DELETED,
+    # and it reports green.
+    assert (
+        executed.type_check_command is not None
+        and 'pyright' in executed.type_check_command
+    ), (
+        f'executed type_check_command is {executed.type_check_command!r} for a '
+        f'{MODULE_PREFIX}/-only diff (task 3456). Declaring only test_command '
+        f'and lint_command on this module config downgrades TYPE to a '
+        f'vacuously-passing CheckRun.skipped at rc=0: {_VACUOUS_PASS}. Every '
+        f'.py file under {MODULE_PREFIX}/ is then type-checked by nothing, on a '
+        'check that reports green. The repo-root type_check_command does not '
+        'cover it either'
+    )
+
+    # (b) THE DECLARED VALUE, which runs VERBATIM under merge-role
+    # merge_verify_breadth=full and on STRUCTURAL diffs.
+    assert mc.type_check_command is not None and 'pyright' in mc.type_check_command, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares type_check_command='
+        f'{mc.type_check_command!r} (task 3456). Under merge-role '
+        f'merge_verify_breadth=full this value runs VERBATIM and unscoped, so '
+        f'an absent or non-pyright command leaves the merge path ungated too: '
+        f'{_VACUOUS_PASS}'
+    )
+
+    # (c) ANTI-COPY-PASTE, part 1 — exact-element target membership. Membership
+    # rather than list equality so that a legitimate strengthening (an
+    # &&-chained additional gate, an extra target) is not rejected with a
+    # message accusing the author of narrowing the gate.
+    targets = _targets(mc.type_check_command, _PYRIGHT)
+    assert f'{MODULE_PREFIX}/' in targets, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares type_check_command='
+        f'{mc.type_check_command!r}, whose pyright targets are {targets!r} — '
+        f'{MODULE_PREFIX + "/"!r} is not among them (task 3456). The gate must '
+        f'be the DIRECTORY-WIDE form: narrowing it to a file list, or leaving a '
+        f'copy-pasted {SIBLING_PREFIX}/ target in place, leaves {MODULE_PREFIX}/ '
+        f'ungated under merge full-verify behind a check that reports green — '
+        f'{_VACUOUS_PASS}. Exact-element membership is deliberate: '
+        f'{MODULE_PREFIX + "/"!r} is a SUBSTRING of {SIBLING_PREFIX + "/"!r}, so '
+        'a substring check would pass for the sibling command'
+    )
+
+    # (d) NOTHING CARVED OUT of the directory-wide target.
+    narrowing = _narrowing_flag_args(mc.type_check_command, _PYRIGHT)
+    assert not narrowing, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares type_check_command='
+        f'{mc.type_check_command!r}, which carves files back out with '
+        f'{narrowing!r} (task 3456). The findings measured at declaration time '
+        f'were FIXED by annotation and narrowing — zero `# type: ignore`, zero '
+        f'`# pyright: ignore`, zero excludes — per the task 3350/3445 '
+        f'fix-don\'t-exclude precedent; an exclude here silently un-gates '
+        'whatever it names while the check still reports green'
+    )
+
+    # (c) ANTI-COPY-PASTE, part 2 — the sibling comparison. These two
+    # directories are distinct trees.
+    sibling = discovered.get(SIBLING_PREFIX)
+    assert sibling is not None, (
+        f'{SIBLING_PREFIX}/orchestrator.yaml is no longer discovered, so the '
+        'anti-copy-paste comparison below cannot be made (task 3456)'
+    )
+    assert mc.type_check_command != sibling.type_check_command, (
+        f'{MODULE_PREFIX} and {SIBLING_PREFIX} declare a BYTE-IDENTICAL '
+        f'type_check_command {mc.type_check_command!r} (task 3456). A shared '
+        f'command means one of them is type-checking the other and its own '
+        f'files are gated by nothing. Note the two test_commands ARE '
+        'byte-identical by design — that is a different, already-recorded issue '
+        'and is not license to duplicate this one'
+    )
