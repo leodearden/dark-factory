@@ -7368,11 +7368,22 @@ async def confirm_merge_verify_flake_suppressible(
         # verdict on zero evidence, letting a genuinely red merge land. Mirrors
         # the same defensive guard in _sweep_failure_reproduces_in_isolation.
         if not groups:
+            # Name the offending node-ids HERE so this ONE merge-lane line
+            # answers both "which tests failed to map?" and "what did the gate
+            # decide?" without correlating a second line: the shared helper's
+            # own INFO names the first unmappable node-id but only knows the
+            # neutral 'unconfirmable', while the verdict vocabulary ('not
+            # suppressing') is the caller's alone. Rendering `groups` also
+            # separates the reachable None case from the defensive-only {}.
+            # The preview is bounded — a mass failure can extract hundreds of
+            # node-ids, and a log line is not a report.
+            shown = node_ids[:10]
+            extra = len(node_ids) - len(shown)
             logger.info(
                 'confirm_merge_verify_flake_suppressible: node-id -> subproject '
-                'mapping yielded nothing usable in %s — unconfirmable, not '
-                'suppressing',
-                worktree,
+                'mapping yielded nothing usable (%r) for %s%s in %s — '
+                'unconfirmable, not suppressing',
+                groups, shown, f' (+{extra} more)' if extra else '', worktree,
             )
             return None
 
