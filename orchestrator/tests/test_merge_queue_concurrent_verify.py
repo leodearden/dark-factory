@@ -214,6 +214,9 @@ def _mock_verify_result(passed: bool) -> VerifyResult:
     )
 
 
+_VERIFY_RESULT_FIELD_NAMES = {f.name for f in dataclasses.fields(VerifyResult)}
+
+
 def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
     """Return a MagicMock(spec=VerifyResult) seeded from a REAL VerifyResult's
     field defaults, with **overrides layered on top (task 3477).
@@ -253,15 +256,21 @@ def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
     is never read off a VerifyResult anywhere in src/ — callers migrating
     off the old inline doubles should simply drop it rather than pass it
     through **overrides.
+
+    **overrides are validated against VerifyResult's real field names
+    before being applied (task 3477 amend). ``spec=`` alone only makes
+    unconfigured *reads* fail loudly; a ``spec=`` (not ``spec_set=``) mock
+    still accepts an unknown attribute WRITE via plain ``setattr`` — so a
+    typo'd override (or a leftover ``verify_skipped=``) would silently
+    produce a double whose real field keeps its seeded default instead of
+    raising, which is exactly the class of silent drift this factory
+    exists to eliminate.
     """
-    real = VerifyResult(
-        passed=passed,
-        test_output='ok' if passed else 'FAILED',
-        lint_output='',
-        type_output='',
-        summary='ok' if passed else 'fail',
-        category='' if passed else 'test_failure',
-    )
+    if unknown := set(overrides) - _VERIFY_RESULT_FIELD_NAMES:
+        raise TypeError(
+            f'_fake_verify_result: not VerifyResult fields: {sorted(unknown)}'
+        )
+    real = _mock_verify_result(passed)
     fake = MagicMock(spec=VerifyResult)
     for f in dataclasses.fields(VerifyResult):
         setattr(fake, f.name, getattr(real, f.name))
@@ -5022,6 +5031,21 @@ class TestFakeVerifyResultFidelity:
             f'_extract_failing_tests_and_candidate_files joins '
             f'(cause_hint, test_output) and str.join rejects a non-str item.'
         )
+
+    def test_rejects_unknown_override_field(self) -> None:
+        """An override key that is not a real VerifyResult field must raise
+        immediately, not silently no-op (task 3477 amend).
+
+        ``spec=VerifyResult`` alone only guards unconfigured *reads*; a
+        plain ``setattr`` on a ``spec=`` (not ``spec_set=``) mock still
+        accepts an unknown attribute WRITE. Without this validation, a
+        typo'd override (e.g. ``categoy=`` for ``category=``) or a
+        leftover ``verify_skipped=`` would silently produce a double whose
+        real field keeps its seeded default instead of raising -- the same
+        class of silent drift this factory exists to eliminate.
+        """
+        with pytest.raises(TypeError, match='verify_skipped'):
+            _fake_verify_result(passed=False, verify_skipped=True)
 
 
 # ---------------------------------------------------------------------------
