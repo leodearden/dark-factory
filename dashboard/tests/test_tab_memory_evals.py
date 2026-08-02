@@ -817,6 +817,68 @@ def test_parity_vocabulary_fully_covered(tab_memory_evals_jsx_code: str) -> None
     )
 
 
+def test_every_open_parity_state_shows_the_escalation_affordance(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """A live escalation must be visible on the badge, for every `*_open` state.
+
+    The requirement is DERIVED from the producer — `{s for s in PARITY_STATES
+    if s.endswith('_open')}` — rather than listed here, which is the whole
+    point: `_parity()` suffixes `_open` onto the linked variant of every
+    non-alarm verdict class, so the next class the producer adds arrives with
+    an `_open` partner and fails here instead of rendering unaffordanced.
+
+    A `*_open` state falling through to the plain verdict badge tells the
+    operator nothing about the live escalation behind the row — the badge reads
+    exactly like the same metric with no escalation at all, which is the
+    distinction the parity field was derived to make.
+    """
+    from dashboard.data.memory_evals import PARITY_STATES
+
+    code = tab_memory_evals_jsx_code
+    open_states = {s for s in PARITY_STATES if s.endswith('_open')}
+    assert open_states, (
+        'no member of memory_evals.PARITY_STATES ends in `_open` — the naming '
+        'convention this assertion derives from is gone, so it would pass '
+        'vacuously. Re-derive the affordance requirement from whatever '
+        'replaced the suffix before deleting this guard.'
+    )
+
+    refinement = _extract_const_object(code, 'PARITY_REFINEMENT')
+    plain = _extract_const_object(code, 'PARITY_PLAIN', open_char='[')
+    assert refinement and plain, (
+        'PARITY_REFINEMENT / PARITY_PLAIN must both be declared (see '
+        'test_parity_vocabulary_fully_covered).'
+    )
+    entries = dict(re.findall(r'[\'"]?(\w+)[\'"]?\s*:\s*\{([^{}]*)\}', refinement))
+    declined = set(re.findall(r"'([^']*)'", plain))
+
+    for state in sorted(open_states):
+        assert state not in declined, (
+            f"'{state}' is in PARITY_PLAIN, so it renders as the bare verdict "
+            'badge. But an escalation is OPEN on that row: the badge is then '
+            'identical to the same verdict with nothing filed, and the '
+            'operator has no way to tell a live escalation from none. States '
+            'may decline refinement only when the verdict badge already says '
+            'everything there is to say, which is never true while an '
+            'escalation is open.'
+        )
+        assert state in entries, (
+            f"'{state}' has no PARITY_REFINEMENT entry, so nothing on its "
+            'badge discloses the open escalation the `_open` suffix asserts.'
+        )
+        suffix = re.search(r"suffix\s*:\s*'([^']*)'", entries[state])
+        assert suffix, f"PARITY_REFINEMENT['{state}'] has no `suffix` string."
+        assert 'escalation open' in suffix.group(1), (
+            f"PARITY_REFINEMENT['{state}'] renders the suffix "
+            f'{suffix.group(1)!r}, which never says the escalation is open. '
+            "Today only `recovered_open` carries that affordance; every "
+            '`_open` state means the same thing — an escalation is linked and '
+            'still live — and must say so in the same words, so the operator '
+            'reads one marker rather than learning six.'
+        )
+
+
 def test_verdict_badges_driven_by_persisted_verdict(
     tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
