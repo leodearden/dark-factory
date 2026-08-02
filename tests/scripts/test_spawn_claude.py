@@ -599,7 +599,7 @@ def test_window_close_yields_129_not_hang(
     blind pre-signal sleep, making SIGHUP-after-trap-install deterministic
     under full-suite xdist load.
 
-    Synchronization contract (load-independent):
+    Synchronization contract -- the ORDERING below is load-independent:
       1. _DETACHING_TERM_TEMPLATE publishes the leader pid IMMEDIATELY after
          setsid (no blind sleep).
       2. The fake claude writes a readiness marker file before exec sleep 300.
@@ -608,6 +608,11 @@ def test_window_close_yields_129_not_hang(
          is installed.
       4. The test waits for BOTH the pidfile AND the readiness marker before
          sending SIGHUP — SIGHUP is always delivered after trap installation.
+
+    The WAIT BUDGETS around that ordering are a separate matter and are NOT
+    load-independent -- they are load-scaled via _wait_for_path_scaled (task
+    3486), after a burst-load excursion past a fixed 5.0s pidfile timeout was
+    observed here in test_window_close_yields_129_not_hang[konsole].
     """
     bin_dir = _make_bin_dir(tmp_path)
 
@@ -645,8 +650,11 @@ def test_window_close_yields_129_not_hang(
     # The pidfile appears first (published immediately by the terminal);
     # the readyfile appears only after spawn-claude.sh has armed its traps and
     # invoked the fake claude — proof that SIGHUP will land on a live HUP trap.
-    _wait_for_path(pidfile, timeout=5.0)
-    _wait_for_path(readyfile, timeout=10.0)
+    # Budgets are load-scaled (task 3486's _wait_for_path_scaled) rather than
+    # fixed, since a burst-load excursion past a fixed 5.0s pidfile timeout is
+    # exactly the flake that was observed here (this test, konsole lane).
+    _wait_for_path_scaled(pidfile, 5)
+    _wait_for_path_scaled(readyfile, 10)
 
     leader_pid = int(pidfile.read_text().strip())
     # Send SIGHUP to the entire process group of the session leader.
@@ -655,12 +663,16 @@ def test_window_close_yields_129_not_hang(
 
     # Must-not-hang guard — NOT a latency SLA.
     # The success path takes ~2-4s (await_sentinel 2s poll + pidfile handshake).
-    # A genuine hang is infinite (no sentinel ever written), so 15s cleanly
-    # separates pass from hang while staying well under the global 60s
-    # pytest-timeout (shared/pyproject.toml, timeout_method=signal), so this
-    # descriptive pytest.fail still fires before the blunt signal-kill.
+    # A genuine hang is infinite (no sentinel ever written), so a load-scaled
+    # ~15s cleanly separates pass from hang while staying well under the
+    # governing 300s pytest-timeout: this file's rootdir/configfile is the
+    # repo-root pyproject.toml (verified via `pytest --collect-only`), whose
+    # [tool.pytest.ini_options] sets no `timeout` of its own -- so
+    # shared/pyproject.toml's timeout=60 does NOT govern this file, and the
+    # real ceiling is the --timeout=300 scripts/orchestrator.yaml:17 passes.
+    # This descriptive pytest.fail still fires well before that blunt kill.
     try:
-        rc = proc.wait(timeout=15)
+        rc = proc.wait(timeout=_load_scaled_grace(15))
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
@@ -2477,7 +2489,7 @@ def _run_sibling_capture_spawn(
         env["CLAUDE_SPAWN_PARENT_ID"] = spawner_parent_id
 
     result = _run_spawn(env, tmp_path)
-    _wait_for_path(capture_file, timeout=5.0)
+    _wait_for_path_scaled(capture_file, 5)
     captured = _parse_captured_env(capture_file)
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     return result, captured, fleet_root
@@ -2653,7 +2665,12 @@ def test_sibling_mode_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
         "spawn-claude.sh returns"
     )
 
-    _wait_for_path(started, timeout=5.0)
+    # Safe to lengthen under load: the done-marker snapshot carrying the
+    # actual fire-and-forget assertion was already taken above, and in
+    # fire-and-forget mode nothing rewrites the registry record after
+    # launch, so the record.status == RUNNING assertion below has no
+    # upper-bound dependency on how long this wait took (task 3486 audit).
+    _wait_for_path_scaled(started, 5)
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
@@ -2720,7 +2737,7 @@ def test_sibling_mode_foreground_emulator_is_fire_and_forget(tmp_path: pathlib.P
         "undetached child"
     )
 
-    _wait_for_path(started, timeout=5.0)
+    _wait_for_path_scaled(started, 5)
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
