@@ -168,6 +168,17 @@ async def _await_outcome(
         )
 
 
+# task 3477 amend: both cascade classes below perform the SAME five sequential
+# real-time waits (2 gates + 2 _await_outcome + 1 worker_task teardown) at
+# MERGE_RESULT_TIMEOUT (45s) each -- a 225s worst case -- plus git-fixture setup
+# and an unbounded worker.stop(). 180 was too tight: it would itself os._exit()
+# the xdist worker (pyproject timeout_method = "thread", --max-worker-restart=0)
+# before the loud _await_outcome failure this task added could ever report. The
+# class mark MUST clear the full 225s budget, not just the pyproject 60s default.
+# Derived, not literal, so the two marks cannot drift apart the way they just did.
+CASCADE_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
+
+
 # ---------------------------------------------------------------------------
 # (d) OrchestratorConfig builders: single-host vs two-host
 # ---------------------------------------------------------------------------
@@ -3403,7 +3414,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)  # task 3477 amend: 5 sequential waits (2 gates + 2 outcomes + 1 teardown) at MERGE_RESULT_TIMEOUT=45s each is a 225s worst case, plus git fixture setup; 180 was too tight (would itself os._exit() the xdist worker before the loud _await_outcome failure could ever report), so this must clear the widened budget below, not just the pyproject 60s default
+@pytest.mark.timeout(CASCADE_TEST_TIMEOUT)  # task 3477 amend: see CASCADE_TEST_TIMEOUT -- derived so this cannot drift from TestCascadeFiresRemoteCancel's identical wait profile
 class TestRunnerUnavailableHeadCascade:
     """RUNNER_UNAVAILABLE on the HEAD triggers the head-failure cascade.
 
@@ -3943,7 +3954,7 @@ class TestStopDrainFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 3477: widened wait budgets (below) can approach the 60s pyproject default; thread-mode timeout would os._exit() the xdist worker with --max-worker-restart=0
+@pytest.mark.timeout(CASCADE_TEST_TIMEOUT)  # task 3477 amend: see CASCADE_TEST_TIMEOUT -- derived so this cannot drift from TestRunnerUnavailableHeadCascade's identical wait profile (was a bare 180, too tight for the 225s worst case below)
 class TestCascadeFiresRemoteCancel:
     """_verifier_loop head-failure cascade fires remote cancel BEFORE task.cancel().
 
