@@ -12949,6 +12949,28 @@ class GitOps:
                 if dirty_tracked:
                     try:
                         await self._park_wip_on_private_ref(branch or merge_sha[:8])
+                    except MergeParkLockContentionError as e:
+                        # SUBCLASS FIRST — the MergeParkError handler below
+                        # would otherwise swallow this and reinstate the
+                        # queue halt.  A foreign git process grabbed the
+                        # index inside the TOCTOU window between the gate
+                        # above and `git stash create`; transient, so
+                        # dispose of it exactly as the gate does.
+                        lock_path = await self._index_lock_path()
+                        _, lock_age = await self._index_lock_state()
+                        logger.warning(
+                            'Foreign git index lock appeared mid-park — '
+                            'standing off; the merge did NOT land. lock=%s '
+                            'age=%.1fs error=%s',
+                            lock_path, lock_age, e,
+                        )
+                        self._last_park_lock_info = {
+                            'lock_path': str(lock_path),
+                            'age_seconds': lock_age,
+                            'waited_seconds': 0.0,
+                            'dirty_files': sorted(dirty_tracked),
+                        }
+                        return AdvanceOutcome('park_lock_contended')
                     except MergeParkContentionError as e:
                         # The merge worker is serialized, so a resolvable
                         # MERGE_PARK_REF here is either an invariant
@@ -13525,6 +13547,13 @@ class GitOps:
         exists — the merge worker is serialized, so a resolvable ref here is
         either an invariant violation or a crash-leftover holding real,
         unrecovered WIP; it is never overwritten.
+        Raises :class:`MergeParkLockContentionError` (a ``MergeParkError``
+        SUBCLASS, so it must be caught FIRST) instead of the generic
+        ``MergeParkError`` when either of those two failures happens while a
+        FOREIGN git process holds ``<git-dir>/index.lock`` — transient
+        contention rather than a park infra fault.  Both failure sites
+        re-probe the lock, closing the TOCTOU window advance_main's
+        pre-park gate cannot cover.
         """
         # Single-flight guard: explicit pre-check so a stale/contended ref
         # fails loudly with a clear message rather than via the terser
@@ -13546,6 +13575,20 @@ class GitOps:
         )
         stash_sha = stash_sha.strip()
         if stash_rc != 0 or not stash_sha:
+            # Re-probe the index lock: advance_main's gate cannot cover the
+            # TOCTOU window where a concurrent `git commit --only` grabs the
+            # index right after the probe.  Under a held lock this failure is
+            # rc=1 with EMPTY stdout AND stderr (git 2.43), so the message
+            # interpolated below carries no diagnostic signal at all —
+            # positive lock detection is the only available classifier.
+            lock_held, lock_age = await self._index_lock_state()
+            if lock_held:
+                raise MergeParkLockContentionError(
+                    f'git stash create failed because a foreign git process '
+                    f'holds {await self._index_lock_path()} '
+                    f'(age={lock_age:.1f}s) — transient contention, not a '
+                    f'park infra failure (rc={stash_rc})'
+                )
             raise MergeParkError(
                 f'git stash create failed or produced no commit (rc={stash_rc}, '
                 f'stdout={stash_sha!r}, stderr={stash_err!r})'
@@ -13571,6 +13614,18 @@ class GitOps:
             cwd=self.project_root,
         )
         if reset_rc != 0:
+            # Same re-probe as the stash-create failure above, so a lock that
+            # appears mid-park is classified consistently rather than by
+            # which step happened to hit it.
+            lock_held, lock_age = await self._index_lock_state()
+            if lock_held:
+                raise MergeParkLockContentionError(
+                    f'read-tree -u --reset HEAD failed after parking WIP on '
+                    f'{MERGE_PARK_REF} because a foreign git process holds '
+                    f'{await self._index_lock_path()} (age={lock_age:.1f}s) — '
+                    f'transient contention (rc={reset_rc}). WIP is safe on '
+                    f'the ref.'
+                )
             raise MergeParkError(
                 f'read-tree -u --reset HEAD failed after parking WIP on '
                 f'{MERGE_PARK_REF} (rc={reset_rc}, stderr={reset_err!r}) — '
