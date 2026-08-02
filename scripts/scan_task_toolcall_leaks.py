@@ -213,12 +213,15 @@ def main(argv: list[str] | None = None) -> int:
 
     Exit codes: 0 = clean, 1 = at least one leak found, 2 = no tasks.db
     could be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS
-    / the dark-factory default.
+    / the dark-factory default, 3 = every resolved tasks.db was unreadable, so
+    NOTHING was scanned (never treat 3 as a clean run).
 
     A single unreadable database (e.g. a stale/corrupt file, or a transient
     "database is locked"/"file is not a database" condition) does not abort
     the sweep: it is logged to stderr and skipped so every other resolvable
-    database is still scanned and reported.
+    database is still scanned and reported. That warn-and-continue skip is
+    exit 0/1 on the readable remainder — it is only when ALL of them fail,
+    leaving nothing scanned at all, that the run is exit 3.
     """
     def _render(matches: list[LeakMatch], args: argparse.Namespace) -> str:
         if args.json:
