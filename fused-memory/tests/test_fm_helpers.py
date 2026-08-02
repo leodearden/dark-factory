@@ -850,3 +850,227 @@ class TestCollectionVectorSize:
             await collection_vector_size(client, 'c', timeout=5.0, interval=0.001)
 
         assert client.get_collection.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared await_index_operational() barrier (task 3377)
+# ---------------------------------------------------------------------------
+# FalkorDB builds indices asynchronously, so a test that queries an index
+# immediately after creating it can silently succeed for a query the engine
+# would otherwise reject (measured while characterising task 3334: 2 of 6 runs
+# falsely reported success). await_index_operational is the shared barrier that
+# closes that window; it was extracted out of
+# test_falkor_fulltext_integration.py so both live-index modules route through
+# one implementation.
+#
+# These tests drive the barrier against FAKE graph objects — no live FalkorDB —
+# so the whole RED/GREEN cycle runs in the DEFAULT `-m 'not integration'` lane,
+# on exactly the CI configuration least able to notice the regression this
+# barrier exists to prevent. Following TestPollUntil's discipline, cases assert
+# only on `db.indexes()` call counts and raises, never on elapsed wall-clock,
+# so the suite stays load-independent.
+
+# The measured live header (FalkorDB module v41800 / 4.18.0). `result.header`
+# rows are (type, name) 2-tuples, so the column NAME is `col[1]`; `status` sits
+# at index 7 of 9 today — a position the barrier must NOT hardcode.
+_LIVE_INDEX_HEADER: list[tuple[int, str]] = [
+    (1, 'label'),
+    (1, 'properties'),
+    (1, 'types'),
+    (1, 'options'),
+    (1, 'language'),
+    (1, 'stopwords'),
+    (1, 'entitytype'),
+    (1, 'status'),
+    (1, 'info'),
+]
+
+# The real measured not-ready value — NOT a bare 'UNDER CONSTRUCTION'. It
+# carries a varying progress prefix, which is why the readiness predicate must
+# match the READY side exactly rather than substring-testing the not-ready one.
+_UNDER_CONSTRUCTION = '[Indexing] 3/200000: UNDER CONSTRUCTION'
+_OPERATIONAL = 'OPERATIONAL'
+
+
+class _FakeIndexResult:
+    """A scripted ``CALL db.indexes()`` result mirroring the measured live shape."""
+
+    def __init__(self, header: list[tuple[int, str]], result_set: list[list]):
+        self.header = header
+        self.result_set = result_set
+
+
+class _FakeIndexGraph:
+    """A fake FalkorDB graph replaying a scripted sequence of index results.
+
+    Counts ``query()`` calls so tests can prove the barrier genuinely polled
+    (rather than returning early) and that an already-ready index costs exactly
+    one round-trip. Once the script is exhausted the final entry repeats
+    forever, so a "never ready" case is expressed by a one-entry script.
+    """
+
+    def __init__(self, results: list[_FakeIndexResult]):
+        assert results, 'scripted result sequence must be non-empty'
+        self._results = results
+        self.calls = 0
+        self.queries: list[str] = []
+
+    async def query(self, q: str, params=None) -> _FakeIndexResult:
+        self.calls += 1
+        self.queries.append(q)
+        return self._results[min(self.calls - 1, len(self._results) - 1)]
+
+
+def _index_row(status: str, header: list[tuple[int, str]] = _LIVE_INDEX_HEADER) -> list:
+    """One ``db.indexes()`` row carrying *status* in the header's `status` column."""
+    return [status if name == 'status' else f'<{name}>' for _, name in header]
+
+
+def _index_result(
+    *statuses: str, header: list[tuple[int, str]] = _LIVE_INDEX_HEADER
+) -> _FakeIndexResult:
+    """A result whose rows carry *statuses*, one row per status."""
+    return _FakeIndexResult(header, [_index_row(s, header) for s in statuses])
+
+
+class TestAwaitIndexOperational:
+    """Unit tests for async await_index_operational(graph, timeout_s)."""
+
+    @pytest.mark.asyncio
+    async def test_already_operational_returns_after_one_query(self):
+        """An already-OPERATIONAL index returns after exactly 1 db.indexes() call.
+
+        Proves check-before-sleep: the barrier costs a single round-trip in the
+        common case, so adding it to a fixture is nearly free.
+        """
+        from _fm_helpers import await_index_operational
+
+        graph = _FakeIndexGraph([_index_result(_OPERATIONAL, _OPERATIONAL)])
+
+        await await_index_operational(graph, timeout_s=5.0)
+
+        assert graph.calls == 1, f'expected exactly 1 query, got {graph.calls}'
+        assert graph.queries == ['CALL db.indexes()']
+
+    @pytest.mark.asyncio
+    async def test_polls_until_status_flips_to_operational(self):
+        """Not-ready for the first 3 polls then OPERATIONAL: returns after exactly 4 calls.
+
+        The call count is what proves the barrier actually blocked rather than
+        returning on the first (under-construction) read.
+        """
+        from _fm_helpers import await_index_operational
+
+        graph = _FakeIndexGraph(
+            [
+                _index_result(_UNDER_CONSTRUCTION),
+                _index_result(_UNDER_CONSTRUCTION),
+                _index_result(_UNDER_CONSTRUCTION),
+                _index_result(_OPERATIONAL),
+            ]
+        )
+
+        await await_index_operational(graph, timeout_s=5.0)
+
+        assert graph.calls == 4, f'expected exactly 4 queries, got {graph.calls}'
+
+    @pytest.mark.asyncio
+    async def test_mixed_rows_do_not_satisfy_the_barrier(self):
+        """One OPERATIONAL row plus one still building must NOT be treated as ready.
+
+        EVERY index on the graph has to be ready; an `any()`-style predicate
+        would let a half-built graph through and reinstate the false-green.
+        """
+        from _fm_helpers import await_index_operational
+
+        graph = _FakeIndexGraph([_index_result(_OPERATIONAL, _UNDER_CONSTRUCTION)])
+
+        with pytest.raises(AssertionError):
+            await await_index_operational(graph, timeout_s=0.05)
+
+    @pytest.mark.asyncio
+    async def test_status_column_is_resolved_by_name_not_position(self):
+        """A reordered header with a decoy 'OPERATIONAL' at index 7 must still block.
+
+        `status` is moved to index 0 and the literal 'OPERATIONAL' is planted at
+        index 7 (its position in today's live header). A barrier that read the
+        column positionally would see the decoy and return success; one that
+        resolves `status` by name reads the real, still-building value and
+        blocks. This is the assertion that stops a FalkorDB column reorder from
+        silently turning the barrier into a no-op.
+        """
+        from _fm_helpers import await_index_operational
+
+        reordered = [(1, 'status')] + [c for c in _LIVE_INDEX_HEADER if c[1] != 'status']
+        assert reordered[7][1] != 'status', 'decoy must not land on the real status column'
+
+        row = _index_row(_UNDER_CONSTRUCTION, reordered)
+        row[7] = _OPERATIONAL  # decoy in the position `status` occupies live
+
+        graph = _FakeIndexGraph([_FakeIndexResult(reordered, [row])])
+
+        with pytest.raises(AssertionError):
+            await await_index_operational(graph, timeout_s=0.05)
+
+    @pytest.mark.asyncio
+    async def test_missing_status_column_raises_immediately_naming_the_header(self):
+        """A header with no `status` column fails loudly and at once — not as a timeout.
+
+        The two failure modes carry different operator actions: "index never
+        became ready" is a slow or wedged build, while "db.indexes() has no
+        status column" means FalkorDB changed its result shape and the barrier
+        can no longer be trusted at all. Collapsing the second into a generic
+        timeout message would hide a silent no-op behind a plausible-looking
+        timeout, so this must raise on the FIRST query with the observed header
+        names in the message — and must never skip.
+        """
+        from _fm_helpers import await_index_operational
+
+        header = [(1, 'label'), (1, 'properties'), (1, 'state')]
+        graph = _FakeIndexGraph([_FakeIndexResult(header, [['Entity', ['name'], 'READY']])])
+
+        with pytest.raises(AssertionError) as excinfo:
+            await await_index_operational(graph, timeout_s=5.0)
+
+        message = str(excinfo.value)
+        assert 'status' in message
+        for name in ('label', 'properties', 'state'):
+            assert name in message, f'header name {name!r} missing from {message!r}'
+        assert graph.calls == 1, (
+            f'expected the header-shape failure to raise on the first query, got '
+            f'{graph.calls} queries — it must not be retried until the deadline and '
+            f'reported as a timeout.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_never_operational_raises_with_last_seen_statuses(self):
+        """An index that never becomes ready raises AssertionError naming its last statuses.
+
+        Raising (rather than skipping or passing) is deliberate: a
+        never-operational index must be a loud failure, since passing would
+        reintroduce exactly the false-green this barrier removes.
+        """
+        from _fm_helpers import await_index_operational
+
+        graph = _FakeIndexGraph([_index_result(_UNDER_CONSTRUCTION)])
+
+        with pytest.raises(AssertionError) as excinfo:
+            await await_index_operational(graph, timeout_s=0.05)
+
+        assert _UNDER_CONSTRUCTION in str(excinfo.value)
+        assert graph.calls >= 1
+
+    @pytest.mark.asyncio
+    async def test_empty_result_set_is_not_ready(self):
+        """A graph reporting ZERO indices must never satisfy the barrier — fail closed.
+
+        `all()` over an empty sequence is vacuously True, so without an explicit
+        non-empty guard a graph whose index vanished (or was never created)
+        would return success having gated nothing.
+        """
+        from _fm_helpers import await_index_operational
+
+        graph = _FakeIndexGraph([_FakeIndexResult(_LIVE_INDEX_HEADER, [])])
+
+        with pytest.raises(AssertionError):
+            await await_index_operational(graph, timeout_s=0.05)
