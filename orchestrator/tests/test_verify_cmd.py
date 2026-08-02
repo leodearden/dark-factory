@@ -83,7 +83,7 @@ _ROOT_TEST_COMMAND = (
     ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
     ' && cd ../sampler && uv run pytest tests/ --timeout=300'
     ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ --timeout=300'
+    ' && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
 )
 
 # Not a config in this repo (yet) — the shape task 3218 predicts and must not
@@ -1810,7 +1810,9 @@ class TestSplitAndChainSegments:
         """The clause esc-3062-2 is about, addressable on its own."""
         segments = split_and_chain_segments(_ROOT_TEST_COMMAND)
         assert segments is not None
-        assert segments[7].command == 'uv run --project shared pytest tests/scripts/ --timeout=300'
+        assert segments[7].command == (
+            'uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
+        )
 
     @pytest.mark.parametrize(
         'raw',

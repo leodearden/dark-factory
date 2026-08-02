@@ -939,7 +939,15 @@ class TestRunVerificationSegmentedAcceptance:
         # The fact the old &&-chain could NEVER produce.
         assert by_label['root-8']['status'] == 'passed'
         assert by_label['root-8']['rc'] == 0
-        assert by_label['root-8']['cmd'].endswith('pytest tests/scripts/ --timeout=300')
+        # Substring, not a full literal: this segment's command comes from the
+        # LIVE committed yaml, whose target LIST grows as the fleet gains
+        # script suites (it gained `scripts/tests/` on 2026-08-02). What
+        # esc-3062-2 is about is that the `tests/scripts/` clause RAN, not how
+        # many targets it happens to carry today — pinning the whole string
+        # here just re-breaks this test on every unrelated config edit.
+        # `test_verify_cmd.TestSplitAndChainSegmentsLiveConfigDrift` is the
+        # single place that guards the exact text.
+        assert 'tests/scripts/' in by_label['root-8']['cmd']
         # Nothing after the red was skipped.
         assert [s['status'] for s in segments] == [
             'passed', 'passed', 'failed', 'passed', 'passed', 'passed', 'passed', 'passed',
