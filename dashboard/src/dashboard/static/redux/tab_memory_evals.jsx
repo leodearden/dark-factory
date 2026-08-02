@@ -146,16 +146,37 @@ const PARITY_REFINEMENT = {
   'insufficient_data_open': { suffix: 'escalation open', cls: 'badge warn' },
   'grandfathered_open':     { suffix: 'escalation open', cls: 'badge warn' },
   'unjudged_open':          { suffix: 'escalation open', cls: 'badge warn' },
-  'unknown_verdict_open':   { suffix: 'escalation open', cls: 'badge warn' },
+
+  // The unknown-verdict pair is the one place severity does NOT follow the
+  // verdict, because there is no readable verdict to follow.  The producer
+  // names this condition as an issue kind — it files an `unknown_verdict`
+  // issue naming the eval, metric and offending value — precisely so a value
+  // outside the closed vocabulary fails toward "visibly unrenderable" rather
+  // than toward the healthy label.  This is the last render step and must not
+  // quietly undo that.
+  //
+  // `base` is 'no verdict' here only because the value is outside the badge
+  // vocabulary, so the label says which of the two it is.  Borrowing
+  // `badge muted` would report a PRESENT-but-unreadable verdict as an ABSENT
+  // one — the same substitution the absent-verdict guard prevents, running the
+  // other way.  `unjudged` is the genuinely-absent case and correctly stays in
+  // PARITY_PLAIN, muted.
+  //
+  // Wording follows `unmatchedReasonText`'s `unrecognised reason: ...`, so the
+  // file has ONE way of saying "the producer emitted a value this UI does not
+  // recognise".
+  'unknown_verdict':        { suffix: 'unrecognised verdict', cls: 'badge bad' },
+  'unknown_verdict_open':   { suffix: 'unrecognised verdict · escalation open', cls: 'badge bad' },
 };
 // Reserved for states where the verdict badge already says everything there is
 // to say: nothing is filed, and the verdict names itself.
+//
+// 9 refined + 4 plain = 13 = |memory_evals.PARITY_STATES|.
 const PARITY_PLAIN = [
   'clear',
   'insufficient_data',
   'grandfathered',
   'unjudged',
-  'unknown_verdict',
 ];
 function verdictBadge(metric) {
   const verdict = metric.verdict;
