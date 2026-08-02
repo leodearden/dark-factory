@@ -748,7 +748,12 @@ def test_parity_vocabulary_fully_covered(tab_memory_evals_jsx_code: str) -> None
         'decision from an oversight.'
     )
 
-    entries = re.findall(r'(\w+)\s*:\s*\{([^{}]*)\}', refinement)
+    # Keys are quoted in the source (they are producer vocabulary strings, not
+    # JS identifiers), but the quotes are tolerated rather than required here:
+    # the presence grep in `test_verdict_badges_driven_by_persisted_verdict` is
+    # what enforces the quoted form, and it says so clearly. Requiring them
+    # here too would report a dropped quote as "the table holds no entries".
+    entries = re.findall(r'[\'"]?(\w+)[\'"]?\s*:\s*\{([^{}]*)\}', refinement)
     handled = {key for key, _ in entries}
     declined = set(re.findall(r"'([^']*)'", plain))
 
@@ -849,9 +854,11 @@ def test_verdict_badges_driven_by_persisted_verdict(
     for parity in sorted(PARITY_STATES):
         assert f"'{parity}'" in code, (
             f"tab_memory_evals.jsx must name the server-derived parity state "
-            f"'{parity}' in CODE — the comment block above verdictBadge names "
-            'all of them, so a whole-file grep proves nothing. Iterated from '
-            'the PRODUCER, so a state added there fails here rather than '
+            f"'{parity}' in CODE, as a quoted string literal — the comment "
+            'block above verdictBadge names all of them, so a whole-file grep '
+            'proves nothing, and PARITY_REFINEMENT quotes its keys precisely '
+            'so they are greppable in the form the payload carries. Iterated '
+            'from the PRODUCER, so a state added there fails here rather than '
             'rendering through an unwritten branch.'
         )
 

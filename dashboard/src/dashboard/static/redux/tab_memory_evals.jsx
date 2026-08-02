@@ -100,9 +100,48 @@ function ageText(seconds) {
 // sides would drift apart".  This function therefore performs string equality
 // only — no arithmetic, no ordering comparison, no limits.
 //
-// The parity dimension REFINES the verdict; it never replaces it.  Where the
-// two agree there is nothing extra to say, so `alarmed_open` and `clear` fall
-// through to the plain verdict badge.
+// The parity dimension REFINES the verdict; it never replaces it.
+//
+// ── The parity vocabulary, in ONE place ──
+//
+// These two declarations are this file's entire view of the parity vocabulary.
+// Every member of memory_evals.PARITY_STATES must appear in EXACTLY ONE of
+// them: PARITY_REFINEMENT for states whose badge carries a fact the verdict
+// alone does not, PARITY_PLAIN for states where the verdict badge already says
+// everything there is to say.  The plain list is an explicit opt-out, not an
+// oversight bucket — "no branch for it" and "considered, nothing to add" are
+// different decisions and only one of them is safe to leave undocumented.
+//
+// test_tab_memory_evals.py::test_parity_vocabulary_fully_covered asserts that
+// split against the exported frozenset rather than a copy pinned in the test
+// file, so a state added by the producer fails there instead of silently
+// rendering through whatever the fall-through happens to be.  (A hand-picked
+// three-member copy DID live in that test, and went blind to six states.)
+//
+// The values are SUFFIXES, never whole labels.  That is what makes "a parity
+// branch may not discard the verdict" structural instead of re-checked per
+// branch: there is no expression below capable of returning a label that omits
+// `base`.
+// Keys are QUOTED: they are the producer's vocabulary strings, looked up by
+// string, not JS identifiers — and quoting keeps them greppable in the same
+// form PARITY_PLAIN and the payload use.
+const PARITY_REFINEMENT = {
+  'recovered_open':   { suffix: 'escalation open', cls: 'badge warn' },
+  'alarmed_unlinked': { suffix: 'no escalation',   cls: 'badge bad' },
+  'storm_collapsed':  { suffix: 'storm-collapsed', cls: 'badge bad' },
+};
+const PARITY_PLAIN = [
+  'alarmed_open',
+  'clear',
+  'insufficient_data',
+  'insufficient_data_open',
+  'grandfathered',
+  'grandfathered_open',
+  'unjudged',
+  'unjudged_open',
+  'unknown_verdict',
+  'unknown_verdict_open',
+];
 function verdictBadge(metric) {
   const verdict = metric.verdict;
   const parity = metric.parity;
@@ -144,16 +183,14 @@ function verdictBadge(metric) {
   // and `storm_collapsed` are only reachable when verdict === 'alarm', so those
   // read as "alarm · ..." as before — composing rather than hard-coding just
   // keeps them honest if the producer's derivation ever widens.
-  if (parity === 'recovered_open') {
-    return { cls: 'badge warn', label: base + ' · escalation open' };
+  //
+  // One lookup and one composition site.  A state listed in PARITY_PLAIN is not
+  // absent from the table by accident; it is declared there as having nothing
+  // to add to the verdict badge.
+  const refinement = PARITY_REFINEMENT[parity];
+  if (refinement) {
+    return { cls: refinement.cls, label: base + ' · ' + refinement.suffix };
   }
-  if (parity === 'alarmed_unlinked') {
-    return { cls: 'badge bad', label: base + ' · no escalation' };
-  }
-  if (parity === 'storm_collapsed') {
-    return { cls: 'badge bad', label: base + ' · storm-collapsed' };
-  }
-  // parity 'alarmed_open' / 'clear' agree with the verdict — plain badge.
   return { cls: cls, label: base };
 }
 
