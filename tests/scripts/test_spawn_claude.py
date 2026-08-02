@@ -828,12 +828,16 @@ def test_window_close_129_robust_to_delayed_trap_install(
 
     # Gate on BOTH the leader pid AND the readiness marker (post-trap proof).
     # The pid is published immediately; the readiness file appears only after
-    # the DELAY + $inner trap-install sequence completes. Budgets are
-    # load-scaled (task 2733's _load_scaled_grace, mirrored from the sibling
-    # transcript tests below) rather than fixed, so a load-slowed-but-correct
-    # run doesn't spuriously time out.
-    _wait_for_path(pidfile, timeout=_load_scaled_grace(5))
-    _wait_for_path(readyfile, timeout=_load_scaled_grace(5) + DELAY + _load_scaled_grace(5))
+    # the DELAY + $inner trap-install sequence completes. Both gates route
+    # through _wait_for_path_scaled (task 3486) -- the single policy owner
+    # for every readiness gate in this file, rather than hand-rolling the
+    # load scaling inline -- so a load-slowed-but-correct run doesn't
+    # spuriously time out. DELAY is a wall-clock-fixed injected sleep, not
+    # load-dependent, so it is passed as extra_secs and added unscaled on
+    # top of the scaled base; floor-identical to the old inline form on an
+    # idle host (5 + DELAY + 5 == _load_scaled_grace(10) + DELAY == 11.0s).
+    _wait_for_path_scaled(pidfile, 5)
+    _wait_for_path_scaled(readyfile, 10, extra_secs=DELAY)
 
     leader_pid = int(pidfile.read_text().strip())
     # SIGHUP arrives after the HUP trap is armed — must yield exit 129.
@@ -2427,6 +2431,16 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     env = _hermetic_environ()
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    # Task 3486 audit: deliberately NOT routed through _wait_for_path_scaled
+    # -- and holds no _wait_for_path call at all. (This task's own brief
+    # misattributed a _wait_for_path(capture_file, timeout=5.0) gate to this
+    # test; that gate actually lives in _run_sibling_capture_spawn, below.)
+    # SPAWN_LAUNCH_GRACE_SECS="2" and the timeout=10 below stay FIXED on
+    # purpose: with no tmux binary and no terminal emulator on PATH, the
+    # availability guard fails immediately, so the rc==126 verdict is
+    # load-INSENSITIVE -- no amount of host load can turn it into a slow
+    # success, and load-scaling would only make a genuine regression take
+    # longer to report. Measured: 0.05s whole-test wall at load-per-core 3.14.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
     env.pop("CLAUDE_TERMINAL_CMD", None)
 
