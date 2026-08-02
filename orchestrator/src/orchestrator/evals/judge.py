@@ -526,6 +526,17 @@ async def judge_plan_quality(
     still degrades to the deterministic structural floor, which remains a
     legitimate content-derived score whenever a real plan exists.
     """
+    # Name WHICH cell to go look at, whichever key the caller populated:
+    # ``run_architect_eval`` passes ``id``, but a second caller — precisely the
+    # scenario BOTH warnings below defend against — may carry only ``name``
+    # (``run_judge`` and the prompt builder further down both key off ``name``
+    # first). Falling through absent AND empty values means a malformed task
+    # dict degrades a log line rather than crashing an anti-fabrication guard
+    # or an out-of-range check. Hoisted here so the unjudgeable-artifact guard
+    # and the out-of-range parse-block check below name the same cell the
+    # same way.
+    cell = task.get('id') or task.get('name') or 'unknown'
+
     if not is_scorable_plan(plan):
         # THIS call's rubric, not the module default. Today the floor
         # short-circuits on ``is_scorable_plan`` before it ever reads a rubric,
@@ -536,14 +547,6 @@ async def judge_plan_quality(
         # becomes rubric-sensitive (a rubric-defined minimum, or criteria that
         # change what "unscorable" means).
         floor = score_plan_structure(plan, rubric=rubric)
-        # Name WHICH cell to go look at, whichever key the caller populated:
-        # ``run_architect_eval`` passes ``id``, but a second caller — precisely
-        # the scenario this guard defends against — may carry only ``name``
-        # (``run_judge`` and the prompt builder below both key off ``name``
-        # first). Falling through absent AND empty values means a malformed
-        # task dict degrades the log line rather than turning an
-        # anti-fabrication guard into a crash.
-        cell = task.get('id') or task.get('name') or 'unknown'
         # LOUD, not a silent 0.0: reaching here means a caller did NOT gate,
         # which is exactly how the reported cell was written. WARNING matches
         # ``run_architect_eval``'s own no-scorable-plan log and the
@@ -645,9 +648,25 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
     try:
         verdict = result.structured_output or json.loads(result.output)
         raw_quality = verdict['plan_quality']
-        plan_quality = (
-            clamp_unit_score(float(raw_quality)) if raw_quality is not None else None
-        )
+        if raw_quality is None:
+            plan_quality = None
+        else:
+            raw_quality = float(raw_quality)
+            plan_quality = clamp_unit_score(raw_quality)
+            # PLAN_QUALITY_SCHEMA declares {'minimum': 0.0, 'maximum': 1.0},
+            # but that only binds the structured_output delivery path — the
+            # json.loads(result.output) fallback above bypasses schema
+            # enforcement entirely, so an out-of-range answer reaches here
+            # unchecked whenever that path is taken. LOUD, not silent: the
+            # value is still corrected (clamp_unit_score), but an operator
+            # must be able to see that the judge answered OUTSIDE its
+            # declared contract, not just read its silently-corrected output.
+            if raw_quality < 0.0 or raw_quality > 1.0:
+                logger.warning(
+                    f'Plan judge for {cell} answered OUTSIDE its declared '
+                    f'[0, 1] contract (raw plan_quality={raw_quality!r}) — '
+                    f'clamped to {plan_quality!r}.'
+                )
     except (json.JSONDecodeError, TypeError, KeyError, ValueError):
         logger.warning(
             f'Plan judge produced unparseable output: {str(result.output)[:200]}'
