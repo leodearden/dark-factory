@@ -380,6 +380,91 @@ class TestMem0BackendScrollByMetadataWithVectors:
         assert result[1]['created_at'] == '2026-02-01T00:00:00+00:00'
 
 
+class TestMem0BackendPayloadFilterSingleHome:
+    """The Qdrant payload ``Filter`` has exactly ONE construction site (INV-5).
+
+    Motivation (task 3225): the same ``Filter(must=[FieldCondition(key=k,
+    match=MatchValue(value=v)) ...])`` was built independently inside
+    ``count_by_metadata``, ``scroll_by_metadata`` and
+    ``scripts/census_memory_metadata.scroll_all_payloads``.  That is not a
+    tidiness problem: the census's coverage reconciliation cross-checks its
+    SCROLL against ``count_by_metadata``'s COUNT, so if the two constructions
+    ever drift the reconciliation silently compares two DIFFERENT point sets
+    while still reporting ``coverage.complete == true``.
+
+    A comment cannot fail CI, so the drift is pinned by an equality assertion
+    at each entry point instead: the ``count_filter=`` kwarg the count API
+    hands Qdrant must EQUAL the ``scroll_filter=`` kwarg the scroll API hands
+    Qdrant must EQUAL ``_build_payload_filter(filters)``.  qdrant models are
+    pydantic, so ``==`` is structural value equality.
+    """
+
+    @pytest.mark.asyncio
+    async def test_builds_field_conditions_in_dict_order(self, backend):
+        """_build_payload_filter maps each filter item to a FieldCondition/MatchValue."""
+        from qdrant_client.http import models as qmodels
+
+        built = backend._build_payload_filter({'category': 'x', 'kind': 'y'})
+
+        assert isinstance(built, qmodels.Filter)
+        assert isinstance(built.must, list)
+        assert len(built.must) == 2
+        # Dict-insertion order is preserved so the filter is deterministic
+        # (two callers passing the same dict produce byte-identical filters).
+        assert [c.key for c in built.must] == ['category', 'kind']
+        for cond, expected in zip(built.must, ['x', 'y'], strict=True):
+            assert isinstance(cond, qmodels.FieldCondition)
+            assert isinstance(cond.match, qmodels.MatchValue)
+            assert cond.match.value == expected
+
+    @pytest.mark.asyncio
+    async def test_count_and_scroll_pass_the_same_filter_object_shape(self, backend):
+        """ANTI-DRIFT: count_filter == scroll_filter == _build_payload_filter(filters).
+
+        This is the whole point of the extraction.  If a future edit changes
+        one construction site and not the other, the census's
+        scroll-vs-count reconciliation starts comparing two different point
+        sets with no error surface — this assertion is what fails first.
+        """
+        filters = {'category': 'procedural_knowledge', 'recon_pool': 'stage2_cycle_summary'}
+        scope = Scope(project_id='dark_factory')
+
+        count_client = AsyncMock()
+        count_client.count = AsyncMock(return_value=MagicMock(count=0))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=count_client)):
+            await backend.count_by_metadata(scope=scope, filters=filters)
+
+        scroll_client = AsyncMock()
+        scroll_client.scroll = AsyncMock(return_value=([], None))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=scroll_client)):
+            await backend.scroll_by_metadata(scope=scope, filters=filters)
+
+        count_filter = count_client.count.call_args.kwargs.get('count_filter')
+        scroll_filter = scroll_client.scroll.call_args.kwargs.get('scroll_filter')
+        built = backend._build_payload_filter(filters)
+
+        assert count_filter == built, (
+            f'count_by_metadata built {count_filter!r}, _build_payload_filter built {built!r}'
+        )
+        assert scroll_filter == built, (
+            f'scroll_by_metadata built {scroll_filter!r}, _build_payload_filter built {built!r}'
+        )
+        assert count_filter == scroll_filter, (
+            'count and scroll must select the same point set for the same filters; '
+            f'got count_filter={count_filter!r} scroll_filter={scroll_filter!r}'
+        )
+
+    def test_empty_filters_raises_value_error(self, backend):
+        """An empty filter dict is rejected at the single home too.
+
+        Every caller already rejects it (an unfiltered Filter would select the
+        WHOLE collection), so the shared builder must not become the hole that
+        lets one through.
+        """
+        with pytest.raises(ValueError, match='at least one filter'):
+            backend._build_payload_filter({})
+
+
 class TestMem0BackendGetPointById:
     """get_point_by_id fetches a single Qdrant point by id, returning its raw payload.
 
