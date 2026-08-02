@@ -523,18 +523,38 @@ still held, gives up having modified **nothing** — no ref move, no tree
 write, no park, and the foreign lock left strictly alone.
 
 That one merge is reported as a per-task **blocked** merge whose reason
-names the lock path, how long it had been held, and how long we waited:
+names the lock path, how long it had been held, and how long we waited.
+This is the ordinary, self-clearing shape — note that it ends there, with
+**no** recovery sentence:
 
 > `advance_main stood off: a foreign git process held /…/.git/index.lock
 > for 301s (waited 300s). The merge did NOT land and NOTHING in
 > project_root was modified. … transient and will be retried on
 > re-dispatch.`
 
-Normally there is **nothing to do** — it is retried on re-dispatch. There
-is exactly one genuine operator action: if the reason reports an **age
-above the grace** (as in the example above, 301s > 300s), the lock may be
-a crashed-git leftover rather than a live commit. Confirm no git process
-is running in `project_root`, then `rm -f .git/index.lock`.
+A normal `git commit --only` whose pre-commit hook outlives the 300s
+grace produces exactly that: a blocked merge, **no** recovery advice, and
+**nothing for you to do** — it is retried on re-dispatch.
+
+There is exactly one genuine operator action, and it is triggered by the
+lock having **already been older than a full grace the moment the merge
+worker first observed it** — not by the age in the line above. That
+post-wait age necessarily exceeds the grace whenever we waited the grace
+out (it is the initial age *plus* the wait), so it says nothing about
+staleness; the 301s example above is a perfectly live commit. The
+distinguishing sentence is spelled out in the reason and simply does not
+appear otherwise:
+
+> `… The lock was ALREADY 3600s old when the merge worker FIRST observed
+> it — older than the entire 300s grace — so it is likely a crashed-git
+> leftover rather than a live commit: confirm no git process is running
+> in project_root, then clear it with rm -f /…/.git/index.lock.`
+
+Only when you see that sentence should you clear the lock by hand, and
+only after confirming no git process is running in `project_root`. The
+advice is gated this narrowly because `rm -f` on a **live** commit's
+index lock corrupts that in-flight commit — the same reason
+`advance_main` never removes the lock itself.
 
 The stand-off budget is **green tier** — retune it live with
 `mcp__escalation__reload_config`, no restart (the value is re-read per
