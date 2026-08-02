@@ -701,6 +701,111 @@ async def poll_until(
         await asyncio.sleep(interval)
 
 
+# ---------------------------------------------------------------------------
+# Shared FalkorDB index-readiness barrier (task 3377; extracted from task 3334)
+# ---------------------------------------------------------------------------
+#
+# Extracted from test_falkor_fulltext_integration.py so every live-index test
+# module routes through ONE implementation instead of re-forking it. Public
+# (no leading underscore) because it is now imported cross-module, matching
+# poll_until / ensure_fresh_collection / collection_vector_size.
+# tests/test_falkor_index_barrier_guard.py enforces that routing.
+# ---------------------------------------------------------------------------
+
+class _IndexHeaderError(AssertionError):
+    """``CALL db.indexes()`` did not expose a ``status`` column.
+
+    A distinct type from the timeout AssertionError because the two failure
+    modes mean different things and call for different operator actions: a
+    timeout is a slow or wedged index build, whereas a missing ``status``
+    column means FalkorDB changed its result shape and the barrier cannot be
+    trusted at all. Collapsing the second into a generic timeout message would
+    hide a silent no-op behind a plausible-looking timeout.
+    """
+
+
+async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
+    """Block until every index on ``graph`` reports ``OPERATIONAL``.
+
+    FalkorDB builds indices **asynchronously**. Querying before the index is
+    ready silently returns success for a query the engine would otherwise
+    reject. Measured while characterising task 3334: a known-unparseable
+    fulltext query issued immediately after
+    ``CALL db.idx.fulltext.createNodeIndex(...)`` across six fresh graphs gave
+    FAIL, OK, OK, FAIL, FAIL, FAIL — **2 of 6 runs falsely reported success**.
+    Range indices are built asynchronously too (measured on a 200k-node graph:
+    ``'[Indexing] 628/200000: UNDER CONSTRUCTION'``, never operational within
+    40 polls), so this barrier is not fulltext-specific.
+
+    The ``status`` column is resolved **by name** from ``result.header`` rather
+    than hardcoded to its current position (7 of 9), so a FalkorDB column
+    reorder fails loudly here instead of silently reading the wrong column and
+    turning the barrier into a no-op.
+
+    Readiness is an **exact** match on ``'OPERATIONAL'`` for every row, never a
+    substring test for ``'UNDER CONSTRUCTION'``: the live not-ready value
+    carries a varying progress prefix (``'[Indexing] N/M: UNDER
+    CONSTRUCTION'``), so matching the not-ready side would have to anticipate
+    every status string FalkorDB might ever emit and would treat an
+    unrecognised future status as ready. Testing the ready side is fail-closed
+    — anything unfamiliar blocks and eventually raises. An empty
+    ``result_set`` counts as NOT ready, since ``all()`` over an empty sequence
+    is vacuously true and would otherwise return success having gated nothing.
+
+    Polling is delegated to :func:`poll_until` (event-loop monotonic clock,
+    check-before-sleep, raise-on-timeout) rather than hand-rolling a second
+    deadline loop in the module that hosts it. An already-operational index
+    therefore costs exactly one ``CALL db.indexes()`` round-trip.
+
+    Raises on timeout — deliberately. A never-operational index must be a loud
+    failure; skipping or passing would reintroduce exactly the false-green this
+    barrier exists to remove.
+
+    Measured against FalkorDB module v41800 (4.18.0), whose live header is
+    ``['label', 'properties', 'types', 'options', 'language', 'stopwords',
+    'entitytype', 'status', 'info']``.
+
+    Args:
+        graph: An async FalkorDB graph exposing ``await graph.query(...)``.
+        timeout_s: Seconds to wait for every index to become operational.
+            Callers with a module-wide ``pytest.mark.timeout`` must keep this
+            budget inside it.
+
+    Raises:
+        _IndexHeaderError: ``CALL db.indexes()`` exposed no ``status`` column —
+            raised on the first poll, never retried until the deadline.
+        AssertionError: Not every index became ``OPERATIONAL`` within
+            *timeout_s*; the message carries the last-seen status strings.
+    """
+    last_statuses: list[str] = []
+
+    async def _all_operational() -> bool:
+        nonlocal last_statuses
+        result = await graph.query('CALL db.indexes()')
+        header_names = [col[1] for col in result.header]
+        if 'status' not in header_names:
+            raise _IndexHeaderError(
+                'CALL db.indexes() has no "status" column; FalkorDB changed its '
+                f'result shape (header={header_names}). The index-readiness '
+                'barrier cannot be trusted until this is re-verified.'
+            )
+        status_idx = header_names.index('status')
+        last_statuses = [row[status_idx] for row in result.result_set]
+        return bool(last_statuses) and all(s == 'OPERATIONAL' for s in last_statuses)
+
+    try:
+        await poll_until(_all_operational, timeout=timeout_s, interval=0.05)
+    except _IndexHeaderError:
+        # Shape failure — propagate untouched so it is never reported as (or
+        # masked by) a timeout.
+        raise
+    except AssertionError as exc:
+        raise AssertionError(
+            f'index not OPERATIONAL within {timeout_s}s '
+            f'(last statuses={last_statuses!r})'
+        ) from exc
+
+
 async def collection_vector_size(
     client: Any,
     collection: str,
