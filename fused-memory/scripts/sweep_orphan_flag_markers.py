@@ -14,9 +14,10 @@ population, since the ledger's own ``gc()`` pass reaps ledger rows directly, lea
 the pre-2406 Mem0 records with no in-cycle collector. That gap has since been partly
 closed: task 2853 restored an automatic, in-cycle, per-project collector —
 ``_sweep_stale_mem0_flag_markers`` (``reconciliation/stages/task_knowledge_sync.py:1272-1340``),
-called unconditionally every cycle at ``:3005`` via the shared ``_sweep_stale_mem0_pool``
-helper (``:1053-1147``) — which enumerates on ``{'source': 'stage1_flag_marker'}`` and
-age-GCs at 14 days, for every project, not just ``dark_factory`` (the only project this
+called unconditionally every cycle at ``:3005`` via the shared
+``_sweep_stale_mem0_pool`` helper (defined at ``:945``; source-only filter at
+``:1053``) — which enumerates on ``{'source': 'stage1_flag_marker'}`` and age-GCs
+at 14 days, for every project, not just ``dark_factory`` (the only project this
 script's own systemd timer targets by default); see that helper's own docstring
 (``:1281-1294``) for the gap it documents closing. The pre-2406 Mem0 records remain
 pure dead weight (nothing reads them — see ``find_stale_markers``/
