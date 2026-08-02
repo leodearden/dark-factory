@@ -89,7 +89,13 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # verify._reproject_str relies on split_chain_tail(cmd, 'uv run') carrying the
 # tail through verbatim; adding target names to the head does not disturb it,
 # restructuring the chain would.
-lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
+# The ``check_bare_magicmock_config.py`` tail leg now also covers all 7
+# members' tests/ dirs, for the same reason and via the same workspace-member
+# set as the ruff leg above — a future member is therefore caught by
+# TestFleetLintCoversEveryWorkspaceMember.
+# test_every_present_workspace_member_tests_dir_is_magicmock_checked rather
+# than silently escaping this gate.
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
 # The bare ``npx pyright`` spelling is DELIBERATE and safe (task 3367 /
 # esc-3359-1): every ``cd`` target below pins pyright's own interpreter via
 # ``[tool.pyright] venvPath = ".."`` / ``venv = ".venv"`` in its pyproject.toml,
