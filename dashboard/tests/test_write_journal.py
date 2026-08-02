@@ -452,3 +452,69 @@ class TestNowThreading:
             conn.row_factory = aiosqlite.Row
             result = await get_agent_breakdown(conn, now=self.FIXED_NOW)
         assert sum(result['values']) == 1
+
+
+def _seed_ops_breakdown_plan_fixture(db_path):
+    """Seed 500 rows / 5 operations spread over ~20 days for plan assertions.
+
+    Matches the architect's validated fixture shape exactly (500 rows, 5
+    distinct operations, sqlite 3.50.4, real six-index schema): reproducing
+    it here is what makes the acceptance strings in
+    TestOperationsBreakdownQueryPlan reliable rather than guessed. Returns
+    the ``since`` ISO timestamp to use (the fixture's start instant), which
+    is what makes the plan meaningful — EXPLAIN QUERY PLAN reasons about the
+    predicate shape, not matched-row counts.
+    """
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    rows = [
+        (
+            f'op-{i}',
+            f'operation-{i % 5}',
+            'dark_factory',
+            'agent-a',
+            'read' if i % 2 == 0 else 'write',
+            (base + timedelta(minutes=i * 57.6)).isoformat(),
+        )
+        for i in range(500)
+    ]
+    _seed_write_ops(db_path, rows)
+    return base.isoformat()
+
+
+class TestOperationsBreakdownQueryPlan:
+    """Pins get_operations_breakdown's query plan to a range-seek on idx_wo_created.
+
+    Reproduces the architect's validated finding (500-row / 5-operation
+    fixture, sqlite 3.50.4, real six-index schema, task 3519): unhinted,
+    ``GROUP BY operation`` is satisfied in-order by walking
+    ``idx_wo_operation`` (a full ``SCAN``); an explicit
+    ``INDEXED BY idx_wo_created`` flips the plan to a range ``SEARCH`` on
+    ``created_at``. Both plans are stable across ``ANALYZE``, so this is
+    schema-shape-determined, not statistics-dependent, and needs no live DB.
+
+    Imports ``OPS_BREAKDOWN_SQL`` from the real module rather than copying the
+    SQL into the test — closing the drift gap
+    fused-memory/tests/test_write_journal.py:726-732 filed as follow-up (its
+    own plan tests hold verbatim SQL copies that cannot detect the dashboard
+    changing its query).
+    """
+
+    @pytest.mark.asyncio
+    async def test_plan_is_search_on_idx_wo_created(self, tmp_path):
+        from dashboard.data.write_journal import OPS_BREAKDOWN_SQL
+
+        db_path = tmp_path / 'ops_plan.db'
+        since = _seed_ops_breakdown_plan_fixture(db_path)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            async with conn.execute(
+                f'EXPLAIN QUERY PLAN {OPS_BREAKDOWN_SQL}', (since,),
+            ) as cursor:
+                plan = ' '.join(row[3] for row in await cursor.fetchall())
+
+        assert 'SEARCH' in plan, f'expected a range seek, got: {plan}'
+        assert 'idx_wo_created' in plan, f'expected idx_wo_created in the plan, got: {plan}'
+        assert 'created_at>?' in plan, (
+            f'created_at must be the seek constraint, got: {plan}'
+        )
+        assert 'SCAN' not in plan, f'still full-scanning write_ops: {plan}'
