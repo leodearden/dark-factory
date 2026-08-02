@@ -10,18 +10,30 @@ The ONE exception is the last column.  `guard matched (replay)` is a **threshold
 
 A `—` cell is **no measurement**, not a measured zero.
 
+`pin changed window` is the diagnostic that makes the `+pin` rows readable.  Every variant is scored over a window of the SAME size (k), so an additive pin can only pay off where a read-side transform left headroom in that budget — under grouping, which collapses the window.  A `+pin` row identical to its twin at `0.00` means the pin never fired, which is a different finding from "the pin does not help".  `—` on a pin-off row means the question was never asked.
+
 ## Decision table
 
-| arm | claim recall@5 | claim recall@10 | canonical in top-5 | median canonical rank | tokens/query | guard candidate present | guard matched (replay) |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| status_quo | 0.78 | 0.90 | 0.54 | 2.00 | 3832.7 | 1.00 | 0.00 |
-| status_quo+pin | 0.78 | 0.90 | 0.54 | 2.00 | 3832.7 | 1.00 | 0.00 |
-| c_peers | 0.94 | 0.97 | 0.50 | 2.00 | 1179.8 | 0.93 | 0.00 |
-| c_peers+pin | 0.99 | 1.00 | 0.99 | 5.00 | 1289.9 | 0.93 | 0.00 |
-| b_grouped | 0.98 | 0.99 | 0.97 | 1.00 | 1195.7 | 0.93 | 0.00 |
-| b_grouped+pin | 0.99 | 1.00 | 0.99 | 1.00 | 1203.9 | 0.93 | 0.00 |
+| arm | claim recall@5 | claim recall@10 | canonical in top-5 | median canonical rank | tokens/query | guard candidate present | guard matched (replay) | pin changed window |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| status_quo | 0.78 | 0.90 | 0.54 | 2.00 | 3832.7 | 1.00 | 0.00 | — |
+| status_quo+pin | 0.78 | 0.90 | 0.54 | 2.00 | 3832.7 | 1.00 | 0.00 | 0.00 |
+| c_peers | 0.94 | 0.97 | 0.50 | 2.00 | 1181.3 | 0.93 | 0.00 | — |
+| c_peers+pin | 0.94 | 0.97 | 0.50 | 2.00 | 1181.3 | 0.93 | 0.00 | 0.00 |
+| b_grouped | 0.98 | 0.99 | 0.97 | 1.00 | 1195.7 | 0.93 | 0.00 | — |
+| b_grouped+pin | 0.98 | 0.99 | 0.97 | 1.00 | 1202.0 | 0.93 | 0.00 | 0.06 |
 
 Token counts come from the `char-proxy:4-chars-per-token` estimator (recorded because a substituted estimator would otherwise be indistinguishable from a measured one).  Guard threshold: 0.92.  Distractor slab: 300 records, identical in every arm.
+
+## What the pin column shows
+
+3111's topic anchor is ADDITIVE at the search seam (PRD D1): it appends a topic's canonical, it never promotes it over a ranked hit.  Both variants of a shape are scored over a window of the same size, so an additive pin can only pay off where a read-side transform freed a slot in that budget.  Per shape, as measured:
+
+- **`status_quo`** — the pin changed 0.00 of the measured windows; every metric column is unchanged from `status_quo`.
+- **`c_peers`** — the pin changed 0.00 of the measured windows; every metric column is unchanged from `c_peers`.
+- **`b_grouped`** — the pin changed 0.06 of the measured windows; the `tokens_per_query` column(s) moved.
+
+Read a `+pin` row against `pin changed window`, not against its twin alone.  A rate of `0.00` beside identical columns means the pin never fired — at a full window there is no slot for an appended record — which is a different finding from "the pin does not help".  A rate above zero beside identical columns means it fired and moved nothing these metrics measure.  Either way, a pin that is to pay off under a shape whose window is already full would have to PROMOTE rather than append, and that is a design choice for gate η, not a tuning knob for this experiment.
 
 ## D10 — audit-recall over the labeled fixture
 
@@ -53,6 +65,6 @@ The **paraphrase band** is the positive pairs no character-level threshold can r
 | --- | --- |
 | `fused-memory/tests/fixtures/write_triage_calibration.jsonl` | 55e242a2c8681fb8a60fdb34e3d5194109781e87 |
 | `fused-memory/tests/fixtures/memory_eval_topic_registry.json` | 02886ef290cde99ce88426cd1d3b5565a551e293 |
-| `fused-memory/tests/fixtures/e2_arm_claims.jsonl` | ae42c3b94ea4058f7e0b0fa577a1fa8f1491b93e |
-| `fused-memory/tests/fixtures/e2_query_set.jsonl` | 010282056f13ffa0df42ddee5db8421d6a0acf1c |
-| `fused-memory/tests/fixtures/e2_distractor_slab.jsonl` | c33409dd4c5632025cf546713d5d750f0bd3a1a7 |
+| `fused-memory/tests/fixtures/e2_arm_claims.jsonl` | e522235a82b0117a264ad497e480045f5c761c6d |
+| `fused-memory/tests/fixtures/e2_query_set.jsonl` | 32193693932db83bf4753f1d62331bf5209f2db6 |
+| `fused-memory/tests/fixtures/e2_distractor_slab.jsonl` | 8563918d31bc01aad597000e8472151796d6cd78 |

@@ -1952,6 +1952,45 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"Distractor slab: {protocol['distractor_slab_size']} records, "
         f'identical in every arm.',
         '',
+        '## What the pin column shows',
+        '',
+        "3111's topic anchor is ADDITIVE at the search seam (PRD D1): it "
+        'appends a topic\'s canonical, it never promotes it over a ranked '
+        'hit.  Both variants of a shape are scored over a window of the same '
+        'size, so an additive pin can only pay off where a read-side '
+        'transform freed a slot in that budget.  Per shape, as measured:',
+        '',
+    ]
+
+    pin_blocks = ('claim_recall', 'discoverability', 'tokens_per_query',
+                  'guard_adequacy')
+    for shape in ARM_SHAPES:
+        off = report['arms'][shape]
+        on = report['arms'][f'{shape}+pin']
+        rate = on['pin']['window_changed_rate']
+        moved = [block for block in pin_blocks if on[block] != off[block]]
+        lines.append(
+            f'- **`{shape}`** — the pin changed {_cell(rate)} of the measured '
+            f'windows; '
+            + (
+                f"every metric column is unchanged from `{shape}`."
+                if not moved
+                else f"the {', '.join(f'`{b}`' for b in moved)} column(s) moved."
+            )
+        )
+
+    lines += [
+        '',
+        'Read a `+pin` row against `pin changed window`, not against its twin '
+        'alone.  A rate of `0.00` beside identical columns means the pin '
+        'never fired — at a full window there is no slot for an appended '
+        'record — which is a different finding from "the pin does not help".  '
+        'A rate above zero beside identical columns means it fired and moved '
+        'nothing these metrics measure.  Either way, a pin that is to pay off '
+        'under a shape whose window is already full would have to PROMOTE '
+        'rather than append, and that is a design choice for gate η, not a '
+        'tuning knob for this experiment.',
+        '',
         '## D10 — audit-recall over the labeled fixture',
         '',
         f"Replay of `{audit['detector']}` at threshold "

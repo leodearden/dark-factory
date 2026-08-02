@@ -3889,13 +3889,35 @@ class TestCommittedReportMarkdown:
 
         assert header == '| ' + ' | '.join(mod.DECISION_TABLE_COLUMNS) + ' |'
 
-    def test_no_cell_in_the_committed_table_is_a_missing_measurement(self):
+    def test_no_measurement_cell_in_the_committed_table_is_missing(self):
         """`—` means "never measured", and next to real numbers it reads as a
-        tie.  A committed table must not contain one."""
-        rendered = _mod().DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        tie.  A committed table must not contain one.
+
+        Scoped to the MEASUREMENT columns.  `pin changed window` is a
+        diagnostic, not a measurement of the arm, and on a pin-off row the
+        question genuinely was never asked — see the test below, which pins
+        that column's `—` exactly where it belongs rather than allowing it
+        anywhere.
+        """
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        pin_column = mod.DECISION_TABLE_COLUMNS.index('pin changed window')
 
         for row in _decision_table_rows(rendered):
-            assert '—' not in row
+            cells = [cell.strip() for cell in row.strip('|').split('|')]
+            assert '—' not in cells[:pin_column], row
+
+    def test_the_pin_column_is_not_applicable_exactly_on_the_pin_off_rows(self):
+        """The stronger form of the rule above: `—` in that column is correct
+        on a pin-off row and a broken run anywhere else."""
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        pin_column = mod.DECISION_TABLE_COLUMNS.index('pin changed window')
+
+        for row in _decision_table_rows(rendered):
+            cells = [cell.strip() for cell in row.strip('|').split('|')]
+            arm, pin_cell = cells[0], cells[pin_column]
+            assert (pin_cell == '—') is not arm.endswith('+pin'), row
 
     def test_it_renders_byte_identically_from_the_committed_json(self):
         """The markdown is a pure function of the JSON, so the two cannot have
