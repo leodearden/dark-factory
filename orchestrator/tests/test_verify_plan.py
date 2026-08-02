@@ -99,7 +99,7 @@ _ROOT_TEST_COMMAND = (
     ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
     ' && cd ../sampler && uv run pytest tests/ --timeout=300'
     ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ --timeout=300'
+    ' && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
 )
 
 # Task 3218: not a config in this repo (yet), but the shape the pytest slot
