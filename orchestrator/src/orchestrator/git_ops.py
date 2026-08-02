@@ -12819,6 +12819,76 @@ class GitOps:
         if rc == 0 and current_branch.strip() == self.config.main_branch:
             is_on_main = True
 
+            # ── Foreign index-lock stand-off (task 3060) ─────────────────
+            # A concurrent `git commit --only <path>` in project_root holds
+            # <git-dir>/index.lock for the ENTIRE pre-commit hook run (this
+            # repo's hook runs pyright; CLAUDE.md instructs callers to pass
+            # `timeout: 300000`).  Under that lock `git stash create` exits
+            # rc=1 with EMPTY stdout AND stderr (verified, git 2.43.0), so
+            # the park below would fail and return the queue-HALTING
+            # 'stash_failed'.  Never park through a foreign lock:
+            # _park_wip_on_private_ref ends with `read-tree -u --reset HEAD`,
+            # which would clobber the in-flight commit's staged/working
+            # state.  When another process owns the index the only safe
+            # action is to touch nothing and come back later.
+            #
+            # This gate is deliberately placed HERE — keyed on `is_on_main`,
+            # BEFORE the dirty-file snapshot below — not inside the
+            # `if dirty_tracked:` park block, for two reasons:
+            #
+            #  (i) It covers EVERY project_root index/tree write advance_main
+            #      performs, not just the park: the update-ref and the
+            #      post-advance `read-tree -u --reset HEAD` sync too.  That
+            #      sync's failure is only LOGGED while the outcome still
+            #      reports 'advanced', so on a CLEAN tree (where no park is
+            #      attempted at all) a foreign lock would silently land main
+            #      with a stale project_root tree — and the NEXT advance
+            #      would then read the whole old-main→new-main delta as
+            #      "dirty" WIP, cascading into wip_overlap/park damage.
+            #  (ii) The dirty-file snapshot is now taken AFTER the lock
+            #      clears, so it can never record the half-written state of
+            #      an in-flight `git commit --only`.  A stale snapshot would
+            #      mis-drive both the wip_overlap check and the park.
+            #
+            # It is deliberately NOT hoisted above the pre-existing
+            # unmerged-state gate: that gate's `git status --porcelain` read
+            # succeeds under a held lock (verified rc=0) and cannot
+            # false-positive from a concurrent `commit --only` (which never
+            # creates unmerged entries), so its precedence is preserved.
+            #
+            # The grace is re-read PER ADVANCE (never captured at startup)
+            # so a green-tier reload of git.merge_park_lock_grace_seconds
+            # takes effect on the very next advance.  On the clean happy
+            # path this costs exactly one stat().
+            cleared, waited = await self._await_index_lock_clear(
+                timeout_s=self.config.merge_park_lock_grace_seconds,
+                context=f'advance_main for {branch or merge_sha[:8]}',
+            )
+            if not cleared:
+                lock_path = await self._index_lock_path()
+                _, lock_age = await self._index_lock_state()
+                logger.warning(
+                    'Foreign git index lock still held in project_root after '
+                    '%.1fs — standing off; the merge did NOT land and nothing '
+                    'in project_root was modified. lock=%s age=%.1fs',
+                    waited, lock_path, lock_age,
+                )
+                # Mirrors the _last_overlap_files / _last_stash_dirty_files
+                # side channels so _map_advance_failure can name the lock in
+                # the per-task blocked reason.  'dirty_files' is empty on
+                # this path by construction — the snapshot below has not been
+                # taken yet — but the key is kept PRESENT so consumers need
+                # no shape branching.  _last_stash_dirty_files is left
+                # untouched, so the stash_failed escalation text is
+                # unaffected.
+                self._last_park_lock_info = {
+                    'lock_path': str(lock_path),
+                    'age_seconds': lock_age,
+                    'waited_seconds': waited,
+                    'dirty_files': [],
+                }
+                return AdvanceOutcome('park_lock_contended')
+
             # Check for uncommitted changes (staged or unstaged)
             _, porcelain, _ = await _run(
                 ['git', 'status', '--porcelain'],
@@ -12877,42 +12947,6 @@ class GitOps:
                 # (??) entries survive read-tree without conflict — parking
                 # them risks spurious apply failures (e.g. .worktrees/).
                 if dirty_tracked:
-                    # ── Foreign index-lock stand-off ─────────────────────
-                    # A concurrent `git commit --only <path>` in
-                    # project_root holds <git-dir>/index.lock for the ENTIRE
-                    # pre-commit hook run.  Under that lock `git stash
-                    # create` exits rc=1 with EMPTY stdout AND stderr
-                    # (verified, git 2.43.0), so the park below would fail
-                    # and return the queue-HALTING 'stash_failed'.  Never
-                    # park through a foreign lock: _park_wip_on_private_ref
-                    # ends with `read-tree -u --reset HEAD`, which would
-                    # clobber the in-flight commit's staged/working state.
-                    # Touch nothing and come back later instead.
-                    # The grace is re-read PER ADVANCE (never captured at
-                    # startup) so a green-tier reload of
-                    # git.merge_park_lock_grace_seconds takes effect on the
-                    # very next advance.
-                    cleared, waited = await self._await_index_lock_clear(
-                        timeout_s=self.config.merge_park_lock_grace_seconds,
-                        context=f'advance_main park for {branch or merge_sha[:8]}',
-                    )
-                    if not cleared:
-                        lock_path = await self._index_lock_path()
-                        _, lock_age = await self._index_lock_state()
-                        logger.warning(
-                            'Foreign git index lock still held in project_root '
-                            'after %.1fs — standing off instead of parking '
-                            'WIP. lock=%s age=%.1fs dirty=%s',
-                            waited, lock_path, lock_age,
-                            ', '.join(sorted(dirty_tracked)[:10]),
-                        )
-                        self._last_park_lock_info = {
-                            'lock_path': str(lock_path),
-                            'age_seconds': lock_age,
-                            'waited_seconds': waited,
-                            'dirty_files': sorted(dirty_tracked),
-                        }
-                        return AdvanceOutcome('park_lock_contended')
                     try:
                         await self._park_wip_on_private_ref(branch or merge_sha[:8])
                     except MergeParkContentionError as e:
