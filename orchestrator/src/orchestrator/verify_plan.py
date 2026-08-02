@@ -17,6 +17,7 @@ from enum import Enum, StrEnum
 from typing import Literal
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.pytest_markers import deselecting_expression_for_targets
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
@@ -445,6 +446,27 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     return VerifyCmd(tool=scoped.tool, raw=f'{render(scoped)} {tail}')
 
 
+def _marker_deselecting_expression(
+    mc: ModuleConfig,
+    collectable_tests: list[str],
+    worktree_reader: Callable[[str], str | None],
+) -> str | None:
+    """The module's effective ``-m`` expression when it provably deselects EVERY target.
+
+    Returns None — "keep today's FILE_SCOPED behaviour" — for every other case,
+    including any unreadable file or unparseable expression. See
+    :mod:`orchestrator.pytest_markers` for the soundness and cost arguments;
+    both reads go through the SAME injected *worktree_reader*, so this function
+    introduces no filesystem access of its own.
+    """
+    return deselecting_expression_for_targets(
+        collectable_tests,
+        worktree_reader(f'{mc.prefix}/pyproject.toml'),
+        mc.test_command,
+        worktree_reader,
+    )
+
+
 def _derive_module_runs(
     mc: ModuleConfig,
     existing_files: list[str],
@@ -496,6 +518,30 @@ def _derive_module_runs(
     above). ``workflow.py`` is exactly such a file. A SOURCE-only predicate
     would therefore make pytest breadth silently depend on whether a module
     happens to configure a type checker.
+
+    MARKER DESELECTION (task 3494, escalation esc-3292-1): :func:`classify_file`
+    is purely PATH-based, so a ``test_*.py`` basename is COLLECTABLE_TEST
+    regardless of whether pytest would actually collect anything from it. When
+    the module's own ``addopts`` deselect every item in every touched test file
+    — as ``orchestrator``'s ``-m 'not warm_lane_bash'`` does for
+    ``tests/test_warm_lane_bash_suite.py``, whose module-level ``pytestmark``
+    carries that marker — the arm-4 FILE_SCOPED run collects ZERO items, pytest
+    exits rc=5, and ``verify_classify._classify_opaque`` classifies rc=5 as RED.
+    A false RED on a diff that touched a real, passing test file.
+
+    This is the SECOND instance of the task-1852 class ("the path says
+    collectable, pytest collects zero"), and it is fixed where the first one was
+    — in THIS scoping layer, by widening to the owning module's full suite —
+    rather than by softening rc=5 in the classification layer, which stays a
+    genuine RED for a target that vanished for any other reason.
+
+    The probe is FAIL-SAFE in exactly one direction: any unreadable file,
+    unparseable expression, or merely-unknown marker yields no widening, i.e.
+    precisely the pre-3494 behaviour. Its extra I/O is bounded at one
+    ``worktree_reader`` read of ``<prefix>/pyproject.toml`` per ModuleConfig —
+    through the same content-cached reader used above, so a target already read
+    for STRUCTURAL detection costs nothing further — and ZERO target reads for a
+    module that declares no ``-m`` expression at all.
     """
     prefix = mc.prefix + '/'
     scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
@@ -558,7 +604,7 @@ def _derive_module_runs(
             mc.prefix, None, ScopeKind.SKIPPED, 'pyright: no type_check_command configured',
         ))
 
-    # -- pytest: a five-arm cascade, in this order --
+    # -- pytest: a six-arm cascade, in this order --
     #   1. CONFTEST touched      -> FULL_SUITE (D1: fixtures/hooks affect the
     #      whole subtree)
     #   2. TEST_DATA touched     -> FULL_SUITE (D1: consumed by tests we can't
@@ -567,7 +613,13 @@ def _derive_module_runs(
     #      -> FULL_SUITE, the task-3294 floor. It sits HERE, above arm 4, so
     #      that coverage is monotone in the diff: co-committing a test must
     #      not narrow a run the production file alone would have widened.
-    #   4. collectable tests     -> FILE_SCOPED to them
+    #   4a. collectable tests, ALL provably deselected by the module's own `-m`
+    #      -> FULL_SUITE, the task-3494 arm. It sits BELOW arms 1-3 so those
+    #      stay unreachable-by-construction from the new probe, and it is a
+    #      sub-branch of arm 4 rather than a peer because it fires only on the
+    #      selection arm 4 would otherwise emit. See the MARKER DESELECTION
+    #      paragraph in this function's docstring.
+    #   4b. collectable tests     -> FILE_SCOPED to them
     #   5. otherwise             -> an explicit reasoned SKIPPED (the task-1852
     #      "not silent" requirement: never a dropped command)
     # Arm 5 is reachable only at role='merge'. At role='task' every
@@ -607,12 +659,22 @@ def _derive_module_runs(
                 )
             runs.append(PlannedRun(mc.prefix, test_cmd, ScopeKind.FULL_SUITE, reason))
         elif collectable_tests:
-            test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
-            runs.append(PlannedRun(
-                mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
-                'pytest: file-scoped to touched test file(s)',
-                scoped_targets=tuple(collectable_tests),
-            ))
+            deselecting = _marker_deselecting_expression(mc, collectable_tests, worktree_reader)
+            if deselecting is not None:
+                test_cmd = parse_config_command(mc.test_command)
+                runs.append(PlannedRun(
+                    mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
+                    f"pytest: every touched test file is deselected by the module's "
+                    f'-m {deselecting!r} — owning-module full suite instead of a '
+                    f'zero-collecting file-scoped run (rc=5)',
+                ))
+            else:
+                test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
+                runs.append(PlannedRun(
+                    mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
+                    'pytest: file-scoped to touched test file(s)',
+                    scoped_targets=tuple(collectable_tests),
+                ))
         else:
             runs.append(PlannedRun(
                 mc.prefix, None, ScopeKind.SKIPPED,
