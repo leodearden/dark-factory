@@ -87,7 +87,8 @@ asyncio_mode = "auto"
 # leave the NEXT non-member directory to re-open the same gap silently -- the
 # invisible-asymmetry class this table exists to close. tests/scripts/
 # test_nonmember_ruff_config.py asserts both halves: behavioural parity with a
-# live member, and that no shadowing config reappears.
+# live member, and -- by SWEEPING every non-member directory at any depth rather
+# than checking a hand-written list -- that no shadowing config reappears.
 #
 # THE UN-GATED RESIDUE, recorded rather than left silent. This table also now
 # governs conftest.py, df_pytest_isolation.py and
@@ -99,15 +100,29 @@ asyncio_mode = "auto"
 # trigger that would swing this branch's own verify onto the whole-fleet path,
 # for a change otherwise confined to two directories.
 #
-# [tool.ruff.format] IS DECLARED FOR CONVENTION PARITY ONLY. The repo has NO
-# `ruff format --check` gate anywhere (verified by grep over every
-# orchestrator.yaml and the git hooks), so it binds nothing today, and the files
-# this table newly covers are NOT currently in that format. Introduce a
-# formatter gate only with a measured diff in hand, never as a silent flip.
+# [tool.ruff.format] IS DELIBERATELY ABSENT -- do not "restore parity" by adding
+# it back without the burn-down. The members declare quote-style = "single", but
+# the files THIS table governs are largely double-quoted (scripts/legibility's
+# census_trigger.py, codebook.py and trickle_state.py, and most of
+# scripts/tests/). `ruff format` needs no flags to pick up a config, so declaring
+# one here that is known to disagree with its own files arms the next person who
+# runs `ruff format scripts/` with a large, silent, unrelated reformat -- the
+# same "a rule set nobody chose applies silently" failure this task was filed to
+# eliminate, merely moved from lint to format. There is NO `ruff format --check`
+# gate anywhere in the repo (verified by grep over every orchestrator.yaml,
+# hooks/project-checks and hooks/pre-commit), so nothing is lost by omitting it.
+# A formatter config belongs here only in the same branch as a measured
+# burn-down and a gate that keeps it true -- the discipline the lint half of
+# this change followed. Note the members are not even self-consistent on it:
+# dashboard, fused-memory, orchestrator and sampler add
+# docstring-code-format = true; cockpit, escalation and shared do not.
 #
-# Values below are byte-identical to all seven members'; the guard test asserts
-# that equality against every member read from [tool.uv.workspace].members, so
-# this is an enforced invariant rather than an eighth hand-maintained copy.
+# WHAT IS ENFORCED, EXACTLY. tests/scripts/test_nonmember_ruff_config.py asserts
+# the three values below equal every member's, over the member list read from
+# [tool.uv.workspace].members -- and additionally asserts this table declares
+# NOTHING BEYOND them, because an un-compared key here would be an eighth
+# hand-maintained copy free to drift from the seven. To add one, extend that
+# comparison first.
 
 [tool.ruff]
 line-length = 100
@@ -115,7 +130,3 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
-
-[tool.ruff.format]
-quote-style = "single"
-indent-style = "space"

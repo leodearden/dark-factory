@@ -33,6 +33,26 @@ lived at the given path, so the probe is hermetic: NOTHING is written to disk.
 Test (b) then pins the DECLARED config so a reader can see the intended values
 and a member cannot silently diverge from them.
 
+BOTH HALVES SWEEP, THEY DO NOT ENUMERATE. The probed paths and the forbidden
+shadowing configs are DERIVED by walking the repo and subtracting the workspace
+members declared in ``[tool.uv.workspace].members``, never listed by hand. A
+hand-maintained list is the same failure mode this table closes one level up: it
+covers today's two gated directories and lets the NEXT non-member directory —
+or a nested ``scripts/legibility/ruff.toml``, which would silently re-scope
+roughly half of what ``ruff check scripts/`` covers — re-open the gap without
+anything going red. The two gated directories are separately asserted to be
+PRESENT in the derived set, so a pruning bug cannot shrink coverage silently.
+
+WHAT TEST (b) COMPARES, AND WHY THE ROOT TABLE MAY DECLARE NOTHING ELSE. Only
+``[tool.ruff].line-length`` and ``[tool.ruff.lint].{select,ignore}`` are held
+equal to every member. Any OTHER key at the root would be an eighth, unenforced
+hand-maintained copy free to drift from the members, so the guard asserts the
+root declares none — extend the comparison first, then the table. This is not
+hypothetical: ``[tool.ruff.format]`` was declared at the root by this task's
+first pass and was ALREADY divergent, since four of the seven members add
+``docstring-code-format = true``. It has since been removed; see the
+``[tool.ruff]`` comment block in the repo-root ``pyproject.toml``.
+
 THIS GUARD MUST NEVER SKIP. ruff is resolved as ``sys.executable -m ruff`` so it
 has no PATH dependency, and a missing interpreter or module FAILS rather than
 skipping. A guard that skips itself away reproduces the vacuous-pass failure mode
@@ -75,8 +95,13 @@ Y = list(zip([1], [2]))
 print(sys, os, X, Y)
 '''
 
-# The two GATED non-member directories this task exists for.
-NONMEMBER_PROBE_PATHS = ('scripts/_ruff_probe.py', 'tests/scripts/_ruff_probe.py')
+PROBE_BASENAME = '_ruff_probe.py'
+
+# The two GATED non-member directories this task exists for. These are a FLOOR,
+# not the coverage list: the probed set is derived by walking the repo (see
+# _nonmember_probe_paths), and these two are asserted to be in it so a pruning
+# bug or a moved directory cannot quietly shrink the guard to nothing.
+GATED_NONMEMBER_DIRS = ('scripts', 'tests/scripts')
 
 # A live workspace member, used as the BASELINE. Parity is asserted against what
 # ruff actually resolves here rather than against a hardcoded rule-code list, so
@@ -92,16 +117,76 @@ _MECHANISM = (
     'member resolves E,F,UP,B,SIM,I'
 )
 
-# Any of these under a non-member directory would shadow the repo-root table and
-# silently re-open the asymmetry this task closed.
+# Any of these ANYWHERE outside a workspace member would shadow the repo-root
+# table and silently re-open the asymmetry this task closed, because ruff takes
+# the NEAREST applicable config and does not merge.
 _SHADOWING_FILENAMES = ('pyproject.toml', 'ruff.toml', '.ruff.toml')
 
-# Directories that MUST stay free of a shadowing config. `scripts/pyproject.toml`
-# is doubly forbidden: `orchestrator.config._discover_module_configs` and
-# `verify._single_subproject_prefix` both key on pyproject.toml PRESENCE, so
-# adding one would silently re-route verify for scripts/ diffs on top of
-# shadowing the lint config.
-_MUST_NOT_SHADOW = ('scripts', 'tests', 'tests/scripts')
+# Root [tool.ruff] keys this file COMPARES against every member. Declaring
+# anything else at the root creates an unenforced copy that can drift, so the
+# root is asserted to declare nothing outside these sets. `lint` is the
+# sub-table holding _ROOT_COMPARED_LINT_KEYS.
+_ROOT_COMPARED_KEYS = frozenset({'line-length', 'lint'})
+_ROOT_COMPARED_LINT_KEYS = frozenset({'select', 'ignore'})
+
+# Never walked: VCS metadata, virtualenvs, caches, build output, and nested task
+# worktrees (each is a full checkout of this repo, so descending into one would
+# rediscover every member pyproject.toml under a non-member prefix).
+_PRUNED_DIR_NAMES = frozenset({
+    '.git', '.hg', '.mypy_cache', '.pytest_cache', '.ruff_cache', '.task',
+    '.tox', '.venv', '.worktrees', '__pycache__', 'build', 'dist',
+    'node_modules', 'venv',
+})
+
+
+def _root_pyproject() -> dict:
+    return tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text())
+
+
+def _member_roots() -> set[pathlib.Path]:
+    """Directories owned by a workspace member, read from the root declaration.
+
+    Members are globbed rather than string-matched because uv permits patterns
+    (``packages/*``); ``Path.glob`` handles a literal name identically.
+    """
+    members = _root_pyproject()['tool']['uv']['workspace']['members']
+    roots: set[pathlib.Path] = set()
+    for pattern in members:
+        roots.update(path for path in REPO_ROOT.glob(pattern) if path.is_dir())
+    return roots
+
+
+def _nonmember_dirs() -> list[pathlib.Path]:
+    """Every directory the repo-root [tool.ruff] table governs.
+
+    The whole repo minus the member subtrees minus _PRUNED_DIR_NAMES. Derived,
+    never enumerated: a hand-written list covers today's directories and lets the
+    next one re-open the gap silently.
+    """
+    member_roots = _member_roots()
+    found: list[pathlib.Path] = []
+    stack = [REPO_ROOT]
+    while stack:
+        directory = stack.pop()
+        found.append(directory)
+        for child in sorted(directory.iterdir()):
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if child.name in _PRUNED_DIR_NAMES or child.name.endswith('.egg-info'):
+                continue
+            if child in member_roots:
+                continue
+            stack.append(child)
+    return found
+
+
+def _nonmember_probe_paths() -> list[str]:
+    """One probe path per non-member directory that actually holds Python."""
+    return sorted(
+        str((directory / PROBE_BASENAME).relative_to(REPO_ROOT))
+        for directory in _nonmember_dirs()
+        if any(directory.glob('*.py'))
+    )
 
 
 def _resolved_rule_codes(probe_path: str) -> set[str]:
@@ -144,7 +229,7 @@ def _resolved_rule_codes(probe_path: str) -> set[str]:
 
 
 def test_nonmember_dirs_resolve_the_member_ruff_rule_set() -> None:
-    """scripts/ and tests/scripts/ must resolve the SAME rule set as a member."""
+    """EVERY non-member directory holding Python must resolve a member's rule set."""
     baseline = _resolved_rule_codes(BASELINE_PROBE_PATH)
 
     # Non-vacuity: without this, a broken probe passes as the empty set == the
@@ -156,7 +241,23 @@ def test_nonmember_dirs_resolve_the_member_ruff_rule_set() -> None:
         f'[tool.ruff] table. {_MECHANISM}.'
     )
 
-    for probe_path in NONMEMBER_PROBE_PATHS:
+    probe_paths = _nonmember_probe_paths()
+
+    # The derived set is the coverage; the two GATED directories are the floor.
+    # A prune that swallowed them, or a rename, would otherwise leave this test
+    # green while checking nothing that any lint_command targets.
+    for gated in GATED_NONMEMBER_DIRS:
+        expected = f'{gated}/{PROBE_BASENAME}'
+        assert expected in probe_paths, (
+            f'{gated}/ carries a directory-wide lint_command ({gated}/orchestrator.yaml) but '
+            f'was not discovered by _nonmember_probe_paths(), which found {probe_paths}. '
+            'Either the directory moved (update GATED_NONMEMBER_DIRS and its orchestrator.yaml '
+            'together), it no longer holds any .py file, or _PRUNED_DIR_NAMES / the member '
+            'subtraction is over-pruning — in which case this guard is checking less than it '
+            'reads as checking.'
+        )
+
+    for probe_path in probe_paths:
         resolved = _resolved_rule_codes(probe_path)
         assert resolved == baseline, (
             f'A file at {probe_path} resolves rule codes {sorted(resolved)}, but the '
@@ -172,7 +273,7 @@ def test_nonmember_dirs_resolve_the_member_ruff_rule_set() -> None:
 
 def test_root_ruff_config_matches_every_workspace_member() -> None:
     """The DECLARED root config must equal every member's, and nothing may shadow it."""
-    root_toml = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text())
+    root_toml = _root_pyproject()
     root_ruff = root_toml.get('tool', {}).get('ruff', {})
     root_lint = root_ruff.get('lint', {})
 
@@ -182,18 +283,39 @@ def test_root_ruff_config_matches_every_workspace_member() -> None:
         f'[tool.ruff] = {root_ruff!r}.\n{_MECHANISM}.'
     )
 
-    members = root_toml['tool']['uv']['workspace']['members']
-    assert members, 'Root [tool.uv.workspace].members is empty; the comparison below is vacuous.'
+    # ...and NOTHING ELSE. Only the keys asserted equal below are enforced; any
+    # other key at the root is a copy nothing holds to the members, free to drift
+    # exactly as [tool.ruff.format] already had (four of seven members add
+    # `docstring-code-format = true`; the root's first-pass copy did not).
+    for scope, declared, allowed in (
+        ('[tool.ruff]', set(root_ruff), _ROOT_COMPARED_KEYS),
+        ('[tool.ruff.lint]', set(root_lint), _ROOT_COMPARED_LINT_KEYS),
+    ):
+        assert declared <= allowed, (
+            f'The repo-root {scope} declares {sorted(declared - allowed)}, which this guard '
+            f'does NOT compare against the workspace members (it compares only '
+            f'{sorted(allowed)}). An un-compared root key is an eighth hand-maintained copy '
+            'that can silently diverge from the seven members — the invisible-asymmetry class '
+            'task 3457 exists to close. Extend the comparison in this test FIRST, then declare '
+            'the key; or drop it. See the [tool.ruff] comment block in the repo-root '
+            'pyproject.toml for why [tool.ruff.format] in particular is deliberately absent.'
+        )
+
+    member_roots = sorted(_member_roots())
+    assert member_roots, (
+        'Root [tool.uv.workspace].members matched no directory; the comparison below is vacuous.'
+    )
 
     # A member that declares NO [tool.ruff] simply inherits the root table, which
     # preserves the invariant — so it is skipped rather than failed. `compared`
     # keeps that leniency from degenerating into a vacuous pass.
     compared = 0
-    for member in members:
-        member_path = REPO_ROOT / member / 'pyproject.toml'
+    for member_root in member_roots:
+        member = member_root.relative_to(REPO_ROOT)
+        member_path = member_root / 'pyproject.toml'
         assert member_path.is_file(), (
-            f'Workspace member {member!r} declared in root [tool.uv.workspace].members has no '
-            f'pyproject.toml at {member_path}.'
+            f'Workspace member {str(member)!r} declared in root [tool.uv.workspace].members has '
+            f'no pyproject.toml at {member_path}.'
         )
         member_toml = tomllib.loads(member_path.read_text())
         member_ruff = member_toml.get('tool', {}).get('ruff', {})
@@ -225,17 +347,30 @@ def test_root_ruff_config_matches_every_workspace_member() -> None:
         'were vacuous. Either the members lost their tables or the member list is wrong.'
     )
 
-    for directory in _MUST_NOT_SHADOW:
+    # SWEPT, not enumerated: every non-member directory, at any depth. A
+    # hand-listed set would miss e.g. scripts/legibility/ruff.toml, which
+    # silently re-scopes roughly half of what `ruff check scripts/` covers.
+    shadows = []
+    for directory in _nonmember_dirs():
         for filename in _SHADOWING_FILENAMES:
-            shadow = REPO_ROOT / directory / filename
-            assert not shadow.exists(), (
-                f'{directory}/{filename} exists and SHADOWS the repo-root [tool.ruff] table — '
-                'ruff takes the NEAREST applicable config and does not merge, so this file '
-                f'silently decides the rule set for everything under {directory}/.\n'
-                'If a per-directory rule set is genuinely wanted, change the repo-root table '
-                'and this guard together, deliberately. Note additionally that a '
-                'scripts/pyproject.toml is NOT a safe vehicle at all: '
-                'orchestrator.config._discover_module_configs and '
-                'verify._single_subproject_prefix both key on pyproject.toml PRESENCE, so '
-                'adding one silently re-routes verify for scripts/ diffs.'
-            )
+            candidate = directory / filename
+            if not candidate.is_file():
+                continue
+            # The repo-root pyproject.toml IS the table under test. A root
+            # ruff.toml/.ruff.toml is NOT exempt: ruff prefers those over a
+            # pyproject.toml in the SAME directory, so one there would replace
+            # the very table the assertions above pin.
+            if directory == REPO_ROOT and filename == 'pyproject.toml':
+                continue
+            shadows.append(str(candidate.relative_to(REPO_ROOT)))
+
+    assert not shadows, (
+        f'{sorted(shadows)} SHADOW the repo-root [tool.ruff] table — ruff takes the NEAREST '
+        'applicable config and does not merge, so each one silently decides the rule set for '
+        'everything beneath its directory, at any depth and with no gate going red.\n'
+        'If a per-directory rule set is genuinely wanted, change the repo-root table and this '
+        'guard together, deliberately. Note additionally that a pyproject.toml under scripts/ '
+        'is NOT a safe vehicle at all: orchestrator.config._discover_module_configs and '
+        'verify._single_subproject_prefix both key on pyproject.toml PRESENCE, so adding one '
+        'silently re-routes verify for scripts/ diffs on top of shadowing the lint config.'
+    )
