@@ -979,66 +979,6 @@ class TestReviewLoopRouting:
 # ---------------------------------------------------------------------------
 
 
-def _make_steward(*, worktree: Path, config_overrides=None, suggestion_count=15):
-    """Build a minimal TaskSteward with mocked dependencies.
-
-    *worktree* must be a pytest ``tmp_path``-rooted directory, so that
-    pytest's own retention policy reclaims it; it is keyword-only with no
-    default so no caller can fall back to an unmanaged temp dir.  The
-    helper creates the directory itself — the steward's pre-flight
-    auto-escalates "Worktree missing" on a path that is not a directory —
-    and nothing else inside it needs to exist.
-    """
-    from orchestrator.steward import TaskSteward
-
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.project_root = Path('/tmp/project')
-    config.steward_lifetime_budget = 12.0
-    config.steward_max_attempts = 3
-    config.steward_max_timeouts_per_escalation = 3
-    config.steward_max_empty_outputs_per_escalation = 2
-    config.suggestion_triage_threshold = 10
-    config.models.triage = 'sonnet'
-    config.budgets.triage = 2.0
-    config.max_turns.triage = 25
-    config.effort.triage = 'medium'
-    config.backends.triage = 'claude'
-    config.models.steward = 'opus'
-    config.budgets.steward = 5.0
-    config.max_turns.steward = 100
-    config.effort.steward = 'high'
-    config.backends.steward = 'claude'
-    config.escalation.host = '127.0.0.1'
-    config.escalation.port = 8100
-    if config_overrides:
-        for k, v in config_overrides.items():
-            setattr(config, k, v)
-
-    queue = MagicMock()
-    queue.make_id.return_value = 'esc-42-1'
-    queue.get_by_task.return_value = []
-
-    briefing = MagicMock()
-    briefing.build_steward_initial_prompt = AsyncMock(return_value='initial prompt')
-
-    mcp = MagicMock()
-    mcp.mcp_config_json.return_value = {}
-
-    task = {'id': '42', 'title': 'Test Task', 'description': 'desc'}
-    worktree.mkdir(parents=True, exist_ok=True)
-    steward = TaskSteward(
-        task_id='42',
-        task=task,
-        worktree=worktree,
-        config=config,
-        mcp=mcp,
-        escalation_queue=queue,
-        briefing=briefing,
-        usage_gate=None,
-    )
-    return steward
-
-
 def _make_suggestions(n):
     """Generate n fake review suggestions."""
     return [
@@ -1107,8 +1047,8 @@ def _invoke_writing_verdict(worktree: Path, triage_output: dict, **result_kwargs
 
 class TestPreTriageSuggestions:
     @pytest.mark.asyncio
-    async def test_pre_triage_invoked_above_threshold(self, steward_worktree):
-        steward = _make_steward(worktree=steward_worktree)
+    async def test_pre_triage_invoked_above_threshold(self, make_steward):
+        steward = make_steward()
         suggestions = _make_suggestions(15)
 
         triage_output = {
@@ -1144,9 +1084,9 @@ class TestPreTriageSuggestions:
         assert '5 skipped' in result.summary
 
     @pytest.mark.asyncio
-    async def test_pre_triage_not_invoked_below_threshold(self, steward_worktree):
+    async def test_pre_triage_not_invoked_below_threshold(self, make_steward):
         """Small suggestion sets should skip pre-triage in _handle_escalation."""
-        steward = _make_steward(worktree=steward_worktree)
+        steward = make_steward()
         suggestions = _make_suggestions(5)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1163,8 +1103,8 @@ class TestPreTriageSuggestions:
         assert call_kwargs.kwargs.get('model') or 'opus' in str(call_kwargs)
 
     @pytest.mark.asyncio
-    async def test_pre_triage_failure_falls_back(self, steward_worktree):
-        steward = _make_steward(worktree=steward_worktree)
+    async def test_pre_triage_failure_falls_back(self, make_steward):
+        steward = make_steward()
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1179,7 +1119,7 @@ class TestPreTriageSuggestions:
         assert result.summary == esc.summary
 
     @pytest.mark.asyncio
-    async def test_pre_triage_clears_stale_verdict_before_spawn(self, steward_worktree):
+    async def test_pre_triage_clears_stale_verdict_before_spawn(self, make_steward):
         """I-FRESH: a stale verdicts/triage.json from a prior run must not be
         consumed by a run whose invocation never calls submit_triage.
 
@@ -1190,7 +1130,7 @@ class TestPreTriageSuggestions:
         this stale verdict would be read back and returned as a bogus
         pre-triaged escalation instead of falling back to the original.
         """
-        steward = _make_steward(worktree=steward_worktree)
+        steward = make_steward()
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1220,8 +1160,8 @@ class TestPreTriageSuggestions:
         assert result.summary == esc.summary
 
     @pytest.mark.asyncio
-    async def test_pre_triage_cost_tracked_in_metrics(self, steward_worktree):
-        steward = _make_steward(worktree=steward_worktree)
+    async def test_pre_triage_cost_tracked_in_metrics(self, make_steward):
+        steward = make_steward()
         assert steward.metrics.total_cost_usd == 0.0
 
         suggestions = _make_suggestions(15)
@@ -1240,8 +1180,8 @@ class TestPreTriageSuggestions:
         assert steward.metrics.invocations == 1
 
     @pytest.mark.asyncio
-    async def test_pre_triage_replaces_escalation_detail(self, steward_worktree):
-        steward = _make_steward(worktree=steward_worktree)
+    async def test_pre_triage_replaces_escalation_detail(self, make_steward):
+        steward = make_steward()
         suggestions = _make_suggestions(12)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1273,13 +1213,13 @@ class TestPreTriageSuggestions:
         assert 'Original Suggestions' in result.detail
 
     @pytest.mark.asyncio
-    async def test_pre_triage_malformed_item_falls_back(self, steward_worktree):
+    async def test_pre_triage_malformed_item_falls_back(self, make_steward):
         """A malformed per-item shape (a proposed_task_groups entry missing
         'title') must degrade to the original escalation unchanged, not
         raise KeyError out of format_pretriaged_detail's unguarded
         g["title"] indexing (steward.py:766, outside the try/except).
         """
-        steward = _make_steward(worktree=steward_worktree)
+        steward = make_steward()
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1335,14 +1275,14 @@ class TestPreTriageSuggestions:
         ],
         ids=['accepted-files-non-list', 'group-accepted-indices-non-int-element'],
     )
-    async def test_pre_triage_wrong_value_type_falls_back(self, triage_output, steward_worktree):
+    async def test_pre_triage_wrong_value_type_falls_back(self, triage_output, make_steward):
         """A well-shaped-but-mistyped verdict (all required keys present, but
         `files` or `accepted_indices` has the wrong value type) must degrade
         to the original escalation unchanged, not raise TypeError out of
         format_pretriaged_detail's extend(int) / `0 <= '0'` comparison
         (steward.py:766, outside the try/except).
         """
-        steward = _make_steward(worktree=steward_worktree)
+        steward = make_steward()
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1366,7 +1306,7 @@ class TestPreTriageSuggestions:
 class TestPreTriageCapHandling:
     @pytest.mark.asyncio
     async def test_pre_triage_returns_original_escalation_on_cap(
-        self, caplog, steward_worktree
+        self, caplog, make_steward
     ):
         """_pre_triage_suggestions must return the original escalation unchanged on cap.
 
@@ -1374,7 +1314,7 @@ class TestPreTriageCapHandling:
         _pre_triage_suggestions, crashing the steward.
         After step-8 impl: exception is caught, original escalation returned.
         """
-        steward = _make_steward(worktree=steward_worktree)
+        steward = make_steward()
         suggestions = _make_suggestions(15)
         escalation = _make_escalation(detail=json.dumps(suggestions))
 
