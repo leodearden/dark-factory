@@ -108,6 +108,54 @@ class TestCallDbIndexesOverRoQuery:
         # The first (and only) index should be on label Entity
         assert result.result_set[0][0] == 'Entity'
 
+    @pytest.mark.asyncio
+    async def test_db_indexes_exposes_status_column_reading_operational(self, live_test_graph):
+        """PREMISE PIN for the index-readiness barrier — task 3377.
+
+        This is NOT a RED-first TDD test; it is expected to PASS on
+        introduction. A timing race cannot be reliably RED-tested: on this
+        fixture's single-node graph the index build completes before the first
+        poll (measured: 6 of 6 polls already read OPERATIONAL), so an
+        unbarriered fixture passes by luck — which is precisely the false-green
+        mechanism the barrier removes. Manufacturing a reliable RED would mean
+        seeding bulk data to widen the window, producing a slow and inherently
+        flaky test that blows the module's 15s timeout budget.
+
+        Its durable job is different: ``_fm_helpers.await_index_operational``
+        resolves the readiness column BY NAME (``status``) from
+        ``result.header`` and matches its value EXACTLY against
+        ``'OPERATIONAL'``. If a FalkorDB upgrade renames or reorders that
+        column, or changes the ready sentinel, the barrier silently degrades
+        into a no-op. This test makes that fail loudly in the integration lane
+        instead.
+
+        Uses ``graph.query`` (not ``ro_query``) deliberately — the same path
+        the barrier itself uses; the RO-path acceptance is pinned by the
+        sibling test above.
+
+        Verified against FalkorDB module v41800 (4.18.0), whose header is
+        ['label', 'properties', 'types', 'options', 'language', 'stopwords',
+        'entitytype', 'status', 'info'].
+        """
+        result = await live_test_graph.query('CALL db.indexes()')
+
+        header_names = [col[1] for col in result.header]
+        assert 'status' in header_names, (
+            f'CALL db.indexes() has no "status" column (header={header_names}). '
+            f'_fm_helpers.await_index_operational resolves readiness from this '
+            f'column by name; without it the barrier cannot be trusted.'
+        )
+
+        status_idx = header_names.index('status')
+        statuses = [row[status_idx] for row in result.result_set]
+        assert statuses, 'CALL db.indexes() reported zero indices on the fixture graph'
+        assert all(s == 'OPERATIONAL' for s in statuses), (
+            f'fixture returned with a non-OPERATIONAL index (statuses={statuses!r}); '
+            f'the readiness barrier in live_test_graph did not hold. Note the live '
+            f'not-ready value carries a progress prefix, e.g. '
+            f'"[Indexing] N/M: UNDER CONSTRUCTION".'
+        )
+
 
 class TestBackendListIndicesLive:
     """Pin the end-to-end GraphitiBackend.list_indices() row-parsing path against live FalkorDB.
