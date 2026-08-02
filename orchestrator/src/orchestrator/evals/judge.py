@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
 import re
 from collections.abc import Callable
@@ -516,7 +517,15 @@ async def judge_plan_quality(
     constrain the ``structured_output`` delivery path: the
     ``json.loads(result.output)`` fallback above bypasses schema enforcement
     entirely, so an out-of-range judge answer must still be caught at runtime
-    regardless of which path delivered it.
+    regardless of which path delivered it. The parse contract is one rule
+    with two LOUD exceptions (never silent — each leaves one WARNING naming
+    the cell): an out-of-range-but-orderable answer (e.g. ``1.5``) is clamped
+    and the WARNING names the raw and clamped values; a non-finite,
+    unorderable answer (``NaN``) cannot be clamped meaningfully — ``min``/
+    ``max`` pass NaN straight through unchanged — so it degrades to the
+    ``None`` sentinel instead, exactly like a parse failure. ``+/-Infinity``
+    IS orderable, so it takes the ordinary clamp path (``1.0``/``0.0``), not
+    the NaN one.
 
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
     sentinel :func:`run_architect_eval` degrades on), never a crash. When the
@@ -652,6 +661,29 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             plan_quality = None
         else:
             raw_quality = float(raw_quality)
+            # NaN is unorderable, so clamp_unit_score cannot enforce [0, 1] on
+            # it (round(min(max(nan, 0.0), 1.0), 4) is itself nan — verified
+            # by execution) — checked BEFORE the clamp, not after.
+            # +/-Infinity IS orderable and falls through to the clamp +
+            # out-of-range warning below instead: a judge answering infinity
+            # clearly means "as high/low as it goes", the same
+            # intent-preserving reasoning that governs any other
+            # out-of-range-but-orderable answer.
+            if math.isnan(raw_quality):
+                logger.warning(
+                    f'Plan judge for {cell} answered a non-finite '
+                    f'plan_quality (NaN) — not a real judgement, degraded to '
+                    f'the None sentinel (run_architect_eval falls back to '
+                    f'the deterministic structural floor).'
+                )
+                return PlanQualityVerdict(
+                    plan_quality=None,
+                    per_criterion={},
+                    reasoning=(
+                        f'Plan judge answered a non-finite plan_quality '
+                        f'(NaN) for {cell}'
+                    ),
+                )
             plan_quality = clamp_unit_score(raw_quality)
             # PLAN_QUALITY_SCHEMA declares {'minimum': 0.0, 'maximum': 1.0},
             # but that only binds the structured_output delivery path — the
