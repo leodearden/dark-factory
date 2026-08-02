@@ -1232,6 +1232,145 @@ async def test_curator_combine_corrupt_target_metadata_aborts(
     ), f'expected a WARNING naming target 50; got {[r.getMessage() for r in caplog.records]}'
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Task 3446, direction 2: a gated CANDIDATE must never be absorbed into
+# an ungated target. metadata_mode='merge' does not cover this — the
+# candidate's own metadata is never written anywhere by the combine path.
+# ─────────────────────────────────────────────────────────────────────
+
+# What operational_routing_guard.inject_operational_routing produces at the
+# submit boundary for a declared execution_class='operational' gate.
+_GATE_CANDIDATE_METADATA = {
+    'execution_class': 'operational',
+    'operational_mode': 'gate',
+    'task_kind': 'deterministic',
+    'always_escalates': True,
+}
+
+
+def _set_target(taskmaster, metadata=None, *, status: str = 'pending') -> str | None:
+    """Point ``tm.get_task`` at target 50 with the given stored metadata blob."""
+    raw = None if metadata is None else json.dumps(metadata)
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': status,
+            'title': 'Test Task',
+            'metadata': raw,
+        }
+    )
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_refuses_gated_candidate_into_ungated_target(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    caplog,
+):
+    """Gated candidate + ungated target → refuse the combine, degrade to create.
+
+    Propagating the candidate's gate stamp onto the target instead is unsafe:
+    under shallow merge a ``before_done`` key already on the target survives,
+    yielding task_kind='deterministic' + always_escalates=True + before_done —
+    exactly the combination deterministic_task_guard invariant 6 rejects.
+    Refusal has no such failure mode, and filing the gate as its own task is
+    the correct conservative outcome for a duplicate human gate.
+    """
+    _set_target(taskmaster, None)
+    curator_interceptor._curator = _mock_curator(_combine_decision('looks like a dup'))
+
+    with caplog.at_level(logging.WARNING):
+        result = await _submit_and_resolve(
+            curator_interceptor,
+            '/project',
+            title='Human gate: consolidate the duplicate cluster',
+            metadata=dict(_GATE_CANDIDATE_METADATA),
+        )
+
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_not_called()
+    taskmaster.add_task.assert_called_once()
+    # Refused before the audit append, like the fingerprint/terminal guards.
+    assert _combine_audit_lines(audit_dir) == []
+    messages = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any(
+        'combine-guard' in msg and '50' in msg and 'always_escalates' in msg
+        for msg in messages
+    ), f'expected a WARNING naming target 50 and the gate markers; got {messages}'
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_allows_gated_candidate_into_gated_target(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """Gate-into-gate is legitimate dedup — the guard must not refuse it."""
+    _set_target(taskmaster, {'task_kind': 'deterministic', 'always_escalates': True})
+    curator_interceptor._curator = _mock_curator(_combine_decision('same gate, dedup'))
+
+    result = await _submit_and_resolve(
+        curator_interceptor,
+        '/project',
+        title='Human gate: consolidate the duplicate cluster',
+        metadata=dict(_GATE_CANDIDATE_METADATA),
+    )
+
+    assert result['action'] == 'combine'
+    assert result['id'] == '50'
+    taskmaster.update_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_allows_ungated_candidate_into_gated_target(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """The task-3426 shape: ungated candidate into a gated target still combines.
+
+    Guards against an over-broad refusal in the exact direction the fix is
+    meant to preserve — and re-checks that the target's gate survives.
+    """
+    existing_raw = _set_target(taskmaster, _GATE_TARGET_METADATA, status='blocked')
+    recorded = _record_merged_metadata(taskmaster, existing_raw)
+    curator_interceptor._curator = _mock_curator(_combine_decision('folds into the gate'))
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='ordinary dup')
+
+    assert result['action'] == 'combine'
+    assert recorded['stored']['always_escalates'] is True
+    assert recorded['stored']['operational_mode'] == 'gate'
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_gate_predicate_ignores_malformed_metadata(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """Unparseable candidate metadata is treated as ungated, never raised on.
+
+    Matches _extract_metadata_dict's degrade contract: the shape warning is
+    emitted there, and the guard falls back to the permissive answer rather
+    than turning a malformed blob into a hard failure of the combine path.
+    """
+    _set_target(taskmaster, None)
+    curator_interceptor._curator = _mock_curator(_combine_decision('malformed candidate'))
+
+    result = await _submit_and_resolve(
+        curator_interceptor,
+        '/project',
+        title='dup',
+        metadata='{not json',
+    )
+
+    assert result['action'] == 'combine'
+    taskmaster.update_task.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_concurrent_add_task_produces_single_task(
     taskmaster,
