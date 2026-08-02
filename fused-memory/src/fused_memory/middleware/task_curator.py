@@ -1565,6 +1565,32 @@ class TaskCurator:
         unique_indices = non_premise_unique
         # ── End premise-verification check ──────────────────────────────────────
 
+        # ── Propagate deterministic refusals to byte-identical duplicates ──────
+        # The pre-batch dedup above ran BEFORE the blocklist/premise guards, so a
+        # duplicate of a refused candidate was skipped by them entirely and still
+        # carries a synthetic batch_target_index drop.  At dispatch that drop
+        # resolves against a sibling with task_id=None (a refusal creates nothing),
+        # hits the 'sibling failed' branch, and fails OPEN to create — filing the
+        # very dead-premise task the guard just refused.  Identical payload_hash
+        # means an identical guard verdict by construction, so inherit the refusal.
+        # Only pre-batch-dedup drops are rewritten: an LLM-chosen
+        # batch_target_index still fails open, because that sibling is a DIFFERENT
+        # payload which the guards did check and did pass.
+        for i, dup_dec in list(pre_dedup_decisions.items()):
+            j = dup_dec.batch_target_index
+            if j is None:
+                # Unreachable in practice — every pre-dedup decision is minted
+                # with a batch_target_index above. Narrowing for the type
+                # checker, which types the field `int | None`.
+                continue
+            refusal = blocklist_decisions.get(j) or premise_decisions.get(j)
+            if refusal is not None:
+                pre_dedup_decisions[i] = CuratorDecision(
+                    action='refuse',
+                    justification=refusal.justification,
+                )
+        # ── End refusal propagation ───────────────────────────────────────────
+
         # ── Recon claim-verification advisory backstop (task 2438) ─────────────
         # For each still-live candidate, flag (never drop) any code-level claim
         # it attributes to a completed task/commit/ACTION whose token verifies
