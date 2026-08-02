@@ -79,6 +79,20 @@ a bool, the sweep reverts to pending, the coalesce re-drive calls
   ``candidate_sha``. Used by the merge-marker path and the stranded-
   in-progress sweep.
 
+A second shared predicate lives here for the same INV-5 reason (task 3103):
+:func:`branch_is_degenerate` (with its :func:`is_valid_sha_40` helper) answers
+"did this branch ever advance past its recorded creation point?" — the #1226
+degeneracy signal that must run BEFORE :func:`validate_landing_evidence` on
+every already-landed re-derivation. Both were previously private to
+``harness.py``, which left the escalation server's ``merge_status`` Tier-3.5
+and ``merge_request`` fast-path unguarded against a branch parked at an OLD
+main commit: such a branch IS an ancestor of main and is NOT at main's tip,
+so an ancestry-only check answers a confident ``done`` against a commit
+containing none of the task's work. Consumers: ``harness.py`` (×3 sites, via
+the ``Harness._branch_is_degenerate`` delegation), ``escalation/server.py``
+``merge_status`` (both git-authority arms) and ``merge_request``'s
+``already_merged`` fast-path.
+
 Also shared here (INV-5): :func:`format_unattributed_landing_detail` renders
 a rejected verdict into a human-facing ``(summary, detail)`` pair, and
 :func:`file_unattributed_landing_escalation` is the dedup-guarded L1 filing
@@ -92,7 +106,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -100,6 +114,57 @@ if TYPE_CHECKING:
     from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger(__name__)
+
+
+def is_valid_sha_40(s: object) -> TypeGuard[str]:
+    """Return True iff *s* is a well-formed 40-char lowercase hex SHA.
+
+    Used to validate ``branch_base_sha`` values read from task metadata
+    before comparing them against live git output.  Any non-conforming
+    value is treated as missing so the reconciler falls through to the
+    existing citation-grep guard rather than making a bogus comparison.
+    """
+    return (
+        isinstance(s, str)
+        and len(s) == 40
+        and all(c in '0123456789abcdef' for c in s)
+    )
+
+
+async def branch_is_degenerate(
+    git_ops: GitOps, branch: str, metadata: dict[str, Any],
+) -> bool:
+    """Return True iff the branch is a provisioning-only degenerate branch.
+
+    A branch is degenerate when its live tip SHA equals the recorded
+    branch_base_sha (#1226), meaning zero commits were ever pushed beyond
+    the creation point.  Such a branch is still an ancestor of main and is
+    still distinct from main's tip, so every ancestry-based already-landed
+    check needs this predicate to avoid attributing a foreign commit's
+    content to the task.
+
+    Returns False when:
+    - branch_base_sha is absent or not a valid 40-hex SHA (backward compat
+      for pre-#1226 tasks or tasks whose metadata write failed transiently);
+    - resolve_branch_sha returns None (branch ref vanished mid-sweep —
+      treat as non-degenerate so the caller falls through to escalate); or
+    - the live tip has advanced past the recorded base SHA.
+
+    The metadata check deliberately precedes the git call: an absent or
+    malformed base must cost nothing and must never reach a comparison
+    against live git output.
+
+    Args:
+        git_ops: A ``GitOps`` instance (or a duck-typed stand-in exposing
+            ``resolve_branch_sha``).
+        branch: The task's branch name (e.g. ``f'task/{task_id}'``).
+        metadata: The task's metadata dict, read for ``branch_base_sha``.
+    """
+    branch_base_sha = metadata.get('branch_base_sha')
+    if not is_valid_sha_40(branch_base_sha):
+        return False
+    branch_tip_sha = await git_ops.resolve_branch_sha(branch)
+    return branch_tip_sha is not None and branch_tip_sha == branch_base_sha
 
 
 @dataclass(frozen=True)
