@@ -15,12 +15,15 @@ importable-by-sibling-scripts only. It hosts two tiers:
   :func:`discover_db_paths`) — adopted by ALL THREE sweep scripts.
 * **Tier 2, leak-scanner CLI plumbing** — adopted by the two leak scanners
   only. ``audit_wiped_metadata_files.py`` deliberately keeps its own
-  ``format_report``/``format_json``/``_build_parser``/``main``: its fourth
-  exit code (3 = roots resolved but every one failed to audit, kept distinct
-  from 0 per ``docs/legibility/design-invariants.md``'s no-silent-fail-soft
-  rule), its ``--min-fidelity`` filter and its object-shaped JSON are
-  genuinely different behaviour, not duplication. Folding them in here would
-  silently delete those semantics.
+  ``format_report``/``format_json``/``_build_parser``/``main``: its
+  ``--min-fidelity`` filter, its object-shaped rather than array-shaped JSON
+  and its different no-roots message are genuinely different behaviour, not
+  duplication. Folding them in here would silently delete those semantics.
+  Its exit 3 is NOT among those differences any more — task 3474 gave
+  :func:`run_scan_cli` the same "nothing was scanned/audited, so this is not
+  a clean run" semantics, so ``docs/legibility/design-invariants.md``'s
+  no-silent-fail-soft rule is now honoured by BOTH tiers rather than only by
+  the script that opted out of the shared plumbing.
 
 IMPORT-RESOLUTION CONTRACT — read before moving this file.
 This module MUST stay a flat sibling at ``scripts/_task_db_scan.py``. The
@@ -134,10 +137,15 @@ def discover_db_paths(
 # Tier 2 — leak-scanner CLI plumbing (the two leak scanners only).
 #
 # audit_wiped_metadata_files.py deliberately does NOT adopt this tier: its
-# main() carries a fourth exit code (3 = roots resolved but every one failed
-# to audit, kept distinct from 0 per docs/legibility/design-invariants.md's
-# no-silent-fail-soft rule), a --min-fidelity filter, object-shaped rather
-# than array-shaped JSON, and a different no-roots message.
+# main() carries a --min-fidelity filter, object-shaped rather than
+# array-shaped JSON, and a different no-roots message.
+#
+# Its exit 3 (roots resolved but every one failed to audit, kept distinct
+# from 0 per docs/legibility/design-invariants.md's no-silent-fail-soft rule)
+# used to be listed here too. It is no longer a differentiator: run_scan_cli
+# returns 3 for the same condition as of task 3474, which is what makes this
+# shared plumbing consistent with the invariant rather than an exception to
+# it.
 # ---------------------------------------------------------------------------
 
 # The exit-2 signal, emitted verbatim by both leak scanners.
