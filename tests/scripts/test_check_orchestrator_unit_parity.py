@@ -100,8 +100,20 @@ def test_shared_parser_module_importable_and_exposes_the_parser():
     directory (scripts/) at sys.path[0], and under pytest
     tests/scripts/conftest.py explicitly inserts scripts/ onto sys.path
     (pyproject's ``--import-mode=importlib`` deliberately does NOT).
+
+    The ``# pyright: ignore[reportMissingImports]`` on the import is a
+    STATIC-ANALYSIS artifact, not a papering-over: pyright never executes
+    conftest.py, so it cannot see that sys.path insertion, and the root
+    pyproject's ``[tool.pyright] extraPaths`` deliberately omits ``scripts/``.
+    Do NOT "fix" this by adding scripts/ to extraPaths — scripts/ is knowingly
+    not yet pyright-clean, which is exactly why scripts/orchestrator.yaml
+    declines to declare a ``type_check_command``; widening extraPaths would
+    pull that whole tree into resolution for every consumer. The suppression
+    is the convention already in force at three sibling sites here
+    (test_migrate_metadata_modules_to_files.py, test_repair_wiped_metadata_files.py).
+    The runtime import is the assertion; these tests passing IS its proof.
     """
-    import systemd_unit_parity
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
 
     assert callable(systemd_unit_parity.parse_unit_directives)
     assert callable(systemd_unit_parity._join_continuations)
@@ -117,7 +129,7 @@ def test_shared_parser_parses_sections_keys_and_values():
     dropped rather than attributed, and the split taken on the FIRST ``=``
     only so ``Environment=A=1`` yields value ``A=1``.
     """
-    import systemd_unit_parity
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
 
     parsed = systemd_unit_parity.parse_unit_directives(_SAMPLE_UNIT)
 
@@ -156,7 +168,7 @@ def test_dashboard_checker_consumes_the_lifted_parser():
     apart, which is precisely the failure mode these parity checkers exist to
     catch. Asserting object identity is the only check that fires on that.
     """
-    import systemd_unit_parity
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
 
     dashboard = _load_dashboard_checker()
 
