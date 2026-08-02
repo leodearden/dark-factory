@@ -297,7 +297,13 @@ class TestDefaultFixturePaths:
         assert '/home/' not in source
         assert '.worktrees' not in source
 
-        package_root = Path(mod.__file__).resolve().parent.parent
+        # `ModuleType.__file__` is `str | None` (namespace/builtin modules have
+        # none). `_mod()` loads via `spec_from_file_location`, so it is always
+        # set here — assert rather than assume, since a None would otherwise
+        # turn this path-derivation check into a TypeError far from its cause.
+        module_file = mod.__file__
+        assert module_file is not None
+        package_root = Path(module_file).resolve().parent.parent
         for default in (
             mod.DEFAULT_ARM_CLAIMS_PATH,
             mod.DEFAULT_QUERY_SET_PATH,
@@ -1537,7 +1543,9 @@ def _available_estimators():
     mod = _mod()
     estimators = [(mod.CHAR_PROXY_ESTIMATOR_NAME, mod.character_proxy_tokens)]
     try:
-        import tiktoken  # noqa: PLC0415
+        # Optional dep, absent from this venv (see the docstring above); the
+        # except arm is the normal path, so pyright cannot resolve it.
+        import tiktoken  # type: ignore[reportMissingImports]  # noqa: PLC0415
 
         encoding = tiktoken.get_encoding('cl100k_base')
     except Exception:  # noqa: BLE001 — absent OR unable to fetch its BPE file

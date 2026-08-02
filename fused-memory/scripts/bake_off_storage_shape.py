@@ -1180,7 +1180,10 @@ def resolve_token_estimator() -> tuple[str, Any]:
     built at most once per resolution rather than per call.
     """
     try:
-        import tiktoken  # noqa: PLC0415
+        # tiktoken is an OPTIONAL dep, absent from this venv — the try/except
+        # below is the whole point, so pyright's unresolved-import complaint is
+        # expected rather than a defect.
+        import tiktoken  # type: ignore[reportMissingImports]  # noqa: PLC0415
 
         encoding = tiktoken.get_encoding('cl100k_base')
     except Exception:  # noqa: BLE001 — absent, broken, or offline: same answer
