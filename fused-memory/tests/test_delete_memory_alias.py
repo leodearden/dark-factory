@@ -111,3 +111,83 @@ class TestDeleteMemoryIdAlias:
         mock_service.delete_memory.assert_awaited_once()
         call_kwargs = mock_service.delete_memory.call_args[1]
         assert call_kwargs.get('memory_id') == 'm1'
+
+
+class TestDeleteMemoryCascadeTool:
+    """The `cascade` opt-in and the child refusal at the MCP wire (task 3197).
+
+    Pinning the safe default HERE and not only in the service signature
+    matters: the wire is where an agent that never heard of this contract
+    arrives.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        svc = AsyncMock()
+        svc.delete_memory = AsyncMock(
+            return_value={'status': 'deleted', 'store': 'mem0', 'id': 'm1'}
+        )
+        return svc
+
+    @pytest.fixture
+    def mcp_server(self, mock_service):
+        return create_mcp_server(mock_service)
+
+    @pytest.mark.asyncio
+    async def test_cascade_defaults_to_false_on_the_wire(self, mcp_server, mock_service):
+        await mcp_server._tool_manager.call_tool(
+            'delete_memory',
+            {'memory_id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+        )
+        assert mock_service.delete_memory.call_args.kwargs['cascade'] is False
+
+    @pytest.mark.asyncio
+    async def test_cascade_true_is_forwarded(self, mcp_server, mock_service):
+        await mcp_server._tool_manager.call_tool(
+            'delete_memory',
+            {
+                'memory_id': 'm1', 'store': 'mem0',
+                'project_id': 'dark_factory', 'cascade': True,
+            },
+        )
+        assert mock_service.delete_memory.call_args.kwargs['cascade'] is True
+
+    @pytest.mark.asyncio
+    async def test_refusal_reaches_the_wire_with_every_child_id(
+        self, mcp_server, mock_service
+    ):
+        """`@mcp_tool_errors` derives the shape generically, so the new
+        exception class needs no registry edit — and the child ids ride the
+        message, so an agent can act on the response alone without a second
+        lookup."""
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        mock_service.delete_memory = AsyncMock(
+            side_effect=ParentHasChildrenError(
+                parent_id='m1', child_ids=['c1', 'c2']
+            )
+        )
+
+        parsed = _parse_result(await mcp_server._tool_manager.call_tool(
+            'delete_memory',
+            {'memory_id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+        ))
+
+        assert parsed['error_type'] == 'ParentHasChildrenError'
+        assert 'c1' in parsed['error']
+        assert 'c2' in parsed['error']
+        assert 'cascade' in parsed['error']
+
+    @pytest.mark.asyncio
+    async def test_prologue_still_runs_before_the_service_call(
+        self, mcp_server, mock_service
+    ):
+        """The new parameter must not reorder the validation prologue that
+        tests/test_mcp_boundary_canonicalization.py sweeps."""
+        parsed = _parse_result(await mcp_server._tool_manager.call_tool(
+            'delete_memory',
+            {'memory_id': 'm1', 'store': 'not-a-store', 'project_id': 'dark_factory',
+             'cascade': True},
+        ))
+        assert parsed['error_type'] == 'ValidationError'
+        mock_service.delete_memory.assert_not_awaited()
