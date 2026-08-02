@@ -446,6 +446,96 @@ class TestRunSegmentedSharedDeadline:
         assert rc != 0
         assert timed_out is True
 
+    @pytest.mark.asyncio
+    async def test_a_red_segment_then_a_deadline_bound_timeout_is_a_test_failure(
+        self, tmp_path,
+    ):
+        """The MID-FLIGHT half of the budget-exhaustion rule, via the real flag.
+
+        `test_a_red_segment_before_the_deadline_still_wins_the_rc` covers the
+        boundary-exact case: the budget runs out cleanly BETWEEN two segments,
+        so the tail is `not_run` and only the SYNTHETIC flag is in play. That
+        is the rarer shape. The common one is mid-flight: a segment is handed
+        `remaining = deadline - now()` — never the full budget once anything
+        ran before it — straddles the deadline and comes back
+        `timed_out=True`. That sets `any_timed_out`, which used to be
+        UNCONDITIONAL, so the same `infra_timeout` relabelling the sibling test
+        forbids came back through the other door.
+
+        With a genuine red already recorded, the run must still classify as
+        `test_failure`: under the old `&&` chain the shell short-circuited at
+        the red and the later segment never ran at all, so nothing it reports
+        may upgrade the category. Reporting `infra_timeout` here would re-run
+        the whole fleet `max_retries` times at a full budget each
+        (`VerifyAttempt.pure_timeout_failure`) and route it to infra-hold
+        instead of the debugger.
+        """
+        clock = _Clock(cost_per_segment=2.0)
+        run_one = _RecordingRunOne(
+            clock,
+            results={
+                1: (7, _PYTEST_RED, False),          # genuine red, segment 2
+                3: (124, 'timed out', True),         # straddles the deadline
+            },
+        )
+        segments = _fleet_segments()
+        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify_categories import FailureCategory  # noqa: PLC0415
+        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
+        from orchestrator.verify_cmd import ToolKind  # noqa: PLC0415
+
+        rc, output, timed_out, seg_dicts = await _run_segmented(
+            segments,
+            run_one=run_one,
+            worktree=tmp_path,
+            budget_secs=10_000.0,
+            now=clock,
+        )
+
+        # The timeout is still recorded as a FACT on its own segment — only the
+        # aggregate flag is withheld. Nothing is hidden, only reclassified.
+        assert seg_dicts[3]['status'] == 'timed_out'
+        assert seg_dicts[3]['timed_out'] is True
+        assert rc == 7
+        assert timed_out is False
+        assert classify_failure(
+            ToolKind.PYTEST, rc, output, timed_out,
+        ) is FailureCategory.TEST_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_a_lone_hang_with_no_earlier_red_is_still_an_infra_timeout(
+        self, tmp_path,
+    ):
+        """The contrasting half: withholding the flag must not swallow a hang.
+
+        With nothing red before it, a segment that blows its wall clock is the
+        genuine article — the `&&` chain would have reached it and reported
+        exactly this — so the flag stays unconditional there and the category
+        stays `infra_timeout` (retryable). Read this and the test above as one
+        rule: a timeout counts iff the shell would have gotten that far.
+        """
+        clock = _Clock(cost_per_segment=2.0)
+        run_one = _RecordingRunOne(clock, results={2: (124, 'timed out', True)})
+        segments = _fleet_segments()
+        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify_categories import FailureCategory  # noqa: PLC0415
+        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
+        from orchestrator.verify_cmd import ToolKind  # noqa: PLC0415
+
+        rc, output, timed_out, _seg_dicts = await _run_segmented(
+            segments,
+            run_one=run_one,
+            worktree=tmp_path,
+            budget_secs=10_000.0,
+            now=clock,
+        )
+
+        assert rc == 124
+        assert timed_out is True
+        assert classify_failure(
+            ToolKind.PYTEST, rc, output, timed_out,
+        ) is FailureCategory.INFRA_TIMEOUT
+
 
 _PYTEST_RED = (
     'collected 412 items\n'

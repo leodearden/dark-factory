@@ -3718,10 +3718,13 @@ async def _run_segmented(
       number the shell's `&&` chain would have returned, so every downstream rc
       consumer keeps reading what it read before. Running the later segments
       buys information, never leniency.
-    * ``timed_out`` is true if any segment ACTUALLY timed out, or — only when
-      no segment produced a genuine red — if the shared budget left some
-      segment unrun. Synthesising it on top of a real failure would relabel
-      that failure `infra_timeout`; see the comment on the return statement.
+    * ``timed_out`` is true if a segment ACTUALLY timed out at a point the old
+      `&&` chain would have reached (nothing red before it), or — only when no
+      segment produced a genuine red — if the shared budget left some segment
+      unrun. Both halves are conditional on there being no earlier red, because
+      raising the flag on top of a real failure relabels that failure
+      `infra_timeout`; see the loop's ``chain_broken`` guard and the comment on
+      the return statement.
     * ``segments`` is one flat JSON-native dict per segment
       (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason),
       which rides to ``.task/verify/attempt-N.json`` on ``CheckRun.segments``.
@@ -3735,6 +3738,10 @@ async def _run_segmented(
     first_nonzero = 0
     any_timed_out = False
     any_not_run = False
+    # True once a segment has produced the result that would have STOPPED the
+    # old `&&` chain (non-zero rc, or a timeout). Everything after that point is
+    # information the shell never had; see the `any_timed_out` guard below.
+    chain_broken = False
     blocks: list[str] = []
     deadline = now() + budget_secs
 
@@ -3773,7 +3780,24 @@ async def _run_segmented(
             status = 'failed'
         else:
             status = 'passed'
-        any_timed_out = any_timed_out or seg_timed_out
+        if not chain_broken:
+            # A timeout only counts as a GENUINE timeout when the old `&&`
+            # chain would actually have reached this segment — i.e. nothing
+            # before it already went red. Past the first red, every segment is
+            # running on a deadline the earlier segments have already eaten
+            # into (`remaining = deadline - now()`, never the full budget), so
+            # the dominant way a late segment reports `timed_out=True` is
+            # SHARED-BUDGET exhaustion mid-flight, not a hang of its own. That
+            # is the same fact `not_run` encodes one segment later, and it must
+            # be treated the same way: as budget exhaustion, which never
+            # outranks a real red. Letting it through here would reintroduce
+            # exactly the `infra_timeout` relabelling the return-statement
+            # comment below exists to prevent — through the unconditional flag
+            # rather than the synthetic one. Pinned by
+            # `test_a_red_segment_then_a_deadline_bound_timeout_is_a_test_failure`.
+            any_timed_out = any_timed_out or seg_timed_out
+        if seg_timed_out or rc != 0:
+            chain_broken = True
         if rc != 0 and first_nonzero == 0:
             first_nonzero = rc
         results.append({
@@ -3814,10 +3838,13 @@ async def _run_segmented(
     #     timed_out=True — that is the case this synthetic flag exists for, and
     #     it classifies as `infra_timeout` (retryable) exactly as a single-chain
     #     timeout does today, leaving the retry/env-recovery machinery untouched.
-    #   * A segment that ACTUALLY hit its wall clock still forces
-    #     `timed_out=True` unconditionally through `any_timed_out`. That is a
-    #     real timeout and is deliberately unchanged; only the SYNTHETIC flag is
-    #     conditional.
+    #   * A segment that ACTUALLY hit its wall clock BEFORE anything went red
+    #     still forces `timed_out=True` through `any_timed_out` — including the
+    #     lone-hang case (segment 1 wedges on the full budget), which stays
+    #     `infra_timeout` exactly as the single `&&` chain reported it. Only a
+    #     timeout in a segment the shell would never have reached is folded
+    #     away, because past the first red that flag reports the shared budget,
+    #     not a hang; see the `chain_broken` guard in the loop above.
     #
     # Load-bearing, not an edge case: removing the `&&` short-circuit (the whole
     # point of task 3338) makes budget exhaustion strictly MORE likely, since
