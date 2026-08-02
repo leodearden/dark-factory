@@ -901,17 +901,37 @@ async def _map_advance_failure(
         waited = info.get('waited_seconds')
         age_txt = f'{age:.0f}s' if isinstance(age, int | float) else 'unknown'
         waited_txt = f'{waited:.0f}s' if isinstance(waited, int | float) else 'unknown'
+        # Staleness keys ONLY on the age observed BEFORE the stand-off.
+        #
+        # The previous test (`waited > 0 and age > waited`) was wrong and must
+        # not be reintroduced: on the gate path `age_seconds` is re-probed
+        # AFTER the wait (git_ops.advance_main), so it always equals
+        # initial_age + waited + epsilon.  `age > waited` therefore reduces to
+        # `initial_age > -epsilon` — true for a 2-second-old live commit
+        # exactly as for an hour-old leftover — and handed destructive `rm -f`
+        # advice to every ordinary docs-direct-commit-on-main that outlived
+        # the grace.  Only a pre-wait age carries staleness information.
+        #
+        # Both isinstance guards are load-bearing: a missing key yields None,
+        # which must degrade to not-stale (no destructive advice), never
+        # raise.  And the grace is read from the side channel, NEVER through
+        # git_ops.config — this mapper's tests pass a bare MagicMock whose
+        # auto-vivified attribute would make the comparison raise TypeError.
+        # The dict is the whole input, by the same discipline as the
+        # `getattr(git_ops, '_last_park_lock_info', None) or {}` read above.
+        initial_age = info.get('initial_age_seconds')
+        grace = info.get('grace_seconds')
         stale = (
-            isinstance(age, int | float)
-            and isinstance(waited, int | float)
-            and waited > 0
-            and age > waited
+            isinstance(initial_age, int | float)
+            and isinstance(grace, int | float)
+            and initial_age > grace
         )
         recovery = (
-            f' The lock is OLDER ({age_txt}) than the stand-off we waited '
-            f'({waited_txt}), so it may be a crashed-git leftover rather than '
-            f'a live commit: confirm no git process is running in '
-            f'project_root, then clear it with `rm -f {lock_path}`.'
+            f' The lock was ALREADY {initial_age:.0f}s old when the merge '
+            f'worker FIRST observed it — older than the entire {grace:.0f}s '
+            f'grace — so it is likely a crashed-git leftover rather than a '
+            f'live commit: confirm no git process is running in project_root, '
+            f'then clear it with `rm -f {lock_path}`.'
             if stale else ''
         )
         return MergeOutcome(
