@@ -201,3 +201,117 @@ class TestTopicSlugNamespaceIsShared:
         """
         source = SCRIPT_PATH.read_text()
         assert '[a-z0-9]+(?:-[a-z0-9]+)*' not in source
+
+
+# ===========================================================================
+# compute_patch — the idempotence heart
+# ===========================================================================
+
+class TestComputePatchTopic:
+    """The ``topic`` half of ``compute_patch``.
+
+    ``compute_patch(existing_metadata, *, target_topic, make_canonical)``
+    returns a :class:`PatchDecision` carrying the metadata patch to write
+    (possibly empty) and the dispositions that explain it.  Pure: it takes a
+    plain dict and no service, so a wrong answer here can never be masked by
+    a mock.
+    """
+
+    def test_absent_topic_is_stamped(self):
+        decision = _mod.compute_patch(
+            {'category': 'observations_and_summaries'},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert decision.patch == {'topic': 'docs-prd-landing'}
+        assert 'topic_stamped' in decision.dispositions
+
+    def test_matching_topic_writes_nothing(self):
+        """Idempotence: run two must not re-issue the same write."""
+        decision = _mod.compute_patch(
+            {'topic': 'docs-prd-landing'},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert 'topic' not in decision.patch
+        assert 'topic_already_present' in decision.dispositions
+
+    def test_snake_case_twin_is_normalized_in_place(self):
+        """The measured live case — and ε's stated precondition.
+
+        ``eval_worktree_plan_tools_missing`` and the target
+        ``eval-worktree-plan-tools-missing`` are the SAME topic wearing two
+        shapes.  Rewriting the record to the conforming shape is exactly the
+        normalization ε's enforcement note delegates to θ; leaving it is what
+        blocks ``memory_metadata.enforce``.
+        """
+        decision = _mod.compute_patch(
+            {'topic': 'eval_worktree_plan_tools_missing'},
+            target_topic='eval-worktree-plan-tools-missing',
+            make_canonical=False,
+        )
+        assert decision.patch == {'topic': 'eval-worktree-plan-tools-missing'}
+        assert 'topic_normalized' in decision.dispositions
+        assert 'conflicting_existing_topic' not in decision.dispositions
+
+    def test_different_existing_topic_is_never_clobbered(self):
+        """A human-set topic outranks the sweep's guess, always.
+
+        Overwriting here would silently re-file someone's record under
+        another topic — a retro sweep must not be able to destroy a fact it
+        did not create.  Refusing costs one report line; guessing costs a
+        fact.
+        """
+        decision = _mod.compute_patch(
+            {'topic': 'some-other-topic'},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert 'topic' not in decision.patch
+        assert 'conflicting_existing_topic' in decision.dispositions
+        assert 'topic_normalized' not in decision.dispositions
+        assert 'topic_stamped' not in decision.dispositions
+
+    def test_unfoldable_existing_topic_is_a_conflict_not_an_overwrite(self):
+        """An existing value ``derive_topic_slug`` cannot fold is still a fact.
+
+        ``None`` from the fold means "no honest comparison available" — which
+        is a reason to refuse, not a licence to overwrite.
+        """
+        decision = _mod.compute_patch(
+            {'topic': '!!!'},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert 'topic' not in decision.patch
+        assert 'conflicting_existing_topic' in decision.dispositions
+
+    def test_nothing_to_do_yields_an_empty_patch(self):
+        """The property ``run`` keys its no-op on.
+
+        An empty patch means the caller issues NO ``update_memory`` at all —
+        not an update that happens to change nothing.  That is what makes a
+        second run cost zero writes rather than zero net effect.
+        """
+        decision = _mod.compute_patch(
+            {'topic': 'docs-prd-landing', 'canonical': True},
+            target_topic='docs-prd-landing',
+            make_canonical=True,
+        )
+        assert not decision.patch
+
+    def test_is_pure_and_does_not_mutate_its_input(self):
+        existing = {'topic': 'docs-prd-landing', 'category': 'preferences_and_norms'}
+        before = dict(existing)
+        _mod.compute_patch(
+            existing, target_topic='docs-prd-landing', make_canonical=False
+        )
+        assert existing == before
+
+    def test_dispositions_is_a_tuple(self):
+        """Frozen, hashable, and safe to fold straight into a report."""
+        decision = _mod.compute_patch(
+            {}, target_topic='docs-prd-landing', make_canonical=False
+        )
+        assert isinstance(decision.dispositions, tuple)
+        assert isinstance(decision.patch, dict)
