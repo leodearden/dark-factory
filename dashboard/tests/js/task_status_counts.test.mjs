@@ -59,24 +59,27 @@ test('default-imported module exposes the status-counting functions', () => {
 // ---------------------------------------------------------------------------
 
 test('projectStatusCounts: splits the 2026-07-30 false-alarm population into three counts', () => {
-  // The shape that triggered the false alarm: the header read "38 active"
+  // The shape that triggered the false alarm: the header read "43 active"
   // against a max_concurrent_tasks cap of 24, so an operator saw a cap
   // breach that never happened — only the 24 in-progress tasks are bounded
-  // by the cap; blocked and merge-deferred tasks hold no agent slot.
+  // by the cap; blocked and merge-deferred tasks hold no agent slot. The
+  // 24/14/5 split reproduces that same 43 (the number quoted in
+  // task_status_counts.js's header, tab_tasks.jsx's counts-site comment and
+  // test_tab_tasks_status_counts.py's docstring — keep all four in step).
   const tasks = [
     ...tasksWithStatus('in-progress', 24),
-    ...tasksWithStatus('blocked', 9),
+    ...tasksWithStatus('blocked', 14),
     ...tasksWithStatus('merge-deferred', 5),
   ];
 
   const counts = projectStatusCounts(tasks);
 
   assert.equal(counts.running, 24);
-  assert.equal(counts.blocked, 9);
+  assert.equal(counts.blocked, 14);
   assert.equal(counts.mergeDeferred, 5);
-  // The whole point: `running` is NOT the merged 38.
-  assert.notEqual(counts.running, 38);
-  assert.equal(counts.total, 38);
+  // The whole point: `running` is NOT the merged 43.
+  assert.notEqual(counts.running, 43);
+  assert.equal(counts.total, 43);
 });
 
 test('projectStatusCounts: "deferred" is not "merge-deferred", and neither is running', () => {
@@ -195,18 +198,40 @@ test('activityPips: fixed running -> blocked -> merge-deferred order with stable
   }
 });
 
+test('activityPips: labels are the literal task status strings', () => {
+  // Not just "some non-empty string": the `running` pip is labelled
+  // 'in-progress' ON PURPOSE. The dashboard already uses three words for
+  // this one population — the status 'in-progress', the filter toggle
+  // 'active' (deliberately still merged), and 'running', which the
+  // Orchestrators tab uses for orchestrator PROCESS liveness. Labelling
+  // the pip with the task status string is the only spelling that cannot
+  // be read as either of the other two, and the point of this module is an
+  // unambiguous number to compare against max_concurrent_tasks.
+  const pips = activityPips({ running: 4, blocked: 3, mergeDeferred: 2 });
+
+  assert.deepEqual(
+    pips.map(p => p.label),
+    ['in-progress', 'blocked', 'merge-deferred'],
+  );
+  // Keys are the code-facing handle (tab_tasks.jsx's PIP_DOT_COLOR_T is
+  // keyed by them) and are NOT required to match the label.
+  assert.equal(pips[0].key, 'running');
+  assert.notEqual(pips[0].key, pips[0].label);
+});
+
 test('activityPips: each entry carries its own count, individually readable', () => {
-  const pips = activityPips({ running: 24, blocked: 9, mergeDeferred: 5 });
+  const pips = activityPips({ running: 24, blocked: 14, mergeDeferred: 5 });
   const byKey = Object.fromEntries(pips.map(p => [p.key, p.count]));
 
-  // The three numbers an operator could not tell apart before this task.
-  assert.deepEqual(byKey, { running: 24, blocked: 9, 'merge-deferred': 5 });
+  // The three numbers an operator could not tell apart when they were one
+  // merged "43 active" (the 2026-07-30 false alarm).
+  assert.deepEqual(byKey, { running: 24, blocked: 14, 'merge-deferred': 5 });
 });
 
 test('activityPips: suppresses a zero-valued component', () => {
   // Most projects have no merge-deferred tasks; a permanent "0
   // merge-deferred" pip would be noise in every header that has one.
-  const pips = activityPips({ running: 24, blocked: 9, mergeDeferred: 0 });
+  const pips = activityPips({ running: 24, blocked: 14, mergeDeferred: 0 });
 
   assert.equal(pips.length, 2);
   assert.deepEqual(pips.map(p => p.key), ['running', 'blocked']);
@@ -224,7 +249,7 @@ test('activityPips: suppression is per-component, not all-or-nothing', () => {
   );
 });
 
-test('activityPips: an all-zero project still renders exactly one "0 running" pip', () => {
+test('activityPips: an all-zero project still renders exactly one "0 in-progress" pip', () => {
   // Suppressing all three would leave the activity region of the header
   // empty — indistinguishable from a failed data load, which is the same
   // ambiguity class this task exists to remove, just inverted.
@@ -232,6 +257,7 @@ test('activityPips: an all-zero project still renders exactly one "0 running" pi
 
   assert.equal(pips.length, 1);
   assert.equal(pips[0].key, 'running');
+  assert.equal(pips[0].label, 'in-progress');
   assert.equal(pips[0].count, 0);
 });
 
@@ -239,8 +265,8 @@ test('activityPips: rendered counts sum to the three components when any is non-
   // No pip may silently absorb another's tasks: what the header displays
   // must add back up to what projectStatusCounts measured.
   const cases = [
-    { running: 24, blocked: 9, mergeDeferred: 5 },
-    { running: 24, blocked: 9, mergeDeferred: 0 },
+    { running: 24, blocked: 14, mergeDeferred: 5 },
+    { running: 24, blocked: 14, mergeDeferred: 0 },
     { running: 0, blocked: 0, mergeDeferred: 7 },
     { running: 1, blocked: 0, mergeDeferred: 0 },
   ];

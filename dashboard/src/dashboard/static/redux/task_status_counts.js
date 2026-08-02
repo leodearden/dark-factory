@@ -28,6 +28,20 @@
 // suite loads this file into a bare `vm.createContext({window:{}})`, and a
 // module that reached for browser globals would behave differently under test
 // than in the browser.
+//
+// NOT A CONTRADICTION OF prd_grouping.js. That module deliberately folds
+// 'merge-deferred' into its `inProgress` bucket (and 'deferred' into
+// `pending`) in aggregatePrdStatus/summarizePrdMembers, which feed the PRD
+// box's single status badge and its stacked-bar segments in the same tab.
+// The two rules answer different questions and both are correct as written:
+//   - Here, the question is "how does this number compare to the
+//     max_concurrent_tasks cap?", which only `running` can answer, so the
+//     components MUST stay separate.
+//   - There, the question is "is this PRD finished?", for which
+//     merge-deferred work is legitimately still-in-flight (it is not done
+//     until it lands), and a bar with five thin segments would be unreadable.
+// Change one and you do NOT have to change the other. If a future task does
+// reconcile them, reconcile the QUESTIONS first, not just the buckets.
 
 // ── Per-project status tallies for the header ──
 // Single pass over `tasks` bucketing by status: running (ONLY 'in-progress'),
@@ -73,12 +87,24 @@ function projectStatusCounts(tasks) {
 // merge-deferred tasks, and a permanent "0 merge-deferred" pip would be
 // noise in every one of their headers.
 //
+// LABELS ARE THE LITERAL TASK STATUS STRINGS, deliberately — including
+// 'in-progress' for the key `running`. Three competing words for this one
+// population already exist in the dashboard: the task status is
+// 'in-progress', the filter toggle directly above this header says 'active'
+// (and keeps its merged three-status meaning on purpose), and 'running' is
+// already spoken for by ORCHESTRATOR PROCESS liveness in the Orchestrators
+// tab (`status-dot running`). Since the entire point of this module is
+// making one number unambiguously comparable to max_concurrent_tasks, the
+// pip is labelled with the one word that can only mean the task status.
+// The object KEY stays `running` — it reads better in code and is what
+// tab_tasks.jsx's PIP_DOT_COLOR_T is keyed by.
+//
 // Pure — no `window`, and no colour/DOM concerns (the caller owns the dot
 // colours).
 function activityPips(counts) {
   const c = counts || {};
   const all = [
-    { key: 'running', label: 'running', count: c.running || 0 },
+    { key: 'running', label: 'in-progress', count: c.running || 0 },
     { key: 'blocked', label: 'blocked', count: c.blocked || 0 },
     { key: 'merge-deferred', label: 'merge-deferred', count: c.mergeDeferred || 0 },
   ];
@@ -87,7 +113,7 @@ function activityPips(counts) {
   // zero the suppression rule would empty the header's activity region
   // entirely, and an empty region is indistinguishable from a failed data
   // load — the same ambiguity this module exists to remove, just inverted.
-  // A quiet project shows an unambiguous "0 running" instead.
+  // A quiet project shows an unambiguous "0 in-progress" instead.
   return shown.length > 0 ? shown : [all[0]];
 }
 

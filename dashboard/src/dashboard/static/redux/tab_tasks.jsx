@@ -732,9 +732,20 @@ function TasksTab({ projectFilter, search }) {
             // reify "50 active" against 48; neither was a real breach.
             const statusCounts = projectStatusCounts(projTasks);
             const _fallbackDone = statusCounts.done;
+            // Display keys are picked EXPLICITLY rather than spread in from
+            // statusCounts. Its `done` is the BOUNDED tally of the done rows
+            // actually loaded (≤50 per project); spreading it onto the display
+            // object would park it beside the authoritative `complete` under a
+            // near-synonymous name, and the next `{counts.done} done` edit
+            // would silently render the lower bound as if it were the real
+            // count. Keep it reachable only via `_fallbackDone`, whose
+            // underscore says "not for display".
             const counts = {
-              // total / running / blocked / mergeDeferred / pending / done
-              ...statusCounts,
+              total: statusCounts.total,
+              running: statusCounts.running,
+              blocked: statusCounts.blocked,
+              mergeDeferred: statusCounts.mergeDeferred,
+              pending: statusCounts.pending,
               // DONE_COUNTS carries the authoritative full count from the server.
               // The fallback counts only the bounded done rows loaded into ACTIVE_TASKS
               // (≤50 per project). If we hit that cap without a server count, show
