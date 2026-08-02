@@ -173,6 +173,43 @@ info "Installing orchestrator units + watchdog"
 mkdir -p "$HOME/bin"
 install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.py"
 
+# Pre-install parity gate. Runs BEFORE the cp block below, and that ordering
+# is the whole point: once these units have been overwritten there is no drift
+# left to observe, so a post-install-only check would report green on exactly
+# the divergence this exists to surface. (No post-install re-check either —
+# unlike the dashboard's template-rendered unit, these are plain cp targets, so
+# a second run would only restate what the copy just did.)
+#
+# Warn-only, deliberately: drift must never abort an install, and five of the
+# seven registered units are KNOWN RED on this host until the follow-up task
+# lands. What this buys is a RECORD — the operator sees what was silently stale
+# before it got changed.
+#
+# NOTE the report does not mean "the installed copy is stale". Measured
+# 2026-08-02, the direction varies per unit: the repo copy is correct for
+# RestartSteps=4, but the INSTALLED copy is correct for the ExecStart --config
+# path (two committed units name config files that do not exist). Read the
+# [orchestrator_unit_parity] report before acting on it.
+if python3 "$REPO_ROOT/scripts/check_orchestrator_unit_parity.py" \
+     --installed-dir "$UNIT_DIR" \
+     --repo-root     "$REPO_ROOT"; then
+  ok "Orchestrator units: parity with committed copies"
+else
+  _orch_parity_exit=$?
+  if [ "$_orch_parity_exit" -eq 2 ]; then
+    info "Orchestrator units: not yet installed in $UNIT_DIR (installing below)"
+  else
+    # Exit 1 is "drift OR unverifiable" — it also covers a vanished committed
+    # unit and a drop-in override, which the checker words apart so the
+    # operator is not sent hunting for a directive diff that does not exist.
+    warn "Orchestrator units: drift or unverifiable state — see the"
+    warn "  [orchestrator_unit_parity] report above. The cp block below"
+    warn "  overwrites the installed copies for the units it copies; check the"
+    warn "  report's direction first, and note a drop-in override needs manual"
+    warn "  removal."
+  fi
+fi
+
 cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"   "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-reify.service"          "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-autopilot-video.service" "$UNIT_DIR/"
