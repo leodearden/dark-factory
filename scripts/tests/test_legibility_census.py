@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -954,6 +955,10 @@ def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     # A null baseline is UNKNOWN, not malformed -- the state file still loads.
     status, data = census_trigger.load_census_state(path)
     assert status == "ok"
+    # load_census_state returns tuple[str, dict | None] — the None is real for
+    # the "missing"/"malformed" statuses, so narrow it explicitly rather than
+    # subscripting an Optional.
+    assert data is not None
     assert data["last_census_done_count"] is None
 
     with caplog.at_level(logging.WARNING):
@@ -996,6 +1001,7 @@ def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path):
 
     status, data = census_trigger.load_census_state(path)
     assert status == "ok"
+    assert data is not None  # tuple[str, dict | None]; None only for missing/malformed
     assert data["last_census_at"] == "2026-07-14T12:00:00+00:00"
     assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
     assert data["last_census_done_count"] == 7
@@ -1080,7 +1086,7 @@ def test_render_report_force_marker_present_when_forced():
 
 
 def test_render_report_is_deterministic_no_clock():
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1147,7 +1153,10 @@ def _capped_mining_result(*, stop_reason, max_batches, batches=2):
 
 
 def _render(**overrides):
-    kwargs = dict(
+    # Annotated for the same reason as _run_census_kwargs: a heterogeneous
+    # dict whose inferred value union would otherwise be re-reported once per
+    # union member per render_report parameter.
+    kwargs: dict[str, Any] = dict(
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1352,8 +1361,15 @@ def test_render_report_flagless_output_is_byte_identical_golden():
 # step-17: RED — run_census() DEFER path (headroom banner)
 # ---------------------------------------------------------------------------
 
-def _run_census_kwargs(tmp_path, **overrides):
-    kwargs = dict(
+def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
+    # The return annotation is load-bearing for the type gate, not decoration.
+    # This dict is deliberately heterogeneous — injected callables, a
+    # LegibilityConfig, Paths, strs, bools, None — so without it pyright infers
+    # the value type as a wide union and then re-reports that union once per
+    # member per use: at each `mod.run_census(**kwargs)` call site (one error
+    # per parameter) and at each `kwargs[...]` attribute access. Measured: this
+    # single annotation cleared 337 of the 350 errors this file carried.
+    kwargs: dict[str, Any] = dict(
         batch_source=None,
         invoke=_make_fake_invoke(default="pong"),
         verify_fn=_poison("verify_fn"),
@@ -2325,6 +2341,7 @@ def test_run_census_dry_run_uses_the_given_path_when_free(tmp_path, caplog):
 
     # no gratuitous renaming: the free path is used verbatim (step-13 contract)
     assert payloads_path.exists()
+    assert outcome.dry_run is not None  # DryRunFiling | None on the outcome
     assert outcome.dry_run.path == str(payloads_path)
     assert list(tmp_path.glob("*-payloads-*.json")) == []
     assert not any("already exists" in r.message for r in caplog.records)
