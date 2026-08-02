@@ -302,6 +302,99 @@ def test_non_stale_verdict_is_a_hard_skip(requests_dir, verdict):
     assert req.skip_reason is not None and 'verdict' in req.skip_reason
 
 
+# ── the empty-string cls/action defaults (task 3456) ─────────────────────────
+#
+# `Request.cls` and `Request.action` are typed `str = ''`, not
+# `str | None = None`. Both dataclass comments assert one invariant to justify
+# that: load_request populates either field ONLY after validating it against
+# the fixed CLASS_ACTION mapping, so a request that can be acted on carries a
+# known class and a known action, and the empty default is reachable only on a
+# request that already carries a skip_reason.
+#
+# The retyping removed a `str | None` that had to be narrowed at every dict
+# lookup keyed on these two fields, but it also collapsed "never populated,
+# because the request was rejected at load" into a value that READS as a
+# legitimate empty string. Three properties are what make that safe, so all
+# three are pinned rather than left asserted in prose:
+#
+#   1. every load-failure path leaves both fields at '' -- here
+#   2. '' takes the defensive unknown-action branch in guard_row and in
+#      apply_request, and issues no write
+#   3. a load-skipped request never reaches a line that RENDERS cls, so no
+#      journal line degrades from `(None)` to `()`
+#
+# (2) and (3) need helpers from three later sections and so live at the end of
+# this module, under their own header.
+
+
+def _edited_request(requests_dir, *, drop=None, **body_edits):
+    """Write a valid gate_closure request for task 5, then corrupt its body.
+
+    ``drop`` removes one required key; keyword arguments overwrite body keys.
+    The filename is left at the valid ``redispatch-5-gate_closure.json``, which
+    is what lets the name-vs-body disagreement paths be reached at all.
+    """
+    path = write_request(requests_dir, 5, 'gate_closure')
+    body = json.load(open(path))
+    if drop is not None:
+        del body[drop]
+    body.update(body_edits)
+    open(path, 'w').write(json.dumps(body, indent=2, sort_keys=True) + '\n')
+    return path
+
+
+# One builder per early return in load_request, keyed by what it trips.
+# ENUMERATED, not sampled: each of those returns constructs a Request without
+# passing cls or action, so each is a separate site at which the empty default
+# is what the caller receives. A new validation check added without a builder
+# here is a skip path whose defaults nothing pins.
+_LOAD_FAILURES = {
+    'unreadable path': lambda d: os.path.join(
+        str(d), 'redispatch-5-gate_closure.json'),          # never written
+    'filename off-contract': lambda d: write_request(
+        d, 5, 'gate_closure', name='redispatch-five-gate_closure.json'),
+    'unparseable JSON': lambda d: write_request(
+        d, 5, 'gate_closure', raw='{not json'),
+    'non-object body': lambda d: write_request(d, 5, 'gate_closure', raw='[]'),
+    'missing required field': lambda d: _edited_request(d, drop='action'),
+    'unsupported schema_version': lambda d: write_request(
+        d, 5, 'gate_closure', schema_version=2),
+    'non-integer task_id': lambda d: _edited_request(d, task_id='five'),
+    'task_id disagrees with filename': lambda d: _edited_request(d, task_id=7),
+    'unknown class': lambda d: _edited_request(d, **{'class': 'some_future_class'}),
+    'class disagrees with filename': lambda d: _edited_request(
+        d, **{'class': 'merge_verify_red'}),
+    'non-STALE verdict': lambda d: write_request(
+        d, 5, 'gate_closure', verdict='LIVE'),
+    'action disagrees with the class mapping': lambda d: write_request(
+        d, 5, 'gate_closure', action='redispatch'),
+}
+
+
+@pytest.mark.parametrize('label', sorted(_LOAD_FAILURES))
+def test_every_load_failure_leaves_cls_and_action_at_the_empty_default(
+        requests_dir, label):
+    """No load-failure path ever half-populates the two mapping-keyed fields.
+
+    Not a style preference: everything downstream keys dict lookups on these
+    two, and the ONLY thing standing between a rejected request and a lookup
+    that resolves is that '' is a member of none of those tables. A skip path
+    that populated `action` before rejecting the body would hand a consumer a
+    live key on a request that was never validated.
+    """
+    req = crr.load_request(_LOAD_FAILURES[label](requests_dir))
+    assert req.skip_reason is not None, f'{label} was expected to be skipped'
+    assert (req.cls, req.action) == ('', ''), (
+        f'the {label!r} skip path left cls={req.cls!r} action={req.action!r} '
+        'rather than the empty defaults (task 3456). Both fields are typed '
+        '`str = \'\'` on the premise that only a validated request carries a '
+        'known class and action; a skip path that populates either one before '
+        'rejecting the body breaks that premise, and guard_row / apply_request '
+        'would then resolve a real table entry for a request load_request '
+        'refused'
+    )
+
+
 # ── step-3: the stdlib MCP client ────────────────────────────────────────────
 #
 # The consumer talks to the fused-memory MCP server over streamable HTTP with
@@ -1378,3 +1471,100 @@ def test_main_default_max_writes_is_the_blast_radius_cap(requests_dir):
     """Default 5: bounds a first-night surprise to a handful of transitions an
     operator can read in the journal and undo."""
     assert crr.DEFAULT_MAX_WRITES == 5
+
+
+# ── the empty-string cls/action defaults, parts 2 and 3 (task 3456) ──────────
+#
+# Properties (2) and (3) of the invariant whose part (1) is pinned by
+# test_every_load_failure_leaves_cls_and_action_at_the_empty_default. They live
+# at the END of the module, not beside it, because between them they need
+# _row and RecordingClient (step-5), REIFY, and _run (step-9) -- moving those
+# helpers up to keep the three tests adjacent would reorder four sections to
+# suit one claim. The header, and the cross-reference by test NAME rather than
+# by line, is what keeps them findable together.
+
+
+def test_the_empty_class_and_action_take_the_defensive_unknown_branches(
+        requests_dir):
+    """'' is a member of no mapping, so both consumers fail CLOSED on it.
+
+    This is the property that makes typing the two fields `str = ''` safe. The
+    tables are asserted non-members first, because that -- not any branch in
+    guard_row or apply_request -- is the actual mechanism: both look the value
+    up with `.get()` and take their defensive branch on a miss, exactly as they
+    did when the miss was a None key.
+    """
+    for name in ('CLASS_ACTION', 'ACTION_TARGET_STATUS', 'ACTION_APPLIERS',
+                 'LEGAL_STATUSES'):
+        table = getattr(crr, name)
+        assert '' not in table, (
+            f"'' became a key of {name} (task 3456). Request.cls and "
+            "Request.action default to '' on every load-skipped request, so a "
+            'table entry for it turns the fail-closed default into a live '
+            'action on a request load_request refused'
+        )
+
+    req = crr.load_request(
+        write_request(requests_dir, 5321, 'gate_closure', schema_version=2))
+    assert req.skip_reason is not None and (req.cls, req.action) == ('', '')
+
+    # guard_row: the ACTION_TARGET_STATUS miss fires first and returns a skip
+    # reason. Its own comment records why that branch must never read as
+    # "no target, so nothing to compare, so proceed".
+    reason = crr.guard_row(req, _row('blocked'))
+    assert reason is not None and 'no target status known' in reason, reason
+
+    # apply_request: no applier, so no write is even attempted.
+    client = RecordingClient({5321: _row('blocked')})
+    assert crr.apply_request(client, req, REIFY) is False
+    assert client.calls == [], (
+        f'a load-skipped request reached the wire: {client.calls!r}')
+
+    # The LEGAL_STATUSES/cls branch is SHADOWED on any real load-skipped
+    # request -- the action miss above returns before guard_row gets there --
+    # so it is exercised on a hand-built half-populated Request, a state
+    # load_request cannot produce. Defence in depth, and labelled as such
+    # rather than dressed up as a reachable path.
+    half = crr.Request(path='synthetic', mtime=SWEEP_MTIME, task_id=5321,
+                       action='close')
+    assert half.cls == ''
+    reason = crr.guard_row(half, _row('blocked'))
+    assert reason is not None and 'no legal-status scope known' in reason, reason
+
+
+def test_a_load_skipped_request_never_reaches_a_class_rendering_log_line(
+        requests_dir, capsys):
+    """No journal line degrades from `task 5321 (None)` to `task 5321 ()`.
+
+    The legibility cost of the empty default would be real if a load-skipped
+    request could reach one of consume's `task <id> (<cls>)` lines. It cannot:
+    the `skip_reason is not None` continue is the FIRST thing in the loop body,
+    and it logs the basename and the reason instead -- which names the file and
+    says what was wrong with it, strictly more than a class ever could.
+
+    Asserted with a positive control in the same run, so it cannot pass by
+    consume having logged nothing at all.
+    """
+    write_request(requests_dir, 5321, 'gate_closure', schema_version=2)
+    _req(requests_dir, 5322, 'gate_closure')            # valid, for the control
+
+    client = RecordingClient({5322: _row('blocked', task_id=5322)})
+    summary = _run(requests_dir, client)
+    assert (summary.skipped, summary.applied) == (1, 1)
+
+    err = capsys.readouterr().err
+    assert 'task 5322 (gate_closure): close applied' in err, (
+        f'positive control missing -- consume logged no (cls) line at all:\n{err}')
+    assert 'redispatch-5321-gate_closure.json: SKIP (invalid)' in err, (
+        f'the invalid request was not reported by name:\n{err}')
+    # On the empty-class rendering ITSELF, not on `task 5321 ()`: a
+    # load-skipped request may also have no task_id (the id is populated one
+    # check later than the class), so the degraded line reads `task None ():`
+    # on some skip paths and `task 5321 ():` on others. Both are the same
+    # defect, and pinning only the second lets half of them through.
+    assert '():' not in err, (
+        f'a log line rendered the empty class default (task 3456). Either keep '
+        f'the skip_reason continue above every `(cls)` line, or stop rendering '
+        f'cls on a request that has none — `task <id> ():` names the file for '
+        f'nobody, where the SKIP (invalid) line names it and says what was '
+        f'wrong with it:\n{err}')
