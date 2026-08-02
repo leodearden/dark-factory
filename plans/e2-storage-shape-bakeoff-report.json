@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "protocol": {
+    "blind_authoring": "single-author-blind-to-metrics, mechanized by commit ordering: the arm decomposition and query set were committed before any metric function existed in the tree",
+    "fixtures": [
+      {
+        "path": "fused-memory/tests/fixtures/write_triage_calibration.jsonl",
+        "commit": "55e242a2c8681fb8a60fdb34e3d5194109781e87"
+      },
+      {
+        "path": "fused-memory/tests/fixtures/memory_eval_topic_registry.json",
+        "commit": "02886ef290cde99ce88426cd1d3b5565a551e293"
+      },
+      {
+        "path": "fused-memory/tests/fixtures/e2_arm_claims.jsonl",
+        "commit": "ae42c3b94ea4058f7e0b0fa577a1fa8f1491b93e"
+      },
+      {
+        "path": "fused-memory/tests/fixtures/e2_query_set.jsonl",
+        "commit": "010282056f13ffa0df42ddee5db8421d6a0acf1c"
+      },
+      {
+        "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl",
+        "commit": "c33409dd4c5632025cf546713d5d750f0bd3a1a7"
+      }
+    ],
+    "token_estimator": "char-proxy:4-chars-per-token",
+    "guard_threshold": 0.92,
+    "distractor_slab_size": 300,
+    "embedder_model": "text-embedding-3-small",
+    "search_limit": 10,
+    "guard_fetch_limit": 6,
+    "guard_replay_window": 5,
+    "seed_concurrency": 8,
+    "clusters_measured": 20,
+    "queries_measured": 236,
+    "guard_probes_measured": 15,
+    "collections": [
+      "_test_e2_bakeoff_e2_bakeoff_b_grouped_main",
+      "_test_e2_bakeoff_e2_bakeoff_c_peers_main",
+      "_test_e2_bakeoff_e2_bakeoff_status_quo_main"
+    ]
+  },
+  "arms": {
+    "status_quo": {
+      "claim_recall": {
+        "at_5": 0.7838983050847458,
+        "at_10": 0.902542372881356
+      },
+      "discoverability": {
+        "canonical_in_top_5_rate": 0.538135593220339,
+        "median_canonical_rank": 2.0,
+        "canonical_found_count": 127
+      },
+      "tokens_per_query": {
+        "mean": 3832.6949152542375,
+        "estimator": "char-proxy:4-chars-per-token",
+        "window": 10
+      },
+      "guard_adequacy": {
+        "candidate_present_rate": 1.0,
+        "guard_matched_rate": 0.0,
+        "threshold_replay": true,
+        "threshold": 0.92,
+        "probes": 15
+      }
+    },
+    "status_quo+pin": {
+      "claim_recall": {
+        "at_5": 0.7838983050847458,
+        "at_10": 0.902542372881356
+      },
+      "discoverability": {
+        "canonical_in_top_5_rate": 0.538135593220339,
+        "median_canonical_rank": 2.0,
+        "canonical_found_count": 127
+      },
+      "tokens_per_query": {
+        "mean": 3832.6949152542375,
+        "estimator": "char-proxy:4-chars-per-token",
+        "window": 10
+      },
+      "guard_adequacy": {
+        "candidate_present_rate": 1.0,
+        "guard_matched_rate": 0.0,
+        "threshold_replay": true,
+        "threshold": 0.92,
+        "probes": 15
+      }
+    },
+    "c_peers": {
+      "claim_recall": {
+        "at_5": 0.9364406779661016,
+        "at_10": 0.9745762711864406
+      },
+      "discoverability": {
+        "canonical_in_top_5_rate": 0.5042372881355932,
+        "median_canonical_rank": 2.0,
+        "canonical_found_count": 119
+      },
+      "tokens_per_query": {
+        "mean": 1179.7881355932204,
+        "estimator": "char-proxy:4-chars-per-token",
+        "window": 10
+      },
+      "guard_adequacy": {
+        "candidate_present_rate": 0.9333333333333333,
+        "guard_matched_rate": 0.0,
+        "threshold_replay": true,
+        "threshold": 0.92,
+        "probes": 15
+      }
+    },
+    "c_peers+pin": {
+      "claim_recall": {
+        "at_5": 0.9872881355932204,
+        "at_10": 0.9957627118644068
+      },
+      "discoverability": {
+        "canonical_in_top_5_rate": 0.9915254237288136,
+        "median_canonical_rank": 5.0,
+        "canonical_found_count": 234
+      },
+      "tokens_per_query": {
+        "mean": 1289.9025423728813,
+        "estimator": "char-proxy:4-chars-per-token",
+        "window": 10
+      },
+      "guard_adequacy": {
+        "candidate_present_rate": 0.9333333333333333,
+        "guard_matched_rate": 0.0,
+        "threshold_replay": true,
+        "threshold": 0.92,
+        "probes": 15
+      }
+    },
+    "b_grouped": {
+      "claim_recall": {
+        "at_5": 0.9788135593220338,
+        "at_10": 0.9915254237288136
+      },
+      "discoverability": {
+        "canonical_in_top_5_rate": 0.9745762711864406,
+        "median_canonical_rank": 1.0,
+        "canonical_found_count": 230
+      },
+      "tokens_per_query": {
+        "mean": 1195.6525423728813,
+        "estimator": "char-proxy:4-chars-per-token",
+        "window": 10
+      },
+      "guard_adequacy": {
+        "candidate_present_rate": 0.9333333333333333,
+        "guard_matched_rate": 0.0,
+        "threshold_replay": true,
+        "threshold": 0.92,
+        "probes": 15
+      }
+    },
+    "b_grouped+pin": {
+      "claim_recall": {
+        "at_5": 0.9872881355932204,
+        "at_10": 0.9957627118644068
+      },
+      "discoverability": {
+        "canonical_in_top_5_rate": 0.9915254237288136,
+        "median_canonical_rank": 1.0,
+        "canonical_found_count": 234
+      },
+      "tokens_per_query": {
+        "mean": 1203.9322033898304,
+        "estimator": "char-proxy:4-chars-per-token",
+        "window": 10
+      },
+      "guard_adequacy": {
+        "candidate_present_rate": 0.9333333333333333,
+        "guard_matched_rate": 0.0,
+        "threshold_replay": true,
+        "threshold": 0.92,
+        "probes": 15
+      }
+    }
+  },
+  "audit_recall": {
+    "detector": "audit_duplicate_memories.find_near_duplicate_memory_groups",
+    "threshold": 0.85,
+    "groups_found": 0,
+    "true_dup": {
+      "pairs": 301,
+      "recovered": 0,
+      "recall": 0.0,
+      "lexical_band": {
+        "pairs": 0,
+        "recovered": 0,
+        "recall": null
+      },
+      "paraphrase_band": {
+        "pairs": 301,
+        "recovered": 0,
+        "recall": 0.0
+      }
+    },
+    "hard_negative": {
+      "pairs": 18,
+      "falsely_grouped": 0,
+      "rate": 0.0
+    },
+    "unrelated": {
+      "pairs": 5037,
+      "falsely_grouped": 0,
+      "rate": 0.0
+    },
+    "paraphrase_exemplars": [
+      {
+        "a": "64564dd5-2c0d-4d0f-89e1-88d881da3d41",
+        "b": "bf91bc5c-727c-48d8-a3cc-66e6938201ac",
+        "max_ratio": 0.5463589659952703
+      },
+      {
+        "a": "76f848f3-39b6-4a1d-92d7-bca5e3de5dfe",
+        "b": "de782198-1743-4efc-9915-8eee9cdc7e1c",
+        "max_ratio": 0.4334763948497854
+      },
+      {
+        "a": "0b746438-6ce8-435c-885c-b3ac82666764",
+        "b": "0f7b5fc7-fc11-4f5a-91f3-ab174e2216ed",
+        "max_ratio": 0.40950118764845606
+      },
+      {
+        "a": "0e954870-bba1-44a7-81e9-5be94d5f6255",
+        "b": "166f5106-00da-4364-9c6f-d0a0d514db7a",
+        "max_ratio": 0.37936940937638775
+      },
+      {
+        "a": "1c2a0424-9e79-47f4-97f9-331160f5849a",
+        "b": "2180e5df-7a95-475a-b123-165e55dd4770",
+        "max_ratio": 0.36446370530877575
+      }
+    ]
+  }
+}
