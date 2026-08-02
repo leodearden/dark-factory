@@ -10,6 +10,7 @@ import subprocess
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
@@ -13699,6 +13700,20 @@ class TestDisableSharedRepoAutoMaintenance:
 # ---------------------------------------------------------------------------
 
 
+class _MergedNotAdvanced(NamedTuple):
+    """The two already-narrowed fields the stand-off tests need off a merge.
+
+    ``MergeResult.merge_commit``/``merge_worktree`` are declared ``| None``,
+    and pyright does NOT carry a helper's internal ``assert ... is not None``
+    across the return boundary — every caller would see ``str | None`` again.
+    Handing back this pair narrows once, in the helper, instead of making all
+    six call sites re-assert.
+    """
+
+    merge_commit: str
+    merge_worktree: Path
+
+
 @pytest.mark.asyncio
 class TestAdvanceMainIndexLockStandoff:
     """A concurrent `git commit --only <path>` in project_root holds
@@ -13720,9 +13735,11 @@ class TestAdvanceMainIndexLockStandoff:
     """
 
     @staticmethod
-    async def _make_merge(git_ops: GitOps, branch: str, filename: str):
-        """Create a mergeable commit on *branch* and merge it, returning the
-        MergeResult (not yet advanced)."""
+    async def _make_merge(
+        git_ops: GitOps, branch: str, filename: str,
+    ) -> _MergedNotAdvanced:
+        """Create a mergeable commit on *branch* and merge it, returning its
+        (merge_commit, merge_worktree) pair — merged, but not yet advanced."""
         worktree_info = await git_ops.create_worktree(branch)
         (worktree_info.path / filename).write_text('x = 1\n')
         await git_ops.commit(worktree_info.path, f'Add {filename}')
@@ -13730,7 +13747,9 @@ class TestAdvanceMainIndexLockStandoff:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
-        return merge_result
+        return _MergedNotAdvanced(
+            merge_result.merge_commit, merge_result.merge_worktree,
+        )
 
     async def test_held_index_lock_returns_park_lock_contended_not_stash_failed(
         self, git_ops: GitOps,
