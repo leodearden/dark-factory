@@ -345,6 +345,36 @@ def is_scorable_plan(plan: object) -> TypeGuard[dict]:
     return isinstance(plan, dict) and bool(plan.get('steps'))
 
 
+def clamp_unit_score(score: float) -> float:
+    """THE output-range contract shared by both plan-quality instruments.
+
+    :func:`score_plan_structure` and :func:`judge_plan_quality` are a
+    two-instrument pair reduced onto ONE axis (``EvalMetrics.plan_quality``) —
+    exactly the shape :func:`is_scorable_plan` (above) already solved for
+    scorability. That function's docstring records the rule: "making both call
+    sites literally this function makes that drift structurally impossible."
+    The range invariant gets the same treatment — the ONE named contract both
+    instruments call, rather than a copied expression the two can silently
+    drift apart on the next time either is edited.
+
+    Covers a real schema gap: ``PLAN_QUALITY_SCHEMA`` declares
+    ``{'minimum': 0.0, 'maximum': 1.0}``, but that only constrains the
+    ``structured_output`` delivery path — the documented
+    ``result.structured_output or json.loads(result.output)`` fallback in
+    :func:`judge_plan_quality` bypasses schema enforcement entirely, so an
+    out-of-range judge answer reaches this runtime clamp regardless of which
+    path delivered it.
+
+    Clamps to ``[0, 1]`` and rounds to 4 decimal places — the precision
+    :func:`score_plan_structure` has always used. Does NOT handle NaN: ``min``/
+    ``max`` are ordering operations and NaN is unordered, so a NaN input passes
+    straight through unclamped (``round(min(max(nan, 0.0), 1.0), 4)`` is
+    ``nan``). A caller with untrusted input (:func:`judge_plan_quality`) must
+    check for that itself before calling this.
+    """
+    return round(min(max(score, 0.0), 1.0), 4)
+
+
 def score_plan_structure(
     plan: dict | None, rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
 ) -> float:
@@ -354,8 +384,9 @@ def score_plan_structure(
     plan that is not :func:`is_scorable_plan` (empty / ``None`` / no steps /
     the header-only ``create_plan`` stub) is not a plan and scores ``0.0``
     outright. Otherwise returns the weight-weighted fraction
-    of satisfied structural criteria,
-    ``round(satisfied_weight / total_weight, 4)``, clamped to ``[0, 1]``.
+    of satisfied structural criteria, ``satisfied_weight / total_weight``, put
+    through :func:`clamp_unit_score` — the ``[0, 1]``/4dp contract this
+    function and :func:`judge_plan_quality` share.
 
     This is the ALWAYS-non-sentinel floor :func:`run_architect_eval` degrades to
     when the LLM plan judge fails, so an architect-eval run never emits a null
@@ -393,7 +424,7 @@ def score_plan_structure(
     if total_weight <= 0.0:
         raise ValueError('plan-quality rubric total weight must be > 0')
     score = satisfied_weight / total_weight
-    return round(min(max(score, 0.0), 1.0), 4)
+    return clamp_unit_score(score)
 
 
 @dataclass
@@ -477,6 +508,15 @@ async def judge_plan_quality(
     the content-failure / infra-failure distinction tasks 3118 and 3302 turn on:
     a stepless plan from a healthy architect is a real reliability signal worth
     ``0.0``, never a cap-tainted exclusion.
+
+    A successfully parsed ``plan_quality`` is put through
+    :func:`clamp_unit_score` — the same ``[0, 1]``/4dp contract
+    :func:`score_plan_structure` uses — rather than returned as a raw float.
+    This matters because ``PLAN_QUALITY_SCHEMA``'s declared bounds only
+    constrain the ``structured_output`` delivery path: the
+    ``json.loads(result.output)`` fallback above bypasses schema enforcement
+    entirely, so an out-of-range judge answer must still be caught at runtime
+    regardless of which path delivered it.
 
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
     sentinel :func:`run_architect_eval` degrades on), never a crash. When the
@@ -605,7 +645,9 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
     try:
         verdict = result.structured_output or json.loads(result.output)
         raw_quality = verdict['plan_quality']
-        plan_quality = float(raw_quality) if raw_quality is not None else None
+        plan_quality = (
+            clamp_unit_score(float(raw_quality)) if raw_quality is not None else None
+        )
     except (json.JSONDecodeError, TypeError, KeyError, ValueError):
         logger.warning(
             f'Plan judge produced unparseable output: {str(result.output)[:200]}'
