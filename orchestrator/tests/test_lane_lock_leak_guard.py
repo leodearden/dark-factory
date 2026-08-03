@@ -93,11 +93,22 @@ __all__ = [
 _FOREIGN_HOLDER_HOLD_SECS = 120
 
 #: Bound on how long :func:`foreign_lane_lock_holder` waits for the child to
-#: actually own the lock before failing the test.
-_FOREIGN_HOLDER_STARTUP_SECS = 5.0
+#: actually own the lock before failing the test.  The gate waits for a
+#: spawned ``flock(1)`` to acquire the lock, and task 3451 measured
+#: worst-case happy-path subprocess spawn latency at 4.71s (n=3:
+#: 2.13/3.10/4.71) at load-per-core 6.6 on this host — leaving the old 5.0s
+#: bound only ~6% headroom over a measured worst case.  This is the same
+#: load-sensitive full-suite-flake class as 1335/1836/2819/3451/3491, and
+#: 30s is the ceiling task 3491 settled on for it.  Widening this can never
+#: make a broken staging pass — it only lengthens how long a genuinely
+#: broken one takes to fail.
+_FOREIGN_HOLDER_STARTUP_SECS = 30.0
 
 #: Bound on how long :func:`foreign_lane_lock_holder` waits, on exit, for the
-#: kernel to stop attributing the lock to the child.
+#: kernel to stop attributing the lock to the child.  Left UNCHANGED at 5.0:
+#: this polls for the DISAPPEARANCE of an attribution after a SIGKILL to an
+#: already-running process group, which is not gated on spawn latency and has
+#: not been observed to flake.
 _FOREIGN_HOLDER_TEARDOWN_SECS = 5.0
 
 #: Bound on how long :func:`wait_for_lane_lock_holder` polls for the kernel to
