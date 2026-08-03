@@ -563,23 +563,87 @@ class TestQdrantHelpers:
 class TestFalkorHelpers:
     """Unit tests for FALKOR_HOST/FALKOR_PORT, _falkor_available(), falkor_skipif()."""
 
-    def test_falkor_host_constant(self):
-        """FALKOR_HOST matches the local-FalkorDB default all six forks used."""
-        from _fm_helpers import FALKOR_HOST
+    def test_falkor_host_from_env_default(self, monkeypatch):
+        """_falkor_host_from_env() falls back to the local-FalkorDB default.
 
-        assert FALKOR_HOST == 'localhost'
-
-    def test_falkor_port_constant_is_int(self):
-        """FALKOR_PORT is the default 6379 *as an int*, not the raw env string.
-
-        Every fork wrote ``int(os.environ.get('FALKOR_PORT', '6379'))``; the
-        int() coercion is the load-bearing part, since a str port silently
-        breaks ``FalkorDB(port=...)``.
+        The ``delenv`` is what makes this assertion deterministic: FALKOR_HOST
+        is explicitly env-derived, so asserting a default without first
+        clearing the variable couples the default `-m 'not integration'` lane
+        to the operator's environment.
         """
-        from _fm_helpers import FALKOR_PORT
+        from _fm_helpers import _falkor_host_from_env
 
-        assert FALKOR_PORT == 6379
+        monkeypatch.delenv('FALKOR_HOST', raising=False)
+
+        assert _falkor_host_from_env() == 'localhost'
+
+    def test_falkor_host_from_env_override(self, monkeypatch):
+        """FALKOR_HOST is honoured — the whole reason the env read exists.
+
+        A non-localhost host is the normal configuration when FalkorDB is not
+        on the loopback interface (docker network, CI matrix, a second
+        instance), so the override is contract, not an edge case.
+        """
+        from _fm_helpers import _falkor_host_from_env
+
+        monkeypatch.setenv('FALKOR_HOST', 'falkordb.internal')
+
+        assert _falkor_host_from_env() == 'falkordb.internal'
+
+    def test_falkor_port_from_env_default(self, monkeypatch):
+        """_falkor_port_from_env() falls back to 6379 *as an int*."""
+        from _fm_helpers import _falkor_port_from_env
+
+        monkeypatch.delenv('FALKOR_PORT', raising=False)
+
+        assert _falkor_port_from_env() == 6379
+        assert isinstance(_falkor_port_from_env(), int)
+
+    def test_falkor_port_from_env_coerces_to_int(self, monkeypatch):
+        """An overridden FALKOR_PORT is coerced from str to int.
+
+        This is the only assertion in the suite that can fail if the ``int()``
+        is dropped: without it the call returns the string ``'7000'``, and
+        ``'7000' == 7000`` is False. The coercion is load-bearing because a str
+        port silently breaks ``FalkorDB(port=...)``.
+        """
+        from _fm_helpers import _falkor_port_from_env
+
+        monkeypatch.setenv('FALKOR_PORT', '7000')
+
+        assert _falkor_port_from_env() == 7000
+        assert isinstance(_falkor_port_from_env(), int)
+
+    def test_falkor_constants_are_derived_from_env(self):
+        """The module constants are derived through the helpers, not hardcoded.
+
+        Deliberately takes no monkeypatch: the constants were computed from the
+        ambient environment at import time, so calling ``setenv`` here would
+        prove nothing. The two halves differ in strength, honestly:
+
+        * the ``isinstance`` pair is env-INDEPENDENT — it holds under any
+          environment and catches the real hazard, a str port silently
+          breaking ``FalkorDB(port=...)``;
+        * the two equality assertions pin that the constants flow THROUGH
+          these helpers rather than being hardcoded. That is strong under a
+          configured environment and a smoke check under the default one.
+
+        Note what is deliberately absent: no ``FALKOR_HOST == 'localhost'`` or
+        ``FALKOR_PORT == 6379`` against the live constants. That was the
+        defect — it turned this unit test red whenever an operator configured
+        a non-default FalkorDB.
+        """
+        from _fm_helpers import (
+            FALKOR_HOST,
+            FALKOR_PORT,
+            _falkor_host_from_env,
+            _falkor_port_from_env,
+        )
+
+        assert isinstance(FALKOR_HOST, str)
         assert isinstance(FALKOR_PORT, int)
+        assert FALKOR_HOST == _falkor_host_from_env()
+        assert FALKOR_PORT == _falkor_port_from_env()
 
     def test_falkor_available_true_when_client_ok(self, monkeypatch):
         """_falkor_available() returns True when construct, query, and close all succeed."""
