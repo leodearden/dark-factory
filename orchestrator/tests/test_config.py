@@ -3040,7 +3040,7 @@ class TestSessionResumeConfig:
     SessionResumeConfig mirrors DeliveredChecksConfig's shape (an `enabled`
     kill-switch plus ge-bounded int knobs), is exposed on OrchestratorConfig
     under the literal field name `session_resume` (delivered-check contract),
-    and all four leaves are green-tier hot-reloadable via the
+    and all five leaves are green-tier hot-reloadable via the
     `_submodel_leaf_paths('session_resume', SessionResumeConfig)` whole-submodel
     group in RELOADABLE_FIELDS.
     """
@@ -3054,6 +3054,19 @@ class TestSessionResumeConfig:
         assert cfg.freshness_window_secs == 86400
         assert cfg.max_resumes_per_task == 3
         assert cfg.fallback_storm_threshold == 5
+        # task 3256: the storm streak is a rolling window, not a cumulative
+        # per-boot counter. 3600s is read off the measured signature — bursts
+        # are ~17 fallbacks inside one hour, quiet gaps are ~7h and ~39h.
+        assert cfg.storm_window_secs == 3600
+
+    def test_storm_window_secs_ge_1_rejects_zero(self):
+        """storm_window_secs < 1 must raise ValidationError (ge=1 bound)."""
+        from orchestrator.config import SessionResumeConfig
+
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(storm_window_secs=0)
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(storm_window_secs=-1)
 
     def test_freshness_window_secs_ge_1_rejects_zero(self):
         """freshness_window_secs < 1 must raise ValidationError (ge=1 bound)."""
@@ -3094,14 +3107,20 @@ class TestSessionResumeConfig:
         assert config.session_resume.enabled is True
 
     def test_leaves_in_reloadable_fields(self):
-        """All four session_resume leaves are green-tier hot-reloadable
+        """All five session_resume leaves are green-tier hot-reloadable
         (membership assertions, robust to future growth of RELOADABLE_FIELDS).
+
+        `storm_window_secs` (task 3256) needed no RELOADABLE_FIELDS edit —
+        `_submodel_leaf_paths` enumerates `model_fields` dynamically, which is
+        exactly the property its docstring advertises. This assertion is what
+        pins that the property actually held.
         """
         for leaf in (
             'session_resume.enabled',
             'session_resume.freshness_window_secs',
             'session_resume.max_resumes_per_task',
             'session_resume.fallback_storm_threshold',
+            'session_resume.storm_window_secs',
         ):
             assert leaf in RELOADABLE_FIELDS, (
                 f'{leaf} must be a member of RELOADABLE_FIELDS '

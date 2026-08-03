@@ -2175,6 +2175,74 @@ class TestSessionResumeStorm:
             )
         assert harness._escalation_queue.submit.call_count == 0
 
+    async def test_streak_decays_after_storm_window(self, harness: Harness):
+        """A gap of >= storm_window_secs between two genuine fallbacks decays
+        the streak to 0, so an isolated drip can never accumulate into a false
+        storm (task 3256 — the addendum's second defect).
+
+        The clock is advanced by rewinding the harness's own monotonic stamp,
+        NOT by monkeypatching time.monotonic globally: the rewind is
+        deterministic and perturbs no unrelated timer.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        # Two genuine fallbacks inside the window → streak=2.
+        for i in range(2):
+            await _drive_session_slot(harness, f'd{i}', self._stale_session(f'uuid-d{i}'))
+        assert harness._session_resume_fallback_streak == 2
+
+        # ...then the clock jumps past the window before the 3rd arrives.
+        harness._last_session_resume_fallback_at -= 120
+
+        await _drive_session_slot(harness, 'd2', self._stale_session('uuid-d2'))
+
+        # Decayed to 0, then re-incremented — NOT 3, so no L1.
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_streak_survives_within_storm_window(self, harness: Harness):
+        """The decay must NOT neuter INV-4: a genuine tight burst still reaches
+        the threshold and files exactly one L1 (task 3256).
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        # Three back-to-back fallbacks — no rewind, so all chain inside the window.
+        for i in range(3):
+            await _drive_session_slot(harness, f'w{i}', self._stale_session(f'uuid-w{i}'))
+
+        assert harness._session_resume_fallback_streak == 3
+        assert harness._escalation_queue.submit.call_count == 1
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+
+    async def test_eligible_resume_clears_fallback_timestamp(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """An eligible resume clears the chain's comparison point as well as
+        the streak, so the next fallback starts a fresh run rather than
+        chaining off a pre-reset stamp (task 3256).
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+
+        await _drive_session_slot(harness, 'ts0', self._stale_session('uuid-ts0'))
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._last_session_resume_fallback_at is not None
+
+        cfg = _make_transcript(tmp_path, 'uuid-ts-ok')
+        await _drive_session_slot(
+            harness, 'ts-ok', self._fresh_session('uuid-ts-ok'), config_dir=cfg,
+        )
+
+        assert harness._session_resume_fallback_streak == 0
+        assert harness._last_session_resume_fallback_at is None
+
     async def test_no_escalation_queue_never_raises(self, harness: Harness):
         """A bare harness (no escalation queue) must never raise on a fallback
         that would otherwise trip the storm filer (fail-safe totality, I3).
