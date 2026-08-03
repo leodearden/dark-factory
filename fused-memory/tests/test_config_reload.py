@@ -407,6 +407,113 @@ class TestReloadConfigTool:
         assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
 
 
+class TestMem0UpdateLeavesAreGreenTier:
+    """All five mem0_update.* leaves must hot-apply (task 3088).
+
+    Modelled on TestWriteTriageLeavesAreGreenTier below — the direct precedent
+    for registering TOP-LEVEL (non-reconciliation.*) leaves. The existing
+    test_reloadable_fields_are_all_real_leaves guards these paths against typos
+    automatically.
+
+    The kill switch is the load-bearing one: mem0_update.enabled is what an
+    operator flips to stop an in-flight rewrite incident, and a restart-only
+    kill switch is no kill switch. The two storm leaves are only genuinely
+    reload-safe because StormCounter takes threshold/window per record() call.
+    """
+
+    PATHS = (
+        'mem0_update.enabled',
+        'mem0_update.content_amend_allowed_agent_prefixes',
+        'mem0_update.metadata_patch_allowed_agent_prefixes',
+        'mem0_update.storm_threshold',
+        'mem0_update.storm_window_seconds',
+    )
+
+    @pytest.mark.parametrize('path', PATHS)
+    def test_leaf_is_allowlisted(self, path):
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+    @pytest.mark.parametrize(
+        ('path', 'new_value'),
+        [
+            ('mem0_update.enabled', False),
+            ('mem0_update.content_amend_allowed_agent_prefixes', []),
+            (
+                'mem0_update.metadata_patch_allowed_agent_prefixes',
+                ['recon-stage-', 'curator-'],
+            ),
+            ('mem0_update.storm_threshold', 5),
+            ('mem0_update.storm_window_seconds', 600.0),
+        ],
+    )
+    def test_changed_leaf_lands_in_applied_candidates(self, path, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        field = path.split('.', 1)[1]
+        old = getattr(live.mem0_update, field)
+        object.__setattr__(fresh.mem0_update, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates, (
+            f'{path} must hot-apply so an operator can retune without a restart'
+        )
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+    def test_kill_switch_flip_is_observed_live_without_a_restart(self):
+        """A reload must be visible to the resolver through the SHARED config
+        object — the precondition config/reload.py's reload-safety rule states
+        before a leaf may be registered at all."""
+        from types import SimpleNamespace
+
+        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
+
+        live = FusedMemoryConfig()
+        svc = SimpleNamespace(config=live)
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='recon-stage-1', content_amend=True, metadata_patch=False,
+        ).allowed is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.mem0_update, 'enabled', False)
+        result = apply_reload(live, fresh)
+
+        assert result['reloaded'] is True, f'reload failed: {result.get("error")!r}'
+        assert 'mem0_update.enabled' in result['applied']
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='recon-stage-1', content_amend=True, metadata_patch=False,
+        ).allowed is False, (
+            'the resolver reads the same shared config object apply_reload '
+            'mutated in place, so the flip takes effect with no restart'
+        )
+
+    def test_widened_metadata_bar_is_observed_live(self):
+        """The operator story: admit a curator-gate metadata patch on a running
+        server WITHOUT granting content-amend authority."""
+        from types import SimpleNamespace
+
+        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
+
+        live = FusedMemoryConfig()
+        svc = SimpleNamespace(config=live)
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(
+            fresh.mem0_update,
+            'metadata_patch_allowed_agent_prefixes',
+            ['recon-stage-', 'curator-'],
+        )
+        apply_reload(live, fresh)
+
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='curator-gate', content_amend=False, metadata_patch=True,
+        ).allowed is True
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='curator-gate', content_amend=True, metadata_patch=False,
+        ).allowed is False, 'widening one bar must not widen the other'
+
+
 class TestWriteTriageLeavesAreGreenTier:
     """The calibration script's config write must be hot-reloadable.
 

@@ -100,3 +100,96 @@
     - file: src/fused_memory/server/recon_report.py
       must_not_contain:
         - "max_length"
+
+- name: deterministic_gate_escalation_record_archived_not_missing
+  reason: >
+    Task 3023. Recon Stage 1/2 have repeatedly asserted that a done
+    task_kind='deterministic' gate task stamped metadata.gate_escalated_at has
+    "no escalation record" — filed 16 times across dark_factory (2841, 2842,
+    2844, 2846, 2919, 2954, 2955, 2958, 2999, 3005, 3006) and reify (5330,
+    5341, 5349, 5352, 5353). Empirically refuted: the record IS written for
+    every deterministic-gate instance. Once a human resolves a born-at-L2
+    gate, EscalationQueue.resolve() MOVES the file to
+    data/escalations/archive/<date>/, so the root-only
+    get_pending_escalations(task_id) probe the auditor used correctly returns
+    [] — an archive-inclusive fact read through a pending-only lens. Verified
+    on disk: esc-2999-1 and esc-3005-1 are resolved and archived; esc-3011-1
+    is pending in the queue root. The orchestrator side is already
+    archive-inclusive (deterministic_runner.py calls get_by_task with no
+    status filter — task 2954, commit 403c978) and is NOT the defect.
+    Task 3023 registered get_task_escalations on the ORCHESTRATOR-side
+    escalation server (port 8102). Reachability there is PARTIAL as shipped:
+    interactive and skill-driven callers (e.g. /unblock) can call it because no
+    AgentRole allowlist applies to them, but no orchestrator role's ENFORCED
+    allowed_tools names it yet — not the steward's (roles.py) and not
+    _WATCHER_ALLOWED_TOOLS (harness.py). Task 3176 owns that wiring and is
+    blocked on 3164; until it lands, orchestrator-spawned steward and
+    escalation-watcher rotations cannot call the tool. Recon stages CANNOT
+    reach it at all, for a different and permanent reason: their `escalation`
+    MCP server is backed
+    by the RECONCILIATION queue (data/reconciliation/escalations, port 8103 —
+    ReconciliationConfig.escalation_queue_dir), a different store from
+    data/escalations (port 8102, dark-factory-orchestrator.yaml), so no
+    mcp__escalation__* result available to a stage can establish absence. Task
+    3023 therefore makes the POSITIVE rule primary and sufficient: status='done'
+    PLUS metadata.gate_escalated_at PLUS a deterministic-gate done_provenance,
+    read via mcp__fused-memory__get_task, IS legitimate closure. That rule is
+    rendered as a subsection of the shared escalation-store boundary note
+    (render_escalation_boundary_note, prompts/__init__.py) — which already
+    states the queue split and "an empty escalation result is not evidence of
+    absence" once for all three stages — rather than as a second block
+    restating it. Any recurrence
+    should be dropped without an LLM call while the archive-inclusive scan and
+    that guidance remain in place. Anchored on assertion-of-absence phrasings
+    only (NOT a bare "gate_escalated_at" token), so a legitimate proposal to
+    improve this area still reaches the architect — pinned by
+    tests/test_recon_code_fix_premise_guard.py::TestSeedRegistryRealSource::
+    test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped, whose
+    candidate title carries BOTH anchor tokens by construction so the
+    description anchor is genuinely exercised (match_candidate requires ALL
+    title_substrings). Two executable guards back that test: a
+    dataclasses.replace mutation control asserting the candidate DOES match
+    once description_substrings is widened to a bare "gate_escalated_at"
+    token, and the inverse control
+    test_absence_phrasing_with_same_title_does_match (same title, absence
+    phrasing, matches).
+  title_substrings:
+    - "deterministic"
+    - "escalation"
+  description_substrings:
+    - "no escalation record exists"
+    - "gate_escalated_at but no escalation record"
+    - "escalation record was never written"
+    - "never wrote an escalation record"
+  source_assertions:
+    # The archive-inclusive two-tier scan that refutes the premise. Path is
+    # relative to the fused-memory/ server cwd; _assertion_holds fails OPEN on
+    # an unreadable file, so a fused-memory-only deployment without the sibling
+    # escalation package simply leaves this entry inert (the safe direction).
+    - file: ../escalation/src/escalation/queue.py
+      must_contain:
+        - "def get_by_task"
+        - "_iter_archive_paths"
+    # Pins that the Stage 1/2 guidance still NAMES the archive-inclusive lookup
+    # and explains the queue split — get_task_escalations is the ORCHESTRATOR-
+    # side (port 8102) probe that recon stages cannot reach, which is exactly
+    # why the guidance tells an auditor its own empty escalation result is
+    # uninformative. The guidance prose is a shared constant in
+    # prompts/__init__.py (it is interpolated into the stage f-strings, so the
+    # literal tool name appears HERE, not in stage1.py/stage2.py). If
+    # get_task_escalations is ever retired, this assertion stops holding and
+    # the guard self-corrects, letting the candidate through to a human.
+    - file: src/fused_memory/reconciliation/prompts/__init__.py
+      must_contain:
+        - "_GATE_CLOSURE_ARCHIVE_GUIDANCE"
+        - "get_task_escalations"
+    # ...and the guidance is actually WIRED INTO the stage that files
+    # remediation tasks. It is rendered as a subsection of the shared
+    # escalation-store boundary note (render_escalation_boundary_note), not
+    # pasted separately, so the wiring token to pin in stage2.py is that render
+    # call. Unwiring it also self-corrects the guard, so the candidate is only
+    # dropped while an auditor genuinely had the disconfirming instruction in
+    # front of it.
+    - file: src/fused_memory/reconciliation/prompts/stage2.py
+      must_contain:
+        - "render_escalation_boundary_note(can_escalate=True)"

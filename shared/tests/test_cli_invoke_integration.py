@@ -1,7 +1,23 @@
-"""Integration tests: validate that claude --resume works across OAuth accounts.
+"""Integration tests: exercise ``claude --resume`` against the real CLI.
 
 These tests invoke the real Claude CLI with haiku to minimize cost (~$0.002/call).
 They require at least one OAuth token in env; cross-account tests need two.
+
+**Mechanism.** A Claude CLI session is a LOCAL JSONL transcript at
+``<config_dir>/projects/<cwd-slug>/<session_id>.jsonl`` — not a server-side,
+account-scoped object — and ``--resume`` replays that local file.  So what
+governs whether a resume keeps its context is transcript REACHABILITY (same
+config dir, same cwd), not which OAuth account issues the call.  These tests
+pass no ``config_dir``, so the CLI inherits the ambient ``CLAUDE_CONFIG_DIR``
+(``invoke_claude_agent`` copies ``os.environ``); the transcript lands there,
+NOT necessarily under ``~/.claude``.  Production's reachability guard lives in
+``shared.cli_invoke.invoke_with_cap_retry`` — see the measurement comment above
+its cap-hit resume branch, which is the single source of truth for what has and
+has not been established about cross-account resume.
+
+**The ``-m integration`` marker is mandatory.** ``shared/pyproject.toml`` sets
+``addopts = "-m 'not integration'"``, so without it every test in this module is
+silently deselected and the run looks green while having executed nothing.
 
 Run explicitly:  uv run pytest tests/test_cli_invoke_integration.py -xvs -m integration
 """
@@ -140,7 +156,31 @@ class TestCrossAccountResume:
 
     @_need_two_accounts
     async def test_session_resume_preserves_context_across_accounts(self):
-        """Key test: start on account A, resume on account B, verify context preserved."""
+        """Probe: does a resume issued on account B recall context started on A?
+
+        The name of the thing being probed is deliberately a QUESTION, not a
+        claim.  As of 2026-08-01 (claude CLI 2.1.220, task 3454) this has NOT
+        been answered: 4 of the 5 accounts in env were capped, and the probe
+        needs two simultaneously-uncapped accounts, so there were 0 valid runs.
+        What IS established is that the transcript-reachability explanation is
+        ruled out — the r1 transcript was on disk both times, and a resume on a
+        different account appended to that same local file — so a failure here
+        would NOT be explained by an unreachable session.  Full measurement:
+        the comment above the cap-hit resume branch in ``shared.cli_invoke``.
+
+        The ZEPPELIN assertion is retained deliberately and must not be weakened:
+        it is the only signal that would distinguish outcome (a) from (b).
+
+        KNOWN MISLEADING FAILURE.  When account B is capped, the CLI answers the
+        resumed turn with e.g. "You've hit your weekly limit · resets Aug 5,
+        11am".  ``_looks_like_capacity_failure`` does NOT match that text (its
+        marker is "you've hit your usage"), so this test does not skip — it
+        fails the assertion below with a cap message as the "output", which is
+        indistinguishable at a glance from genuine context loss.  Check the
+        reported output for a limit message before reading a red run as a
+        regression.  (The marker list is intentionally left alone here; it is
+        owned by the task that narrowed it.)
+        """
         _name_a, token_a = _AVAILABLE_TOKENS[0]
         _name_b, token_b = _AVAILABLE_TOKENS[1]
 

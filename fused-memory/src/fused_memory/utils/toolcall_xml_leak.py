@@ -6,10 +6,23 @@ consumers depend on this module, and they must never drift apart:
 * ``scripts/scan_task_toolcall_leaks.py`` — the READ-ONLY Taskmaster task-DB
   sweep (task 2939), which is where this detector was originally written and
   hardened;
-* ``fused_memory.middleware.toolcall_xml_guard`` — the live rejection at the
-  ``submit_task``/``update_task``/``add_memory``/``add_episode`` MCP boundary;
 * ``fused-memory/scripts/sweep_toolcall_xml_leak.py`` — the Mem0/Qdrant
-  corpus sweep.
+  corpus sweep;
+* ``Mem0Backend.scan_payload_text`` / the ``scan_memory_content`` MCP tool —
+  the read capability that makes the corpus sweepable at all.
+
+This detector is deliberately PRECISE: it requires real whitespace between the
+stray closing tag and the continuation, so prose that merely quotes the leak
+shape with an escaped ``\n`` is not a hit. That matters because every consumer
+above runs over ALREADY-STORED content, where a false positive would provoke an
+unnecessary rewrite of a user's memory.
+
+It is NOT the live write-boundary guard. That is
+:mod:`fused_memory.server.markup_tripwire`, which owns the authoritative
+enumeration of the envelope literals and is deliberately calibrated the other
+way — a bare substring scan that accepts over-reporting to maximise recall at
+write time, where the cost of a false positive is only a retry. The two are
+complementary and must not be collapsed into one another.
 
 ## Root cause (task 3083, WORK a)
 

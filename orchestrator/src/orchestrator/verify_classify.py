@@ -314,6 +314,80 @@ _VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE = re.compile(
 # module's existing clippy::/error[E\d+]: SEMAPHORE_TIMEOUT veto style below.
 _RUSTC_DIAGNOSTIC_SPAN_RE = re.compile(r'-->\s*\S+:\d+:\d+', re.MULTILINE)
 
+# Mis-resolved pyright interpreter (task 3367 / esc-3359-1) — the SINGLE
+# detection site for this signature. verify.py imports the predicate below
+# rather than re-spelling this regex, so there is exactly one pattern to keep
+# grounded (Invariant C1 discipline).
+_UNRESOLVED_IMPORT_RE = re.compile(
+    r'Import "([\w.]+)" could not be resolved \(reportMissingImports\)'
+)
+
+# Modules EVERY uv-workspace member declares as a dev dependency, so a HEALTHY
+# environment always resolves them. Their absence from the resolved interpreter
+# is evidence the INTERPRETER is wrong, not that the branch's dependency set is.
+# Keep this to modules that are genuinely universal across members — a module
+# only some members depend on would make the sentinel a false-negative source.
+_BASELINE_WORKSPACE_MODULES = frozenset({'pytest'})
+
+# Minimum DISTINCT top-level unresolved modules required alongside the sentinel.
+# Set far below the observed signature (~40+ distinct modules) and far above the
+# realistic branch-defect shape (a branch adds one or two undeclared imports).
+_MIN_DISTINCT_UNRESOLVED_IMPORTS = 5
+
+
+def is_interpreter_missing_workspace_packages(output: str) -> bool:
+    """True when *output* shows a Python interpreter holding NONE of the
+    workspace's third-party packages — i.e. pyright resolved the wrong
+    interpreter, not a branch that is genuinely missing a dependency.
+
+    Task 3367 / esc-3359-1. Measured signature: 509-514 pyright errors, ~40+
+    DISTINCT unresolved third-party modules, emitted in a cold merge worktree
+    on a DOCS-ONLY diff — a branch that changed no Python at all. Root cause:
+    a subproject whose ``[tool.pyright]`` declared no ``venvPath``/``venv``, so
+    ``cd <sub> && npx pyright`` resolved its interpreter from the ambient
+    ``VIRTUAL_ENV``/``PATH`` — both of which ``verify._target_subprocess_env``
+    deliberately strips.
+
+    DISCRIMINATOR CONTRACT — deliberately conservative, and asymmetric on
+    purpose. A FALSE POSITIVE is the dangerous direction: it would excuse a
+    genuine missing-dependency regression as environmental and let it through
+    the merge gate as an infra hold instead of blaming the branch. So BOTH
+    conditions must hold, never either alone:
+
+      1. a baseline sentinel module (``_BASELINE_WORKSPACE_MODULES``) is among
+         the unresolved imports — every workspace member declares it as a dev
+         dependency, so a healthy env ALWAYS resolves it; losing it proves the
+         interpreter is wrong rather than the dependency set;
+      2. at least ``_MIN_DISTINCT_UNRESOLVED_IMPORTS`` DISTINCT top-level
+         modules are unresolved — which rejects the realistic defect shape of a
+         branch adding one or two undeclared imports.
+
+    Dotted names collapse to their top-level module, so submodules of a single
+    package (``qdrant_client.models``, ``qdrant_client.http``) cannot inflate
+    the distinct count on their own.
+
+    Pure and total: any input that grounds neither condition returns ``False``
+    rather than raising — a classifier must never be the thing that fails.
+    """
+    unresolved = unresolved_top_level_modules(output)
+    return (
+        len(unresolved) >= _MIN_DISTINCT_UNRESOLVED_IMPORTS
+        and bool(unresolved & _BASELINE_WORKSPACE_MODULES)
+    )
+
+
+def unresolved_top_level_modules(output: str) -> frozenset[str]:
+    """Distinct TOP-LEVEL module names reported unresolved in *output*.
+
+    The one place ``_UNRESOLVED_IMPORT_RE`` is applied — both the predicate
+    above and verify.py's loud log (which reports the count) read the signature
+    through this helper, so there is never a second copy of the regex.
+    """
+    return frozenset(
+        name.split('.')[0] for name in _UNRESOLVED_IMPORT_RE.findall(output) if name
+    )
+
+
 _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
     # shape 2: the verify entrypoint script itself is gone (rc=127 lint
     # stage, <0.4s) — "./scripts/verify.sh: No such file or directory".
@@ -345,7 +419,8 @@ _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
 
 def _classify_environmental(output: str) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / ENV_TRANSIENT (broken
-    ``_merge-verify`` worktree, incl. restart collateral) / SEMAPHORE_TIMEOUT.
+    ``_merge-verify`` worktree, incl. restart collateral; mis-resolved pyright
+    interpreter) / SEMAPHORE_TIMEOUT.
 
     Checked in ``classify_failure`` immediately after the ``timed_out`` ->
     ``INFRA_TIMEOUT`` guard and before any per-tool dispatch — these
@@ -469,6 +544,28 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     grounded in any observed sample today (see plan.json's grounding
     discipline note); left as a residual, accepted gap until a real
     grounded false-positive sample of that shape is observed.
+
+    ENV_TRANSIENT — mis-resolved pyright interpreter (task 3367 / esc-3359-1):
+    a THIRD flavour of the same "the host, not the branch" root cause. When the
+    checked subproject's ``[tool.pyright]`` pins no ``venvPath``/``venv``,
+    pyright resolves its interpreter from the ambient ``VIRTUAL_ENV``/``PATH``
+    — both of which ``verify._target_subprocess_env`` deliberately strips — so
+    a cold merge worktree type-checks against an environment holding none of
+    the workspace's third-party packages and emits hundreds of phantom
+    ``reportMissingImports`` errors on a branch with no defect (509-514 errors
+    on a DOCS-ONLY diff). Detected via
+    ``is_interpreter_missing_workspace_packages``, whose conjunctive
+    discriminator (a baseline sentinel module AND >=5 distinct unresolved
+    top-level modules) is documented on the predicate itself. Checked after the
+    broken-worktree shapes and before the looser SEMAPHORE_TIMEOUT heuristic,
+    the same placement and for the same reason as those: a specific grounded
+    host condition outranks a loose lock+timeout co-occurrence. Like them, it
+    is tool-blind by design — the fleet chain ``cd fused-memory && npx pyright
+    && ...`` resolves ``ToolKind.OPAQUE`` while the per-module commands resolve
+    ``ToolKind.PYRIGHT``, and one guard-3 branch covers both without any
+    per-tool table duplication (Invariant C1 intact — C1 forbids duplicating
+    the same pattern across per-tool tables, not a category being reachable
+    from more than one guard).
     """
     lower = output.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
@@ -482,6 +579,8 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ) and not _RUSTC_DIAGNOSTIC_SPAN_RE.search(output):
         return FailureCategory.ENV_TRANSIENT
     if any(pattern.search(output) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
+        return FailureCategory.ENV_TRANSIENT
+    if is_interpreter_missing_workspace_packages(output):
         return FailureCategory.ENV_TRANSIENT
     if (
         _LOCK_TOKEN_RE.search(output)
@@ -505,11 +604,14 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        command output)
     3. ``_classify_environmental(output)`` -> ``FailureCategory.DISK_FULL``,
        ``FailureCategory.SEMAPHORE_TIMEOUT``, or ``FailureCategory.ENV_TRANSIENT``
-       (broken ``_merge-verify`` worktree) when grounded in *output* (wins
-       over any per-tool output pattern for the same "root cause is the
-       environment, not the command output" reason as guard 2 — a host
-       condition like a full disk, a lock/semaphore-slot timeout, or an
-       unreadable worktree lockfile is not a property of any one tool).
+       (broken ``_merge-verify`` worktree; or a mis-resolved pyright
+       interpreter holding none of the workspace's third-party packages —
+       task 3367) when grounded in *output* (wins over any per-tool output
+       pattern for the same "root cause is the environment, not the command
+       output" reason as guard 2 — a host condition like a full disk, a
+       lock/semaphore-slot timeout, an unreadable worktree lockfile, or an
+       interpreter resolved from a stripped ambient env is not a property of
+       any one tool).
 
     Then dispatches on *tool* to a per-tool classification table (Invariant
     C1: a tool-T pattern lives ONLY in tool-T's table, so a cargo token can
@@ -624,6 +726,18 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # verify.py auto-recovery retry) regardless of which ToolKind the failing
 # check resolves to. verify.py's `_tool_for_cmd` NOTE echoes this same
 # now-narrower PYTEST-only claim; read it as scoped identically to this one.
+#
+# SCOPE OF THE NARROWING (task 3367 update): a THIRD ToolKind-independent
+# producer now lives in the same guard 3 —
+# `is_interpreter_missing_workspace_packages` (mis-resolved pyright
+# interpreter, esc-3359-1). This retires a corollary that USED to hold: it is
+# no longer true that "a lint or type-check failure cannot classify as
+# env_transient by construction". A TYPE check IS now a possible env_transient
+# producer, so any reasoning that relied on env_transient implying the failing
+# leg was the TEST leg must be re-derived rather than assumed. The one place
+# that reasoning was load-bearing is verify.py's env-recovery retry gate, which
+# task 3367 tightens with an explicit `attempt.test.rc != 0` check instead of
+# leaning on the retired corollary.
 # ---------------------------------------------------------------------------
 
 # Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from

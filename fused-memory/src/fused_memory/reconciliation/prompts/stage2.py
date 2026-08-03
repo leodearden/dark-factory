@@ -13,6 +13,7 @@ from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
     get_recon_report_tool_guidance,
+    render_escalation_boundary_note,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_cycle_summary_section,
@@ -644,12 +645,11 @@ Stale flags require human investigation. Do not attempt to silently resolve them
 re-acting on the same content — escalate (and delete) so an operator can diagnose the \
 root cause without being spammed by repeat alarms.
 
-**Escalation scope**: Use `mcp__escalation__escalate_blocker` sparingly — \
-escalate_blocker is sanctioned ONLY for the Stale Flag Escalation (FIX D) case above. \
-For integrity and task-lifecycle findings (e.g. complete-but-unmerged tasks, lifecycle \
-inconsistencies), report them through the recon_report channel \
-(`mcp__recon-report__add_finding`); the reconciliation harness owns their \
-persistence-gated escalation path.
+**Escalation scope**: For integrity and task-lifecycle findings (e.g. \
+complete-but-unmerged tasks, lifecycle inconsistencies), do NOT escalate — report them \
+through the recon_report channel (`mcp__recon-report__add_finding`); the reconciliation \
+harness owns their persistence-gated escalation path. The sanctioned scope of \
+`escalate_blocker` itself is stated once, under `## Escalation Store Boundary` below.
 
 One of these is now handled for you: the before/after `get_task` self-check \
 around a write to a live in-progress task — reading status/`claimant_run_id`/ \
@@ -661,6 +661,8 @@ self-files a `task_lifecycle_reset_detected` finding via the recon_report \
 channel whenever `status` or `claimant_run_id` diverges unexpectedly. You do \
 not need to spend budget re-implementing this check by hand — rely on the \
 finding being filed automatically.
+
+{render_escalation_boundary_note(can_escalate=True)}
 
 ## Same-Run Stage 1 human_operator_required Suppression
 If Stage 1 already filed a `human_operator_required` flag for a given `(task_id, \

@@ -64,6 +64,7 @@ from fused_memory.middleware.path_scope_guard import (
     check_files_for_scope,
     check_text_for_scope,
     is_routing_override,
+    local_attesting_signals,
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
@@ -1513,14 +1514,47 @@ class TaskInterceptor:
         Priority: ``files`` (canonical orchestrator field) →
         ``files_to_modify`` (legacy curator-internal name). Coerces the
         result to a list of non-empty strings, and returns ``[]`` when
-        neither key is present or the value is empty / falsy.
+        neither key is present, both values are empty / falsy, or both
+        values are malformed (see below).
+
+        Malformed-value guard (task 3407): mirrors
+        :meth:`_extract_deliverable_signals_from_meta`'s guard (task 3106).
+        ``metadata`` is unvalidated caller kwargs at this seam and
+        :meth:`_parse_metadata` deliberately warns-and-continues rather than
+        raising, so a value that is neither a string nor a list/tuple/set
+        (e.g. ``files: 5``) is discarded the same way instead of raising
+        ``TypeError`` out of :func:`check_files_for_scope` /
+        :func:`all_files_foreign_owner` as an unstructured crash — a
+        discarded ``files`` falls through to ``files_to_modify``, same as
+        an absent/falsy one. A dict value (e.g. ``files: {'a/b.py': 1}``)
+        is the quiet variant: plain iteration would walk its KEYS and could
+        silently drive the FILES-certain hard reject off metadata the
+        author never meant as a path list, so it is discarded too rather
+        than iterated.
 
         Callers that have not yet parsed metadata should use the kwargs-taking
         entry point :meth:`_extract_meta_files` instead.
         """
-        files = meta.get('files') or meta.get('files_to_modify') or []
-        if isinstance(files, str):
-            files = [files]
+        files: list | tuple | set | None = None
+        for key in ('files', 'files_to_modify'):
+            value = meta.get(key)
+            if not value:
+                continue
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, (list, tuple, set)):
+                logger.warning(
+                    'task_metadata.schema_warning source=%s error=%s '
+                    '(type=%s); meta-files key discarded',
+                    'TaskInterceptor._extract_meta_files_from_meta',
+                    f'metadata.{key} is not a list/tuple/set of paths',
+                    type(value).__name__,
+                )
+                continue
+            files = value
+            break
+        if files is None:
+            files = []
         return [str(f) for f in files if f]
 
     @staticmethod
@@ -1542,6 +1576,80 @@ class TaskInterceptor:
         """
         meta = TaskInterceptor._parse_metadata(kwargs)
         return TaskInterceptor._extract_meta_files_from_meta(meta)
+
+    @staticmethod
+    def _extract_deliverable_signals_from_meta(meta: dict) -> list[str]:
+        """Extract the UNION of declared deliverable signals from *meta*.
+
+        Reads ``files``, ``files_to_modify`` and ``modules`` in that order,
+        coercing a scalar string to a one-element list, ``str()``-coercing
+        each entry, dropping falsy ones, and deduplicating while preserving
+        first-occurrence order.
+
+        SEPARATE HELPER, NOT A WIDENING of
+        :meth:`_extract_meta_files_from_meta` — deliberately (task 3106).
+        That helper feeds the FILES-CERTAIN hard reject
+        (:func:`check_files_for_scope`) and the cross-repo tagger
+        (:func:`all_files_foreign_owner`), where its ``files``-over-
+        ``files_to_modify`` PRECEDENCE is correct because those callers need
+        ONE authoritative declared file list, and where admitting ``modules``
+        would mean a foreign lock-key entry starts hard-REJECTING
+        submissions — a behaviour change well outside this task.
+
+        Attribution wants the widest view of what the filer declared, and
+        this list feeds ONLY :meth:`_local_attesting_signals`, so it can
+        never weaken a rejection.  :func:`local_attesting_signals` documents
+        how the extra keys are treated in BOTH directions — they can attest,
+        and a foreign one vetoes.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        for key in ('files', 'files_to_modify', 'modules'):
+            values = meta.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, (list, tuple, set)):
+                # Malformed caller metadata (``modules: 5``, ``modules:
+                # {...}``).  ``metadata`` is still unvalidated kwargs at this
+                # seam and :func:`_parse_metadata` deliberately
+                # warns-and-continues rather than raising, so degrade the
+                # same way: an unusable value contributes NO signal (falling
+                # back to the unchanged advisory) instead of raising
+                # ``TypeError`` out of ``submit_task`` as an unstructured
+                # crash.  A dict is the quiet variant — iterating it would
+                # walk its KEYS and could silently attest.
+                logger.warning(
+                    'task_metadata.schema_warning source=%s error=%s '
+                    '(type=%s); deliverable-signal key discarded',
+                    'TaskInterceptor._extract_deliverable_signals_from_meta',
+                    f'metadata.{key} is not a list/tuple/set of paths',
+                    type(values).__name__,
+                )
+                continue
+            for value in values:
+                if not value:
+                    continue
+                entry = str(value)
+                if entry in seen:
+                    continue
+                seen.add(entry)
+                out.append(entry)
+        return out
+
+    @staticmethod
+    def _extract_deliverable_signals(kwargs: dict[str, Any]) -> list[str]:
+        """Extract declared deliverable signals from add_task kwargs.
+
+        Thin wrapper around :meth:`_extract_deliverable_signals_from_meta`
+        that handles the ``kwargs → meta`` parsing step via
+        :meth:`_parse_metadata` — the SAME parsing path
+        :meth:`_extract_meta_files` uses, so JSON-string metadata is
+        normalised identically with no new parsing branch.  Only the
+        key-selection policy differs (union of three keys vs. precedence
+        over two); see that method's docstring for why.
+        """
+        meta = TaskInterceptor._parse_metadata(kwargs)
+        return TaskInterceptor._extract_deliverable_signals_from_meta(meta)
 
     @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
@@ -1633,6 +1741,37 @@ class TaskInterceptor:
         )
         return all_files_foreign_owner(files, project_id, registry)
 
+    def _local_attesting_signals(
+        self,
+        kwargs: dict[str, Any],
+        project_id: str,
+    ) -> list[str]:
+        """Return the declared deliverable signals that ATTEST *project_id*.
+
+        Thin wrapper — registry guard here, all registry logic in the pure
+        :func:`local_attesting_signals` (which documents the two conditions
+        attestation requires and why).  Same shape as the sibling
+        :meth:`_all_files_foreign_owner`, and, like it, returns the WITNESS
+        rather than a bare bool so the caller can name it in the log.
+
+        Reads ``kwargs`` directly rather than ``candidate.files_to_modify``:
+        the candidate's list has already been narrowed by
+        :meth:`_extract_meta_files_from_meta`'s ``files``-over-
+        ``files_to_modify`` precedence and carries no ``modules`` at all, so
+        it is the wrong signal for attribution, which wants the UNION (see
+        :meth:`_extract_deliverable_signals_from_meta`).
+
+        Returns ``[]`` when no :attr:`_prefix_registry` is configured — with
+        no owner map nothing can attest, so the caller falls through to the
+        unchanged advisory.
+        """
+        registry = self._prefix_registry
+        if registry is None:
+            return []
+        return local_attesting_signals(
+            self._extract_deliverable_signals(kwargs), project_id, registry,
+        )
+
     def _path_guard_check(
         self,
         candidate: CandidateTask | None,
@@ -1678,14 +1817,30 @@ class TaskInterceptor:
         project_id: str,
         *,
         llm_reason: str | None = None,
+        advisory: bool = False,
     ) -> None:
-        """Fire the scope_violation escalation on a rejection verdict.
+        """Fire the scope_violation escalation for EITHER guard outcome.
 
         Pure side-effect helper: resolves the suggested root, builds the
         candidate title, and delegates to :attr:`_scope_violation_escalator`.
         Errors are logged and swallowed so a queue failure can never convert
-        a rejection into an exception (matches the never-raise convention).
-        No-ops when no escalator is configured.
+        a guard outcome into an exception (matches the never-raise
+        convention).  No-ops when no escalator is configured.
+
+        This helper is the SEAM where the two outcomes of
+        :meth:`_path_guard_or_skip` are distinguished, so *advisory* selects
+        which one the operator-facing escalation describes (task 3119):
+
+        * ``False`` (default) — the FILES-certain hard reject.  No task was
+          created; the caller receives the ``DarkFactoryPathScopeViolation``
+          error dict.
+        * ``True`` — the PROSE-only advisory.  Nothing was blocked: the task
+          WAS created and stamped with ``metadata.possible_scope_mismatch``.
+
+        Getting this wrong is not cosmetic — an advisory filed with rejection
+        wording tells the operator (and any agent reading it in a briefing)
+        that a task was rejected when it in fact exists, and instructs a
+        resubmission of work that already landed.
 
         The optional *llm_reason* is forwarded to ``report_rejection``
         (task 1822) so genuine-misroute / fail-safe cases carry the LLM
@@ -1712,6 +1867,7 @@ class TaskInterceptor:
                 suggested_project=verdict.suggested_project,
                 suggested_root=suggested_root,
                 llm_reason=llm_reason,
+                advisory=advisory,
             )
         except Exception:  # pragma: no cover — defensive only
             # Escalator is built to never raise (queue failures are
@@ -1734,24 +1890,32 @@ class TaskInterceptor:
         """Run the path-scope guard, escalate on rejection, return error dict.
 
         Returns the structured error dict on a hard rejection, or ``None``
-        when the submission is allowed (including the PROSE-ADVISORY case
-        below, which allows creation but attaches a marker).
+        when the submission is allowed (including the PROSE-ADVISORY case,
+        which allows creation but attaches a marker).
 
-        Split by signal quality (task 2206):
+        This method IS the evaluation order the three-outcome taxonomy in
+        :mod:`fused_memory.middleware.path_scope_guard`'s module docstring
+        describes — read it there rather than re-deriving it here; only the
+        facts specific to this seam are recorded below.
 
-        * FILES-CERTAIN (:meth:`_files_scope_check`) — an exact
-          ``metadata.files`` owner-mismatch is a hard reject.  No LLM
-          adjudication: the file's owner is either known and different, or
-          it isn't, so there is nothing to adjudicate.
-        * PROSE-ADVISORY (:meth:`_path_guard_check`) — a regex-over-prose
-          heuristic hit in title/description/details, with no files-level
-          mismatch.  This never rejects: the submission proceeds, but
+        * Outcome (1), FILES-CERTAIN reject — :meth:`_files_scope_check`.  No
+          LLM adjudication: the file's owner is either known and different,
+          or it isn't, so there is nothing to adjudicate.
+        * Outcome (2), CROSS-REPO allow-and-tag — :meth:`_all_files_foreign_owner`.
+        * Outcome (3), PROSE-ADVISORY — :meth:`_path_guard_check`, gated on
+          :meth:`_local_attesting_signals`.  The registry is always present
+          (defaults to ``ProjectPrefixRegistry.default()``, task 2208), so
+          the advisory is the ONLY prose path — the pre-task-2208
+          hard-reject-on-prose back-compat branch has been retired.  On an
+          unsuppressed hit,
           ``kwargs['metadata']['possible_scope_mismatch']`` is attached (via
           :meth:`_attach_possible_scope_mismatch`) and a ``scope_violation``
-          escalation still fires (loud, non-blocking).  The registry is
-          always present (defaults to ``ProjectPrefixRegistry.default()``,
-          task 2208), so this is the ONLY path — the pre-task-2208
-          hard-reject-on-prose back-compat branch has been retired.
+          escalation fires (loud, non-blocking).
+
+          NOT SILENT when suppressed: one structured INFO record carries the
+          matched prose prefixes, the prose-suggested owner, the filing
+          project and the attesting signals, so the branch stays auditable
+          without putting a non-actionable item in the operator queue.
 
         The inline Stage-2 LLM adjudicator (task 1822) is no longer
         consulted here: FILES-certain rejects have nothing to adjudicate,
@@ -1819,11 +1983,40 @@ class TaskInterceptor:
         if not verdict.is_rejection:
             return None
 
+        # PROSE-hit SUPPRESSED BY LOCAL ATTRIBUTION (task 3106): the declared
+        # deliverables attest local work (see local_attesting_signals for the
+        # exact conditions), so the foreign path in the prose is an incidental
+        # citation ("mirror the logic in <other-project>/x.rs"), not a
+        # misrouting — neither the stamp nor the escalation fires.
+        #
+        # INFO, not WARNING, and deliberately not an escalation: this is a
+        # CORRECT attribution decision replacing operator-queue noise, so it
+        # belongs in the log trail rather than in a queue an operator has to
+        # triage. But it is never SILENT — the guard's most consequential
+        # branch has to stay auditable by anyone asking why a task was not
+        # flagged, so the record carries every fact the decision turned on.
+        attesting_signals = self._local_attesting_signals(kwargs, project_id)
+        if attesting_signals:
+            logger.info(
+                'path-guard PROSE ADVISORY SUPPRESSED: declared deliverable '
+                'attests local work, so the prose citation is incidental — '
+                'no possible_scope_mismatch stamp and no escalation. '
+                'project_id=%s matched_paths=%s suggested_project=%s '
+                'attested_by=%s',
+                project_id,
+                list(verdict.matched_paths),
+                verdict.suggested_project,
+                attesting_signals,
+            )
+            return None
+
         # PROSE-ADVISORY: a heuristic hit never blocks creation — the
         # escalation below preserves the signal loudly; the marker lets
-        # async triage see it too.
+        # async triage see it too.  advisory=True so the escalation the
+        # operator reads says the task was CREATED, not rejected (task 3119).
         self._emit_scope_violation_escalation(
-            verdict, candidate, kwargs, project_root, project_id, llm_reason=None,
+            verdict, candidate, kwargs, project_root, project_id,
+            llm_reason=None, advisory=True,
         )
         self._attach_possible_scope_mismatch(kwargs, verdict)
         return None

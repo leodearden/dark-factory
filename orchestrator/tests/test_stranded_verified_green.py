@@ -18,16 +18,23 @@ from typing import Any, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import wire_scheduler_liveness_mock
+from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
-from orchestrator.stranded_verified_green import VerifiedGreenMatch
+from orchestrator.stranded_verified_green import (
+    VerifiedGreenMatch,
+    merge_request_marker_is_fresh,
+    submit_verified_green_merge_request,
+)
+from orchestrator.task_ground_truth import EscalationRef
 
 
 @pytest.fixture(autouse=True)
@@ -647,6 +654,254 @@ class TestReconcileStrandedDriverVerifiedGreen:
         assert harness._merge_queue.qsize() == 0
 
 
+_OFF_MAIN_SHA = 'off' + 'a' * 37  # 40-char unmerged branch tip
+
+
+def _wire_exists_off_main(harness: Harness, tid: str) -> None:
+    """Wire *harness* so *tid*'s blocked branch resolves EXISTS_OFF_MAIN.
+
+    Branch ref present but NOT an ancestor of main, no merge marker, and no
+    bound MergeProvenance journal row (the autouse ``_reset_merge_provenance``
+    fixture guarantees the miss) — the shape a verified-green task that never
+    got merged is actually in.
+    """
+    harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_OFF_MAIN_SHA)
+    harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+    harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+        return_value=({tid: 'blocked'}, None),
+    )
+
+
+def _seed_pending(queue: EscalationQueue, tid: str, category: str, *, level: int = 1) -> str:
+    """Seed ONE pending escalation of *category* for *tid* and return its id.
+
+    The id is deliberately DISTINCT from ``queue.make_id(tid)`` so it cannot
+    collide with (or be mistaken for) a record the reaper files itself.
+    """
+    esc_id = f'esc-seed-{category}-{tid}'
+    queue.submit(Escalation(
+        id=esc_id, task_id=tid, agent_role='steward', severity='blocking',
+        category=category, summary=f'pre-existing {category}', level=level,
+    ))
+    return esc_id
+
+
+def _asserted_no_repend(harness: Harness, tid: str) -> None:
+    """The task was never flipped back to 'pending'."""
+    for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
+        assert tuple(call.args[:2]) != (tid, 'pending')
+
+
+@pytest.mark.asyncio
+class TestVerifiedGreenVetoRelaxExistsOffMain:
+    """δ: a merge-remediable open escalation no longer vetoes the auto-merge.
+
+    Boundary pair on the EXISTS_OFF_MAIN sweep-side RE_FILE_ESCALATION upgrade
+    — the branch shape a verified-green-but-never-merged task is in.  D-1: the
+    reaper's OWN ``stranded_blocked`` request no longer blocks the merge it
+    asked for.  D-2: a human-concern escalation still vetoes, unchanged.
+    """
+
+    async def test_d1_merge_remediable_esc_no_longer_vetoes_submit(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_d1')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        _wire_exists_off_main(harness, tid)
+        _seed_pending(queue, tid, 'stranded_blocked')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # The verified-green branch was submitted merge-queue-direct despite
+        # the open stranded_blocked — the anti-synergy δ closes.
+        assert harness._merge_queue.qsize() == 1
+        assert harness.event_store is not None
+        rows = harness.event_store.fetch_events_by_type_all_runs(
+            EventType.merge_queued, task_id=tid,
+        )
+        assert len(rows) == 1
+        assert (rows[0].get('data') or {}).get('source') == 'stranded-reaper'
+        # Still left blocked for the merge to land — never re-pended.
+        _asserted_no_repend(harness, tid)
+
+    async def test_d2_human_concern_esc_still_vetoes(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """A design_concern is NOT merge-remediable → LEAVE, unchanged."""
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_d2')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        _wire_exists_off_main(harness, tid)
+        seeded = _seed_pending(queue, tid, 'design_concern')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # No auto-submit: the human-concern escalation holds the task.
+        assert harness._merge_queue.qsize() == 0
+        _asserted_no_repend(harness, tid)
+        pending = queue.get_by_task(tid, status='pending')
+        assert [e.id for e in pending] == [seeded]
+        assert pending[0].category == 'design_concern'
+
+    async def test_non_match_with_open_remediable_esc_files_no_duplicate(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Relaxing the veto must not turn the re-file path into a duplicator.
+
+        The relax means RE_FILE_ESCALATION is now reachable with a
+        stranded_blocked ALREADY pending.  On a verified-green NON-match the
+        submit declines, and the fallback re-file would stack a SECOND
+        stranded_blocked L1 for the same task — so the call-site must leave the
+        already-open escalation for its handler instead.
+        """
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_dedup')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        _wire_exists_off_main(harness, tid)
+        seeded = _seed_pending(queue, tid, 'stranded_blocked')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=None),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert harness._merge_queue.qsize() == 0
+        _asserted_no_repend(harness, tid)
+        pending = queue.get_by_task(tid, status='pending')
+        assert [e.id for e in pending] == [seeded], (
+            'must not stack a second stranded_blocked L1'
+        )
+
+
+_ADVANCED_SHA = 'ad' * 20  # 40-hex on-main landing SHA
+
+
+def _wire_on_main_mark_done(harness: Harness, tid: str, tmp_path: Path) -> None:
+    """Wire *harness* so *tid*'s blocked branch resolves ON_MAIN and the
+    found_on_main mark-done collaborators are satisfied.
+
+    Mirrors ``test_submit_then_land_marks_done_via_found_on_main``'s sweep-2
+    wiring: a bound MergeProvenance journal row is the authoritative ON_MAIN
+    signal, and mark_done forwards to set_task_status so the provenance is
+    assertable.
+    """
+    _bind_landed_row(tmp_path, task_id=tid, advanced_sha=_ADVANCED_SHA)
+
+    async def _fake_mark_done(t, *, kind, sha, note=None):
+        prov = {'kind': kind, 'commit': sha}
+        if note is not None:
+            prov['note'] = note
+        await harness.scheduler.set_task_status(t, 'done', done_provenance=prov)
+
+    harness.scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)  # type: ignore[attr-defined]
+    harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+    harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+    harness.git_ops.cleanup_worktree = AsyncMock()
+    harness.git_ops.release_lane_for_terminal_task = AsyncMock()
+    harness.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
+    harness.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)
+    harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+        return_value=({tid: 'blocked'}, None),
+    )
+
+
+def _done_provenance(harness: Harness, tid: str) -> dict | None:
+    """The done_provenance the task was marked done with, or None if it wasn't."""
+    for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
+        if tuple(call.args[:2]) == (tid, 'done'):
+            return call.kwargs.get('done_provenance')
+    return None
+
+
+@pytest.mark.asyncio
+class TestVerifiedGreenVetoRelaxOnMain:
+    """δ: a merge-remediable open escalation no longer vetoes the self-heal.
+
+    Boundary pair on the ON_MAIN sweep-side MARK_DONE_WITH_PROVENANCE upgrade —
+    the shape of a task whose branch LANDED while it was still blocked.  Case A:
+    the reaper's own ``stranded_blocked`` no longer holds the task blocked
+    forever after its branch landed.  Case B: a human-concern escalation still
+    vetoes, unchanged.
+    """
+
+    async def test_case_a_merge_remediable_esc_no_longer_vetoes_mark_done(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_ma')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_pending(queue, tid, 'stranded_blocked')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=None),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        prov = _done_provenance(harness, tid)
+        assert prov is not None, 'landed branch must self-heal to done'
+        assert prov['kind'] == 'found_on_main'
+
+    async def test_case_b_human_concern_esc_still_vetoes_mark_done(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """A design_concern is NOT merge-remediable → the task stays blocked."""
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_mb')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        seeded = _seed_pending(queue, tid, 'design_concern')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=None),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert _done_provenance(harness, tid) is None, (
+            'a human-concern escalation must still hold the task'
+        )
+        pending = queue.get_by_task(tid, status='pending')
+        assert [e.id for e in pending] == [seeded]
+
+
 def _marker(*, tip: str = _TIP, request_id: str = 'mr-prev1234', age_s: float = 0.0) -> dict:
     """A ``stranded_merge_request`` metadata marker (step-16 race-guard).
 
@@ -859,6 +1114,56 @@ def test_status_sets_exhaust_merge_outcome_vocabulary() -> None:
     )
 
 
+def _ref(category: str, *, level: int = 1) -> EscalationRef:
+    """An open-escalation ref carrying *category* (δ predicate input)."""
+    return EscalationRef(id=f'esc-{category}', level=level, category=category)
+
+
+class TestOnlyMergeRemediable:
+    """Harness.MERGE_REMEDIABLE_ESC_CATEGORIES + _only_merge_remediable (δ).
+
+    The single predicate authority for the relaxed verified-green auto-merge
+    veto: an escalation that exists to REQUEST the merge must not itself veto
+    the merge, while every human-concern class still vetoes unchanged.
+    """
+
+    def test_set_contains_the_merge_request_class(self) -> None:
+        assert 'stranded_blocked' in Harness.MERGE_REMEDIABLE_ESC_CATEGORIES
+
+    @pytest.mark.parametrize('category', [
+        'design_concern',
+        'task_failure',
+        'review_issues',
+        'stranded_merge_failed',
+        'infra_issue',
+    ])
+    def test_set_excludes_human_concern_classes(self, category: str) -> None:
+        """A human-concern esc is NOT remediable by re-merging.
+
+        ``stranded_merge_failed`` in particular is the DURABLE
+        merge/verify-failure born-at-L2 signal — re-merging cannot remediate
+        it, so it MUST keep vetoing.
+        """
+        assert category not in Harness.MERGE_REMEDIABLE_ESC_CATEGORIES
+
+    def test_empty_is_vacuously_true(self) -> None:
+        """No open escalation → True, byte-identical to today's
+        ``not report.open_escalations``."""
+        assert Harness._only_merge_remediable([]) is True
+
+    def test_all_remediable_is_true(self) -> None:
+        assert Harness._only_merge_remediable([_ref('stranded_blocked')]) is True
+
+    def test_mixed_is_false(self) -> None:
+        """One non-remediable esc among remediable ones still vetoes."""
+        refs = [_ref('stranded_blocked'), _ref('design_concern')]
+        assert Harness._only_merge_remediable(refs) is False
+
+    @pytest.mark.parametrize('category', ['design_concern', 'stranded_merge_failed'])
+    def test_single_non_remediable_is_false(self, category: str) -> None:
+        assert Harness._only_merge_remediable([_ref(category)]) is False
+
+
 @pytest.mark.asyncio
 class TestStrandedMergeFailedL2:
     """Durable merge/verify FAILURE → born-at-L2 stranded_merge_failed (step-13).
@@ -991,11 +1296,16 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
     the action via an auto-dismissed escalation (NO pending L1, marker
     stamped).  The merge then LANDS (a MergeProvenance journal row makes the
     branch resolve ON_MAIN).  Sweep 2 marks the blocked task done via the
-    EXISTING found_on_main MARK_DONE_WITH_PROVENANCE path — which is only
-    reachable because (a) the record escalation is DISMISSED, not pending
-    (else the ``not report.open_escalations`` guard would block the flip),
-    and (b) the ``stranded_merge_request`` marker lives in metadata, ignored
-    by the mark-done path.  No ``stranded_merge_failed`` L2 is ever filed.
+    EXISTING found_on_main MARK_DONE_WITH_PROVENANCE path — reachable because
+    (a) the record escalation is DISMISSED, not pending, so the upgrade's
+    open-escalation guard is vacuously satisfied, and (b) the
+    ``stranded_merge_request`` marker lives in metadata, ignored by the
+    mark-done path.  No ``stranded_merge_failed`` L2 is ever filed.
+
+    Since PRD leaf δ that guard is ``_only_merge_remediable``, so a pending
+    ``stranded_blocked`` record would not block the flip either — this test
+    still pins the DISMISSED shape the submit path actually produces, and
+    TestVerifiedGreenVetoRelaxOnMain covers the still-pending case.
     """
 
     async def test_submit_then_land_marks_done_via_found_on_main(
@@ -1081,3 +1391,199 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
             if e.category == 'stranded_merge_failed'
         ]
         assert l2s == []
+
+
+# ---------------------------------------------------------------------------
+# Shared merge-submit primitives (task 3031 β, INV-5 extraction).
+#
+# The stranded reaper and the architect's `report_ready_to_merge` desync exit
+# both need the same build→register-callback→enqueue→stamp-marker plumbing.
+# It lives here as two free functions so neither caller copies it and
+# workflow.py needn't import harness.py (circular).  The two callers differ
+# ONLY in `source=` tag, marker key, and terminal done-callback.
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRequestMarkerIsFresh:
+    """The shared freshness predicate behind BOTH submit-dedup guards."""
+
+    def test_fresh_matching_marker_is_fresh(self) -> None:
+        assert merge_request_marker_is_fresh(_marker(tip=_TIP), _TIP) is True
+
+    def test_non_dict_marker_is_not_fresh(self) -> None:
+        """Fail-safe: a malformed marker must never wedge a submit."""
+        assert merge_request_marker_is_fresh('not-a-dict', _TIP) is False
+        assert merge_request_marker_is_fresh(None, _TIP) is False
+        assert merge_request_marker_is_fresh(['a'], _TIP) is False
+
+    def test_mismatched_tip_is_not_fresh(self) -> None:
+        assert merge_request_marker_is_fresh(_marker(tip='f' * 40), _TIP) is False
+
+    def test_missing_or_unparseable_timestamp_is_not_fresh(self) -> None:
+        assert merge_request_marker_is_fresh({'tip_sha': _TIP}, _TIP) is False
+        assert merge_request_marker_is_fresh(
+            {'tip_sha': _TIP, 'submitted_at': ''}, _TIP,
+        ) is False
+        assert merge_request_marker_is_fresh(
+            {'tip_sha': _TIP, 'submitted_at': 'not-a-timestamp'}, _TIP,
+        ) is False
+        assert merge_request_marker_is_fresh(
+            {'tip_sha': _TIP, 'submitted_at': 12345}, _TIP,
+        ) is False
+
+    def test_stale_timestamp_is_not_fresh(self) -> None:
+        assert merge_request_marker_is_fresh(
+            _marker(tip=_TIP, age_s=7200.0), _TIP,
+        ) is False
+
+    def test_grace_is_configurable(self) -> None:
+        """The recency window is a parameter, not a hard-coded constant — the
+        reaper passes its own grace; the default is the shared window."""
+        marker = _marker(tip=_TIP, age_s=120.0)
+        assert merge_request_marker_is_fresh(marker, _TIP, grace_s=60.0) is False
+        assert merge_request_marker_is_fresh(marker, _TIP, grace_s=600.0) is True
+
+    def test_naive_timestamp_is_read_as_utc(self) -> None:
+        """A tz-naive submitted_at is interpreted as UTC (not local), so a
+        just-stamped naive marker still reads fresh."""
+        naive = datetime.now(UTC).replace(tzinfo=None).isoformat()
+        assert merge_request_marker_is_fresh(
+            {'tip_sha': _TIP, 'submitted_at': naive}, _TIP,
+        ) is True
+
+    def test_future_timestamp_is_fresh(self) -> None:
+        """Clock skew lands on the safe side: a future stamp reads fresh
+        (skip) rather than triggering a duplicate submit."""
+        assert merge_request_marker_is_fresh(
+            _marker(tip=_TIP, age_s=-300.0), _TIP,
+        ) is True
+
+
+@pytest.mark.asyncio
+class TestSubmitVerifiedGreenMergeRequest:
+    """The shared build→callback→enqueue→stamp submit helper."""
+
+    async def _submit(
+        self,
+        tmp_path: Path,
+        *,
+        source: str = 'architect-desync',
+        marker_key: str = 'architect_merge_request',
+        done_callback: Callable[[asyncio.Future], None] | None = None,
+        update_task: Any = None,
+        event_store: EventStore | None = None,
+        merge_queue: asyncio.Queue | None = None,
+        config: Any = None,
+    ):
+        from orchestrator.merge_types import QueuedBranch
+
+        queue = merge_queue if merge_queue is not None else asyncio.Queue()
+        cfg = config
+        if cfg is None:
+            cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+            cfg.module_configs_or_empty = {}
+        req = await submit_verified_green_merge_request(
+            task_id=_TID,
+            branch=QueuedBranch.parse(_TID, 'task/'),
+            worktree=tmp_path / 'wt',
+            tip_sha=_TIP,
+            config=cfg,
+            module_configs=[],
+            merge_queue=queue,
+            event_store=event_store,
+            source=source,
+            marker_key=marker_key,
+            done_callback=done_callback or (lambda fut: None),
+            update_task=update_task or AsyncMock(return_value=True),
+        )
+        return req, queue
+
+    async def test_builds_and_enqueues_one_merge_request(
+        self, tmp_path: Path,
+    ) -> None:
+        req, queue = await self._submit(tmp_path)
+
+        assert queue.qsize() == 1
+        queued = queue.get_nowait()
+        assert queued is req
+        assert queued.task_id == _TID
+        assert queued.branch.bare_id == _TID
+        assert queued.snapshot_tip == _TIP
+        assert queued.pre_rebased is False
+        assert queued.task_files is None
+        assert queued.worktree == tmp_path / 'wt'
+
+    async def test_registers_done_callback_on_the_future(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_types import MergeOutcome
+
+        seen: list[Any] = []
+        req, _queue = await self._submit(
+            tmp_path, done_callback=lambda fut: seen.append(fut),
+        )
+        req.result.set_result(MergeOutcome(status='done', merge_sha='abc'))
+        await asyncio.sleep(0)
+
+        assert len(seen) == 1
+        assert seen[0] is req.result
+
+    async def test_threads_source_to_merge_queued_event(
+        self, tmp_path: Path,
+    ) -> None:
+        """The submission's merge_queued event carries data.source=<source>,
+        so the two callers stay distinguishable in the event stream."""
+        store = EventStore(tmp_path / 'submit-runs.db', 'run-1')
+        await self._submit(tmp_path, source='architect-desync', event_store=store)
+
+        rows = store.fetch_events_by_type_all_runs(
+            EventType.merge_queued, task_id=_TID,
+        )
+        assert len(rows) == 1
+        assert (rows[0].get('data') or {}).get('source') == 'architect-desync'
+
+    async def test_stamps_marker_under_the_given_key(
+        self, tmp_path: Path,
+    ) -> None:
+        update_task = AsyncMock(return_value=True)
+        req, _queue = await self._submit(
+            tmp_path, marker_key='architect_merge_request', update_task=update_task,
+        )
+
+        update_task.assert_awaited_once()
+        call = update_task.await_args
+        assert call is not None
+        assert call.args[0] == _TID
+        payload = call.args[1]
+        # A single key keeps merge-mode writes from clobbering siblings — and
+        # keeps the two submit paths' markers from clobbering each other.
+        assert list(payload.keys()) == ['architect_merge_request']
+        marker = payload['architect_merge_request']
+        assert marker['tip_sha'] == _TIP
+        assert marker['request_id'] == req.request_id
+        datetime.fromisoformat(marker['submitted_at'])
+
+    async def test_stamped_marker_reads_back_as_fresh(
+        self, tmp_path: Path,
+    ) -> None:
+        """The stamp and the freshness predicate agree — a just-stamped marker
+        suppresses an immediate re-submit by the same caller."""
+        update_task = AsyncMock(return_value=True)
+        await self._submit(tmp_path, update_task=update_task)
+        call = update_task.await_args
+        assert call is not None
+        marker = call.args[1]['architect_merge_request']
+
+        assert merge_request_marker_is_fresh(marker, _TIP) is True
+
+    async def test_failing_update_task_is_swallowed(
+        self, tmp_path: Path,
+    ) -> None:
+        """Best-effort marker stamp: a lost marker only risks a benign
+        re-submit, so a write failure must never abort the remediation (the
+        request is already enqueued)."""
+        update_task = AsyncMock(side_effect=RuntimeError('scheduler down'))
+        req, queue = await self._submit(tmp_path, update_task=update_task)
+
+        assert queue.qsize() == 1
+        assert req.request_id.startswith('mr-')

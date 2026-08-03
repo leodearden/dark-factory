@@ -8,7 +8,15 @@
 # the SERVICE env, not a bare shell, or the census silently narrows), then
 # passes caller args through -- e.g. --project-id reify --max-backlog 0.
 # Exit code only: 0 = residual source-tagged backlog within --max-backlog,
-# 1 = violated (the orchestrator's predicate contract reads no output).
+# 1 = violated. The VERDICT is the exit code; the orchestrator parses no
+# output to reach it. It does, however, READ the output: on rc=0 it extracts
+# a bounded structured summary (a trailing JSON block, else one clean final
+# line, log lines dropped) into done_provenance.note, and on rc!=0 it carries
+# the output verbatim in the escalation detail. This header previously
+# asserted the runner "reads no output" -- that stale belief is precisely why
+# task 2902's server-log noise reached a task note and, from there, memory
+# (task 3286). Emit a trailing JSON object or one clean final line if you
+# want this script's verdict preserved.
 #
 # Unlike the nightly sweep wrapper this performs NO deletions (--check
 # without --apply is a dry-run census + verdict), so resolve/resume re-runs

@@ -23,10 +23,13 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import logging
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger('legibility.digest')
 
 
 def load_transcript(path: Any) -> list[dict[str, Any]]:
@@ -81,10 +84,16 @@ def _user_turn_text(content: Any) -> str | None:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        # The `isinstance(..., str)` guard already excludes None and non-str at
+        # runtime, but binding it with a walrus is what carries that narrowing
+        # into the element expression — pyright cannot narrow an unbound
+        # `.get()` CALL across the guard, so the un-bound spelling inferred
+        # list[Unknown | None] and rejected the join. Same iteration, same
+        # filter, same values.
         texts = [
-            block.get('text') for block in content
+            block_text for block in content
             if isinstance(block, dict) and block.get('type') == 'text'
-            and isinstance(block.get('text'), str)
+            and isinstance(block_text := block.get('text'), str)
         ]
         if texts:
             return '\n'.join(texts)
@@ -103,8 +112,8 @@ def _content_to_text(content: Any) -> str:
         return content
     if isinstance(content, list):
         parts = [
-            block.get('text') for block in content
-            if isinstance(block, dict) and isinstance(block.get('text'), str)
+            block_text for block in content
+            if isinstance(block, dict) and isinstance(block_text := block.get('text'), str)
         ]
         return '\n'.join(parts)
     return ''
@@ -420,7 +429,12 @@ def find_retry_loops(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     PRD Sec 13.2): no fuzzy string similarity, just "same tool, same
     canonical-JSON input, again".
     """
-    groups: dict[tuple[str, str], list[int]] = {}
+    # `str | None` in the key, not `str`: _iter_tool_use_blocks selects on
+    # `type == 'tool_use'` only, so a malformed block with no 'name' yields a
+    # None here and always has. The declared type is corrected to match rather
+    # than the value coerced, which would change what a nameless block renders
+    # as in the report for no benefit.
+    groups: dict[tuple[str | None, str], list[int]] = {}
     for index, block in _iter_tool_use_blocks(records):
         key = (block.get('name'), _input_signature(block.get('input')))
         groups.setdefault(key, []).append(index)
@@ -512,6 +526,37 @@ CURATOR_CLASSIFIER_MARKERS: tuple[str, ...] = (
 (fused_memory/src/fused_memory/middleware/task_curator.py) and the
 code-module classifier (orchestrator/src/orchestrator/harness.py)."""
 
+HARNESS_BRIEFING_HEADINGS: tuple[str, ...] = ('# context', '## agent identity', '# task')
+"""Injected orchestrator-briefing heading literals
+(orchestrator/src/orchestrator/agents/briefing.py: ``_get_memory_context``
+emits '# Context'; ``_agent_identity`` emits '## Agent Identity'; the role
+prompt templates emit '# Task'). All three must co-occur as line-anchored
+headings (matched via all(), not any() -- the same false-positive guard as
+ORCHESTRATED_TASK_MARKERS) so a genuine human turn that happens to open
+with '# Task', or that quotes '# Context' mid-prose, is never excluded
+from the gold user_corrections section."""
+
+HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
+    'you are the trickle coder for the dark-factory agent-confusion codebook',
+)
+"""Harness-authored PROSE preamble literals, matched as plain
+case-insensitive substrings (unlike the line-anchored heading markers
+above): the trickle coder's system prompt
+(scripts/legibility/coder.py:174 ``build_prompt``). Extend with future
+harness prompt literals as one-line additions."""
+
+
+def is_harness_injected_turn(text: str) -> bool:
+    """True when *text* is harness-injected rather than genuine human-typed
+    input: either the orchestrator's briefing preamble (all
+    HARNESS_BRIEFING_HEADINGS co-occur, each as its own stripped line) or a
+    harness prose preamble (any HARNESS_PROMPT_MARKERS substring)."""
+    lowered = text.lower()
+    lines = {line.strip() for line in lowered.splitlines()}
+    if all(heading in lines for heading in HARNESS_BRIEFING_HEADINGS):
+        return True
+    return any(marker in lowered for marker in HARNESS_PROMPT_MARKERS)
+
 
 def classify_agent_class(
     records: list[dict[str, Any]], override: str | None = None,
@@ -550,9 +595,15 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return genuine non-sidechain, non-meta human user turns.
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
-    isMeta=True (system-injected) turns, and user records whose content is
-    entirely tool_result blocks. User corrections are gold (PRD Sec 5) --
-    this is the highest-priority digest section.
+    isMeta=True (system-injected) turns, user records whose content is
+    entirely tool_result blocks, and harness-injected briefing/prompt turns
+    (see :func:`is_harness_injected_turn`) -- these are typed into the
+    transcript as ordinary user-role text (isMeta=False), so isMeta alone
+    cannot exclude them. This function is the SINGLE source for both the
+    gold user_corrections section and render_digest's n_user_turns score
+    component, so this one filter excludes a harness-injected turn from
+    both. User corrections are gold (PRD Sec 5) -- this is the
+    highest-priority digest section.
     """
     turns = []
     for index, record in enumerate(records):
@@ -564,6 +615,8 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         text = _user_turn_text(_message_content(record))
         if text is None:
+            continue
+        if is_harness_injected_turn(text):
             continue
         turns.append({'index': index, 'text': text})
     return turns
@@ -655,12 +708,19 @@ def _derive_date(records: list[dict[str, Any]]) -> str:
 def _encode_cwd(cwd: str) -> str:
     """Mirror Claude Code's own ``~/.claude/projects/<enc>`` encoding.
 
-    Both '/' and '.' map to '-' (same rule as
-    orchestrator/src/orchestrator/session_registry.py:transcript_path_for_cwd,
-    reused here as the fallback when the real transcript path isn't
-    available to read the ground-truth encoded dir name off disk).
+    '/', '.' AND '_' all map to '-', and case is preserved — same rule as
+    orchestrator.session_registry.encode_cwd, the canonical implementation,
+    which carries the authoritative statement of the rule and the record of
+    the 738 real (encoded-dir, decoded-cwd) pairs it was validated against.
+    Reused here as the fallback when the real transcript path isn't
+    available to read the ground-truth encoded dir name off disk.
+
+    Agreement with the canonical is not left to goodwill: it is asserted
+    row-for-row against real on-disk dir names by
+    ``scripts/tests/test_legibility_inventory.py``'s ``TestEncoderLockstep``
+    (task 3272, which found this copy and three others all missing '_').
     """
-    return cwd.replace('/', '-').replace('.', '-')
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
 
 
 def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> str:
@@ -749,14 +809,73 @@ _SECTION_RENDERERS: dict[str, Any] = {
 """(detector, item-renderer) pair per section key, keyed identically to
 SECTION_HEADINGS/SECTION_PRIORITY."""
 
+ITEM_TRUNCATION_MARKER = '... [item truncated]'
+"""Appended to a per-item line that exceeded its byte cap. Explicit and
+ASCII (so its own byte length equals its character length), keeping
+degradation legible rather than silently lossy."""
 
-def _build_sections(records: list[dict[str, Any]]) -> dict[str, list[str]]:
+MAX_ITEM_BYTES = 2048
+"""Hard ceiling on a single rendered item's UTF-8 byte length, regardless
+of how large *max_bytes* is."""
+
+MIN_ITEM_BYTES = 256
+"""Floor on a single rendered item's cap, even for a very small
+*max_bytes* -- an item capped below this would be truncated into
+unreadable noise."""
+
+FRONTMATTER_RESERVE_BYTES = 512
+"""Bytes reserved for the frontmatter block plus a '## ' section heading
+when deriving the per-item cap from *max_bytes* (see
+:func:`_item_byte_cap`). Measured frontmatter is ~276-310 bytes;
+reserving 512 leaves headroom for a heading line too, so "frontmatter +
+heading + one capped item" always fits under any realistic max_bytes --
+this is what makes the R2 empty-body pathology structurally unreachable
+rather than merely checked (:func:`_warn_if_body_evicted` is the
+belt-and-braces backstop for the residual edge cases, e.g. a pathologically
+tiny max_bytes)."""
+
+
+def _item_byte_cap(max_bytes: int) -> int:
+    """Derive the per-item byte cap from the digest's overall *max_bytes*
+    budget: never above MAX_ITEM_BYTES, never below MIN_ITEM_BYTES,
+    otherwise *max_bytes* minus headroom for the frontmatter + heading."""
+    return max(MIN_ITEM_BYTES, min(MAX_ITEM_BYTES, max_bytes - FRONTMATTER_RESERVE_BYTES))
+
+
+def _cap_item(line: str, cap: int) -> str:
+    """Return *line* unchanged when its UTF-8 byte length is within *cap*;
+    otherwise byte-truncate (never splitting a multi-byte codepoint) and
+    append :data:`ITEM_TRUNCATION_MARKER`.
+
+    Byte-wise because the whole digest budget is measured in UTF-8 bytes
+    (:func:`_resolve_size_bytes`); ``decode(..., 'ignore')`` drops a
+    partial trailing codepoint instead of emitting a U+FFFD replacement
+    character, so a truncated item never introduces mojibake into text a
+    downstream LLM coder reads verbatim.
+    """
+    encoded = line.encode('utf-8')
+    if len(encoded) <= cap:
+        return line
+    keep = max(0, cap - len(ITEM_TRUNCATION_MARKER))
+    return encoded[:keep].decode('utf-8', 'ignore') + ITEM_TRUNCATION_MARKER
+
+
+def _build_sections(
+    records: list[dict[str, Any]], *, item_max_bytes: int = _item_byte_cap(15360),
+) -> dict[str, list[str]]:
     """Run every detector once and render its hits to markdown bullet
-    lines, keyed by section key. A section with zero hits maps to an empty
-    list -- render_digest skips emitting a heading for it."""
+    lines, keyed by section key, capping each rendered line to
+    *item_max_bytes* (see :func:`_cap_item`) at this single choke point --
+    applied uniformly across all seven sections so ONE oversized item
+    (e.g. a multi-KB pasted user turn, or a huge echoed tool_result) can
+    never evict every sibling section during :func:`_truncate_sections`'
+    trim loop. A section with zero hits maps to an empty list --
+    render_digest skips emitting a heading for it."""
     sections = {}
     for key, (detector, renderer) in _SECTION_RENDERERS.items():
-        sections[key] = renderer(detector(records))
+        sections[key] = [
+            _cap_item(line, item_max_bytes) for line in renderer(detector(records))
+        ]
     return sections
 
 
@@ -798,7 +917,7 @@ def _resolve_size_bytes(meta: dict[str, Any], body: str) -> str:
 
 def _truncate_sections(
     meta: dict[str, Any], sections: dict[str, list[str]], max_bytes: int,
-) -> str:
+) -> tuple[str, dict[str, list[str]]]:
     """Trim *sections* in ASCENDING SECTION_PRIORITY order (lowest-signal
     first) until the fully-rendered digest fits within *max_bytes*, or
     there is nothing left to trim -- PRD Sec 7.2 "truncate lowest-signal
@@ -813,6 +932,11 @@ def _truncate_sections(
     the worst case every item in every section is removed, at which point
     the loop stops even if the (now section-free) digest is still over
     the cap -- a soft cap can't shrink the frontmatter itself.
+
+    Returns the rendered digest AND the post-trim section dict, so a
+    caller can inspect final section state (e.g. render_digest's
+    :func:`_warn_if_body_evicted` consistency guard) without re-parsing
+    the rendered markdown body.
     """
     sections = {key: list(lines) for key, lines in sections.items()}
     digest = _resolve_size_bytes(meta, _render_body(sections))
@@ -824,7 +948,35 @@ def _truncate_sections(
         sections[target_key].pop()
         digest = _resolve_size_bytes(meta, _render_body(sections))
 
-    return digest
+    return digest, sections
+
+
+def _warn_if_body_evicted(
+    meta: dict[str, Any], sections: dict[str, list[str]], max_bytes: int,
+) -> None:
+    """Emit-time consistency guard: nonzero ``signal_counts`` implies a
+    non-empty body. :func:`_item_byte_cap`'s per-item cap makes a
+    violation structurally unreachable for any realistic *max_bytes* (see
+    FRONTMATTER_RESERVE_BYTES) -- this is the belt-and-braces backstop for
+    the residual edge cases (e.g. a pathologically tiny *max_bytes*).
+
+    Never raises: a soft-cap edge case must not turn into a per-session
+    failure for census.py/nightly.py callers. Never silent either -- a
+    violation is logged LOUDLY, naming the session, the nonzero counts and
+    *max_bytes*, so the degenerate digest is never mistaken for a
+    genuinely signal-free session.
+    """
+    counts = meta['signal_counts']
+    if not any(counts.values()):
+        return
+    if any(sections.values()):
+        return
+    nonzero = {key: value for key, value in counts.items() if value}
+    logger.warning(
+        'digest body fully evicted despite nonzero signal_counts: '
+        'session=%s signal_counts=%s max_bytes=%d',
+        meta['session'], nonzero, max_bytes,
+    )
 
 
 def render_digest(
@@ -859,8 +1011,10 @@ def render_digest(
         'signal_counts': counts,
     }
 
-    sections = _build_sections(records)
-    return _truncate_sections(meta, sections, max_bytes)
+    sections = _build_sections(records, item_max_bytes=_item_byte_cap(max_bytes))
+    digest, trimmed_sections = _truncate_sections(meta, sections, max_bytes)
+    _warn_if_body_evicted(meta, trimmed_sections, max_bytes)
+    return digest
 
 
 def build_digest(

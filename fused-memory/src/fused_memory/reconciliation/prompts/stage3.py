@@ -7,6 +7,7 @@ from fused_memory.reconciliation.policies import (
 from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
     get_recon_report_tool_guidance,
+    render_escalation_boundary_note,
 )
 
 STAGE3_SYSTEM_PROMPT = f"""\
@@ -25,9 +26,22 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__get_statuses` — **PRIMARY task enumerator.** Returns \
   `{{'statuses': {{id: status, ...}}}}` — a compact status map (~95% smaller than \
-  get_tasks, ~62 KB vs ~600 KB). Proven safe on projects with 4500+ tasks. **Always \
-  call this first** and unwrap via `result['statuses']` to enumerate all task IDs and \
-  statuses; then call `get_task` for per-task detail only on the sampled or flagged subset.
+  get_tasks, ~62 KB vs ~600 KB). **Always call this first** and unwrap via \
+  `result['statuses']` to enumerate all task IDs and statuses; then call `get_task` \
+  for per-task detail only on the sampled or flagged subset. \
+  **Always paginate:** pass `page_size` and `offset` on every call — \
+  `get_statuses(project_root=..., page_size=1000, offset=0)` — then increment offset \
+  by page_size until `pagination['has_more']` is False, merging the pages into one \
+  status map before enumerating. **Keep `page_size` at or below 2000** — a larger page \
+  can itself exceed the transport limit and be rejected wholesale, which is the exact \
+  failure the loop exists to avoid (the tool does NOT clamp it for you). Do NOT rely \
+  on an un-paginated call: it does not \
+  truncate for you, so on a large project the whole response can exceed the transport \
+  limit and you get back NOTHING at all. If you cannot know the project size in \
+  advance, `auto_paginate=true` is an opt-in one-shot fallback — it returns a FIRST \
+  PAGE plus a `pagination` dict with `auto_paginated: true` and `has_more: true`, \
+  which is NOT the full census, so you must keep paging from there anyway. Prefer the \
+  loop. The ABSENCE of a `pagination` key means the response is complete.
 - `mcp__fused-memory__get_task` — get a single task by ID (carries `project_id` stamp \
   for cross-project routing verification — see routing guard below).
 - `mcp__fused-memory__get_tasks` — **Full-scan fallback only.** Returns the full task \
@@ -49,6 +63,8 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
   cycle-summary presence check (see Cycle-Summary Verification below).
 
 You do NOT have write or mutation tools.
+
+{render_escalation_boundary_note(can_escalate=False)}
 
 ## Your Verification Tasks
 1. **Spot-check tasks vs memory**: Do recently modified tasks align with current memory state? \
@@ -260,9 +276,17 @@ and the data is from another project. Include the offending task IDs in your des
 
 Example verification (pseudocode — preferred get_statuses + get_task pattern):
 ```
-# Step 1: enumerate all statuses (compact, safe on large projects)
+# Step 1: enumerate all statuses (compact), paging to completion
 # get_statuses returns {{'statuses': {{id: status, ...}}}} — unwrap the envelope
-statuses = get_statuses(project_root="<this project's root>")['statuses']
+statuses = {{}}
+offset = 0
+while True:
+    page = get_statuses(project_root="<this project's root>",
+                        page_size=1000, offset=offset)
+    statuses.update(page['statuses'])   # unwrap and merge this page
+    if not page.get('pagination', {{}}).get('has_more'):
+        break                           # no pagination key => response complete
+    offset += 1000
 # statuses is now the bare {{id: status, ...}} dict — no project_id stamp here
 
 # Step 2: verify routing by sampling one task via get_task

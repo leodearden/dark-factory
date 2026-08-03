@@ -31,6 +31,85 @@ def _extract_payload_text(payload: dict[str, Any]) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# mem0-owned metadata keys
+# ---------------------------------------------------------------------------
+
+#: Keys mem0's ``AsyncMemory._update_memory``
+#: (site-packages/mem0/memory/main.py, ~line 2449) never trusts from a
+#: forwarded metadata dict: ``data``/``hash``/``created_at``/``updated_at``
+#: are unconditionally recomputed from the update call's own arguments and
+#: the existing stored point, and
+#: ``user_id``/``agent_id``/``run_id``/``actor_id``/``role`` are restored
+#: from the *currently stored* payload (unconditionally for ``actor_id``;
+#: whenever absent from what was forwarded for the rest).  Forwarding stale
+#: copies of these works only because mem0 keeps overwriting/re-deriving
+#: them -- an implicit coupling to mem0 internals.  Stripping them makes
+#: the intent explicit: preserve only a record's CUSTOM provenance keys.
+#:
+#: DEFENSIVE NOTE (PRD D12 / task 3055 §6, extracted here by task 3195):
+#: this module is the DECIDED HOME for this set.  ``memory_metadata.py``,
+#: ``scripts/tag_cgl_eta_rehome_scope.py`` (which defined it first) and the
+#: in-place ``update_memory`` tool (task 3088, via
+#: :func:`split_managed_metadata` below and ``server/tools.py``) bind this
+#: same object rather than rebuilding it; task 3195 landed first and task
+#: 3088 imports rather than re-extracts.  Never two copies (INV-5) -- a
+#: second definition that drifts from this one is exactly the failure D12
+#: exists to prevent, and is asserted against by object identity in
+#: ``tests/test_memory_metadata.py::TestKeyLayers``.
+MEM0_MANAGED_METADATA_KEYS = frozenset({
+    'data', 'hash', 'created_at', 'updated_at',
+    'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
+})
+
+
+# Payload keys FUSED-MEMORY owns, which a caller-supplied metadata delta must
+# not be able to destroy by omission. Distinct from the mem0-owned set above:
+# mem0 recomputes-or-restores its own keys, so losing one of those is
+# self-healing, whereas nothing restores these.
+#
+# 'category': Mem0Backend.search pushes it down to Qdrant as a payload filter
+# (`filters = {'category': categories[0]}`), and every record carries it —
+# MemoryService.add_memory and add_system_record both stamp
+# meta['category'] = resolved_category.value before the write. A record that
+# loses the key is therefore permanently invisible to every category-scoped
+# search, with no error and no other symptom: the point still exists, still
+# has its content, and still answers a direct get. That silence is what makes
+# the key worth protecting rather than merely documenting.
+#
+# Protected is not frozen: an explicit metadata_patch={'category': ...} still
+# overrides the carried-through value, so deliberate re-categorization works.
+# Registering a new key here makes update_memory's replace mode carry it
+# through; it lives beside the mem0-owned set so a reader asking "which
+# payload keys are protected from a caller-supplied delta?" finds both answers
+# in one place (INV-5).
+_FUSED_MEMORY_OWNED_METADATA_KEYS = frozenset({'category'})
+
+
+def split_managed_metadata(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Partition a stored Qdrant payload into (mem0-owned, custom) subsets.
+
+    Unknown keys land in the CUSTOM subset: anything mem0 does not
+    recompute-or-restore is provenance the caller is responsible for
+    preserving, so the fail-safe direction for an unrecognised key is
+    "preserve it", not "drop it".
+
+    Both returned dicts are fresh shallow copies -- callers mutate the custom
+    subset in place (the metadata merge/delete arms) and must not disturb the
+    payload they read.
+    """
+    managed: dict[str, Any] = {}
+    custom: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in MEM0_MANAGED_METADATA_KEYS:
+            managed[key] = value
+        else:
+            custom[key] = value
+    return managed, custom
+
+
 class Mem0Backend:
     """Lazily creates AsyncMemory instances keyed by project_id."""
 
@@ -280,6 +359,94 @@ class Mem0Backend:
             timeout=self._write_timeout,
         )
 
+    async def set_payload(
+        self,
+        memory_id: str,
+        payload: dict[str, Any],
+        scope: Scope,
+    ) -> None:
+        """Partial-merge *payload* into a point's stored payload. No re-embed.
+
+        Straight to Qdrant's ``set_payload`` — a genuine storage-layer partial
+        merge, so pre-existing keys not named in *payload* survive and no
+        read-modify-write is needed to compute the result. Deliberately bypasses
+        mem0's ``AsyncMemory.update`` (see :meth:`update`), which would re-embed
+        the content, rewrite ``updated_at`` and append a mem0 history row for
+        what may be a purely cosmetic tag.
+
+        A write timeout PROPAGATES (raises ``TimeoutError``) rather than being
+        swallowed into a falsy return — the posture of
+        :meth:`get_point_by_id` / :meth:`count_by_metadata`, in deliberate
+        contrast to :meth:`get`. A caller must never mistake an unreachable
+        Qdrant for a completed write (no-silent-fail invariant).
+
+        NOTE: Qdrant answers ``acknowledged``/``completed`` for an UNKNOWN point
+        id — a no-op, not an error. Callers must confirm the point exists (see
+        :meth:`get_point_by_id`) before treating a return here as proof that
+        anything was written.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        await asyncio.wait_for(
+            client.set_payload(
+                collection_name=collection_name,
+                payload=payload,
+                points=[memory_id],
+            ),
+            timeout=self._write_timeout,
+        )
+
+    async def delete_payload(
+        self,
+        memory_id: str,
+        keys: list[str],
+        scope: Scope,
+    ) -> None:
+        """Remove exactly *keys* from a point's stored payload. No re-embed.
+
+        Straight to Qdrant's ``delete_payload``; keys not named are untouched.
+        Same bypass rationale, same propagating-timeout posture and the same
+        unknown-point-id caveat as :meth:`set_payload`.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        await asyncio.wait_for(
+            client.delete_payload(
+                collection_name=collection_name,
+                keys=keys,
+                points=[memory_id],
+            ),
+            timeout=self._write_timeout,
+        )
+
+    async def overwrite_payload(
+        self,
+        memory_id: str,
+        payload: dict[str, Any],
+        scope: Scope,
+    ) -> None:
+        """Replace a point's ENTIRE stored payload with *payload*. No re-embed.
+
+        Straight to Qdrant's ``overwrite_payload``. Unlike :meth:`set_payload`
+        this is NOT a merge: every key absent from *payload* is destroyed. In
+        particular the mem0-owned keys (``_MEM0_MANAGED_METADATA_KEYS``) must be
+        read back and re-attached by the caller, or the point becomes unreadable
+        by mem0's own ``get``/``search``.
+
+        Same bypass rationale, same propagating-timeout posture and the same
+        unknown-point-id caveat as :meth:`set_payload`.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        await asyncio.wait_for(
+            client.overwrite_payload(
+                collection_name=collection_name,
+                payload=payload,
+                points=[memory_id],
+            ),
+            timeout=self._write_timeout,
+        )
+
     async def delete(self, memory_id: str, scope: Scope) -> dict[str, Any]:
         """Delete a memory."""
         instance = await self._get_instance(scope)
@@ -362,6 +529,8 @@ class Mem0Backend:
         scope: Scope,
         filters: dict[str, Any],
         limit: int = 1000,
+        *,
+        with_vectors: bool = False,
     ) -> list[dict[str, Any]]:
         """Deterministic enumeration of memories whose payload matches all *filters*.
 
@@ -384,11 +553,26 @@ class Mem0Backend:
                 count_by_metadata).  Empty dict is rejected to avoid silently
                 enumerating every memory in the collection.
             limit: Maximum number of points to return (default 1000).
+            with_vectors: When False (default) only the payload is fetched,
+                preserving the payload-only contract every existing caller
+                relies on and paying no bandwidth for vectors nobody reads.
+                When True, each point's stored vector is fetched and lifted
+                onto its result dict under ``'vector'``.  This exists for ANN
+                candidate generation (``scripts/audit_duplicate_memories.py``):
+                re-using the vector Mem0 already wrote means the caller can
+                query Qdrant for neighbours without making a single embedding
+                API call, and without risking a second metric space.
 
         Returns:
             List of dicts ``{'id': ..., 'created_at': ..., 'metadata': {...}}``
             where ``created_at`` is the raw string from the Qdrant payload (or
             ``None`` if absent) and ``metadata`` is the full payload dict.
+            When *with_vectors* is True each dict additionally carries
+            ``'vector'`` — the stored embedding, or ``None`` if Qdrant
+            returned that point without one.  A vector-less point is still
+            returned (degraded, not dropped) so the caller can count and
+            report it rather than losing it silently; the ``'vector'`` key is
+            absent entirely when *with_vectors* is False.
 
         Raises:
             ValueError: If *filters* is empty.
@@ -416,6 +600,7 @@ class Mem0Backend:
                 collection_name=collection_name,
                 scroll_filter=qdrant_filter,
                 with_payload=True,
+                with_vectors=with_vectors,
                 limit=limit,
             ),
             timeout=self._read_timeout,
@@ -424,11 +609,18 @@ class Mem0Backend:
         result = []
         for point in points:
             payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-            result.append({
+            record: dict[str, Any] = {
                 'id': point.id,
                 'created_at': payload.get('created_at'),
                 'metadata': payload,
-            })
+            }
+            if with_vectors:
+                # getattr-with-default, not point.vector: Qdrant can return a
+                # point carrying no vector at all.  Degrade to None so the
+                # caller can count it as a disclosure — raising here would
+                # discard an entire otherwise-good scan over one bad point.
+                record['vector'] = getattr(point, 'vector', None)
+            result.append(record)
 
         if len(points) == limit:
             logger.warning(

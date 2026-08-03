@@ -23,12 +23,13 @@ import shutil
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable, Collection, Iterator
+from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from orchestrator.critical_gate import critical_filing_gate
+from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
@@ -37,6 +38,7 @@ from orchestrator.git_ops import (
     GitOps,
     MergeResult,
     MergeVerifyLeaseContended,
+    MergeVerifyLeaseHeld,
     WorktreeMissing,
     _run,
 )
@@ -127,6 +129,9 @@ from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     did_not_pass_subset,
     diff_per_test_results,
     merge_retry_shadow_baseline,
+    nextest_filter_ids,
+    parse_failed_run_all_members,
+    parse_nextest_list_planned,
     parse_per_test_results,
 )
 from orchestrator.merge_speculation_controller import (  # noqa: F401  re-export shim
@@ -935,7 +940,7 @@ async def _classify_disposition_for_outcome(
     main_sha: str,
     event_store: EventStore | None,
     real_main_head_sha: str | None = None,
-) -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
+) -> tuple[MergeFailureDisposition, dict[str, str] | None, str, SkewEvidence | None]:
     """Classify a non-preexisting merge-verify failure and render its I4
     surfaces (task 2383 β).
 
@@ -952,11 +957,19 @@ async def _classify_disposition_for_outcome(
 
     Belt-and-suspenders fail-open (I3): any exception — including one raised
     by the classifier itself, atop its own internal fail-open — is caught
-    here, logged at WARNING, and degrades to ``(INDETERMINATE, None, '')``
+    here, logged at WARNING, and degrades to ``(INDETERMINATE, None, '', None)``
     so the caller's outcome is never left half-attached.
+
+    The 4th element (task 3178) is the classifier's GATHERED bundle
+    (``ClassificationResult.observed_evidence``), NOT its adjudicated
+    ``evidence``: it is the one the step-18 ``merge_attempt`` emit needs, because
+    that emit now persists evidence on the ADJUDICATED-INDETERMINATE path too.
+    ``_render_skew_surfaces`` keeps receiving the ADJUDICATED bundle, so only
+    INTEGRATION_SKEW ever renders the "port the landed commit" directive — that
+    contract is untouched.
     """
     try:
-        disposition, evidence = await classify_merge_failure_disposition(
+        result = await classify_merge_failure_disposition(
             verify_result=verify,
             branch=req.branch.bare_id,
             merge_base_sha=merge_base_sha,
@@ -967,8 +980,16 @@ async def _classify_disposition_for_outcome(
             repo_root=req.config.project_root,
             event_store=event_store,
         )
-        reason_suffix, failure_diagnostic = _render_skew_surfaces(disposition, evidence)
-        return disposition, failure_diagnostic, reason_suffix
+        # Read the two evidence slots BY NAME (ClassificationResult): the
+        # ADJUDICATED bundle goes to the renderer (only INTEGRATION_SKEW gets a
+        # directive), the OBSERVED/gathered one out to the caller (task 3178).
+        reason_suffix, failure_diagnostic = _render_skew_surfaces(
+            result.disposition, result.evidence,
+        )
+        return (
+            result.disposition, failure_diagnostic, reason_suffix,
+            result.observed_evidence,
+        )
     except Exception:
         logger.warning(
             'Task %s: _classify_disposition_for_outcome failed; degrading to '
@@ -976,7 +997,7 @@ async def _classify_disposition_for_outcome(
             req.task_id,
             exc_info=True,
         )
-        return MergeFailureDisposition.INDETERMINATE, None, ''
+        return MergeFailureDisposition.INDETERMINATE, None, '', None
 
 
 async def _resolve_dispatch_time_merge_base(
@@ -1624,6 +1645,16 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 # consumes.  These REIFY_VERIFY_RETRY_* / REIFY_RUN_ALL_MEMBER_SUBSET /
 # REIFY_GUI_RETRY_SPECS env keys are BRAND NEW — this producer defines them:
 #
+# OWNERSHIP (task 3059).  DF owns the subset CONTENT end to end: it is derived
+# from attempt-0's OWN VerifyResult (per-test verdicts + failed run_all members)
+# unioned with a DF-run ``cargo nextest list`` planned probe — see
+# :func:`_build_attempt0_payload`.  The ONLY thing sourced from reify is the
+# attempt-0 pin: ``tree_oid`` and ``profiles``, read from the sidecar reify
+# actually writes at ``target/reify-verify-attempt.json`` (reify tasks
+# 5287/5548 — see :data:`_REIFY_ATTEMPT_SIDECAR_RELPATH`).  There is no
+# cross-repo obligation for the subset itself; a missing or stale sidecar
+# simply routes the retry to a FULL verify.
+#
 #   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG    absolute path to a newline
 #   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE  file of EXACT {did-not-pass}
 #                                                   nextest ids for that cargo
@@ -1631,11 +1662,26 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 #                                                   Files (not env values) because
 #                                                   a subset can be thousands of
 #                                                   ids — too large for an env.
-#   REIFY_RUN_ALL_MEMBER_SUBSET   comma-delimited {failed run_all members}.
-#   REIFY_GUI_RETRY_SPECS         comma-delimited {failed gui spec files}.
-#   REIFY_VERIFY_RETRY_TREE_OID   the attempt-0-pinned content-tree OID; reify
-#                                 corroborates it (belt-and-suspenders with the
-#                                 orchestrator's own tree-OID gate, INV-3).
+#   REIFY_RUN_ALL_MEMBER_SUBSET   SPACE-delimited {failed run_all members}.
+#   REIFY_GUI_RETRY_SPECS         SPACE-delimited {failed gui spec files}.
+#
+#     SPACE, not comma — reify WORD-SPLITS both values:
+#       verify.sh:2579  _mk_ra_toks=(${REIFY_RUN_ALL_MEMBER_SUBSET})
+#       verify.sh:2141  for _gui_retry_tok in $_gui_retry_specs
+#     and the gui shell-safety allowlist is [A-Za-z0-9._/ -], which EXCLUDES
+#     ','.  A comma-joined gui value is therefore rejected wholesale (loud full
+#     fallback, :2156) and a comma-joined run_all value collapses into one
+#     unmatchable token.
+#
+#     An EMPTY value is the deliberate SAFE fallback meaning "run this suite in
+#     FULL", never "run nothing": verify.sh:2545 and :2127 both gate the subset
+#     on the value being non-empty.
+#   REIFY_VERIFY_RETRY_TREE_OID   the attempt-0-pinned content-tree OID, taken
+#                                 from reify's own ``git rev-parse HEAD:`` stamp
+#                                 in target/reify-verify-attempt.json and
+#                                 corroborated against DF's independent
+#                                 get_head_tree_hash read (INV-3); reify then
+#                                 re-checks it a third time from its side.
 #   REIFY_VERIFY_RETRY_SCOPE      always 'failed_only' — the retry-scope marker.
 #
 # The whole dict is merged into MergeVerifySpec.verify_env (the channel already
@@ -1646,6 +1692,42 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 
 # Subdir under merge_wt holding the per-profile nextest filter files.
 _RETRY_FILTER_SUBDIR = '.reify-verify-retry'
+
+# DF-side MIRROR of reify's REIFY_VERIFY_RETRY_MAX_SUBSET storm-escape ceiling
+# (verify.sh:1703, default 5000).  reify refuses to narrow a profile whose
+# subset reaches it and runs that profile in FULL — so a subset at or above the
+# ceiling is not a narrowed retry, and DF must not charge it to the larger
+# narrowed budget.  Mirrored (not read from reify) because this is a DF-side
+# COST decision; a drift in reify's default only makes DF conservative.
+_REIFY_VERIFY_RETRY_MAX_SUBSET = 5000
+
+
+def _materially_narrows(planned: Sequence[str], subset: Sequence[str]) -> bool:
+    """True when ``subset`` is a REAL, reify-acceptable reduction of ``planned``.
+
+    Three ways a produced subset fails to narrow anything, all of which make
+    reify run the profile in FULL:
+
+    * **empty** — reify's per-profile "retry refused: no subset" fallback fires
+      (``verify.sh:1698``);
+    * **the whole plan** — reachable whenever attempt-0 reds before any test
+      line is emitted (compile-gate red, ``env_transient``,
+      ``semaphore_timeout``): ``parse_per_test_results`` returns ``{}``, so
+      every planned test is ``'not-started'``;
+    * **at/over the ceiling** — reify rejects it wholesale
+      (:data:`_REIFY_VERIFY_RETRY_MAX_SUBSET`).
+
+    Each is SAFE (the retry runs everything), but calling any of them
+    "narrowed" is a lie with a price: the caller would switch to the larger
+    ``MAX_POST_MERGE_VERIFY_NARROWED_RETRIES`` budget on the premise that a
+    narrowed retry is cheap, so the merge lane would pay TWO full re-verifies
+    where the legacy ``max_enospc`` budget paid one.
+    """
+    return (
+        bool(subset)
+        and len(subset) < len(planned)
+        and len(subset) <= _REIFY_VERIFY_RETRY_MAX_SUBSET
+    )
 
 
 def _build_retry_verify_env(
@@ -1663,7 +1745,11 @@ def _build_retry_verify_env(
     exact test id per line, deterministic order preserved from the passed lists)
     into ``filter_dir/.reify-verify-retry`` and returns the env dict documented
     in the module comment above.  ``run_all_members`` and ``gui_specs`` ship as
-    comma-delimited env values; the nextest subsets ship as file paths.
+    SPACE-delimited env values (reify word-splits both, and the gui allowlist
+    excludes ','); the nextest subsets ship as file paths.
+
+    Callers must pass nextest ids already mapped through
+    :func:`nextest_filter_ids` — this function writes the lines verbatim.
 
     Args:
         nextest_subset_debug: {did-not-pass} nextest ids for the debug profile.
@@ -1687,8 +1773,10 @@ def _build_retry_verify_env(
     return {
         'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
         'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
-        'REIFY_RUN_ALL_MEMBER_SUBSET': ','.join(run_all_members),
-        'REIFY_GUI_RETRY_SPECS': ','.join(gui_specs),
+        # SPACE-delimited: reify word-splits both, and the gui allowlist
+        # excludes ',' outright.  See the module comment above.
+        'REIFY_RUN_ALL_MEMBER_SUBSET': ' '.join(run_all_members),
+        'REIFY_GUI_RETRY_SPECS': ' '.join(gui_specs),
         'REIFY_VERIFY_RETRY_TREE_OID': tree_oid,
         'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
     }
@@ -1696,27 +1784,29 @@ def _build_retry_verify_env(
 
 @dataclasses.dataclass(frozen=True)
 class _Attempt0Payload:
-    """Injected attempt-0 result the failed-only retry is constructed from.
+    """The attempt-0 result the failed-only retry is constructed from.
 
-    Read at the ``_run_post_merge_verify`` wiring boundary from the reify-written
-    attempt-0 sidecar under ``merge_wt`` (the sidecar SCHEMA is owned by the
-    cross-project reify α/β/γ tasks; the DF reader degrades tolerantly when it is
-    absent/malformed — the whole retry path stays a no-op until reify lands).
-    Passing it as an explicit parameter keeps the subset/env/gate logic pure and
-    fully unit-testable with fixtures, independent of the sidecar.
+    **DF CONSTRUCTS this** (see :func:`_build_attempt0_payload`) from attempt-0's
+    own ``VerifyResult.test_output`` plus a ``cargo nextest list`` planned probe.
+    Only the tree-OID pin and the profile list come from reify's sidecar
+    (:data:`_REIFY_ATTEMPT_SIDECAR_RELPATH`); the subset CONTENT is DF-owned end
+    to end.  Passing it as an explicit parameter keeps the subset/env/gate logic
+    pure and fully unit-testable.
 
     Fields:
-        tree_oid: attempt-0-pinned content-tree OID (``git rev-parse HEAD^{tree}``)
-            the retry is corroborated against (INV-3).
-        debug_planned / debug_verdicts: the debug-profile nextest plan/list
-            (authoritative full set) and the parsed attempt-0 verdicts
-            (RUN tests only) — combined via :func:`build_fail_fast_map`.
+        tree_oid: attempt-0-pinned content-tree OID the retry is corroborated
+            against (INV-3) — reify's ``git rev-parse HEAD:`` stamp.
+        profiles: the cargo profiles attempt-0 PLANNED to run, in reify's order.
+        debug_planned / debug_verdicts: the debug-profile nextest plan
+            (authoritative full set) and the parsed attempt-0 verdicts (RUN tests
+            only) — combined via :func:`build_fail_fast_map`.
         release_planned / release_verdicts: same, for the release profile.
         run_all_members: {failed} run_all member ids (pass-through).
         gui_specs: {failed} gui spec files (pass-through).
     """
 
     tree_oid: str
+    profiles: tuple[str, ...]
     debug_planned: list[str]
     debug_verdicts: dict[str, str]
     release_planned: list[str]
@@ -1733,26 +1823,42 @@ async def _assemble_retry_verify_env(
 ) -> dict[str, str] | None:
     """INV-3 tree-OID corroboration gate → the retry env, or None for full verify.
 
-    Corroborates the CURRENT merge-tree OID (``git_ops.get_head_tree_hash``)
-    against the attempt-0-pinned OID before trusting the cached did-not-pass set.
-    A rebased tree (mismatch) or an unreadable OID (None) fails safe: log a
-    WARNING and return None so the caller leaves the spec untouched and the
-    existing ``_reverify_rebased_tree`` (M4) route runs a FULL re-verify.
+    **Two INDEPENDENT reads of the same fact** (belt-and-suspenders):
+
+    1. DF's own ground truth — ``git_ops.get_head_tree_hash(merge_wt)``;
+    2. reify's own ``git rev-parse HEAD:`` stamp, carried in
+       ``attempt0.tree_oid`` from its ``target/reify-verify-attempt.json``
+       sidecar (:func:`_load_reify_attempt_sidecar`).
+
+    A disagreement (rebased tree) or an unreadable OID (None — an ABSENCE of
+    corroboration, not a match) fails safe: log a WARNING and return None so the
+    caller leaves the spec untouched and the existing ``_reverify_rebased_tree``
+    (M4) route runs a FULL re-verify.  reify then independently re-checks the
+    same pin from its own side (verify.sh's ``_RETRY_SUBSET_ELIGIBLE`` guard), so
+    the tree is corroborated on both sides of the seam.
 
     On a match, builds the per-profile {did-not-pass} nextest subsets via
-    :func:`build_fail_fast_map` → :func:`did_not_pass_subset`, passes the failed
-    run_all members / gui specs through unchanged, and delegates to
-    :func:`_build_retry_verify_env` to write the filter files and env dict.
+    :func:`build_fail_fast_map` → :func:`did_not_pass_subset`, then maps them
+    through :func:`nextest_filter_ids` at the write boundary so the filter files
+    carry nextest's ``test(=...)`` domain while the internal plan/verdict space
+    stays uniform.  Failed run_all members / gui specs pass through unchanged.
+
+    **Third gate: the subset must actually narrow something.** A subset that is
+    empty, equal to the whole plan, or over reify's storm-escape ceiling makes
+    reify run the profile in FULL — so returning an env dict for it would let
+    the caller charge a full re-verify to the larger narrowed-retry budget.  See
+    :func:`_materially_narrows`.
 
     Args:
-        git_ops: GitOps for the current-tree-OID probe.
+        git_ops: GitOps for DF's own tree-OID read.
         req: the merge request (for ``task_id`` in log lines).
         merge_wt: the merge worktree — both the tree-OID probe target and the
             filter-file directory.
-        attempt0: the injected attempt-0 payload.
+        attempt0: the DF-constructed attempt-0 payload.
 
     Returns:
-        The REIFY_VERIFY_RETRY_* env dict on a corroborated tree, else None.
+        The REIFY_VERIFY_RETRY_* env dict on a corroborated tree whose subset
+        materially narrows, else None.
     """
     current = await git_ops.get_head_tree_hash(merge_wt)
     if current is None or current != attempt0.tree_oid:
@@ -1770,9 +1876,52 @@ async def _assemble_retry_verify_env(
     release_subset = did_not_pass_subset(
         build_fail_fast_map(attempt0.release_planned, attempt0.release_verdicts)
     )
+
+    # MATERIAL-NARROWING gate: a retry that narrows NOTHING must not be called
+    # narrowed.  `narrowed` is what unlocks the larger MAX_POST_MERGE_VERIFY_
+    # NARROWED_RETRIES budget, on the premise that a narrowed retry re-runs only
+    # the {did-not-pass} subset and is therefore cheap.  When that premise is
+    # false (see :func:`_materially_narrows`) the lane would pay TWO FULL
+    # re-verifies where the legacy max_enospc budget paid one — a real
+    # worst-case regression for exactly the infra-transient class this branch
+    # handles.  Returning None here routes the caller to the legacy budget AND
+    # leaves `spec` untouched, so nothing about the retry changes except its
+    # accounting.  Both profiles are checked because only the FIRST one is ever
+    # populated and the payload does not name which that was.
+    if not (
+        _materially_narrows(attempt0.debug_planned, debug_subset)
+        or _materially_narrows(attempt0.release_planned, release_subset)
+    ):
+        logger.warning(
+            'Task %s: failed-only retry would narrow NOTHING '
+            '(nextest debug %d/%d, release %d/%d; ceiling %d) — reify would run '
+            'these profiles in full anyway, so this is charged to the legacy '
+            'budget as a FULL retry, not the narrowed one',
+            req.task_id,
+            len(debug_subset), len(attempt0.debug_planned),
+            len(release_subset), len(attempt0.release_planned),
+            _REIFY_VERIFY_RETRY_MAX_SUBSET,
+        )
+        return None
+
+    # Per-suite sizes at the narrowing site, so the cost premise behind the
+    # larger narrowed budget is auditable from the log rather than inferred.
+    logger.info(
+        'Task %s: narrowed failed-only retry — nextest debug %d/%d, '
+        'release %d/%d, run_all %d, gui %d',
+        req.task_id,
+        len(debug_subset), len(attempt0.debug_planned),
+        len(release_subset), len(attempt0.release_planned),
+        len(attempt0.run_all_members), len(attempt0.gui_specs),
+    )
+
+    # Map into nextest's matcher domain ONLY here, at the single write boundary:
+    # a filter file of full "<binary-id> <test-name>" parse keys is non-empty
+    # (so reify's "retry refused: no subset" fallback never fires) yet matches
+    # ZERO tests — a FALSE-GREEN retry.  See :func:`nextest_filter_ids`.
     return _build_retry_verify_env(
-        nextest_subset_debug=debug_subset,
-        nextest_subset_release=release_subset,
+        nextest_subset_debug=nextest_filter_ids(debug_subset),
+        nextest_subset_release=nextest_filter_ids(release_subset),
         run_all_members=list(attempt0.run_all_members),
         gui_specs=list(attempt0.gui_specs),
         tree_oid=current,
@@ -1780,66 +1929,443 @@ async def _assemble_retry_verify_env(
     )
 
 
-# reify writes the attempt-0 sidecar here (under the same .reify-verify-retry
-# subdir the filter files land in).  reify owns the authoritative schema (the
-# verify-retry-failed-only α/β/γ tasks); this DF reader is deliberately tolerant
-# and the whole retry path stays a no-op until reify lands and writes one.
-_ATTEMPT0_SIDECAR_NAME = 'attempt0.json'
+# reify's attempt-0 sidecar — the REAL one, relative to the worktree root.
+#
+# Producer: reify ``scripts/verify.sh`` ``add_test_passes()``, which stamps it as
+# its FIRST plan line so the pin survives a RED psi-gate / compile-gate / nextest
+# pole (reify task 5548).  ``verify.sh:738`` defines the path as
+# ``_ATTEMPT_SIDECAR_PATH="${REIFY_VERIFY_ATTEMPT_SIDECAR:-target/reify-verify-attempt.json}"``.
+#
+# Schema (exactly three keys; see tests/fixtures/reify_verify_retry/ for the
+# verbatim captured bytes and PROVENANCE.md)::
+#
+#     {"tree_oid": "<git rev-parse HEAD:>",
+#      "profiles": "debug release",          # SPACE-DELIMITED STRING, not a list
+#      "timestamp": "2026-07-30T04:56:41Z"}
+#
+# ``profiles`` records what the attempt PLANNED to run — because the stamp
+# precedes the test poles, it is NEVER proof that a profile actually executed.
+# That is precisely why only the FIRST profile may be narrowed (see
+# :func:`_build_attempt0_payload`).
+#
+# ``tree_oid`` is reify's own ``git rev-parse HEAD:`` — the same value DF's
+# ``git_ops.get_head_tree_hash`` produces, which is what makes the INV-3
+# corroboration two genuinely INDEPENDENT reads rather than one read twice.
+_REIFY_ATTEMPT_SIDECAR_RELPATH = 'target/reify-verify-attempt.json'
+
+# The cargo profiles DF can emit a per-profile nextest filter-file env key for.
+# A `profiles` value naming anything outside this set aborts to a full verify:
+# there is no REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_<X> key for a third
+# profile, so DF could not satisfy reify's "a filter file for EVERY profile
+# named in `profiles`, or fall back to a full verify" obligation
+# (verify.sh:219-230), and silently ignoring it would narrow a profile whose
+# attempt-0 pass never ran.
+_KNOWN_REIFY_PROFILES = frozenset({'debug', 'release'})
 
 
-def _load_attempt0_sidecar(merge_wt: Path) -> _Attempt0Payload | None:
-    """Tolerantly load the reify-written attempt-0 sidecar under ``merge_wt``.
+@dataclasses.dataclass(frozen=True)
+class _ReifyAttemptSidecar:
+    """The parsed contents of reify's ``target/reify-verify-attempt.json``.
 
-    Returns the parsed :class:`_Attempt0Payload`, or None (leaving the caller to
-    run a full verify) when the sidecar is absent, unreadable, malformed, or
-    missing the required ``tree_oid`` — never raises.  This tolerant degradation
-    is what keeps the failed-only retry a strict no-op until reify's α/β/γ land.
-
-    Expected JSON shape (reify-owned, read defensively)::
-
-        {"tree_oid": "<oid>",
-         "debug":   {"planned": [...], "verdicts": {...}},
-         "release": {"planned": [...], "verdicts": {...}},
-         "run_all_members": [...],
-         "gui_specs": [...]}
+    Fields:
+        tree_oid: reify's ``git rev-parse HEAD:`` stamp for the attempt-0 tree.
+        profiles: the cargo profiles attempt-0 PLANNED to run, in the order
+            reify named them (the sidecar's space-delimited ``profiles``
+            string, split).  Never proof a profile executed.
     """
-    path = Path(merge_wt) / _RETRY_FILTER_SUBDIR / _ATTEMPT0_SIDECAR_NAME
+
+    tree_oid: str
+    profiles: tuple[str, ...]
+
+
+def _load_reify_attempt_sidecar(merge_wt: Path) -> _ReifyAttemptSidecar | None:
+    """Tolerantly load reify's attempt-0 sidecar from ``merge_wt``.
+
+    Never raises.  Returns None — routing the caller to a FULL verify — when the
+    sidecar is absent, unreadable, not JSON, not an object, missing ``tree_oid``,
+    carries an empty/whitespace-only ``profiles``, or names a profile outside
+    :data:`_KNOWN_REIFY_PROFILES`.
+
+    Args:
+        merge_wt: the merge worktree root the sidecar path is relative to.
+
+    Returns:
+        The parsed :class:`_ReifyAttemptSidecar`, or None.
+    """
+    path = Path(merge_wt) / _REIFY_ATTEMPT_SIDECAR_RELPATH
     try:
         raw = path.read_text()
     except OSError:
-        # Absent sidecar is the common (pre-reify) case — no warning, just no-op.
+        # An absent sidecar is an ordinary outcome (non-reify project, or a
+        # verify that died before add_test_passes) — no warning, just full.
         return None
     try:
         data = json.loads(raw)
     except (ValueError, TypeError) as exc:
         logger.warning(
-            'attempt-0 sidecar at %s is not valid JSON (%s) — full verify', path, exc,
+            'reify attempt-0 sidecar at %s is not valid JSON (%s) — full verify',
+            path, exc,
         )
         return None
     if not isinstance(data, dict) or 'tree_oid' not in data:
         logger.warning(
-            'attempt-0 sidecar at %s missing tree_oid / not an object — full verify',
-            path,
+            'reify attempt-0 sidecar at %s missing tree_oid / not an object '
+            '— full verify', path,
         )
         return None
-    try:
-        debug = data.get('debug') or {}
-        release = data.get('release') or {}
-        return _Attempt0Payload(
-            tree_oid=str(data['tree_oid']),
-            debug_planned=list(debug.get('planned') or []),
-            debug_verdicts=dict(debug.get('verdicts') or {}),
-            release_planned=list(release.get('planned') or []),
-            release_verdicts=dict(release.get('verdicts') or {}),
-            run_all_members=list(data.get('run_all_members') or []),
-            gui_specs=list(data.get('gui_specs') or []),
-        )
-    except (TypeError, ValueError, AttributeError) as exc:
+
+    tree_oid = str(data['tree_oid'])
+    # `profiles` is a SPACE-DELIMITED STRING in reify's real bytes, not a list.
+    raw_profiles = data.get('profiles')
+    profiles = tuple(raw_profiles.split()) if isinstance(raw_profiles, str) else ()
+    if not profiles:
         logger.warning(
-            'attempt-0 sidecar at %s has malformed fields (%s) — full verify',
-            path, exc,
+            'reify attempt-0 sidecar at %s has empty/unparseable profiles %r '
+            '— full verify', path, raw_profiles,
         )
         return None
+    unknown = [p for p in profiles if p not in _KNOWN_REIFY_PROFILES]
+    if unknown:
+        logger.warning(
+            'reify attempt-0 sidecar at %s names unsupported profile(s) %r '
+            '(DF has no per-profile filter-file env key for them, so it cannot '
+            'satisfy reify\'s every-profile obligation) — full verify',
+            path, unknown,
+        )
+        return None
+    return _ReifyAttemptSidecar(tree_oid=tree_oid, profiles=profiles)
+
+
+# Bounds the planned-set probe so it can NEVER wedge the merge lane.  In a warm
+# merge lane the binaries are already built, so `nextest list` links and lists in
+# seconds; this ceiling only matters on a cold lane where the probe would have to
+# compile — and there, timing out into a full verify is the correct outcome.
+#
+# That "warm ⇒ seconds" premise is only true if the probe runs under the SAME
+# build environment as the verify (the shared sccache backend et al) — which is
+# why `verify_env` is threaded all the way down to the spawn.  Without it the
+# probe compiles cold on exactly the lanes this capability targets.
+_NEXTEST_LIST_PROBE_TIMEOUT_SECS = 300
+
+# Per-signal grace for the timeout path's group kill (SIGTERM, then SIGKILL).
+# Kept short: the probe is a `nextest list`, so there is nothing to flush.
+_PROBE_KILL_GRACE_SECS = 2.0
+
+# How much of a failed probe's stderr is carried into the WARNING.  Enough to
+# tell 'cargo-nextest not installed' from 'unknown flag' from 'workspace failed
+# to compile' from 'lockfile out of date' (structured-facts-at-failure, see
+# docs/legibility/design-invariants.md); short enough that a runaway build log
+# cannot flood the orchestrator log.
+_PROBE_STDERR_TAIL_CHARS = 500
+
+
+def _stderr_tail(stderr: str) -> str:
+    """Last :data:`_PROBE_STDERR_TAIL_CHARS` of ``stderr``, or an explicit marker."""
+    tail = stderr.strip()[-_PROBE_STDERR_TAIL_CHARS:]
+    return tail if tail else '<empty>'
+
+
+async def _kill_probe_process_tree(
+    proc: asyncio.subprocess.Process, pgid: int
+) -> None:
+    """Terminate the probe's whole process GROUP via the shared helper.
+
+    ``cargo nextest list`` spawns ``rustc`` / build-script children that a bare
+    ``proc.kill()`` leaves running.  Since the probe exists precisely to be
+    bounded (:data:`_NEXTEST_LIST_PROBE_TIMEOUT_SECS`), leaking compiles into
+    the merge lane on the timeout path would defeat the ceiling.
+
+    Delegates to :func:`shared.proc_group.terminate_process_group` — the
+    repo's single blessed SIGTERM→SIGKILL group-kill (landed on main; see also
+    ``verify.py``) — rather than re-implementing it.  ``pgid`` MUST be the value
+    captured immediately after the ``start_new_session=True`` spawn (where
+    ``pgid == proc.pid`` by POSIX guarantee): calling ``os.getpgid(proc.pid)``
+    here instead would be unsafe, because by this point the process may already
+    have been reaped and its pid recycled onto an unrelated group.
+    """
+    from shared.proc_group import terminate_process_group
+
+    await terminate_process_group(proc, pgid, grace_secs=_PROBE_KILL_GRACE_SECS)
+
+
+async def _run_probe_cmd(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout_secs: float,
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, str, str]:
+    """Run ``argv`` in ``cwd``, returning ``(returncode, stdout, stderr)``.
+
+    A thin, separately-patchable subprocess seam: it exists so
+    :func:`_probe_nextest_planned` can be unit-tested hermetically without
+    shelling out.  Raises :class:`TimeoutError` on timeout and :class:`OSError`
+    (incl. :class:`FileNotFoundError`) on spawn failure — the caller converts
+    both into a fail-safe ``None``.
+
+    ``env`` carries the verify's OWN environment overrides
+    (``MergeVerifySpec.verify_env`` — the shared sccache backend:
+    ``RUSTC_WRAPPER``, ``SCCACHE_*``, ``CARGO_INCREMENTAL``, …) layered OVER
+    ``os.environ``.  Threading it is load-bearing, not cosmetic: on a lane where
+    the sccache wrapper is *why* the merge worktree is warm, a probe run without
+    it compiles from scratch — burning minutes of lane CPU/disk and usually
+    timing out, i.e. silently degrading every narrowed retry to a full verify
+    while still paying the probe cost.  ``None`` inherits the orchestrator
+    environment unchanged (the legacy behaviour, kept for direct/test callers).
+
+    stderr is CAPTURED rather than discarded so the caller's failure WARNING can
+    name the actual reason instead of a bare exit code.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=({**os.environ, **env} if env else None),
+        # Own session/process group so the timeout path can kill the whole build
+        # tree — see :func:`_kill_probe_process_tree`.
+        start_new_session=True,
+    )
+    # Capture the pgid NOW, while proc is guaranteed alive and unreaped: with
+    # start_new_session=True, pgid == proc.pid by POSIX guarantee.  Reading it
+    # later (os.getpgid) could hit a recycled pid and signal a stranger.
+    pgid = proc.pid
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_secs
+        )
+    except (TimeoutError, asyncio.CancelledError):
+        # Hard-bounded: a cancelled communicate() can leave proc.wait() pending
+        # on still-open pipe transports, so the cleanup itself gets a ceiling.
+        # Never trade a probe timeout for an unbounded await in the merge lane.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                _kill_probe_process_tree(proc, pgid),
+                timeout=_PROBE_KILL_GRACE_SECS * 3,
+            )
+        raise
+    return (
+        proc.returncode or 0,
+        stdout.decode('utf-8', errors='replace'),
+        stderr.decode('utf-8', errors='replace'),
+    )
+
+
+# Planned-set source: DECISION (task 3059).
+#
+# Candidate (a) — THIS: a `cargo nextest list` probe run in the warm merge lane.
+# Chosen because the binaries are already built there, so it links and lists
+# WITHOUT compiling; it is DF-owned (no cross-repo obligation — which is the
+# whole point of this leaf); and it emits ids in exactly
+# `parse_per_test_results`' key space, so `build_fail_fast_map` composes with no
+# translation.
+#
+# Candidate (b) — the warm shadow baseline's prior full per-test map — is NOT
+# VIABLE: `data/orchestrator/warm_verify_shadow.json` persists only
+# `ShadowCompareState` cadence fields (merges_since_last_shadow,
+# last_shadow_run_at).  The full per-test map lives in-process only
+# (`_warm_capture` → `build_warm_shadow_results`) and is gone by the next merge.
+#
+# Candidate (c) — a reify-emitted planned list — is the phantom cross-repo
+# dependency this leaf exists to DELETE.  Re-introducing it would recreate the
+# exact "DONE producer ≠ wired at the seam" failure.
+#
+# KNOWN IMPRECISION, and why it is safe: DF cannot reproduce reify's per-pass
+# selector (`--workspace` vs `$AFFECTED_ALL_FLAGS` vs `$_RELEASE_ALL_FLAGS`) or
+# its heavy-exclude filterset, so this probe may return a SUPERSET of what
+# attempt-0 actually planned.  A superset only adds extra 'not-started' ids to
+# the retry subset — it runs MORE tests, never FEWER — and reify's
+# `REIFY_VERIFY_RETRY_MAX_SUBSET` ceiling (default 5000) is the storm escape if
+# it ever approaches the whole suite.
+#
+# THE INVARIANT: ``None`` is NEVER treated as an empty plan.  It routes to a
+# FULL verify.  Narrowing on a partial plan would silently skip every test the
+# probe failed to see.
+async def _probe_nextest_planned(
+    merge_wt: Path,
+    profile: str,
+    *,
+    timeout_secs: float,
+    verify_env: Mapping[str, str] | None = None,
+) -> list[str] | None:
+    """Probe the merge lane for the ``profile``'s planned nextest set.
+
+    Totally fail-safe: any non-zero exit, empty/unparseable stdout, timeout, or
+    spawn failure returns ``None`` (→ full verify), logging a WARNING that names
+    the profile and the reason (including a bounded stderr tail on a non-zero
+    exit, so 'cargo-nextest absent' is distinguishable from 'workspace failed to
+    compile').
+
+    Args:
+        merge_wt: the warm merge worktree to run the probe in.
+        profile: ``'debug'`` or ``'release'`` — selects the ``--release`` flag.
+        timeout_secs: hard ceiling on the probe.
+        verify_env: the verify's own env overrides (``MergeVerifySpec.verify_env``)
+            so the probe models the SAME build the verify performs — notably the
+            shared sccache backend that is why a warm lane is warm.  See
+            :func:`_run_probe_cmd`.
+
+    Returns:
+        Planned test ids in :func:`parse_per_test_results`' key space, or None.
+    """
+    argv = ['cargo', 'nextest', 'list', '--workspace', '--message-format', 'json']
+    if profile == 'release':
+        argv.append('--release')
+
+    try:
+        rc, stdout, stderr = await _run_probe_cmd(
+            argv, cwd=Path(merge_wt), timeout_secs=timeout_secs, env=verify_env
+        )
+    except TimeoutError:
+        logger.warning(
+            'nextest list probe for profile %r timed out after %ss — full verify',
+            profile, timeout_secs,
+        )
+        return None
+    except OSError as exc:
+        # FileNotFoundError (no cargo on PATH) is the common shape here.
+        logger.warning(
+            'nextest list probe for profile %r could not run (%s) — full verify',
+            profile, exc,
+        )
+        return None
+
+    if rc != 0:
+        logger.warning(
+            'nextest list probe for profile %r exited %s — full verify '
+            '(stderr tail: %s)',
+            profile, rc, _stderr_tail(stderr),
+        )
+        return None
+    if not stdout.strip():
+        logger.warning(
+            'nextest list probe for profile %r produced empty stdout — full verify',
+            profile,
+        )
+        return None
+
+    planned = parse_nextest_list_planned(stdout)
+    if planned is None:
+        logger.warning(
+            'nextest list probe for profile %r produced unparseable stdout '
+            '— full verify', profile,
+        )
+    return planned
+
+
+async def _build_attempt0_payload(
+    merge_wt: Path,
+    verify: VerifyResult,
+    *,
+    verify_env: Mapping[str, str] | None = None,
+) -> _Attempt0Payload | None:
+    """Build the retry payload from attempt-0's OWN result — no cross-repo handoff.
+
+    Sources, all DF-owned except the two pins:
+
+    * ``verify.test_output`` → per-test verdicts (:func:`parse_per_test_results`)
+      and the {failed} run_all members (:func:`parse_failed_run_all_members`);
+    * a ``cargo nextest list`` probe → the authoritative planned set;
+    * reify's sidecar → ONLY ``tree_oid`` (the INV-3 pin) and ``profiles``.
+
+    **Profile attribution — the load-bearing rule.** ``verify.test_output`` is a
+    single blended blob across BOTH nextest passes, and the verdict key
+    (``"<binary-id> <test-name>"``) does not carry the profile.  So a ``pass``
+    observed in profile 1 is INDISTINGUISHABLE from a test that never ran in
+    profile 2.  ``verify.sh:219-230`` makes "never narrow a profile that never
+    ran" DF's seam obligation.  Therefore **only the FIRST profile named in the
+    sidecar is narrowed**; every later profile gets an empty subset, which reify
+    turns into its loud per-profile "retry refused: no subset" FULL fallback.
+
+    Under fail-fast the red lands in the first (debug) pass, which is where the
+    savings are, so the capability still fires meaningfully.
+
+    Fail-safe throughout: a None from the sidecar loader or from the first
+    profile's probe returns None, routing the caller to a FULL verify.
+
+    Args:
+        merge_wt: the merge worktree (sidecar location and probe cwd).
+        verify: attempt-0's own failing :class:`VerifyResult`.
+        verify_env: attempt-0's own ``MergeVerifySpec.verify_env``, threaded to
+            the probe so it models the SAME build (sccache backend et al).
+
+    Returns:
+        The constructed :class:`_Attempt0Payload`, or None for a full verify.
+    """
+    sidecar = _load_reify_attempt_sidecar(merge_wt)
+    if sidecar is None:
+        return None
+
+    # Only the FIRST profile can be narrowed — see the rule above.
+    first = sidecar.profiles[0]
+    planned = await _probe_nextest_planned(
+        merge_wt,
+        first,
+        timeout_secs=_NEXTEST_LIST_PROBE_TIMEOUT_SECS,
+        verify_env=verify_env,
+    )
+    if planned is None:
+        # Never narrow on a partial plan: an unknown plan cannot distinguish
+        # "this test passed" from "this test was never listed".
+        return None
+
+    verdicts = parse_per_test_results(verify.test_output)
+
+    # PLAN-COVERAGE gate: the probe must SEE everything attempt-0 saw fail.
+    #
+    # `build_fail_fast_map` iterates `planned` only and documents "keys present
+    # in verdicts but not in planned are ignored".  So a test attempt-0 reported
+    # FAIL/TIMEOUT that the probe did not list is silently DROPPED from the
+    # retry subset — the retry then never re-runs the actual failure and reports
+    # PASS.  A FALSE GREEN, the worst outcome available here.
+    #
+    # The comment above claims the probe returns a SUPERSET of attempt-0's plan
+    # (`--workspace` ⊇ reify's `-p` selectors).  That holds TODAY by coincidence
+    # of reify's flags; a future `--all-features` / `--all-targets` /
+    # `--cargo-profile` change on reify's side would break it with no signal.
+    # This is the one form of plan-incompleteness DF can detect IN-PROCESS, so
+    # the module's standing rule — never narrow on an incomplete plan — is
+    # enforced here rather than assumed.
+    #
+    # Only nextest-shaped keys ("<binary-id> <test-name>", hence the space) are
+    # comparable: `parse_per_test_results` also emits bare libtest paths, which
+    # `cargo nextest list` never produces and which are not evidence of drift.
+    planned_ids = set(planned)
+    uncovered = sorted(
+        key
+        for key, verdict in verdicts.items()
+        if verdict != 'pass' and ' ' in key and key not in planned_ids
+    )
+    if uncovered:
+        logger.warning(
+            'nextest list probe for profile %r did not cover %d did-not-pass '
+            'id(s) attempt-0 observed (%s%s) — the probed plan is INCOMPLETE, '
+            'so narrowing would silently drop the real failure; full verify',
+            first, len(uncovered), ', '.join(uncovered[:5]),
+            ', …' if len(uncovered) > 5 else '',
+        )
+        return None
+    # A later profile's planned set is never even requested — it could not be
+    # used, and probing it would cost a `nextest list` for nothing.
+    per_profile: dict[str, tuple[list[str], dict[str, str]]] = {
+        p: ([], {}) for p in _KNOWN_REIFY_PROFILES
+    }
+    per_profile[first] = (planned, verdicts)
+
+    return _Attempt0Payload(
+        tree_oid=sidecar.tree_oid,
+        profiles=sidecar.profiles,
+        debug_planned=per_profile['debug'][0],
+        debug_verdicts=per_profile['debug'][1],
+        release_planned=per_profile['release'][0],
+        release_verdicts=per_profile['release'][1],
+        run_all_members=parse_failed_run_all_members(verify.test_output),
+        # Deliberately empty (task 3059): no real reify gui failure log was
+        # available to pin a fixture to, and authoring one from prose is the
+        # drift class this leaf corrects.  verify.sh:2127-2158 treats an empty
+        # value as "run the FULL gui suite" — unambiguously safe.
+        gui_specs=[],
+    )
 
 
 async def _run_post_merge_verify(
@@ -1885,12 +2411,13 @@ async def _run_post_merge_verify(
     Args:
         max_narrowed: Budget for the classified-infra-transient retry loop
             (task 2835) when this call's failed-only retry was actually
-            NARROWED (the D2 producer merged ``retry_env`` — see
-            ``narrowed`` below).  Default ``1`` matches the legacy
+            NARROWED — i.e. the D2 producer inside that branch built a
+            payload from attempt-0's own result and merged ``retry_env``
+            (see ``narrowed`` below).  Default ``1`` matches the legacy
             single-retry behaviour, so every existing caller that omits
             this param is byte-identical.  A non-narrowed retry (flag off,
-            or flag on but no sidecar yet) always uses ``max_enospc``
-            instead, regardless of this value.
+            or a payload that could not be built or corroborated) always
+            uses ``max_enospc`` instead, regardless of this value.
         narrowed_retries: Per-task counter dict for the narrowed budget
             above, mirroring ``enospc_retries`` but DECOUPLED from it (an
             earlier ENOSPC event never starves a narrowed retry, and vice
@@ -1905,7 +2432,7 @@ async def _run_post_merge_verify(
         shadow_baseline_sink: Optional mutable out-param (PRD
             verify-retry-failed-only D4, §5.4).  When supplied AND this call
             actually narrowed the retry (``narrowed`` — the D2 producer merged
-            ``retry_env`` on a tree-OID-corroborated attempt-0 sidecar), the
+            ``retry_env`` on a tree-OID-corroborated attempt-0 payload), the
             attempt-0 ``debug_verdicts`` ∪ ``release_verdicts`` map is copied
             into it.  :class:`SpeculativeMergeWorker` unions this with the
             PARTIAL narrowed-retry warm output (via
@@ -2015,47 +2542,17 @@ async def _run_post_merge_verify(
 
     spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
-    # Failed-only merge-verify retry PRODUCER (PRD verify-retry-failed-only D2).
-    # Guarded by req.retry_failed_only (D1, task 2833) so the flag-off / legacy
-    # path is byte-identical (D1's strict no-op guarantee preserved).  Reads the
-    # reify-written attempt-0 sidecar tolerantly (missing/malformed → None → leave
-    # spec untouched), corroborates the merge tree OID (INV-3), and on success
-    # MERGES the REIFY_VERIFY_RETRY_* env into spec.verify_env via
-    # dataclasses.replace.  A rebased/unknown tree returns None from
-    # _assemble_retry_verify_env → full verify via the existing
-    # _reverify_rebased_tree (M4) route.  NOTE (task 2822): injecting into `spec`
-    # here means the merged verify_env flows into BOTH the primary pool.dispatch
-    # below AND task 2822's post-dispatch remote-green cross-check re-verify (which
-    # reuses this same `spec`) — correct and desired: a failed-only retry's local
-    # trust-anchor cross-check should scope to the same {did-not-pass} subset.
     # narrowed (task 2835) tracks whether THIS call actually applied a
-    # narrowed retry_env below — the ONLY correct gate for the larger
-    # max_narrowed budget later.  req.retry_failed_only alone is NOT enough:
-    # until reify writes the attempt-0 sidecar, a flag-on retry is still a
-    # FULL re-verify and must keep the small legacy max_enospc budget.
+    # narrowed retry_env — the ONLY correct gate for the larger max_narrowed
+    # budget below.  req.retry_failed_only alone is NOT enough: a flag-on
+    # retry whose payload could not be built is still a FULL re-verify and
+    # must keep the small legacy max_enospc budget.
+    #
+    # The narrowing itself is applied in the classified-infra-transient retry
+    # branch below, built from THIS call's own attempt-0 VerifyResult (task
+    # 3059).  It deliberately does NOT happen here: attempt-0 has not run yet
+    # at this point, so narrowing here would narrow attempt-0 ITSELF.
     narrowed = False
-    if req.retry_failed_only:
-        attempt0 = _load_attempt0_sidecar(merge_wt)
-        if attempt0 is not None:
-            retry_env = await _assemble_retry_verify_env(git_ops, req, merge_wt, attempt0)
-            if retry_env is not None:
-                spec = dataclasses.replace(
-                    spec, verify_env={**spec.verify_env, **retry_env}
-                )
-                narrowed = True
-                # PRD verify-retry-failed-only D4 (§5.4): copy the attempt-0
-                # per-test verdict map into the caller's sink so the warm shadow
-                # baseline is MERGED (attempt-0 ∪ partial narrowed-retry output)
-                # before storage.  This narrowed retry re-runs ONLY the
-                # {did-not-pass} subset, so its output alone OMITS every
-                # attempt-0-passed test → a from-scratch full cold shadow compare
-                # would flag them all only_cold → phantom born-at-L2 divergence.
-                # Populated ONLY here (narrowed=True) so a rebased/uncorroborated
-                # tree (assemble→None) never seeds a stale baseline.
-                if shadow_baseline_sink is not None:
-                    shadow_baseline_sink.update(
-                        {**attempt0.debug_verdicts, **attempt0.release_verdicts}
-                    )
 
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
@@ -2178,15 +2675,77 @@ async def _run_post_merge_verify(
         # retry chance (see test_classified_infra_transient_zero_retry_after_
         # shared_budget_exhausted in test_merge_queue.py).
         elif not verify.passed and (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
-            # task 2835: a NARROWED (failed-only) retry — this call's D2
-            # producer actually merged retry_env, above — earns its own
-            # SEPARATE, larger budget (max_narrowed/narrowed_retries),
-            # decoupled from the legacy enospc_retries/max_enospc budget so
-            # an unrelated prior ENOSPC event can never starve it.  A
-            # non-narrowed retry (flag off, or flag on but no sidecar yet)
-            # keeps sharing the legacy budget, byte-identical to before this
-            # task (both are 1 in production today, so this loop performs
-            # exactly one retry either way until reify's sidecar lands).
+            # Failed-only merge-verify retry PRODUCER (PRD verify-retry-failed-
+            # only D2, re-wired in task 3059).  THIS is the only correct site:
+            # attempt-0 has just run and FAILED, so its own VerifyResult is the
+            # evidence the retry is narrowed against.  The shipped D2 built the
+            # env BEFORE the first dispatch from a sidecar nothing has ever
+            # written — which would have narrowed attempt-0 ITSELF had the file
+            # existed.  The causal chain now reads:
+            #
+            #   attempt-0 result -> _build_attempt0_payload (DF-owned: this
+            #   result's per-test verdicts + a `cargo nextest list` planned
+            #   probe, with only the tree-OID pin and the profile list from
+            #   reify's target/reify-verify-attempt.json) -> INV-3 tree-OID
+            #   corroboration (_assemble_retry_verify_env) -> narrowed retry.
+            #
+            # Guarded by req.retry_failed_only (D1, task 2833) so the flag-off /
+            # legacy path is byte-identical (D1's strict no-op guarantee).  Every
+            # fail-safe route — unreadable/malformed sidecar, a probe that could
+            # not produce a plan, a probe whose plan does not COVER attempt-0's
+            # observed failures, a rebased or uncorroborated tree, or a subset
+            # that would not materially narrow (_materially_narrows) — returns
+            # None and leaves `spec` untouched, so the retry runs FULL via the
+            # existing _reverify_rebased_tree (M4) semantics AND stays on the
+            # legacy budget.
+            #
+            # `not narrowed` keeps this a once-per-call operation: the loop below
+            # may dispatch several times, but the subset is always attempt-0's.
+            #
+            # NOTE (task 2822): injecting into `spec` means the merged verify_env
+            # flows into BOTH the retry dispatch below AND task 2822's
+            # post-dispatch remote-green cross-check re-verify (which reuses this
+            # same `spec`) — correct and desired: a failed-only retry's local
+            # trust-anchor cross-check should scope to the same subset.
+            if req.retry_failed_only and not narrowed:
+                # spec.verify_env is attempt-0's OWN build environment (the
+                # shared sccache backend et al).  Threading it makes the
+                # `cargo nextest list` probe model the same build the verify
+                # performs — without it a warm lane's probe compiles cold.
+                attempt0 = await _build_attempt0_payload(
+                    merge_wt, verify, verify_env=spec.verify_env
+                )
+                if attempt0 is not None:
+                    retry_env = await _assemble_retry_verify_env(
+                        git_ops, req, merge_wt, attempt0
+                    )
+                    if retry_env is not None:
+                        spec = dataclasses.replace(
+                            spec, verify_env={**spec.verify_env, **retry_env}
+                        )
+                        narrowed = True
+                        # PRD verify-retry-failed-only D4 (§5.4): copy the
+                        # attempt-0 per-test verdict map into the caller's sink
+                        # so the warm shadow baseline is MERGED (attempt-0 ∪
+                        # partial narrowed-retry output) before storage.  This
+                        # narrowed retry re-runs ONLY the {did-not-pass} subset,
+                        # so its output alone OMITS every attempt-0-passed test →
+                        # a from-scratch full cold shadow compare would flag them
+                        # all only_cold → phantom born-at-L2 divergence.
+                        # Populated ONLY here (narrowed=True) so an
+                        # uncorroborated tree never seeds a stale baseline.
+                        if shadow_baseline_sink is not None:
+                            shadow_baseline_sink.update(
+                                {**attempt0.debug_verdicts, **attempt0.release_verdicts}
+                            )
+
+            # task 2835: a NARROWED (failed-only) retry — the producer directly
+            # above actually merged retry_env — earns its own SEPARATE, larger
+            # budget (max_narrowed/narrowed_retries), decoupled from the legacy
+            # enospc_retries/max_enospc budget so an unrelated prior ENOSPC event
+            # can never starve it.  A non-narrowed retry (flag off, or a payload
+            # that could not be built/corroborated) keeps sharing the legacy
+            # budget, byte-identical to before task 2835.
             retries, budget = (
                 (narrowed_retries, max_narrowed) if narrowed else (enospc_retries, max_enospc)
             )
@@ -2571,6 +3130,10 @@ async def _run_post_merge_verify(
         # debugger's dry-run context too.
         disposition = MergeFailureDisposition.INDETERMINATE
         failure_diagnostic: dict[str, str] | None = None
+        # Stays None when classification is SKIPPED below (absent base facts) —
+        # the seam the step-18 emit guard keys on (task 3178): nothing was
+        # gathered, so no merge_attempt row is emitted for that INDETERMINATE.
+        skew_evidence: SkewEvidence | None = None
         if merge_base_sha is not None and main_sha is not None:
             # Resolve the CURRENT real published main HEAD (task 2869, I6): the
             # merge-skew classifier filters cited landings to ancestors of real
@@ -2595,7 +3158,7 @@ async def _run_post_merge_verify(
                     req.task_id,
                     exc_info=True,
                 )
-            disposition, failure_diagnostic, reason_suffix = (
+            disposition, failure_diagnostic, reason_suffix, skew_evidence = (
                 await _classify_disposition_for_outcome(
                     verify, req=req, merge_base_sha=merge_base_sha,
                     main_sha=main_sha, event_store=event_store,
@@ -2660,6 +3223,7 @@ async def _run_post_merge_verify(
             failure_cause_hint=verify.cause_hint,
             disposition=disposition,
             failure_diagnostic=failure_diagnostic,
+            skew_evidence=skew_evidence,
         )
 
     # Task 2823 (gate-hole #3/3): a config-only merge (no .py/.rs in the diff)
@@ -3260,6 +3824,19 @@ def _elapsed_ms(start: float | None) -> int | None:
     return round((time.monotonic() - start) * 1000)
 
 
+# Bound on how many SHAs / paths a single merge_attempt row spells out (task
+# 3178). Driver: reify 5566 attempt-2 cited 22 SHAs touching 7 files, and an
+# unbounded list would bloat runs.db rows. The TRUE count is persisted alongside
+# each truncated slice as ``<key>_total``, so the bounding is never silent.
+#
+# Deliberately LARGER than merge_disposition._MAX_LOGGED_EVIDENCE_ITEMS (5),
+# which bounds the same bundle on the degrade WARNING: that cap is tuned for
+# one-line log readability, this one for runs.db row size — a census querying
+# these rows wants more of the citation than a human grepping a log line does.
+# The two truncation points differ on purpose; neither is drift from the other.
+_MAX_EVENT_EVIDENCE_ITEMS = 10
+
+
 def _emit_merge_attempt(
     event_store: EventStore | None,
     task_id: str,
@@ -3272,6 +3849,7 @@ def _emit_merge_attempt(
     disposition: MergeFailureDisposition | None = None,
     origin_host: Literal['local', 'remote'] | None = None,
     probe_host: Literal['local', 'remote'] | None = None,
+    skew_evidence: SkewEvidence | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -3312,6 +3890,21 @@ def _emit_merge_attempt(
     verify ran remote. When omitted (the default; every non-main-health-red
     call site), neither key is added — existing callers' payloads stay
     byte-identical.
+
+    *skew_evidence* is the optional :class:`SkewEvidence` bundle GATHERED by
+    ``classify_merge_failure_disposition`` (task 3178; motivation in
+    merge_disposition's module docstring, THE I7 INCIDENT). When supplied, its
+    ``failing_tests`` / ``implicated_commits`` / ``overlap_files`` are written as
+    json-serialisable lists, each BOUNDED at ``_MAX_EVENT_EVIDENCE_ITEMS`` with
+    the true length recorded under ``<key>_total`` — a silent cap would let a
+    reader infer "3 commits were cited" from a truncated row, so the truncation
+    is made self-describing. When omitted or None (every pre-3178 call site), no
+    key is added — existing callers' payloads stay byte-identical.
+
+    This helper is deliberately disposition-AGNOSTIC about evidence: it writes
+    whatever bundle it is handed, and deciding *when* to emit at all is the
+    caller's guard. That is what lets one code path serve both the
+    ``integration_skew`` row and the ADJUDICATED ``indeterminate`` row.
     """
     if event_store is not None:
         data: dict = {'outcome': outcome}
@@ -3327,6 +3920,16 @@ def _emit_merge_attempt(
             data['origin_host'] = origin_host
         if probe_host is not None:
             data['probe_host'] = probe_host
+        if skew_evidence is not None:
+            for key, items in (
+                ('failing_tests', skew_evidence.failing_tests),
+                ('implicated_commits', skew_evidence.implicated_commits),
+                ('overlap_files', skew_evidence.overlap_files),
+            ):
+                data[key] = list(items[:_MAX_EVENT_EVIDENCE_ITEMS])
+                # Recorded unconditionally: a reader never has to know the cap
+                # to tell a short citation from a truncated one.
+                data[f'{key}_total'] = len(items)
         event_store.emit(
             EventType.merge_attempt, task_id=task_id, phase='merge',
             data=data, duration_ms=duration_ms,
@@ -4079,6 +4682,114 @@ def _inflight_entry_is_stale(
         return not any(e.get('branch') == branch for e in entries)
 
 
+def _inflight_worktree_is_stale(
+    wt: Path,
+    branch: str,
+    live_snapshot: Callable[[], dict] | None,
+) -> bool:
+    """Return True when the on-disk ``_merge-*`` worktree *wt* is a CORPSE.
+
+    The disk-scan companion to :func:`_inflight_entry_is_stale`, with the same
+    polarity: **True = corpse → reap and dispatch fresh**, **False = keep
+    coalescing**.
+
+    Why a snapshot signal is needed at all.  The disk-scan coalesce arm decides
+    liveness from *wt*'s ROOT inode mtime.  But
+    :meth:`SpeculativeMergeWorker._touch_owned_merge_worktrees` ``os.utime``s
+    the root inode of every path in ``_owned_merge_worktrees`` on every
+    heartbeat tick (~30 s, i.e. ~360x inside the 10800 s liveness window).  So
+    for an OWNED worktree root mtime measures *owner-process* liveness, not
+    *merge* liveness: once such a worktree outlives its request's terminal
+    finalization while still in the ledger, the heartbeat pins its mtime fresh
+    forever, ``age <= liveness_secs`` is permanently true, and every resubmit
+    for that branch coalesces onto a corpse until the process restarts.
+    :func:`orchestrator.merge_liveness.newest_content_mtime` states the same
+    hazard for the in-flight verify no-progress budget ("the #1728 alpha
+    owner-heartbeat ... can never mask a dead/hung verify subprocess"); this
+    predicate is that treatment for the coalesce arm.
+
+    Why OWNERSHIP gates the verdict.  The disk-scan arm exists for
+    cross-process / post-restart crash-safety: an in-progress merger's
+    ``_merge-*`` worktree persists on disk even when the in-memory registry was
+    cleared by a restart, and it must still coalesce or two mergers race onto
+    one branch.  A foreign or pre-restart merger's worktree is BY CONSTRUCTION
+    absent from *this* worker's snapshot entries, so a bare branch-absence test
+    would reap genuinely live foreign merges.  Ownership is the precise
+    discriminator: for a worktree this worker is heartbeating, mtime is
+    known-contaminated and cannot be evidence of life, so "no live entry for
+    the branch" proves the owning request already finalized.  Everything else
+    keeps the pre-existing behaviour.
+
+    Returns **False** (not stale → keep coalescing) in six cases:
+
+    1. *live_snapshot* is None — no provider wired (back-compat default; all
+       existing callers without a worker).
+    2. ``live_snapshot()`` raises — transient error (fail-safe to coalesce).
+    3. The snapshot is not a dict or lacks the ``'entries'`` key — malformed
+       response.  Same philosophy as the sibling predicate: when the snapshot
+       cannot be trusted, assume live rather than risk a double-dispatch, which
+       is strictly worse because a delayed coalesce is self-healing while a
+       double-dispatch corrupts main.
+    4. The snapshot lacks the ``'owned_merge_worktrees'`` key entirely — a
+       producer predating that additive key (a test double, or a rolling deploy
+       where the escalation server sees an older worker).  Distinguished from
+       an *empty* ledger, which is a live worker's honest answer and still
+       permits the decisive check below.
+    5. The ownership comparison cannot be computed — *wt* is unresolvable
+       (OSError), or ``owned_merge_worktrees`` is not an iterable of
+       path-likes (TypeError/ValueError, e.g. an int, or a list holding a
+       non-path element).  A malformed snapshot must degrade to "coalesce",
+       never fail the caller's submission: this predicate is reached from the
+       ``merge_request`` MCP tool, so an exception here would reject the
+       submission outright instead of falling back to today's behaviour.
+    6. *wt* is not in this worker's ledger — foreign / pre-restart merger; its
+       mtime is real evidence, so the crash-safety property is preserved.
+
+    The final branch scan is guarded the same way: a snapshot whose
+    ``entries`` is not a list of dicts yields False rather than raising.
+
+    Ownership is compared on ``Path.resolve()``, matching how
+    :meth:`SpeculativeMergeWorker.worktree_ledger_violations` already
+    normalises the same ledger, so the two ownership tests can never disagree.
+    The real producer (:meth:`SpeculativeMergeWorker.snapshot`) already emits
+    resolved strings, so re-normalising here is redundant for it — but it is
+    what lets a hand-built ledger (a test double, or any caller assembling the
+    dict itself) spell a path unnormalised and still be recognised as owned.
+    """
+    if live_snapshot is None:
+        return False
+    try:
+        snap = live_snapshot()
+    except Exception:
+        return False  # fail-safe: transient error → not stale → coalesce
+    if not isinstance(snap, dict) or 'entries' not in snap:
+        return False  # malformed snapshot → fail-safe: not stale → coalesce
+    owned = snap.get('owned_merge_worktrees')
+    if owned is None:
+        # Key absent (not merely empty) → producer predates the additive key.
+        # Note the `is None` test: an EMPTY list from a live worker is a
+        # trustworthy answer and must not short-circuit the decisive check.
+        return False
+    try:
+        wt_key = str(Path(wt).resolve())
+        owned_keys = {str(Path(p).resolve()) for p in owned}
+    except (OSError, TypeError, ValueError):
+        # Unresolvable path, or a ledger that is not an iterable of
+        # path-likes.  Fail-safe: not stale → coalesce.  Broader than OSError
+        # alone because the realistically-malformed input is a wrong-typed
+        # ledger (TypeError), not an unresolvable path — `Path.resolve()` is
+        # non-strict and practically never raises.
+        return False
+    if wt_key not in owned_keys:
+        return False  # not ours → mtime is real evidence → keep coalescing
+    # Owned by this worker: mtime is heartbeat-pinned, so the ONLY liveness
+    # signal is whether the live pipeline still carries this branch.
+    try:
+        return not any(e.get('branch') == branch for e in snap['entries'])
+    except (TypeError, AttributeError):
+        return False  # malformed 'entries' → fail-safe: not stale → coalesce
+
+
 def _snapshot_verify_state(
     live_snapshot: Callable[[], dict] | None,
     request_id: str | None,
@@ -4172,15 +4883,30 @@ async def coalesce_or_enqueue_merge_request(
 
     *live_snapshot* (keyword-only, default None): a zero-argument callable
     that returns the live worker snapshot dict (same shape as
-    ``SpeculativeMergeWorker.snapshot()``).  When provided, the registry
-    fast-path **reconciles** the in-memory slot against the live snapshot
-    before coalescing: if the slot's ``request_id`` is absent from the
+    ``SpeculativeMergeWorker.snapshot()``).  When provided, it **reconciles
+    BOTH coalesce arms** against live worker state before coalescing.
+
+    *Registry arm*: if the slot's ``request_id`` is absent from the
     snapshot the slot is considered stale (the request finalized but its
     slot was not auto-released), it is reaped via
     ``registry.release(branch, detach_waiters=True)``, and the call falls
     through to the acquire-and-enqueue block dispatching a fresh request.
-    When absent (None) or when ``live_snapshot()`` raises, the gate
-    behaves exactly as today — trust the registry.
+
+    *Disk-scan arm*: the same reconciliation, but additionally gated on
+    OWNERSHIP via the snapshot's ``owned_merge_worktrees`` ledger (see
+    :func:`_inflight_worktree_is_stale`).  A worktree this worker is
+    heartbeating has a root-inode mtime pinned fresh by
+    ``_touch_owned_merge_worktrees``, so mtime cannot prove liveness; when the
+    snapshot additionally holds no entry for the branch, the owning request has
+    finalized and the worktree is a corpse — reaped with reason
+    ``finalized_owner`` (distinct from the mtime path's ``stale_inflight``),
+    falling through to a fresh dispatch.  Requiring ownership is what preserves
+    the cross-process crash-safety property documented above: a foreign or
+    pre-restart merger's worktree is by construction absent from this worker's
+    snapshot entries, so branch-absence alone would reap live foreign merges.
+
+    When absent (None) or when ``live_snapshot()`` raises, both arms behave
+    exactly as before — trust the registry and the on-disk mtime.
 
     *classifier_git_ops* (keyword-only, default None): when provided AND both
     ``entry.snapshot_tip`` and ``req.snapshot_tip`` are set, the registry
@@ -4207,7 +4933,10 @@ async def coalesce_or_enqueue_merge_request(
     registry mutation — the only await (ancestry classification) precedes them
     and performs no mutation.  When absent or either snapshot_tip is None, the
     gate is a no-op and the path preserves current behaviour (back-compat).
-    The disk-scan cross-process coalesce branch is intentionally left untouched.
+    The C3 submit-identity gate is scoped to the registry fast-path; the
+    disk-scan branch has no in-process entry to classify a tip against.  That
+    branch is reconciled instead by the ownership-gated staleness check
+    described under *live_snapshot* above.
     """
     branch = req.branch.bare_id  # bookkeeping key (registry / worktree scan / result)
 
@@ -4410,11 +5139,38 @@ async def coalesce_or_enqueue_merge_request(
     if git_ops is not None:
         wt = await git_ops.find_inflight_merge_worktree(branch)
         if wt is not None:
-            try:
-                age = time.time() - wt.stat().st_mtime
-            except OSError:
-                age = 0.0  # stat failed — treat as alive to be safe
-            if age <= liveness_secs:
+            # Two independent corpse tests, evaluated as ALTERNATIVES (not
+            # nested cases) and collapsed to a single reap below.
+            #   'finalized_owner' — owned by THIS worker (so its root mtime is
+            #     heartbeat-pinned by _touch_owned_merge_worktrees and carries
+            #     no information about merge liveness) while the live pipeline
+            #     holds no entry for the branch: the owning request already
+            #     finalized.  Without this test the mtime test below coalesces
+            #     onto the corpse forever and the branch can never re-enter the
+            #     merge queue until the process restarts.
+            #   'stale_inflight' — the pre-existing age test: an owner that
+            #     died long enough ago that even an unpinned mtime went cold.
+            #   None — alive: coalesce.
+            if _inflight_worktree_is_stale(wt, branch, live_snapshot):
+                reap_reason: str | None = 'finalized_owner'
+                reap_detail = (
+                    'owned by this worker but no live entry for the branch — its '
+                    'request already finalized; root mtime is heartbeat-pinned and '
+                    'cannot be trusted'
+                )
+            else:
+                try:
+                    age = time.time() - wt.stat().st_mtime
+                except OSError:
+                    age = 0.0  # stat failed — treat as alive to be safe
+                if age > liveness_secs:
+                    reap_reason = 'stale_inflight'
+                    reap_detail = f'age={age:.0f}s > liveness={liveness_secs}s'
+                else:
+                    reap_reason = None
+                    reap_detail = ''
+
+            if reap_reason is None:
                 # ALIVE: coalesce without enqueuing or reaping.
                 # No alias is registered here: the primary request_id belongs to
                 # a different process, so there is no in-process registry entry
@@ -4427,27 +5183,64 @@ async def coalesce_or_enqueue_merge_request(
                     branch=branch,
                     source='worktree',
                 )
-            else:
-                # STALE/ABANDONED: reap the abandoned worktree so a fresh merger
-                # can be dispatched.  Foreign-process killing is deliberately out
-                # of scope — there is no cwd-based kill utility in the repo
-                # (terminate_process_group only handles procs the orchestrator
-                # spawned), and git worktree remove --force removes the tree so
-                # any orphaned build procs fail when their cwd vanishes.
+
+            # REAP, then fall through to acquire-and-enqueue below.
+            # `cleanup_merge_worktree` IS the lease-guarded path: it routes
+            # through `remove_merge_worktree_guarded` (git_ops.py:8875-8878), so
+            # a tree whose merge-verify flock is held by a LIVE holder is
+            # SKIPPED, not yanked — the same C1 protection the C3 REPLACE reap
+            # above relies on.  It adds only a crash-safe filesystem fallback on
+            # the primitive's ``'failed'`` outcome, which by construction means
+            # the lease acquire already confirmed no live holder.  That matters
+            # most for 'finalized_owner', which (unlike the 10800 s mtime arm)
+            # can fire milliseconds after the owner retired its item.
+            # Foreign-process killing is deliberately out of scope — there is no
+            # cwd-based kill utility in the repo (terminate_process_group only
+            # handles procs the orchestrator spawned), and `git worktree remove
+            # --force` removes the tree so any orphaned build procs fail when
+            # their cwd vanishes.
+            logger.warning(
+                'coalesce_or_enqueue_merge_request: reaping %s _merge-* worktree '
+                '%s for branch %r (%s). Dispatching fresh.',
+                reap_reason, wt, branch, reap_detail,
+            )
+            await git_ops.cleanup_merge_worktree(wt)
+            # Observed post-condition, not the primitive's return value:
+            # cleanup_merge_worktree returns None and may apply its own fallback
+            # after the primitive returns, so "is the tree actually gone?" is the
+            # only honest outcome to record.  False means the removal was skipped
+            # (a live holder still owns the lane's flock) or failed — the reap is
+            # then a no-op and this call dispatches alongside a surviving tree,
+            # which the I6 audit/orphan reaper collect later.  Recorded rather
+            # than silently dropped (no-silent-fail-soft).
+            reap_removed = not wt.exists()
+            if not reap_removed:
                 logger.warning(
-                    'coalesce_or_enqueue_merge_request: reaping stale '
-                    '_merge-* worktree %s for branch %r (age=%.0fs > liveness=%ss)',
-                    wt, branch, age, liveness_secs,
+                    'coalesce_or_enqueue_merge_request: %s reap did NOT remove %s '
+                    '(lease held by a live verify, or removal failed) — dispatching '
+                    'fresh alongside the surviving tree; the orphan reaper collects it',
+                    reap_reason, wt,
                 )
-                await git_ops.cleanup_merge_worktree(wt)
-                if event_store is not None:
-                    event_store.emit(
-                        EventType.worktree_reaped,
-                        task_id=req.task_id,
-                        phase='merge',
-                        data={'branch': branch, 'path': str(wt), 'reason': 'stale_inflight'},
-                    )
-                # Fall through to acquire-and-enqueue below
+            if event_store is not None:
+                event_store.emit(
+                    EventType.worktree_reaped,
+                    task_id=req.task_id,
+                    phase='merge',
+                    data={
+                        'branch': branch,
+                        'path': str(wt),
+                        'reason': reap_reason,
+                        'removed': reap_removed,
+                    },
+                )
+            # NB: this gate holds no worker handle, so it cannot drop the reaped
+            # path from `_owned_merge_worktrees` directly.  A 'finalized_owner'
+            # reap therefore leaves a phantom ledger entry for at most one
+            # heartbeat tick (~30 s), after which `_touch_owned_merge_worktrees`
+            # hits ENOENT and deregisters it.  Harmless in the interim: the
+            # exemption it grants (`keep_worktrees`) names a path that no longer
+            # exists, and the fresh merger gets a new `_merge-<uuid>` path, so
+            # the phantom can neither shadow it nor re-wedge the branch.
 
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
     if registry.acquire(branch, req.task_id, req.result, request_id=req.request_id):
@@ -5076,6 +5869,9 @@ async def reconcile_landed_row(
     outbox: LandedOutbox,
     main_sha: str,
     provenance_conflict_sink: Any = None,
+    project_root: str | Path | None = None,
+    check_timeout_secs: float | None = None,
+    delivered_checks_enabled: bool = True,
 ) -> str:
     """Reconcile a single :class:`LandedRow` against RC-1/RC-2/RC-3 (task 2155, W1 γ).
 
@@ -5155,6 +5951,31 @@ async def reconcile_landed_row(
       gate's re-pend recipe, ``resolve_issue`` alone is sufficient here
       because ``should_skip`` reads the escalation's own status, not the
       task's.
+    * ``'delivered_checks_withheld'`` (task 3057) — the delivered-capability
+      guard refused the RC-2 done-write: git ancestry proves the branch tip
+      reached ``main_sha``, but the task's declared
+      ``metadata.delivered_checks`` are NOT verifiably present in that tree,
+      so stamping ``kind='merged'`` here would write a hollow done. Like
+      ``'skipped'``/``'stale_conflict'`` the row is left UNCONSUMED — the task
+      is not done, and the row is the only surviving record of the
+      crash-window intent — and :func:`reconcile_landed_task` maps this
+      disposition to ``False`` so the task stays DISPATCHABLE and an agent
+      actually delivers the capability. Deliberately NOT folded into
+      ``'skipped'``, which maps to ``True`` (do not dispatch) and would
+      convert a misattribution into a permanent strand.
+
+      The guard is OPT-IN: it runs only when BOTH *project_root* and
+      *check_timeout_secs* are supplied (the harness arms them from live
+      config — see ``Harness._reconcile_landed_outbox`` /
+      ``Harness._landed_dispatch_gate``). Their ``None`` defaults leave every
+      other caller byte-identical to the pre-3057 behavior.
+      *delivered_checks_enabled* forwards ``config.delivered_checks.enabled``
+      so the fleet-wide kill switch stays single-sourced in
+      :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+      rather than being re-implemented here. The already-resolved *main_sha*
+      is threaded to the guard so it audits the SAME main the RC-1 ancestry
+      test used — re-resolving could evaluate a different (newer) main than
+      the decision being gated, and would cost an extra git round-trip.
     """
     if not await git_ops.is_ancestor(row.advanced_sha, main_sha):
         outbox.consume(row.task_id)
@@ -5169,9 +5990,14 @@ async def reconcile_landed_row(
     # task 2677 amendment (reviewer_comprehensive #2): intentionally omits
     # reopen_at here, unlike the harness's dispatch-gate and stranded-sweep
     # should_skip call sites — a LandedRow (task_id/branch_tip_sha/
-    # advanced_sha/landed_at) carries no task metadata, and fetching it would
-    # require an extra scheduler round-trip this module-level function does
-    # not otherwise make. This site therefore cannot self-heal on a fresh
+    # advanced_sha/landed_at) carries no task metadata. Amended by task 3057:
+    # this function DOES now make a scheduler round-trip for metadata, but
+    # only on the delivered-checks path below — i.e. only when the guard is
+    # ARMED *and* the row already reached RC-2, which is once per
+    # crash-recovered landing, never on the hot dispatch path (the
+    # overwhelmingly common no-row case returns at the caller's lookup with
+    # zero I/O). Widening it to also feed should_skip's reopen_at arm was NOT
+    # in 3057's scope, so this site still cannot self-heal on a fresh
     # reopen_at; it only re-attempts once the provenance_conflict escalation
     # is resolved. See the docstring above for the full rationale.
     if (
@@ -5179,6 +6005,53 @@ async def reconcile_landed_row(
         and provenance_conflict_sink.should_skip(row.task_id)
     ):
         return 'stale_conflict'
+    # task 3057 — delivered-capability guard on the RC-2 done-write. Ancestry
+    # above proves the branch TIP reached main; it never proves THIS task's
+    # declared capability rode along with it. Placed last so the cheap
+    # dispositions ('skipped'/'already_done_pruned'/'stale_conflict') still
+    # short-circuit with zero check work, and structurally immediately before
+    # the mark_done it guards so a later refactor cannot drift them apart.
+    # *delivered_checks_enabled* is part of the ARMING condition, not merely
+    # forwarded to the gate (task 3057 review): the metadata pre-read below
+    # runs BEFORE the shared decision, and its two fail-safe arms return
+    # 'delivered_checks_withheld' without ever reaching the gate. Gating only
+    # on the two params would therefore let a transient `scheduler.get_task`
+    # failure refuse the RC-2 done-write even with the fleet-wide kill switch
+    # off. Disarmed must mean pre-3057 behaviour exactly.
+    if (
+        delivered_checks_enabled
+        and project_root is not None
+        and check_timeout_secs is not None
+    ):
+        try:
+            task = await scheduler.get_task(row.task_id)
+        except Exception:
+            logger.warning(
+                'reconcile_landed_row: task %s metadata unreadable — '
+                'withholding the RC-2 done-write (fail-safe); row retained '
+                'for the next pass',
+                row.task_id, exc_info=True,
+            )
+            return 'delivered_checks_withheld'
+        if task is None:
+            logger.warning(
+                'reconcile_landed_row: task %s has no scheduler record — '
+                'withholding the RC-2 done-write (fail-safe); row retained '
+                'for the next pass',
+                row.task_id,
+            )
+            return 'delivered_checks_withheld'
+        if await gate_mark_done_on_delivered_checks(
+            row.task_id,
+            (task.get('metadata') or {}),
+            project_root=project_root,
+            check_timeout_secs=check_timeout_secs,
+            main_sha=main_sha,
+            enabled=delivered_checks_enabled,
+            site='landed-reconcile-rc2',
+            log=logger,
+        ) is not None:
+            return 'delivered_checks_withheld'
     try:
         await scheduler.mark_done(row.task_id, kind='merged', sha=row.advanced_sha)
     except StaleEvidenceRejection as exc:
@@ -5229,6 +6102,9 @@ async def reconcile_landed_task(
     scheduler: Any,
     outbox: LandedOutbox,
     provenance_conflict_sink: Any = None,
+    project_root: str | Path | None = None,
+    check_timeout_secs: float | None = None,
+    delivered_checks_enabled: bool = True,
 ) -> bool:
     """Single-task landed-outbox consult for the scheduler dispatch gate (task 2156, W1 δ / SD-1).
 
@@ -5257,10 +6133,18 @@ async def reconcile_landed_task(
     via ``'skipped'``, or gate via ``'stale_conflict'`` — task 2677: a
     contested task under provenance-conflict arbitration must never
     dispatch) has already happened inline via ``reconcile_landed_row``.
-    Returns ``False`` when there is no row, or when the row's disposition is
+    Returns ``False`` when there is no row, when the row's disposition is
     ``'pruned_not_landed'`` — the task never actually landed (crash before
     the CAS advance), so it stays normally dispatchable and its stale row
-    has already been pruned.
+    has already been pruned — or when it is ``'delivered_checks_withheld'``
+    (task 3057): the RC-2 done-write was refused because the task's declared
+    ``metadata.delivered_checks`` are not verifiably on main, and the correct
+    recovery is precisely to DISPATCH so an agent delivers them. Gating there
+    would wedge the task forever, converting a would-be misattribution into a
+    permanent strand. The three delivered-checks params are forwarded
+    verbatim to :func:`reconcile_landed_row`; leaving *project_root* /
+    *check_timeout_secs* at their ``None`` defaults keeps the guard unarmed
+    and this function byte-identical to its pre-3057 behavior.
     """
     row = outbox.lookup(task_id)
     if row is None:
@@ -5269,8 +6153,11 @@ async def reconcile_landed_task(
     disposition = await reconcile_landed_row(
         row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
         provenance_conflict_sink=provenance_conflict_sink,
+        project_root=project_root,
+        check_timeout_secs=check_timeout_secs,
+        delivered_checks_enabled=delivered_checks_enabled,
     )
-    return disposition != 'pruned_not_landed'
+    return disposition not in ('pruned_not_landed', 'delivered_checks_withheld')
 
 
 async def reconcile_landed_outbox(
@@ -5278,6 +6165,9 @@ async def reconcile_landed_outbox(
     git_ops: Any,
     scheduler: Any,
     provenance_conflict_sink: Any = None,
+    project_root: str | Path | None = None,
+    check_timeout_secs: float | None = None,
+    delivered_checks_enabled: bool = True,
 ) -> dict[str, int]:
     """Scan *outbox* at startup and reconcile every unconsumed row (task 2155, W1 γ).
 
@@ -5314,6 +6204,15 @@ async def reconcile_landed_outbox(
     self-cleaning at the next boot and never a phantom-done risk — and is
     additionally guarded against an RC-2 re-done by the server-side
     reopen-freshness gate.
+
+    The three delivered-checks params (task 3057) are forwarded verbatim to
+    :func:`reconcile_landed_row`, which arms its RC-2 capability guard only
+    when BOTH *project_root* and *check_timeout_secs* are supplied. A refused
+    done-write is tallied under ``'delivered_checks_withheld'`` — a
+    first-class disposition, NOT an error — and its row is deliberately left
+    unconsumed so the next pass re-evaluates it. The key is always present in
+    the report (initialised to 0) so a reader never has to distinguish
+    "absent" from "none withheld".
     """
     report = {
         'pruned_not_landed': 0,
@@ -5321,6 +6220,7 @@ async def reconcile_landed_outbox(
         'already_done_pruned': 0,
         'skipped': 0,
         'stale_conflict': 0,
+        'delivered_checks_withheld': 0,
         'errors': 0,
     }
     main_sha = await git_ops.get_main_sha()
@@ -5329,6 +6229,9 @@ async def reconcile_landed_outbox(
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
                 provenance_conflict_sink=provenance_conflict_sink,
+                project_root=project_root,
+                check_timeout_secs=check_timeout_secs,
+                delivered_checks_enabled=delivered_checks_enabled,
             )
             report[disposition] += 1
         except Exception:
@@ -7080,11 +7983,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # transient retry loop (task 2835) — decoupled from the ENOSPC budget
     # above so it is affordable to make larger: a narrowed retry re-runs only
     # the did-not-pass subset (cheap per retry), unlike the ENOSPC budget
-    # which bounds a full re-verify.  Inert in production until reify writes
-    # the attempt-0 sidecar the D2 producer (_run_post_merge_verify) needs to
-    # actually narrow a retry — until then every retry_failed_only=True
-    # request still falls back to the small MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES
-    # budget.  Kept as a class attribute so tests can monkeypatch it.
+    # which bounds a full re-verify.  LIVE in production (task 3059): the
+    # retry payload is built in-process from attempt-0's OWN VerifyResult
+    # (_build_attempt0_payload), so a retry_failed_only=True request that
+    # corroborates its tree OID gets this budget, not the small
+    # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES one.  A request whose payload
+    # cannot be built or corroborated still falls back to the ENOSPC budget —
+    # the gate is ACTUAL narrowing, never the raw flag.
+    # Kept as a class attribute so tests can monkeypatch it.
     MAX_POST_MERGE_VERIFY_NARROWED_RETRIES: int = 2
     # Poll interval (seconds) used in the _verify_and_advance abort-loop that
     # checks whether a sole-waiter detach() cancelled req.result mid-verify.
@@ -7164,6 +8070,68 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # streak counts only UNBROKEN contention.  Kept as a class attribute so tests
     # can monkeypatch it small (mirrors MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
     CONTENDED_LEASE_REQUEUE_WARN_STREAK: int = 5
+    # task 3003 (review fix 1): MINIMUM INTER-ATTEMPT PERIOD for a
+    # contended-lane DEFER — NOT an unconditional extra sleep.  The backoff
+    # actually slept is max(0, PERIOD - exc.wait_secs), so the two BOUNDED-WAIT
+    # raisers already self-throttle and sleep ZERO additional seconds
+    # (reset: 30 s via _RESET_WARM_LANE_LOCK_WAIT_SECS; lease: 300 s via
+    # _MERGE_VERIFY_LEASE_WAIT_SECS — both already ≥ this period).  It exists
+    # for MergeVerifyLeaseHeld, whose FOREIGN-holder pre-check
+    # (git_ops.reset_persistent_merge_worktree) refuses IMMEDIATELY and carries
+    # no wait at all: without a floor here a live foreign holder would make the
+    # merger spin dequeue → `git worktree add` + merge → instant refusal →
+    # cleanup → requeue at whatever rate git allows, for the entire 1–2 h holder
+    # window.  30 s matches the reset path's own bounded wait, so a
+    # zero-wait defer re-attempts at the same cadence a contended one does.
+    # Kept as a class attribute so tests can monkeypatch it small — or to 0.0
+    # to opt out (mirrors the MAX_*/WARN_STREAK monkeypatch convention above).
+    CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS: float = 30.0
+    # task 3003 (review fix 2): ELAPSED-TIME budget for an UNBROKEN
+    # contended-lane defer streak.  Past this, the defer converts to a terminal
+    # 'blocked' instead of re-queuing again — a contended-lane defer never
+    # escalates and never counts against the requeue cap, so without a bound a
+    # permanently wedged lane holder would defer one task forever.
+    #
+    # The default MUST stay above the longest LEGITIMATE holder.  The
+    # motivating incident is a 1–2 h merge-verify / speculative merge-ahead
+    # train holding the lane; a cap short enough to fire on THAT would
+    # re-create exactly the false-positive escalation this task removed.  4 h
+    # clears that class with margin while still bounding a genuinely wedged
+    # lane.
+    #
+    # ELAPSED time, not a raw defer COUNT: the effective re-attempt period
+    # differs per raiser (0 s for MergeVerifyLeaseHeld's immediate pre-check,
+    # 30 s for the reset acquire, 300 s for the lease acquire), so a count cap
+    # would mean a wildly different real-world budget depending on which one
+    # fired — and would shift again with any change to
+    # CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS above.  A time cap is invariant
+    # under both.  Class attribute so tests monkeypatch it small (mirrors
+    # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
+    MAX_CONTENDED_LEASE_DEFER_SECS: float = 14400.0
+    # task 3003 amend (reviewer_comprehensive, robustness): what makes the
+    # streak above CONTINUOUS.  MAX_CONTENDED_LEASE_DEFER_SECS measures elapsed
+    # time from the streak's FIRST defer, which is only a contention budget if
+    # the defers in between were actually consecutive.  They need not be: a
+    # deferred request can leave the defer loop entirely without ever
+    # re-reaching the except arm that clears the streak — its requeued dispatch
+    # can remerge into a conflict (DecidedItem passthrough), be abandoned, or
+    # die at shutdown — and the per-worker dicts live for the orchestrator
+    # process (~8 h between fleet redeploys).  Without this, a single defer at
+    # T0 followed hours later by ONE brief transient contention for the same
+    # task_id would cap out on the FIRST defer of the fresh streak, resolving
+    # exactly the false-positive 'blocked' this task was chartered to remove.
+    #
+    # So the streak is treated as BROKEN when the gap since its last defer is
+    # far larger than the defer cadence can explain: a gap that big means
+    # something other than a defer happened in between.  FACTOR x the expected
+    # inter-attempt period (whichever is larger — the configured throttle or
+    # this raiser's own bounded wait, so the 300 s lease acquire is not
+    # mis-judged by a 30 s yardstick), floored so a test/operator opting out of
+    # the throttle (PERIOD = 0.0) cannot collapse the window to zero and break
+    # a genuinely continuous streak on its second defer.  Both are class
+    # attributes so tests can monkeypatch them (mirrors MAX_*/WARN_STREAK).
+    CONTENDED_LEASE_STREAK_STALE_FACTOR: float = 4.0
+    CONTENDED_LEASE_STREAK_STALE_FLOOR_SECS: float = 60.0
     # MQ-invariants iota (task 1994): grace window (seconds, wall-clock mtime)
     # before an unregistered on-disk `_merge-*` worktree is flagged by
     # worktree_ledger_violations().  Tactical default sits strictly between
@@ -7177,6 +8145,39 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # for fast, deterministic coverage.  Mirrors the MAX_*/
     # VERIFY_ABANDON_POLL_SECS monkeypatch convention above.
     RESOURCE_AUDIT_WORKTREE_GRACE_SECS: float = 9000.0
+    # task 3018: minimum age before the PERIODIC (steady-state) reap sweep
+    # DESTROYS an unregistered `_merge-*` worktree — deliberately larger than
+    # the RESOURCE_AUDIT_WORKTREE_GRACE_SECS DETECTION threshold above.
+    #
+    # Detection and destruction answer different questions and want different
+    # answers: "old enough to be worth REPORTING" is deliberately eager, while
+    # "old enough that destroying it cannot interrupt live work" must be
+    # conservative.  Promoting the reap from a startup-only sweep to a
+    # steady-state one would otherwise have silently re-purposed the detection
+    # grace as a destruction deadline.  A tree between the two thresholds is
+    # still flagged by worktree_ledger_violations on every heartbeat — it is
+    # simply not destroyed yet (detect-early / destroy-late).
+    #
+    # The value is DERIVED, not picked: merge_verify_cold_command_timeout_secs
+    # (7200 s, defaults.yaml) is a PER-COMMAND budget, and a cold merge verify
+    # runs >= 2 command phases (scoped verify + unscoped typechecks) plus
+    # worktree creation and venv/dep seeding — so the total-lifetime ceiling of
+    # a legitimately slow cold verify is >= 2 x 7200 = 14400 s.  21600 s clears
+    # that with headroom while staying below the 8h fleet-redeploy window, so
+    # an in-run leak is still reclaimed rather than deferred to the next
+    # restart (which was the whole point of the periodic sweep).  Note this is
+    # why INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS (10800 s) was NOT reused here:
+    # 10800 < 14400, so it would not actually clear the cold-verify ceiling.
+    #
+    # This is DEFENSE-IN-DEPTH, not the primary protection.  A live throwaway
+    # verify worktree now holds `merge_verify_lease(lane_dir=wt)` for the
+    # duration of its verify (merge_shadow._run_cold_shadow_verify /
+    # merge_drift._run_drift_check), so remove_merge_worktree_guarded returns
+    # 'skipped_lease_held' and skips it regardless of age.  This floor covers
+    # any live-but-unleased tree on a path not yet enumerated.  Kept as a class
+    # attribute so tests can monkeypatch it small, matching the
+    # RESOURCE_AUDIT_*/MAX_* convention above.
+    PERIODIC_REAP_MIN_AGE_SECS: float = 21600.0
     # MQ-invariants iota (task 1994): number of CONSECUTIVE
     # _check_resource_audit heartbeats a resource-conservation violation
     # (speculation_accounting_violations / worktree_ledger_violations) must
@@ -7361,6 +8362,47 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # UNBROKEN contention (unlike the requeue itself, which never counts
         # against the requeue cap and never escalates on its own).
         self._contended_lease_requeues: dict[str, int] = {}
+        # task 3003 (review fix 2): per-task time.monotonic() stamp of the FIRST
+        # defer in the current unbroken contended-lane streak, set with
+        # setdefault on each defer.  Its elapsed span is compared against
+        # MAX_CONTENDED_LEASE_DEFER_SECS to convert an unbounded fail-safe
+        # requeue loop into a terminal 'blocked'.  monotonic (not time.time())
+        # because this is a pure duration reference — never persisted, never
+        # compared against a stored wall-clock value — so it must be immune to
+        # NTP/manual clock steps, which could otherwise false-'block' a healthy
+        # task on a forward step (same rationale recorded for the dead-verify
+        # progress budget below).  Popped in lockstep with
+        # _contended_lease_requeues at every reset site, so a verify that
+        # actually runs clears BOTH — a stale start stamp would otherwise make
+        # a much later, unrelated streak cap out on its very first defer.
+        self._contended_lease_first_defer_at: dict[str, float] = {}
+        # task 3003 amend (reviewer_comprehensive, robustness): per-task
+        # time.monotonic() stamp of the MOST RECENT defer, the companion that
+        # makes the streak's "continuous" claim CHECKABLE rather than assumed.
+        # A gap since this stamp far larger than the defer cadence
+        # (CONTENDED_LEASE_STREAK_STALE_*) proves something other than a defer
+        # happened in between, so the streak is closed and a fresh one opened.
+        # Needed because a deferred request can leave the defer loop WITHOUT
+        # ever re-reaching the arm that clears the streak (its requeued dispatch
+        # remerges into a conflict, is abandoned, or dies at shutdown), and
+        # these dicts live for the whole orchestrator process.  Popped in
+        # lockstep with the other two via _clear_contended_lease_streak.
+        self._contended_lease_last_defer_at: dict[str, float] = {}
+        # task 3003 amend (reviewer_comprehensive, test_quality): per-WORKER
+        # count of terminal contended-lane cap-outs, rendered into the 'blocked'
+        # reason so two cap-outs are signature-distinct STRUCTURALLY rather than
+        # by scheduling jitter.  In production the elapsed-seconds and
+        # streak-count components are near-CONSTANT across consecutive cap-outs
+        # (each streak starts fresh at the cap, so each caps at the first defer
+        # past MAX_CONTENDED_LEASE_DEFER_SECS with the same cadence, rendering
+        # ~the same '14400s across 481 attempts'); they differed only in the
+        # sub-second jitter surviving ':.0f'.  With max_consecutive_merge_thrash
+        # defaulting to 2, an unlucky alignment would reopen the very
+        # false-positive ladder walk this task removed.  Deliberately NOT
+        # per-task: a plain incrementing worker ordinal cannot collide with
+        # itself.  (It restarts at 0 with the process, where the numeric
+        # components remain as the secondary difference.)
+        self._contended_lease_cap_outs: int = 0
         # Speculation-depth cap: one permit consumed by the Merger when it
         # prefetches a speculative item; released by the Verifier when it drains
         # that speculative item.  Symmetric accounting: acquire=prefetch,
@@ -7537,6 +8579,41 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Default interval ~5 min; override in tests for deterministic rate-limit checks.
         # Mirrors the _shutdown_timeout override precedent.
         self._heartbeat_interval_s: float = 300.0
+        # Periodic orphaned-_merge-* reap (task 3018 — closes the
+        # observe-but-never-reclaim gap: reap_orphaned_merge_worktrees was
+        # previously wired only at worker construction/recovery time, so a
+        # leak crossing grace mid-run sat unreaped until the next restart).
+        # Deliberately DIVERGES from the _last_heartbeat_at=0.0 idiom (task
+        # 3018 amendment — reviewer_comprehensive correctness finding):
+        # Harness._start_merge_worker spawns this worker's loops via
+        # lifecycle.start_all() BEFORE the startup recovery sequence runs
+        # (_recover_pending_merges, then the startup
+        # Harness._reap_orphaned_merge_worktrees(recovered_branches) call —
+        # see harness.py ~1844-1893). An init-0.0 first poll (~30s later)
+        # could fire the periodic sweep — which passes no recovered_branches
+        # — before that startup sweep re-adopts a worktree backing a
+        # recovered in-flight merge, reaping it out from under recovery.
+        # Seeding to real construction time instead defers the first
+        # periodic sweep by a full _reap_interval_s, giving startup recovery
+        # time to settle first.
+        self._last_reap_at: float = time.time()
+        # Default interval ~5 min; override in tests for deterministic rate-limit checks.
+        # Mirrors the _heartbeat_interval_s / _shutdown_timeout override precedent.
+        self._reap_interval_s: float = 300.0
+        # Bounds a single periodic-reap sweep (task 3018 amendment —
+        # reviewer_comprehensive robustness finding). reap_orphaned_merge_worktrees
+        # runs os.scandir plus one `git worktree remove --force` subprocess per
+        # aged orphan via GitOps._run, which has NO internal timeout. A wedged
+        # git (repo lock contention, NFS, many orphans in one sweep) would
+        # otherwise block this loop indefinitely — starving step 1's
+        # owned-worktree touch well past the liveness-margin's touch-miss
+        # floor (_HEARTBEAT_POLL_S x TOUCH_MISS_TOLERANCE = 600s). _run's own
+        # docstring documents asyncio.wait_for(..., timeout=...) wrapping as
+        # cancellation-safe (best-effort kills + reaps the child before
+        # re-raising) — the same pattern delivered_checks.py's
+        # _run_script_check already relies on. Override in tests for
+        # deterministic bounded-hang checks (mirrors the precedents above).
+        self._reap_sweep_timeout_s: float = 120.0
         # Per-lane FIFO buffers — items are drained from _queue into these so
         # pick-order can prefer high over normal.  Each deque preserves FIFO
         # within a lane.  Accessed only from the merger coroutine.
@@ -7622,6 +8699,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         #   (e) Coalesced GroupMergeRequest merge worktrees ARE in scope;
         #       registered automatically at _merger_loop handoff (:5703).
         self._owned_merge_worktrees: set[Path] = set()
+        # task 3148: resolved-string memo for the ledger above, maintained by
+        # _register/_deregister_owned_merge_worktree so snapshot()'s
+        # 'owned_merge_worktrees' key stays a PURE IN-MEMORY read.  The
+        # resolve() (lstat/readlink per path component) happens once, at
+        # registration, instead of once per entry on every snapshot() — and
+        # snapshot() is called on every heartbeat tick before the interval
+        # gate, from _check_request_liveness, and from the get_merge_queue MCP
+        # tool, i.e. on the event loop.  Paths added to the set directly
+        # (tests, legacy call sites) are simply absent here and fall back to
+        # str(path); the consumer (_inflight_worktree_is_stale) re-normalises,
+        # so an unresolved fallback still matches.
+        self._owned_merge_wt_keys: dict[Path, str] = {}
         # One-warning-per-path set: added when a non-ENOENT OSError is logged
         # for a path; cleared on next successful touch or on ENOENT-drop so
         # each new failure episode emits exactly one WARNING.
@@ -8277,16 +9366,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         worktree is reset-in-place and already exempt from reaper scans
         (git_ops.py:2075), so touching it would be meaningless.
         The guard is also defence-in-depth against accidental registration.
+
+        Also memoises *wt*'s resolved string (task 3148) so
+        :meth:`snapshot`'s ``owned_merge_worktrees`` key needs no filesystem
+        I/O.  This is the right place to pay for it: registration happens once
+        per merge worktree, on a path that has just been created on disk,
+        while snapshot() runs on every heartbeat tick.  An unresolvable path
+        falls back to its literal string rather than being dropped — the
+        ledger must never silently lose an entry it is heartbeating.
         """
         if wt is None or wt.name == PERSISTENT_MERGE_WORKTREE_NAME:
             return
         self._owned_merge_worktrees.add(wt)
+        try:
+            self._owned_merge_wt_keys[wt] = str(wt.resolve())
+        except OSError:
+            self._owned_merge_wt_keys[wt] = str(wt)
 
     def _deregister_owned_merge_worktree(self, wt: Path | None) -> None:
-        """Remove *wt* from both ledger sets (idempotent)."""
+        """Remove *wt* from both ledger sets (idempotent).
+
+        Also drops its memoised resolved key (task 3148) so the memo can never
+        outlive the ledger entry it describes.
+        """
         if wt is None:
             return
         self._owned_merge_worktrees.discard(wt)
+        self._owned_merge_wt_keys.pop(wt, None)
         self._merge_wt_touch_warned.discard(wt)
 
     async def _cleanup_owned_merge_worktree(self, wt: Path | None) -> None:
@@ -8313,9 +9419,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         disk.  Cold/ephemeral fallback paths (``spec_warm=False``) delegate to
         ``_cleanup_owned_merge_worktree`` which deregisters the ledger entry
         and calls ``git worktree remove``.
+
+        INVARIANT (task 3148): *neither* branch may return with ``merge_wt``
+        still in ``_owned_merge_worktrees``.
         """
         if spec_warm and merge_wt is not None:
             await self._git_ops.release_spec_lane(merge_wt, warm=True)
+            # task 3148: the lane goes back to the pool on disk, but this worker
+            # no longer owns it — drop it from the liveness ledger
+            # unconditionally so _touch_owned_merge_worktrees can never keep
+            # pinning its root mtime.  A retained entry is doubly immortal: the
+            # heartbeat refreshes the ROOT-inode mtime that the disk-scan
+            # coalesce arm reads for liveness, and
+            # keep_worktrees=set(self._owned_merge_worktrees) exempts it from
+            # reaping — together wedging the branch out of the merge queue until
+            # process restart.  And it is invisible to the I6 audit, which flags
+            # only worktrees ABSENT from the ledger.  Idempotent .discard(), so
+            # this is a no-op on the common path where the lane is a pool-owned
+            # _spec- lane that was never registered; it exists to make the
+            # invariant unconditional rather than to fix a demonstrated leak.
+            # Ordered AFTER the release_spec_lane await so the ledger mutation
+            # follows the pool hand-off, matching _cleanup_owned_merge_worktree's
+            # single-owner discipline (release_spec_lane is documented
+            # never-raise, so this is not an error-path question).
+            self._deregister_owned_merge_worktree(merge_wt)
         else:
             await self._cleanup_owned_merge_worktree(merge_wt)
 
@@ -9482,18 +10609,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         *,
         recovered_branches: Collection[str] = (),
         now: float | None = None,
+        min_age_secs: float | None = None,
     ) -> dict[str, list[str]]:
         """Reap aged unregistered on-disk ``_merge-*`` worktrees (I6 leak
         closure, task 2060).
 
         The remediation counterpart to :meth:`worktree_ledger_violations`:
         that method only DETECTS leaked worktrees; this method REMOVES them.
-        Intended to run once at worker construction/recovery time (see
-        ``Harness._reap_orphaned_merge_worktrees``), backstopping two orphan
-        sources — a caller's ``finally`` cleanup skipped by a mid-run SIGTERM,
-        and an orchestrator restart that wipes :attr:`_owned_merge_worktrees`
-        while the on-disk worktree (and its ``.git/worktrees`` admin entry)
-        survives.
+        Has two callers (task 3018 added the second): the one-shot startup/
+        recovery sweep (see ``Harness._reap_orphaned_merge_worktrees``,
+        which passes *recovered_branches* so a worktree backing a
+        just-recovered in-flight merge is re-adopted rather than reaped),
+        and the periodic steady-state sweep from
+        :meth:`_maybe_reap_orphaned_merge_worktrees` (invoked every
+        ``_reap_interval_s`` from :meth:`_heartbeat_loop`, always with no
+        *recovered_branches* since re-adoption is a startup-only concern).
+        Together they backstop three orphan sources — a caller's ``finally``
+        cleanup skipped by a mid-run SIGTERM, an orchestrator restart that
+        wipes :attr:`_owned_merge_worktrees` while the on-disk worktree (and
+        its ``.git/worktrees`` admin entry) survives, and a leak that first
+        crosses grace mid-run (only ever reclaimed by the periodic sweep,
+        since the one-shot startup sweep has already run by then).
 
         Reuses :meth:`worktree_ledger_violations`'s exact os.scandir discovery
         so remediation stays symmetric with detection: direct children of
@@ -9502,10 +10638,31 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (:data:`PERSISTENT_MERGE_WORKTREE_NAME`) and any path already present
         in :attr:`_owned_merge_worktrees`.  A candidate is only removed (via
         :meth:`GitOps.cleanup_merge_worktree`) once its mtime age exceeds
+        *min_age_secs*, which defaults to
         :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS` — the same grace window
         :meth:`worktree_ledger_violations` uses — so a worktree from a
         just-started concurrent merge (register-after-create race) is never
         touched.
+
+        DETECT-EARLY / DESTROY-LATE (task 3018).  *min_age_secs* exists so the
+        periodic steady-state caller can destroy at a STRICTLY LARGER floor
+        (:attr:`PERIODIC_REAP_MIN_AGE_SECS`) than the audit detects at.
+        Detection is deliberately unchanged: :meth:`worktree_ledger_violations`
+        and :meth:`_check_resource_audit` keep flagging at
+        :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS` and stay observation-only
+        (PRD design decision 4), so a tree between the two thresholds is still
+        reported on every heartbeat — it is simply not destroyed yet.  Only
+        this remediation pass destroys.  Leaving *min_age_secs* as ``None``
+        keeps the startup/recovery caller (``Harness._reap_orphaned_merge_worktrees``)
+        byte-identical to its pre-3018 behaviour.
+
+        Note the age gate is DEFENSE-IN-DEPTH, not the primary protection for
+        a live verify: throwaway verify worktrees hold
+        ``merge_verify_lease(lane_dir=wt)`` for the duration of their verify
+        (``merge_shadow._run_cold_shadow_verify`` /
+        ``merge_drift._run_drift_check``), so
+        :meth:`GitOps.remove_merge_worktree_guarded` refuses them with
+        ``'skipped_lease_held'`` regardless of age.
 
         Before the reap scan, *recovered_branches* (the branches of merge
         requests recovered from the durable journal — see
@@ -9518,7 +10675,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (re-adoption bypasses the grace gate entirely).
 
         *now* is injectable for deterministic tests; defaults to
-        ``time.time()``.
+        ``time.time()``.  *min_age_secs* overrides the destruction floor;
+        defaults to :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`.
 
         Returns ``{'readopted': [...], 'reaped': [...]}`` — string paths of
         every worktree re-adopted / removed this sweep.  Returns
@@ -9549,7 +10707,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 readopted.append(str(wt.resolve()))
 
         effective_now = now if now is not None else time.time()
-        grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        grace = (
+            min_age_secs
+            if min_age_secs is not None
+            else self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        )
         # Computed AFTER re-adoption so the reap scan below skips paths just
         # re-adopted above (re-adoption is exempt from the grace gate).
         owned = {p.resolve() for p in self._owned_merge_worktrees}
@@ -9604,6 +10766,73 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
 
         return {'readopted': readopted, 'reaped': reaped}
+
+    async def _maybe_reap_orphaned_merge_worktrees(self, now: float) -> None:
+        """Periodic/steady-state counterpart to the startup-only reap sweep
+        (task 3018 — closes the observe-but-never-reclaim gap).
+
+        :meth:`reap_orphaned_merge_worktrees` is lease-safe and already
+        reaps aged unregistered ``_merge-*`` worktrees while preserving
+        owned/lease-held ones, but it was previously invoked only once at
+        worker construction/recovery time (see
+        ``Harness._reap_orphaned_merge_worktrees``). A leak that first
+        crosses :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS` mid-run therefore
+        sat unreaped until the next orchestrator restart — up to the fleet's
+        8h redeploy window — even though the observation-only resource audit
+        (:meth:`_check_resource_audit` / :meth:`worktree_ledger_violations`)
+        reported it on every heartbeat. This helper is invoked from
+        :meth:`_heartbeat_loop` so the sweep also runs periodically in
+        steady state, bounding a leak's on-disk lifetime instead of leaving
+        it until the next restart.
+
+        Deliberately calls :meth:`reap_orphaned_merge_worktrees` with NO
+        ``recovered_branches``: re-adoption from the durable journal is a
+        startup-only concern (recovery), and in steady state a live merge's
+        worktree is already registered in :attr:`_owned_merge_worktrees`
+        (and therefore skipped by the reap scan) well before it could ever
+        approach the grace window.
+
+        Leaves :meth:`_check_resource_audit` / :meth:`worktree_ledger_violations`
+        untouched — they remain observation + escalation only (PRD design
+        decision 4); this is a deliberately SEPARATE remediation pass, not a
+        change to the audit's mutation-free contract.
+
+        DESTROYS AT A STRICTLY LARGER FLOOR THAN THE AUDIT DETECTS AT.  Passes
+        ``min_age_secs=`` :attr:`PERIODIC_REAP_MIN_AGE_SECS` rather than
+        inheriting :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`, so promoting
+        this sweep to steady state does not silently re-purpose a *detection*
+        threshold as a *destruction* deadline.  The audit keeps flagging a
+        tree in the band on every heartbeat; only this pass destroys, and only
+        past the larger floor (see :attr:`PERIODIC_REAP_MIN_AGE_SECS` for the
+        derivation).  That floor is defense-in-depth behind the primary
+        protection: a live throwaway verify worktree holds
+        ``merge_verify_lease(lane_dir=wt)`` across its verify
+        (``merge_shadow._run_cold_shadow_verify`` /
+        ``merge_drift._run_drift_check``), so this sweep skips it via
+        ``'skipped_lease_held'`` regardless of age.
+
+        Rate-limited by :attr:`_reap_interval_s` (default 300s), mirroring
+        the :attr:`_last_heartbeat_at` / :attr:`_heartbeat_interval_s`
+        clock-injected idiom, with one deliberate divergence (task 3018
+        amendment): :attr:`_last_reap_at` is seeded to real construction
+        time rather than 0.0, so the FIRST periodic sweep fires one full
+        :attr:`_reap_interval_s` after worker construction rather than on
+        the first heartbeat poll — giving the harness startup recovery
+        sequence (which runs after this worker's loops are already spawned;
+        see ``Harness._reap_orphaned_merge_worktrees``) time to re-adopt any
+        worktree backing a recovered in-flight merge before this sweep could
+        otherwise reap it out from under recovery. Each subsequent call is a
+        no-op until at least ``_reap_interval_s`` seconds have elapsed since
+        the last sweep. This bounds a leak's on-disk lifetime to roughly
+        ``PERIODIC_REAP_MIN_AGE_SECS + _reap_interval_s`` after startup
+        settles, instead of up to the next restart.
+        """
+        if now - self._last_reap_at < self._reap_interval_s:
+            return
+        self._last_reap_at = now
+        await self.reap_orphaned_merge_worktrees(
+            now=now, min_age_secs=self.PERIODIC_REAP_MIN_AGE_SECS,
+        )
 
     def _warn_if_verify_base_not_frozen_tip(
         self,
@@ -9798,6 +11027,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           occupancy: {hosts_total, hosts_busy, by_host} — per-host in-flight count.
           is_wip_halted: bool.
           halt_owner_esc_id: str or None.
+          owned_merge_worktrees: sorted resolved absolute path strings for this
+            worker's merge-worktree liveness ledger (the paths
+            _touch_owned_merge_worktrees heartbeats).  Read by
+            _inflight_worktree_is_stale so the disk-scan coalesce arm can tell
+            a heartbeat-pinned corpse from a foreign merger's worktree.
 
         Each entry dict contains:
           task_id, branch, state, enqueued_at, age_secs, position,
@@ -10140,6 +11374,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'speculation_accounting': self.speculation_accounting_violations(),
                 'worktree_ledger': self.worktree_ledger_violations(),
             },
+            # task 3148 additive key: this worker's merge-worktree liveness
+            # ledger.  Consumed by _inflight_worktree_is_stale so the disk-scan
+            # coalesce arm (coalesce_or_enqueue_merge_request §2) can tell a
+            # heartbeat-pinned corpse (owned here, but no live entry for its
+            # branch) from a foreign / pre-restart merger's worktree (not owned
+            # here), which must still coalesce for crash-safety.  PURE
+            # IN-MEMORY read — no await, no git, and no filesystem I/O: the
+            # .resolve() is paid once at _register_owned_merge_worktree time
+            # and memoised in _owned_merge_wt_keys, so this key never puts a
+            # blocking lstat/readlink chain on the event loop (snapshot() runs
+            # on every heartbeat tick before the interval gate, from
+            # _check_request_liveness, and from the get_merge_queue MCP tool).
+            # A path added to the set directly, bypassing the registrar, has no
+            # memo entry and falls back to str(p) — still I/O-free, and the
+            # consumer re-normalises, so it still matches.  Resolved absolute
+            # strings so the value survives the JSON hop through
+            # get_merge_queue; `sorted` makes snapshot-diffing deterministic.
+            # Same .resolve() normalisation as worktree_ledger_violations, so
+            # the two ownership tests can never disagree.  No collision with
+            # existing keys (entries/depth/head_of_line/verify_in_progress/
+            # occupancy/is_wip_halted/halt_owner_esc_id/suffix_conflict_graph/
+            # metrics/frozen_prefix/two_layer_invariants/speculation/
+            # resource_audit).
+            'owned_merge_worktrees': sorted(
+                self._owned_merge_wt_keys.get(p) or str(p)
+                for p in self._owned_merge_worktrees
+            ),
         }
 
     def _check_request_liveness(self, now: float, *, threshold_s: float | None = None) -> None:
@@ -10362,9 +11623,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              never starve the heartbeat log.
           2. Delegates the fire/rate-limit/format/emit decision to the
              synchronous, clock-injectable :meth:`_maybe_log_queue_heartbeat`.
+          3. Delegates to the rate-limited, clock-injectable
+             :meth:`_maybe_reap_orphaned_merge_worktrees` (task 3018), the
+             steady-state counterpart to the startup-only orphan reap — this
+             is what bounds an audit-flagged leak's on-disk lifetime instead
+             of leaving it until the next restart.  Bounded by
+             :attr:`_reap_sweep_timeout_s` via ``asyncio.wait_for`` (task
+             3018 amendment) so a hung git subprocess can never block this
+             loop — and therefore step 1's owned-worktree touch — indefinitely;
+             a timed-out sweep is logged and simply retried on a later poll,
+             subject to its own rate limit.
 
-        Any unexpected exception from either call is logged and swallowed so a
-        heartbeat bug can never crash the worker.
+        Steps 1-2 and step 3 are wrapped in their OWN, SEPARATE try/except
+        (mirroring the swallow-and-log convention used here and in
+        :meth:`_reprobe_loop`) so a fault in the periodic reap can never
+        suppress — or be suppressed by — the touch/heartbeat step, and
+        either kind of bug is logged and swallowed instead of crashing the
+        worker.
         """
         while self._running:
             await asyncio.sleep(_HEARTBEAT_POLL_S)
@@ -10373,6 +11648,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._maybe_log_queue_heartbeat(time.time())
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
+            try:
+                await asyncio.wait_for(
+                    self._maybe_reap_orphaned_merge_worktrees(time.time()),
+                    timeout=self._reap_sweep_timeout_s,
+                )
+            except Exception:
+                logger.exception('merge queue heartbeat: periodic reap failed')
 
     async def _reprobe_loop(self) -> None:
         """Periodically probe quarantined remote hosts and clear on recovery.
@@ -13420,6 +14702,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             req, sig, esc_id or '', category, cause_hint, outcome.reason,
         )
 
+    def _clear_contended_lease_streak(self, task_id: str) -> None:
+        """Close out a task's contended-lane defer streak (task 3003 amend).
+
+        Pops all THREE per-task streak dicts in lockstep.  They are only
+        meaningful together: a surviving ``_contended_lease_first_defer_at``
+        without its counter would make a much later, unrelated streak cap out
+        terminally on its very first defer, and a surviving
+        ``_contended_lease_last_defer_at`` would mis-date the next streak's
+        staleness check.  Routing every reset through one method is what
+        guarantees that — the three call sites that previously popped two dicts
+        by hand were one edit away from drifting apart.
+
+        Called from every exit that proves the streak is over: a verify that
+        actually ran (pass, fail, or generic error), the terminal cap, and every
+        NON-defer exit from :meth:`_run_inflight_verify` — a dropped request, an
+        operator-halt requeue, a dead-verify abort or its busy-loop cap, and a
+        remote-runner-unavailable re-dispatch.  None of those is lane
+        contention, so none of them may leave a streak open behind it.
+        Idempotent: popping an absent task_id is a no-op.
+        """
+        self._contended_lease_requeues.pop(task_id, None)
+        self._contended_lease_first_defer_at.pop(task_id, None)
+        self._contended_lease_last_defer_at.pop(task_id, None)
+
     async def _run_inflight_verify(
         self,
         item: RealMergeItem,
@@ -13434,10 +14740,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         here; CAS advance_main and lease release are deferred to _finalize_inflight.
 
         LOCAL lease (lease.is_local=True):
-            Warm-swap runs: _verify_attempt_count incremented,
-            _acquire_warm_verify_worktree called, runner=None so the internal
-            LocalRunner sees the POST-swap merge_wt (byte-identical single-host
-            path).
+            Warm-swap runs: _acquire_warm_verify_worktree called, runner=None
+            so the internal LocalRunner sees the POST-swap merge_wt
+            (byte-identical single-host path).  _verify_attempt_count advances
+            only once that acquire has SUCCEEDED — i.e. only for attempts that
+            actually reach a verify; an attempt DEFERRED because the
+            merge-verify lane was unavailable leaves it untouched (task 3003),
+            so the periodic cold-verify safety valve it drives cannot be
+            advanced by attempts that never verified anything.
 
         REMOTE lease (lease.is_local=False):
             No warm-swap, no _verify_attempt_count increment.
@@ -13512,9 +14822,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # _verifier_loop finalize-head BaseException handler — which resolved
                 # the future as 'blocked' but did NOT clean the ephemeral merge
                 # worktree (a regression vs. the old _verifier_loop except clause).
-                self._verify_attempt_count += 1
+                #
+                # task 3003 (reviewer's secondary finding): the attempt counter
+                # is STAGED here and only committed once the warm acquire has
+                # SUCCEEDED. It drives the periodic cold-verify safety valve, so
+                # it must count attempts that actually reached a verify — a
+                # lane-unavailable DEFER (or any other acquire failure: no
+                # verify ran either way) would otherwise burn through the
+                # valve's period and fire a from-scratch cold verify for
+                # nothing. _safety_valve_due still receives the 1-BASED count it
+                # documents, so the valve fires on exactly the same Nth real
+                # attempt as before. This is the sole increment site.
+                _attempt_n = self._verify_attempt_count + 1
                 _due = _safety_valve_due(
-                    self._verify_attempt_count,
+                    _attempt_n,
                     req.config.git.persistent_merge_worktree_safety_valve_every_n,
                 )
                 merge_wt, _spec_warm = await _acquire_warm_verify_worktree(
@@ -13522,6 +14843,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     safety_valve_due=_due,
                     speculative=item.speculative,
                 )
+                self._verify_attempt_count = _attempt_n
                 assert merge_wt is not None
                 if merge_wt is not item.merge_wt:
                     self._deregister_owned_merge_worktree(item.merge_wt)
@@ -13648,6 +14970,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # normal-completion exit paths) to keep the dict scoped to
                     # genuinely live/in-flight task_ids on every exit path.
                     self._inflight_dead_verify_aborts.pop(req.task_id, None)
+                    # task 3003 amend (robustness): a NON-defer exit — whatever
+                    # contended-lane streak this task had is over, and leaving
+                    # its start stamp behind would let a much later, unrelated
+                    # contention cap out terminally on its first defer.
+                    self._clear_contended_lease_streak(req.task_id)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -13675,6 +15002,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # MQ-reliability kappa (task 2169): mirror the re-arm onto
                     # the lifecycle registry.
                     self._note_requeue(req.request_id, live_obj=req)
+                    # task 3003 amend (robustness): an operator-halt requeue is
+                    # NOT a contended-lane defer — a verify was running, so the
+                    # lane lock had been acquired.  Close any open streak so its
+                    # elapsed budget cannot span this interruption.
+                    self._clear_contended_lease_streak(req.task_id)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -13749,6 +15081,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     with contextlib.suppress(BaseException):
                         await verify_task
                     await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                    # task 3003 amend (robustness): a dead/hung verify — abort or
+                    # busy-loop cap — is not lane contention either (the verify
+                    # got as far as running), so neither branch below may leave a
+                    # contended-lane streak open behind it.
+                    self._clear_contended_lease_streak(req.task_id)
                     if _busy_loop_capped:
                         # task 2420 amend (reviewer finding #2): the
                         # counter has served its purpose once the
@@ -13789,52 +15126,298 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'will re-dispatch on another host',
                 req.task_id, merge_commit[:8],
             )
+            # task 3003 amend (robustness): a dead remote transport is not lane
+            # contention — this item is re-dispatched on another host, so close
+            # any open contended-lane streak rather than let its start stamp
+            # outlive the re-dispatch.
+            self._clear_contended_lease_streak(req.task_id)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=merge_wt,
                 status=InflightStatus.RUNNER_UNAVAILABLE,
                 reason=str(exc),
             )
-        except MergeVerifyLeaseContended as exc:
-            # The merge-verify lane lock stayed contended past its bounded wait,
-            # so merge_verify_lease RAISED rather than run this verify
-            # UNPROTECTED (task 2828, limb 2). This is a transient "come back
-            # later," not a verify failure — DEFER by re-queuing for a later
-            # re-verify, mirroring the operator-halt abort branch above VERBATIM
-            # (release_or_cleanup + put_nowait + on_requeued + _note_requeue +
-            # InflightStatus.REQUEUED). req.result is left PENDING and the
-            # per-task dead-verify-abort counter is untouched, so this never
-            # counts as a dead-verify abort or a 'blocked' resolution. Placed
-            # BEFORE the generic `except Exception`, which would otherwise map
-            # it to MergeOutcome('blocked'). The verify_task has already failed
-            # (the lease raised on acquire, before the verify body ran), so
-            # there is no in-flight verify to abort/cancel here.
+        except (MergeVerifyLeaseContended, MergeVerifyLeaseHeld) as exc:
+            # The shared merge-verify <lane_dir>.lock was unavailable, so the
+            # raiser refused to proceed rather than act UNPROTECTED. This is a
+            # transient "come back later," not a verify failure — DEFER by
+            # re-queuing for a later re-verify, mirroring the operator-halt
+            # abort branch above VERBATIM (release_or_cleanup + put_nowait +
+            # on_requeued + _note_requeue + InflightStatus.REQUEUED).
+            # req.result is left PENDING and the per-task dead-verify-abort
+            # counter is untouched, so this never counts as a dead-verify abort
+            # or a 'blocked' resolution. Placed BEFORE the generic
+            # `except Exception`, which would otherwise map every one of these
+            # to MergeOutcome('blocked') — with a DETERMINISTIC reason string,
+            # hence an identical merge_outcome_signature on every attempt,
+            # which is exactly what tripped workflow.py's
+            # consecutive_merge_thrash ladder into a false-positive human
+            # escalation (reify 5354/5300/5328).
+            #
+            # THREE raise sites now land here:
+            #   1. merge_verify_lease's contended acquire (task 2828, limb 2) —
+            #      MergeVerifyLeaseContended, raised while the verify was
+            #      STARTING, surfacing at verify_task.result().
+            #   2. reset_persistent_merge_worktree's contended acquire (task
+            #      3003, limbs a/b), reached via _acquire_warm_verify_worktree
+            #      in the LOCAL warm-swap branch above —
+            #      MergeVerifyLeaseContended with operation=.
+            #   3. reset_persistent_merge_worktree's FOREIGN-holder pre-check
+            #      (task 3003, limb c) — MergeVerifyLeaseHeld, whose REQUEUE /
+            #      counts_against_requeue_cap=False disposition row in
+            #      workflow_types.py already declared this policy; before 3003
+            #      only the merge worker disagreed.
+            #
+            # The completed policy, as one story (task 3003 review fixes):
+            # a defer is TRANSIENT BUT BOUNDED, never an unbounded spin.
+            #   - it is THROTTLED to CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS
+            #     between attempts, which the two bounded-wait raisers have
+            #     already paid inside their acquire and the immediate
+            #     pre-check has not;
+            #   - the unbroken streak escalates to a single ERROR at the
+            #     CROSSING of CONTENDED_LEASE_REQUEUE_WARN_STREAK, with a
+            #     per-defer WARNING heartbeat either side of it;
+            #   - and continuous contention past MAX_CONTENDED_LEASE_DEFER_SECS
+            #     stops deferring and resolves terminally as 'blocked', with a
+            #     reason carrying the elapsed seconds and the streak count so
+            #     consecutive cap-outs stay signature-DISTINCT and cannot
+            #     re-feed the consecutive_merge_thrash ladder this whole task
+            #     was chartered to stop.
+            #
+            # In BOTH reset cases (2 and 3) the exception fires before
+            # verify_task exists at all, so merge_wt is still the ephemeral
+            # item.merge_wt and _spec_warm is still False — precisely what
+            # _release_or_cleanup(merge_wt, spec_warm=_spec_warm) already
+            # handled on today's blocked path. In case 1 the verify_task has
+            # already failed (the lease raised on acquire, before the verify
+            # body ran). So in no case is there an in-flight verify to
+            # abort/cancel here.
+            #
             # task 2828 amend (reviewer_comprehensive, robustness): count the
             # UNBROKEN contended-lease requeue streak for this task and RAISE the
             # log severity once it crosses CONTENDED_LEASE_REQUEUE_WARN_STREAK, so
             # a long-running / wedged lane holder (which would otherwise defer
             # this verify at the ~wait_secs cadence forever — never escalating,
             # never counting against the requeue cap) becomes operator-visible.
+            #
+            # task 3003 amend (reviewer_comprehensive, robustness): before
+            # touching the streak, CHECK that it is still continuous instead of
+            # assuming it.  Nothing guarantees a deferred request comes back
+            # through this arm: its requeued dispatch can remerge into a
+            # conflict (a DecidedItem passthrough that never reaches
+            # _run_inflight_verify at all), be abandoned, or die at shutdown —
+            # and these dicts live for the whole orchestrator process (~8 h
+            # between fleet redeploys).  Without this check, one defer at T0
+            # followed hours later by a single BRIEF transient contention for the
+            # same task_id would find _contended_elapsed already past the cap and
+            # resolve 'blocked' on the FIRST defer of a fresh streak — precisely
+            # the false-positive blocked-on-transient-lane-busy resolution this
+            # task exists to remove, reintroduced by its own guard.  A gap since
+            # the last defer far larger than the defer cadence can explain proves
+            # something else happened in between, so the streak is closed and
+            # this defer starts a new one.  (The pre-existing
+            # _contended_lease_requeues counter had the same staleness gap, but
+            # it only shaped log severity; the elapsed budget is TERMINAL, so the
+            # gap now has consequences.)
+            _defer_now = time.monotonic()
+            _waited = float(getattr(exc, 'wait_secs', 0.0) or 0.0)
+            _prev_defer_at = self._contended_lease_last_defer_at.get(req.task_id)
+            _streak_stale_after = max(
+                self.CONTENDED_LEASE_STREAK_STALE_FLOOR_SECS,
+                self.CONTENDED_LEASE_STREAK_STALE_FACTOR
+                * max(self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS, _waited),
+            )
+            if (
+                _prev_defer_at is not None
+                and _defer_now - _prev_defer_at > _streak_stale_after
+            ):
+                logger.info(
+                    'Task %s: %.0fs since its last contended-lane defer '
+                    '(> %.0fs) — that gap cannot be explained by the defer '
+                    'cadence, so the previous streak is closed and this defer '
+                    'starts a fresh one',
+                    req.task_id, _defer_now - _prev_defer_at, _streak_stale_after,
+                )
+                self._clear_contended_lease_streak(req.task_id)
+            self._contended_lease_last_defer_at[req.task_id] = _defer_now
             _contended_streak = self._contended_lease_requeues.get(req.task_id, 0) + 1
             self._contended_lease_requeues[req.task_id] = _contended_streak
-            if _contended_streak >= self.CONTENDED_LEASE_REQUEUE_WARN_STREAK:
+            # task 3003 (review fix 2): bound the streak in ELAPSED time. The
+            # stamp marks the START of the unbroken streak (setdefault), so the
+            # very first defer measures 0s and always defers.
+            _streak_started_at = self._contended_lease_first_defer_at.setdefault(
+                req.task_id, _defer_now,
+            )
+            _contended_elapsed = _defer_now - _streak_started_at
+            if _contended_elapsed >= self.MAX_CONTENDED_LEASE_DEFER_SECS:
+                # Terminal cap, shaped like the MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+                # busy-loop guard above. A contended-lane defer never escalates
+                # and never counts against the requeue cap, so a permanently
+                # wedged holder would otherwise defer this task forever with no
+                # terminal resolution at all.
+                #
+                # Pop EVERY per-task dict: an operator-resolved re-submission of
+                # this task_id must get a FRESH budget rather than instantly
+                # re-capping on a stale start stamp, and none of them may grow
+                # unboundedly for permanently-blocked tasks.
+                self._clear_contended_lease_streak(req.task_id)
+                # task 3003 amend (reviewer_comprehensive, resource_cleanup):
+                # the dead-verify-abort counter too — this is a TERMINAL
+                # 'blocked' resolution, and both other terminal 'blocked' exits
+                # on this coroutine pop it for the two reasons recorded there
+                # (task 2420 amend).  Without this, a task carrying
+                # MAX_INFLIGHT_DEAD_VERIFY_ABORTS-1 stale aborts that caps out
+                # here would, once an operator clears the lane and re-submits
+                # it, trip the busy-loop cap on its very FIRST dead verify and
+                # be abandoned without a requeue; and the dict would grow
+                # unboundedly for permanently-blocked task_ids.
+                self._inflight_dead_verify_aborts.pop(req.task_id, None)
+                # task 3003 amend (reviewer_comprehensive, test_quality): a
+                # per-worker cap-out ordinal, rendered into the reason below.
+                # See the attribute's comment in __init__ for why the elapsed/
+                # streak components alone are NOT a structural distinctness
+                # guarantee in production.
+                self._contended_lease_cap_outs += 1
+                _cap_out_n = self._contended_lease_cap_outs
+                await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                 logger.error(
-                    'Task %s: merge-verify lease contended (%s) — DEFERRED %d '
-                    'times in a row (~%.0f min of continuous contention). A '
-                    'long-running or wedged lane holder is blocking this verify; '
-                    're-queuing again rather than running unprotected. If this '
-                    'persists, inspect the merge-verify lane lock holder.',
-                    req.task_id, exc, _contended_streak,
-                    _contended_streak * getattr(exc, 'wait_secs', 0.0) / 60.0,
+                    'Task %s: merge-verify lane has been unavailable for %.0fs '
+                    'across %d consecutive deferred attempts (%s) — resolving '
+                    'BLOCKED instead of deferring again (lane cap-out #%d). '
+                    'This is a genuine lane pathology: inspect the merge-verify '
+                    'lane lock holder.',
+                    req.task_id, _contended_elapsed, _contended_streak, exc,
+                    _cap_out_n,
+                )
+                # Deliberately routed through the ordinary blocked-merge path
+                # rather than workflow.py's consecutive_merge_thrash ladder:
+                # that ladder means "the SAME mechanical merge failure
+                # repeated", which lane unavailability is not.
+                #
+                # The reason must therefore never be INVARIANT across cap-outs,
+                # or two of them would hash to the same
+                # merge_outcome_signature and walk that ladder anyway
+                # (max_consecutive_merge_thrash defaults to 2) — the exact
+                # false-positive this task removed.  The cap-out ORDINAL is what
+                # guarantees that structurally: it strictly increases, so no two
+                # cap-outs from one worker can render the same string even when
+                # the elapsed seconds and streak count collide — which in
+                # production they very nearly always do, since each streak
+                # starts fresh at the cap and so caps at the first defer past the
+                # same budget with the same cadence.  The elapsed seconds and
+                # streak count are kept as operator information (and as a
+                # secondary difference across a process restart, which resets
+                # the ordinal).  Do NOT round these to a coarser unit (hours at
+                # .1f would render '4.0h' every time).
+                err_outcome = MergeOutcome(
+                    'blocked',
+                    reason=(
+                        f'merge-verify lane unavailable for '
+                        f'{_contended_elapsed:.0f}s across {_contended_streak} '
+                        f'consecutive deferred attempts '
+                        f'(lane cap-out #{_cap_out_n}): {exc}'
+                    ),
+                )
+                if not req.result.done():
+                    req.result.set_result(err_outcome)
+                return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
+            if _contended_streak == self.CONTENDED_LEASE_REQUEUE_WARN_STREAK:
+                # task 3003 (review fix 3): `==`, not `>=` — this ERROR marks
+                # the CROSSING, once. A `>=` test re-alarms on every defer past
+                # the threshold, which against a genuinely wedged holder is
+                # thousands of identical lines telling the operator nothing
+                # new. Defers past the crossing fall to the `else` WARNING
+                # below (which carries the running streak count), so the
+                # per-defer heartbeat is preserved and only the alarm is
+                # de-duplicated. The streak is closed out loudly at the other
+                # end by the terminal MAX_CONTENDED_LEASE_DEFER_SECS cap above.
+                #
+                # task 3003: the "~N min of continuous contention" estimate is
+                # only meaningful for the two BOUNDED-WAIT raisers, which carry
+                # wait_secs. MergeVerifyLeaseHeld has no such attribute — its
+                # pre-check refuses IMMEDIATELY, so there is no wait to
+                # multiply. Rendering getattr(..., 0.0) as "~0 min" would tell
+                # an operator the exact opposite of the truth (the holder has
+                # been there a while; this exception simply cannot say how
+                # long), so the duration clause is SUPPRESSED when absent
+                # rather than printed as zero. The streak count and the
+                # exception detail (which names the holder pgid) are kept in
+                # both variants.
+                _wait_secs = getattr(exc, 'wait_secs', None)
+                _duration_clause = (
+                    f' (~{_contended_streak * _wait_secs / 60.0:.0f} min of '
+                    f'continuous contention)'
+                    if _wait_secs is not None
+                    else ''
+                )
+                logger.error(
+                    'Task %s: merge-verify lane unavailable (%s) — DEFERRED %d '
+                    'times in a row%s. A long-running or wedged lane holder is '
+                    'blocking this verify; re-queuing again rather than running '
+                    'unprotected. If this persists, inspect the merge-verify '
+                    'lane lock holder.',
+                    req.task_id, exc, _contended_streak, _duration_clause,
                 )
             else:
+                # task 3003: "lane unavailable" rather than "lease contended" —
+                # this arm now also covers MergeVerifyLeaseHeld (a FOREIGN
+                # holder refused immediately, never a bounded-wait contention)
+                # and the warm-swap reset's own acquire. The exception detail
+                # (%s) names which of the three it was.
                 logger.warning(
-                    'Task %s: merge-verify lease contended (%s) — re-queuing '
-                    'merge for re-verify rather than running the verify '
-                    'unprotected (consecutive contended-lease requeue #%d)',
+                    'Task %s: merge-verify lane unavailable (%s) — re-queuing '
+                    'merge for re-verify rather than proceeding unprotected '
+                    '(consecutive contended-lane requeue #%d)',
                     req.task_id, exc, _contended_streak,
                 )
+            # The ephemeral worktree and its disk are freed BEFORE the backoff
+            # below, never held across it.
             await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+            # task 3003 (review fix 1): throttle the re-attempt to a minimum
+            # INTER-ATTEMPT PERIOD.  The two bounded-wait raisers have already
+            # burned wait_secs inside the acquire, so they sleep 0 here and
+            # their cadence is byte-unchanged; MergeVerifyLeaseHeld's immediate
+            # pre-check carries no wait at all and would otherwise hot-spin the
+            # full dequeue → merge → refuse → cleanup → requeue cycle at git
+            # speed for the whole holder window.
+            #
+            # Accepted trade-off: _run_inflight_verify runs as a background
+            # asyncio.ensure_future task, so this sleep does NOT stall the
+            # merger's dequeue loop — but the HostLease is only released by
+            # _finalize_inflight once this coroutine returns, so the backoff
+            # holds the verify slot for ≤ the min period.  That is bounded,
+            # orders of magnitude shorter than the real verify the slot normally
+            # runs, and moot on the warm path anyway (any other local verify
+            # would contend on the same lane lock).
+            #
+            # task 3003 (review fix 4): the requeue bookkeeping deliberately
+            # runs ONLY on the non-cancelled path — NOT from a `finally`.
+            # A CANCELLING CALLER OWNS THE REQUEST.  That is the pre-existing
+            # convention on this coroutine: the operator-halt and dead-verify
+            # defer branches above also await before their put_nowait, and a
+            # cancellation there simply skips the requeue.  All three
+            # production cancel sites already discharge the request
+            # themselves:
+            #   - stop()'s finalizing-head short-circuit (~10796) and its
+            #     _inflight drain (~10921) BOTH resolve req.result with the
+            #     shutdown outcome and _retire_item BEFORE cancelling
+            #     verify_task;
+            #   - _verifier_loop's head-failure cascade (~12631) either
+            #     re-queues the entry itself (the _head_was_requeued branch)
+            #     or re-dispatches it through _remerge.
+            # Re-queuing from a `finally` would DOUBLE-file the request at
+            # every one of them.  Worst case is the cascade: a task cancelled
+            # inside the sleep is `cancelled()`, so `_entry_status` stays None
+            # and the REQUEUED `continue` guard at ~12693 does not fire;
+            # control reaches the `_head_was_requeued and ...cancelled()`
+            # branch, whose only other guard is `not _entry_req.result.done()`
+            # — and a deferred request's future is deliberately left PENDING.
+            # The request would land on _queue TWICE and be merged twice.
+            # _waited was computed at the top of this arm (it also scales the
+            # streak-staleness window), so it is reused rather than re-derived.
+            _backoff = max(0.0, self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS - _waited)
+            if _backoff:
+                await asyncio.sleep(_backoff)
             self._queue.put_nowait(req)
             self._request_ledger.on_requeued(req.request_id)
             self._note_requeue(req.request_id, live_obj=req)
@@ -13857,7 +15440,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._inflight_dead_verify_aborts.pop(req.task_id, None)
             # task 2828 amend: terminal 'blocked' exit — drop any contended-lease
             # streak so it never lingers stale for a task that will not re-verify.
-            self._contended_lease_requeues.pop(req.task_id, None)
+            # task 3003: the streak's start stamp is popped in lockstep, else a
+            # much later unrelated streak would inherit it and cap out on its
+            # very first defer.
+            self._clear_contended_lease_streak(req.task_id)
             err_outcome = MergeOutcome('blocked', reason=f'Verification error: {exc}')
             if not req.result.done():
                 req.result.set_result(err_outcome)
@@ -13874,7 +15460,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._inflight_dead_verify_aborts.pop(req.task_id, None)
         # task 2828 amend: the verify actually RAN (lease was acquired), so any
         # prior contended-lease requeue streak for this task is broken — reset it.
-        self._contended_lease_requeues.pop(req.task_id, None)
+        # task 3003: pop the streak's start stamp in lockstep, so the next
+        # streak measures its own elapsed span from its own first defer.
+        self._clear_contended_lease_streak(req.task_id)
 
         if out is None:
             logger.info(
@@ -14272,30 +15860,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # I4 runs.db surface (task 2383 β, step 18): thread the skew
                 # attribution verdict into a merge_attempt event so gamma's
                 # digest.merge_disposition_counts (task 2384) is non-sentinel
-                # on the production path.  Guarded to INTEGRATION_SKEW/BRANCH_BUG
-                # only — MAIN_RED already emitted 'main_health_red' when the
-                # outcome was built (see _classify_main_health_red, above), and
-                # INDETERMINATE (fail-open default, I3) stays byte-identical
-                # with no emit at all.
+                # on the production path.  MAIN_RED is excluded because it
+                # already emitted 'main_health_red' when the outcome was built
+                # (see _classify_main_health_red, above).
                 #
-                # Amendment (reviewer_comprehensive, round 2): this is a
-                # deliberate choice, not an oversight — INDETERMINATE verify
-                # failures (the common fail-open default on non-orchestrator
-                # submit paths and on any classifier degradation) are
-                # intentionally UNCOUNTED here rather than emitted as a
-                # 'verify_failed' row with disposition=indeterminate. 2384's
-                # digest.merge_disposition_counts therefore has no
-                # denominator signal for that bucket and must compute rates
-                # only over {integration_skew, branch_bug}; it cannot
-                # distinguish "zero INDETERMINATE failures" from
-                # "INDETERMINATE failures not recorded" from this event
-                # alone. I3 requires the fail-open default to stay
-                # byte-identical (no emit) rather than manufacture a new kind
-                # of row, and
-                # test_indeterminate_first_attempt_emits_no_disposition_key
-                # (test_merge_skew_end_to_end.py) pins that contract — widening
-                # this guard to include INDETERMINATE is a deliberate,
-                # separately-reviewed semantics change, not a drive-by fix.
+                # Amendment (task 3178 — the separately-reviewed widening the
+                # round-2 note below deferred).  Keyed on GATHERED EVIDENCE
+                # (`skew_evidence is not None`), deliberately NOT by adding
+                # INDETERMINATE to the enum tuple, because that splits two
+                # INDETERMINATEs the old blanket exclusion conflated:
+                #
+                #   * ADJUDICATED — the classifier RAN and cited implicated
+                #     landings, but I7/I5 refused to promote them.  A bundle
+                #     exists, so a row IS emitted carrying it.
+                #   * SKIPPED / FAIL-OPEN — base facts absent so classification
+                #     never ran, or the classifier raised (I3).  Nothing
+                #     gathered, so NO row — byte-identical to pre-3178, which is
+                #     why test_indeterminate_first_attempt_emits_no_disposition
+                #     _key survives verbatim and I3's guarantee holds.
+                #
+                # (Why any of this exists: merge_disposition's module docstring,
+                # THE I7 INCIDENT.  Persisting the evidence is the half that
+                # makes the next false premise checkable.)
+                #
+                # Consumer caveat for 2384's digest.merge_disposition_counts: it
+                # gains a real DENOMINATOR for the adjudicated-INDETERMINATE
+                # bucket, but still has NONE for the skipped/fail-open bucket, so
+                # rates over these rows must not be read as covering ALL
+                # INDETERMINATE verify failures.  BRANCH_BUG implicates no
+                # landings, so its skew_evidence is None and its row's payload
+                # stays byte-identical too.
                 #
                 # Amendment (reviewer_comprehensive, round 3): BRANCH_BUG is
                 # the COMMON case whenever the caller supplies dispatch-time
@@ -14311,14 +15905,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # (duration_ms is stamped here) over this event kind will see
                 # new volume/outliers starting with this task — future
                 # readers should not assume the speculative verify-fail path
-                # was already emitting these rows pre-β.
+                # was already emitting these rows pre-β.  Task 3178's widening
+                # adds FURTHER volume on the adjudicated-INDETERMINATE path,
+                # for the same reason and with the same caveat.
                 if vr.outcome.disposition in (
                     MergeFailureDisposition.INTEGRATION_SKEW,
                     MergeFailureDisposition.BRANCH_BUG,
-                ):
+                ) or vr.outcome.skew_evidence is not None:
                     _emit_merge_attempt(
                         self._event_store, req.task_id, OutcomeKind.verify_failed,
                         disposition=vr.outcome.disposition,
+                        skew_evidence=vr.outcome.skew_evidence,
                         duration_ms=_elapsed_ms(item.started_monotonic),
                     )
                 self._resolve_or_drop_abandoned(req, vr.outcome)

@@ -6,10 +6,12 @@ Calibration fixtures and a rehearsal verdict table for the two consumers of
 design-invariants audit (`skills/review/references/phase2-architecture.md`).
 
 **Normative source.** `docs/legibility/design-invariants.md` is the single
-normative copy of the five invariant slugs, rules, and checkable design
+normative copy of the invariant slugs, rules, and checkable design
 questions — this doc does not restate them (per INV-5
 `no-lockstep-duplication`). When in doubt about a rule or a checkable
-question, Read the normative doc, not this one.
+question, Read the normative doc, not this one. INV-1..5 fixtures were
+seeded 2026-07-14; INV-6..7 fixtures were added 2026-08-02 with the
+task/escalation state-graph invariants.
 
 **Two fixture shapes.** Each invariant below carries exactly two seeded
 violations — both expressions of the SAME underlying violation, so the two
@@ -243,6 +245,73 @@ ALLOWED_EVENT_TYPES = ["task.created", "task.done", "task.blocked", "escalation.
 {"invariant": "no-lockstep-duplication", "file": "webhooks/src/webhooks/validator.py", "line": 2, "issue": "ALLOWED_EVENT_TYPES hand-copied from orchestrator/src/orchestrator/events.py (line 1) — no shared helper or import ties the two lists together, so they must be kept byte-for-byte identical by hand", "severity": "warning"}
 ```
 
+## INV-6 `status-matches-liveness`
+
+### PRD-leaf-shaped (`INV-6-PRD`)
+
+> Add a `capacity-probe` bail: when the runner detects host memory
+> pressure at VERIFY entry, it returns `ABORTED` immediately with no
+> status write, releasing the slot — the row stays `in-progress`, and
+> "the stranded sweep will re-pend it within one sweep interval."
+
+**Expected disposition**: `flag: status-matches-liveness`
+
+**Redesign that clears it**: Write `pending` (or the appropriate park
+status) through the requeue choke point *before* the slot is released,
+with a test pinning the exit; the stranded sweep remains the crash
+backstop only, never a designed exit.
+
+### Code-snippet-shaped (`INV-6-CODE`)
+
+```python
+async def _bail_on_pressure(self) -> Outcome:
+    if host_memory_pct() > 95:
+        # no status write here — caller's finally releases the slot;
+        # the reconcile sweep will eventually revert the row
+        return Outcome.ABORTED
+    return Outcome.CONTINUE
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "status-matches-liveness", "file": "orchestrator/src/orchestrator/pressure_bail.py", "line": 5, "issue": "the ABORTED exit releases the slot without writing a successor status, leaving an in-progress row with no live claimant and delegating its recovery to the stranded sweep by design", "severity": "high"}
+```
+
+## INV-7 `holds-owned-and-bounded`
+
+### PRD-leaf-shaped (`INV-7-PRD`)
+
+> Add a `quota-hold`: when the model quota is exhausted mid-run, file an
+> escalation and wait on its resolution event — `await
+> self._quota_event.wait()` with no timeout. The watcher will resolve
+> the escalation when quota returns, which wakes the wait.
+
+**Expected disposition**: `flag: holds-owned-and-bounded`
+
+**Redesign that clears it**: Bound the wait with a progress-refreshed
+idle deadline (the steward-wait house pattern) whose expiry stops the
+wait and re-escalates; name the owner that exits the hold; surface the
+hold's age on the attention rail.
+
+### Code-snippet-shaped (`INV-7-CODE`)
+
+```python
+def maybe_skip_recovery(task, open_escalations):
+    if open_escalations:
+        # someone is nominally on it — skip this task.
+        # No log, no counter, no deadline, no record of which
+        # escalation pinned it or for how long.
+        return None
+    return plan_recovery(task)
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "holds-owned-and-bounded", "file": "orchestrator/src/orchestrator/recovery_skip.py", "line": 5, "issue": "an open escalation vetoes recovery with no structured fact naming the pinning record, no streak counter, and no bound — the hold has no visible owner and can persist indefinitely in silence", "severity": "high"}
+```
+
 ## Rehearsal verdict table
 
 Walked 2026-07-14 against `skills/prd/references/gates.md` §"G7 — Design
@@ -274,6 +343,25 @@ quoted rationale as still current.
 **Result: 10/10 match.** Every seeded violation flags with the correct
 slug under the as-landed G7 and Step 5.5 text — acceptance met, no
 rehearsal miss.
+
+### Addendum — INV-6/INV-7 walk (2026-08-02)
+
+Walked against the same as-landed G7 §"Design invariants pass" text
+(which Reads the normative doc's checkable questions at run time — its
+illustrative inline family-inventory row was updated to INV-1..7 in the
+same change, since a hardcoded INV-1..5 row would be an INV-5 lock-step
+copy contradicting the doc) and the Step 5.5 audit text:
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-6-PRD` | PRD | INV-6 status-matches-liveness | `status-matches-liveness` | G7's walk of the checkable question ("does any exit/bail path leave a task in a status whose implied owner is gone?") fires on the ABORTED-with-no-status-write row that names the sweep as its designed exit → `flag: status-matches-liveness` | Y |
+| `INV-6-CODE` | CODE | INV-6 status-matches-liveness | `status-matches-liveness` | Step 5.5 applies the same question to the slot-releasing return with no successor-status write → `invariant_findings` entry with `invariant="status-matches-liveness"` | Y |
+| `INV-7-PRD` | PRD | INV-7 holds-owned-and-bounded | `holds-owned-and-bounded` | G7's walk of the checkable question ("who exits it, what bounds it, where does an operator see it?") fires on the timeout-less `await` whose only exit is another component's action → `flag: holds-owned-and-bounded` | Y |
+| `INV-7-CODE` | CODE | INV-7 holds-owned-and-bounded | `holds-owned-and-bounded` | Step 5.5 applies the question to the silent `return None` veto with no structured fact, counter, or deadline → `invariant_findings` entry with `invariant="holds-owned-and-bounded"` | Y |
+
+**Addendum result: 4/4 match** (cumulative 14/14). No wording changes to
+the gate/review text were needed — both consumers read the normative
+doc's questions at run time.
 
 ## Reconciliation
 

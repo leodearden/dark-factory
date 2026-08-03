@@ -48,8 +48,11 @@ Environment=MEM0_TELEMETRY=false
 # back off up to 60s. main() in fused_memory/server/main.py exits 0 only when
 # an operator-stop signal (SIGTERM/SIGINT) was received — cascades exit 1 so
 # `Restart=on-failure` brings us back up.
+# RestartSteps makes RestartMaxDelaySec effective (without it systemd warns and
+# ignores the cap): backoff 5s -> 60s over 4 steps.
 Restart=on-failure
 RestartSec=5
+RestartSteps=4
 RestartMaxDelaySec=60
 
 # Give it time to shut down gracefully (async cleanup). Must exceed the

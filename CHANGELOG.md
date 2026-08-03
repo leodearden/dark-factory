@@ -83,6 +83,59 @@ corrupted entries as a merge side effect and destroys the specimens.
 
 ### Changed (BREAKING)
 
+#### MCP writes carrying raw envelope markup are now REJECTED (task 3141)
+
+Four fused-memory MCP write tools — `add_memory`, `add_episode`, `submit_task`,
+`update_task` — now **hard-reject** a write whose payload contains a raw MCP
+tool-call envelope fragment.  Writes that previously succeeded (and silently
+persisted the fragment) now fail.
+
+**Rejected fields:** `content` for the memory tools; `title`, `description`,
+`details` and `prompt` for the task tools — the same four-field set
+`premise_lint_guard` already lints, since all four reach the same description
+parser.
+
+**Response shape** (the write does NOT reach the store or the interceptor):
+
+```
+error       : mcp_markup_write_blocked
+error_type  : McpEnvelopeMarkupWriteRejected
+field       : which field tripped
+matched_pattern : the exact literal that matched
+content_excerpt : first 200 chars of the offending text
+hint        : remediation + the override key + DF 3083
+storm       : present ONLY on a rejection burst (count/threshold/window_seconds
+              /hint, plus escalation_id when one was filed)
+```
+
+**Why:** a harness serialization bug leaks envelope fragments into write
+payloads.  Two observed vectors: memory `content` arriving with a closing-tag
+tail (permanent specimens now sitting in the mem0 and Graphiti corpora), and
+task text arriving with a `<parameter name=`-shaped fragment that the
+interceptor's description parser then mis-parsed **silently** — one reify task
+was filed `priority=high` and stored as `medium`.  Loud rejection at the
+boundary is strictly better than either outcome.  Rejecting is deliberately
+scoped to CONTAINMENT: DF task 3083 owns the root cause, the Qdrant payload
+text-match read tool and the retroactive corpus sweep.
+
+**Migration note:** if you write text that quotes envelope markup on purpose —
+documenting this very leak, for instance — pass
+`metadata={'allow_mcp_markup': True}`.  Only a literal boolean `True` counts,
+and the flag is write-time-only: it is stripped before persistence, so it never
+enters stored memory metadata or the task metadata vocabulary.  An accidental
+serialization leak never sets an explicit flag; an author can.  The matcher is
+deliberately a bare case-sensitive substring scan and therefore over-reports
+relative to the retrospective `scripts/scan_task_toolcall_leaks.py`; the
+authoritative pattern list and the reasoning behind the differing calibration
+live in `fused-memory/src/fused_memory/server/markup_tripwire.py`.
+
+**Also new:** a per-server rolling-window storm counter.  Three rejections
+within an hour emit one greppable `markup_tripwire_storm` ERROR log line and
+file a best-effort `mcp_markup_write_storm` escalation (level 1, deduped against
+an open one), because a burst means the upstream leak is *active* rather than
+that the tripwire is misfiring.  Escalation is purely additive — a queue
+failure never changes a rejection's outcome.
+
 #### `reservation_installed` (reason=reserve_now) → `reserve_now_consumed` (task 1230)
 
 The reserve-now short-circuit path in the scheduler **no longer emits**

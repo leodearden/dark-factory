@@ -88,6 +88,32 @@ class TestMarkerLifecycle:
                 f'MARKER_LIFECYCLE[{kind!r}].deleter must be a non-empty str'
             )
 
+    def test_mem0_tombstone_lifecycle_is_registered_with_ttl_deleter(self):
+        """mem0_tombstone (task 3041) is documented in MARKER_LIFECYCLE and
+        expires purely by TTL.
+
+        NOT DELETER_GC: that would break the subset==recon_ledger.MARKER_KINDS
+        invariant below. NOT DELETER_POOL_TRIM either — a tombstone is never
+        evicted by a pool cap, only by its own expires_at.
+        """
+        entry = m.MARKER_LIFECYCLE['mem0_tombstone']
+        assert isinstance(entry.writer, str) and entry.writer
+        assert entry.deleter == m.DELETER_TTL, (
+            f'a tombstone expires only via expires_at, got {entry.deleter!r}'
+        )
+
+    def test_mem0_tombstone_is_in_neither_marker_kinds_constant(self):
+        """A Mem0 memory uuid must never reach a task-id-keyed path.
+
+        mem0_tombstone's task_id column holds a memory uuid, not a Taskmaster
+        task id, so it is registered in MARKER_LIFECYCLE ONLY — MARKER_LIFECYCLE
+        is a SUPERSET of the record_kind vocabulary, not a mirror of it.
+        """
+        from fused_memory.reconciliation.recon_ledger import MARKER_KINDS as LEDGER_GC_KINDS
+
+        assert 'mem0_tombstone' not in LEDGER_GC_KINDS
+        assert 'mem0_tombstone' not in m.MARKER_KINDS
+
     def test_ledger_gc_kinds_is_subset_of_marker_kinds(self):
         """recon_ledger.MARKER_KINDS (the GC-on-terminal marker subset) is a
         subset of the full record_kind vocabulary."""

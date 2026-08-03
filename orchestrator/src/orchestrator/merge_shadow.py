@@ -132,6 +132,28 @@ _LIBTEST_TEST_LINE_RE = re.compile(
 )
 
 
+# Matches reify run_all.sh's BARE {failed}-member classifier marker line.
+# Capture group: (1) the space-separated member names.
+#
+# Producer: reify tests/infra/run_all.sh:26-36 (documented contract) and
+# :1839-1841 (the emitting `printf 'FAILED %s\n' "${failed_names[*]}"`).  This
+# is the same line DF's own verify.py already classifies via `^FAILED\s`
+# (pattern #7b), so the format is established and source-verified.
+#
+# Anchored at line start with a REQUIRED space, so the sibling human-readable
+# summary `=== FAILED: <names> ===` (run_all.sh:1840) cannot also match and
+# double-count the members.
+_RUN_ALL_FAILED_MARKER_RE = re.compile(r'^FAILED[ \t]+(.*)$', re.MULTILINE)
+
+
+# The sentinel token reify's SECOND marker producer appends when an outer
+# timeout SIGTERMs a run mid-flight: `tests/infra/run_all.sh:684-685`
+# (`_ra_on_term`) emits `printf 'FAILED %s(partial)\n' "${_names:+$_names }"`.
+# Its presence means the marker describes an INTERRUPTED run, so
+# :func:`parse_failed_run_all_members` refuses to narrow on it entirely.
+_RUN_ALL_PARTIAL_MARKER_TOKEN = '(partial)'
+
+
 def _classify_test_status(raw_status: str) -> str:
     """Map a raw nextest or libtest status token to a 3-valued verdict string.
 
@@ -288,6 +310,253 @@ def did_not_pass_subset(fail_fast_map: Mapping[str, str]) -> list[str]:
         when every test passed.
     """
     return sorted(t for t, v in fail_fast_map.items() if v != 'pass')
+
+
+def nextest_filter_ids(subset: Iterable[str]) -> list[str]:
+    """Map DF's per-test key space into cargo-nextest's ``test(=...)`` domain.
+
+    DF's internal ids are :func:`parse_per_test_results` keys — ``"<binary-id>
+    <test-name>"`` on the nextest branch, a bare test path on the libtest
+    branch.  cargo-nextest's ``test(=...)`` equality matcher accepts only the
+    **bare test name**, so this strips the binary-id prefix at the single
+    filter-file write boundary.  Everything upstream (``build_fail_fast_map``,
+    :func:`did_not_pass_subset`) keeps operating in the uniform parse-key space.
+
+    **Why this mapping exists.** Resolved empirically against cargo-nextest
+    0.9.136 — the exact version reify's merge gate runs — not from docs::
+
+        cargo nextest list -E 'test(=mymod::mytest)'          -> MATCHES
+        cargo nextest list -E 'test(=nxprobe mymod::mytest)'  -> MATCHES NOTHING
+
+    reify wraps every filter-file line as ``test(=<line>)`` at one construction
+    site (``verify.sh`` ``emit_nextest_pass``).  Emitting the full ``"<binary-id>
+    <test-name>"`` key therefore produces a file that is **non-empty** — so
+    reify's loud "retry refused: no subset" fallback never fires — and that
+    matches **ZERO tests**: a narrowed retry that runs nothing and reports PASS.
+    That is a **FALSE GREEN**, strictly worse than not narrowing at all.
+
+    **Soundness of the bare form.** An unqualified ``test(=name)`` term matches
+    that name in *every* binary, so the resulting run is a **superset** of the
+    intended subset.  That errs in the safe direction: it may re-run a test that
+    already passed in another binary, but it never *skips* a did-not-pass test.
+
+    Args:
+        subset: Test ids in :func:`parse_per_test_results`' key space.
+
+    Returns:
+        Bare nextest test names, **input order preserved**, exact duplicates
+        collapsed to their first occurrence (two binaries running the same test
+        name need only one ``test(=name)`` term).
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for test_id in subset:
+        # Split on the FIRST space only: nextest permits spaces inside test
+        # names for some harnesses, and splitting on every space would truncate
+        # such a name — silently dropping it from the retry subset.
+        _, _, bare = test_id.partition(' ')
+        name = bare if bare else test_id
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _nextest_case_is_planned(meta: object) -> bool:
+    """True when a ``testcases`` entry is a test nextest would actually RUN.
+
+    cargo-nextest lists every DISCOVERED test, including ones it has already
+    decided to skip, and marks them (real 0.9.136 bytes, see
+    ``tests/fixtures/reify_verify_retry/nextest-list-ignored.json``)::
+
+        "alpha::test_ignored": {"ignored": true,
+                                "filter-match": {"status": "mismatch",
+                                                 "reason": "ignored"}}
+        "gamma::test_one":     {"ignored": false,
+                                "filter-match": {"status": "mismatch",
+                                                 "reason": "expression"}}
+
+    Counting those as *planned* would be permanently self-inflating:
+    :func:`parse_per_test_results` deliberately drops SKIP/ignored result lines,
+    so a skipped test never has a verdict, is annotated ``'not-started'`` by
+    :func:`build_fail_fast_map`, and therefore lands in the {did-not-pass}
+    subset of **every** narrowed retry.  It is never *unsafe* — nextest still
+    refuses to run it — but it pushes every filter file toward reify's
+    ``REIFY_VERIFY_RETRY_MAX_SUBSET`` ceiling, and tripping that ceiling makes
+    reify refuse narrowing for the whole profile.  A workspace with many
+    ``#[ignore]``d tests would silently lose the capability.
+
+    Fail-safe bias: an entry whose shape is unrecognised (not a dict, no
+    ``filter-match``, a non-string ``status``) is treated as PLANNED.  That errs
+    toward the superset the module's ``None``-is-never-empty rule already
+    accepts — it can only re-run more tests, never skip one.
+    """
+    if not isinstance(meta, dict):
+        return True
+    if meta.get('ignored'):
+        return False
+    filter_match = meta.get('filter-match')
+    if isinstance(filter_match, dict):
+        status = filter_match.get('status')
+        if isinstance(status, str) and status != 'matches':
+            return False
+    return True
+
+
+def parse_nextest_list_planned(stdout: str) -> list[str] | None:
+    """Parse ``cargo nextest list --message-format json`` into the planned set.
+
+    Pure — no I/O, no subprocess — so it is trivially unit-testable against
+    checked-in real producer bytes
+    (``tests/fixtures/reify_verify_retry/nextest-list.json``, unmodified
+    cargo-nextest 0.9.136 output) and reusable outside the probe.
+
+    **Key-space contract.** The returned ids are ``f"{binary-id} {test-name}"``
+    — exactly :func:`parse_per_test_results`' key space — so
+    ``build_fail_fast_map(planned, verdicts)`` composes directly with no
+    translation.  They are mapped through :func:`nextest_filter_ids` **only** at
+    the moment they are written to a nextest filter file.
+
+    **Fail-safe input path.** Every ``json.loads`` and field access is guarded:
+    any malformed shape returns ``None`` rather than raising.  ``None`` routes
+    the caller to a FULL verify — it is never treated as an empty plan.
+
+    Args:
+        stdout: Raw stdout of ``cargo nextest list --message-format json``.
+
+    **Skipped tests are NOT planned.** Entries nextest has already excluded —
+    ``#[ignore]``d, or filtered out by a filterset expression — are dropped via
+    :func:`_nextest_case_is_planned`; see that docstring for why counting them
+    would silently disable the capability on an ignore-heavy workspace.  Note
+    that the document's own top-level ``test-count`` counts them, so it is NOT
+    the planned count and is deliberately not read here.
+
+    Returns:
+        Sorted test ids on success.  ``[]`` for a well-formed document whose
+        suites carry no RUNNABLE testcases (a genuinely test-free workspace, or
+        one where every test is ignored/filtered out).  ``None`` when the input
+        is not a parseable nextest list document — the caller MUST treat that as
+        "do not narrow", not as an empty plan.
+    """
+    try:
+        doc = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    suites = doc.get('rust-suites')
+    if not isinstance(suites, dict):
+        return None
+
+    planned: list[str] = []
+    try:
+        for suite_key, suite in suites.items():
+            if not isinstance(suite, dict):
+                return None
+            # nextest keys the rust-suites map BY the binary id, so the map key
+            # is the same value and is a sound fallback if the field is absent.
+            binary_id = suite.get('binary-id') or suite_key
+            testcases = suite.get('testcases')
+            if not isinstance(testcases, dict):
+                return None
+            planned.extend(
+                f'{binary_id} {case}'
+                for case, meta in testcases.items()
+                if _nextest_case_is_planned(meta)
+            )
+    except (AttributeError, TypeError):
+        return None
+    return sorted(planned)
+
+
+def parse_failed_run_all_members(test_output: str) -> list[str]:
+    """Extract the {failed} run_all member names from attempt-0's own log.
+
+    Consumes reify's **bare classifier marker** line, ``FAILED <space-separated
+    names>``, documented at ``reify tests/infra/run_all.sh:26-36`` and emitted
+    at ``:1839-1841``.  DF's own ``verify.py`` already classifies that same line
+    via its ``^FAILED\\s`` regex (pattern #7b), so this parser reuses an
+    established, source-verified format rather than inventing one.
+
+    The sibling human-readable summary ``=== FAILED: <names> ===`` is emitted on
+    the immediately preceding line; the anchored regex deliberately does not
+    match it, so members are never double-counted.
+
+    **The ``(partial)`` marker refuses to narrow at all.** run_all.sh has a
+    SECOND marker producer — ``:684-685`` in ``_ra_on_term``, the outer-timeout
+    SIGTERM handler — which emits
+    ``printf 'FAILED %s(partial)\\n' "${_names:+$_names }"``.  Both of its forms
+    match the same regex as the clean producer:
+
+    ==============================  =====================================
+    ``FAILED (partial)``            SIGTERM landed before any member had
+                                    recorded a nonzero exit (the
+                                    ``${_names:+...}`` guard collapses)
+    ``FAILED a.sh b.sh (partial)``  some members had failed when it landed
+    ==============================  =====================================
+
+    Whenever that token appears among the governing marker's tokens this
+    returns ``[]`` — the full run_all suite.  Emitting the sentinel as a member
+    name instead would be a **false green**: a non-empty subset passes
+    ``verify.sh:2545``'s ``[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]`` gate, so
+    the safe fallback never fires, and ``run_all.sh:1327`` then warns
+    ``member '(partial)' not found in $INFRA_DIR (ignored)`` and runs ZERO
+    members.  The named form is refused too, for a different reason: an
+    interrupted run's failed-set is not a *complete* failed-set — members that
+    had not yet executed are neither passed nor failed, so narrowing to just
+    the named failures would silently skip them on the retry.
+
+    That is this plan's single rule, now adopted for the third time: **never
+    narrow on an incomplete plan.**  Its two siblings are
+    ``merge_queue._probe_nextest_planned`` returning ``None`` (an unknown
+    planned set routes to a full verify) and the first-profile-only rule (a
+    profile whose attempt-0 nextest pass never executed is never narrowed).
+
+    The token is matched **anywhere** in the token list rather than only in
+    trailing position, because a real run_all member is always a ``.sh``
+    basename: no legitimate member can collide with it, so a looser check can
+    only ever widen the retry to the full suite.
+
+    **[] is the SAFE degradation, not a silent narrowing.** An empty result
+    means DF sets ``REIFY_RUN_ALL_MEMBER_SUBSET`` to the empty string, and
+    ``verify.sh:2545`` gates the subset on ``[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]``
+    — so empty runs the **FULL** run_all suite.  A no-marker log therefore
+    widens the retry, never skips a member.
+
+    .. note::
+
+       The **gui counterpart is deliberately NOT implemented here.** No real
+       reify gui/vitest failure log was available to pin a fixture to, and
+       authoring one from prose is the exact drift class this leaf corrects
+       (PRD §12 root cause (a)) — so ``REIFY_GUI_RETRY_SPECS`` ships empty,
+       which ``verify.sh:2127-2158`` treats as "run the full gui suite".  A
+       follow-up captures real gui bytes and adds the parser.
+
+    Args:
+        test_output: Attempt-0's captured verify output (stdout+stderr blob).
+
+    Returns:
+        Member names from the LAST marker in the log, in emission order, exact
+        duplicates collapsed.  ``[]`` when no marker is present, when the marker
+        carries no names, or when the marker is a ``(partial)`` one.
+    """
+    matches = _RUN_ALL_FAILED_MARKER_RE.findall(test_output)
+    if not matches:
+        return []
+    # A merge-gate log can concatenate more than one run_all invocation; the
+    # LAST marker describes the final state.
+    tokens = matches[-1].split()
+    # Refusal is a property of the governing marker only: an earlier clean
+    # marker is not poisoned by a later partial one, and vice versa.
+    if _RUN_ALL_PARTIAL_MARKER_TOKEN in tokens:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in tokens:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +1135,11 @@ async def _run_cold_shadow_verify(
     — it has no retained ``target/`` warmth — ensuring a true from-scratch
     cold verify (PRD §10 invariant 6(b)).
 
+    The verify body runs under ``merge_verify_lease(lane_dir=wt)`` so a
+    concurrent periodic worktree reap (task 3018) cannot delete the checkout
+    mid-verify; the lease is released before the ``finally`` cleanup — see the
+    inline comment for why that scope is load-bearing.
+
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
         req: The :class:`MergeRequest` that just warm-landed (provides config,
@@ -894,27 +1168,65 @@ async def _run_cold_shadow_verify(
 
     wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
     try:
-        task_files_tuple = (
-            tuple(req.task_files) if req.task_files is not None else None
-        )
-        spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
-        # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor detective
-        # control (PRD §10 invariant 6(b)).  Adding remotes here would (a) defeat the
-        # from-scratch-cold guarantee (a remote may have a warm sccache/target) and
-        # (b) reintroduce remote scope-derivation concerns into the very control whose
-        # purpose is to BE the local ground truth.  See design decision in plan.json.
-        pool = _mq.VerifyRunnerPool(
-            [_mq.LocalRunner(
-                wt, req.config, req.module_configs, task_files_tuple,
-                run_scoped=_mq.run_scoped_verification,
-                run_unscoped=_mq._run_unscoped_typechecks,
+        # Hold THIS throwaway lane's flock for the duration of the verify
+        # (task 3018).  Three things to know:
+        #
+        # (i) WHY IT IS NEEDED.  Task 3018 promoted
+        #     `reap_orphaned_merge_worktrees` from a startup-only sweep to a
+        #     steady-state one fired from the merge worker's heartbeat, which
+        #     turned RESOURCE_AUDIT_WORKTREE_GRACE_SECS from a *detection*
+        #     threshold into a *destruction* deadline.  This throwaway tree is
+        #     neither registered in `_owned_merge_worktrees` (so the reap's
+        #     owned-ledger skip misses it) nor touched by
+        #     `_touch_owned_merge_worktrees` (so its measured age is real
+        #     elapsed time) — the lane flock consulted by
+        #     `remove_merge_worktree_guarded` is its ONLY liveness protection.
+        #     Holding it makes that protection independent of how long the
+        #     cold verify runs, rather than resting on an age heuristic: a
+        #     concurrent sweep gets 'skipped_lease_held' instead of deleting
+        #     the checkout out from under a running verify.
+        #
+        # (ii) PRECEDENT.  Passing `lane_dir=` an ephemeral `_merge-*`
+        #     worktree (rather than the persistent lane) is established — the
+        #     DF-2822 per-land REMOTE-green cross-check does exactly this
+        #     (merge_queue.py, `lane_dir=merge_wt`).
+        #
+        # (iii) CONTENTION IS NOT A PRACTICAL FAILURE MODE here, so no
+        #     MergeVerifyLeaseContended fail-safe branch is warranted: the
+        #     `_merge-<uuid>` path was just minted by
+        #     create_throwaway_verify_worktree and is uncontended by
+        #     construction — nobody else knows it.
+        #
+        # SCOPE IS LOAD-BEARING: the lease wraps ONLY the verify body and
+        # closes before the `finally` below.  If cleanup ran while we still
+        # held the lease, `remove_merge_worktree_guarded`'s NON-BLOCKING
+        # acquire would fail against OURSELVES, return 'skipped_lease_held',
+        # and leak the very tree the finally exists to remove.
+        async with git_ops.merge_verify_lease(lane_dir=wt):
+            task_files_tuple = (
+                tuple(req.task_files) if req.task_files is not None else None
+            )
+            spec = _mq.build_merge_verify_spec(
+                req.config, req.module_configs, task_files_tuple
+            )
+            # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor
+            # detective control (PRD §10 invariant 6(b)).  Adding remotes here would
+            # (a) defeat the from-scratch-cold guarantee (a remote may have a warm
+            # sccache/target) and (b) reintroduce remote scope-derivation concerns
+            # into the very control whose purpose is to BE the local ground truth.
+            # See design decision in plan.json.
+            pool = _mq.VerifyRunnerPool(
+                [_mq.LocalRunner(
+                    wt, req.config, req.module_configs, task_files_tuple,
+                    run_scoped=_mq.run_scoped_verification,
+                    run_unscoped=_mq._run_unscoped_typechecks,
+                    task_id=req.task_id,
+                )],
+                event_store=event_store,
                 task_id=req.task_id,
-            )],
-            event_store=event_store,
-            task_id=req.task_id,
-        )
-        verify = await pool.dispatch(merge_commit, spec)
-        return parse_per_test_results(verify.test_output or '')
+            )
+            verify = await pool.dispatch(merge_commit, spec)
+            return parse_per_test_results(verify.test_output or '')
     finally:
         await git_ops.cleanup_merge_worktree(wt)
 

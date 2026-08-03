@@ -80,6 +80,11 @@ def test_dark_factory_orchestrator_service_structure() -> None:
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
+    # The cap above is INERT without this pairing: systemd warns and discards
+    # RestartMaxDelaySec= when no RestartSteps= accompanies it. This pins the
+    # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
+    # in tests/scripts/test_systemd_restart_backoff.py.
+    assert "RestartSteps=4" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
@@ -157,6 +162,11 @@ def test_reify_orchestrator_service_structure() -> None:
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
+    # The cap above is INERT without this pairing: systemd warns and discards
+    # RestartMaxDelaySec= when no RestartSteps= accompanies it. This pins the
+    # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
+    # in tests/scripts/test_systemd_restart_backoff.py.
+    assert "RestartSteps=4" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content

@@ -686,6 +686,27 @@ async def _acquire_warm_verify_worktree(
         ``warm=True`` → ``release_spec_lane`` (retains target/) for spec lanes
         or ``reset_persistent_merge_worktree`` already handled the swap;
         ``warm=False`` → ``cleanup_merge_worktree`` (ephemeral).
+
+    Raises:
+        MergeVerifyLeaseContended: The serial-head
+            :meth:`~orchestrator.git_ops.GitOps.reset_persistent_merge_worktree`
+            call below found the shared ``<lane_dir>.lock`` still contended
+            past its bounded wait (task 3003).
+        MergeVerifyLeaseHeld: That same call's fail-CLOSED pre-check found a
+            DIFFERENT live process holding the merge-verify lease (task 2315,
+            BUG 1).
+
+        Both mean the warm worktree was NEVER touched and no verify was
+        started — the lane is simply busy.  The caller MUST DEFER the whole
+        dispatch (requeue and retry later) and must NEVER classify either as a
+        verify failure: mapping them to ``MergeOutcome('blocked')`` produces a
+        deterministic reason string, hence an identical
+        ``merge_outcome_signature`` on every attempt, which trips workflow.py's
+        ``consecutive_merge_thrash`` ladder into a false-positive human
+        escalation.  ``merge_queue._run_inflight_verify`` implements that
+        defer in an ``except`` arm placed BEFORE its generic
+        ``except Exception``.  This swap seam is the only place a reader can
+        see that this call can raise at all, hence the note here.
     """
     # ── Speculative branch: route LOCAL spec items to the _spec- warm pool ──
     # Preconditions (all must hold to use the spec pool):

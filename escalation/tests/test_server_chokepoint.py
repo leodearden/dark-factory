@@ -3629,6 +3629,217 @@ class TestMergeRequestDuplicateInVerify:
 
 
 # ---------------------------------------------------------------------------
+# TestMergeRequestRetentionParity — task 3021: thread retention= into
+# coalesce_or_enqueue_merge_request (Tier-2 TerminalOutcomeRetention parity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestRetentionParity:
+    """The merge_request MCP path must populate the TerminalOutcomeRetention ring.
+
+    merge_request's coalesce_or_enqueue_merge_request call threads the
+    harness-mounted TerminalOutcomeRetention ring (harness._terminal_retention,
+    read via _get_terminal_retention) through to the dispatch and coalesce
+    arms, so:
+      - enqueue_merge_request's _on_finalized callback records a
+        TerminalOutcomeRecord for an MCP-dispatched merge once it finishes;
+      - the coalesce arm calls retention.record_alias for a coalesced
+        submission, so the coalesced request_id later resolves to the
+        primary's outcome;
+      - merge_status's Tier-2 read (_durable_terminal_state) can therefore
+        serve MCP-submitted merges even when every other tier misses.
+
+    All three tests below pin one invariant: there is no partial
+    implementation that satisfies one without the others, since a single
+    retention=... kwarg at the coalesce_or_enqueue_merge_request call site
+    is what makes all three true simultaneously.
+    """
+
+    async def test_dispatched_merge_records_terminal_outcome_in_ring(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeOutcome,
+            TerminalOutcomeRetention,
+        )
+
+        ring = TerminalOutcomeRetention()
+        server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='ret-a',
+                branch='ret-a',
+                worktree=str(tmp_path / 'wt-ret-a'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+        assert result.get('status') == 'queued', f'Expected queued dispatch: {result}'
+        rid = result['request_id']
+
+        req = mq.get_nowait()
+        assert req.request_id == rid
+
+        req.result.set_result(MergeOutcome('done', merge_sha='ret-a-sha'))
+        await asyncio.sleep(0)  # let the _on_finalized done-callback run
+
+        rec = ring.get(rid)
+        assert rec is not None, (
+            f'Expected the retention ring to hold a terminal record for '
+            f'{rid!r} — the merge_request tool must thread retention=... '
+            'through to coalesce_or_enqueue_merge_request so the '
+            'enqueue_merge_request done-callback records it.'
+        )
+        assert rec.state == 'done', f'Expected state=done, got: {rec.state}'
+        assert rec.merge_sha == 'ret-a-sha', (
+            f'Expected merge_sha=ret-a-sha, got: {rec.merge_sha}'
+        )
+
+    async def test_coalesced_merge_registers_retention_alias(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeOutcome,
+            TerminalOutcomeRetention,
+        )
+
+        class _RecordingRetention(TerminalOutcomeRetention):
+            """Captures record_alias(alias, primary) args for assertion.
+
+            The 'attached' MCP response deliberately returns the PRIMARY
+            entry's request_id (server.py:1632-1634), so the coalesced
+            submission's own request_id is not observable from the tool
+            response — this subclass captures the record_alias args
+            instead of reaching into the ring's private _aliases state.
+            """
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.alias_calls: list[tuple[str, str]] = []
+
+            def record_alias(self, alias_id: str, primary_request_id: str) -> None:
+                self.alias_calls.append((alias_id, primary_request_id))
+                super().record_alias(alias_id, primary_request_id)
+
+        ring = _RecordingRetention()
+        server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
+
+        result1 = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='ret-b',
+                branch='ret-b',
+                worktree=str(tmp_path / 'wt-ret-b1'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+        assert result1.get('status') == 'queued', (
+            f'Expected first submission dispatched: {result1}'
+        )
+        primary_rid = result1['request_id']
+
+        result2 = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='ret-b',
+                branch='ret-b',
+                worktree=str(tmp_path / 'wt-ret-b2'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+        assert result2.get('status') == 'attached', (
+            f'Expected second submission coalesced: {result2}'
+        )
+        # The 'attached' response's request_id IS the primary's id (D8) — the
+        # coalesced submission's own id is only observable via record_alias.
+        assert result2['request_id'] == primary_rid
+
+        assert len(ring.alias_calls) == 1, (
+            f'Expected exactly one record_alias call, got: {ring.alias_calls} — '
+            'the coalesce arm in coalesce_or_enqueue_merge_request only calls '
+            'retention.record_alias when retention is not None, which '
+            "requires merge_request's coalesce_or_enqueue_merge_request call "
+            'to pass retention=...'
+        )
+        coalesced_id, alias_primary = ring.alias_calls[0]
+        assert alias_primary == primary_rid, (
+            f'Expected the alias to point at the primary {primary_rid!r}, '
+            f'got: {alias_primary!r}'
+        )
+
+        # Resolve the PRIMARY's future for real, through the same production
+        # path as test_dispatched_merge_records_terminal_outcome_in_ring, so
+        # enqueue_merge_request's _on_finalized callback writes a genuine
+        # TerminalOutcomeRecord for primary_rid (only the first submission
+        # was ever enqueued — the coalesced one attached to it instead).
+        req = mq.get_nowait()
+        assert req.request_id == primary_rid
+        req.result.set_result(MergeOutcome('done', merge_sha='ret-b-sha'))
+        await asyncio.sleep(0)  # let the _on_finalized done-callback run
+
+        # The user-visible consequence: a caller polling merge_status with
+        # the COALESCED request_id (never itself enqueued) must resolve —
+        # via the record_alias entry asserted above — to the primary's real
+        # terminal outcome.
+        status = await asyncio.wait_for(
+            _call_merge_status(server, request_id=coalesced_id), timeout=2.0,
+        )
+        assert status.get('state') == 'done', (
+            f'Expected merge_status(request_id={coalesced_id!r}) to resolve '
+            f"'done' via the alias to primary {primary_rid!r}, got: {status}"
+        )
+
+    async def test_merge_status_resolves_mcp_submitted_merge_from_retention_tier(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeOutcome,
+            TerminalOutcomeRetention,
+        )
+
+        ring = TerminalOutcomeRetention()
+        # worker=None, event_store=None, git_ops=None (_build_merge_server's
+        # defaults) so Tier-1 (live snapshot), Tier-3 (event store), and
+        # Tier-3.5 (git authority) all miss — only Tier-2 (this ring) can
+        # possibly serve merge_status, making this the task's stated
+        # end-to-end consequence.
+        server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='ret-c',
+                branch='ret-c',
+                worktree=str(tmp_path / 'wt-ret-c'),
+                wait_secs=0,
+            ),
+            timeout=2.0,
+        )
+        assert result.get('status') == 'queued', f'Expected queued dispatch: {result}'
+        rid = result['request_id']
+
+        req = mq.get_nowait()
+        req.result.set_result(MergeOutcome('done', merge_sha='ret-c-sha'))
+        await asyncio.sleep(0)
+
+        status = await asyncio.wait_for(
+            _call_merge_status(server, request_id=rid), timeout=2.0,
+        )
+        assert status.get('state') == 'done', (
+            "Expected merge_status to resolve 'done' from the retention "
+            f'tier (every other tier misses by construction), got: {status}'
+        )
+        assert status.get('outcome') == 'done', (
+            f'Expected outcome=done, got: {status}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestBoundary9CancelRetire — PRD §8 boundary #9 (task ε) step-5 RED / step-6 GREEN
 # ---------------------------------------------------------------------------
 

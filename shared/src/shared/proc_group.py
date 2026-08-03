@@ -60,6 +60,7 @@ acceptable for the current codebase because cargo/rustc do not call
 ``setsid``.  Git sub-processes spawned by short-lived helpers are out of
 scope (they are bounded and never appear in stuck-process incidents).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -138,7 +139,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
             rparen = stat_text.rfind(')')
             if rparen < 0:
                 continue
-            tail = stat_text[rparen + 2:]  # skip ') '
+            tail = stat_text[rparen + 2 :]  # skip ') '
             fields = tail.split()
             # fields[0]=state, [1]=ppid, [2]=pgrp, [3]=session, ...
             state = fields[0]
@@ -178,8 +179,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
             cmdline = '?'
 
         rows.append(
-            f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm}'
-            f' cmdline={cmdline}'
+            f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm} cmdline={cmdline}'
         )
 
     if not rows:
@@ -335,9 +335,7 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
     return False
 
 
-def _scan_process_groups_under_path_unsafe(
-    root: str, exclude_pgids: Iterable[int]
-) -> set[int]:
+def _scan_process_groups_under_path_unsafe(root: str, exclude_pgids: Iterable[int]) -> set[int]:
     """Implement scan_process_groups_under_path; may raise — caller wraps it."""
     result: set[int] = set()
     exclude = frozenset(exclude_pgids)
@@ -365,7 +363,7 @@ def _scan_process_groups_under_path_unsafe(
             rparen = stat_text.rfind(')')
             if rparen < 0:
                 continue
-            fields = stat_text[rparen + 2:].split()
+            fields = stat_text[rparen + 2 :].split()
             pgrp = int(fields[2])  # fields: state, ppid, pgrp, ...
         except (IndexError, ValueError):
             continue
@@ -402,8 +400,7 @@ def scan_process_groups_under_path(
         return _scan_process_groups_under_path_unsafe(str(root), exclude_pgids)
     except Exception:
         logger.warning(
-            'scan_process_groups_under_path(%s): unexpected error — '
-            'returning empty set',
+            'scan_process_groups_under_path(%s): unexpected error — returning empty set',
             root,
             exc_info=True,
         )
@@ -426,9 +423,7 @@ def _pgid_alive(pgid: int) -> bool:
         return False
 
 
-def _drop_dead_pgids(
-    pgids: list[int], grace_secs: float, poll_step: float
-) -> list[int]:
+def _drop_dead_pgids(pgids: list[int], grace_secs: float, poll_step: float) -> list[int]:
     """Bounded-poll *pgids*, returning those still alive after *grace_secs*.
 
     Checks liveness immediately (so an already-dead group needs no sleep),
@@ -473,7 +468,8 @@ def reap_process_groups(
             outcomes[pgid] = f'refused:{reason}'
             logger.error(
                 'reap_process_groups: refusing to killpg pgid %s — %s',
-                pgid, reason,
+                pgid,
+                reason,
             )
         else:
             safe.append(pgid)

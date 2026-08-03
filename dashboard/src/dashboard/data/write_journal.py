@@ -81,6 +81,26 @@ async def get_operations_breakdown(
 
     *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
     pass an explicit value for deterministic results.
+
+    Performance — this query does NOT benefit from ``idx_wo_created`` (task 3304),
+    and that is expected, not a tuning miss. With that index present it still
+    plans as ``SCAN write_ops USING INDEX idx_wo_operation``: SQLite satisfies
+    ``GROUP BY operation`` in order by walking that index (avoiding a temp B-tree)
+    rather than range-seeking the date index, and pays a per-row created_at test
+    across all 16.6M rows instead. Measured 2026-07-31 on a copy of the live 7 GB
+    journal, warm: 15.958 s before the index, 14.132-20.800 s after — versus
+    31.644 s -> 0.399 s for :func:`get_agent_breakdown` and 2.570 s -> 1.019 s for
+    :func:`get_memory_timeseries`, which both flip to
+    ``SEARCH ... idx_wo_created (created_at>?)``. ``api_memory_graphs`` in
+    :mod:`dashboard.app` serves exactly this query plus
+    :func:`get_memory_timeseries`, so the endpoint's residual latency is now
+    dominated by this one.
+
+    Why it will not switch under any tuning, and the remedy options (query
+    reshape, cache, materialised rollup, or dropping it from that endpoint —
+    explicitly NOT task 3304, needs its own PRD row) are recorded once,
+    authoritatively, in the "Note on α's corrected signal" amendment in
+    plans/dashboard-availability-prd.md. Do not add indexes here chasing it.
     """
     since = (resolve_now(now) - timedelta(hours=hours)).isoformat()
 

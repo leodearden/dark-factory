@@ -244,6 +244,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         BranchResetError,
         EphemeralWorktreeError,
         InteractiveWorktreeLimitError,
+        LaneLockSelfOwnedLeak,
         MergeParkContentionError,
         MergeParkError,
         MergeVerifyLeaseContended,
@@ -468,6 +469,20 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             reason_prefix='interactive_worktree_limit_reached',
             block_class=BlockClass.AGENT_FAILURE,
         ),
+        # A merge-verify lease held by a DIFFERENT live process (task 2315,
+        # BUG 1): the fail-CLOSED pre-check in
+        # GitOps.reset_persistent_merge_worktree refused BEFORE touching the
+        # tree, so nothing was mutated and nothing was verified — the lane is
+        # simply busy. REQUEUE, never escalates, never counts against the
+        # requeue cap.
+        #
+        # task 3003: this is no longer a BD-2-completeness-only row. The merge
+        # worker's _run_inflight_verify now genuinely requeues this type (its
+        # defer arm catches (MergeVerifyLeaseContended, MergeVerifyLeaseHeld)),
+        # so the values below finally describe what the code does. Until then
+        # the type fell to the generic `except Exception` and resolved a
+        # 'blocked' MergeOutcome — the merge worker directly contradicting the
+        # policy declared right here.
         MergeVerifyLeaseHeld: BlockDisposition(
             category=FailureCategory.NONE,
             escalate_to_human=False,
@@ -476,17 +491,45 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             reason_prefix='merge_verify_lease_held',
             block_class=BlockClass.AGENT_FAILURE,
         ),
-        # A contended merge-verify lease (task 2828) is transient "come back
+        # A contended merge-verify lane lock (task 2828) is transient "come back
         # later," identical in shape to MergeVerifyLeaseHeld above: REQUEUE,
-        # never escalates, never counts against the requeue cap. Raised by
-        # GitOps.merge_verify_lease and requeued by the merge worker's
-        # _run_inflight_verify (BD-2 forces this explicit row).
+        # never escalates, never counts against the requeue cap. Requeued by
+        # the merge worker's _run_inflight_verify (BD-2 forces this explicit
+        # row). Raised by BOTH bounded-wait acquires on the shared
+        # <lane_dir>.lock: GitOps.merge_verify_lease (the verify span, 2828)
+        # and GitOps.reset_persistent_merge_worktree (the warm-swap reset,
+        # task 3003 — where it additionally means the tree was never touched).
         MergeVerifyLeaseContended: BlockDisposition(
             category=FailureCategory.NONE,
             escalate_to_human=False,
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='merge_verify_lease_contended',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Task 3081 (D8/B13). IS-A MergeVerifyLeaseContended, and keeps that
+        # row's REQUEUE + no-cap-burn: a leaked lane lock is an infra fault the
+        # task must not be charged for. Diverges on ONE axis --
+        # escalate_to_human -- because unlike ordinary contention it can never
+        # resolve by waiting: nothing releases the leaked fd before process
+        # exit. In reify esc-5548-5 three tasks blocked behind one identical
+        # merge_outcome_signature 3173b64436423738 and nothing surfaced until an
+        # unattended restart ~3h later. An explicit row is required regardless
+        # (BD-2 completeness enumerates git_ops' exports), but the MRO would
+        # otherwise resolve it to the parent's escalate_to_human=False.
+        #
+        # HONEST LIMITATION: on the merge-worker path this exception is caught
+        # by merge_queue.py's contended-defer arm (it IS-A the parent) BEFORE
+        # the disposition table is consulted, so this row governs the OTHER
+        # consumers -- cli.py verify-merge and workflow block classification.
+        # The loud FIRST-OCCURRENCE signal is the logger.error at the detection
+        # site in GitOps._lane_lock_self_owned_leak, not this flag.
+        LaneLockSelfOwnedLeak: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='lane_lock_self_owned_leak',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         IllegalTransitionError: BlockDisposition(

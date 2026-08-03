@@ -16,9 +16,52 @@ docs/legibility/census-state.json): in addition to the §7.5 minimal shape
 done-task count as of the last census, used to compute the "tasks landed
 since last census" delta for condition (b). fused-memory's get_statuses
 returns only a `{id: status}` status snapshot with no timestamps, so that
-delta is uncomputable without a persisted baseline. When
-`last_census_done_count` is absent (never censused, or η not yet writing
-it), condition (b) fails SAFE — it never fires — rather than guessing.
+delta is uncomputable without a persisted baseline. That baseline is
+THREE-VALUED (task 3291):
+
+  * an int — a real observed done-count as of the last census. A real `0`
+    (a project with no done tasks) is included and is NOT treated as
+    missing;
+  * `null` — the count could not be OBSERVED at census time. Condition (b)
+    fails SAFE, exactly as for an absent key, until the next successful
+    census; condition (a) (`max_interval_days`) remains the unconditional
+    backstop;
+  * absent — never censused, or η not yet writing it. Condition (b) fails
+    SAFE.
+
+Only a real int ever arms condition (b). A FABRICATED `0` used to be the
+fourth case, and it was the dangerous one: `census.py` wrote 0 whenever the
+get_statuses call failed, and that 0 was persisted as a real baseline on
+2026-07-24 and on 2026-07-31. It is UNSOUND rather than immediately
+visible, and the distinction matters for anyone debugging over-firing —
+these are the measured facts (2026-07-31 decision replayed against the
+pre-task code at merge-base `2b0afe47d9`, with the historical state and
+codebook from `3e462e1b56^`):
+
+  * while the fetch was ALSO broken the fabricated 0 was self-cancelling.
+    The same relative-project_root defect zeroed `current_done` too, so the
+    delta was `0 - 0 = 0` — far under the 120 threshold. Replay of the real
+    pre-fix census.py gate reports `tasks-landed: 0 landed since last
+    census (threshold 120)`: condition (b) did NOT fire. In the nightly
+    trickle it could not fire at all, since `run_nightly` defaults
+    `status_fetcher=None` (nightly.py:727 -> :901) and (b) is structurally
+    N/A there;
+  * but it ARMS (b) the moment the fetch is repaired: with a working
+    fetcher the same replay reports `tasks-landed: 2872 landed since last
+    census (threshold 120) -> FIRE`, ~24x over. So the root-cause fix below
+    would have DETONATED the poisoned baseline had the two not landed
+    together with the on-disk data repair.
+
+What actually fired the 2026-07-31 census was condition (c): `novelty-spike:
+25 candidate(s) within 72h (threshold 4)`. Condition (a) did not fire either
+(7.4d elapsed, 10d threshold). Recalibrating the novelty-spike thresholds is
+NOT part of task 3291 — see the follow-up filed against
+docs/legibility/legibility.yaml.
+
+Task 3291 removed the fabricated-0 path; `census.advance_census_state` now
+persists `null` for an unobservable count, and `extract_done_count` below is
+the single chokepoint that refuses to turn an unusable payload into a
+number.
 
 This module does NOT import task β's `legibility.yaml` config *loader*
 (`legibility.config.load_config`): that loader requires four mandatory
@@ -41,7 +84,13 @@ and "a failing get_statuses fails SAFE" is testable with a raising fake.
 standalone CLI, unwrapping the real MCP `tools/call` JSON-RPC envelope via
 `_extract_tool_result` (the tool's actual return value lives at
 `result.structuredContent` or `result.content[0].text`, never at the
-envelope's top level); task ε injects the real MCP-backed fetcher.
+envelope's top level); task ε injects the real MCP-backed fetcher. It
+resolves its `project_root` to an ABSOLUTE path before sending it: the MCP
+argument is interpreted by the server's cwd, not the client's, and
+fused-memory's `_normalize_project_root` hard-rejects any relative path
+(task 3291). Whatever the fetcher returns is converted to a number by
+`extract_done_count`, never by an inline `.get("statuses")` -- see that
+function for why.
 """
 from __future__ import annotations
 
@@ -50,9 +99,11 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import overload
 
 import yaml
 
@@ -62,10 +113,24 @@ from legibility.config import Census as _LegibilityCensus
 logger = logging.getLogger("legibility.census_trigger")
 
 
+@overload
+def _as_utc(value: datetime) -> datetime: ...
+
+
+@overload
+def _as_utc(value: None) -> None: ...
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     """Normalize a datetime to timezone-aware UTC. A naive datetime (e.g.
     parsed from a bare `YYYY-MM-DD` codebook date) is assumed to already be
-    UTC. `None` passes through unchanged."""
+    UTC. `None` passes through unchanged.
+
+    Overloaded because the pass-through is exactly correlated with the input:
+    the plain `datetime | None -> datetime | None` signature discarded that,
+    so `evaluate`'s `now` (declared non-Optional) came back Optional and made
+    every subsequent arithmetic on it a type error. The overloads state what
+    the body already does; the runtime implementation is unchanged."""
     if value is None:
         return None
     if value.tzinfo is None:
@@ -396,16 +461,139 @@ class StatusFetchUnavailable(Exception):
     caller -- catch fetch failures deterministically."""
 
 
+# Every `StatusFetchUnavailable` message below is re-emitted verbatim by
+# `compute_tasks_landed`'s WARNING and by `census.run_census`'s "done-count
+# unobservable (%s)" WARNING, i.e. into the nightly systemd journal. An
+# unbounded `{payload!r}` there would dump a whole malformed-but-large body
+# (get_statuses over a big project is thousands of entries) into a single log
+# line -- the opposite of the legible failure this module is for. Diagnosis
+# only ever needs the shape, so the reprs are truncated and the type
+# name/key list, which is what actually identifies the fault, is always
+# reported outside the truncated part.
+_MAX_REPR_CHARS = 200
+_MAX_REPORTED_KEYS = 20
+
+
+def _bounded_repr(value, limit: int = _MAX_REPR_CHARS) -> str:
+    """`repr(value)` truncated to *limit* chars with an explicit elision
+    marker, so a log line stays one readable line regardless of payload size."""
+    text = repr(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... (repr truncated, {len(text)} chars total)"
+
+
+def _bounded_keys(mapping) -> str:
+    """A bounded, order-stable summary of a mapping's keys. Sorts by `str` so
+    a payload with mixed-type keys cannot raise `TypeError` from inside the
+    error path itself -- a failure while reporting a failure is the worst
+    possible place to be clever."""
+    keys = sorted(mapping, key=str)
+    shown = keys[:_MAX_REPORTED_KEYS]
+    suffix = f", ... ({len(keys)} total)" if len(keys) > _MAX_REPORTED_KEYS else ""
+    return f"{shown}{suffix}"
+
+
+def extract_done_count(payload) -> int:
+    """Count `"done"` values in a get_statuses payload, or raise
+    `StatusFetchUnavailable` if *payload* is not a usable get_statuses
+    envelope.
+
+    This is the SOLE place a get_statuses payload is turned into a number,
+    and it exists because the idiom it replaces silently fabricated
+    baselines. Both `compute_tasks_landed` below and `census.run_census`
+    used to inline `sum(1 for v in (payload.get("statuses") or {}).values()
+    if v == "done")`. That `or {}` swallowed *every* unusable payload into a
+    done-count of 0 -- no warning, no exception, no way to tell a real
+    empty project from a failed call. fused-memory's `@mcp_tool_errors`
+    returns its `{"error", "error_type"}` dict on an `isError: false`
+    JSON-RPC response, so `_extract_tool_result` unwraps it as though it
+    were a genuine result and the old idiom read it as 0. That fabricated 0
+    was persisted as a real census baseline on 2026-07-24 and on 2026-07-31
+    (task 3291) — an unsound baseline that stayed latent only for as long as
+    the fetch itself was broken (the same defect zeroed `current_done`, so
+    the delta was `0 - 0`), and that arms condition (b) with a delta of
+    ~2872 — every done task ever, ~24x its 120 threshold — as soon as the
+    fetch is repaired. See the module docstring for the replayed
+    measurements, including what actually fired the 2026-07-31 census.
+
+    `{"statuses": {}}` is deliberately a VALID done-count of 0: a project
+    with no done tasks is a real, expected state, and
+    `census.advance_census_state`'s contract explicitly guarantees a real 0
+    is never dropped as falsy. The distinction that matters is
+    presence-of-shape, not emptiness-of-content -- only a missing or
+    non-mapping `statuses` key, a non-dict payload, or the tool-error
+    envelope is treated as unavailable.
+
+    Note this strictness deliberately lives HERE and not in
+    `_extract_tool_result`: that unwrapper is shared with
+    `census._post_mcp_tool_call`, which serves `submit_task` and
+    `escalate_info`, and those callers legitimately receive and inspect the
+    `{"error": ...}` dict (submit_task's documented rejection shape).
+    Raising there would break unrelated paths; raising at the
+    get_statuses-specific boundary closes the hole at both call sites at
+    once without touching them.
+
+    Raises:
+        StatusFetchUnavailable: with a message naming the offending shape --
+            or quoting the server's own `error` text -- so the operator sees
+            the real cause rather than a generic complaint. The identifying
+            facts (type name, key list, container length) are always stated
+            in full; any embedded value repr is bounded, because this message
+            is re-emitted into the nightly journal as a single log line (see
+            `_bounded_repr`).
+    """
+    if not isinstance(payload, dict):
+        raise StatusFetchUnavailable(
+            f"get_statuses payload is not a dict (got {type(payload).__name__}): "
+            f"{_bounded_repr(payload)}"
+        )
+
+    # The fused-memory tool-error envelope, checked before the shape
+    # complaint so the operator sees the actual server-side reason (e.g.
+    # "project_root must be a non-empty absolute path") instead of merely
+    # being told a `statuses` key was missing.
+    if "statuses" not in payload and "error" in payload:
+        raise StatusFetchUnavailable(
+            f"get_statuses returned a tool-error envelope "
+            f"({payload.get('error_type') or 'error'}): "
+            f"{_bounded_repr(payload.get('error'))}"
+        )
+
+    if "statuses" not in payload:
+        raise StatusFetchUnavailable(
+            f"get_statuses payload has no 'statuses' key (keys: {_bounded_keys(payload)})"
+        )
+
+    statuses = payload["statuses"]
+    if not isinstance(statuses, Mapping):
+        sized = f", len={len(statuses)}" if hasattr(statuses, "__len__") else ""
+        raise StatusFetchUnavailable(
+            f"get_statuses 'statuses' is not a mapping "
+            f"(got {type(statuses).__name__}{sized}): {_bounded_repr(statuses)}"
+        )
+
+    return sum(1 for status in statuses.values() if status == "done")
+
+
 def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
     """Fail-SAFE "tasks done since last census" delta for condition (b).
 
     Returns `None` (never fires condition (b)) plus exactly one WARNING
     when: `status_fetcher` is `None`; `state` has no `last_census_done_count`
-    baseline (§7.5 extended read contract, see module docstring); or calling
-    `status_fetcher` raises for any reason. Otherwise counts `"done"` values
-    in the fetcher's wrapped `{"statuses": {id: status}}` envelope (matching
-    get_statuses' real shape -- fused-memory/src/fused_memory/server/tools.py:2665)
-    and returns `current_done - baseline`.
+    baseline (§7.5 extended read contract, see module docstring); calling
+    `status_fetcher` raises for any reason; or the fetched payload is not a
+    usable `{"statuses": {id: status}}` envelope (matching get_statuses' real
+    shape -- fused-memory/src/fused_memory/server/tools.py:2665). In
+    particular fused-memory's `{"error", "error_type"}` tool-error dict --
+    which rides an `isError: false` JSON-RPC response and so survives
+    `_extract_tool_result` intact -- fails SAFE here rather than counting
+    zero; see `extract_done_count` for why counting zero was the defect
+    (task 3291). Otherwise returns `current_done - baseline`.
+
+    A bad payload and an unreachable server deliberately share ONE code path
+    and ONE warning, so there is no separate failure mode to reason about --
+    only the warning TEXT distinguishes them in the journal.
     """
     baseline = (state or {}).get("last_census_done_count")
     if baseline is None:
@@ -427,8 +615,15 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
         logger.warning("tasks-landed: status_fetcher failed: %s", exc)
         return None
 
-    statuses = payload.get("statuses") or {} if isinstance(payload, dict) else {}
-    current_done = sum(1 for status in statuses.values() if status == "done")
+    # Extraction is guarded separately from the fetch so the warning TEXT can
+    # distinguish "server unreachable" from "server answered with something
+    # unusable" -- but both land on the same return-None fail-safe branch.
+    try:
+        current_done = extract_done_count(payload)
+    except StatusFetchUnavailable as exc:
+        logger.warning("tasks-landed: get_statuses returned an unusable payload: %s", exc)
+        return None
+
     return current_done - baseline
 
 
@@ -482,7 +677,9 @@ def _extract_tool_result(rpc_response: dict) -> dict:
     """
     result = rpc_response.get("result") if isinstance(rpc_response, dict) else None
     if not isinstance(result, dict):
-        raise StatusFetchUnavailable(f"malformed MCP response (no result): {rpc_response!r}")
+        raise StatusFetchUnavailable(
+            f"malformed MCP response (no result): {_bounded_repr(rpc_response)}"
+        )
 
     structured = result.get("structuredContent")
     if isinstance(structured, dict):
@@ -501,7 +698,8 @@ def _extract_tool_result(rpc_response: dict) -> dict:
                 return parsed
 
     raise StatusFetchUnavailable(
-        f"MCP tools/call result has neither structuredContent nor parseable content: {result!r}"
+        f"MCP tools/call result has neither structuredContent nor parseable "
+        f"content: {_bounded_repr(result)}"
     )
 
 
@@ -518,8 +716,37 @@ def default_status_fetcher(project_root: str | Path):
     `_extract_tool_result` before returning, so the callable's return value
     matches `compute_tasks_landed`'s expected `{"statuses": {...}}` shape
     instead of the outer JSON-RPC envelope.
+
+    *project_root* is resolved to an ABSOLUTE path before it crosses the
+    wire: the MCP `get_statuses` argument is interpreted by the SERVER's
+    cwd, not the client's, so a relative path is meaningless there and is
+    hard-rejected by fused-memory's `_normalize_project_root` (task 3291 --
+    see the comment at the resolve call below).
     """
-    project_root_str = str(project_root)
+    # THE ROOT-CAUSE FIX (task 3291). The MCP argument is resolved by the
+    # server process, not this one, so a relative path is not merely
+    # fragile -- fused-memory's `_normalize_project_root` rejects it
+    # outright with {"error": "project_root must be a non-empty absolute
+    # path, got: '.'", "error_type": "ValidationError"}. That envelope rides
+    # an `isError: false` JSON-RPC response, so it used to sail through
+    # `_extract_tool_result` and get counted as a done-count of 0.
+    #
+    # In production this call ALWAYS carried a relative path: census.py's
+    # CLI defaults --project-root to "." and nightly._default_census_launcher
+    # (nightly.py:521) launches census.py with no arguments at all.
+    #
+    # Resolving HERE, at the wire boundary, rather than at each CLI
+    # entrypoint, fixes every consumer at once -- census.py's main(), the
+    # nightly trickle's decide_for_project, and the `evaluate` CLI all build
+    # their fetcher through this one function. Fixing it at the CLIs instead
+    # would need lockstep edits with the same silent-failure risk this
+    # module already single-sources MCP_STREAMABLE_HTTP_HEADERS to avoid.
+    #
+    # census.py's own Path(args.project_root) stays relative-friendly: it is
+    # used for local filesystem access (config, codebook, report, state),
+    # where a cwd-relative path resolves correctly in-process. Only the
+    # over-the-wire argument was ever broken.
+    project_root_str = str(Path(project_root).resolve())
     url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
 
     def _fetch() -> dict:

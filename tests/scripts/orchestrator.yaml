@@ -1,0 +1,152 @@
+# Module config for the repo-root tests/scripts/ suite.
+#
+# WHY THIS FILE EXISTS (task 3350, escalation esc-3062-3)
+#
+# _build_fallback_config is consulted only when the discovered module_configs
+# list is EMPTY. For a diff confined to tests/scripts/, _single_subproject_prefix
+# and _root_plus_single_subproject_prefix both return None (`tests` has no
+# pyproject.toml, and no real subproject is touched), so it fell through to the
+# `config.test_command != 'pytest'` branch: prefix __fallback__, test_command =
+# the whole seven-segment fleet chain, verify_command_timeout_secs=None so the
+# repo-root global ceiling applied. Task 3062 attempt-2 measured that path
+# consuming 1733.60s across four of seven segments before dashboard even
+# started, then timing out at 1800.66s — category infra_timeout — on a diff
+# whose own tests take ~105s.
+#
+# Registering a real module config here makes module_configs non-empty, which
+# by itself is sufficient to bypass the fallback builder entirely. This is the
+# intent task 2361 already wrote into the root yaml's comment, but which a
+# trailing chain segment could never deliver: a segment at the end of a
+# 7-segment && chain only runs if all ~1800s of the preceding segments finish
+# first, so tests/scripts' own gating was hostage to every other suite.
+#
+# Registered at prefix `tests/scripts` (depth 2), not `tests` (depth 1):
+# depth 2 is <= the effective lock_depth of 4 (shipped by the package-bundled
+# orchestrator/src/orchestrator/defaults.yaml), so the config.py:4712-4725
+# "prefix deeper than lock_depth" warning does not fire and the
+# scheduler/workflow path can reach this config. Registering at `tests` would
+# additionally capture any future tests/<other>/ subtree that this `uv run
+# --project shared` environment cannot necessarily run, silently mis-gating it.
+#
+# Pin --project shared: tests/scripts/ lives at the repo root and is not itself
+# a workspace member, so a bare `uv run pytest` resolves against the
+# workspace-ROOT project (dark-factory), which declares no deps and no pytest ->
+# verify dies with "Failed to spawn: pytest" on a freshly-synced venv (e.g. a
+# fresh _merge-* verify worktree). shared is a member that declares pytest, and
+# these tests import no first-party package beyond what the root conftest puts
+# on sys.path, so its env suffices. No --directory, so cwd stays at the worktree
+# root and the tests/scripts/ path still resolves. Mirrors scripts/
+# orchestrator.yaml and the other subprojects' --project <member> convention;
+# verify.py's own _ROOT_OWNING_TEST_COMMAND and _FALLBACK_UV_PROJECT = 'shared'
+# already encode exactly this pairing.
+#
+# --timeout=300 is required by test_fallback_verify_config.py's
+# test_per_module_merge_verify_raises_per_test_timeout guard, and is correct on
+# its own merits: this verbatim FULL_SUITE form runs when a touched file
+# classifies STRUCTURAL and under merge-role merge_verify_breadth=full.
+test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
+
+# KNOWN COST, recorded rather than left invisible (task 3350 amendment).
+#
+# This command is BYTE-IDENTICAL to scripts/orchestrator.yaml's test_command
+# (verified). That is not an accident — scripts/ has no tests of its own and has
+# always pointed at this suite — but it means the suite now runs TWICE, and the
+# two dedupe layers each miss it for a different reason:
+#
+#   * run_full_verification (verify.py:4735) asyncio.gathers over
+#     module_configs.values() with NO dedupe by command, so on every review
+#     checkpoint, run_main_tip_sweep and merge full-verify, `scripts` and
+#     `tests/scripts` both fire this identical command CONCURRENTLY in one
+#     worktree — two pytest processes sharing the worktree-root .pytest_cache
+#     and tests/scripts/__pycache__.
+#   * workflow._resolve_module_configs dedupes by `mc.prefix` (`seen[mc.prefix]
+#     = mc`, workflow.py:3558), not by command, so a SCOPED verify whose touched
+#     files span both scripts/ and tests/scripts/ also runs it twice.
+#
+# Cost: ~110-230s of duplicated work per full verify. That cuts against this
+# file's own premise — the 600s budget below is sized for a ~39% run-to-run
+# spread attributed to host oversubscription, and duplicate execution is itself
+# a contributor to that oversubscription.
+#
+# It is documented here rather than fixed because both fixes are out of this
+# task's lock scope: narrowing/removing scripts/orchestrator.yaml's test_command
+# would edit a file this task does not hold, and a dedupe-identical-commands
+# guard in run_full_verification is a production-code change of a different
+# class. Filed as follow-up. Recording it keeps the cost measured and visible —
+# the same standard this file applies to its timeout budgets — instead of
+# leaving a silent 2x for someone to rediscover under load.
+
+# ALL THREE commands are declared DELIBERATELY, not incidentally.
+#
+# Omitting either of the two below would NOT leave them running as they do
+# today — it would DELETE them. verify_plan.py:334-363 emits an explicit
+# SKIPPED PlannedRun for a falsy lint_command/type_check_command,
+# _executed_module_configs_from_plan leaves the field None (verify.py:4892),
+# and _run_or_skip_timed turns a None command into a CheckRun.skipped that is
+# VACUOUSLY PASSING at rc=0. So a test-only module config would silently drop
+# lint and type gating for every tests/scripts diff — strictly worse than the
+# fallback path this file replaces, which esc-3062-3 logs narrowing both legs
+# correctly (ruff check <file> rc=0, pyright <file> rc=0). Closing the TEST gap
+# must not open a LINT/TYPE one; the guard for that is
+# test_tests_scripts_module_config.py's (c)/(d) assertions.
+#
+# Both forms are the directory-wide widening of what esc-3062-3 already logs at
+# rc=0 on the fallback path, and task 3350's pre-1 verified them clean
+# directory-wide before declaring them here (ruff rc=0 as-is; pyright needed 4
+# fixes, all confined to tests/scripts/ and made in commit 2fe3a3ef6d rather
+# than by weakening either command).
+#
+# --project shared on ruff for the same PATH reason the root yaml's own comment
+# gives — "ruff is not on PATH at the worktree root, only inside each member
+# venv"; verify.py's _FALLBACK_UV_PROJECT = 'shared' encodes the same choice.
+#
+# npx pyright matches the root type_check_command's invocation style and
+# resolves [tool.pyright] extraPaths from the root pyproject.toml, which is what
+# lets `from orchestrator.config import ...` resolve in these tests.
+#
+# Note both run VERBATIM (not file-scoped) under merge-role
+# merge_verify_breadth=full, and type_check widens to this directory form when a
+# touched file classifies STRUCTURAL — hence pre-1 checking the directory form
+# rather than only the per-file one.
+lint_command: "uv run --project shared ruff check tests/scripts/"
+type_check_command: "npx pyright tests/scripts/"
+
+# Per-module verify budget. MEASUREMENT PROVENANCE, two independent sources:
+#
+#   105-127s         four runs on the fallback path (task 3062, esc-3062-3)
+#   233.50s, 167.73s  two runs of this VERBATIM command, 369 passed / 1
+#                     skipped each, on the task 3350 worktree at HEAD
+#                     9d6af5289f
+#
+# Size against 233.50s — the largest figure, and measured on the same command
+# this file declares. 600s is ~2.6x it. The 233.50s / 167.73s spread (~39%)
+# between two runs of an identical command on one host is itself the reason
+# for that much headroom: this box is oversubscribed by concurrent orchestrator
+# work, exactly as the same day esc-3062-3 was logged showed the orchestrator
+# segment swing 1157.62s -> 1366.23s (~18%). Still tight enough to surface a
+# genuine hang in minutes rather than in the ~50 the whole-fleet ceiling
+# permits.
+#
+# Both figures are recorded rather than only the convenient one: task 3350
+# exists because a single unrecorded estimate ("Full warm verify here is
+# ~2 min") was left standing in the root yaml until it was off by an order of
+# magnitude. If this suite grows enough to approach 600s, re-measure and raise
+# BOTH this value and the >= 300s floor asserted in
+# test_tests_scripts_module_config.py — do not quietly widen one.
+#
+# This is where the root yaml's "tight timeouts surface hangs" intent actually
+# lives now. It could never hold at the whole-fleet level, because a ceiling
+# the honest green path cannot clear surfaces nothing but false infra_timeouts;
+# it holds here, scoped to a suite whose real cost is known.
+#
+# verify_command_timeout_secs is a PER-COMMAND budget
+# (skills/orchestrate/references/project-setup.md:150), so this bounds the TEST
+# leg on its own — not the sum of test+lint+type.
+#
+# verify_cold_command_timeout_secs is deliberately left UNSET here: this suite
+# has no build step whose cold cost would justify a separate cold budget. Note
+# what that actually means, per the _resolve_verify_timeout cascade
+# (verify.py:3634-3640) — an unset module cold knob falls through to
+# config.verify_cold_command_timeout_secs, which the repo root DOES set (3600),
+# NOT to the 600 below. The 600 is the warm budget only.
+verify_command_timeout_secs: 600

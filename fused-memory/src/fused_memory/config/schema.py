@@ -15,6 +15,19 @@ from pydantic_settings import (
 )
 from shared.config_models import UsageCapConfig
 
+# The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
+# stdlib-only leaf, NOT from fused_memory.memory_metadata: that module
+# imports backends.mem0_client, which imports THIS module at module scope,
+# so the direct import raises (measured)
+#   ImportError: cannot import name 'FusedMemoryConfig'
+#                from 'fused_memory.config.schema'
+# and would additionally make config loading require the mem0 SDK.
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    TOPIC_SLUG_RE,
+    is_valid_topic_slug,
+)
+
 # Config path used when the ``CONFIG_PATH`` env var is unset. Single-sourced here
 # so both ``settings_customise_sources`` (the actual loader) and the reload_config
 # MCP tool's ``config_path`` disposition field agree on the file actually read —
@@ -348,6 +361,91 @@ class TaskMetadataConfig(BaseModel):
     )
 
 
+# --- Mem0 metadata write-boundary validation (task 3195, leaf β) ---
+
+class MemoryMetadataConfig(BaseModel):
+    """Governs ``MemoryService``'s write-boundary validation of Mem0 ``metadata``.
+
+    Backed by ``fused_memory.memory_metadata`` (the single normative home for
+    the Mem0 metadata vocabulary — PRD ``docs/prds/memory-metadata-vocabulary.md``
+    V1 / INV-5). This is a top-level config section — NOT nested under
+    ``reconciliation`` or ``taskmaster`` — because it governs a vocabulary
+    shared beyond any one backend or caller, mirroring ``TaskMetadataConfig``
+    directly above. PRD D3 names that section as its precedent for
+    "census first, tiers later", so this follows it rather than inventing a
+    second shape.
+
+    ``extra='forbid'`` so a mistyped leaf fails loud at config load/reload
+    rather than silently doing nothing: under ``extra='ignore'`` an operator
+    who typed ``enforce_kind_regsitry`` would get a silently-dropped key and
+    believe enforcement was on.
+
+    Reload tier: ``reload.py``'s ``RELOADABLE_FIELDS`` is an opt-IN allowlist,
+    so every leaf here is restart-required by default and none is listed. That
+    is correct for BOTH pairs, not just the enforce flags — the storm-tuning
+    leaves are read once when ``MemoryService.__init__`` constructs the
+    ``UnknownKeyStormDetector``, so they are captured by value and a hot
+    reload genuinely would not take effect. Allowlisting them would advertise
+    a reload that silently does nothing.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    enforce: bool = Field(
+        default=False,
+        description=(
+            'RED-TIER / restart-only: warn-mode when False (default) — '
+            'validation violations emit a memory_metadata.schema_warning log '
+            'line and the write proceeds; True rejects the write with '
+            'MemoryMetadataValidationError. Not hot-reloadable.'
+        ),
+    )
+    enforce_kind_registry: bool = Field(
+        default=False,
+        description=(
+            'RED-TIER / restart-only: whether an unknown metadata.kind is '
+            'FATAL (rejectable) rather than census-only. Carved out from '
+            "`enforce` and left OFF even after `enforce` flips, because it is "
+            'specifically this check whose safety premise leaf α measured '
+            'FALSE: PRD D3 assumed kind writers are in-repo code + prompts, '
+            'but 242 of the 329 live kind values are singletons, i.e. the '
+            'population is agent-invented free text and open in practice. '
+            'Flipping this on day one would turn every newly invented kind '
+            'into a hard memory-write failure on the live fleet. See PRD §10 '
+            'open question 1. Not hot-reloadable.'
+        ),
+    )
+    unknown_key_storm_threshold: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Unknown-key census warnings from ONE (project_id, agent_id) '
+            'within the window before an escalation is filed. Per-writer, not '
+            'global: a storm is a DRIFTING WRITER, and a global counter would '
+            'fire on healthy fleet traffic given the 1,627-key baseline while '
+            'never identifying the culprit. Calibrated from leaf α\'s census '
+            '(plans/memory-metadata-census-report.json, grand_total.keys.'
+            'entries, excluding the mem0-managed / server-stamped / reserved '
+            '/ blessed layers and x_ keys): the unknown tail is 1,604 '
+            'distinct keys totalling 17,261 occurrences across the whole '
+            'corpus lifetime, and its BUSIEST single key totals 545. Since '
+            'this threshold is keyed per-writer-per-window, 50 from one '
+            'writer in 5 minutes is far above any legitimate rate. '
+            'Restart-only: read once when MemoryService builds the detector.'
+        ),
+    )
+    unknown_key_storm_window_seconds: int = Field(
+        default=300,
+        ge=1,
+        description=(
+            'Rolling window for unknown_key_storm_threshold. Warns older than '
+            'this are dropped, so a slow trickle never accumulates into a '
+            'false storm. Restart-only: read once when MemoryService builds '
+            'the detector.'
+        ),
+    )
+
+
 # --- Task status transition authority (task 2175, rho1b) ---
 
 class TaskStatusConfig(BaseModel):
@@ -384,11 +482,29 @@ class ProceduralTopicCluster(BaseModel):
     below-cosine-threshold restatement the semantic near-dup guard cannot catch
     (task 2845). ``extra='forbid'`` so a mistyped cluster key fails loud at config
     load/reload, never silently matches nothing.
+
+    ``topic_id`` shares ONE namespace with the ``metadata.topic`` memory
+    vocabulary key (PRD ``docs/prds/memory-metadata-vocabulary.md`` D4):
+    both are validated by the single rule in
+    :mod:`fused_memory.topic_slug`. That is what makes 3135's auto-seed
+    invariant -- ``cluster.topic_id == canonical.metadata.topic`` --
+    expressible at all. A snake_case ``topic_id`` could never equal a
+    validated ``metadata.topic``, so the guard would load cleanly and then
+    match nothing forever; the validator below turns that silent no-op
+    into a config-load failure.
     """
 
     model_config = ConfigDict(extra='forbid')
 
-    topic_id: str = Field(description='Stable identifier for this topic cluster.')
+    topic_id: str = Field(
+        description=(
+            'Stable identifier for this topic cluster. Shares ONE namespace with the '
+            'metadata.topic memory key (PRD D4) and is validated by the same rule '
+            f'({TOPIC_SLUG_RE.pattern}, max {TOPIC_SLUG_MAX_LEN} chars) from '
+            'fused_memory.topic_slug, so a cluster id can equal a canonical '
+            "memory's metadata.topic."
+        ),
+    )
     phrases: list[str] = Field(
         description=(
             'Identifying substring phrases, matched case-insensitively. A write '
@@ -410,6 +526,37 @@ class ProceduralTopicCluster(BaseModel):
             'When empty, the guard substitutes a module-default hint.'
         ),
     )
+
+    @field_validator('topic_id')
+    @classmethod
+    def _validate_topic_id_slug(cls, v: str) -> str:
+        """Reject a ``topic_id`` that is not a well-formed topic slug (PRD D4).
+
+        Fails fast at config load/reload for the same reason
+        ``extra='forbid'`` is on this model: the alternative is a cluster
+        that loads cleanly and then matches nothing, because a snake_case
+        id can never equal a validated ``metadata.topic``. A silent no-op
+        guard is strictly worse than a loud rejection an operator can fix.
+
+        ``is_valid_topic_slug`` is THE shared predicate -- deliberately
+        called rather than re-expressing the regex or the cap inline, so
+        the memory side and the config side cannot drift to two different
+        answers (INV-5; ``tests/test_topic_slug_namespace.py`` asserts the
+        identity by ``is``).
+
+        The message quotes the offending value, the rule, and the module
+        that owns it, so an operator who trips this at load can find the
+        rule without reading the source.
+        """
+        if not is_valid_topic_slug(v):
+            raise ValueError(
+                f'topic_id {v!r} is not a valid topic slug: it must match '
+                f'{TOPIC_SLUG_RE.pattern} and be at most {TOPIC_SLUG_MAX_LEN} '
+                f'characters. topic_id shares one namespace with the '
+                f'metadata.topic memory key (PRD D4); the rule lives in '
+                f'fused_memory.topic_slug.'
+            )
+        return v
 
 
 def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
@@ -1482,6 +1629,108 @@ class WriteTriageConfig(BaseModel):
     )
 
 
+class Mem0UpdateConfig(BaseModel):
+    """Authorization + storm knobs for the in-place update_memory tool (task 3088).
+
+    Decided by ``plans/mem0-in-place-update-decision.md`` §4. In-place content
+    amendment is a silent-rewrite primitive, so the tool ships behind a narrow
+    self-reported-agent allowlist and a kill switch.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig: this is exactly the growth ReconciliationConfig's
+    near-dup ownership note anticipated ("if this guard ever grows independent of
+    reconciliation, move these two fields to a dedicated server-owned config
+    section instead of assuming colocation implies subsystem ownership") — recon
+    Stage 1 is this gate's first sanctioned CALLER, not its owner. Starting here
+    avoids a later migration.
+
+    Declared on FusedMemoryConfig as a BARE (non-Optional) submodel so
+    config/reload.py's `_iter_leaves` descends into per-leaf paths. An
+    `X | None` submodel is compared whole and lands as a single
+    restart_required entry (esc-2718-1), which would cost every leaf here its
+    green-tier hot-reload.
+
+    TWO CORRECTIONS to the decision doc a reader should not be misled by:
+
+    1. §4 cites CuratorConfig / TicketJanitorConfig / SummaryRebuildConfig as
+       three top-level precedents, but TicketJanitorConfig is actually NESTED
+       under CuratorConfig as `janitor`. The genuine top-level precedents are
+       `write_triage`, `curator` and `summary_rebuild` — still three, but a
+       different three; WriteTriageConfig is the freshest shape template.
+
+    2. The storm knobs live HERE in config rather than as module constants,
+       diverging from server/markup_tripwire.py's local choice. markup argues a
+       config field "would add hot-reload tier surface and a schema migration for
+       no operator gain"; that reasoning does not transfer. This model must exist
+       regardless to carry the authz knobs, so two more fields buy no new schema
+       surface; §4 explicitly ratifies both as green-tier hot-reloadable; and
+       ReconciliationConfig already carries storm knobs in config. Unlike
+       markup's alarm this one has a real operator-tuning story — see
+       `metadata_patch_allowed_agent_prefixes`.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for the in-place update_memory tool. When false EVERY '
+            'caller is denied regardless of agent_id, with error_type '
+            'Mem0UpdateToolDisabled — the single knob an operator flips to stop an '
+            'in-flight rewrite incident without a restart. Green-tier '
+            'hot-reloadable via reload_config.'
+        ),
+    )
+    content_amend_allowed_agent_prefixes: list[str] = Field(
+        default_factory=lambda: ['recon-stage-'],
+        description=(
+            'agent_id prefixes authorized to AMEND CONTENT in place. Defaults to '
+            'the narrow recon-stage- bar (the same literal prefix '
+            'add_system_record gates on) because a content amend is a silent '
+            'history-rewrite primitive. NOTE: agent_id is SELF-REPORTED, so this '
+            'is a misuse deterrent for cooperating callers, not cryptographic '
+            'authorization. Deliberately a separate list from '
+            'metadata_patch_allowed_agent_prefixes so the two bars move '
+            'independently. Green-tier hot-reloadable via reload_config.'
+        ),
+    )
+    metadata_patch_allowed_agent_prefixes: list[str] = Field(
+        default_factory=lambda: ['recon-stage-'],
+        description=(
+            'agent_id prefixes authorized to PATCH METADATA in place. Ships '
+            'identical to the content-amend list but is independently '
+            'configurable, and that is the point: widening THIS list alone is the '
+            'supported way to admit an interactive curator-gate flow (tagging a '
+            'survivor with topic=) without granting content-amend authority. A '
+            'mistagged patch is cheap to notice and cheap to correct; a runaway '
+            'silent content rewrite is not. Green-tier hot-reloadable via '
+            'reload_config.'
+        ),
+    )
+    storm_threshold: int = Field(
+        default=20,
+        gt=0,
+        description=(
+            'CONTENT-AMEND calls from one agent_id within storm_window_seconds '
+            'before an mem0_in_place_update_storm escalation fires (INV-4). '
+            'Metadata-only calls do not count. This is an ALARM, not a rate '
+            'limiter: crossing the threshold never rejects the write, since a '
+            'hard block would risk a legitimate large consolidation cycle failing '
+            'mid-run over its own success count. Green-tier hot-reloadable — read '
+            'live on every call and passed into StormCounter.record(), which is '
+            'what makes the leaf genuinely reloadable rather than restart-only in '
+            'disguise (see server/storm_counter.py).'
+        ),
+    )
+    storm_window_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'Rolling window for storm_threshold. Half-open: an amend aged exactly '
+            'this long is already out. Green-tier hot-reloadable on the same '
+            'read-live-per-record() basis as storm_threshold.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -1494,12 +1743,15 @@ class FusedMemoryConfig(BaseSettings):
     queue: QueueConfig = Field(default_factory=QueueConfig)
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
+    memory_metadata: MemoryMetadataConfig = Field(default_factory=MemoryMetadataConfig)
     task_status: TaskStatusConfig = Field(default_factory=TaskStatusConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     # Bare (non-Optional) submodel on purpose — see WriteTriageConfig's docstring:
     # reload.py descends only into required submodels, so nullability here would
     # cost the section its per-leaf hot-reload.
     write_triage: WriteTriageConfig = Field(default_factory=WriteTriageConfig)
+    # Bare submodel for the same per-leaf-reload reason as write_triage above.
+    mem0_update: Mem0UpdateConfig = Field(default_factory=Mem0UpdateConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
     summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)
     path_scope_adjudicator: PathScopeAdjudicatorConfig = Field(

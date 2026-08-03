@@ -706,3 +706,215 @@ async def test_prune_idempotent_ops_never_raises(journal):
     await journal.close()
     journal._db = None
     assert await journal.prune_idempotent_ops() == 0
+
+
+# --- write_ops(created_at) seekability (task 3304) -------------------------
+#
+# PREDICATE_SQL is the property under test in its minimal form: idx_wo_created
+# serves the bare `created_at >= ?` range constraint, and nothing in the SELECT
+# list or GROUP BY affects whether that constraint is seekable. It is the
+# shape-independent floor and it cannot drift.
+#
+# The two constants after it are copied VERBATIM from the dashboard's consumers
+# — `get_memory_timeseries` and `get_agent_breakdown` in
+# `dashboard/src/dashboard/data/write_journal.py` (cited by FUNCTION NAME, never
+# by line number: line numbers in another package go stale on the next edit
+# there, which is exactly how this comment's first version broke). The two
+# packages have separate venvs and cannot import each other, and the schema
+# under test is produced by fused-memory, so the copy is deliberate.
+#
+# KNOWN GAP: nothing here detects the dashboard changing its SQL (e.g. adding a
+# `project_id = ?` filter or a BETWEEN range) — these copies would keep testing
+# the old shape and stay green while the real endpoint regressed. The test that
+# would close it belongs on the dashboard side, where the real SQL is
+# importable; that file is outside this task's lock, so it is filed as
+# follow-up rather than faked here. PREDICATE_SQL bounds the damage: the index's
+# own contract stays pinned regardless of what the consumers do.
+
+PREDICATE_SQL = 'SELECT COUNT(*) FROM write_ops WHERE created_at >= ?'
+
+TIMESERIES_SQL = (
+    "SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour,"
+    ' kind, COUNT(*) AS cnt'
+    ' FROM write_ops WHERE created_at >= ?'
+    ' GROUP BY hour, kind'
+)
+
+AGENT_BREAKDOWN_SQL = (
+    "SELECT COALESCE(agent_id, 'unknown') AS agent, COUNT(*) AS cnt"
+    ' FROM write_ops WHERE created_at >= ?'
+    ' GROUP BY agent ORDER BY cnt DESC'
+)
+
+SEEKABLE_QUERIES = (
+    ('predicate only', PREDICATE_SQL),
+    ('get_memory_timeseries', TIMESERIES_SQL),
+    ('get_agent_breakdown', AGENT_BREAKDOWN_SQL),
+)
+
+
+async def _assert_created_at_seekable(db, *, context: str) -> None:
+    """Assert every SEEKABLE_QUERIES shape range-SEEKs on created_at under *db*.
+
+    Asserts the PROPERTY the acceptance names (a seekable range constraint),
+    never the index NAME — see
+    test_created_at_range_is_seekable_for_dashboard_queries for why. Shared by
+    the fresh-schema test and the legacy-upgrade test so both prove the same
+    thing: an index that exists but is unusable is not the deliverable.
+    """
+    since = '2026-07-30T00:00:00+00:00'
+    for label, sql in SEEKABLE_QUERIES:
+        # EXPLAIN QUERY PLAN rows are (id, parent, notused, detail).
+        async with db.execute(f'EXPLAIN QUERY PLAN {sql}', (since,)) as cursor:
+            plan = ' '.join(row[3] for row in await cursor.fetchall())
+
+        assert 'SEARCH' in plan, f'{context}/{label}: expected a range seek, got: {plan}'
+        assert 'created_at>?' in plan, (
+            f'{context}/{label}: created_at must be the seek constraint, got: {plan}'
+        )
+        assert 'SCAN' not in plan, (
+            f'{context}/{label}: still full-scanning write_ops: {plan}'
+        )
+
+
+@pytest.mark.asyncio
+async def test_schema_creates_idx_wo_created(tmp_path):
+    """SCHEMA_SQL creates idx_wo_created with created_at as the LEADING column.
+
+    The leading-column assertion is the substance of this test. Five existing
+    write_ops indexes already MENTION created_at, and every one of them is
+    useless to a bare ``WHERE created_at >= ?`` precisely because created_at is
+    not first. Both the name and the position are mandated — the sidecar
+    delivered_check greps for ``idx_wo_created``.
+    """
+    j = WriteJournal(tmp_path / 'idx_test')
+    await j.initialize()
+    try:
+        db = j._require_db()
+
+        # PRAGMA index_list -> (seq, name, unique, origin, partial)
+        async with db.execute("PRAGMA index_list('write_ops')") as cursor:
+            names = {row[1] for row in await cursor.fetchall()}
+        assert 'idx_wo_created' in names, f'idx_wo_created missing; have {sorted(names)}'
+
+        # PRAGMA index_info -> (seqno, cid, name)
+        async with db.execute("PRAGMA index_info('idx_wo_created')") as cursor:
+            info = list(await cursor.fetchall())
+        columns = [row[2] for row in sorted(info, key=lambda r: r[0])]
+        assert columns[0] == 'created_at', f'created_at must lead; got {columns}'
+    finally:
+        await j.close()
+
+
+@pytest.mark.asyncio
+async def test_created_at_range_is_seekable_for_dashboard_queries(tmp_path):
+    """The dashboard's bare ``created_at >= ?`` filter must range-SEEK, not SCAN.
+
+    initialize() runs SCHEMA_SQL *and* _migrate(), so the DB under test carries
+    the real six-index set (including idx_wo_kind_time / idx_wo_agent_time) that
+    the live journal has — not a reduced test schema.
+
+    This asserts the PROPERTY the acceptance names (a seekable range constraint),
+    never the index NAME. Measured by the architect on sqlite 3.45.1 and 3.50.4:
+    once ``sqlite_stat1`` exists (i.e. after any ANALYZE) the planner reaches the
+    same range seek through a skip-scan on a pre-existing composite —
+    ``SEARCH ... COVERING INDEX idx_wo_kind_time (ANY(kind) AND created_at>?)`` —
+    rather than through idx_wo_created. Seekability still holds there, so a test
+    pinning the index name in the query plan would go red on a change that broke
+    nothing. The mandated name is pinned separately, and unambiguously, by
+    test_schema_creates_idx_wo_created's PRAGMA assertions.
+
+    Deliberately NOT asserted: ``get_operations_breakdown`` still plans as
+    ``SCAN write_ops USING INDEX idx_wo_operation`` with idx_wo_created present,
+    and that is expected, not a failure. Pinning "stays SCAN" would freeze
+    planner behaviour we do not want and would fail the day SQLite improves. The
+    measured plans and timings behind that live at the query itself
+    (``get_operations_breakdown`` in dashboard/src/dashboard/data/write_journal.py)
+    and, authoritatively, in the "Note on α's corrected signal" amendment in
+    plans/dashboard-availability-prd.md — not restated here.
+    """
+    j = WriteJournal(tmp_path / 'plan_test')
+    await j.initialize()
+    try:
+        await _assert_created_at_seekable(j._require_db(), context='fresh schema')
+    finally:
+        await j.close()
+
+
+@pytest.mark.asyncio
+async def test_existing_db_gains_idx_wo_created_on_initialize(tmp_path):
+    """An existing pre-change journal gains a WORKING idx_wo_created on startup.
+
+    This is the deployment claim: initialize() runs ``executescript(SCHEMA_SQL)``
+    unconditionally on every start and the DDL is IF NOT EXISTS, so the SCHEMA_SQL
+    placement ALONE upgrades the live 7 GB journal at the next fused-memory start,
+    with no ``_migrate()`` entry needed.
+
+    Seeds the full pre-change write_ops schema — current column set plus all five
+    legacy indexes and no idx_wo_created — then asserts the index appears, the
+    seeded rows survive, AND the upgraded DB actually range-seeks (via the shared
+    _assert_created_at_seekable helper). The seek assertion is the point: name
+    presence alone would pass while the real journal still scanned — e.g. a
+    _migrate() reordering, or a legacy column affinity the index cannot serve —
+    so the DB proven seekable must be the legacy-upgraded one, not only a fresh
+    one.
+    """
+    import aiosqlite
+
+    data_dir = tmp_path / 'legacy'
+    data_dir.mkdir()
+    db_path = data_dir / 'write_journal.db'
+
+    pre_change_schema = """
+    CREATE TABLE write_ops (
+        id TEXT PRIMARY KEY,
+        causation_id TEXT,
+        source TEXT,
+        provenance TEXT DEFAULT 'original',
+        operation TEXT,
+        project_id TEXT,
+        agent_id TEXT,
+        session_id TEXT,
+        kind TEXT NOT NULL DEFAULT 'write',
+        params TEXT DEFAULT '{}',
+        result_summary TEXT,
+        success INTEGER DEFAULT 1,
+        error TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_wo_causation ON write_ops(causation_id);
+    CREATE INDEX idx_wo_project_time ON write_ops(project_id, created_at);
+    CREATE INDEX idx_wo_operation ON write_ops(operation);
+    CREATE INDEX idx_wo_kind_time ON write_ops(kind, created_at);
+    CREATE INDEX idx_wo_agent_time ON write_ops(agent_id, created_at);
+    """
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.executescript(pre_change_schema)
+        await db.executemany(
+            'INSERT INTO write_ops (id, operation, created_at) VALUES (?, ?, ?)',
+            [
+                ('legacy-1', 'add_memory', '2026-07-29T12:00:00+00:00'),
+                ('legacy-2', 'search', '2026-07-30T12:00:00+00:00'),
+            ],
+        )
+        await db.commit()
+
+    j = WriteJournal(data_dir)
+    await j.initialize()
+    try:
+        db_inner = j._require_db()
+
+        async with db_inner.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wo_created'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None, 'idx_wo_created should be present after initialize()'
+
+        async with db_inner.execute('SELECT id FROM write_ops ORDER BY id') as cursor:
+            ids = [r[0] for r in await cursor.fetchall()]
+        assert ids == ['legacy-1', 'legacy-2'], f'seeded rows must survive; got {ids}'
+
+        # The index must be USABLE on the upgraded DB, not merely present.
+        await _assert_created_at_seekable(db_inner, context='legacy upgrade')
+    finally:
+        await j.close()

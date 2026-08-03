@@ -45,9 +45,48 @@ Invariants (see the task-2381 plan / merge-skew-attribution-prd.md):
        classification after a fleet redeploy. Reading across runs keeps the
        durable prior-run green visible (any-prior-green semantics unchanged;
        result set bounded by the task_id filter).
-  I7 — INTEGRATION_SKEW additionally requires evidence.failing_tests
-       non-empty; a guard/ratchet failure parsing zero failing-test ids
-       degrades to INDETERMINATE (task 2871).
+  I7 — INTEGRATION_SKEW additionally requires at least one failing-test id
+       carrying a real test-node SHAPE — ``path::test_name`` for pytest,
+       ``crate::mod::test`` for Rust (task 2871 introduced the non-empty
+       requirement; task 3178 added the shape floor). A guard/ratchet failure
+       whose only ``FAILED`` token is a bare filename parses zero node-shaped
+       ids and degrades to INDETERMINATE. See the I7 incident account below.
+
+THE I7 INCIDENT (task 3178) — this is the ONE authoritative account; every
+other site in the codebase that touches this behaviour points here rather than
+restating it, because six copies of an incident narrative is how the false
+premise below survived two task cycles in the first place.
+
+  What went wrong. ``_PYTEST_FAILED_ID_RE`` was an unconstrained
+  ``^FAILED\\s+(\\S+)``, and reify renders a shell-guard trip as ``FAILED
+  <guard>.sh``. The guard's own FILENAME was therefore returned as a
+  "failing-test id" and satisfied task 2871's non-empty I7 requirement
+  VACUOUSLY. The same hole parsed the English word "to" out of "FAILED to
+  release semaphore slot".
+
+  Blast radius. All 8 INTEGRATION_SKEW dispositions between 2026-07-24 and
+  2026-07-28 were shell/infra guards, not skews: reify 5316/5373/5302
+  (test_harness_kloc_cap.sh), 5300 x3 (test_verify_scope.sh), 5566 x2
+  (test_reify_audit_ptodo.sh), 5321
+  (test_deterministic_gate_closure_staleness_sweep.sh). Each told a debugger
+  to "port the landed commit — do not hunt your own diff" about a failure
+  that was not a skew. reify 5187 (a Rust-shaped id) was the ONE genuine skew
+  in that population and is provably unaffected: ``_RUST_FAILED_ID_RE`` has
+  always required ``::`` by construction, so the shape floor only mirrors an
+  invariant the sibling regex already had.
+
+  Why it survived. Task 2871's comment asserted guard output "matches neither
+  ``_PYTEST_FAILED_ID_RE`` nor ``_RUST_FAILED_ID_RE``" — FALSE in production.
+  Its test passed only because the fixture was invented (``HARNESS_KLOC_CAP
+  FAIL …``, which has no ``^FAILED <token>`` and so genuinely parses zero
+  ids), and ``merge_attempt`` rows persisted only ``{disposition, outcome}``,
+  so nobody could read the evidence back out of runs.db to check. Task 2918
+  then built on the same premise. The two fixes are therefore paired: the
+  shape floor in ``_extract_failing_tests_and_candidate_files``, and the
+  evidence now persisted on BOTH the promoted and the degraded path (the
+  ``observed_evidence`` slot of :class:`ClassificationResult`) so the next
+  false premise is checkable. Every regression fixture is now a VERBATIM
+  captured production string — see ``TestShellGuardFilenameIsNotATestId``.
 
 This module is intentionally self-contained (task 2381 α scope): it defines
 the classifier, its data types, and private helpers only. Wiring into the
@@ -62,7 +101,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import _run
@@ -100,6 +139,45 @@ class SkewEvidence:
     implicated_commits: tuple[str, ...]
     failing_tests: tuple[str, ...]
     overlap_files: tuple[str, ...]
+
+
+class ClassificationResult(NamedTuple):
+    """What ``classify_merge_failure_disposition`` returns.
+
+    A NamedTuple, so every existing positional unpack keeps working while call
+    sites can read the two evidence slots BY NAME. That matters here because
+    the slots differ only in their gate, not their type, and picking the wrong
+    one silently re-creates the bug this module was fixed for.
+
+    ``evidence`` — the ADJUDICATED attribution: non-``None`` **iff**
+    ``disposition is INTEGRATION_SKEW``. This is what
+    ``_render_skew_surfaces`` turns into the "port the landed commit … do not
+    hunt your own diff" directive, so its non-``None``-ness must keep meaning
+    "this IS a skew".
+
+    ``observed_evidence`` — the bundle GATHERED (task 3178): non-``None``
+    whenever implicated landings were found, REGARDLESS of verdict. On the
+    promoted path it is the same object as ``evidence``; on an I7/I5 DEGRADE it
+    is the evidence the gate refused to promote — which is what makes the
+    degrade measurable. ``None`` when no landings were implicated, when
+    classification could not proceed (no candidate files / no repo), and on the
+    fail-open path.
+
+    Explicitly NOT a skew verdict: read ``disposition`` for that. The
+    adjudicated slot is deliberately kept narrow — "a non-empty evidence field
+    means this is a skew" is the inference that let the false I7 premise
+    survive two task cycles (see the module docstring's I7 account).
+
+    Known redundancy: ``evidence`` is derivable from the other two fields (it is
+    ``observed_evidence`` when the disposition is INTEGRATION_SKEW, else
+    ``None``), and its sole consumer already gates on ``disposition``. Task 3261
+    tracks collapsing it away, which removes the over-readable slot structurally
+    rather than by docstring.
+    """
+
+    disposition: MergeFailureDisposition
+    evidence: SkewEvidence | None
+    observed_evidence: SkewEvidence | None
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +228,19 @@ def _extract_failing_tests_and_candidate_files(
             failing_tests.append(test_id)
 
     for m in _PYTEST_FAILED_ID_RE.finditer(combined):
-        _add_test(m.group(1))
+        tid = m.group(1)
+        if '::' not in tid:
+            # Node-id SHAPE floor — see the module docstring's I7 incident
+            # account (task 3178). ACCEPTED edge case: a pytest COLLECTION-level
+            # ``FAILED tests/test_foo.py`` (no ``::``) now parses zero ids and
+            # degrades to INDETERMINATE rather than skew. pytest emits ``ERROR
+            # <path>`` for collection errors, so this shape is rare, and the
+            # degrade errs toward the honest fallback, not a fabricated skew.
+            continue
+        _add_test(tid)
     for m in _RUST_FAILED_ID_RE.finditer(combined):
+        # No shape floor needed: _RUST_FAILED_ID_RE requires a ``::``-separated
+        # path by construction (see its definition above).
         _add_test(m.group(1))
 
     candidate_files: set[str] = set(_FILE_TOKEN_RE.findall(combined))
@@ -166,6 +255,19 @@ def _extract_failing_tests_and_candidate_files(
 
     return tuple(failing_tests), tuple(sorted(candidate_files))
 
+
+# Bound on how many SHAs / paths the degrade WARNING spells out (task 3178).
+# reify 5566 attempt-2 cited 22 SHAs touching 7 files; an unbounded list would
+# make the log line unreadable. The true count is logged alongside EVERY slice,
+# so the truncation is never silent.
+#
+# Deliberately SMALLER than merge_queue._MAX_EVENT_EVIDENCE_ITEMS (10), which
+# bounds the same bundle on the runs.db merge_attempt row: this cap is tuned for
+# one-line log readability (a human greps it), that one for row size (a census
+# queries it, and wants more of the citation). A reader comparing a log line
+# against its row will therefore see two different truncation points — that is
+# intended, not drift.
+_MAX_LOGGED_EVIDENCE_ITEMS = 5
 
 # Full 40-hex-char commit SHA, as emitted by ``git log --format=%H``.
 _FULL_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
@@ -424,7 +526,7 @@ async def classify_merge_failure_disposition(
     task_id: str | None = None,
     repo_root: Path | None = None,
     event_store: EventStore | None = None,
-) -> tuple[MergeFailureDisposition, SkewEvidence | None]:
+) -> ClassificationResult:
     """Classify a merge-verify failure's disposition (git-only, read-only, fail-open).
 
     Invariants (continued from the module docstring):
@@ -442,9 +544,12 @@ async def classify_merge_failure_disposition(
            reference frame (see ``_implicated_landings``). *main_sha* stays the
            frozen dispatch-time input (2357 untouched); *real_main_head_sha* is
            a distinct, additional input used only for the ancestor filter.
-      I7 — INTEGRATION_SKEW additionally requires evidence.failing_tests
-           non-empty; a guard/ratchet failure parsing zero failing-test ids
-           degrades to INDETERMINATE (task 2871).
+      I7 — INTEGRATION_SKEW additionally requires at least one failing-test id
+           carrying a real test-node SHAPE (``path::test_name`` for pytest,
+           ``crate::mod::test`` for Rust). A guard/ratchet failure whose only
+           ``FAILED`` token is a bare filename parses zero node-shaped ids and
+           degrades to INDETERMINATE. See the module docstring's I7 incident
+           account for why (task 2871 non-empty floor, task 3178 shape floor).
 
     Args:
         verify_result: the failing VerifyResult from the branch's merge-time verify.
@@ -469,15 +574,16 @@ async def classify_merge_failure_disposition(
             verdict). None degrades I5 to indeterminate (fail-open).
 
     Returns:
-        ``(disposition, evidence)`` — ``evidence`` is a :class:`SkewEvidence`
-        iff ``disposition is MergeFailureDisposition.INTEGRATION_SKEW``, else
-        ``None``.
+        A :class:`ClassificationResult` — see its docstring for the contract
+        distinguishing the ADJUDICATED ``evidence`` slot from the GATHERED
+        ``observed_evidence`` slot. Unpacks positionally as
+        ``(disposition, evidence, observed_evidence)``.
     """
     try:
         if preexisting:
             # [boundary row 1] I1: refine the caller-computed bucket only —
             # never re-probe verify_failure_is_preexisting_on_main.
-            return (MergeFailureDisposition.MAIN_RED, None)
+            return ClassificationResult(MergeFailureDisposition.MAIN_RED, None, None)
 
         # Extract the branch's failing-test ids and the source/test files they
         # implicate (Open Q1: VerifyResult carries no structured per-test list,
@@ -490,7 +596,7 @@ async def classify_merge_failure_disposition(
         # failure, or there is no repo to search -> evidence is unavailable ->
         # INDETERMINATE. Never guess BRANCH_BUG from an empty extraction.
         if not candidate_files or repo_root is None:
-            return (MergeFailureDisposition.INDETERMINATE, None)
+            return ClassificationResult(MergeFailureDisposition.INDETERMINATE, None, None)
 
         # Map candidate files to landings on main between the branch's merge-base
         # and main's tip (I2 read-only git log; 2357: both SHAs are the
@@ -526,7 +632,10 @@ async def classify_merge_failure_disposition(
         # specifically) — a separate, not-yet-scoped follow-up, not a gap in
         # this task's I7 fix.
         if not implicated_commits:
-            return (MergeFailureDisposition.BRANCH_BUG, None)
+            # No landings -> nothing gathered, so observed_evidence is None too
+            # (task 3178). That is what keeps the BRANCH_BUG merge_attempt row's
+            # payload byte-identical under the widened emit guard.
+            return ClassificationResult(MergeFailureDisposition.BRANCH_BUG, None, None)
 
         # A landing IS implicated. I5: call it INTEGRATION_SKEW only when the
         # branch is *positively confirmed* green pre-merge (workflow_verify).
@@ -534,35 +643,77 @@ async def classify_merge_failure_disposition(
         # submit path) or a failed green (False) degrades to the honest
         # INDETERMINATE — never a fabricated skew.
         #
-        # I7 (task 2871, reify esc-5053-13 & esc-5056-11): additionally
-        # require a parsed failing-test id. A harness-ratchet / shell-guard
-        # failure (kLOC cap, baseline-manifest grandfathering, other
-        # tests/infra/*.sh guards) emits guard text that matches neither
-        # _PYTEST_FAILED_ID_RE nor _RUST_FAILED_ID_RE, so its only "evidence"
-        # is a spurious file-token overlap on the runner (run_all.sh /
-        # verify.sh) or the guard's own artifact — causally irrelevant even
-        # when the implicated landing is a genuine real-main ancestor (2869's
-        # I6 filter therefore cannot prune it). An empty failing_tests here
-        # degrades to the honest INDETERMINATE (never a fabricated skew
-        # steering the debugger off its own diff); NOT BRANCH_BUG, because
-        # the class's true cause is heterogeneous across the census (own-diff
-        # for 5053/5056 vs main-red for 5288/5266) and BRANCH_BUG would both
+        # I7 (task 2871, reify esc-5053-13 & esc-5056-11; SHAPE FLOOR added by
+        # task 3178 — see the module docstring's I7 incident account): require
+        # at least one NODE-SHAPED failing-test id. The floor itself lives in
+        # _extract_failing_tests_and_candidate_files, so by the time control
+        # reaches here `failing_tests` holds only node-shaped ids.
+        #
+        # Load-bearing local choice: an empty failing_tests degrades to
+        # INDETERMINATE, NOT BRANCH_BUG. A harness-ratchet / shell-guard failure
+        # (kLOC cap, baseline-manifest grandfathering, other tests/infra/*.sh
+        # guards) has as its only "evidence" a spurious file-token overlap on
+        # the runner (run_all.sh / verify.sh) or the guard's own artifact —
+        # causally irrelevant even when the implicated landing is a genuine
+        # real-main ancestor (2869's I6 filter therefore cannot prune it). The
+        # class's true cause is heterogeneous across the census (own-diff for
+        # 5053/5056 vs main-red for 5288/5266), so BRANCH_BUG would both
         # mislabel the main-red instances and emit a misleading merge_attempt
-        # disposition row.
-        if failing_tests and _branch_pre_merge_verify_green(event_store, task_id) is True:
-            return (
-                MergeFailureDisposition.INTEGRATION_SKEW,
-                SkewEvidence(
-                    implicated_commits=implicated_commits,
-                    failing_tests=failing_tests,
-                    overlap_files=overlap_files,
-                ),
+        # disposition row. INDETERMINATE is the honest fallback.
+        #
+        # The bundle GATHERED — built exactly once, returned as
+        # observed_evidence on BOTH the promoted and the degraded path (see
+        # ClassificationResult).
+        observed = SkewEvidence(
+            implicated_commits=implicated_commits,
+            failing_tests=failing_tests,
+            overlap_files=overlap_files,
+        )
+        green = _branch_pre_merge_verify_green(event_store, task_id)
+        if failing_tests and green is True:
+            return ClassificationResult(
+                MergeFailureDisposition.INTEGRATION_SKEW, observed, observed,
             )
-        return (MergeFailureDisposition.INDETERMINATE, None)
+
+        # Loud degrade (task 3178). This complements — does not replace — the
+        # merge_attempt row the caller now emits: the row is the machine-readable
+        # census surface, this is the greppable operator surface. Both honour the
+        # repo's loud-over-silent / structured-facts-at-failure invariant, and
+        # the silent return this replaced is half of why the false I7 premise
+        # went unchecked (module docstring, THE I7 INCIDENT).
+        reasons: list[str] = []
+        if not failing_tests:
+            reasons.append('no node-shaped failing-test id')
+        if green is not True:
+            reasons.append('branch pre-merge green not confirmed')
+        # Every list logs its TRUE length beside the slice (see
+        # _MAX_LOGGED_EVIDENCE_ITEMS): a truncation a reader cannot detect is
+        # the same silent-degrade failure mode this warning exists to end.
+        # failing_tests is logged too, so an I5-ONLY degrade (node-shaped ids
+        # present, green unconfirmed) names the ids that were on the table.
+        logger.warning(
+            'classify_merge_failure_disposition: task=%s degrading implicated '
+            'landings to INDETERMINATE (%s); failing_tests=%d %s '
+            'implicated_commits=%d %s overlap_files=%d %s',
+            task_id,
+            '; '.join(reasons),
+            len(failing_tests),
+            failing_tests[:_MAX_LOGGED_EVIDENCE_ITEMS],
+            len(implicated_commits),
+            implicated_commits[:_MAX_LOGGED_EVIDENCE_ITEMS],
+            len(overlap_files),
+            overlap_files[:_MAX_LOGGED_EVIDENCE_ITEMS],
+        )
+        return ClassificationResult(
+            MergeFailureDisposition.INDETERMINATE, None, observed,
+        )
     except Exception:
         logger.warning(
             'classify_merge_failure_disposition: internal error; degrading to '
             'INDETERMINATE (fail-open, I3)',
             exc_info=True,
         )
-        return (MergeFailureDisposition.INDETERMINATE, None)
+        # A classifier fault gathered nothing and MUST NOT fabricate a bundle:
+        # observed_evidence stays None, which is what keeps I3's fail-open path
+        # byte-identical downstream (no merge_attempt row is emitted for it).
+        return ClassificationResult(MergeFailureDisposition.INDETERMINATE, None, None)

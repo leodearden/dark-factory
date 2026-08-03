@@ -22,7 +22,7 @@ import pytest
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from escalation.server import create_server
+from escalation.server import _COMPACT_ESCALATION_FIELDS, create_server
 
 # ---------------------------------------------------------------------------
 # Cross-package orchestrator imports — used by TestMergeStatus.
@@ -90,6 +90,12 @@ async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
 async def _stamp_triage(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('stamp_triage')
     # stamp_triage is a sync def, so tool.fn(...) returns directly
+    return tool.fn(**kwargs)
+
+
+async def _get_task_escalations(server, **kwargs: Any) -> list[dict[str, Any]]:
+    tool = await server.get_tool('get_task_escalations')
+    # get_task_escalations is a sync def, so tool.fn(...) returns directly
     return tool.fn(**kwargs)
 
 
@@ -410,6 +416,159 @@ class TestGetPendingCompact:
         assert len(result) == 2, f"Expected 2 L2 rows, got {len(result)}: {result}"
         assert all(r['level'] == 2 for r in result)
         assert all(set(r.keys()) == self._COMPACT_KEYS for r in result)
+
+
+# ---------------------------------------------------------------------------
+# TestGetTaskEscalations: archive-inclusive task-scoped lookup (task 3023)
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskEscalations:
+    """get_task_escalations(task_id=...) is ARCHIVE-INCLUSIVE by default.
+
+    The recurring recon false positive this tool exists to disconfirm: an
+    auditor probes ``get_pending_escalations(task_id=...)``, gets ``[]``
+    because the human-resolved born-at-L2 gate record was archived to
+    ``data/escalations/archive/<date>/``, and concludes the record was never
+    written.  ``get_task_escalations`` sees the archived record, so an empty
+    result THERE (and only there) is evidence of absence.
+    """
+
+    def _seed(
+        self,
+        queue: EscalationQueue,
+        esc_id: str,
+        *,
+        task_id: str = '42',
+        level: int = 0,
+        agent_role: str = 'implementer',
+    ) -> Escalation:
+        """Submit a pending escalation with an explicit id."""
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role=agent_role,
+            severity='blocking',
+            category='task_failure',
+            summary=f'{esc_id} test escalation',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    def _mixed_queue(self, tmp_path: Path) -> EscalationQueue:
+        """One resolved+archived record and one still-pending record for task '42'.
+
+        ``esc-42-1`` mirrors a human-resolved born-at-L2 deterministic gate:
+        submitted at level 2 by the deterministic runner, then resolved (which
+        moves the file out of the queue root into ``archive/<date>/``).
+        ``esc-42-2`` stays in the queue root.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._seed(queue, 'esc-42-1', level=2, agent_role='deterministic')
+        queue.resolve('esc-42-1', 'Human reviewed the gate')
+        self._seed(queue, 'esc-42-2', level=0, agent_role='implementer')
+        return queue
+
+    # -- (a) THE REGRESSION -------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_pending_probe_misses_archived_record_but_task_scoped_finds_it(
+        self, tmp_path: Path,
+    ):
+        """get_pending_escalations misses the archived record; get_task_escalations doesn't."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        pending = await _get_pending(server, task_id='42')
+        assert {e['id'] for e in pending} == {'esc-42-2'}, (
+            f'get_pending_escalations must stay root-only, got {pending}'
+        )
+
+        result = await _get_task_escalations(server, task_id='42')
+
+        assert {e['id'] for e in result} == {'esc-42-1', 'esc-42-2'}, (
+            f'Expected both the archived and the pending record, got {result}'
+        )
+        archived = next(e for e in result if e['id'] == 'esc-42-1')
+        assert archived['status'] == 'resolved'
+
+    # -- (b) status filter --------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_status_resolved_returns_only_the_archived_record(self, tmp_path: Path):
+        """status='resolved' → only the archived record."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        result = await _get_task_escalations(server, task_id='42', status='resolved')
+
+        assert {e['id'] for e in result} == {'esc-42-1'}, f'got {result}'
+
+    @pytest.mark.asyncio
+    async def test_status_pending_returns_only_the_root_record(self, tmp_path: Path):
+        """status='pending' → get_by_task's root-only fast path."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        result = await _get_task_escalations(server, task_id='42', status='pending')
+
+        assert {e['id'] for e in result} == {'esc-42-2'}, f'got {result}'
+
+    # -- (c) level / agent_role passthrough ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_level_filter_is_passed_through(self, tmp_path: Path):
+        """level=2 narrows to the archived L2 gate record."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        result = await _get_task_escalations(server, task_id='42', level=2)
+
+        assert {e['id'] for e in result} == {'esc-42-1'}, f'got {result}'
+        assert result[0]['level'] == 2
+
+    @pytest.mark.asyncio
+    async def test_agent_role_filter_is_passed_through(self, tmp_path: Path):
+        """agent_role='deterministic' narrows to the record filed by that role."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        result = await _get_task_escalations(
+            server, task_id='42', agent_role='deterministic',
+        )
+
+        assert {e['id'] for e in result} == {'esc-42-1'}, f'got {result}'
+        assert result[0]['agent_role'] == 'deterministic'
+
+    # -- (d) compact projection --------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_compact_projects_to_the_shared_compact_fields(self, tmp_path: Path):
+        """compact=True projects each dict to exactly _COMPACT_ESCALATION_FIELDS."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        result = await _get_task_escalations(server, task_id='42', compact=True)
+
+        assert len(result) == 2, f'Expected both records, got {result}'
+        for row in result:
+            assert set(row.keys()) == set(_COMPACT_ESCALATION_FIELDS), (
+                f'compact row keys {sorted(row.keys())} != '
+                f'{sorted(_COMPACT_ESCALATION_FIELDS)}'
+            )
+
+    # -- (e) unknown task ---------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_unknown_task_id_returns_empty_list(self, tmp_path: Path):
+        """An unknown task id returns [] — the ONLY sound evidence of absence."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        result = await _get_task_escalations(server, task_id='no-such-task')
+
+        assert result == [], f'Expected [], got {result}'
 
 
 # ---------------------------------------------------------------------------
@@ -2308,6 +2467,198 @@ class TestMergeRequestDedup:
         )
         # Clean up the never-resolving future to avoid ResourceWarning
         never_future.cancel()
+
+    async def test_a_worktree_attach_marks_itself_unpollable(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """task 3148: a disk-scan attach must disclose that it is NOT pollable.
+
+        The incident's misleading shape: merge_request returned a
+        documented-durable `attached` whose `request_id` was the SUBMITTING
+        request's own never-enqueued id, because the disk-scan arm registers no
+        retention alias, and the `_waiters` registration sits AFTER the
+        `if dispatch.in_flight: return base` early-return — so no waiter either.
+        Every merge_status resolution tier misses and the id resolves 'unknown';
+        /unblock and unblock-low-risk submit-then-poll on it and hang.
+        """
+        import asyncio
+
+        from orchestrator import merge_queue as _mq_mod  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeDispatchResult,
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        # The disk-scan arm needs a real git repo + worktree to reach, so return
+        # its exact result shape directly: no inflight_task_id, no
+        # inflight_request_id, source='worktree'.
+        async def _fake_coalesce(*args, **kwargs):
+            return MergeDispatchResult(
+                dispatched=False, in_flight=True, branch='X', source='worktree',
+            )
+
+        monkeypatch.setattr(
+            _mq_mod, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
+        )
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server, task_id='X', branch='X',
+                worktree=str(tmp_path / 'wt'), description='',
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'attached', f'got: {result}'
+        assert result.get('source') == 'worktree', f'got: {result}'
+        assert result.get('inflight_request_id') is None
+        assert result.get('inflight_task_id') is None
+        assert result.get('pollable') is False, (
+            'a worktree attach carries no alias and no waiter, so its '
+            f'request_id is not a poll handle: {result}'
+        )
+        # NEITHER handle is present, so the remedy is named explicitly rather
+        # than left for the caller to infer: poll by branch / get_merge_queue.
+        assert result.get('poll_by') == 'branch', f'got: {result}'
+
+    async def test_b_registry_attach_is_pollable(self, tmp_path: Path):
+        """A registry attach DOES carry a pollable handle (alias + task_id)."""
+        import asyncio
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        # NB: request_id must be passed EXPLICITLY — the sibling
+        # test_in_flight_branch_returns_immediately omits it (the legacy case,
+        # covered by test_c below).
+        assert registry.acquire('X', '5566', never_future, request_id='mr-primary')
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+        try:
+            result = await asyncio.wait_for(
+                _call_merge_request(
+                    server, task_id='X', branch='X',
+                    worktree=str(tmp_path / 'wt'), description='',
+                ),
+                timeout=2.0,
+            )
+
+            assert result.get('status') == 'attached', f'got: {result}'
+            assert result.get('source') == 'registry', f'got: {result}'
+            assert result.get('inflight_task_id') == '5566'
+            assert result.get('inflight_request_id') == 'mr-primary'
+            assert result.get('pollable') is True, f'got: {result}'
+            # The returned request_id IS the in-flight entry's id (D8 override),
+            # so it is the handle to poll.
+            assert result.get('poll_by') == 'request_id', f'got: {result}'
+            assert result.get('request_id') == 'mr-primary', f'got: {result}'
+        finally:
+            never_future.cancel()
+
+    async def test_c_legacy_registry_entry_polls_by_task_id(
+        self, tmp_path: Path,
+    ):
+        """A legacy entry (no request_id) is routed to the handle it DOES have.
+
+        `_nonblocking_state_response` falls back to the SUBMITTING call's id when
+        `req_id_override` is None, so the returned `request_id` is not a real
+        poll handle even though the attach came from the registry.  But the
+        entry still carries a task_id, and `merge_status` accepts task_id (D10),
+        so this attach IS pollable — just not by `request_id`.  Deriving the
+        verdict from the handles actually present (rather than from `source`, or
+        from `inflight_request_id` alone) is what makes this case come out
+        right: `poll_by='task_id'` names the usable handle instead of writing
+        the attach off as unpollable and sending the caller to the branch tier.
+        """
+        import asyncio
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        assert registry.acquire('X', 'existing-task', never_future)  # NO request_id
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+        try:
+            result = await asyncio.wait_for(
+                _call_merge_request(
+                    server, task_id='X', branch='X',
+                    worktree=str(tmp_path / 'wt'), description='',
+                ),
+                timeout=2.0,
+            )
+
+            assert result.get('status') == 'attached', f'got: {result}'
+            assert result.get('source') == 'registry', f'got: {result}'
+            assert result.get('inflight_request_id') is None
+            assert result.get('inflight_task_id') == 'existing-task'
+            assert result.get('poll_by') == 'task_id', f'got: {result}'
+            assert result.get('pollable') is True, (
+                'a task_id IS a merge_status handle (D10) — reporting this '
+                f'attach as unpollable would send the caller to git: {result}'
+            )
+            # ...and the returned request_id is explicitly NOT the handle here.
+            assert result.get('request_id') != result.get('inflight_request_id')
+        finally:
+            never_future.cancel()
+
+    async def test_d_dispatched_unaffected(self, tmp_path: Path):
+        """A freshly-dispatched submission still returns the `queued` shape.
+
+        Pre-existing keys asserted as a SUBSET, not an exact-dict equality, so
+        this does not become brittle against the very additive convention the
+        three new `attached` keys follow.
+        """
+        import asyncio
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server, task_id='D', branch='D',
+                worktree=str(tmp_path / 'wt'), description='',
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'queued', f'got: {result}'
+        assert set(result) >= {
+            'request_id', 'generation', 'position', 'queue_depth', 'snapshot_tip',
+        }, f'pre-existing queued keys must be unchanged: {sorted(result)}'
 
     async def test_dispatch_resolves_and_releases_registry(self, tmp_path: Path):
         """merge_request with empty registry enqueues, awaits outcome, and releases the slot.

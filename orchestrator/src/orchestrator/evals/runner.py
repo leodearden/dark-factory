@@ -41,7 +41,7 @@ from .configs import (
     claude_endpoint_price_table,
     matrix_pairs,
 )
-from .metrics import EvalMetrics, collect_metrics
+from .metrics import EvalMetrics, collect_metrics, detect_invocation_error
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree, read_python_pin
 
@@ -495,16 +495,75 @@ async def run_architect_eval(
     judge, against the REAL landed reference diff
     ``pre_task_commit..reference.post_task_commit`` — the always-available
     ground truth since ζ fixtures frequently carry ``plan: null``), degrading to
-    the deterministic :func:`score_plan_structure` floor on ANY judge failure so
-    ``plan_quality`` is ALWAYS a non-sentinel float. The result carries
-    ``role_under_test='architect'`` and is persisted via :func:`save_result`.
+    the deterministic :func:`score_plan_structure` floor on ANY judge failure.
+    The judge is reached only for a plan that is
+    :func:`~orchestrator.evals.judge.is_scorable_plan` (task 3302), and the
+    judge REFUSES such an artifact itself (task 3303) — defense in depth around
+    one predicate. Left ungated, an LLM judge returns a confident nonzero score
+    for the very shape ``score_plan_structure`` short-circuits to 0.0,
+    persisting a cell whose ``plan_steps=0`` contradicts its own
+    ``plan_quality``; with both the call site and the instrument consulting
+    ``is_scorable_plan``, no caller can write that cell.
+
+    ``plan_quality`` is therefore a non-sentinel float whenever the architect
+    was actually ASKED — with ONE deliberate exception (task 3118): when the
+    architect invocation failed in a way that left NO model content to score
+    AND no SCORABLE plan artifact was produced, scoring is skipped and the cell
+    records ``plan_quality=None`` plus ``cap_tainted=True`` and a stage-prefixed
+    ``invocation_error``. ``plan_quality is None`` on an architect run means
+    exactly that case, and the plan-quality aggregates EXCLUDE such cells rather
+    than averaging in a fabricated zero.
+
+    Which failures taint, and WHY the line falls where it does:
+
+    - **Transport refusal with no SCORABLE plan** (429 cap hit, auth failure,
+      model-not-found, zero-output wedge) → TAINTED. The candidate was never
+      asked; the outcome is a property of the schedule or of our configuration,
+      not of the candidate. "No scorable plan" covers both an absent artifact
+      and the header-only stub ``create_plan`` writes with zero steps — see
+      :func:`~orchestrator.evals.judge.is_scorable_plan`.
+    - **Harness error** (worktree/config/briefing/artifact-read raised) →
+      TAINTED, for the same reason: charging our own crash to the candidate
+      would be a fabricated score.
+    - **Transport refusal that still left a plan WITH STEPS** (a cap landing
+      mid-run, after the architect wrote real steps through plan-tools) → NOT
+      tainted. Model content exists, so the deterministic structural floor is a
+      genuine content measurement; the marker is recorded and the LLM judge is
+      skipped (it would 429 in the same window), but the cell stays in the
+      aggregate.
+    - **Timeout** → NOT tainted, deliberately. It is marked
+      (``architect:timeout: ...``) so it is never silently indistinguishable
+      from a bad plan, but unlike a cap hit it is CANDIDATE-attributable: the
+      model was asked and did not finish inside the operator's budget. Excluding
+      it would let a pathologically slow candidate dodge the penalty its
+      competitors paid, so it keeps scoring on content (an absent plan scores
+      the structural floor, 0.0) and the reliability signal is carried in BOTH
+      ``outcome='timeout'`` and ``invocation_error``.
+    - **Ordinary content failure** (an architect that ran fine and merely
+      produced a bad or absent plan) → NOT marked at all, scores 0.0. That is a
+      real reliability signal, not an infra failure. When the plan is stepless
+      the LLM judge is SKIPPED and the structural floor (0.0) is persisted
+      directly, so the score can never be the judge's opinion of an artifact
+      that carries nothing to judge (task 3302 gates here; task 3303 makes
+      :func:`~orchestrator.evals.judge.judge_plan_quality` refuse it too, so
+      the guarantee no longer depends on this call site alone).
+    - **Refusal of the JUDGE alone** → recorded in ``invocation_error``
+      (prefixed ``judge:``) but does NOT taint: the structural floor is still
+      derived from a real produced plan.
+
+    The result carries ``role_under_test='architect'`` and is persisted via
+    :func:`save_result`.
     """
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
     from orchestrator.agents.roles import ARCHITECT
     from orchestrator.artifacts import TaskArtifacts
     from orchestrator.evals import snapshots
-    from orchestrator.evals.judge import judge_plan_quality, score_plan_structure
+    from orchestrator.evals.judge import (
+        is_scorable_plan,
+        judge_plan_quality,
+        score_plan_structure,
+    )
 
     task = load_task(task_path)
     task_id = task['id']
@@ -525,6 +584,16 @@ async def run_architect_eval(
     cost_usd = 0.0
     arch_duration_ms = 0
     outcome = 'done'
+    # The architect-side infra marker (task 3118): WHAT went wrong, if anything.
+    # Set on the transport-refusal path (classified from the AgentResult) AND on
+    # the timeout / harness-exception paths below, so no zero-content failure is
+    # left byte-indistinguishable from a genuinely terrible plan.
+    arch_error: str | None = None
+    # Whether that failure left NO model content to score — the input to the
+    # taint decision, kept SEPARATE from the marker because the two differ for a
+    # timeout: a timeout is marked (so it is legible) but is candidate-
+    # attributable, so it keeps scoring on content. See the scoring block below.
+    arch_unmeasurable = False
     # Honor the operator's --timeout around the LIVE architect invoke, exactly
     # as run_eval bounds workflow.run(). timeout_override is in MINUTES
     # (run_eval convention — the CLI threads the same --timeout to both); without
@@ -581,6 +650,21 @@ async def run_architect_eval(
         arch_duration_ms = result.duration_ms
         if not result.success:
             outcome = 'blocked'
+        # Was this a TRANSPORT-layer refusal (a 429 cap hit / auth failure — we
+        # never got to ask the model) rather than an ordinary content failure?
+        # The outcome vocabulary stays 'blocked' either way; the distinction
+        # lives in metrics, which is what the report and the persisted JSON
+        # read. Guarded so a classifier bug degrades to an unmarked cell rather
+        # than nuking the whole run.
+        try:
+            arch_error = detect_invocation_error(result, backend=config.backend)
+            arch_unmeasurable = arch_error is not None
+        except Exception:
+            logger.warning(
+                f'invocation-error classification raised for {task_id} × '
+                f'{config.name}; leaving the cell unmarked',
+                exc_info=True,
+            )
         # 5. Read the produced plan artifact (the scoring input).
         plan = artifacts.read_plan() or {}
     except TimeoutError:
@@ -589,9 +673,21 @@ async def run_architect_eval(
             f'{timeout_minutes}m'
         )
         outcome = 'timeout'
+        # MARKED but NOT unmeasurable: see the scoring block for why a timeout
+        # keeps scoring on content while a cap hit does not.
+        arch_error = arch_error or f'timeout: no answer within {timeout_minutes}m'
     except Exception as e:
         logger.error(f'Architect eval {task_id} × {config.name} failed: {e}')
         outcome = 'blocked'
+        # A HARNESS failure (worktree/config/briefing/artifact-read raised), not
+        # a candidate failure — the candidate was never even asked, so scoring it
+        # 0.0 would charge our own crash to it. Marked AND unmeasurable. An
+        # already-classified transport refusal is more specific, so it wins.
+        # The reason is whitespace-collapsed and clipped so the marker stays a
+        # single short line in the result JSON and the report tables.
+        reason = ' '.join(str(e).split())[:80]
+        arch_error = arch_error or f'harness_error: {type(e).__name__}: {reason}'
+        arch_unmeasurable = True
     finally:
         # Plan already read above; the worktree is no longer needed (scoring
         # reads the in-memory plan + the committed reference diff).
@@ -611,28 +707,147 @@ async def run_architect_eval(
             logger.warning(f'reference diff failed for {task_id}: {e}')
 
     # 7. Score the produced plan: LLM judge vs the landed diff, degrading to the
-    #    deterministic structural floor on ANY failure so plan_quality is ALWAYS
-    #    a non-sentinel float (unlike recovery scoring, which degrades to None).
+    #    deterministic structural floor on ANY judge failure so plan_quality is a
+    #    non-sentinel float — UNLESS the architect invocation failed in a way
+    #    that left NOTHING to score (see the docstring's taint table for which
+    #    failures qualify and why a timeout deliberately does not).
     plan_quality: float | None = None
-    try:
-        verdict = await judge_plan_quality(plan, reference_diff, task)
-        plan_quality = verdict.plan_quality
-    except Exception:
+    judge_error: str | None = None
+    # The taint decision consults whether the artifact is SCORABLE, not merely
+    # whether one exists (reviewer: correctness). A session cap can land MID-run,
+    # after the architect has already written plan.json through plan-tools MCP —
+    # the common shape of a cap hit during a long campaign. When a plan WITH
+    # STEPS landed, nulling it would discard a genuine content measurement
+    # (exactly what the judge-only branch is careful NOT to do) while persisting
+    # a self-contradictory cell: plan_steps > 0 alongside "we never got to ask
+    # the model".
+    #
+    # Raw truthiness was INSUFFICIENT: create_plan — the architect's first
+    # plan-tools call, and the only one it can reach before a 429 — persists a
+    # truthy header-only dict with zero steps. A cap landing right after it left
+    # tainted=False while score_plan_structure short-circuited to a fabricated
+    # 0.0. is_scorable_plan is that short-circuit's own test, so the two can no
+    # longer disagree.
+    tainted = arch_unmeasurable and not is_scorable_plan(plan)
+    if tainted:
+        # We never got to ask the model AND no SCORABLE plan exists, so every
+        # available number would be FABRICATED — and a fabricated 0.0 is
+        # byte-indistinguishable from a genuinely terrible plan, which is the
+        # defect this marker exists to remove. The judge is skipped rather than
+        # invoked-and-discarded: it has nothing to judge, and inside a cap
+        # window it would 429 too (the second-order failure that manufactured
+        # the 0.0), burning an opus call on a doomed request.
         logger.warning(
-            f'plan judge raised for {task_id}; degrading to structural floor',
-            exc_info=True,
+            f'Architect eval {task_id} × {config.name}: invocation refused with '
+            f'no scorable plan artifact ({arch_error}) — plan judge skipped, '
+            f'plan_quality=None, cell marked cap_tainted (NOT scored 0.0)'
         )
-    if plan_quality is None:
+    elif arch_unmeasurable:
+        # Refused, but a plan WITH STEPS landed first: score it on the
+        # deterministic structural floor and do NOT taint — symmetric with the
+        # judge-only case, where a content-derived score survives an infra
+        # refusal. Gating on is_scorable_plan is what makes that justification
+        # true: this branch now fires ONLY when the floor can actually derive a
+        # content score, never when it would short-circuit to a fabricated 0.0.
+        # The LLM judge is still skipped: inside the same cap window it would
+        # 429 too, and the floor is the exact degradation path a judge failure
+        # already takes. The marker is still recorded so the reader knows why.
         plan_quality = score_plan_structure(plan)
+        logger.warning(
+            f'Architect eval {task_id} × {config.name}: invocation refused '
+            f'({arch_error}) but a plan artifact exists — LLM judge skipped, '
+            f'scored on the structural floor ({plan_quality}), NOT tainted'
+        )
+    elif not is_scorable_plan(plan):
+        # The architect ran FINE and produced nothing worth scoring, so the
+        # deterministic ANTI-FABRICATION floor (Graphiti e2066ec6) applies:
+        # score_plan_structure short-circuits a stepless artifact to 0.0, and an
+        # LLM opinion of that artifact would write a cell whose own plan_steps=0
+        # CONTRADICTS its score — the shape the report-layer floor
+        # (metrics.produced_a_plan, task 3302) has to defend the existing corpus
+        # against.
+        #
+        # judge_plan_quality now refuses such an artifact ITSELF and returns the
+        # same floor (task 3303), so this gate is no longer the sole correctness
+        # guarantee — but it remains LOAD-BEARING, for three things the
+        # instrument-level guard cannot do from where it stands:
+        #   1. the taint decision below (NOT tainted: a content failure, not the
+        #      3118 "we never got to ask" exclusion),
+        #   2. the log line naming task_id × config.name, which the judge cannot
+        #      see, and
+        #   3. skipping the async call and the reference-diff-bearing prompt
+        #      entirely, on the arch_unmeasurable branch's own justification:
+        #      nothing to judge, a 429 inside a cap window anyway, and an opus
+        #      call on an unjudgeable artifact is pure waste.
+        # Both gates consult the ONE is_scorable_plan predicate, which is the
+        # point: they cannot drift into disagreeing about what a plan is.
+        #
+        # NOT tainted: no infra failure occurred. This is a CONTENT failure and
+        # must keep scoring on content — a genuine 0.0, distinct from the
+        # "we never got to ask" exclusion above (task 3118).
+        plan_quality = score_plan_structure(plan)
+        logger.warning(
+            f'Architect eval {task_id} × {config.name}: architect ran '
+            f'successfully but produced no scorable plan — plan judge skipped, '
+            f'scored on the structural floor ({plan_quality}), NOT tainted'
+        )
+    else:
+        try:
+            verdict = await judge_plan_quality(plan, reference_diff, task)
+            plan_quality = verdict.plan_quality
+            # getattr, not attribute access: a monkeypatched or legacy verdict
+            # without the field must not break scoring.
+            judge_error = getattr(verdict, 'invocation_error', None)
+        except Exception:
+            logger.warning(
+                f'plan judge raised for {task_id}; degrading to structural floor',
+                exc_info=True,
+            )
+        if plan_quality is None:
+            plan_quality = score_plan_structure(plan)
 
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
+    # The marker names WHICH stage failed; the join keeps the field well-defined
+    # if both ever fire (today an architect-side refusal skips the judge, so at
+    # most one does). cap_tainted keys on ``tainted``, NOT on the marker: a
+    # judge-only refusal, a timeout, and a refusal that still left a plan behind
+    # all keep a content-derived score, so excluding those cells would discard
+    # valid measurements.
+    stage_markers = [
+        f'{stage}:{marker}'
+        for stage, marker in (('architect', arch_error), ('judge', judge_error))
+        if marker
+    ]
     metrics = EvalMetrics(
         plan_quality=plan_quality,
         role_under_test='architect',
-        plan_steps=len(plan.get('steps', [])),
+        # NO test signal exists for a plan-only cell (task 3099): this path
+        # freezes implementer/debugger/reviewer/verify, so verification never
+        # runs. ``None`` is the documented "unknown" sentinel; the dataclass
+        # DEFAULT of ``False`` would read as "the tests failed" and hard-gate
+        # ``blend_composite`` to 0.0, collapsing every architect row's composite
+        # to 0.0000 and leaving ``select_survivors``' alphabetical tie-break as
+        # the whole selection mechanism.
+        #
+        # ``True`` is NOT the fix either, on two counts:
+        #   - ``build_composite_report`` draws each fixture's cost/latency FLOOR
+        #     from PASSING trials, and ``ofat_candidates()`` mixes architect,
+        #     implementer and judge candidates over the SAME fixtures into one
+        #     result set. A ~$0.30/60s plan-only cell marked passing would
+        #     become the floor for ~$5/900s full-workflow cells.
+        #   - it would fabricate a 100% ``tests_pass_rate`` for a cell that
+        #     never ran a test.
+        tests_pass=None,
+        # ``or []``, not a .get default: a plan can carry an explicit
+        # ``steps: None`` (the normalizer's other empty shape), and len(None)
+        # would crash the cell OUTSIDE the try above — turning a marked,
+        # recoverable cap cell into a lost run.
+        plan_steps=len(plan.get('steps') or []),
         cost_usd=cost_usd,
         workflow_duration_ms=arch_duration_ms,
+        invocation_error='; '.join(stage_markers) or None,
+        cap_tainted=tainted,
     )
     result_obj = EvalResult(
         task_id=task_id,
@@ -648,6 +863,11 @@ async def run_architect_eval(
     logger.info(
         f'Architect eval complete: {task_id} × {config.name} → '
         f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s)'
+        + (
+            f' [{"cap_tainted" if tainted else "invocation_error"}: '
+            f'{metrics.invocation_error}]'
+            if metrics.invocation_error else ''
+        )
     )
     return result_obj
 

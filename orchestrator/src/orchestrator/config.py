@@ -36,9 +36,13 @@ logger = logging.getLogger(__name__)
 
 # --- Priority-tier constants (value/h scheduler) ---
 #
-# Canonical 5-tier priority order.  Lower rank = higher priority.  Unknown
-# priority strings coerce to DEFAULT_TIER so legacy tasks and typos never crash
-# the scheduler.
+# Canonical 5-tier priority order.  Lower rank = higher priority.  An unset
+# (None) priority silently coerces to DEFAULT_TIER — that is a normal,
+# expected state (e.g. subtasks in this repo's tasks.json routinely carry no
+# priority), not an anomaly.  An unrecognized non-None value (a typo or a
+# stale tier string) also coerces to DEFAULT_TIER so it never crashes the
+# scheduler, but that path is logged loudly instead, since it means some
+# upstream caller passed something the config layer doesn't understand.
 PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish')
 PRIORITY_RANK: dict[str, int] = {tier: i for i, tier in enumerate(PRIORITY_TIERS)}
 DEFAULT_TIER: str = 'medium'
@@ -54,11 +58,79 @@ TIER_BASE: dict[str, int] = {
     'polish': 1000,
 }
 
+# Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
+# below, keyed by a length-capped repr(value) (safe for unhashable/non-str
+# inputs) — mirrors the b3_gate._warned_description_read_failures /
+# sqlite_task_backend._warned_malformed_task_ids house pattern for
+# module-level dedup sets. A process restart clears the memo and
+# re-enables the warning.
+#
+# Bounded in two dimensions because orchestrator.config is imported into
+# the scheduler's multi-day daemon process:
+#   - entry COUNT: an unbounded stream of distinct bad priority values (an
+#     adversarial or corrupt tasks.json) would otherwise grow this set
+#     forever. Once the cap is reached, coerce_tier() emits exactly one
+#     final WARNING noting the cap and then suppresses further
+#     unrecognized-priority warnings entirely (rather than either leaking
+#     memory or re-flooding the log on every call past the cap).
+#   - entry SIZE: the same adversarial/corrupt tasks.json could hand a
+#     large nested blob as a "priority", so both the memo key and the
+#     logged value are truncated to _MAX_PRIORITY_VALUE_REPR_LEN instead
+#     of retaining/logging the full repr().
+_warned_priority_values: set[str] = set()
+_MAX_WARNED_PRIORITY_VALUES = 1000
+_MAX_PRIORITY_VALUE_REPR_LEN = 200
+
 
 def coerce_tier(value: Any) -> str:
-    """Normalize a priority value (possibly None/unknown) to a canonical tier."""
+    """Normalize a priority value (possibly None/unknown) to a canonical tier.
+
+    An unset (None) priority is a NORMAL expected state — not an anomaly —
+    so it falls back to DEFAULT_TIER silently; it is a default, not a
+    fail-soft fallback, and the repo's no-silent-fail-soft invariant does
+    not apply to it. An unrecognized non-None value (a typo or a stale tier
+    string) still falls back to DEFAULT_TIER so legacy tasks and typos never
+    crash the scheduler, but that fallback IS logged loudly (rather than
+    silently): it means some upstream caller passed something the config
+    layer doesn't understand, and that should be observable.
+    ``stacklevel=2`` attributes the log record to the caller's file/line
+    (the actual call site) rather than to this helper. To avoid flooding a
+    hot path (e.g. the scheduler re-coercing the same raw values every
+    tick), each distinct unrecognized value is only warned about once per
+    process — see ``_warned_priority_values`` above.
+    """
     if isinstance(value, str) and value in PRIORITY_RANK:
         return value
+    if value is None:
+        return DEFAULT_TIER
+
+    key = repr(value)[:_MAX_PRIORITY_VALUE_REPR_LEN]
+    # Cap not yet reached and this value hasn't been warned about before —
+    # if the memo is already full, or this value was already warned about,
+    # fall straight through and suppress silently (the cap-reached notice
+    # below fires exactly once, on the call that fills the last slot).
+    if (
+        key not in _warned_priority_values
+        and len(_warned_priority_values) < _MAX_WARNED_PRIORITY_VALUES
+    ):
+        _warned_priority_values.add(key)
+        # Log the (already-truncated) key rather than %r-formatting the raw
+        # value again — for a large/adversarial value that second repr()
+        # would blow the log-line-size bound the truncation above exists
+        # to enforce.
+        logger.warning(
+            'coerce_tier: unrecognized priority %s, falling back to %r',
+            key,
+            DEFAULT_TIER,
+            stacklevel=2,
+        )
+        if len(_warned_priority_values) >= _MAX_WARNED_PRIORITY_VALUES:
+            logger.warning(
+                'coerce_tier: unrecognized-priority warning memo reached '
+                'its cap of %d distinct values; suppressing further '
+                'unrecognized-priority warnings until process restart',
+                _MAX_WARNED_PRIORITY_VALUES,
+            )
     return DEFAULT_TIER
 
 
@@ -888,6 +960,50 @@ class SpeculationProbeConfig(BaseModel):
                 f'probe_depths entries must all be positive integers; got {v!r}'
             )
         return v
+
+
+class MergeDeepConfig(BaseModel):
+    """Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
+
+    Lets a single verify cover a CHAIN of k queued merge items (one scratch
+    worktree, sequential in-order merges, one verify on the tip) instead of one
+    item at a time, so a passing tip lands the whole clean prefix in one round.
+
+    ``chain_cap`` is the single gate for the whole feature. The dispatch contract
+    it feeds (when a chain is built, and how ``target_depth`` is derived) and the
+    cap-staging plan live in the PRD, which is the ONE canonical narrative for
+    both — deliberately not restated here, because β (task 3184, the chain
+    builder) and γ (task 3185, the dispatch gate) are the consumers that
+    implement that contract and may change it. Nothing in the orchestrator reads
+    the knob yet.
+
+    ``chain_cap=0`` (the shipped default) is the KILL SWITCH: the gate can never
+    open, so no chain code runs on any dispatch path and behaviour is
+    byte-identical to pre-PRD merging — the ``probe_fraction=0.0`` precedent in
+    :class:`SpeculationProbeConfig`.
+
+    Plain BaseModel (no ``frozen``, no ``validate_assignment``) so ``_set_leaf``
+    can mutate it in place on hot-reload and held references observe the update
+    (invariant I3) — see :class:`RetentionConfig`'s docstring, below, for the
+    same requirement. Every leaf is green-tier hot-reloadable via
+    RELOADABLE_FIELDS (PRD decision #7), so an operator can enable, retune, or
+    KILL the feature (cap -> 0) via ``mcp__escalation__reload_config`` without a
+    process restart.
+    """
+
+    chain_cap: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            'Maximum number of queued items a single deep merge-ahead chain may '
+            'contain. 0 (the default) disables the feature entirely -- the kill '
+            'switch: no chain is ever built, so merge behaviour is byte-identical '
+            'to pre-task-3183 behaviour. Must be >= 0; a negative cap is rejected '
+            'at load rather than reaching dispatch. No upper bound is imposed. '
+            'See plans/deep-merge-ahead-prd.md for the dispatch contract this '
+            'gates and for the cap-staging plan.'
+        ),
+    )
 
 
 class RetentionConfig(BaseModel):
@@ -2148,6 +2264,73 @@ class ChronicFlakeConfig(BaseModel):
     )
 
 
+class ZeroProgressRequeueConfig(BaseModel):
+    """Zero-progress requeue backstop configuration (task 3068).
+
+    Backstops a blind spot the per-task requeue cap structurally cannot see:
+    a task that requeues forever without ever invoking an agent. The full
+    causal chain — why ``_disposition_table``'s non-counting warm-lane
+    dispositions make this invisible to both ceilings in
+    ``Harness._apply_retry_cap`` — is documented once, canonically, in
+    ``orchestrator.zero_progress_requeue``'s module docstring. Read that
+    before retuning anything here.
+
+    The alarm predicate is deliberately two-dimensional: ``threshold``
+    consecutive zero-agent-invocation requeues AND ``min_span_seconds`` of
+    wall clock. Requiring both is what separates a stuck task from ordinary
+    busy-fleet contention, which is why those dispositions are non-counting
+    in the first place.
+
+    Unlike ``chronic_flake`` (shipped ``enabled: false``, gated on an
+    un-landed reify substrate) this ships ENABLED: it reads only
+    ``TaskReport`` fields that already exist, so shipping it off would leave
+    the gap open indefinitely.  All fields are green-tier hot-tunable via
+    RELOADABLE_FIELDS, so a noisy detector can be retuned or silenced live.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable the zero-progress requeue detector. '
+            'Shipped enabled — this is the ONLY backstop for requeue loops '
+            'that the per-task requeue cap cannot see by design. Disabling '
+            'suppresses new alerts only; an already-filed alert still '
+            'auto-resolves when its task resumes progress.'
+        ),
+    )
+    threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Consecutive requeues-with-zero-agent-invocations for a single '
+            'task before a blocking L1 is filed (both this AND '
+            'min_span_seconds must be satisfied). Must be >= 1. Grounded in '
+            'the origin incident (reify esc-5556-1): ~349 requeues across '
+            '~24 tasks is ~14.5 consecutive zero-progress requeues per task, '
+            'so 5 fires at roughly a third of the observed loop — hours into '
+            'a 46h incident rather than at its end.'
+        ),
+    )
+    min_span_seconds: float = Field(
+        default=900.0,
+        ge=0.0,
+        description=(
+            'Wall-clock seconds the streak must ALSO span before a blocking '
+            'L1 is filed. Set to 0 to alarm on streak count alone. Exists '
+            'because the dispositions this watches are non-counting '
+            'precisely because they represent NORMAL busy-fleet backpressure '
+            '(task 2988 flipped warm_lane_pool_exhausted to non-counting for '
+            'exactly that reason): where max_concurrent_tasks exceeds the '
+            'warm-lane pool size, a low-priority task can lose the pool race '
+            'several dispatches in a row within seconds, and paging a human '
+            'at the loudest severity tier for that would be a false '
+            'positive. 900s (15 min) of CONTINUOUS zero progress is well '
+            'past any contention blip but still hours short of the 46h '
+            'origin incident.'
+        ),
+    )
+
+
 class VerifyRunnerConfig(BaseModel):
     """Configuration for a single remote verify runner (Lever C).
 
@@ -3265,6 +3448,20 @@ class OrchestratorConfig(BaseSettings):
     # genuinely stranded task's stale decision still ages out and promotes.
     # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
     orphan_l0_dispatch_freshness_secs: float = Field(default=300.0)
+    # Task 2991: freshness grace (seconds) for the merge-phase-liveness gate in
+    # the orphan-L0 divergence reaper. The divergence false positive recurred
+    # for MERGE-stage tasks (successor to task 2931): the pre-enqueue merge
+    # loop (rebase + scoped verify + queue submit) makes NO LLM calls, so it
+    # never refreshes ``metadata.routing.latest.decided_at`` — a legitimately
+    # live merge-stage task therefore fails the ``_has_fresh_dispatch`` gate
+    # and gets false-promoted. A durable ``metadata.merge_phase_liveness.
+    # entered_at`` stamp (restart-survivable, written at merge entry) is read
+    # by ``_has_fresh_merge_phase``; if within this grace of the sweep ``now``
+    # the divergence L0 is deferred (not promoted). Default 600.0 anchored to
+    # ``orchestrator_restart_merge_phase_grace_secs`` (the existing legitimate
+    # pre-enqueue merge-phase duration bound), not a guessed threshold.
+    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
+    orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
 
     # Terminal-status watcher — periodically polls fused-memory for active
     # workflow tasks whose status has gone terminal out-of-band (typical
@@ -3349,6 +3546,23 @@ class OrchestratorConfig(BaseSettings):
     # kill-switch convention; set to False to restore legacy single-observation
     # filing (tip arm disabled — byte-identical post-2370 behavior).
     main_tip_sweep_rerun_confirm_enabled: bool = Field(default=True)
+
+    # Isolated PRE-FILTER gating the main-tip sweep's full-suite retry (task
+    # 3095).  When a first-pass sweep fails, run_main_tip_sweep used to
+    # unconditionally re-run the WHOLE suite a second time in the same
+    # worktree — minutes of background CPU that itself worsens the contention
+    # it is trying to measure.  With this on, the sweep first re-runs just the
+    # first-pass failing node-ids, scoped + forced-serial + generous-timeout,
+    # in the already-pinned worktree: a deterministic reproduction SKIPS the
+    # expensive full retry, while a non-reproduction (or any unconfirmable
+    # outcome) still pays for it, so a genuine full-verify PASS remains the
+    # precondition for the harness's escalation self-heal.  The pre-filter is
+    # a COST gate only and never suppresses — the harness's fresh-worktree
+    # confirm_main_tip_failure_is_real gate remains the sole suppression
+    # authority.  Default-on, mirrors main_tip_sweep_rerun_confirm_enabled's
+    # operator kill-switch convention; set to False to restore byte-identical
+    # pre-3095 behavior (unconditional full retry).
+    main_tip_sweep_isolated_prefilter_enabled: bool = Field(default=True)
 
     # Category allowlist narrowing the terminal-subject auto-close (task 2724).
     # The subject-terminal Source-C close (criterion a above) used to fire for
@@ -3748,6 +3962,12 @@ class OrchestratorConfig(BaseSettings):
     # the disabled-by-default instance (probe_fraction=0.0, byte-identical).
     speculation_probe: SpeculationProbeConfig = Field(default_factory=SpeculationProbeConfig)
 
+    # Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
+    # An absent stanza in orchestrator.yaml yields the kill-switch instance
+    # (chain_cap=0, byte-identical current merge behaviour); the shipped
+    # defaults.yaml declares the block explicitly so the knob is discoverable.
+    merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
+
     # Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md
     # alpha). An absent stanza yields the enabled-by-default instance; the
     # producer hook lives in TaskWorkflow._invoke's finally and resolves its
@@ -3781,6 +4001,13 @@ class OrchestratorConfig(BaseSettings):
     # stanza in orchestrator.yaml yields the disabled-by-default instance
     # (gated until reify:5142's ledger/marker substrate is confirmed).
     chronic_flake: ChronicFlakeConfig = Field(default_factory=ChronicFlakeConfig)
+
+    # Zero-progress requeue backstop (task 3068). An absent stanza in
+    # orchestrator.yaml yields the ENABLED-by-default instance — this is the
+    # only detector for requeue loops the per-task requeue cap cannot see.
+    zero_progress_requeue: ZeroProgressRequeueConfig = Field(
+        default_factory=ZeroProgressRequeueConfig
+    )
 
     # κ: shared sccache backend (the laptop warm multiplier)
     # An absent stanza in orchestrator.yaml yields the disabled default;
@@ -4669,11 +4896,23 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # dedicated submodel, so its whole-submodel group auto-covers every
     # leaf (idiom shared with psi_admission/routing above).
     _submodel_leaf_paths('chronic_flake', ChronicFlakeConfig),
+    # Zero-progress requeue backstop (task 3068) — same whole-submodel-group
+    # idiom.  Green-tier deliberately: an operator must be able to retune the
+    # threshold or silence a noisy detector WITHOUT a fleet restart, because a
+    # detector you can only silence by restarting is one that gets silenced by
+    # ignoring it instead.
+    _submodel_leaf_paths('zero_progress_requeue', ZeroProgressRequeueConfig),
     # Variable-depth speculative verify placement (task 2359) — a new
     # dedicated submodel, same whole-submodel-group idiom: every probe knob
     # (probe_fraction/probe_depths/suppress_flake_rate) is green-tier
     # hot-reloadable with no separate RELOADABLE_FIELDS edit.
     _submodel_leaf_paths('speculation_probe', SpeculationProbeConfig),
+    # Deep merge-ahead chains (task 3183, PRD alpha, decision #7) — a new
+    # dedicated submodel, same whole-submodel-group idiom: chain_cap (and any
+    # knob beta/gamma add later) is green-tier hot-reloadable with no separate
+    # RELOADABLE_FIELDS edit, so the cap can be raised, retuned, or killed
+    # (-> 0) without a restart. See MergeDeepConfig for the rest.
+    _submodel_leaf_paths('merge_deep', MergeDeepConfig),
     # Agent-transcript archival (task 2742, PRD alpha) — a new dedicated
     # submodel, same whole-submodel-group idiom: enabled/root and the atomic
     # .retention leaf are all green-tier hot-reloadable with no separate
@@ -4717,6 +4956,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # the divergence-class routing.latest liveness gate; hot-reloadable so
         # the FP-suppression window can be tuned without a redeploy.
         'orphan_l0_dispatch_freshness_secs',
+        # Task 2991: sibling of orphan_l0_dispatch_freshness_secs — freshness
+        # grace for the merge-phase-liveness gate in the divergence reaper;
+        # hot-reloadable so the merge-phase FP-suppression window can be tuned
+        # without a redeploy.
+        'orphan_l0_merge_phase_freshness_secs',
         'watcher_rotation_escalations',
         'watcher_rotation_hours',
         'watcher_max_crashloop_restarts',

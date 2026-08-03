@@ -15,6 +15,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import yaml
@@ -283,6 +284,8 @@ def test_load_census_state_valid_file_is_ok_with_no_warning(tmp_path, caplog):
         status, data = ct.load_census_state(path)
 
     assert status == "ok"
+    # tuple[str, dict | None] — None only for the missing/malformed statuses.
+    assert data is not None
     assert data["last_census_at"] == "2026-07-01T00:00:00+00:00"
     assert data["last_census_report"] == "plans/confusion-census-2026-07-01.md"
     assert data["last_census_done_count"] == 500
@@ -434,7 +437,164 @@ def test_compute_tasks_landed_missing_baseline_returns_none_with_one_warning(cap
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
 
 
-def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(tmp_path):
+# ---------------------------------------------------------------------------
+# task 3291: extract_done_count() — the ONE place a get_statuses payload
+# becomes a number, and the one place the silent-zero hole is closed.
+#
+# The idiom this replaces -- `(payload.get("statuses") or {})`, duplicated at
+# census_trigger.compute_tasks_landed and census.run_census -- coerced EVERY
+# unusable payload to a done-count of 0 with no warning and no exception.
+# That is how a fabricated 0 was persisted as a real census baseline on
+# 2026-07-24 and again on 2026-07-31.
+#
+# Be precise about the harm, because the arithmetic matters: while the fetch
+# was also broken the poisoned baseline was self-cancelling (`current_done`
+# was zeroed by the same defect, so the delta was `0 - 0` and condition (b)
+# did NOT fire -- measured by replaying the 2026-07-31 decision against the
+# pre-task code). It is unsound because it ARMS (b) with a delta of ~2872,
+# ~24x its 120 threshold, the instant the fetch is repaired. Which is why
+# the payload guard, the absolute-project_root fix and the on-disk baseline
+# repair all had to land together. See census_trigger's module docstring.
+# ---------------------------------------------------------------------------
+
+# fused-memory's `_normalize_project_root` hard-rejects a relative path with
+# exactly this payload. Verified live against localhost:8002 with
+# `{"project_root": "."}` -- and critically, the JSON-RPC envelope carries
+# `isError: false`, so `_extract_tool_result` unwraps this dict as though it
+# were a genuine tool result and hands it straight to the caller.
+_TOOL_ERROR_ENVELOPE = {
+    "error": "project_root must be a non-empty absolute path, got: '.'",
+    "error_type": "ValidationError",
+}
+
+
+def test_extract_done_count_counts_done_values():
+    assert ct.extract_done_count({"statuses": {"1": "done", "2": "done", "3": "pending"}}) == 2
+
+
+def test_extract_done_count_empty_statuses_is_a_valid_zero():
+    """A project with zero done tasks is a real, expected state and MUST stay
+    distinguishable from a failed call -- it is precisely the case
+    `advance_census_state`'s "0 is never dropped as falsy" contract exists
+    for. The distinction that matters is presence-of-shape, not
+    emptiness-of-content."""
+    assert ct.extract_done_count({"statuses": {}}) == 0
+
+
+def test_extract_done_count_raises_on_fused_memory_tool_error_envelope():
+    """The regression that poisoned the live baseline. `@mcp_tool_errors`
+    returns this dict with `isError: false` at the JSON-RPC layer, so
+    `_extract_tool_result` unwraps it happily; the old
+    `(payload.get("statuses") or {})` idiom then read it as a done-count of
+    0 -- silently, with no warning and no exception."""
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count(_TOOL_ERROR_ENVELOPE)
+
+    # structured-facts-at-failure: the operator must see the REAL cause, not
+    # a generic shape complaint, so the server's own error text is quoted.
+    assert "project_root must be a non-empty absolute path" in str(excinfo.value)
+
+
+def test_extract_done_count_raises_when_statuses_key_absent():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count({})
+
+    assert "statuses" in str(excinfo.value)
+
+
+def test_extract_done_count_prefers_a_present_statuses_key_over_an_error_key():
+    """Pin the documented precedence of the error-envelope guard: it is
+    conditioned on `"statuses" not in payload`, so a payload that DOES carry a
+    real status snapshot is counted even if some stray `error` key rides along.
+    Untested, a future reorder of the two guards would flip this silently --
+    and the wrong direction (rejecting a usable snapshot) reintroduces exactly
+    the never-observable baseline this module exists to avoid."""
+    assert ct.extract_done_count({"statuses": {"1": "done"}, "error": "x"}) == 1
+
+
+def test_extract_done_count_raises_when_statuses_is_not_a_mapping():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count({"statuses": ["1", "2"]})
+
+    # The message must name the offending shape, not just that something failed.
+    assert "statuses" in str(excinfo.value)
+    assert "list" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("payload", [None, [], "oops", 0])
+def test_extract_done_count_raises_on_non_dict_payload(payload):
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count(payload)
+
+    assert type(payload).__name__ in str(excinfo.value)
+
+
+def test_compute_tasks_landed_tool_error_envelope_returns_none_with_one_warning(caplog):
+    """Before task 3291 this returned `0 - 500 == -500` with ZERO warnings --
+    a silent negative delta from a payload that was never a status snapshot
+    at all. A shape failure must land in the same "one WARNING, return None"
+    fail-safe branch as an unreachable server."""
+    state = {"last_census_done_count": 500}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=lambda: _TOOL_ERROR_ENVELOPE
+        )
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_payload_without_statuses_returns_none_with_one_warning(caplog):
+    state = {"last_census_done_count": 500}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(state=state, status_fetcher=lambda: {})
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_empty_project_computes_a_real_zero_delta(caplog):
+    """Regression guard in the OPPOSITE direction: collapsing "empty result"
+    into "failed call" would break the first baseline of a newly-onboarded
+    project with no done tasks. A real 0 baseline against a real empty
+    snapshot is a real delta of 0, not a fail-safe None, and warns nothing."""
+    state = {"last_census_done_count": 0}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(state=state, status_fetcher=_wrapped_fetcher({}))
+
+    assert result == 0
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(
+    tmp_path, monkeypatch
+):
+    """An unreachable endpoint must surface as StatusFetchUnavailable, never
+    as a raw transport exception.
+
+    The transport failure is INJECTED rather than relied upon. This test
+    originally passed on two ambient premises, both of which are now false:
+    that httpx was not importable here (so the lazy-import ImportError branch
+    fired), and that nothing listened on the default FUSED_MEMORY_MCP_URL
+    (http://localhost:8002). httpx is installed today, and a real fused-memory
+    MCP server listens on :8002 on any machine running the stack -- so the
+    test flapped pass/fail with that live server's connection state instead of
+    testing this module. Injecting a failing `httpx` module (the same
+    sys.modules convention used by
+    test_default_status_fetcher_sends_streamable_http_accept_headers below)
+    makes the "unreachable" premise true by construction.
+    """
+    fake_httpx = type(sys)("httpx")
+
+    def _fake_post(url, **kwargs):
+        raise OSError("[Errno 111] Connection refused")
+
+    fake_httpx.post = _fake_post
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
     fetcher = ct.default_status_fetcher(tmp_path)
 
     with pytest.raises(ct.StatusFetchUnavailable):
@@ -458,8 +618,9 @@ def test_default_status_fetcher_sends_streamable_http_accept_headers(tmp_path, m
     POST whose Accept header doesn't include both application/json and
     text/event-stream -- verified live against a local MCP /mcp endpoint.
     default_status_fetcher's httpx import is lazy (httpx is not a scripts/
-    dependency and is not importable in this test env), so a fake `httpx`
-    module is injected into sys.modules for the duration of this test."""
+    dependency, though it is importable in this test env as a transitive
+    one), so a fake `httpx` module is injected into sys.modules for the
+    duration of this test to capture the outbound call without a network."""
     captured_kwargs = {}
     rpc_response = {
         "jsonrpc": "2.0",
@@ -492,13 +653,86 @@ def test_default_status_fetcher_sends_streamable_http_accept_headers(tmp_path, m
     assert envelope.get("params", {}).get("name") == "get_statuses"
 
 
+def _capture_get_statuses_project_root(monkeypatch, project_root):
+    """Drive `default_status_fetcher(project_root)` against a fake httpx and
+    return the `project_root` argument it actually put on the wire. Reuses
+    the `_FakeHttpxResponse` + sys.modules injection harness above (the
+    `import httpx` inside `_fetch` is lazy precisely so this works)."""
+    captured_kwargs = {}
+    fake_httpx = type(sys)("httpx")
+
+    def _fake_post(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeHttpxResponse(
+            {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"statuses": {}}}}
+        )
+
+    fake_httpx.post = _fake_post
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+    ct.default_status_fetcher(project_root)()
+    return captured_kwargs["json"]["params"]["arguments"]["project_root"]
+
+
+def test_default_status_fetcher_sends_absolute_project_root_for_dot(tmp_path, monkeypatch):
+    """Task 3291 root cause. fused-memory's `_normalize_project_root` hard-
+    rejects ANY relative path -- verified live against localhost:8002, which
+    answered `{"project_root": "."}` with
+    `{"error": "project_root must be a non-empty absolute path, got: '.'",
+      "error_type": "ValidationError"}`.
+
+    In production that call ALWAYS carried a relative path: census.py's CLI
+    defaults `--project-root` to `"."`, and `nightly._default_census_launcher`
+    (nightly.py:521) launches census.py with no arguments at all. The MCP
+    argument is resolved by the SERVER's cwd, not the client's, so a relative
+    path is meaningless over the wire."""
+    monkeypatch.chdir(tmp_path)
+
+    sent = _capture_get_statuses_project_root(monkeypatch, ".")
+
+    assert sent == str(tmp_path.resolve())
+    assert Path(sent).is_absolute()
+
+
+def test_default_status_fetcher_sends_absolute_project_root_for_relative_subdir(
+    tmp_path, monkeypatch
+):
+    """Second case so the fix cannot pass by special-casing `"."` alone."""
+    (tmp_path / "sub" / "dir").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    sent = _capture_get_statuses_project_root(monkeypatch, "sub/dir")
+
+    assert sent == str((tmp_path / "sub" / "dir").resolve())
+    assert Path(sent).is_absolute()
+
+
+def test_default_status_fetcher_leaves_absolute_project_root_unchanged(tmp_path, monkeypatch):
+    """The other half of the contract: an ALREADY-absolute root must cross the
+    wire byte-for-byte unchanged. Both tests above start from a relative path,
+    so on their own they would not notice a "fix" that mangles absolute inputs.
+
+    This matters concretely because fused-memory keys its `_MAIN_CHECKOUT_CACHE`
+    on the path it is handed: if `resolve()` were ever to rewrite an operator's
+    configured root (a symlinked home, say `/home/leo` -> elsewhere), the cache
+    key would silently stop matching the configured one. Pinning pass-through
+    for the already-absolute case is what keeps this fix a normalisation of
+    relative paths rather than a rewrite of every path."""
+    monkeypatch.chdir(tmp_path)
+    absolute_root = str(tmp_path)
+
+    sent = _capture_get_statuses_project_root(monkeypatch, absolute_root)
+
+    assert sent == absolute_root
+
+
 # ---------------------------------------------------------------------------
 # amendment pass (review findings #1/#2): _extract_tool_result() unwraps the
-# real MCP tools/call JSON-RPC envelope. httpx is not installed in this test
-# env (see test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
-# above -- default_status_fetcher's ImportError branch is the only reachable
-# path here), so default_status_fetcher's HTTP round-trip itself cannot be
-# driven end-to-end; these tests instead exercise the envelope parser
+# real MCP tools/call JSON-RPC envelope. default_status_fetcher's HTTP
+# round-trip is never driven against a real endpoint here -- the tests above
+# inject a fake `httpx` module instead, since anything else makes them depend
+# on whether a live fused-memory MCP server happens to be listening on the
+# default URL; these tests instead exercise the envelope parser
 # directly against realistic tools/call response shapes, and then bridge its
 # output into compute_tasks_landed to pin the exact contract between them.
 # ---------------------------------------------------------------------------
@@ -639,7 +873,8 @@ def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
         last_census_report="plans/confusion-census-prior.md",
         last_census_done_count=500,
     )
-    fetcher = lambda: {"statuses": _done_statuses(550)}  # delta 50 < 120
+    def fetcher():  # delta 50 < 120
+        return {"statuses": _done_statuses(550)}
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
 
@@ -654,7 +889,8 @@ def test_decide_for_project_row3_day7_130_landed_fires(tmp_path):
         last_census_report="plans/confusion-census-prior.md",
         last_census_done_count=500,
     )
-    fetcher = lambda: {"statuses": _done_statuses(630)}  # delta 130 >= 120
+    def fetcher():  # delta 130 >= 120
+        return {"statuses": _done_statuses(630)}
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
 

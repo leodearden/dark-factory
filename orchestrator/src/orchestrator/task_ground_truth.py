@@ -116,6 +116,7 @@ class EscalationRef:
 
     id: str
     level: int
+    category: str = ''
 
 
 @dataclass(frozen=True)
@@ -474,7 +475,10 @@ class TaskGroundTruth:
         if self.escalation_queue is None:
             return []
         rows = self.escalation_queue.get_by_task(tid, status='pending')
-        return [EscalationRef(id=row.id, level=row.level) for row in rows]
+        return [
+            EscalationRef(id=row.id, level=row.level, category=row.category)
+            for row in rows
+        ]
 
     def _resolve_deploy_phase(self, metadata: object) -> DeployPhase | None:
         """Resolve a deterministic task's ``deploy_state.phase`` (DS-1/ε).

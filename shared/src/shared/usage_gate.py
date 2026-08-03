@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 from dotenv import load_dotenv
 
 from shared.cli_invoke import AgentResult
-from shared.config_dir import TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, sweep_stale_pid_dirs
 from shared.config_models import UsageCapConfig
 from shared.invocation_outcome import (
     OK,
@@ -83,6 +83,69 @@ CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 # constant, not an operator knob.
 _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
 
+# Probe config-dir naming (task 3086). _PROBE_TASK_ID_PREFIX is the task_id
+# stem handed to TaskConfigDir; _PROBE_DIR_PREFIX is the resulting on-disk
+# prefix the sweep keys off. Both construction sites below build from the
+# same constant, so the swept prefix and the created names are provably the
+# same string.
+_PROBE_TASK_ID_PREFIX = 'usage-gate-probe-'
+_PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + _PROBE_TASK_ID_PREFIX
+
+# Set once the stale-probe-dir sweep has run in this process. The sweep
+# reclaims OTHER (dead) processes' leftovers, so it is a process-wide
+# one-shot: re-running it per gate would re-scan /tmp for no benefit, and the
+# pathological /tmp this bounds has a 40 MB directory inode.
+_probe_dir_sweep_done: bool = False
+
+
+def _sweep_stale_probe_dirs_once() -> int:
+    """Reclaim dead-PID probe config dirs left by earlier processes.
+
+    Runs at most once per process. Returns the number of dirs removed (0 when
+    already swept this process, or on failure).
+
+    UsageGate.shutdown() already removes this process's own probe dirs on a
+    clean exit, so teardown was never the missing piece. What leaks is (a)
+    hard kills — the fleet SIGKILLs and restarts every unit roughly 8-hourly
+    and no teardown hook survives that — and (b) constructors that never call
+    shutdown() at all (orchestrator/evals/runner.py,
+    fused_memory/reconciliation/harness.py). Only reclaiming other processes'
+    dead-PID leftovers bounds the population, at
+    (live processes x accounts).
+
+    Never raises — for ANY exception class, not just OSError: tmp hygiene must
+    not be able to fail gate construction, and therefore orchestrator startup.
+    """
+    global _probe_dir_sweep_done
+    if _probe_dir_sweep_done:
+        return 0
+    # Set BEFORE the call, not after, so a raising sweep still cannot re-run
+    # on every subsequent gate construction.
+    _probe_dir_sweep_done = True
+    try:
+        reclaimed = sweep_stale_pid_dirs(_PROBE_DIR_PREFIX)
+        if reclaimed:
+            # Silent on the zero case so the steady state stays quiet; loud
+            # when there is something to say, so an operator can see the /tmp
+            # population draining rather than rebuilding.
+            logger.info(
+                'UsageGate: reclaimed %d stale probe config dir(s) under %s '
+                '(dead-PID sweep, task 3086)', reclaimed, _PROBE_DIR_PREFIX,
+            )
+        return reclaimed
+    except Exception:
+        # Deliberately broad. sweep_stale_pid_dirs already contains OSError
+        # internally, so anything that reaches here is an UNFORESEEN failure —
+        # a future bug, a pathological tree, a mocked side effect in a sibling
+        # suite. Letting it escape would fail UsageGate.__init__ and therefore
+        # orchestrator startup, which is strictly worse than leaving a stale
+        # /tmp dir behind. Logged at WARNING with a traceback, never silent.
+        logger.warning(
+            'UsageGate: stale probe-dir sweep of %s failed — continuing without it '
+            '(the next process start retries)', _PROBE_DIR_PREFIX, exc_info=True,
+        )
+        return 0
+
 
 def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
     """Return True iff the probe stdout is a CLI JSON result reporting that
@@ -128,17 +191,21 @@ class IllegalTransitionError(Exception):
 # escape hatch reserved for _on_sighup_async's operator-driven hard reset).
 _LEGAL_TRANSITIONS: dict[AccountPhase, frozenset[AccountPhase]] = {
     AccountPhase.AVAILABLE: frozenset({AccountPhase.CAPPED, AccountPhase.AUTH_FAILED}),
-    AccountPhase.PROBING: frozenset({
-        AccountPhase.AVAILABLE,
-        AccountPhase.PROBE_IN_FLIGHT,
-        AccountPhase.CAPPED,
-        AccountPhase.AUTH_FAILED,
-    }),
-    AccountPhase.PROBE_IN_FLIGHT: frozenset({
-        AccountPhase.AVAILABLE,
-        AccountPhase.CAPPED,
-        AccountPhase.AUTH_FAILED,
-    }),
+    AccountPhase.PROBING: frozenset(
+        {
+            AccountPhase.AVAILABLE,
+            AccountPhase.PROBE_IN_FLIGHT,
+            AccountPhase.CAPPED,
+            AccountPhase.AUTH_FAILED,
+        }
+    ),
+    AccountPhase.PROBE_IN_FLIGHT: frozenset(
+        {
+            AccountPhase.AVAILABLE,
+            AccountPhase.CAPPED,
+            AccountPhase.AUTH_FAILED,
+        }
+    ),
     AccountPhase.CAPPED: frozenset({AccountPhase.PROBING}),
     AccountPhase.AUTH_FAILED: frozenset({AccountPhase.AVAILABLE, AccountPhase.CAPPED}),
 }
@@ -179,7 +246,7 @@ class AccountState:
     """Per-account cap tracking."""
 
     name: str
-    token: str | None          # None = default account (no override)
+    token: str | None  # None = default account (no override)
     phase: AccountPhase = AccountPhase.AVAILABLE
     resets_at: datetime | None = None
     pause_started_at: datetime | None = None
@@ -357,7 +424,11 @@ class InvokeSlot:
         attributes to only this account's model-scope.
         """
         hit = self._gate.detect_cap_hit(
-            stderr, output, backend, oauth_token=self.token, scope=self.scope,
+            stderr,
+            output,
+            backend,
+            oauth_token=self.token,
+            scope=self.scope,
         )
         if hit:
             self._settled = True
@@ -424,7 +495,8 @@ class InvokeSlot:
                 f'anyway (Q4 log-and-proceed fail-safe)',
             )
             self._gate._fire_cost_event(
-                self.account_name, 'lease_stale',
+                self.account_name,
+                'lease_stale',
                 json.dumps({'outcome': type(outcome).__name__}),
             )
         token = self.token
@@ -433,7 +505,10 @@ class InvokeSlot:
                 self._gate.confirm_account_ok(token)
             elif isinstance(outcome, CapHit):
                 self._gate._handle_cap_detected(
-                    outcome.reason, outcome.resets_at, token, scope=self.scope,
+                    outcome.reason,
+                    outcome.resets_at,
+                    token,
+                    scope=self.scope,
                 )
             elif isinstance(outcome, AuthFailed):
                 self._gate._handle_auth_failure(f'HTTP {outcome.status}', token)
@@ -501,14 +576,29 @@ class UsageGate:
         self._shutting_down: bool = False
 
         self._accounts: list[AccountState] = self._init_accounts()
+        # Reclaim dead-PID probe dirs left behind by earlier processes BEFORE
+        # creating this process's own, so our fresh dirs are never sweep
+        # candidates (task 3086).
+        _sweep_stale_probe_dirs_once()
         # Per-(account, pid) probe config dirs (PRD §6 task θ, finding 5):
         # concurrent probes across the ~6-process fleet, and the SIGHUP
         # parallel all-account probe gather within one process, must not
         # share a single .credentials.json. pid disambiguates cross-process
         # same-account probes; acct.name disambiguates same-process
         # cross-account probes.
+        #
+        # That per-(account, pid) naming fixed the race but made the dirs
+        # unbounded in /tmp, since nothing reclaimed them once their owner
+        # died (task 3086). They are now covered from both ends:
+        # cleanup_at_exit handles clean exits — including the constructors
+        # that never call shutdown() (orchestrator/evals/runner.py,
+        # fused_memory/reconciliation/harness.py) — and the sweep above
+        # reclaims whatever a SIGKILL left behind, which no hook can.
         self._probe_config_dirs: dict[str, TaskConfigDir] = {
-            acct.name: TaskConfigDir(f'usage-gate-probe-{acct.name}-{os.getpid()}')
+            acct.name: TaskConfigDir(
+                f'{_PROBE_TASK_ID_PREFIX}{acct.name}-{os.getpid()}',
+                cleanup_at_exit=True,
+            )
             for acct in self._accounts
         }
         # Back-compat alias: several sibling test suites (test_probe_loop.py,
@@ -518,7 +608,7 @@ class UsageGate:
         # dict entry, so those assertions keep holding.
         self._probe_config_dir = next(
             iter(self._probe_config_dirs.values()), None
-        ) or TaskConfigDir(f'usage-gate-probe-{os.getpid()}')
+        ) or TaskConfigDir(f'{_PROBE_TASK_ID_PREFIX}{os.getpid()}', cleanup_at_exit=True)
         self._sighup_handler_installed: bool = False
         self.register_signal_handlers()
 
@@ -615,11 +705,13 @@ class UsageGate:
         if not force and new_phase not in _LEGAL_TRANSITIONS.get(acct.phase, frozenset()):
             logger.error(
                 'Illegal phase transition for account %r: %s -> %s (reason=%r)',
-                acct.name, acct.phase, new_phase, reason,
+                acct.name,
+                acct.phase,
+                new_phase,
+                reason,
             )
             raise IllegalTransitionError(
-                f'Illegal phase transition for account {acct.name!r}: '
-                f'{acct.phase} -> {new_phase}'
+                f'Illegal phase transition for account {acct.name!r}: {acct.phase} -> {new_phase}'
             )
 
         old_phase = acct.phase
@@ -644,9 +736,8 @@ class UsageGate:
             acct.pause_started_at = None
         if old_phase == AccountPhase.AUTH_FAILED and new_phase != AccountPhase.AUTH_FAILED:
             acct.auth_failed_at = None
-        if (
-            (old_phase == AccountPhase.CAPPED and new_phase == AccountPhase.PROBING)
-            or (old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase == AccountPhase.AVAILABLE)
+        if (old_phase == AccountPhase.CAPPED and new_phase == AccountPhase.PROBING) or (
+            old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase == AccountPhase.AVAILABLE
         ):
             acct.probe_count = 0
 
@@ -666,10 +757,7 @@ class UsageGate:
             acct.resets_at = None
 
         # --- Centralized _open recompute (DD-5) ---------------------------
-        if any(
-            a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING)
-            for a in self._accounts
-        ):
+        if any(a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING) for a in self._accounts):
             self._open.set()
             # Symmetric counterpart to the closing branch below: consume the
             # gate-level pause into _total_pause_secs and clear
@@ -730,8 +818,7 @@ class UsageGate:
         detect it via stderr pattern matching in ``detect_cap_hit()``.
         """
         logger.info(
-            'Usage gate startup: %d account(s) configured — '
-            'caps will be detected reactively',
+            'Usage gate startup: %d account(s) configured — caps will be detected reactively',
             len(self._accounts),
         )
 
@@ -753,8 +840,10 @@ class UsageGate:
         ``scope is not None``.
         """
         # Session budget check
-        if (self._config.session_budget_usd is not None
-                and self._cumulative_cost >= self._config.session_budget_usd):
+        if (
+            self._config.session_budget_usd is not None
+            and self._cumulative_cost >= self._config.session_budget_usd
+        ):
             raise SessionBudgetExhausted(self._cumulative_cost)
 
         if not self._accounts:
@@ -768,9 +857,7 @@ class UsageGate:
                 for acct in self._accounts:
                     if acct.capped or acct.probe_in_flight or acct.auth_failed:
                         continue
-                    if scope is not None and self._scope_capped_at(
-                        acct, scope, datetime.now(UTC)
-                    ):
+                    if scope is not None and self._scope_capped_at(acct, scope, datetime.now(UTC)):
                         # Scope-capped for this model (S2): skip for this scope
                         # only — the account still serves general work (S1). The
                         # account-level skip above already dominates (S4), and
@@ -784,8 +871,7 @@ class UsageGate:
                         # reset, and the centralized _open recompute.
                         self._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
                         logger.info(
-                            f'Account {acct.name}: probe slot claimed — '
-                            f'single task testing',
+                            f'Account {acct.name}: probe slot claimed — single task testing',
                         )
                     logger.debug(f'Using account {acct.name}')
                     # Failover detection: emit event if account changed. The
@@ -820,14 +906,14 @@ class UsageGate:
                                 self._fire_cost_event(
                                     acct.name,
                                     'failover',
-                                    json.dumps(
-                                        {'from': prev, 'to': acct.name, 'scope': scope}
-                                    ),
+                                    json.dumps({'from': prev, 'to': acct.name, 'scope': scope}),
                                 )
                         else:
                             scope_last[scope] = acct.name
                     return AccountLease(
-                        name=acct.name, token=acct.token, generation=acct.generation,
+                        name=acct.name,
+                        token=acct.token,
+                        generation=acct.generation,
                     )
 
             # All capped — check if any reset times have passed before blocking.
@@ -984,7 +1070,10 @@ class UsageGate:
 
         if isinstance(outcome, CapHit):
             return self._handle_cap_detected(
-                outcome.reason, outcome.resets_at, oauth_token, scope=scope,
+                outcome.reason,
+                outcome.resets_at,
+                oauth_token,
+                scope=scope,
             )
         if isinstance(outcome, NearCap):
             return self._handle_near_cap_warning(outcome.reason, oauth_token, scope=scope)
@@ -1383,8 +1472,7 @@ class UsageGate:
                 await self._reprobe_account(acct)
             except Exception:
                 logger.warning(
-                    f'Account {acct.name}: auth re-probe raised — '
-                    f'retrying after interval',
+                    f'Account {acct.name}: auth re-probe raised — retrying after interval',
                     exc_info=True,
                 )
 
@@ -1399,9 +1487,7 @@ class UsageGate:
         if token_env:
             fresh = os.environ.get(token_env)
             if fresh and fresh != acct.token:
-                logger.info(
-                    f'Account {acct.name}: env token changed — refreshing'
-                )
+                logger.info(f'Account {acct.name}: env token changed — refreshing')
                 acct.token = fresh
 
         logger.info(f'Account {acct.name}: firing auth re-probe')
@@ -1420,7 +1506,9 @@ class UsageGate:
                 logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
                 if self._cost_store:
                     self._fire_cost_event(
-                        acct.name, 'auth_resumed', json.dumps({}),
+                        acct.name,
+                        'auth_resumed',
+                        json.dumps({}),
                     )
         else:
             logger.info(
@@ -1498,9 +1586,7 @@ class UsageGate:
             if token_env:
                 fresh = os.environ.get(token_env)
                 if fresh and fresh != acct.token:
-                    logger.info(
-                        f'SIGHUP: account {acct.name} env token changed — refreshing'
-                    )
+                    logger.info(f'SIGHUP: account {acct.name} env token changed — refreshing')
                     acct.token = fresh
             # _transition owns: the phase write, cancelling any in-flight
             # resume/auth-reprobe task, probe_count/resets_at reset,
@@ -1510,9 +1596,7 @@ class UsageGate:
             # this operator-driven hard reset.
             self._transition(acct, AccountPhase.AVAILABLE, force=True)
         self._paused_reason = ''
-        logger.info(
-            f'SIGHUP: reloaded {len(self._accounts)} account(s); firing probes'
-        )
+        logger.info(f'SIGHUP: reloaded {len(self._accounts)} account(s); firing probes')
         await asyncio.gather(
             *(self._reprobe_account(a) for a in self._accounts),
             return_exceptions=True,
@@ -1608,9 +1692,7 @@ class UsageGate:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            logger.warning(
-                'No running event loop for cost event %s/%s', event_type, account_name
-            )
+            logger.warning('No running event loop for cost event %s/%s', event_type, account_name)
             return
         coro = self._write_cost_event(account_name, event_type, details)
         try:
@@ -1620,9 +1702,7 @@ class UsageGate:
             )
         except RuntimeError as exc:
             coro.close()
-            logger.warning(
-                'Failed to schedule cost event %s/%s: %s', event_type, account_name, exc
-            )
+            logger.warning('Failed to schedule cost event %s/%s: %s', event_type, account_name, exc)
             return
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
@@ -1667,7 +1747,7 @@ class UsageGate:
 
             base = self._config.probe_interval_secs
             ceiling = self._config.max_probe_interval_secs
-            interval = min(base * (2 ** acct.probe_count), ceiling)
+            interval = min(base * (2**acct.probe_count), ceiling)
 
             remaining = max(0, (target - datetime.now(UTC)).total_seconds())
             sleep_for = min(interval, remaining) if remaining > 0 else 0
@@ -1715,7 +1795,8 @@ class UsageGate:
                     logger.info(f'Account {acct.name} RESUMED (probe confirmed)')
                     if self._cost_store:
                         await self._write_cost_event(
-                            acct.name, 'resumed',
+                            acct.name,
+                            'resumed',
                             json.dumps({'label': f'probe #{confirmed_probe_num} confirmed'}),
                         )
                 return
@@ -1738,12 +1819,20 @@ class UsageGate:
             config_dir.write_credentials(acct.token)
 
         cmd = [
-            'claude', '--print', '--output-format', 'json',
-            '--model', 'haiku',
-            '--max-turns', '1',
-            '--max-budget-usd', '0.01',
-            '--permission-mode', 'bypassPermissions',
-            '--', 'Say ok',
+            'claude',
+            '--print',
+            '--output-format',
+            'json',
+            '--model',
+            'haiku',
+            '--max-turns',
+            '1',
+            '--max-budget-usd',
+            '0.01',
+            '--permission-mode',
+            'bypassPermissions',
+            '--',
+            'Say ok',
         ]
 
         env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
@@ -1764,7 +1853,8 @@ class UsageGate:
             # Capture pgid at spawn (pgid == pid under start_new_session).
             pgid = proc.pid
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=_PROBE_TIMEOUT,
+                proc.communicate(),
+                timeout=_PROBE_TIMEOUT,
             )
         except TimeoutError:
             logger.warning(f'Account {acct.name}: probe timed out')
@@ -1818,10 +1908,7 @@ class UsageGate:
                 # effect at its next suspension point, so the field
                 # is cleared explicitly here rather than left to
                 # settle asynchronously).
-                if (
-                    acct.auth_reprobe_task is not None
-                    and not acct.auth_reprobe_task.done()
-                ):
+                if acct.auth_reprobe_task is not None and not acct.auth_reprobe_task.done():
                     acct.auth_reprobe_task.cancel()
                 acct.auth_reprobe_task = None
                 # resets_at is persisted here (mirrors
@@ -1834,8 +1921,10 @@ class UsageGate:
                 # loop, the cap_hit cost event, and the centralized
                 # _open recompute.
                 self._transition(
-                    acct, AccountPhase.CAPPED,
-                    resets_at=resets_at, reason=reason,
+                    acct,
+                    AccountPhase.CAPPED,
+                    resets_at=resets_at,
+                    reason=reason,
                 )
             return False
 
@@ -1948,9 +2037,10 @@ class UsageGate:
     @property
     def total_pause_secs(self) -> float:
         if self._pause_started_at:
-            return self._total_pause_secs + (
-                datetime.now(UTC) - self._pause_started_at
-            ).total_seconds()
+            return (
+                self._total_pause_secs
+                + (datetime.now(UTC) - self._pause_started_at).total_seconds()
+            )
         return self._total_pause_secs
 
     @property
@@ -1974,9 +2064,7 @@ class UsageGate:
         has ``resets_at=None`` (i.e. the reset time is not yet known).
         """
         times = [
-            acct.resets_at
-            for acct in self._accounts
-            if acct.capped and acct.resets_at is not None
+            acct.resets_at for acct in self._accounts if acct.capped and acct.resets_at is not None
         ]
         return min(times) if times else None
 
@@ -2030,8 +2118,7 @@ class UsageGate:
             return
         if acct.phase == AccountPhase.PROBE_IN_FLIGHT:
             logger.info(
-                f'Account {acct.name}: probe slot released after exception — '
-                f'opening to all tasks',
+                f'Account {acct.name}: probe slot released after exception — opening to all tasks',
             )
             # _transition owns: the phase write, probe_count reset, and the
             # centralized _open recompute. clear_near_cap=False preserves
@@ -2104,8 +2191,18 @@ def _read_oauth_token() -> str | None:
 
 
 _MONTH_ABBR = {
-    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+    'jan': 1,
+    'feb': 2,
+    'mar': 3,
+    'apr': 4,
+    'may': 5,
+    'jun': 6,
+    'jul': 7,
+    'aug': 8,
+    'sep': 9,
+    'oct': 10,
+    'nov': 11,
+    'dec': 12,
 }
 
 
@@ -2138,11 +2235,13 @@ def _parse_resets_at(text: str) -> datetime:
     m = re.search(
         r'resets\s+([A-Za-z]{3,9})\s+(\d{1,2}),?\s+'
         r'(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     if m:
         try:
             import zoneinfo
+
             month_str = m.group(1).lower()[:3]
             day = int(m.group(2))
             time_str = m.group(3).strip()
@@ -2162,9 +2261,13 @@ def _parse_resets_at(text: str) -> datetime:
             now_in_tz = datetime.now(tz)
             year = now_in_tz.year
             target = now_in_tz.replace(
-                year=year, month=month, day=day,
-                hour=parsed_time.hour, minute=parsed_time.minute,
-                second=0, microsecond=0,
+                year=year,
+                month=month,
+                day=day,
+                hour=parsed_time.hour,
+                minute=parsed_time.minute,
+                second=0,
+                microsecond=0,
             )
             # If target is in the past, assume next year
             if target <= now_in_tz:
@@ -2176,11 +2279,13 @@ def _parse_resets_at(text: str) -> datetime:
     # Absolute: "resets Xpm (TZ)" or "resets X:XX AM (TZ)"
     m = re.search(
         r'resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     if m:
         try:
             import zoneinfo
+
             time_str = m.group(1).strip()
             tz_str = m.group(2).strip()
             tz = zoneinfo.ZoneInfo(tz_str)
@@ -2197,7 +2302,8 @@ def _parse_resets_at(text: str) -> datetime:
             target = now_in_tz.replace(
                 hour=parsed_time.hour,
                 minute=parsed_time.minute,
-                second=0, microsecond=0,
+                second=0,
+                microsecond=0,
             )
             if target <= now_in_tz:
                 target += timedelta(days=1)

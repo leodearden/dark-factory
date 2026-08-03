@@ -3,6 +3,16 @@ const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarCh
 const { Glyph: GL, ProjectGroup, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+// Unguarded, like the DF_* destructures above: index.html loads
+// tab_memory_evals.jsx BEFORE this file (guarded by test_tab_memory_evals.py),
+// which is the contract — the tab_scheduler.jsx:15 / DF_SCHED_HEATMAP idiom.
+const { MemoryEvalsSection } = window.DF_MEMORY_EVALS;
+// Guarded, unlike the DF_* destructures above: those globals gate real
+// rendering, but orchEmptyLabel only supplies one cosmetic empty-state label.
+// A 404'd / mis-ordered orch_filter.js must not throw here and blank every tab
+// defined in this file — index.html's load order (guarded by
+// test_index_html.py) is the real contract; this is the degradation path.
+const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No tasks' };
 const { useState: uS, useEffect: uE } = React;
 
 // shared open-state helper for furl/unfurl, persisted to localStorage by key
@@ -275,7 +285,7 @@ function OrchTab({ projectFilter, search }) {
                       <th>Status</th>
                     </tr></thead>
                     <tbody>
-                      {filtered.length === 0 && <tr><td colSpan={12} className="empty" style={{ padding: 20 }}>No {filter === 'all' ? '' : filter + ' '}tasks</td></tr>}
+                      {filtered.length === 0 && <tr><td colSpan={12} className="empty" style={{ padding: 20 }}>{orchEmptyLabel(filter)}</td></tr>}
                       {filtered.map(t => {
                         const isDone = t.status === 'done';
                         const isPending = t.status === 'pending';
@@ -552,7 +562,7 @@ function PerfTab({ projectFilter }) {
 }
 
 // ── Memory ──
-function MemoryTab({ projectFilter }) {
+function MemoryTab({ projectFilter, onNavigate }) {
   const projects = Object.entries(DF.MEMORY_STATUS.projects).filter(([pid]) => projectFilter.length === 0 || projectFilter.includes(pid));
   const ts = DF.MEMORY_TIMESERIES;
   return (
@@ -656,6 +666,12 @@ function MemoryTab({ projectFilter }) {
             </tbody>
           </table>
         </div>
+      </div>
+
+      {/* Memory-eval monitoring (PRD DD3: a section here, not a new tab).
+          Placed last so the existing memory KPIs stay above the fold. */}
+      <div className="col-span-12">
+        <MemoryEvalsSection onNavigate={onNavigate} />
       </div>
     </div>
   );

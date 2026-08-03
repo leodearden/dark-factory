@@ -5,10 +5,54 @@ re-export shim module was retired in task 2208 / PRD D2) to a per-project
 prefix registry built from configured ``known_project_roots``.
 
 A candidate is rejected when its title / description / details / files
-mention a path prefix owned by a project other than the one being filed
-into.  The verdict's ``suggested_project`` field carries the owning
+cite a path prefix owned by a project other than the one being filed
+into.  "Cite" is two-sided (task 3120): the prefix must sit at a left word
+boundary AND be followed by something that looks like a path segment, so a
+bare MENTION ("see ``fused-memory/``") or an English slash-construction
+("not a ``backend/``timeout error") is not a hit.  The verdict's
+``suggested_project`` field carries the owning
 project_id of the first mismatched prefix so the caller can resubmit (or
 the LLM can re-route under the multi-project Stage 2 prompt).
+
+The guard runs on TWO signals with different certainties.  DECLARED files
+(``metadata.files`` &c.) are classified exactly, via
+:meth:`ProjectPrefixRegistry.project_for_path`; PROSE is classified
+heuristically, via :func:`find_paths`.  Because prose cannot distinguish
+"modifies X" from "merely cites X", the prose branch is gated on the declared
+signal (task 3106).
+
+That yields THREE outcomes at the interceptor's ``submit_task`` seam
+(``TaskInterceptor._path_guard_or_skip``), in evaluation order — recorded
+here so a future reader need not re-derive the taxonomy from the call site:
+
+1. FILES-CERTAIN REJECT (:func:`check_files_for_scope`, task 2206) — a
+   DECLARED file is owned by another project.  Hard reject, no LLM
+   adjudication: the owner is either known and different, or it isn't.
+2. CROSS-REPO ALLOW-AND-TAG (:func:`all_files_foreign_owner`, task 3004) —
+   EVERY owned declared file belongs to ONE other REGISTERED project, and
+   the filer is registered too.  A legitimate cross-repo deliverable: allowed
+   and tagged (``metadata.cross_repo``), not rejected.
+3. PROSE ADVISORY (:func:`check_text_for_scope`) — a heuristic hit in
+   title/description/details with no files-level mismatch.  NEVER rejects:
+   the task is created, stamped ``metadata.possible_scope_mismatch``, and a
+   non-blocking advisory escalation fires.  ITSELF GATED on attribution —
+   :func:`local_attesting_signals` (task 3106) asks whether the DECLARED
+   deliverables (``metadata.files`` ∪ ``files_to_modify`` ∪ ``modules``)
+   attest work in the FILING project, i.e. at least one is owned by it and
+   NONE is owned by another; when they do, the interceptor suppresses BOTH
+   the stamp and the escalation, logging the decision at INFO instead.  With
+   no declared deliverable, with only unowned ones, or with a MIXED
+   declaration, the advisory fires unchanged.
+
+(1) and (2) partition the DECLARED signal; (3) applies only once neither
+fired.  (2) and (3)'s suppression are logical complements — one needs every
+owned file foreign, the other needs at least one local and none foreign — so
+they can never both apply.
+
+THIS IS THE CANONICAL STATEMENT of the taxonomy: the interceptor's
+``_path_guard_or_skip`` and the individual functions below cross-reference
+it by outcome number rather than restating it, so there is one place to edit
+when the ordering or the attribution inputs change.
 
 Wired into :class:`fused_memory.middleware.task_interceptor.TaskInterceptor`
 at the ``submit_task`` entry point.  Path-guard
@@ -36,15 +80,29 @@ if TYPE_CHECKING:
 
 _PATTERN_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
 
+# One path segment: the chars that may legally appear in a single path
+# component (no '/').  Used only inside the right-context lookahead.
+_SEG: str = r'[A-Za-z0-9_.\-]+'
+
+# Right-context assertion (task 3120): the token after '<prefix>/' must
+# look like a path segment — either another '/' follows, or it carries a
+# file extension.  NOTE: the interval quantifier is written {{1,6}} here
+# because this is an f-string; braces in the RENDERED value are not
+# re-processed when it is interpolated into _build_pattern below.
+_RIGHT_CONTEXT: str = rf'(?={_SEG}/|[A-Za-z0-9_\-]*\.[A-Za-z0-9]{{1,6}}(?![A-Za-z0-9]))'
+
 
 def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     """Build (and cache) a compiled regex for the given prefix tuple.
 
-    Each prefix is anchored by a leading word boundary: start-of-string OR
-    a character that is NOT ``[A-Za-z0-9_\\-/.]``.  This means a prefix
-    matches ONLY as a *leading* path component — at start-of-string or after
-    whitespace, punctuation, quotes, colons, etc. — but NOT when preceded by a
-    path separator (``/``) or a dot (``.``).
+    Each prefix is anchored on BOTH sides: a left word boundary, and a right
+    context that must look like a path segment.
+
+    LEFT boundary — start-of-string OR a character that is NOT
+    ``[A-Za-z0-9_\\-/.]``.  This means a prefix matches ONLY as a *leading*
+    path component — at start-of-string or after whitespace, punctuation,
+    quotes, colons, etc. — but NOT when preceded by a path separator (``/``)
+    or a dot (``.``).
 
     Excluding ``/`` and ``.`` from the boundary class ensures that mid-path
     occurrences like ``vendor/corpus/expr.txt`` or ``x.corpus/foo`` do NOT
@@ -54,14 +112,63 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     Note: ``\\-`` is kept escaped (literal hyphen, no range); ``/`` and ``.``
     are plain literals inside the class.
 
+    RIGHT boundary (task 3120) — the token following ``<prefix>/`` must look
+    like a path segment: either another ``/`` follows (``crates/reify/src.rs``)
+    or the token carries a file extension (``gui/package.json``).  Without
+    this, any English slash-construction whose left half happens to name a
+    registered top-level directory lexed as a path — "not a ``backend/``
+    timeout error", "``tools/``call", "``archive/``pause".
+
+    A bare trailing ``<prefix>/`` at end-of-token deliberately does NOT match,
+    because that is the bare-MENTION class ("see ``fused-memory/``", "the
+    'corpus/' dir") and admitting it would re-admit almost all of the noise
+    this assertion exists to remove.  For the ``submit_task`` path this loses
+    no real protection: the interceptor classifies ``metadata.files`` through
+    the FILES-certain check (:func:`check_files_for_scope` ->
+    ``registry.project_for_path``), which still hard-rejects a genuinely
+    DECLARED foreign file and is untouched by this change.
+
+    That backstop is specific to that path, and the guarantee is NOT blanket:
+    :func:`check_candidate_for_scope` folds ``files_to_modify`` into this same
+    prose scan with no certain-check fallback, so a declared *directory* entry
+    (``files_to_modify=['fused-memory/src']``) now goes undetected there —
+    measured: that call returns ``ok`` where :func:`check_files_for_scope`
+    returns ``rejection``.  Harmless today because that function has no
+    production caller (the interceptor imports only ``check_files_for_scope``
+    and ``check_text_for_scope``), but any future caller must route concrete
+    file entries through :func:`check_files_for_scope` rather than rely on
+    this heuristic scan.
+
+    KNOWN FAIL-OPEN residue, deliberately not closed (each is pinned by a
+    test so the gap stays visible rather than implied covered):
+
+    - extensionless right context — ``<prefix>/<dir>`` and extensionless
+      filenames (``fused-memory/src``, ``crates/reify-eval``,
+      ``crates/README``) satisfy neither alternative.  This is the LARGEST
+      miss class, since bare directory references are a common prose
+      spelling; it is accepted anyway because admitting it would mean
+      accepting any ``<word>/<word>``, which is exactly the English-
+      punctuation shape this assertion exists to reject;
+    - extensions longer than 6 chars (the ``{1,6}`` cap) — ``docs/.gitignore``,
+      ``crates/x.markdown``, ``crates/x.properties`` fail the extension
+      alternative.  The mechanism is the LENGTH cap, NOT the leading dot: a
+      short-extension dotfile such as ``docs/.env`` still matches;
+    - glob spellings — the metacharacter in ``plans/*.md`` is in neither the
+      segment class nor the extension class.
+
+    All three are MISSED detections, never false ones — the same conservative
+    direction ``project_prefix_registry`` already takes for
+    ``../other-repo/x.py`` and ``~user/...``.  Widening the character classes
+    to admit them would start re-admitting the punctuation shapes above.
+
     Cache note: ``_PATTERN_CACHE`` is keyed by the prefix tuple; the boundary
-    class is a compile-time constant (not a runtime variable), so no cache
-    invalidation or versioning is needed when the pattern template changes —
-    only new prefixes cause a new compile.
+    class and the right-context assertion are both compile-time constants
+    (not runtime variables), so no cache invalidation or versioning is needed
+    when the pattern template changes — only new prefixes cause a new compile.
     """
     if prefixes not in _PATTERN_CACHE:
         alts = '|'.join(re.escape(p) for p in prefixes)
-        pattern = re.compile(rf'(?:^|(?<=[^A-Za-z0-9_\-/.]))({alts})')
+        pattern = re.compile(rf'(?:^|(?<=[^A-Za-z0-9_\-/.]))({alts}){_RIGHT_CONTEXT}')
         _PATTERN_CACHE[prefixes] = pattern
     return _PATTERN_CACHE[prefixes]
 
@@ -226,6 +333,15 @@ def check_candidate_for_scope(
     Scans ``title``, ``description``, ``details``, and
     ``files_to_modify``.  Returns ``ok`` when the registry is empty, when
     no prefixes match, or when every match is owned by ``project_id``.
+
+    CAVEAT (task 3120): ``files_to_modify`` entries are folded into the same
+    heuristic prose scan as the free text, so they inherit :func:`find_paths`'
+    right-boundary requirement — a declared *directory* entry such as
+    ``['fused-memory/src']`` is NOT detected here, and unlike the
+    interceptor's ``submit_task`` path there is no FILES-certain backstop
+    behind this function.  A caller that needs concrete file entries
+    classified with certainty must call :func:`check_files_for_scope` on them
+    as well; this function alone is a heuristic.
     """
     if not registry:
         return PathGuardVerdict(outcome='ok', project_id=project_id)
@@ -371,6 +487,88 @@ def all_files_foreign_owner(
     if len(foreign_owners) != 1:
         return None
     return first_owner
+
+
+def local_attesting_signals(
+    signals: list[str] | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry,
+) -> list[str]:
+    """Return the declared deliverable signals that ATTEST *project_id* work.
+
+    Gate for the module docstring's outcome (3) — the prose advisory —
+    returning the WITNESS rather than a bare bool so the caller can name the
+    attesting entries in its log without reclassifying.  Truthiness IS the
+    predicate: :func:`local_deliverable_attested` is ``bool()`` of this, so
+    the two cannot drift and every signal is classified exactly once.
+
+    *signals* are the submission's DECLARED deliverables — the union of
+    ``metadata.files``, ``metadata.files_to_modify`` and ``metadata.modules``
+    (task 3106).  Attestation requires BOTH:
+
+    1. at least one signal OWNED by *project_id* (the positive half the
+       module docstring describes), and
+    2. NO signal owned by a DIFFERENT project.
+
+    (2) exists because the caller's upstream ``check_files_for_scope`` sees a
+    NARROWER list than this one: only ``files``, or (when ``files`` is
+    absent) ``files_to_modify`` — never ``modules``, and never a
+    ``files_to_modify`` entry shadowed by a present ``files`` key.  A foreign
+    entry in that non-overlapping remainder was therefore never classified by
+    the hard reject, so a MIXED declaration (local ``files`` + foreign
+    ``modules``) must not buy silence here.  It is advisory-only: declining
+    to attest leaves such a submission on the unchanged
+    stamp-plus-advisory path, and never creates a new rejection.
+
+    Signals are classified with the CERTAIN
+    :meth:`ProjectPrefixRegistry.project_for_path` lookup, never the
+    heuristic regex-over-prose :func:`find_paths`.  That matters: a declared
+    DIRECTORY (``'fused-memory/src'``, a ``modules`` lock key) and an
+    ABSOLUTE spelling both classify correctly here, where the prose
+    scanner's right-boundary assertion (task 3120) deliberately misses them.
+    It also means attribution inherits ``project_for_path``'s documented
+    fail-open residue (``'../other-repo/x.py'``, ``'~user/...'``) in the SAFE
+    direction: an unclassifiable signal simply fails to attest, so the
+    advisory still fires.
+
+    Entries with no registered owner are NEUTRAL — they neither attest nor
+    veto, matching :func:`_aggregate_owner_mismatches`' conservative
+    direction.  Declaring only ``README.md`` is no evidence of local work.
+
+    Returns ``[]`` when the registry is empty/falsy or *signals* is
+    empty/falsy.
+    """
+    if not registry or not signals:
+        return []
+    local: list[str] = []
+    for signal in signals:
+        owner = registry.project_for_path(signal)
+        if owner is None:
+            continue  # unowned → neutral
+        if owner != project_id:
+            return []  # foreign entry anywhere in the union → no attestation
+        local.append(signal)
+    return local
+
+
+def local_deliverable_attested(
+    signals: list[str] | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry,
+) -> bool:
+    """Return True iff the declared deliverables attest *project_id* work.
+
+    Pure predicate form of :func:`local_attesting_signals` (see it for the
+    two conditions and why the second exists); the interceptor uses the
+    witness-returning form so it can log what attested.
+
+    POSITIVE-attribution counterpart to :func:`all_files_foreign_owner`'s
+    negative one, and its exact logical complement — that function needs
+    EVERY owned entry foreign under ONE owner, this needs at least one LOCAL
+    and none foreign — so the module docstring's outcomes (2) and (3)-
+    suppressed can never both fire.
+    """
+    return bool(local_attesting_signals(signals, project_id, registry))
 
 
 def is_routing_override(routing_override_reason: str | None) -> bool:

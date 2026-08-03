@@ -9,6 +9,7 @@ conftests under `sys.modules['conftest']`.
 import os
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -43,7 +44,22 @@ _escalation_src = os.path.join(
 if _escalation_src not in sys.path:
     sys.path.insert(0, _escalation_src)
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd fused-memory && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, beating the
+# inserts above.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
 from _fm_helpers import pydantic_spec, reap_leaked_ticket_workers  # noqa: E402
+from df_pytest_isolation import (  # noqa: E402
+    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    reject_unsafe_basetemp,
+)
 
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
@@ -56,6 +72,11 @@ from fused_memory.config.schema import (  # noqa: E402
     QueueConfig,
     RoutingConfig,
 )
+
+
+def pytest_configure(config):
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    reject_unsafe_basetemp(config)
 
 
 @pytest.fixture(autouse=True)

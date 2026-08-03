@@ -19,36 +19,27 @@ false-positive prose mentions (tasks 2938/2939) — not invented shapes.
 from __future__ import annotations
 
 import json
-import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
+# discover_db_paths is imported from its DEFINING module rather than re-exported
+# through the scanner: the scanner itself never calls it (run_scan_cli resolves it
+# from _task_db_scan's own namespace), so re-exporting it would be a dead import.
+# Same function object either way — these tests exercise an identical callable.
+from _task_db_scan import discover_db_paths
 from scan_task_toolcall_leaks import (
     LeakMatch,
     detect_leak,
-    discover_db_paths,
     format_json,
     format_report,
     scan_db,
 )
 
-# Minimal reproduction of the live tasks table schema (columns + NOT NULL
-# constraints only — see fused-memory's sqlite_task_backend.py _SCHEMA_SQL).
-# Only the columns scan_db actually reads/needs are included.
-_TASKS_SCHEMA = """
-CREATE TABLE tasks (
-    tag           TEXT NOT NULL DEFAULT 'master',
-    id            INTEGER NOT NULL,
-    title         TEXT NOT NULL,
-    description   TEXT,
-    details       TEXT,
-    test_strategy TEXT,
-    status        TEXT NOT NULL,
-    metadata      TEXT,
-    updated_at    TEXT NOT NULL,
-    PRIMARY KEY (tag, id)
-);
-"""
+# The tasks-table schema and the fake-db builder live in scripts/tests/
+# conftest.py, behind the `make_tasks_db` fixture (task
+# 3336) — they were previously copied near-identically into all three
+# sweep-script test files.
 
 # ---------------------------------------------------------------------------
 # Genuine-leak fixtures: a stray closing tag, a REAL newline, then one or more
@@ -186,40 +177,7 @@ def test_detect_leak_returns_none_for_zero_whitespace_adjacent_tag():
 # scan_db(db_path) -> list[LeakMatch]
 # ---------------------------------------------------------------------------
 
-def _make_db(tmp_path, rows):
-    """Build a temp sqlite tasks.db at tmp_path/'tasks.db' seeded with *rows*.
-
-    Each row is a dict of column -> value; title/status/updated_at (the
-    NOT NULL columns) default to per-id placeholders when omitted.
-    """
-    db_path = tmp_path / "tasks.db"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(_TASKS_SCHEMA)
-        for row in rows:
-            conn.execute(
-                "INSERT INTO tasks (tag, id, title, description, details, "
-                "test_strategy, status, metadata, updated_at) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    row.get("tag", "master"),
-                    row["id"],
-                    row.get("title", f"Task {row['id']}"),
-                    row.get("description"),
-                    row.get("details"),
-                    row.get("test_strategy"),
-                    row.get("status", "pending"),
-                    row.get("metadata"),
-                    row.get("updated_at", "2026-07-22T00:00:00+00:00"),
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path
-
-
-def test_scan_db_finds_only_genuine_leaks_and_is_read_only(tmp_path):
+def test_scan_db_finds_only_genuine_leaks_and_is_read_only(make_tasks_db):
     rows = [
         {"id": 1, "description": "Clean task, nothing wrong here."},
         {"id": 2, "description": GENUINE_DESCRIPTION_LEAK},
@@ -241,7 +199,7 @@ def test_scan_db_finds_only_genuine_leaks_and_is_read_only(tmp_path):
             ),
         },
     ]
-    db_path = _make_db(tmp_path, rows)
+    db_path = make_tasks_db(rows)
     before = db_path.read_bytes()
 
     matches = scan_db(str(db_path))
@@ -266,23 +224,14 @@ def test_scan_db_finds_only_genuine_leaks_and_is_read_only(tmp_path):
     assert by_task_id[4].fragment == SWALLOWED_DETAILS_FRAGMENT
 
 
-def test_scan_db_returns_empty_list_for_clean_db(tmp_path):
-    db_path = _make_db(tmp_path, [{"id": 1, "description": "All clean here."}])
+def test_scan_db_returns_empty_list_for_clean_db(make_tasks_db):
+    db_path = make_tasks_db([{"id": 1, "description": "All clean here."}])
     assert scan_db(str(db_path)) == []
 
 
 # ---------------------------------------------------------------------------
 # discover_db_paths(explicit_dbs, project_roots, env) -> list[str]
 # ---------------------------------------------------------------------------
-
-def _touch_tasks_db(project_root):
-    """Create an (empty-content) tasks.db under project_root/.taskmaster/tasks/."""
-    db_dir = project_root / ".taskmaster" / "tasks"
-    db_dir.mkdir(parents=True)
-    db_file = db_dir / "tasks.db"
-    db_file.write_text("")
-    return db_file
-
 
 def test_discover_db_paths_explicit_dbs_passed_through_existing_only(tmp_path):
     existing = tmp_path / "a.db"
@@ -294,23 +243,23 @@ def test_discover_db_paths_explicit_dbs_passed_through_existing_only(tmp_path):
     assert result == [str(existing)]
 
 
-def test_discover_db_paths_project_root_maps_to_taskmaster_tasks_db(tmp_path):
+def test_discover_db_paths_project_root_maps_to_taskmaster_tasks_db(tmp_path, project_root_with_tasks_db):
     root = tmp_path / "proj"
     root.mkdir()
-    db_file = _touch_tasks_db(root)
+    db_file = project_root_with_tasks_db(root)
 
     result = discover_db_paths(project_roots=[str(root)])
 
     assert result == [str(db_file)]
 
 
-def test_discover_db_paths_parses_dashboard_known_project_roots_env(tmp_path):
+def test_discover_db_paths_parses_dashboard_known_project_roots_env(tmp_path, project_root_with_tasks_db):
     root_a = tmp_path / "a"
     root_b = tmp_path / "b"
     root_a.mkdir()
     root_b.mkdir()
-    db_a = _touch_tasks_db(root_a)
-    db_b = _touch_tasks_db(root_b)
+    db_a = project_root_with_tasks_db(root_a)
+    db_b = project_root_with_tasks_db(root_b)
 
     # Comma-separated, whitespace padded, with an empty entry (",,") that
     # must be dropped rather than mapped to a bogus db path.
@@ -420,15 +369,15 @@ SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"
 
 def _run_cli(*args, timeout=10):
     return subprocess.run(
-        ["python3", str(SCRIPT), *args],
+        [sys.executable, str(SCRIPT), *args],
         capture_output=True,
         text=True,
         timeout=timeout,
     )
 
 
-def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(tmp_path):
-    db_path = _make_db(tmp_path, [{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(make_tasks_db):
+    db_path = make_tasks_db([{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
     before = db_path.read_bytes()
 
     result = _run_cli("--db", str(db_path))
@@ -439,8 +388,8 @@ def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(tmp_pat
     assert "992" in result.stdout
 
 
-def test_cli_clean_db_exits_0_with_no_leaks_message(tmp_path):
-    db_path = _make_db(tmp_path, [{"id": 1, "description": "Nothing wrong here."}])
+def test_cli_clean_db_exits_0_with_no_leaks_message(make_tasks_db):
+    db_path = make_tasks_db([{"id": 1, "description": "Nothing wrong here."}])
 
     result = _run_cli("--db", str(db_path))
 
@@ -448,8 +397,8 @@ def test_cli_clean_db_exits_0_with_no_leaks_message(tmp_path):
     assert "no leaked tool-call fragments found" in result.stdout
 
 
-def test_cli_json_flag_exits_1_and_emits_parseable_json(tmp_path):
-    db_path = _make_db(tmp_path, [{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+def test_cli_json_flag_exits_1_and_emits_parseable_json(make_tasks_db):
+    db_path = make_tasks_db([{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
 
     result = _run_cli("--db", str(db_path), "--json")
 
@@ -466,14 +415,14 @@ def test_cli_no_resolvable_db_exits_2():
     assert result.returncode == 2, f"stdout={result.stdout!r} stderr={result.stderr!r}"
 
 
-def test_cli_continues_past_unreadable_db_and_warns_on_stderr(tmp_path):
+def test_cli_continues_past_unreadable_db_and_warns_on_stderr(tmp_path, make_tasks_db):
     """A corrupt/unreadable tasks.db (e.g. a stale WAL-less file, or a
     genuinely non-sqlite file at that path) must not abort the whole sweep:
     the CLI logs a warning naming the bad db to stderr and continues, still
     reporting leaks found in the other, readable database(s)."""
     corrupt_db = tmp_path / "corrupt.db"
     corrupt_db.write_bytes(b"not a sqlite database, just garbage bytes")
-    leaky_db = _make_db(tmp_path, [{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+    leaky_db = make_tasks_db([{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
 
     result = _run_cli("--db", str(corrupt_db), "--db", str(leaky_db))
 

@@ -1405,3 +1405,739 @@ class TestConfirmMainTipFailureIsReal:
             f'Expected a WARNING log about the ambiguous node-id match; got '
             f'calls={mock_logger.warning.call_args_list!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-3095 step-1: verify._group_node_ids_by_subproject
+#
+# _group_node_ids_by_subproject(worktree, module_configs, node_ids, *,
+# log_label) -> dict[str, list[str]] | None
+#
+# Pure helper extracted from confirm_main_tip_failure_is_real's node-id ->
+# subproject existence-mapping block so the new sweep pre-filter reuses it
+# instead of the tree gaining a THIRD copy (INV-5). Returns None for any
+# unmapped node-id (the caller's fail-safe signal); WARNs and takes the first
+# candidate on an ambiguous match.
+# ---------------------------------------------------------------------------
+
+# Two subprojects owning DISTINCT test files — the "group separately" case.
+_GROUP_PROJECT_LAYOUT_TWO = {
+    'alpha/orchestrator.yaml': (
+        'test_command: "uv run --project alpha --directory alpha pytest tests/ --tb=short -q"\n'
+    ),
+    'alpha/tests/test_a.py': 'def test_a():\n    pass\n',
+    'beta/orchestrator.yaml': (
+        'test_command: "uv run --project beta --directory beta pytest tests/ --tb=short -q"\n'
+    ),
+    'beta/tests/test_b.py': 'def test_b():\n    pass\n',
+}
+
+
+def _materialize(root: Path, layout: dict[str, str]) -> None:
+    """Write *layout* (relpath -> content) under *root*."""
+    for relpath, content in layout.items():
+        p = root / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+
+
+class TestGroupNodeIdsBySubproject:
+    """task-3095 step-1: the extracted pure node-id -> subproject mapper.
+
+    RED today: verify._group_node_ids_by_subproject does not exist.
+    """
+
+    @staticmethod
+    def _discover(root: Path):
+        from orchestrator.config import _discover_module_configs
+
+        return _discover_module_configs(root)
+
+    def test_subproject_relative_node_id_resolves_to_qualified_id(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) A bare subproject-relative node-id resolves to its owning
+        prefix, and the returned id is PREFIX-QUALIFIED (worktree-root
+        relative) so the scoped re-run command names a real path."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path, mcs, ['tests/test_a.py::test_a'], log_label='unit',
+        )
+
+        assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
+
+    def test_prefix_qualified_node_id_passes_through_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """(b) An ALREADY prefix-qualified node-id maps to that prefix and is
+        returned verbatim (never double-prefixed)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path, mcs, ['beta/tests/test_b.py::test_b'], log_label='unit',
+        )
+
+        assert groups == {'beta': ['beta/tests/test_b.py::test_b']}, groups
+
+    def test_node_ids_group_by_owning_subproject_preserving_order(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) Node-ids owned by different subprojects land in separate
+        groups, with input order preserved WITHIN each group."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path,
+            mcs,
+            [
+                'tests/test_a.py::test_one',
+                'tests/test_b.py::test_two',
+                'tests/test_a.py::test_three',
+            ],
+            log_label='unit',
+        )
+
+        assert groups == {
+            'alpha': [
+                'alpha/tests/test_a.py::test_one',
+                'alpha/tests/test_a.py::test_three',
+            ],
+            'beta': ['beta/tests/test_b.py::test_two'],
+        }, groups
+
+    def test_unmapped_node_id_returns_none(self, tmp_path: Path) -> None:
+        """(d) A node-id whose file exists under NO discovered subproject
+        returns the None sentinel — the caller's fail-safe signal. One bad
+        node-id poisons the whole batch (no partial guessing)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path,
+            mcs,
+            ['tests/test_a.py::test_a', 'tests/test_nonexistent.py::test_ghost'],
+            log_label='unit',
+        )
+
+        assert groups is None, f'Expected None for an unmapped node-id, got {groups!r}'
+
+    def test_ambiguous_node_id_takes_first_and_warns(self, tmp_path: Path) -> None:
+        """(e) A relpath existing under TWO subprojects resolves to the FIRST
+        by module_configs iteration order and emits a WARNING naming both
+        candidate prefixes AND the caller's *log_label* (so the log line
+        attributes to the right call site)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _CONFIRM_PROJECT_LAYOUT_AMBIGUOUS)
+        mcs = self._discover(tmp_path)
+        assert list(mcs) == ['alpha', 'beta'], f'fixture precondition: {list(mcs)}'
+
+        with patch.object(verify_module, 'logger') as mock_logger:
+            groups = verify_module._group_node_ids_by_subproject(
+                tmp_path, mcs, [CONFIRM_AMBIGUOUS_NODE_ID], log_label='my-call-site',
+            )
+
+        assert groups == {'alpha': [f'alpha/{CONFIRM_AMBIGUOUS_NODE_ID}']}, groups
+
+        warned = False
+        for call in mock_logger.warning.call_args_list:
+            args = call.args
+            msg = (args[0] % args[1:]) if len(args) > 1 else args[0]
+            if 'alpha' in msg and 'beta' in msg and 'my-call-site' in msg:
+                warned = True
+                break
+        assert warned, (
+            'Expected a WARNING naming both candidate prefixes and the '
+            f'log_label; got calls={mock_logger.warning.call_args_list!r}'
+        )
+
+    def test_empty_node_ids_returns_empty_dict_not_none(self, tmp_path: Path) -> None:
+        """(f) An empty node-id list is NOT the unmapped sentinel — it returns
+        an empty dict, so callers distinguish "nothing to run" from
+        "unmappable" via their own cheap early-out."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path, mcs, [], log_label='unit',
+        )
+
+        assert groups == {}, f'Expected {{}} for an empty node-id list, got {groups!r}'
+
+
+# ---------------------------------------------------------------------------
+# task-3095 step-3: verify._sweep_failure_reproduces_in_isolation
+#
+# _sweep_failure_reproduces_in_isolation(worktree, config, failing_result)
+#     -> bool | None
+#
+# COST pre-filter for run_main_tip_sweep's full-suite retry — never a
+# suppression verdict. Tri-state:
+#   True  = the named failing tests reproduce deterministically in isolation
+#           -> the caller may skip the expensive full retry.
+#   False = every named test passed in isolation (suspected contention flake)
+#           -> the caller pays for the full retry as before, so a genuine FULL
+#           green is still required for the harness's self-heal.
+#   None  = UNCONFIRMABLE (no node-id, unmapped node-id, infra sentinel, or a
+#           raise) -> the caller falls through to byte-identical legacy
+#           behavior.
+# ---------------------------------------------------------------------------
+
+# A node-id that maps cleanly into the _GROUP_PROJECT_LAYOUT_TWO alpha tree.
+PREFILTER_ALPHA_NODE_ID = 'tests/test_a.py::test_a'
+PREFILTER_BETA_NODE_ID = 'tests/test_b.py::test_b'
+
+PREFILTER_FAILING_RESULT = VerifyResult(
+    passed=False,
+    test_output=f'FAILED {PREFILTER_ALPHA_NODE_ID}',
+    lint_output='',
+    type_output='',
+    summary='test_failure',
+    cause_hint=f'FAILED {PREFILTER_ALPHA_NODE_ID}',
+    category='test_failure',
+)
+
+# Two node-ids owned by DIFFERENT subprojects -> two scoped groups.
+PREFILTER_TWO_GROUP_FAILING_RESULT = VerifyResult(
+    passed=False,
+    test_output=(
+        f'FAILED {PREFILTER_ALPHA_NODE_ID}\nFAILED {PREFILTER_BETA_NODE_ID}\n'
+    ),
+    lint_output='',
+    type_output='',
+    summary='test_failure',
+    cause_hint=f'FAILED {PREFILTER_ALPHA_NODE_ID}',
+    category='test_failure',
+)
+
+# No recoverable node-id: a pure lint failure with empty test output.
+PREFILTER_NO_NODEID_RESULT = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='orchestrator/src/orchestrator/foo.py:12:5: F401 unused import',
+    type_output='',
+    summary='lint_failure',
+    cause_hint='F401 unused import',
+    category='lint_failure',
+)
+
+# A node-id whose file exists under NO discovered subproject.
+PREFILTER_UNMAPPED_RESULT = VerifyResult(
+    passed=False,
+    test_output='FAILED tests/test_ghost.py::test_ghost',
+    lint_output='',
+    type_output='',
+    summary='test_failure',
+    cause_hint='FAILED tests/test_ghost.py::test_ghost',
+    category='test_failure',
+)
+
+# An infra sentinel paired with passed=True — never trusted either way.
+PREFILTER_INTERNALERROR_PASS = VerifyResult(
+    passed=True,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='pytest_internalerror',
+    cause_hint='INTERNALERROR> KeyError: <WorkerController gw3>',
+    category='pytest_internalerror',
+)
+
+
+class TestSweepFailureReproducesInIsolation:
+    """task-3095 step-3: the tri-state isolated-rerun COST pre-filter.
+
+    RED today: verify._sweep_failure_reproduces_in_isolation does not exist.
+    """
+
+    def test_all_groups_pass_returns_false(self, tmp_path: Path) -> None:
+        """(a) Every scoped group PASSES in isolation -> False (did not
+        reproduce) -> the caller still pays for the full retry, preserving the
+        full-verify-PASS evidence bar for the harness's self-heal."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        config = _make_config(tmp_path)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+        with patch.object(verify_module, 'run_verification', rv):
+            verdict = asyncio.run(
+                verify_module._sweep_failure_reproduces_in_isolation(
+                    tmp_path, config, PREFILTER_TWO_GROUP_FAILING_RESULT,
+                )
+            )
+
+        assert verdict is False, f'Expected False (did not reproduce), got {verdict!r}'
+        assert rv.call_count == 2, (
+            f'Expected one isolated re-run per subproject group, got {rv.call_count}'
+        )
+
+    def test_any_group_fails_returns_true(self, tmp_path: Path) -> None:
+        """(b) A group that still FAILS in isolation -> True (deterministic
+        reproduction) -> the caller may skip the full retry."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        config = _make_config(tmp_path)
+
+        rv = AsyncMock(return_value=FAILING_RESULT)
+        with patch.object(verify_module, 'run_verification', rv):
+            verdict = asyncio.run(
+                verify_module._sweep_failure_reproduces_in_isolation(
+                    tmp_path, config, PREFILTER_FAILING_RESULT,
+                )
+            )
+
+        assert verdict is True, f'Expected True (reproduces), got {verdict!r}'
+
+    def test_no_recoverable_node_id_returns_none_without_running(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) No recoverable node-id -> None WITHOUT invoking
+        run_verification at all (cheap early-out: a pre-filter that costs a
+        subprocess to learn it has nothing to filter is worse than useless)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        config = _make_config(tmp_path)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+        with patch.object(verify_module, 'run_verification', rv):
+            verdict = asyncio.run(
+                verify_module._sweep_failure_reproduces_in_isolation(
+                    tmp_path, config, PREFILTER_NO_NODEID_RESULT,
+                )
+            )
+
+        assert verdict is None, f'Expected None (unconfirmable), got {verdict!r}'
+        rv.assert_not_called()
+
+    def test_unmapped_node_id_returns_none(self, tmp_path: Path) -> None:
+        """(d) A node-id owned by no discovered subproject -> None, and no
+        re-run is attempted (nothing safe to scope to)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        config = _make_config(tmp_path)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+        with patch.object(verify_module, 'run_verification', rv):
+            verdict = asyncio.run(
+                verify_module._sweep_failure_reproduces_in_isolation(
+                    tmp_path, config, PREFILTER_UNMAPPED_RESULT,
+                )
+            )
+
+        assert verdict is None, f'Expected None (unmapped node-id), got {verdict!r}'
+        rv.assert_not_called()
+
+    def test_infra_sentinel_rerun_returns_none_even_when_passed(
+        self, tmp_path: Path
+    ) -> None:
+        """(e) An infra-sentinel re-run category is UNCONFIRMABLE regardless of
+        the passed flag — the category check must be independent of it, or a
+        crashed re-run would masquerade as 'did not reproduce'."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        config = _make_config(tmp_path)
+
+        rv = AsyncMock(return_value=PREFILTER_INTERNALERROR_PASS)
+        with patch.object(verify_module, 'run_verification', rv):
+            verdict = asyncio.run(
+                verify_module._sweep_failure_reproduces_in_isolation(
+                    tmp_path, config, PREFILTER_FAILING_RESULT,
+                )
+            )
+
+        assert verdict is None, (
+            f'Expected None on an infra-sentinel re-run category, got {verdict!r}'
+        )
+
+    def test_rerun_raising_returns_none_and_logs_warning(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """(f) A raise inside the pre-filter degrades to None AND is logged at
+        WARNING — loud-over-silent, and required by the silent-fallthrough
+        ratchet (signature (b) flags `except Exception: return None` handlers
+        with no WARN+ logger call)."""
+        import logging
+
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        config = _make_config(tmp_path)
+
+        rv = AsyncMock(side_effect=RuntimeError('boom'))
+        with (
+            patch.object(verify_module, 'run_verification', rv),
+            caplog.at_level(logging.WARNING, logger=verify_module.logger.name),
+        ):
+            verdict = asyncio.run(
+                verify_module._sweep_failure_reproduces_in_isolation(
+                    tmp_path, config, PREFILTER_FAILING_RESULT,
+                )
+            )
+
+        assert verdict is None, f'Expected None when the re-run raises, got {verdict!r}'
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            f'Expected a WARNING+ record; got {[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+
+    def test_scoped_command_shape(self, tmp_path: Path) -> None:
+        """The ModuleConfig handed to run_verification is scoped to the failing
+        node-ids, forced serial, addopts-cleared, carries a generous explicit
+        --timeout (pyproject's `timeout=60` survives `-o addopts=` and would
+        otherwise starve the isolated run into a false 'reproduces'), and runs
+        NEITHER lint NOR typecheck (not the flake surface; pure cost)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        config = _make_config(tmp_path)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+        with patch.object(verify_module, 'run_verification', rv):
+            asyncio.run(
+                verify_module._sweep_failure_reproduces_in_isolation(
+                    tmp_path, config, PREFILTER_FAILING_RESULT,
+                )
+            )
+
+        rv.assert_awaited()
+        called_mc = rv.call_args.args[2]
+        cmd = called_mc.test_command
+        assert '-p no:xdist' in cmd, cmd
+        assert '-o addopts=' in cmd, cmd
+        assert ('--timeout 300' in cmd or '--timeout=300' in cmd), cmd
+        assert f'alpha/{PREFILTER_ALPHA_NODE_ID}' in cmd, cmd
+        assert called_mc.lint_command is None, called_mc.lint_command
+        assert called_mc.type_check_command is None, called_mc.type_check_command
+
+
+# ---------------------------------------------------------------------------
+# task-3095 step-7: run_main_tip_sweep <-> pre-filter wiring
+#
+# The pre-filter gates the expensive full-suite retry. It NEVER becomes the
+# sweep's verdict: on the reproduces path the sweep returns the FIRST-PASS
+# FAILING result, so the harness's "full-verify PASS required to self-heal"
+# precondition (harness.py's _close_superseded_main_sweep_escalations) can
+# never be satisfied by subset-only evidence.
+# ---------------------------------------------------------------------------
+
+
+class TestRunMainTipSweepIsolatedPrefilter:
+    """task-3095 step-7: the pre-filter's effect on run_main_tip_sweep.
+
+    RED today: the pre-filter is not wired in, so (a) and (d) see 2 calls /
+    a non-zero pre-filter call count.
+    """
+
+    @staticmethod
+    def _fake_git_run():
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        return _fake_run
+
+    def test_reproduces_skips_full_retry_and_returns_first_pass(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) Pre-filter True -> the full retry is SKIPPED and the sweep
+        returns the FIRST-PASS failing object itself (identity), with no
+        suppression record. The harness then adjudicates via its unchanged
+        fresh-worktree confirm gate."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        prefilter = AsyncMock(return_value=True)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert rfv.call_count == 1, (
+            f'Expected the full-suite retry to be SKIPPED (1 call), got {rfv.call_count}'
+        )
+        assert result is not None, 'Expected (sha, VerifyResult), got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr is FAILING_RESULT, (
+            f'Expected the FIRST-PASS result object itself, got {vr!r}'
+        )
+        # Self-heal invariant guard: the sweep must never hand back a passing
+        # result derived from subset-only evidence.
+        assert vr.passed is False, f'Expected passed=False, got {vr.passed!r}'
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert new_records == [], (
+            f'Expected NO suppression record on the reproduces path, got {new_records!r}'
+        )
+
+    def test_does_not_reproduce_runs_full_retry_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """(b) Pre-filter False -> the legacy flake-suppression path is
+        byte-identical: full retry runs, a retry PASS is returned, and exactly
+        one audit record carries the FIRST-PASS sha/category/cause_hint."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        prefilter = AsyncMock(return_value=False)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert rfv.call_count == 2, (
+            f'Expected the full retry to still run (2 calls), got {rfv.call_count}'
+        )
+        assert result is not None
+        _swept_sha, vr = result
+        assert vr is PASSING_RESULT, f'Expected the retry result, got {vr!r}'
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert len(new_records) == 1, f'Expected 1 record, got {new_records!r}'
+        rec = new_records[0]
+        assert rec['sha'] == MAIN_SHA, rec
+        assert rec['first_pass_category'] == FAILING_RESULT.category, rec
+        assert rec['first_pass_cause_hint'] == FAILING_RESULT.cause_hint, rec
+
+    def test_unconfirmable_falls_through_to_legacy_full_retry(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) Pre-filter None (UNCONFIRMABLE) -> byte-identical pre-3095
+        behavior: the full retry runs."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, FAILING_RESULT])
+        prefilter = AsyncMock(return_value=None)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert rfv.call_count == 2, (
+            f'Expected legacy fall-through (2 calls), got {rfv.call_count}'
+        )
+        assert result is not None
+        assert result[1].passed is False
+
+    def test_kill_switch_off_never_invokes_prefilter(self, tmp_path: Path) -> None:
+        """(d) main_tip_sweep_isolated_prefilter_enabled=False -> the
+        pre-filter is never invoked at all and the full retry runs, i.e. the
+        operator revert path is byte-identical pre-3095 behavior."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        config = config.model_copy(
+            update={'main_tip_sweep_isolated_prefilter_enabled': False}
+        )
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        prefilter = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert prefilter.call_count == 0, (
+            f'Expected the pre-filter to be gated off entirely, got '
+            f'{prefilter.call_count} call(s)'
+        )
+        assert rfv.call_count == 2, (
+            f'Expected the legacy full retry (2 calls), got {rfv.call_count}'
+        )
+        assert result is not None
+        assert result[1] is PASSING_RESULT
+
+    def test_prefilter_receives_sweep_worktree_and_first_pass_result(
+        self, tmp_path: Path
+    ) -> None:
+        """(e) The pre-filter is handed the sweep's OWN pinned worktree (no
+        second worktree add) and the FIRST-PASS result — not the retry's."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        prefilter = AsyncMock(return_value=False)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        prefilter.assert_awaited_once()
+        pf_worktree, pf_config, pf_result = prefilter.call_args.args
+        # Same worktree the full verification ran in — the sweep's own pin.
+        sweep_worktree = rfv.call_args_list[0].args[0]
+        assert pf_worktree == sweep_worktree, (
+            f'Expected the sweep worktree {sweep_worktree!r}, got {pf_worktree!r}'
+        )
+        assert str(pf_worktree).startswith(str(git_ops.worktree_base)), pf_worktree
+        assert pf_config is config
+        assert pf_result is FAILING_RESULT, (
+            f'Expected the FIRST-PASS result, got {pf_result!r}'
+        )
+
+    # -- step-9: ordering / fail-safe guards -------------------------------
+
+    def test_infra_sentinel_short_circuits_before_prefilter(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) A first-pass INFRA_TRANSIENT_CATEGORIES result still returns the
+        None sentinel WITHOUT invoking the pre-filter — the infra-sentinel
+        branch keeps precedence, so an infra crash never buys a subprocess
+        trying to reproduce test failures that were never really observed."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(return_value=INTERNALERROR_RESULT)
+        prefilter = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is None, f'Expected the None infra sentinel, got {result!r}'
+        assert prefilter.call_count == 0, (
+            f'Expected the infra branch to short-circuit BEFORE the pre-filter, '
+            f'got {prefilter.call_count} call(s)'
+        )
+        assert rfv.call_count == 1, rfv.call_count
+
+    def test_enoent_on_self_short_circuits_before_prefilter(
+        self, tmp_path: Path
+    ) -> None:
+        """(b) A first-pass result whose cause_hint names THIS sweep's own
+        tmp_path with an ENOENT returns None without invoking the pre-filter —
+        the task-2507 _enoent_on_self backstop keeps precedence (the worktree
+        is gone, so an isolated re-run in it is meaningless)."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        captured_worktrees: list = []
+
+        async def _rfv(worktree, *args, **kwargs):
+            captured_worktrees.append(worktree)
+            return VerifyResult(
+                passed=False,
+                test_output='',
+                lint_output='',
+                type_output='',
+                summary='unknown_test_failure',
+                cause_hint=(
+                    f'[Errno 2] No such file or directory: {worktree}/pyproject.toml'
+                ),
+                category='unknown_test_failure',
+            )
+
+        rfv = AsyncMock(side_effect=_rfv)
+        prefilter = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert captured_worktrees, 'fixture precondition: the sweep ran a verification'
+        assert result is None, (
+            f'Expected the None sentinel for a vanished sweep worktree, got {result!r}'
+        )
+        assert prefilter.call_count == 0, (
+            f'Expected the _enoent_on_self backstop to short-circuit BEFORE the '
+            f'pre-filter, got {prefilter.call_count} call(s)'
+        )
+
+    def test_prefilter_raise_does_not_abort_the_sweep(self, tmp_path: Path) -> None:
+        """(c) A pre-filter that RAISES must not propagate into
+        run_main_tip_sweep's outer `except Exception`, which would silently
+        turn a real sweep signal into the None sentinel. The sweep falls
+        through to the full retry instead."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, FAILING_RESULT])
+        prefilter = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is not None, (
+            'A raising pre-filter must not collapse the sweep into the None '
+            'sentinel — the real failing signal has to survive'
+        )
+        assert rfv.call_count == 2, (
+            f'Expected fall-through to the full retry (2 calls), got {rfv.call_count}'
+        )
+        assert result[1].passed is False

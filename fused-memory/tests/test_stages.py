@@ -4,6 +4,7 @@ import json
 import logging
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +18,7 @@ from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
+    DISALLOW_ESCALATION_READS,
     DISALLOW_MEMORY_WRITES,
     DISALLOW_TASK_WRITES,
     STAGE1_DISALLOWED,
@@ -29,6 +31,12 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.prompts import (
+    ESCALATION_BOUNDARY_NOTE,
+    render_escalation_boundary_note,
+)
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -76,6 +84,31 @@ def _scope(project_id: str, project_root: str) -> ProjectScope:
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
+def _mock_stage_deps() -> dict:
+    """Keyword deps for constructing any stage subclass in a unit test.
+
+    THE construction for the plain default case — no pre-configured mock returns,
+    no ``tmp_path`` root, the ``test_project`` / ``/tmp/test`` scope.  Every
+    ``mock_deps`` fixture in this module that wanted exactly that dict now returns
+    this helper, so a change to BaseStage's constructor signature lands in one
+    place for all of them.
+
+    Fixtures that legitimately differ still build their own dict and are NOT
+    covered by that claim: the ones that stub ``memory_service`` return values
+    (``count_memories_by_metadata``, ``delete_memory``, ``search``), the ones that
+    root ``explore_codebase_root`` at a ``tmp_path``, and the ones that need a
+    non-default scope (``reify``, ``origin``).  Reach for this helper when the
+    plain construction is what you want; don't bend a variant fixture into it.
+    """
+    return {
+        'memory_service': AsyncMock(),
+        'taskmaster': AsyncMock(),
+        'journal': AsyncMock(),
+        'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+        'scope': _scope('test_project', '/tmp/test'),
+    }
+
+
 def make_configured_task_knowledge_sync_stage(
     deps: dict, *, project_id: str, project_root: str, run_id: str = 'test-run'
 ) -> "TaskKnowledgeSync":
@@ -115,6 +148,47 @@ class TestMockTypesConstant:
         assert MagicMock in _MOCK_TYPES
 
 
+# Tools registered by the SHARED escalation.server.create_server that a recon
+# stage may hold. Reviewed for task 3023: none of them READS per-task escalation
+# state, so none can hand a stage a categorical [] to misread as proof that an
+# orchestrator record was never written.
+#
+#   - escalate_blocker / escalate_info — WRITES to the reconciliation store,
+#     which is the correct destination. escalate_blocker is Stage 2's sanctioned
+#     FIX D path; denying it would break FIX D (see render_escalation_boundary_note).
+#   - resolve_issue / stamp_triage / promote_to_l2 — act on an escalation the
+#     caller already has an id for; they answer no existence question.
+#   - merge_* / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
+#     reload_config / get_task_runtime_state — orchestrator control-plane and
+#     merge-lane surface, unrelated to the escalation-record question.
+#
+# This is the reviewed-safe half of the classification asserted by
+# test_every_escalation_server_tool_is_classified; the denied half is
+# DISALLOW_ESCALATION_READS. Adding a name here is a decision that the tool
+# cannot mislead a stage about the reconciliation queue — not a formality.
+_REVIEWED_STAGE_SAFE = {
+    'mcp__escalation__claim_warm_worktree',
+    'mcp__escalation__escalate_blocker',
+    'mcp__escalation__escalate_info',
+    'mcp__escalation__get_merge_halt_status',
+    'mcp__escalation__get_merge_queue',
+    'mcp__escalation__get_task_runtime_state',
+    'mcp__escalation__halt_merge_queue',
+    'mcp__escalation__halt_scheduler',
+    'mcp__escalation__merge_cancel',
+    'mcp__escalation__merge_request',
+    'mcp__escalation__merge_status',
+    'mcp__escalation__promote_to_l2',
+    'mcp__escalation__release_warm_worktree',
+    'mcp__escalation__release_workflow',
+    'mcp__escalation__reload_config',
+    'mcp__escalation__resolve_issue',
+    'mcp__escalation__resume_scheduler',
+    'mcp__escalation__stamp_triage',
+    'mcp__escalation__unhalt_merge_queue',
+}
+
+
 class TestDisallowedToolLists:
     """Verify per-stage disallowed tool lists are correct."""
 
@@ -126,14 +200,30 @@ class TestDisallowedToolLists:
         for tool in DISALLOW_MEMORY_WRITES:
             assert tool not in STAGE1_DISALLOWED
 
-    def test_stage2_disallows_builtins_only(self):
-        """STAGE2_DISALLOWED must equal DISALLOW_BUILTIN.
+    def test_stage2_disallows_builtins_and_retains_write_access(self):
+        """Built-ins are blocked in Stage 2, and Stage 2 keeps memory + task writes.
 
-        Stage 2 has full memory + task access; only built-ins are blocked.
+        Named for what it asserts and nothing more: the Stage-2 half of the
+        escalation-read denial is pinned by
+        ``test_escalation_reads_denied_in_all_three_stages`` below, which is where
+        that property belongs (all three stages, one loop).  This test does not
+        restate it — a name promising coverage its body does not carry is how a
+        deleted guard goes unnoticed.
+
+        RETIRED ASSERTION: this test used to read ``STAGE2_DISALLOWED ==
+        DISALLOW_BUILTIN``.  That exact equality asserted the absence of EVERY
+        future denial class in Stage 2, and it is precisely the shape that kept
+        the ``mcp__escalation__*`` read gap invisible here — PRD §4 names
+        ``STAGE2_DISALLOWED = DISALLOW_BUILTIN`` as the mechanism of the bug
+        (task 3163).  The contract Stage 2 actually needs is now asserted
+        positively: built-ins denied, full memory + task access retained, so an
+        additive denial can land without failing the build for the right change.
         add_subtask was previously in a separate DISALLOW_SUBTASK_CREATE list,
         but the tool has been removed (DF-D).
         """
-        assert STAGE2_DISALLOWED == DISALLOW_BUILTIN
+        assert set(DISALLOW_BUILTIN).issubset(set(STAGE2_DISALLOWED))
+        for tool in DISALLOW_MEMORY_WRITES + DISALLOW_TASK_WRITES:
+            assert tool not in STAGE2_DISALLOWED, f'Stage 2 must retain write access to {tool}'
 
     def test_stage3_disallows_all_writes(self):
         assert set(DISALLOW_TASK_WRITES).issubset(set(STAGE3_DISALLOWED))
@@ -198,26 +288,293 @@ class TestDisallowedToolLists:
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE1_DISALLOWED
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE2_DISALLOWED
 
+    def test_escalation_reads_constant_is_exactly_the_per_task_read_tools(self):
+        """DISALLOW_ESCALATION_READS names the escalation READ tools, nothing more.
+
+        Scoped deliberately tight: the denial exists because a per-task read
+        cannot be answered from a stage, not because the escalation surface is
+        off limits wholesale.  Anything broader would sweep up the sanctioned
+        write path (Stage 2 FIX D).
+
+        ``get_task_escalations`` joined the set in task 3023: it is registered
+        on the SHARED ``escalation.server.create_server``, which backs the
+        reconciliation queue as well as the orchestrator one, so leaving it out
+        exposed an archive-inclusive per-task lookup — pointed at the wrong
+        store — to all three stages.
+
+        ``get_task_escalation_history`` joined it in task 3164 — the same hazard
+        one degree worse.  It delegates to ``get_task_escalations``, so it is the
+        identical archive-inclusive cross-store read, but it wraps the result in
+        an envelope that echoes ``task_id`` and ``level_filter`` back.  Against
+        the reconciliation queue that makes a categorical ``count: 0`` read as an
+        attributable, query-specific answer — "no record was ever filed for this
+        task at this level" — when it is only the artefact of asking the wrong
+        store.  A bare ``[]`` at least looks anonymous; a self-describing zero
+        invites being believed.
+
+        The name is count-agnostic on purpose: it was renamed here from
+        ``..._the_three_read_tools`` when the fourth member landed, and a name
+        that promises a count forces a rename on every accession (and reads as a
+        lie in between — see the RETIRED ASSERTION note above).
+        """
+        assert set(DISALLOW_ESCALATION_READS) == {
+            'mcp__escalation__get_pending_escalations',
+            'mcp__escalation__get_escalation',
+            'mcp__escalation__get_task_escalations',
+            'mcp__escalation__get_task_escalation_history',
+        }
+        assert len(DISALLOW_ESCALATION_READS) == 4, 'no duplicate entries'
+
+    def test_every_escalation_server_tool_is_classified(self):
+        """Every tool the SHARED escalation server registers is denied or reviewed.
+
+        The stage gating is a DENY list only — there is no allow-list — so any
+        tool added to ``escalation.server.create_server`` becomes visible and
+        callable from Stage 1/2/3 the moment it is registered, against the
+        RECONCILIATION queue.  That is how ``get_task_escalations`` shipped
+        reachable from exactly the three agents that must not have it (task
+        3023 review).  A constant-only test cannot catch that: it pins what the
+        list says, not what the server exposes.
+
+        So enumerate the live tool surface and require every name to be
+        classified — either denied in every stage, or explicitly listed below
+        as reviewed-and-safe.  A new tool fails here until a human decides
+        which bucket it belongs in.  Adding a name to ``_REVIEWED_STAGE_SAFE``
+        is that decision; it is not a formality.
+        """
+        pytest.importorskip(
+            'escalation.server',
+            reason='sibling escalation package not installed (standalone checkout)',
+        )
+        import asyncio
+        import tempfile
+
+        from escalation.queue import EscalationQueue
+        from escalation.server import create_server
+
+        server = create_server(
+            EscalationQueue(Path(tempfile.mkdtemp())), startup_sweep=False
+        )
+        registered = {
+            f'mcp__escalation__{tool.name}'
+            for tool in asyncio.run(server.list_tools())
+        }
+
+        unclassified = registered - set(DISALLOW_ESCALATION_READS) - _REVIEWED_STAGE_SAFE
+        assert not unclassified, (
+            'These escalation-server tools are reachable from every recon stage '
+            f'and have not been classified: {sorted(unclassified)}. Either add each '
+            'to DISALLOW_ESCALATION_READS (cli_stage_runner.py) if a stage must not '
+            'call it — the default for anything that READS per-task escalation state, '
+            'since a stage is wired to the reconciliation queue and would read a '
+            'categorical [] as proof of absence — or add it to _REVIEWED_STAGE_SAFE '
+            'here once you have confirmed it is harmless against that store.'
+        )
+
+        # The denial must name tools that actually exist, or it is decoration.
+        stale = set(DISALLOW_ESCALATION_READS) - registered
+        assert not stale, (
+            f'DISALLOW_ESCALATION_READS names tools the server no longer registers: '
+            f'{sorted(stale)}. Remove them, or fix the rename.'
+        )
+
+    def test_escalation_reads_denied_in_all_three_stages(self):
+        """Every stage must deny the escalation read tools (task 3163).
+
+        A recon stage's ``escalation`` MCP connection is wired to the
+        RECONCILIATION escalation queue, never to a project's queue, so a
+        per-task read from a stage returns ``[]`` CATEGORICALLY — not as a race.
+        Three incidents read that ``[]`` as proof that no escalation was ever
+        filed.  Stage 2 was the gap: ``STAGE2_DISALLOWED = DISALLOW_BUILTIN``
+        denied nothing else at all.
+        """
+        for stage_list, name in (
+            (STAGE1_DISALLOWED, 'STAGE1_DISALLOWED'),
+            (STAGE2_DISALLOWED, 'STAGE2_DISALLOWED'),
+            (STAGE3_DISALLOWED, 'STAGE3_DISALLOWED'),
+        ):
+            assert set(DISALLOW_ESCALATION_READS).issubset(set(stage_list)), (
+                f'{name} must deny the escalation read tools'
+            )
+
+    def test_escalate_blocker_stays_allowed_in_every_stage(self):
+        """The escalation WRITE path must never be swept up by the read denial.
+
+        ``escalate_blocker`` is the sole sanctioned recon escalation use — the
+        Stale Flag Escalation (FIX D) path in Stage 2 (prompts/stage2.py).
+        Over-denying breaks FIX D outright, so this is the anti-over-denial
+        guard, structurally identical to the read-tool carve-outs above.
+        """
+        for stage_list, name in (
+            (STAGE1_DISALLOWED, 'STAGE1_DISALLOWED'),
+            (STAGE2_DISALLOWED, 'STAGE2_DISALLOWED'),
+            (STAGE3_DISALLOWED, 'STAGE3_DISALLOWED'),
+        ):
+            assert 'mcp__escalation__escalate_blocker' not in stage_list, (
+                f'{name} must keep the sanctioned escalation write path'
+            )
+
+    def test_stage_hooks_return_lists_covering_escalation_reads(self):
+        """Pin the ``get_disallowed_tools()`` hook, not just the module constants.
+
+        The hook (stages/base.py) is what actually reaches ``--disallowed-tools``
+        on the spawned CLI, so a constant that no stage returns would deny
+        nothing in production.
+        """
+        deps = _mock_stage_deps()
+        for cls, stage_id in (
+            (MemoryConsolidator, StageId.memory_consolidator),
+            (TaskKnowledgeSync, StageId.task_knowledge_sync),
+            (IntegrityCheck, StageId.integrity_check),
+        ):
+            stage = cls(stage_id, **deps)
+            assert set(DISALLOW_ESCALATION_READS).issubset(set(stage.get_disallowed_tools())), (
+                f'{cls.__name__}.get_disallowed_tools() must cover the escalation reads'
+            )
+
+
+class TestEscalationBoundaryNote:
+    """The escalation-store boundary note: one shared core, three consumers.
+
+    Companion to the DISALLOW_ESCALATION_READS denial (task 3163).  Denying the
+    read tools removes the false ``[]`` answer, but ``--disallowed-tools`` OMITS
+    a denied tool from the agent's listing rather than rejecting the call — so
+    without this paragraph the agent simply finds the tool gone, with no
+    explanation, and may conclude the escalation surface does not exist or route
+    around it.  The note is what converts a silent absence into an understood
+    boundary, which makes it load-bearing rather than decorative.
+
+    The note is a stage-agnostic core (``ESCALATION_BOUNDARY_NOTE``) plus a
+    per-stage *sanctioned-action* clause selected by
+    ``render_escalation_boundary_note(can_escalate=...)``: Stage 2 holds the
+    FIX D escalate_blocker path, Stage 1 and Stage 3 hold no sanctioned
+    escalation action at all.
+
+    These are wiring/invariant and tool-name-capability assertions, deliberately
+    not a prose pin.
+    """
+
+    def test_boundary_note_rendered_verbatim_into_all_three_stage_prompts(self):
+        """One constant, three consumers, no per-stage paste (INV-5).
+
+        Exactly-once, not merely present: a second copy would mean a stage
+        interpolated it twice or someone pasted the prose alongside the
+        constant, which is the drift this shared-constant shape exists to stop.
+
+        Also subsumes the type/non-emptiness of the constant, so no separate
+        tautology test guards that: ``str.count('')`` is ``len(s) + 1``, so an
+        empty or non-string ``ESCALATION_BOUNDARY_NOTE`` fails right here.
+        """
+        for prompt, name in (
+            (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
+            (build_stage2_system_prompt('dark_factory'), 'STAGE2_SYSTEM_PROMPT'),
+            (STAGE3_SYSTEM_PROMPT, 'STAGE3_SYSTEM_PROMPT'),
+        ):
+            assert ESCALATION_BOUNDARY_NOTE in prompt, f'{name} must render the boundary note'
+            assert prompt.count(ESCALATION_BOUNDARY_NOTE) == 1, (
+                f'{name} must render the boundary note exactly once'
+            )
+
+    def test_boundary_note_present_on_the_autopilot_video_stage2_path(self):
+        """The conditional guardrail-injection branch must not drop or duplicate it.
+
+        build_stage2_system_prompt takes a different code path for
+        autopilot_video (it splices the contamination guardrail in at the
+        '## Available Tools' sentinel), so the note is pinned on that branch too.
+        """
+        prompt = build_stage2_system_prompt('autopilot_video')
+        assert prompt.count(ESCALATION_BOUNDARY_NOTE) == 1
+
+    def test_boundary_note_does_not_contain_the_stage2_injection_sentinel(self):
+        """The note must not carry the '## Available Tools' heading.
+
+        Load-bearing: build_stage2_system_prompt raises RuntimeError unless that
+        sentinel appears EXACTLY once in STAGE2_SYSTEM_PROMPT.  A note carrying
+        the heading would make it appear twice and hard-fail Stage 2 prompt
+        construction for autopilot_video.
+        """
+        assert '## Available Tools' not in ESCALATION_BOUNDARY_NOTE
+
+    def test_boundary_note_core_is_stage_agnostic(self):
+        """The shared core must not name a write path only one stage may use.
+
+        A TOOL-NAME capability assertion, not a wording pin: this constant is
+        rendered into ALL THREE stage prompts, so anything it names is named to
+        every stage.  ``escalate_blocker`` is a Stage-2-only mechanism (FIX D),
+        so it belongs in the per-stage clause, never in the shared core.
+
+        The constant's own comment used to claim it was "Identical for all three
+        stages — no per-stage parameters", which is exactly what hid the
+        mismatch: its final sentence licensed an escalation write in Stage 1 and
+        Stage 3 too.
+        """
+        assert 'escalate_blocker' not in ESCALATION_BOUNDARY_NOTE
+
+    def test_render_escalation_boundary_note_varies_the_sanctioned_action(self):
+        """The renderer swaps only the sanctioned-action clause, never the core.
+
+        Mirrors the ``render_source_completion_section(*, can_file_tasks=...)``
+        precedent (recon_self_model.py): one shared body, one capability-gated
+        clause, keyword-only flag.  INV-5 is preserved — the shared core still
+        appears exactly once in either rendering.
+        """
+        allowed = render_escalation_boundary_note(can_escalate=True)
+        denied = render_escalation_boundary_note(can_escalate=False)
+
+        assert 'mcp__escalation__escalate_blocker' in allowed, (
+            'can_escalate=True must name the sanctioned FIX D write path'
+        )
+        assert 'escalate_blocker' not in denied, (
+            'can_escalate=False must not name a tool the stage is not sanctioned to use'
+        )
+        for rendered, label in ((allowed, 'can_escalate=True'), (denied, 'can_escalate=False')):
+            assert rendered.count(ESCALATION_BOUNDARY_NOTE) == 1, (
+                f'{label} must carry the shared core exactly once'
+            )
+            assert '## Available Tools' not in rendered, (
+                f'{label} must not carry the build_stage2_system_prompt sentinel'
+            )
+
+    def test_stage1_and_stage3_prompts_never_name_the_escalation_write_tool(self):
+        """A stage with no sanctioned escalation action must not be told about one.
+
+        The durable end-state assertion: it pins the property at the CONSUMER,
+        independent of how the note is assembled.  Stage 3 declares "You do NOT
+        have write or mutation tools" (prompts/stage3.py) — and because
+        ``escalate_blocker`` is deliberately absent from every disallow list
+        (see TestDisallowedToolLists above), the tool really is callable, so a
+        licensing sentence there points at a real durable write to the
+        reconciliation escalation queue.  Stage 1 has no FIX D mechanism either
+        (FIX D lives in TaskKnowledgeSync, not IntegrityCheck).
+        """
+        for prompt, name in (
+            (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
+            (STAGE3_SYSTEM_PROMPT, 'STAGE3_SYSTEM_PROMPT'),
+        ):
+            assert 'escalate_blocker' not in prompt, (
+                f'{name} must not name the escalation write tool — that stage has no '
+                'sanctioned escalation action'
+            )
+
+    def test_stage2_prompt_still_names_the_escalation_write_tool(self):
+        """Anti-over-correction guard: FIX D must survive the fix.
+
+        Stage 2 IS sanctioned to call escalate_blocker for the Stale Flag
+        Escalation (FIX D) case, on both the plain and the autopilot_video
+        guardrail-injection branches of build_stage2_system_prompt.
+        """
+        for project_id in ('dark_factory', 'autopilot_video'):
+            assert 'mcp__escalation__escalate_blocker' in build_stage2_system_prompt(project_id), (
+                f'Stage 2 prompt for {project_id} must keep the FIX D escalation write path'
+            )
+
 
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
 
     @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-        )
-
-    @pytest.fixture
-    def mock_deps(self, config):
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+    def mock_deps(self):
+        return _mock_stage_deps()
 
     def test_memory_consolidator_disallowed(self, mock_deps):
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
@@ -383,14 +740,7 @@ class TestPerStageReportSchema:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def test_integrity_check_returns_stage3_schema(self, mock_deps):
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
@@ -652,14 +1002,7 @@ class TestTaskKnowledgeSyncPayload:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -870,14 +1213,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -1109,14 +1445,7 @@ class BaseStageValidationTest:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _patch_stage(self, stage, cli_side_effect=None):
         """Return a context manager that patches assemble_payload and run_stage_via_cli.
@@ -1453,14 +1782,7 @@ class TestProactiveSampling:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -2013,14 +2335,7 @@ class TestStage2NoTaskIdCeiling:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_high_task_ids_do_not_block_task_writes(self, mock_deps):
@@ -2374,14 +2689,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -2527,29 +2835,19 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
     async def test_stage_does_not_apply_second_slice_on_done_tasks(
         self, mock_deps, watermark
     ):
-        """Stage must NOT apply a second done_tasks slice on top of filter_task_tree's cap.
+        """Exactly MAX_DONE_TASKS_RETAINED done tasks must ALL appear in Recently Completed.
 
-        Two assertions:
-        (1) Source-level guard: assemble_payload source must not contain a slice on
-            done_tasks (e.g. ``done_tasks[:30]``).  This is a tripwire — it fires the
-            moment someone re-introduces a hardcoded re-slice that duplicates the cap
-            already enforced by filter_task_tree.
-        (2) Behavioral guard: exactly MAX_DONE_TASKS_RETAINED done tasks must ALL appear
-            in the Recently Completed section — the stage must not silently trim them.
+        At the cap boundary the stage must not silently trim: filter_task_tree has already
+        enforced MAX_DONE_TASKS_RETAINED, so every task it hands over has to survive
+        assemble_payload's rendering.
+
+        Scope note: this feeds *exactly* MAX_DONE_TASKS_RETAINED tasks, so a re-introduced
+        ``done_tasks[:30]`` re-slice passes all 30 through unchanged and would keep this
+        test green.  The oversized-tree case that actually detects a redundant re-slice
+        lives in ``test_assemble_payload_does_not_re_slice_an_oversized_done_tasks_tree``
+        (which also replaced the inspect.getsource source-text tripwire this test used to
+        carry as its first assertion — see task 3351).
         """
-        import inspect
-        import re
-
-        # (1) Source-level tripwire: assemble_payload must not slice done_tasks.
-        source = inspect.getsource(TaskKnowledgeSync.assemble_payload)
-        assert not re.search(r'done_tasks\[.*:.*\]', source), (
-            "assemble_payload contains a slice on done_tasks (e.g. done_tasks[:30]). "
-            "This is dead code — filter_task_tree already caps done_tasks at "
-            f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}. "
-            "Remove the slice; filter_task_tree is the single source of truth."
-        )
-
-        # (2) Behavioral guard: all MAX_DONE_TASKS_RETAINED tasks pass through uncut.
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='test_project', project_root='/tmp/test_project')
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
@@ -2573,6 +2871,59 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             f"Tasks {missing} missing from Recently Completed section. "
             f"The stage may be applying a redundant slice that trims "
             f"filter_task_tree's already-capped output.\n"
+            f"Section content:\n{section}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_assemble_payload_does_not_re_slice_an_oversized_done_tasks_tree(
+        self, mock_deps, watermark
+    ):
+        """assemble_payload must render EVERY done task it is handed — no second truncation.
+
+        Asserts on RENDERED OUTPUT (the '### Recently Completed Tasks' section), not on
+        source text.  The tree is deliberately OVERSIZED
+        (``MAX_DONE_TASKS_RETAINED + 5`` — a state ``filter_task_tree`` can never produce)
+        and injected through the ``stage.filtered_task_tree`` seam that ``assemble_payload``
+        honours ahead of its ``filter_task_tree`` fallback, because the sibling
+        ``test_stage_does_not_apply_second_slice_on_done_tasks`` sits exactly at the cap
+        where a re-introduced ``done_tasks[:30]`` passes all 30 through and stays green.
+
+        The size of ``done_tasks`` is the ONLY deliberate anomaly: every other field of the
+        injected tree is populated consistently with it.
+        """
+        n_done = MAX_DONE_TASKS_RETAINED + 5
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        done_tasks = [self._make_task(i, 'done') for i in range(1, n_done + 1)]
+        # done_count == len(done_tasks) keeps _check_filtered_tree_invariant quiet;
+        # all_done_tasks (read by the since-boundary completion-memory audit) and
+        # max_task_id are populated to match, so the oversized done_tasks list is the
+        # only way this tree differs from a filter_task_tree output.
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=done_tasks,
+            all_done_tasks=list(done_tasks),
+            done_count=n_done,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=n_done,
+            max_task_id=n_done,
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, '### Recently Completed Tasks')
+        assert section, "Payload missing '### Recently Completed Tasks' section"
+
+        missing = [tid for tid in range(1, n_done + 1) if f'- [{tid}] ' not in section]
+        assert not missing, (
+            f"Task ids {missing} were dropped from the Recently Completed section. "
+            f"assemble_payload was handed {n_done} done tasks and must render all of them. "
+            f"filter_task_tree is the single source of truth for the "
+            f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED} cap, so any truncation "
+            f"inside the stage is a redundant re-slice — remove it.\n"
             f"Section content:\n{section}"
         )
 
@@ -2727,14 +3078,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -3043,14 +3387,7 @@ class TestInvariantAfterTask643:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -3749,14 +4086,7 @@ class TestStage2HandoffShortfallWarning:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -4557,14 +4887,7 @@ class TestMemoryConsolidatorFlagDedup:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_normal_cycle_invokes_dedup_flags(self, mock_deps):
@@ -4670,14 +4993,7 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_cancelled_task_stale_metadata_absent_from_flagged_items(self, mock_deps):
@@ -4783,14 +5099,7 @@ class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_agreeing_flag_dropped_stat_set_and_reclaimed(self, mock_deps):
@@ -4911,14 +5220,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_dropped_flag_acknowledged_and_stat_set(self, mock_deps):
@@ -5252,14 +5554,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _make_base_report(self, items_flagged=None):
         return StageReport(
@@ -9239,14 +9534,7 @@ class TestStage3PayloadIncludesProjectRoot:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_integrity_check_payload_emits_use_project_root_directive(self, mock_deps):
@@ -9474,14 +9762,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _make_cli_result(self, flagged_items: list[dict]) -> MagicMock:
         """Return a fake StageResult-like object for patching run_stage_via_cli."""
@@ -10133,14 +10414,7 @@ class TestBaseStageEscalationQueueAttribute:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def test_escalation_queue_initialised_to_none(self, mock_deps):
         """(a) Fresh MemoryConsolidator has _escalation_queue == None."""
@@ -10318,14 +10592,7 @@ class TestStage2HintConversionDetection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -10839,14 +11106,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -11512,14 +11772,7 @@ class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_no_taskmaster_no_ops_without_invoking_briefing_script(self, mock_deps):
@@ -13264,3 +13517,298 @@ class TestGcReconMarkers:
 
         assert result == 3
         ledger.gc.assert_awaited_once_with(scope.project_id, ANY, [])
+
+
+class TestSweepStaleMem0PoolProtectsMirrorRecords:
+    """_sweep_stale_mem0_pool never deletes a cycle_summary ledger mirror (task 3041).
+
+    Recon gate 165 (esc-165-1) reported cycle_summary Mem0 anchors vanishing
+    with no audit trail. The adjacent precision defect the finding asked us to
+    audit is real and structurally reachable: _FLAG_FOR_STAGE2_ENUM_FILTERS is
+    ``{'flag_for_stage2': True}`` with NO kind/source/record_type
+    discriminator, and ``flag_for_stage2`` is an LLM-supplied metadata key that
+    nothing at the add_memory boundary stops a cycle_summary write from also
+    carrying. No amount of payload-filter tightening fixes that, so the guard
+    lives at the ONE choke point all three marker sweeps already funnel
+    through — this skeleton — and every current and future caller inherits it.
+
+    A skipped mirror logs a WARNING rather than being silently kept: an
+    over-broad filter must become VISIBLE, per the project's
+    loud-over-silent-degradation / no-silent-fail-soft invariant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_protected_mirror_skipped_ordinary_marker_still_deleted(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_pool,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {
+                'id': 'ordinary-marker',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+            {
+                'id': 'protected-mirror',
+                'created_at': stale,
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'record_type': 'ledger_stamp',
+                    'run_id': 'r-victim',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'r1',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'ordinary-marker'}
+        assert 'protected-mirror' not in deleted_ids
+        # The skip is EXCLUDED from the count, not silently counted as a delete.
+        assert result == 1
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'protected-mirror' in message
+        assert 'cycle_summary' in message
+        assert 'ledger_stamp' in message
+        assert '_sweep_stale_mem0_flag_markers' in message
+
+    @pytest.mark.asyncio
+    async def test_mirror_protected_even_when_only_kind_is_present(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_pool,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'kind-only-mirror',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'cycle_summary', 'source': 'stage1_flag_marker'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_pool(
+            memory_service,
+            'dark_factory',
+            'r1',
+            source='stage1_flag_marker',
+            gc_sweep_source='stage1_flag_marker_gc_sweep',
+            max_age_days=14,
+            log_name='_sweep_stale_mem0_flag_markers',
+            now=fixed_now,
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_over_broad_flag_for_stage2_sweep_cannot_take_a_mirror(self):
+        """The concrete over-broad predicate this task was asked to audit.
+
+        _FLAG_FOR_STAGE2_ENUM_FILTERS matches ANY record carrying
+        flag_for_stage2=True — including a cycle_summary mirror, since stage
+        metadata is LLM-supplied and nothing constrains extra keys.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {
+                'id': 'ordinary-relay-marker',
+                'created_at': stale,
+                'metadata': {'flag_for_stage2': True, 'task_id': 't1'},
+            },
+            {
+                'id': 'protected-mirror',
+                'created_at': stale,
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'record_type': 'ledger_stamp',
+                    'run_id': 'r-victim',
+                    'flag_for_stage2': True,
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'dark_factory', run_id='r1', now=fixed_now,
+        )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'ordinary-relay-marker'}
+        assert result == 1
+
+
+class TestSweepStaleMem0PoolTombstones:
+    """Every recon-initiated Mem0 delete leaves a queryable tombstone (task 3041).
+
+    The defining signature of the recon-gate-165 / esc-165-1 finding was "no
+    audit trail": an auditor holding a memory uuid had no reachable path to
+    "who deleted it and why", so a designed eviction was indistinguishable
+    from silent data loss. The tombstone is written from the SUCCESS branch
+    only, so a tombstone always means "really gone".
+    """
+
+    @staticmethod
+    def _stale_members(fixed_now):
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        return [
+            {
+                'id': 'deleted-ok',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1',
+                             'run_id': 'run-victim'},
+            },
+            {
+                'id': 'delete-fails',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't2',
+                             'run_id': 'run-victim'},
+            },
+        ]
+
+    @staticmethod
+    def _service(members):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+
+        async def _delete(**kwargs):
+            if kwargs.get('memory_id') == 'delete-fails':
+                raise RuntimeError('mem0 delete exploded')
+            return None
+
+        memory_service.delete_memory = AsyncMock(side_effect=_delete)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_tombstone_written_only_for_the_successful_delete(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = self._stale_members(fixed_now)
+        memory_service = self._service(members)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        # ONE batch call for the whole sweep — not one fsync'd ledger commit
+        # per victim (task 3041 amendment pass).
+        assert tombstone.await_count == 1
+        call = tombstone.await_args
+        assert call is not None
+        assert call.args[1] == 'dark_factory'
+        # A tombstone must never claim a record that is still alive: the
+        # failed delete is absent from the batch.
+        assert call.args[2] == [members[0]]
+        assert call.kwargs['deleter'] == 'stage1_flag_marker_gc_sweep'
+        assert call.kwargs['deleting_run_id'] == 'run-deleter'
+
+        # Tombstone writing does not perturb the existing accounting.
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_a_raising_tombstone_helper_cannot_propagate_or_change_the_count(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        memory_service = self._service(self._stale_members(fixed_now))
+
+        with patch.object(
+            tks,
+            'record_mem0_deletion_tombstones',
+            new=AsyncMock(side_effect=RuntimeError('ledger db locked')),
+        ):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_no_tombstone_when_nothing_was_deleted(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'fresh',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=0)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 0
+        tombstone.assert_not_awaited()

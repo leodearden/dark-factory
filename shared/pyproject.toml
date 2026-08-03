@@ -58,9 +58,23 @@ timeout_method = "signal"
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "tests"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+extraPaths = ["src", "tests", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+# Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own
+# .venv (venvPath is resolved relative to this file's directory, so it can
+# never name another tree's environment). Without it, a bare `cd shared && npx
+# pyright` resolves the interpreter from ambient VIRTUAL_ENV/PATH — which
+# verify._target_subprocess_env deliberately strips — so a cold merge worktree
+# type-checks against an env holding none of the workspace's third-party
+# packages: measured 68 phantom reportMissingImports here, 0 with this pin.
+# Today this member is type-checked via `uv run --project shared ... pyright`,
+# which resolves the SAME root .venv, so the pin changes no current result —
+# it only removes the dependency on ambient resolution.
+venvPath = ".."
+venv = ".venv"
 
 [tool.ruff]
 line-length = 100

@@ -9,9 +9,11 @@ import json
 import logging
 import os
 import re
+import string
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -69,6 +71,10 @@ from orchestrator.artifacts import (
     TaskArtifacts,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.delivered_checks import (
+    DeliveredChecksBlock,
+    gate_mark_done_on_delivered_checks,
+)
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
@@ -98,6 +104,13 @@ from orchestrator.scheduler import (
     normalize_lock,
 )
 from orchestrator.session_registry import build_session_slug
+from orchestrator.stranded_verified_green import (
+    DURABLE_MERGE_FAILURE_STATUSES,
+    SUCCESS_TRANSIENT_MERGE_STATUSES,
+    last_verified_green_tip,
+    merge_request_marker_is_fresh,
+    submit_verified_green_merge_request,
+)
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -367,6 +380,7 @@ class _BriefingLike(Protocol):
     async def build_architect_prompt(
         self, task: dict, worktree: Path | None = ..., context: str | None = ...,
         *, include_prior_proposals: bool = ...,
+        committed_work: list[dict] | None = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
@@ -965,6 +979,34 @@ class _PriorImplStatus(NamedTuple):
     """SHA read from metadata.json, or None if the file is absent."""
 
 
+_MIN_ABBREV_SHA_LEN = 7
+"""Shortest recorded ``commit`` value accepted as provenance — git's own
+default abbreviation length."""
+
+
+def _is_plausible_sha(value: object) -> bool:
+    """True iff ``value`` looks like a git SHA (or an abbreviation git emits).
+
+    Gate for the bidirectional prefix match that credits a plan step's recorded
+    ``commit`` with beyond-base provenance (task 3033 amendment). Without it,
+    ``recorded.startswith(sha) or sha.startswith(recorded)`` admits arbitrarily
+    short values: an LLM-recorded ``'a'`` or ``'ab'`` prefixes SOME beyond-base
+    SHA on any branch of a few commits, and a value LONGER than 40 hex chars
+    (a full SHA plus trailing junk) passes the first arm outright. Either would
+    re-open the fail-closed hole the provenance filter exists to close, letting
+    ``_recover_before_merge`` resolve ``has_work=True`` on unbacked provenance.
+
+    The sibling idiom in ``_detect_tip_wip_commits`` needs no such gate: there
+    the match only DEDUPs, where a false positive is benign (a commit merely
+    isn't re-surfaced in the next briefing).
+    """
+    text = str(value or '')
+    return (
+        _MIN_ABBREV_SHA_LEN <= len(text) <= 40
+        and all(ch in string.hexdigits for ch in text)
+    )
+
+
 def _iteration_entry_is_work(entry: dict) -> bool:
     """Classify a single iterations.jsonl entry as genuine prior-implementation
     work (task 2372, Layer A).
@@ -982,6 +1024,25 @@ def _iteration_entry_is_work(entry: dict) -> bool:
     - ``'judge'`` ``early_exit`` entries count only when ``substantive_work``
       is True (workflow.py ~4559) — a judge can legitimately declare a task
       complete with zero plan-steps marked done.
+    - ``'architect'`` ``execute_skipped`` entries count only when
+      ``steps_completed`` is non-empty (task 3033 / PRD §A1) — the entry
+      ``_execute_iterations`` writes when every plan step was pre-satisfied at
+      authoring time via ``mark_step_committed`` and EXECUTE ran zero
+      iterations. It IS real work, but NOT because of the authoring-time
+      guard: ``plan_tools._sha_exists_on_branch`` is ``git merge-base
+      --is-ancestor <sha> HEAD``, which accepts ``base_commit`` ITSELF and
+      arbitrary main ancestors below base, so it does NOT establish
+      beyond-base work (and ``update_step_status`` permits ``commit=None``
+      outright). The real basis is at the WRITER: ``_execute_iterations``
+      only ever emits this entry after confirming that every id it names
+      carries a commit that is a member of ``base_commit..HEAD`` at write
+      time, so a non-empty ``steps_completed`` is itself the evidence.
+      Deliberately narrow — BOTH the exact ``event`` name AND a non-empty
+      ``steps_completed`` are required, so a zero-work architect entry (or an
+      architect entry with any other event) can never resolve
+      ``has_work=True``. The ``judge`` clause is the direct precedent: an
+      agent legitimately declaring the plan satisfied without an implementer
+      turn.
 
     An entry that explicitly recorded no durable commit (``committed is False``,
     task 2759) is not prior-implementation work regardless of agent type — the
@@ -999,6 +1060,11 @@ def _iteration_entry_is_work(entry: dict) -> bool:
         return entry.get('source') == 'amendment' or bool(entry.get('steps_completed'))
     if agent == 'judge':
         return entry.get('event') == 'early_exit' and bool(entry.get('substantive_work'))
+    if agent == 'architect':
+        return (
+            entry.get('event') == 'execute_skipped'
+            and bool(entry.get('steps_completed'))
+        )
     return False
 
 
@@ -1539,6 +1605,28 @@ class TaskWorkflow:
             return statuses or {}  # type: ignore[return-value]
 
         async def _mark_member_done(mid: str, sha: str) -> None:
+            # task 3057 (seam 10): a landed train proves MAIN advanced, never
+            # that THIS member's declared capability rode along (a member can be
+            # mis-stacked, dropped by a rebase, or have delivered nothing at
+            # all).  On a withholding we RETURN rather than raise: the merge
+            # worker's post-advance flip loop collects raises into
+            # TRAIN_PARTIAL_FLIP, and this is NOT a partial flip — the merge
+            # genuinely advanced main; only this member's declared deliverable
+            # is unverifiable.  The write-ahead LandedRow is deliberately NOT
+            # consumed (it is the only record of the crash-window intent), and
+            # the member is REVERTED TO PENDING — its only recovery edge, since
+            # the stranded sweep provably cannot reach a merge-deferred task
+            # (see _revert_withheld_member).
+            block = await self._member_delivered_checks_withhold(
+                mid, site='workflow-train-member-merged',
+            )
+            if block is not None:
+                await self._revert_withheld_member(
+                    mid, train_id=train_id,
+                    site='workflow-train-member-merged',
+                    reason=block.reason,
+                )
+                return
             await self.scheduler.mark_done(
                 mid, kind='merged', sha=sha, note=f'train {train_id}',
             )
@@ -1914,6 +2002,21 @@ class TaskWorkflow:
                 'Internal: SUCCESS without merge_sha — provenance unconstructable',
                 escalate_to_human=True,
             )
+        # task 3057: this stamp is DELIBERATELY NOT routed through
+        # `gate_mark_done_on_delivered_checks`, unlike the eleven
+        # attribution-shaped seams in this module, harness.py and
+        # merge_queue.py.  It is not attribution-shaped: the workflow just
+        # performed the merge itself and holds its own `self._merge_sha`, so
+        # there is no INFERENCE here that could be wrong (no git-ancestry
+        # guess, no journal row, no architect claim, no sibling's train
+        # landing credited to this task).  Guarding it would gate EVERY
+        # task's normal completion on `delivered_checks`, converting an
+        # attribution guard into a fleet-wide merge-blocking quality gate —
+        # a far larger behavioural change than task 3057 authorises.  See
+        # task 3057 design decision 2; a follow-up task candidate
+        # (suggestion_hash `3057-workflow-post-merge-success-stamp`) holds
+        # that decision open so a human makes it deliberately rather than by
+        # omission.
         try:
             await self.scheduler.mark_done(
                 self.task_id, kind='merged', sha=self._merge_sha,
@@ -3172,6 +3275,13 @@ class TaskWorkflow:
         # Clearing here keeps the stamp/clear lifecycle symmetric; it is an
         # idempotent no-op when nothing was ever stamped (the common case).
         await self._clear_merge_retry_pending()
+        # Task 2991: likewise discharge the durable merge-phase-liveness stamp.
+        # The enqueue-boundary clear in _submit_to_merge_queue covers the normal
+        # path, but ghost-loop / eval-mode successes reach DONE without passing
+        # through it — so clear here too, keeping a DONE task from carrying a
+        # fresh stamp that would briefly defer an unrelated stranded divergence
+        # orphan in the reaper. Idempotent no-op when unstamped.
+        await self._clear_merge_phase_entered()
 
         # SUCCESS — write completion knowledge (best-effort after merge)
         try:
@@ -3183,7 +3293,7 @@ class TaskWorkflow:
             )
         # Wait for steward to finish any pending work (suggestion triage, etc.)
         await self._ensure_steward_started()
-        await self._await_steward_completion()
+        await self._await_steward_completion(skip_if_idle=True)
         self._enter_phase(WorkflowState.DONE)
         return await self._finalise_merged_done()
 
@@ -3201,11 +3311,30 @@ class TaskWorkflow:
         plan/execute/verify/review (zero reviewer_comprehensive; ``merge_queued``
         is the next pipeline event, matching the observable signal).
 
+        A HEAD match alone is NOT sufficient (task 3024): it proves only that
+        the branch has not MOVED, not that it still MERGES. Main advancing
+        underneath an unchanged branch can introduce a rebase conflict, and the
+        fast-path would then hand an empty ``plan.files`` workflow to the merge
+        phase — tripping the merge-entry scope invariant on every dispatch, in a
+        loop no escalation action could break. So the resume preconditions also
+        require that the branch STILL cleanly merges onto current main, probed
+        object-store-only via :meth:`GitOps.merge_tree_conflicts`.
+
         Fail-safe fall-through to the full pipeline (returns ``None``) on a
-        missing/non-dict stamp, a rev-parse failure, or a HEAD mismatch. On a
-        mismatch it additionally clears the now-stale stamp — main advanced and
-        the branch was rebased to new SHAs, so it can never match again, and
-        resubmitting possibly-divergent code is exactly what we must avoid.
+        missing/non-dict stamp, a rev-parse failure, a HEAD mismatch, a
+        confirmed conflict, or a failed conflict probe. Whether it also CLEARS
+        the stamp turns on whether the obligation is provably void:
+
+        * A HEAD mismatch clears — main advanced and the branch was rebased to
+          new SHAs, so it can never match again, and resubmitting
+          possibly-divergent code is exactly what we must avoid.
+        * A confirmed conflict clears — that obligation can never be satisfied
+          as stamped, and the full pipeline gives an agent the chance to rebase
+          and resolve (or fail as an ordinary task_failure).
+        * A rev-parse or probe FAILURE does NOT clear — an error is a
+          non-verdict, so the durable obligation is preserved for a later
+          dispatch rather than silently discarded on a transient fault.
+
         Clear-on-consume is idempotent and loop-safe: if the resumed merge
         re-blocks and the steward resolves again, ``_requeue`` re-stamps a fresh
         obligation.
@@ -3239,6 +3368,34 @@ class TaskWorkflow:
             )
             await self._clear_merge_retry_pending()
             return None
+        # The branch has not MOVED — but has it stopped MERGING?  Main may have
+        # advanced underneath it since the steward resolved, introducing a
+        # rebase conflict.  Resuming straight to merge with an empty plan.files
+        # would then trip the merge-entry scope invariant on every dispatch
+        # (task 3024), so probe the merge before honouring the fast-path.
+        try:
+            main_sha = await self.git_ops.get_main_sha()
+            probe = await self.git_ops.merge_tree_conflicts(main_sha, current_head)
+        except Exception as exc:  # noqa: BLE001 — fail-safe: fall through to full pipeline
+            # A probe FAILURE is not a conflict VERDICT: it says nothing about
+            # whether the branch still merges.  So fall back to the full
+            # pipeline for this dispatch but leave the durable stamp intact for
+            # a later one — the opposite of the confirmed-conflict arm below.
+            logger.warning(
+                'Task %s: could not verify branch still cleanly merges resolving '
+                'merge_retry_pending (%s) — running full pipeline',
+                self.task_id, exc,
+            )
+            return None
+        if not probe.clean:
+            logger.warning(
+                'Task %s: merge_retry_pending branch %s no longer merges cleanly '
+                'onto current main %s (conflicts: %s) — resume preconditions '
+                'void, clearing stamp and running full pipeline',
+                self.task_id, current_head, main_sha, probe.conflicted_paths,
+            )
+            await self._clear_merge_retry_pending()
+            return None
         logger.info(
             'Task %s: merge_retry_pending HEAD match (%s) — resuming straight to '
             'merge phase, skipping plan/execute/verify/review',
@@ -3263,11 +3420,29 @@ class TaskWorkflow:
 
         self._enter_phase(WorkflowState.MERGE)
 
+        # task 2991: write the durable, restart-survivable merge-phase liveness
+        # stamp immediately on merge entry — BEFORE _check_scope_invariant files
+        # its plan.files/metadata.files divergence L0 and BEFORE the gating bail
+        # below. The orphan-L0 divergence reaper's _has_fresh_merge_phase gate
+        # reads it to DEFER (not promote) a live merge-stage task, which the
+        # pre-enqueue loop (no LLM calls) would otherwise fail the task-2931
+        # routing.latest freshness gate. Placed here so it is refreshed on every
+        # (re-)dispatch into merge phase, including passes that immediately bail
+        # to ESCALATED — exactly the passes a live-but-wedged task cycles
+        # through. (Distinct from the in-memory note_merge_phase_entered at the
+        # retry-loop top, which is the self-redeploy coordinator's signal.)
+        _entry_metadata = await self._stamp_merge_phase_entered()
+
         # Tripwire (task 2505): plan.files must equal metadata.files by
         # construction (the scope-reconciliation choke point keeps them in
         # lockstep) — a divergence here means some path bypassed it. Purely
         # observational: logs + escalates, never blocks the merge.
-        await self._check_scope_invariant()
+        # The stamp above already read this task's backend metadata blob;
+        # thread it in rather than issuing a second identical get_task on the
+        # merge hot path (review amendment). A None/unreadable prefetch falls
+        # back to _check_scope_invariant's own read, so its fail-safe is
+        # unchanged.
+        await self._check_scope_invariant(backend_metadata=_entry_metadata)
 
         # Defense-in-depth: any blocking L0 escalation, or any
         # born-at-L2 (critical/urgent), or any level≥2 escalation
@@ -3313,6 +3488,25 @@ class TaskWorkflow:
             # Cleared at the durable-enqueue boundary in _submit_to_merge_queue
             # and defensively in the harness _run_slot finally.
             self.scheduler.note_merge_phase_entered(self.task_id)
+            # task 2991 (review-fix R2-B): refresh the DURABLE liveness stamp
+            # alongside the in-memory one above, for the same reason. Each
+            # REQUEUED retry re-runs a full vulnerable pre-enqueue window
+            # (Phase-1 rebase + scoped re-verify, minutes, zero LLM calls)
+            # AFTER _submit_to_merge_queue discharged the stamp at the enqueue
+            # boundary. Without this re-stamp that window has neither a durable
+            # merge_phase_liveness nor a fresh routing.latest, so the task
+            # 2931/2991 divergence false positive recurs on every merge retry
+            # (a REQUEUED retry goes through a steward resolution first, so the
+            # merge-entry L0 is already older than orphan_l0_timeout_secs when
+            # attempt 2 begins). The merge-entry stamp above is KEPT — it must
+            # precede _check_scope_invariant and the gating bail, both of which
+            # sit above this loop — so attempt 1 writes twice: an accepted cost
+            # (two cheap best-effort metadata writes, bounded by
+            # max_merge_retries+1 per merge entry) for the simple invariant "a
+            # fresh durable stamp exists at the start of every pre-enqueue
+            # window", which an `if _merge_attempt > 0` would make dependent on
+            # loop-index reasoning.
+            await self._stamp_merge_phase_entered()
             # Phase 1: pre-merge rebase (no lock, no queue slot)
             # Rebase the task branch onto current main and re-verify
             # so the queued merge phase is fast/trivial.
@@ -3786,9 +3980,34 @@ class TaskWorkflow:
             # entirely. A present-but-empty {} plan carries no steps/session
             # data to re-plan from either, so it is semantically equivalent
             # to "no plan" and correctly falls to fresh-dispatch here too.
+            #
+            # committed_work (task 3033 / PRD §A1): surface every commit this
+            # branch already carries so a re-invoked architect can pre-satisfy
+            # already-implemented steps via mark_step_committed instead of
+            # re-planning them as pending.  Scoped to THIS branch of _plan by
+            # design decision — the completion-pass and revalidation branches
+            # above are deliberately left unchanged (both already carry
+            # done-step semantics and explicit "do NOT remove or replace steps
+            # with status done" instructions).  Inert on the common path: on a
+            # truly-fresh first dispatch HEAD == base_commit, so the detector
+            # returns [] and the briefing is byte-identical to today's.
+            #
+            # Belt-and-braces best-effort: the detector already swallows its own
+            # exceptions and returns [], but a failure here must NEVER sink
+            # PLAN, so the call site falls back to [] too.
+            try:
+                committed_work = await self._detect_committed_branch_work()
+            except Exception:
+                logger.warning(
+                    'Task %s: committed-branch-work detection raised at the '
+                    '_plan call site; briefing without it (task 3033)',
+                    self.task_id, exc_info=True,
+                )
+                committed_work = []
             prompt = await self.briefing.build_architect_prompt(
                 self.task, worktree=self.worktree,
                 include_prior_proposals=bool(existing_plan),
+                committed_work=committed_work,
             )
 
         # Snapshot pre-architect open L0 ids so the post-loop check can
@@ -3881,7 +4100,10 @@ class TaskWorkflow:
             # none interacts with the consecutive_no_plan_failures cycle
             # counter.  Order matters: unactionable_task and false_premise are
             # the most decisive (jump straight to L1, bypass steward);
-            # already_done is a clean DONE; blocking_dependency may re-loop
+            # already_done is a clean DONE; ready_to_merge is a deterministic
+            # merge submit (less decisive than already_done's clean DONE — the
+            # work is on the BRANCH, not main — but more decisive than a
+            # re-looping blocking_dependency); blocking_dependency may re-loop
             # the architect.
             if self.artifacts.read_unactionable_task() is not None:
                 return await self._handle_unactionable_task_report()
@@ -3889,6 +4111,8 @@ class TaskWorkflow:
                 return await self._handle_false_premise_report()
             if self.artifacts.read_already_done() is not None:
                 return await self._handle_already_done_report()
+            if self.artifacts.read_ready_to_merge() is not None:
+                return await self._handle_ready_to_merge_report()
             # Fix B: the architect may have written a blocking_dependency
             # report instead of a plan.
             if self.artifacts.read_blocking_dependency() is not None:
@@ -4280,6 +4504,8 @@ class TaskWorkflow:
             return await self._handle_false_premise_report()
         if self.artifacts.read_already_done() is not None:
             return await self._handle_already_done_report()
+        if self.artifacts.read_ready_to_merge() is not None:
+            return await self._handle_ready_to_merge_report()
         if self.artifacts.read_blocking_dependency() is not None:
             # Falling through — the architect path's
             # _handle_blocking_dep_report logic re-acquires base_commit
@@ -4531,11 +4757,126 @@ class TaskWorkflow:
         )
         return False
 
+    async def _read_fresh_backend_metadata(
+        self,
+        *,
+        log_context: str,
+        require_fresh: bool = False,
+    ) -> dict | None:
+        """Read the backend's current task metadata blob, or ``None`` on failure.
+
+        Extracted from :meth:`_merge_fresh_metadata` (task 2991) so a caller can
+        distinguish "read OK" from "could not read".  That distinction matters
+        only for the delete-by-omission clears
+        (:meth:`_clear_merge_phase_entered`, :meth:`_clear_merge_retry_pending`):
+        they persist with ``metadata_mode='replace'``, a whole-blob overwrite,
+        so writing a payload built from in-memory-only metadata would DELETE
+        every backend-only key (``memory_hints`` re-attached by Stage-2
+        reconciliation, ``_causation_id``) — the #4271 sibling-clobber bug.
+
+        Such a caller has two equivalent ways to refuse an unverified write, and
+        both funnel through here (rebase reconciliation, task 2991 vs task 3024):
+
+        * ``require_fresh=False`` (default) — a failed read returns ``None`` and
+          the caller skips its durable write itself.  Used by
+          :meth:`_clear_merge_phase_entered`, which needs the read-failed signal
+          inline so it can still clear the in-memory copy.
+        * ``require_fresh=True`` — a failed read RAISES instead of returning
+          ``None``, so a caller already wrapping its read+write in one
+          best-effort ``try`` (:meth:`_clear_merge_retry_pending`, via
+          :meth:`_merge_fresh_metadata`) lands the refusal in the same handler
+          as a persist failure.
+
+        Args:
+            log_context: Short descriptor of the write site, used verbatim in
+                the warning (e.g. ``'merge_phase_liveness clear'``).
+            require_fresh: When True, raise rather than report a failed read.
+                Never returns ``None`` under this flag.
+
+        Returns:
+            ``{}`` — read OK, backend metadata is empty/absent.
+            ``dict`` — the backend's metadata blob.
+            ``None`` — could not read: ``get_task`` raised, returned a
+            non-dict (e.g. ``None`` for a vanished/unreadable task), or
+            returned a task whose persisted ``metadata`` is CORRUPT (a
+            non-dict — a state ``Scheduler.update_task``'s own docstring
+            acknowledges as the reason ``metadata_mode='replace'`` exists).
+            Not reachable when ``require_fresh`` is True.
+
+        Raises:
+            Exception: Only when ``require_fresh`` is True — the underlying
+                ``get_task`` error verbatim, or a :class:`RuntimeError` for
+                every other unreadable shape (non-task result, corrupt
+                non-dict ``metadata``).
+        """
+        try:
+            fresh_task = await self.scheduler.get_task(self.task_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort unless require_fresh
+            if require_fresh:
+                logger.warning(
+                    'Task %s: failed to refresh metadata before %s write; '
+                    'refusing to build an unverified whole-blob payload '
+                    '(caller requires a backend-verified read): %s',
+                    self.task_id, log_context, exc,
+                )
+                raise
+            logger.warning(
+                'Task %s: failed to refresh metadata before %s write; '
+                'falling back to in-memory metadata '
+                '(memory_hints may be clobbered): %s',
+                self.task_id, log_context, exc,
+            )
+            return None
+        # Non-dict return (e.g. None for a vanished task) is the path production
+        # actually takes — Scheduler.get_task catches every exception and
+        # returns None.  Silent by design when require_fresh is False, which
+        # preserves the pre-extraction behaviour (it warned only on the
+        # exception branch).
+        if not isinstance(fresh_task, dict):
+            if require_fresh:
+                msg = (
+                    f'Task {self.task_id}: metadata refresh before {log_context} '
+                    f'write returned {type(fresh_task).__name__}, not a task dict '
+                    f'— refusing to build an unverified whole-blob payload'
+                )
+                logger.warning(msg)
+                raise RuntimeError(msg)
+            return None
+        meta = fresh_task.get('metadata')
+        if meta is None:
+            return {}
+        if not isinstance(meta, dict):
+            # A corrupt persisted blob must be reported as UNREADABLE, not
+            # returned raw: every caller immediately unpacks the result
+            # (``{**in_memory, **(backend or {})}`` / ``{**metadata,
+            # **backend}``) and a truthy non-dict raises `TypeError: 'X' object
+            # is not a mapping` from an unguarded line — on the merge critical
+            # path, since _clear_merge_phase_entered runs inside
+            # _submit_to_merge_queue. Reporting None also gives the two clears
+            # the right behaviour for free: skip the whole-blob 'replace' write
+            # rather than overwrite a blob nobody understands.
+            msg = (
+                f'Task {self.task_id}: backend metadata is non-dict '
+                f'({type(meta).__name__}) before {log_context} write; '
+                f'treating as unreadable'
+            )
+            logger.warning(msg)
+            if require_fresh:
+                # A require_fresh caller reads the RETURN value as proof the
+                # blob is backend-verified, so reporting None here would send it
+                # down _merge_fresh_metadata's in-memory-only fallback and
+                # straight into the 'replace' clobber this guard exists to
+                # prevent. Refuse the same way the other unreadable shapes do.
+                raise RuntimeError(msg)
+            return None
+        return meta
+
     async def _merge_fresh_metadata(
         self,
         in_memory_metadata: dict,
         *,
         log_context: str,
+        require_fresh: bool = False,
     ) -> dict:
         """Read-modify-write helper: merge in-memory metadata with the backend's.
 
@@ -4548,7 +4889,10 @@ class TaskWorkflow:
 
         If ``get_task`` fails, logs a warning containing ``log_context`` and falls
         back to ``in_memory_metadata`` alone.  Mirrors the boundary-normalisation
-        pattern used in ``_handle_terminal_exit_on_block``.
+        pattern used in ``_handle_terminal_exit_on_block``.  The backend read
+        itself lives in :meth:`_read_fresh_backend_metadata`, which callers
+        needing the read-failed signal (the ``'replace'``-mode clears) use
+        directly.
 
         Args:
             in_memory_metadata: The in-memory metadata dict (from
@@ -4556,29 +4900,36 @@ class TaskWorkflow:
             log_context: Short descriptor of the write site, used verbatim in the
                 fallback warning (e.g. ``'no-plan counter'``,
                 ``'infra-resume thrash counter'``).
+            require_fresh: When True, a failed (or non-dict) backend read RAISES
+                instead of silently falling back to ``in_memory_metadata`` alone.
+                Callers that persist with ``metadata_mode='replace'`` MUST pass
+                True: under replace, every key omitted from the payload is
+                DELETED, so the fallback payload would destroy backend-only keys
+                (e.g. ``memory_hints`` re-attached by Stage-2 reconciliation)
+                rather than merely failing to update them.  Such a caller is
+                expected to catch and skip its write — no write is strictly safer
+                than an unverified whole-blob one.  Defaults to False, which
+                keeps the additive/merge-mode callers' best-effort behaviour
+                (their fallback is bounded to the keys actually supplied).
 
         Returns:
             A new dict ready for counter-field assignment and persist.
+
+        Raises:
+            Exception: Only when ``require_fresh`` is True — the underlying
+                ``get_task`` error verbatim, or a :class:`RuntimeError` if the
+                read returned something other than a task dict.
         """
-        try:
-            fresh_task = await self.scheduler.get_task(self.task_id)
-        except Exception as exc:  # noqa: BLE001 — best-effort, fall back to in-memory
-            logger.warning(
-                'Task %s: failed to refresh metadata before %s write; '
-                'falling back to in-memory metadata '
-                '(memory_hints may be clobbered): %s',
-                self.task_id, log_context, exc,
-            )
-            fresh_task = None
         # Merge: start from in-memory metadata so that locally-set keys not yet
         # persisted are preserved, then overlay fresh backend keys so that
         # backend-side additions (e.g. memory_hints from Stage-2 reconciliation)
-        # win on collision.  When get_task failed (fresh_task is None) the
-        # backend overlay is empty and we fall back to the in-memory copy only.
-        return {
-            **in_memory_metadata,
-            **((fresh_task.get('metadata') or {}) if isinstance(fresh_task, dict) else {}),
-        }
+        # win on collision.  When the read failed (None, only reachable with
+        # require_fresh=False) the backend overlay is empty and we fall back to
+        # the in-memory copy only.
+        backend = await self._read_fresh_backend_metadata(
+            log_context=log_context, require_fresh=require_fresh,
+        )
+        return {**in_memory_metadata, **(backend or {})}
 
     async def _handle_no_plan_failure(
         self, reason: str, *, detail: str,
@@ -5068,11 +5419,59 @@ class TaskWorkflow:
         (the stamp can never match again once the branch moved) — and by
         :meth:`_merge_and_finalise` on merge SUCCESS, so the happy-path
         stamp/clear lifecycle is symmetric (a merged/DONE task carries no stale
-        ``merge_retry_pending``). Uses the full-dict :meth:`_merge_fresh_metadata`
-        + ``scheduler.update_task(metadata=...)`` pattern because only a full-dict
-        write can REMOVE a key (an append-merge can add but not delete). A
-        persistence failure must never crash the resume path; a subsequent
-        re-block re-stamps a fresh obligation, so a lost clear is self-healing.
+        ``merge_retry_pending``).
+
+        ``metadata_mode='replace'`` is REQUIRED, not incidental: the default
+        'merge' mode preserves keys omitted from the payload
+        (``{**existing, **incoming}``), so a mode-less write would log a removal
+        it never performs.  Only a whole-blob replace can actually DELETE a key
+        — which is why the payload is built as a full-dict
+        :meth:`_merge_fresh_metadata` read-modify-write that carries every other
+        key through.  (Same rule, same reason as the harness sibling
+        ``_clear_merge_retry_pending_for_restart``.)
+
+        That duplication is knowingly left in place: the delete-by-omission
+        subtlety belongs in ONE place next to ``metadata_mode``, but the single
+        home for it is ``Scheduler``/the fused-memory metadata contract, which is
+        outside this task's lock scope.  Pending task 3151 (targeted
+        ``delete_keys`` mode, filed with scheduler.py in scope) is the vehicle;
+        when it lands, both clears should delegate to it and this whole-blob
+        dance — plus the ``type: ignore`` below — goes away.
+
+        Because replace DELETES every omitted key, the read is made with
+        ``require_fresh=True``: a failed backend refresh skips the write entirely
+        instead of replacing the blob with an in-memory-only payload that would
+        destroy backend-only keys.  Neither a refresh nor a persist failure may
+        crash the resume path, and neither loses anything permanently — the stamp
+        simply survives, and a later dispatch retries the clear (a subsequent
+        re-block also re-stamps a fresh obligation), so a lost clear is
+        self-healing where clobbered metadata would not be.
+
+        Two failure-visibility rules make that "the stamp simply survives" claim
+        true of EVERY arm, not just the refresh one (amendment):
+
+        * ``scheduler.update_task`` does not raise on an MCP-level failure — it
+          logs and returns ``False``.  So the boolean is checked: an unlanded
+          write logs the same warning as an exception instead of falling through
+          to a success log an operator would read as proof the stamp is gone.
+        * ``self.task['metadata']`` is only overwritten AFTER a confirmed
+          persist.  Clearing it first would desynchronise memory from the backend
+          on a failed write, and the merge-success clear in
+          :meth:`_merge_and_finalise` would then early-return on the missing
+          in-memory key — landing a DONE task that still carries the stamp
+          server-side.  Keeping them in agreement means that same-dispatch clear
+          is a real retry.
+
+        ACCEPTED residual race (review amendment): ``'replace'`` is not
+        unconditionally safe even when the read SUCCEEDED. Read and write
+        straddle an ``await`` boundary, so a whole-blob overwrite silently
+        drops any key another process wrote in between (``'merge'`` could not
+        lose an unsupplied key that way). See
+        :meth:`_clear_merge_phase_entered` for the full statement of the
+        window, its mitigations, and why it cannot be eliminated without a
+        targeted key-delete backend mode (the backend accepts only
+        ``{'merge', 'additive', 'replace'}``) — task 3151 above is that
+        vehicle for both clears.
 
         Idempotent no-op when no stamp is present: returns immediately without a
         fresh-metadata read or backend write, so it is cheap and safe to call
@@ -5081,16 +5480,211 @@ class TaskWorkflow:
         metadata = self.task.get('metadata') or {}
         if 'merge_retry_pending' not in metadata:
             return
-        fresh = await self._merge_fresh_metadata(
-            metadata, log_context='merge_retry_pending clear',
+        try:
+            # require_fresh: a 'replace' write deletes every omitted key, so an
+            # unverified (in-memory-only) payload would clobber backend-only keys.
+            # A refusal lands in the same best-effort handler as a persist failure,
+            # skipping the write entirely rather than replacing on a guess.
+            fresh = await self._merge_fresh_metadata(
+                metadata, log_context='merge_retry_pending clear',
+                require_fresh=True,
+            )
+            fresh.pop('merge_retry_pending', None)
+            ok = await self.scheduler.update_task(
+                self.task_id, metadata=fresh,
+                # SchedulerFacade's Protocol (scheduler.py:681) predates
+                # metadata_mode and only declares `append`; the concrete
+                # Scheduler.update_task (scheduler.py:3757) and the harness
+                # sibling clear already pass it. Same ignore + rationale as the
+                # task-2533 sites above (workflow.py:4464, :10598); widening the
+                # Protocol is outside task 3024's scope — see escalate_info.
+                metadata_mode='replace',  # type: ignore[reportCallIssue]
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+            logger.warning(
+                'Task %s: could not clear merge_retry_pending (metadata refresh or '
+                'persist failed) — leaving the stamp in place; a later dispatch '
+                'retries the clear, and the resume conflict probe and the harness '
+                'restart clear are independent remedies: %s',
+                self.task_id, exc,
+            )
+            return
+        if not ok:
+            # update_task swallows MCP-level failures and returns False, so
+            # without this branch a rejected write is indistinguishable from a
+            # landed one and the stamp's survival goes unlogged.
+            logger.warning(
+                'Task %s: could not clear merge_retry_pending (scheduler.update_task '
+                'reported failure) — leaving the stamp in place; a later dispatch '
+                'retries the clear, and the resume conflict probe and the harness '
+                'restart clear are independent remedies',
+                self.task_id,
+            )
+            return
+        # Backend confirmed: mirror the delete in memory. Doing this only after a
+        # landed write keeps memory and backend in agreement, so a failed clear
+        # leaves the in-memory stamp for the merge-success clear to retry.
+        self.task['metadata'] = fresh
+
+    async def _stamp_merge_phase_entered(self) -> dict | None:
+        """Persist a durable merge-phase-liveness stamp into task metadata.
+
+        Task 2991: the restart-survivable analog of ``routing.latest`` for the
+        orphan-L0 divergence reaper. The pre-enqueue MERGE loop (rebase +
+        scoped verify + queue submit) makes NO LLM calls, so it never refreshes
+        ``metadata.routing.latest.decided_at`` — the reaper's task-2931
+        ``_has_fresh_dispatch`` gate cannot see a legitimately-live merge-stage
+        task and false-promotes its scope-invariant L0 to a human-facing L1
+        (cluster esc-2789-22). This stamp records ``{'entered_at': <iso>}``;
+        the reaper's ``_has_fresh_merge_phase`` gate defers a divergence L0
+        whose task carries a fresh stamp. Being durable task metadata it
+        survives an orchestrator restart (unlike the per-process
+        ``Scheduler._merge_phase_at``), covering the exact redispatch window in
+        which the false positive wedged 2789/2885.
+
+        Written at TWO points in :meth:`_run_merge_phase`, so a fresh stamp
+        exists at the start of every pre-enqueue window: (1) on merge entry,
+        before ``_check_scope_invariant`` files the divergence L0 and before
+        the gating bail — hence refreshed on every (re-)dispatch into merge
+        phase, including passes that immediately bail to ESCALATED; and (2) at
+        the top of each retry attempt, beside the in-memory
+        ``note_merge_phase_entered``, because ``_submit_to_merge_queue``
+        discharges the stamp at the enqueue boundary INSIDE that loop
+        (review-fix R2-B).
+
+        Mirrors :meth:`_stamp_merge_retry_pending`'s durability contract but
+        carries only a timestamp (no worktree HEAD / base SHA): read fresh
+        backend metadata (via :meth:`_read_fresh_backend_metadata`, the same
+        read :meth:`_merge_fresh_metadata` performs) so a concurrent write
+        (``retry_ledger``, ``memory_hints``) is not clobbered, update the
+        in-memory task, and persist via ``scheduler.update_task`` inside a
+        logged try/except. A persistence failure must never crash the merge
+        path — a lost stamp is self-healing (re-written on the next merge entry,
+        and at worst the reaper promotes rather than silently suppresses).
+
+        Returns:
+            The backend metadata blob this stamp just read (``{}`` when the
+            backend blob is empty), or ``None`` when it could not be read.
+            The merge-entry caller threads it straight into
+            :meth:`_check_scope_invariant`, which needs the SAME blob — that
+            saves a second ``get_task`` round-trip on the merge hot path and
+            makes the stamp and the scope check evaluate one snapshot rather
+            than two taken at different instants (review amendment).
+        """
+        metadata = self.task.get('metadata') or {}
+        backend = await self._read_fresh_backend_metadata(
+            log_context='merge_phase_liveness stamp',
         )
-        fresh.pop('merge_retry_pending', None)
+        # Same merge policy as _merge_fresh_metadata: in-memory first, backend
+        # overlaid (a backend-side addition is an external write that must not
+        # be discarded); an unreadable backend (None) falls back to in-memory.
+        fresh = {**metadata, **(backend or {})}
+        fresh['merge_phase_liveness'] = {
+            'entered_at': datetime.now(UTC).isoformat(),
+        }
         self.task['metadata'] = fresh
         try:
             await self.scheduler.update_task(self.task_id, metadata=fresh)
+        except Exception as exc:  # noqa: BLE001 — durability best-effort, never fatal
+            logger.warning(
+                'Task %s: failed to persist merge_phase_liveness stamp '
+                '(merge-phase liveness not durable this cycle): %s',
+                self.task_id, exc,
+            )
+        return backend
+
+    async def _clear_merge_phase_entered(self) -> None:
+        """Remove the durable merge-phase-liveness stamp from task metadata.
+
+        Task 2991 symmetric clear (mirrors :meth:`_clear_merge_retry_pending`):
+        called at the durable-enqueue boundary in
+        :meth:`_submit_to_merge_queue` (alongside ``scheduler.clear_merge_phase``)
+        and on merge SUCCESS in :meth:`_merge_and_finalise`, so a just-enqueued
+        / just-merged task does not carry a fresh stamp that would briefly defer
+        an unrelated stranded divergence orphan.
+
+        Deletion requires ``metadata_mode='replace'`` (review-fix R2-A). A plain
+        ``scheduler.update_task(metadata=...)`` resolves to
+        ``metadata_mode='merge'`` (scheduler.py), which the backend implements
+        as a shallow last-write-wins ``{**old, **new}`` where omitted keys are
+        PRESERVED — so popping a key out of the payload is a backend NO-OP.
+        ``'replace'`` is the mode the scheduler docstring designates for
+        delete-by-omission; it is a whole-blob overwrite, safe here ONLY because
+        the payload is built from a backend blob that was just re-read into
+        ``fresh``. Hence the guard: when
+        :meth:`_read_fresh_backend_metadata` reports a failed read the durable
+        write is SKIPPED (in-memory clear only), because a ``'replace'`` built
+        from in-memory-only metadata would delete backend-only keys
+        (``memory_hints``, ``_causation_id``) — the #4271 sibling-clobber bug.
+        The bounded cost of skipping is that the reaper may keep deferring for
+        up to ``orphan_l0_merge_phase_freshness_secs`` before the stale stamp
+        ages out (deferral, never suppression).
+
+        ACCEPTED residual race (review amendment) — ``'replace'`` is NOT
+        unconditionally safe once the read succeeded. This is a
+        read-modify-write across an ``await`` boundary (two MCP round-trips),
+        and a whole-blob overwrite drops any key another process wrote in
+        between; ``'merge'`` mode could not lose an unsupplied key that way.
+        At risk in that window: ``memory_hints`` re-attached by Stage-2
+        reconciliation, ``_causation_id``, and ``routing.latest`` — the input
+        to the reaper's SIBLING ``_has_fresh_dispatch`` gate, so a clobber
+        there would re-open the task-2931 false positive. Mitigations, in
+        order: (1) read and write are back-to-back with no intervening awaits,
+        which is the narrowest this can be without a new backend primitive;
+        (2) this workflow issues no LLM call while the clear runs, so its own
+        routing mirror is not a competing writer (an external writer such as
+        reconciliation still can be); (3) the write is skipped entirely when
+        the read failed or returned a corrupt blob. It cannot be ELIMINATED
+        here: the backend accepts only ``{'merge', 'additive', 'replace'}``
+        (``sqlite_task_backend._METADATA_MODES``) and offers no targeted
+        key-delete. A ``delete_keys`` mode would make both clears atomic and
+        is filed as follow-up work (fused-memory backend + scheduler, outside
+        this task's module scope). Pinned by
+        ``test_clear_replace_loses_concurrent_backend_write_in_read_window``.
+
+        Deliberately NOT cleared defensively in the harness ``_run_slot``
+        finally (unlike the in-memory ``clear_merge_phase`` grace stamp): an
+        abnormal exit must LEAVE the durable stamp so the reaper keeps deferring
+        across the crash/restart/redispatch window (fix-direction b). A
+        persistence failure must never crash the merge path; a subsequent merge
+        (re-)entry re-stamps, so a lost clear is self-healing.
+
+        Idempotent no-op when no stamp is present: returns immediately without a
+        fresh-metadata read or backend write, so it is cheap and safe to call
+        unconditionally on every enqueue / merge success (the common case never
+        stamped — the stamp is written only at merge entry).
+        """
+        metadata = self.task.get('metadata') or {}
+        if 'merge_phase_liveness' not in metadata:
+            return
+        backend = await self._read_fresh_backend_metadata(
+            log_context='merge_phase_liveness clear',
+        )
+        if backend is None:
+            logger.warning(
+                'Task %s: skipping durable merge_phase_liveness clear — could '
+                'not re-read backend metadata, and a replace-mode write built '
+                'from in-memory metadata alone would clobber backend-only keys '
+                '(clearing in-memory only; the stale stamp ages out of the '
+                'reaper grace on its own)',
+                self.task_id,
+            )
+            self.task['metadata'] = {
+                k: v for k, v in metadata.items() if k != 'merge_phase_liveness'
+            }
+            return
+        fresh = {**metadata, **backend}
+        fresh.pop('merge_phase_liveness', None)
+        self.task['metadata'] = fresh
+        try:
+            await self.scheduler.update_task(
+                self.task_id,
+                metadata=fresh,
+                metadata_mode='replace',  # type: ignore[reportCallIssue]
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
             logger.warning(
-                'Task %s: failed to persist merge_retry_pending clear: %s',
+                'Task %s: failed to persist merge_phase_liveness clear: %s',
                 self.task_id, exc,
             )
 
@@ -5225,15 +5819,33 @@ class TaskWorkflow:
 
         Caller has already verified the artifact exists.
 
-        Validation: ``commit`` must be non-empty and reachable from main.
-        ``git merge-base --is-ancestor`` returns false for both unknown SHAs
-        and SHAs not on main, so this single check covers both.
+        Validation, in two halves. **Reachability**: ``commit`` must be
+        non-empty and reachable from main — ``git merge-base --is-ancestor``
+        returns false for both unknown SHAs and SHAs not on main, so that
+        single check covers both. **Capability** (task 3057, seam 5 of
+        eleven): reachability proves only that the cited commit EXISTS on
+        main, never that THIS task's declared capability is present in it, so
+        when the task declares ``metadata.delivered_checks`` those are
+        re-checked against the SAME main SHA the reachability test used
+        (forwarded as ``main_sha=``, so no second ``get_main_sha`` call and no
+        risk of accepting a claim against one main while rejecting it against
+        another).
+
+        That second half matters here more than anywhere else in the eleven
+        stamp seams: this one is LLM-driven (an architect's claim) rather than
+        git-driven, which makes it the least self-correcting of them all — and
+        the repo's own architect prompt actively instructs agents to use
+        ``report_task_already_done``.
 
         On success: set task status to ``done`` with provenance pointing
         at the architect-named commit, return ``DONE``.
-        On validation failure: clear the artifact, route to ``_mark_blocked``
-        without escalating to a human — this is an architect mistake
-        (wrong/missing commit), not an unworkable task.
+        On validation failure of EITHER half: clear the artifact, route to
+        ``_mark_blocked`` without escalating to a human — this is an architect
+        mistake (wrong/missing commit, or a claim main does not support), not
+        an unworkable task, so a steward retry can resolve it. A capability
+        block surfaces as a VISIBLE blocked task rather than a silent no-op
+        precisely because the artifact is consumed before validation: unlike
+        the sweep seams, nothing here retries on a timer.
         """
         assert self.artifacts is not None
         report = self.artifacts.read_already_done()
@@ -5259,6 +5871,22 @@ class TaskWorkflow:
                 f'but commit is not reachable from main',
                 detail=(
                     f'commit: {commit}\nmain_sha: {main_sha}\n'
+                    f'evidence: {evidence}'
+                )[:2000],
+            )
+
+        block = await self._delivered_checks_block(
+            self.task_id, (self.task.get('metadata') or {}),
+            site='architect-already-done-report', main_sha=main_sha,
+        )
+        if block is not None:
+            return await self._mark_blocked(
+                f'Architect reported task already done at {commit[:12]} but '
+                f'the declared delivered_checks are not present on main',
+                detail=(
+                    f'commit: {commit}\nmain_sha: {block.main_sha or main_sha}\n'
+                    f'block_reason: {block.reason}\n'
+                    f'failed_check: {block.failed_check}\n'
                     f'evidence: {evidence}'
                 )[:2000],
             )
@@ -5293,6 +5921,625 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
         return WorkflowOutcome.DONE
+
+    async def _handle_ready_to_merge_report(self) -> WorkflowOutcome:
+        """Process a ``.task/ready_to_merge.json`` report from the architect.
+
+        Caller has already verified the artifact exists.
+
+        The architect's *merge-landing desync* exit (PRD ``plans/architect-
+        already-complete-exits.md`` §β): the work is complete on THIS BRANCH
+        and only the physical merge to main is missing.  The advised exit
+        before this one — ``report_unactionable_task`` — opened an L1 that
+        cost a human ~100k tokens AND vetoed the verified-green auto-merge
+        reaper, so a branch that was already green sat stranded.
+
+        The report is NEVER trusted.  Every predicate is re-derived FIRST-HAND
+        here (INV-3 corroborate-before-acting):
+
+        1. the cited ``commit`` equals the branch tip we resolve ourselves;
+        2. clean fast-forward — main is an ancestor of the tip, and the tip is
+           NOT already contained in main (that would be ``already_done``);
+        3. verify PASSED on this exact tip
+           (:func:`last_verified_green_tip`, read cross-run);
+        4. review returned a non-blocking verdict on this exact committed tree
+           AND that verdict was minted under the CURRENT reviewer config
+           (``record_review_verdict`` only ever caches PASS / suggestions_only,
+           so a cache hit whose ``reviewer_fingerprint`` positively matches
+           :meth:`_reviewer_config_fingerprint` is proof — a bare hit is not,
+           per the same positive-match contract the canonical cache reader in
+           ``_execute_verify_review_loop`` enforces).
+
+        On a match: enqueue a ``MergeRequest`` tagged ``source=
+        'architect-desync'`` and leave the task BLOCKED with NO open human
+        escalation — the merge worker's own scoped re-verify is the sole gate
+        that advances main, and the done flip arrives via the merge callback
+        (with the existing found_on_main reconciler as the restart-safe
+        backstop).  This handler never lands main itself.
+
+        On any miss: ``_mark_blocked`` WITHOUT escalating to a human — a false
+        ready-to-merge claim is an architect mistake, not an unworkable spec
+        (mirrors the already_done reject path).
+        """
+        assert self.artifacts is not None
+        report = self.artifacts.read_ready_to_merge()
+        assert report is not None  # caller must have verified
+
+        commit = str(report.get('commit') or '').strip()
+        evidence = str(report.get('evidence') or '')
+
+        self.artifacts.clear_ready_to_merge()
+
+        async def _reject(
+            predicate: str, summary: str, measured: dict,
+        ) -> WorkflowOutcome:
+            """Block on a failed desync predicate — no human escalation.
+
+            INV-2 structured-facts-at-failure: the failed *predicate* name and
+            the first-hand values it was judged against land on an
+            ``architect_desync_merge`` event AND on the blocked record, so
+            neither has to be reconstructed from log scraping.
+            """
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.architect_desync_merge,
+                    task_id=self.task_id,
+                    phase='plan',
+                    data={
+                        'decision': 'rejected',
+                        'predicate': predicate,
+                        'measured': measured,
+                    },
+                )
+            detail = '\n'.join(f'{k}: {v}' for k, v in measured.items())
+            return await self._mark_blocked(
+                f'Architect ready_to_merge rejected ({predicate}): {summary}',
+                detail=f'{detail}\nevidence: {evidence}'[:2000],
+            )
+
+        if not commit:
+            return await _reject(
+                'cited_commit',
+                'malformed ready_to_merge.json — missing commit',
+                {'report': json.dumps(report)[:500]},
+            )
+
+        if self.merge_queue is None or self.worktree is None:
+            return await _reject(
+                'merge_queue_available',
+                'merge queue or worktree unavailable — cannot enqueue',
+                {'merge_queue': repr(self.merge_queue),
+                 'worktree': repr(self.worktree)},
+            )
+
+        branch_name = self.task_id  # matches _submit_to_merge_queue convention
+        main_sha = await self.git_ops.get_main_sha()
+        tip = await self.git_ops.resolve_branch_sha(
+            f'{self.config.git.branch_prefix}{branch_name}',
+        )
+        if not tip:
+            return await _reject(
+                'branch_resolved',
+                'the task branch does not resolve',
+                {'branch': branch_name, 'main_sha': main_sha, 'cited': commit},
+            )
+        if commit != tip:
+            return await _reject(
+                'cited_commit',
+                f'cited {commit[:12]} but the branch tip is {tip[:12]}',
+                {'cited': commit, 'tip': tip},
+            )
+
+        main_on_branch = await self.git_ops.is_ancestor(main_sha, tip)
+        branch_on_main = await self.git_ops.is_ancestor(tip, main_sha)
+        if not main_on_branch or branch_on_main:
+            return await _reject(
+                'clean_ff',
+                'the branch is not a clean fast-forward of main',
+                {'tip': tip, 'main_sha': main_sha,
+                 'main_is_ancestor_of_tip': main_on_branch,
+                 'tip_is_ancestor_of_main': branch_on_main},
+            )
+
+        verified_tip = last_verified_green_tip(self.event_store, self.task_id)
+        if verified_tip != tip:
+            return await _reject(
+                'verify_passed',
+                'verify has not passed on the branch tip',
+                {'tip': tip, 'last_verified_green_tip': verified_tip},
+            )
+
+        tree_hash = await self.git_ops.get_head_tree_hash(self.worktree)
+        cached = (
+            self.artifacts.get_cached_verdict(tree_hash) if tree_hash else None
+        )
+        # POSITIVE fingerprint match required — the same contract the canonical
+        # verdict-cache reader enforces (`_execute_verify_review_loop`) and that
+        # `record_review_verdict` documents: a verdict minted under a different
+        # reviewer roster / per-role model config (or with no computable
+        # fingerprint at all) is NOT proof that the CURRENT reviewers would
+        # pass this tree.  Accepting a bare cache hit here would be strictly
+        # weaker than the interactive path — on an UNATTENDED auto-merge lane
+        # whose only downstream gate (the merge worker's scoped re-verify)
+        # covers tests, not review.  Fail-safe: reject → blocked, never a
+        # silent stale-verdict merge.
+        expected_fingerprint = self._reviewer_config_fingerprint()
+        recorded_fingerprint = (
+            cached.get('reviewer_fingerprint')
+            if isinstance(cached, dict) else None
+        )
+        if (
+            not cached
+            or expected_fingerprint is None
+            or recorded_fingerprint != expected_fingerprint
+        ):
+            return await _reject(
+                'review_pass',
+                'review has not passed on the branch tree under the current '
+                'reviewer config',
+                {'tip': tip, 'tree_hash': tree_hash,
+                 'cached_verdict': cached,
+                 'expected_reviewer_fingerprint': expected_fingerprint,
+                 'recorded_reviewer_fingerprint': recorded_fingerprint},
+            )
+
+        # INV-4 storm-escape: a re-invoked architect on the SAME tip must not
+        # pile a second request onto the branch.  The durable marker key is
+        # deliberately distinct from the stranded reaper's
+        # `stranded_merge_request` so the two submit paths never clobber each
+        # other.  Fail-safe, mirroring the reaper: a malformed / stale /
+        # tip-mismatched marker falls through to a fresh submit rather than a
+        # wedged skip — a lost marker must never permanently strand the task.
+        marker = (self.task.get('metadata') or {}).get('architect_merge_request')
+        if merge_request_marker_is_fresh(marker, tip):
+            logger.info(
+                'Task %s: architect-desync merge already submitted for tip %s '
+                '— skipping re-submit (merge presumed in-flight; task stays '
+                'blocked)',
+                self.task_id, tip[:12],
+            )
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.architect_desync_merge,
+                    task_id=self.task_id,
+                    phase='plan',
+                    data={
+                        'decision': 'duplicate',
+                        'tip': tip,
+                        'main_sha': main_sha,
+                        'marker': marker,
+                    },
+                )
+            await self._persist_blocked_row(
+                why=f'architect-desync merge already in flight for {tip[:12]}',
+            )
+            self._enter_phase(WorkflowState.BLOCKED)
+            return WorkflowOutcome.BLOCKED
+
+        logger.info(
+            'Task %s: architect reported merge-landing desync at %s — '
+            'enqueuing deterministic merge (no escalation; merge-queue '
+            'verify is the gate)',
+            self.task_id, tip[:12],
+        )
+        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
+
+        req = await submit_verified_green_merge_request(
+            task_id=self.task_id,
+            branch=QueuedBranch.parse(
+                branch_name, self.config.git.branch_prefix,
+            ),
+            worktree=self.worktree,
+            tip_sha=tip,
+            config=self.config,
+            module_configs=list(self.config.module_configs_or_empty.values()),
+            merge_queue=self.merge_queue,
+            event_store=self.event_store,
+            source='architect-desync',
+            marker_key='architect_merge_request',
+            done_callback=lambda fut: self._schedule_architect_merge_done(
+                fut, tip=tip, evidence=evidence,
+            ),
+            update_task=self.scheduler.update_task,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.architect_desync_merge,
+                task_id=self.task_id,
+                phase='plan',
+                data={
+                    'decision': 'enqueued',
+                    'tip': tip,
+                    'main_sha': main_sha,
+                    'request_id': req.request_id,
+                    'evidence': evidence[:400],
+                },
+            )
+        # Terminal BLOCKED with NO open human escalation: nothing here awaits a
+        # human, and an empty escalation set keeps the found_on_main MARK_DONE
+        # backstop unvetoed if the in-memory merge callback is lost to a
+        # restart.
+        #
+        # The durable row write is LOAD-BEARING, precisely BECAUSE no escalation
+        # is filed: an in-progress row with no live claimant, a branch off main
+        # and no open escalation is exactly the recovery table's
+        # REVERT_TO_PENDING shape (task_ground_truth.py rows (c)/(d)), so the
+        # sweep would set the task back to 'pending' (harness.py:5564) and
+        # replan it while this MergeRequest is still queued.  'blocked' with no
+        # escalation is instead LEAVE-shaped, and the merge callback (or the
+        # found_on_main reconciler) flips it done once main actually moves.
+        await self._persist_blocked_row(
+            why=f'architect-desync merge enqueued for {tip[:12]}',
+        )
+        self._enter_phase(WorkflowState.BLOCKED)
+        return WorkflowOutcome.BLOCKED
+
+    async def _persist_blocked_row(self, *, why: str) -> None:
+        """Durably write ``status='blocked'`` for a non-escalating terminal exit.
+
+        ``_handle_ready_to_merge_report``'s two success-shaped exits (merge
+        enqueued / duplicate skipped) deliberately do NOT route through
+        :meth:`_mark_blocked`: its ``if not merge_phase:`` block calls
+        :meth:`_spawn_dry_run_unblock` regardless of ``skip_escalation``, which
+        would launch a "why is this stuck?" investigation against a task that is
+        merely waiting on its own queued merge.  They still owe the durable row
+        write that ``_mark_blocked`` would otherwise have done — see the
+        REVERT_TO_PENDING note at the enqueue exit.
+
+        Fail-safe in both directions, because the merge is ALREADY enqueued by
+        the time this runs and must never be undone by a bookkeeping failure:
+
+        * :class:`TerminalExitRejection` is the BENIGN already-terminal race —
+          the merge done-callback or the found_on_main reconciler beat us to
+          ``mark_done``.  That row is correct; log at info and leave it
+          terminal.  Never reopen, never retry (unlike ``_mark_blocked``'s
+          bypass trip-wire, a terminal row here is the EXPECTED good outcome).
+        * Any other exception is logged at warning and swallowed; the
+          found_on_main reconciler remains the durable backstop.
+        """
+        try:
+            await self.scheduler.set_task_status(self.task_id, 'blocked')
+        except TerminalExitRejection as exc:
+            logger.info(
+                'Task %s: blocked-row write skipped, row is already terminal '
+                '(%s) — the merge callback or found_on_main got there first; '
+                'leaving it (%s)',
+                self.task_id, exc.old_status, why,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: blocked-row write failed (%s): %s — continuing; the '
+                'found_on_main reconciler is the durable backstop',
+                self.task_id, why, exc,
+            )
+
+    def _schedule_architect_merge_done(
+        self, fut: asyncio.Future, *, tip: str, evidence: str,
+    ) -> None:
+        """Sync done-callback for an architect-desync MergeRequest.
+
+        Fires on the loop when the MergeRequest future resolves.  Derives the
+        terminal :class:`MergeOutcome` — a RAISING future is treated as a
+        durable failure, never as a silent success — and schedules
+        :meth:`_on_architect_merge_done` as a tracked background task.
+
+        A CANCELLED future is handled here instead, and is deliberately NOT a
+        durable failure — it is recorded as ``decision='merge_abandoned'`` and
+        goes no further.  This mirrors the sibling reaper callback
+        (``Harness._on_stranded_merge_done``: ``if fut.cancelled(): return  #
+        abandoned/superseded``) and the queue's own canonical classification
+        (``enqueue_merge_request._on_finalized`` maps a cancelled future to
+        state ``'abandoned'``, distinct from ``'error'``).  Both callers that
+        cancel one of these futures are benign:
+
+        * ``merge_cancel`` — a deliberate operator cancellation (the human is
+          already in the loop; paging them for their own action is backwards);
+        * ``InFlightMergeRegistry.release(detach_waiters=True)`` — the
+          stale-reap path, which cancels the stale primary and immediately
+          re-acquires the slot for a FRESH request on the same branch.  That
+          successor lands the branch and the found_on_main reconciler flips
+          the task done.
+
+        Routing cancellation into the durable branch would file a born-at-L2
+        ``stranded_merge_failed`` (critical, human-routed) for both of those,
+        so it is a spurious page.  It is also not needed to avoid a strand: a
+        task left ``blocked`` / no-escalation / branch EXISTS_OFF_MAIN is
+        picked up by the harness sweep's EXISTS_OFF_MAIN upgrade
+        (``harness.py`` — ``_only_merge_remediable([])`` is vacuously true, so
+        LEAVE is upgraded to ``RE_FILE_ESCALATION``), which files a
+        ``stranded_blocked`` L1 that the watcher auto-resolves into a re-pend.
+        The task is re-dispatched, the architect re-reports the desync, and
+        the (now stale) marker lets it re-submit.  Abandonment self-heals; a
+        durable FAILURE must not take that path, which is exactly why
+        ``stranded_merge_failed`` is excluded from
+        ``MERGE_REMEDIABLE_ESC_CATEGORIES`` — it blocks the upgrade and stops
+        a failed branch being re-submitted into the same failure.
+
+        Wrapped fail-safe: any error is logged and never propagated (mirrors
+        ``enqueue_merge_request._on_finalized`` and the reaper's
+        ``_on_stranded_merge_done``).  Losing this callback is survivable: the
+        task is left blocked with no open escalation, so the found_on_main
+        reconciler still marks it done on the next sweep.
+        """
+        try:
+            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+
+            if fut.cancelled():
+                logger.info(
+                    'Task %s: architect-desync merge future was cancelled at '
+                    'tip %s (abandoned/superseded, not a failure) — no '
+                    'escalation; the stranded-blocked sweep re-drives',
+                    self.task_id, tip[:12],
+                )
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.architect_desync_merge,
+                        task_id=self.task_id,
+                        phase='merge',
+                        data={
+                            'decision': 'merge_abandoned',
+                            'status': 'cancelled',
+                            'tip': tip,
+                            'reason': 'merge future cancelled',
+                        },
+                    )
+                return
+            if (exc := fut.exception()) is not None:
+                outcome = MergeOutcome(
+                    status='error', reason=f'merge future raised: {exc}',
+                )
+            else:
+                outcome = fut.result()
+            _task = asyncio.create_task(
+                self._on_architect_merge_done(
+                    outcome, tip=tip, evidence=evidence,
+                ),
+                name=f'architect_merge_done_{self.task_id}',
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.warning(
+                'Task %s: architect-desync merge done-callback failed '
+                '(found_on_main reconciler remains the backstop)',
+                self.task_id, exc_info=True,
+            )
+
+    async def _on_architect_merge_done(
+        self, outcome: MergeOutcome, *, tip: str, evidence: str,
+    ) -> None:
+        """Report an architect-desync merge's terminal outcome onto the task.
+
+        The FAST path of the done flip (the restart-safe DURABLE backstop is
+        the existing found_on_main reconciler, which can act because this exit
+        leaves the task blocked with NO open escalation):
+
+        - success WITH a landed sha → ``mark_done(kind='found_on_main')``;
+        - success without a sha → no provenance to write, so degrade to the
+          reconciler rather than stamping a bogus one;
+        - success WITH a landed sha but the task's declared
+          ``metadata.delivered_checks`` absent from main (task 3057, seam 6 of
+          eleven) → withhold the stamp and degrade to the reconciler, exactly
+          like the success-without-a-sha case above it. The parallel is
+          deliberate: this method ALREADY holds the precedent that we may land
+          and still be unable to write HONEST provenance, in which case we
+          degrade rather than stamp a bogus one. The guard applies that same
+          judgement to capability evidence rather than SHA evidence. A landed
+          merge sha proves main advanced — never that THIS task's declared
+          capability rode along;
+        - transient / superseded → a strict no-op, re-driven by a later sweep;
+        - durable failure, or any status in NEITHER classification set →
+          leave the task blocked, emit a structured failure event AND file a
+          born-at-L2 ``stranded_merge_failed`` (:meth:`_file_architect_merge_failed`).
+          Loud over silent: an unclassified outcome must not no-op into a
+          stranded task with no operator signal.
+
+        The L2 on the durable path is LOAD-BEARING, not decoration.  The
+        enqueue exit deliberately leaves the task ``blocked`` with NO open
+        escalation — which is LEAVE-shaped for the recovery sweep — and the
+        stranded reaper cannot re-drive it either (``detect_verified_green``
+        requires an assigned lane AND an all-steps-done plan.json, and this
+        exit fires precisely when the architect wrote no plan).  So on a
+        durable merge failure nothing else re-drives the task and nothing else
+        signals a human: without this escalation the exit that exists to stop
+        a branch sitting stranded would itself strand the task forever, worse
+        than the pre-change ``report_unactionable_task`` L1 it replaced.
+
+        A delivered-checks withholding is deliberately NOT routed into that L2
+        (:meth:`_file_architect_merge_failed`): it is not a durable merge
+        failure — the merge genuinely landed — so misrouting it would both
+        misclassify the condition and erode a signal operators must keep
+        trusting. The durable backstop for a withheld flip is instead the
+        found_on_main reconciler, which is itself guarded by the same shared
+        decision, so this degradation closes a loop rather than opening one.
+        """
+        status = outcome.status
+        landed = outcome.merge_sha
+        if status in SUCCESS_TRANSIENT_MERGE_STATUSES:
+            if status == 'done' and landed:
+                block = await self._delivered_checks_block(
+                    self.task_id, (self.task.get('metadata') or {}),
+                    site='architect-desync-merge-landed',
+                )
+                if block is not None:
+                    logger.warning(
+                        'Task %s: architect-desync merge landed at %s but '
+                        'delivered_checks are not verifiably present on main '
+                        '(%s) — NOT stamping found_on_main; leaving blocked '
+                        'for the reconciler backstop',
+                        self.task_id, landed[:12], block.reason,
+                    )
+                    return
+                logger.info(
+                    'Task %s: architect-desync merge landed at %s — marking '
+                    'done (found_on_main)',
+                    self.task_id, landed[:12],
+                )
+                try:
+                    await self.scheduler.mark_done(
+                        self.task_id,
+                        kind='found_on_main',
+                        sha=landed,
+                        note=(
+                            f'architect-desync merge landed; '
+                            f'evidence: {evidence[:400]}'
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        'Task %s: mark_done after architect-desync merge '
+                        'failed — leaving blocked for the found_on_main '
+                        'reconciler',
+                        self.task_id, exc_info=True,
+                    )
+                return
+            logger.info(
+                'Task %s: architect-desync merge outcome %r — no-op (task '
+                'stays blocked; a later sweep re-drives)',
+                self.task_id, status,
+            )
+            return
+
+        if status not in DURABLE_MERGE_FAILURE_STATUSES:
+            logger.error(
+                'Task %s: architect-desync merge returned UNCLASSIFIED status '
+                '%r — treating as a durable failure (classify it into '
+                'DURABLE_MERGE_FAILURE_STATUSES or '
+                'SUCCESS_TRANSIENT_MERGE_STATUSES)',
+                self.task_id, status,
+            )
+        else:
+            logger.warning(
+                'Task %s: architect-desync merge failed durably (%s) — task '
+                'stays blocked',
+                self.task_id, status,
+            )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.architect_desync_merge,
+                task_id=self.task_id,
+                phase='merge',
+                data={
+                    'decision': 'merge_failed',
+                    'status': status,
+                    'tip': tip,
+                    'reason': outcome.reason,
+                    'classified': status in DURABLE_MERGE_FAILURE_STATUSES,
+                },
+            )
+        self._file_architect_merge_failed(outcome, tip=tip)
+
+    def _file_architect_merge_failed(
+        self, outcome: MergeOutcome, *, tip: str,
+    ) -> None:
+        """File a BORN-AT-L2 ``stranded_merge_failed`` for a durably-failed
+        architect-desync merge.
+
+        The sibling of :meth:`Harness._file_stranded_merge_failed`
+        (harness.py) for the byte-identical outcome: a branch that was
+        submitted straight to the merge queue on a verified-green claim and
+        then failed the queue's own verify/merge durably.  Same category on
+        purpose — ``stranded_merge_failed`` is deliberately EXCLUDED from
+        ``Harness.MERGE_REMEDIABLE_ESC_CATEGORIES`` (see the comment at
+        harness.py:4668), so re-using it also buys the invariant that a branch
+        which already failed the merge is never auto-re-submitted into the same
+        failure.
+
+        ``agent_role='orchestrator-architect-desync-merge'`` (a harness-sentinel
+        role) + ``severity='critical'`` + ``level=2`` make the record BORN AT
+        L2 — it bypasses the auto-watcher and routes straight to a human.
+
+        Does NOT touch task status, the lane, or the branch: the task is
+        already ``blocked`` and the branch is preserved for inspection
+        (preservation by omission).  Deduped via a scoped pending/L2/role read.
+        Fail-safe: a missing queue logs loudly and returns; any submit failure
+        is logged and swallowed so a bookkeeping error never propagates out of
+        a done-callback.
+        """
+        status = getattr(outcome, 'status', 'unknown')
+        reason = getattr(outcome, 'reason', '') or ''
+        if self.escalation_queue is None:
+            logger.error(
+                'Task %s: architect-desync merge failed durably (status=%s, '
+                'reason=%r) at tip %s but NO escalation queue is attached — '
+                'the task is blocked with no operator signal',
+                self.task_id, status, reason, tip[:12],
+            )
+            return
+
+        role = 'orchestrator-architect-desync-merge'
+        try:
+            existing = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=2, agent_role=role,
+            )
+            if any(e.category == 'stranded_merge_failed' for e in existing):
+                logger.warning(
+                    'Task %s: stranded_merge_failed L2 already open for the '
+                    'architect-desync merge — suppressing duplicate',
+                    self.task_id,
+                )
+                return
+
+            from escalation.models import Escalation  # noqa: PLC0415
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role=role,
+                severity='critical',
+                category='stranded_merge_failed',
+                summary=(
+                    f'Architect-desync merge FAILED for task {self.task_id} '
+                    f'(status={status}) — manual intervention.'
+                )[:200],
+                detail=(
+                    f'The architect reported a merge-landing desync for task '
+                    f'{self.task_id} and the handler enqueued its branch tip '
+                    f'{tip} directly to the merge queue '
+                    f"(source='architect-desync'), but the merge/verify failed "
+                    f'durably: status={status}, reason={reason!r}.  The task '
+                    f'remains blocked and the branch is preserved (untouched) '
+                    f'for inspection.  Nothing re-drives this task on its own: '
+                    f'the exit files no other escalation by design, and the '
+                    f'verified-green stranded reaper cannot pick it up (it '
+                    f'requires an assigned lane AND an all-steps-done '
+                    f'plan.json, and this exit fires when the architect wrote '
+                    f'no plan).  A branch whose verified-green claim does not '
+                    f"survive the merge queue's own full verify lands here — "
+                    f'the exit never bypasses that gate.  Investigate and '
+                    f're-drive or triage manually.'
+                ),
+                suggested_action='manual_intervention',
+                level=2,
+            )
+            self.escalation_queue.submit(esc)
+        except Exception:
+            logger.error(
+                'Task %s: FAILED to file the architect-desync '
+                'stranded_merge_failed L2 (status=%s) — the task is blocked '
+                'with no operator signal',
+                self.task_id, status, exc_info=True,
+            )
+            return
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id,
+                data={
+                    'escalation_id': esc.id,
+                    'category': 'stranded_merge_failed',
+                    'severity': 'critical',
+                    'level': 2,
+                    'reason': f'architect-desync-merge-{status}',
+                },
+            )
+        logger.warning(
+            'Task %s: filed born-at-L2 stranded_merge_failed %s for the '
+            'architect-desync merge (status=%s) — task stays blocked, branch '
+            'preserved',
+            self.task_id, esc.id, status,
+        )
 
     async def _handle_unactionable_task_report(self) -> WorkflowOutcome:
         """Process a ``.task/unactionable_task.json`` report from the architect.
@@ -5940,7 +7187,191 @@ class TaskWorkflow:
         self._progress_resume_churn_info = None
         self._preserve_config_dir = False
         self._preserve_config_dir_reason = None
-        while self.artifacts.get_pending_steps():
+
+        # Zero-iteration EXECUTE (task 3033 / PRD §A1): nothing is pending, so
+        # the loop below would fall straight through to `return DONE` and emit
+        # NOTHING — making "0 EXECUTE iterations" a pure absence, which a
+        # consumer cannot distinguish from a lost event log. Emit the skip
+        # explicitly instead. Reached when an architect pre-satisfied every step
+        # via mark_step_committed against an already-green branch, and ALSO on a
+        # re-entry after a review cycle with nothing left pending — which is why
+        # execute_iterations is reported FROM THE METRIC rather than hard-coded
+        # to 0. Purely additive: the non-empty path below is byte-for-byte
+        # unchanged.
+        pending = self.artifacts.get_pending_steps()
+        if not pending:
+            plan = self.artifacts.read_plan()
+            items = [
+                s
+                for col in ('prerequisites', 'steps')
+                for s in plan.get(col, [])
+                if isinstance(s, dict)
+            ]
+            done_step_ids = [
+                str(s.get('id')) for s in items if s.get('status') == 'done'
+            ]
+            # Provenance evidence for the durable work entry below. `status ==
+            # 'done'` alone is NOT evidence: mark_step_committed's authoring
+            # guard (plan_tools._sha_exists_on_branch) is `git merge-base
+            # --is-ancestor <sha> HEAD`, which is satisfied by base_commit
+            # ITSELF and by every main ancestor below base — and
+            # update_step_status permits commit=None outright. Reuse the
+            # step-4 detector rather than reimplementing the git call: it
+            # returns exactly `base_commit..HEAD` and already collapses every
+            # missing-collaborator / unset-base / git-error case to [], which
+            # is precisely the fail-closed posture wanted here (no evidence ⇒
+            # no work entry). Belt-and-braces try/except: a detector failure
+            # must degrade to "no evidence", never sink EXECUTE.
+            try:
+                beyond_base = {
+                    str(c['sha']) for c in await self._detect_committed_branch_work()
+                }
+            except Exception:
+                logger.warning(
+                    'Task %s: beyond-base provenance detection failed; treating '
+                    'as no committed work (task 3033)',
+                    self.task_id, exc_info=True,
+                )
+                beyond_base = set()
+            # Bidirectional prefix match, the established idiom at
+            # _detect_tip_wip_commits (~:7062): an abbreviated sha recorded by
+            # mark_step_done still matches a full beyond-base sha, while a
+            # base-reachable or absent sha never does. Gated on
+            # _is_plausible_sha first — unlike the dedup site that idiom comes
+            # from, a false positive HERE credits unbacked provenance, and a
+            # too-short recorded value (e.g. 'a') prefixes some beyond-base sha
+            # on almost any branch.
+            committed_step_ids = [
+                str(s.get('id'))
+                for s in items
+                if s.get('status') == 'done' and _is_plausible_sha(s.get('commit'))
+                and any(
+                    str(s['commit']).startswith(sha) or sha.startswith(str(s['commit']))
+                    for sha in beyond_base
+                )
+            ]
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.phase_skipped,
+                    task_id=self.task_id,
+                    phase='execute',
+                    data={
+                        'reason': 'no_pending_steps',
+                        'execute_iterations': self.metrics.execute_iterations,
+                        'step_count': len(items),
+                        'done_step_ids': done_step_ids,
+                        # Both sets, deliberately: a plan claiming N done steps
+                        # while the branch carries provenance for only M is a
+                        # real anomaly that must be visible in the event log.
+                        'committed_step_ids': committed_step_ids,
+                    },
+                )
+            logger.info(
+                'Task %s: EXECUTE skipped — no pending steps at entry '
+                '(execute_iterations=%s, %s/%s items already done) — every step '
+                'was pre-satisfied at authoring time, or a review re-entry left '
+                'nothing to do (task 3033 / PRD A1)',
+                self.task_id, self.metrics.execute_iterations,
+                len(done_step_ids), len(items),
+            )
+            # Durable honest signal, mirroring the judge early_exit entry shape
+            # below. REQUIRED, not cosmetic: _has_prior_implementation needs at
+            # least one _iteration_entry_is_work entry, and the merge-phase
+            # guard _recover_before_merge uses the iteration-log-only fallback
+            # (wt_head=None). An all-committed plan writes zero
+            # implementer/debugger/judge entries, so without this the guard
+            # would resolve has_work=False on a branch that already landed and
+            # REFUSE to recover-DONE — re-planning merged work. The label is
+            # honest ('architect', not a forged 'implementer') so the log the
+            # reconciler and future architects read never claims an implementer
+            # turn that did not happen.
+            #
+            # FAILS CLOSED ON PROVENANCE, not on `status`: the entry is written
+            # only when at least one done item's recorded commit is a genuine
+            # member of `base_commit..HEAD`, and it names ONLY those ids.
+            # Status alone is insufficient because a done step can carry no
+            # commit at all, or a commit that is base_commit itself / an
+            # arbitrary main ancestor below base — all of which pass the
+            # authoring-time reachability guard while representing zero work on
+            # this branch. Without this filter an architect who pre-satisfied
+            # every step against base-reachable shas would produce a
+            # `committed: True` entry that _iteration_entry_is_work classifies
+            # as work, letting _recover_before_merge recovery-DONE a branch
+            # that implemented nothing. `committed: True` is therefore
+            # evidence-backed by the non-empty committed_step_ids set below
+            # rather than asserted.
+            if done_step_ids and len(committed_step_ids) < len(done_step_ids):
+                unbacked = sorted(set(done_step_ids) - set(committed_step_ids))
+                # Loud over silent: a plan asserting done steps the branch does
+                # not carry is a real anomaly (falsely pre-satisfied steps, or a
+                # rebase that orphaned the recorded shas). VERIFY remains the
+                # semantic gate for it, but it must never vanish from the log.
+                logger.warning(
+                    'Task %s: EXECUTE skip — %s plan item(s) claim status=done '
+                    'but only %s carry a commit in base..HEAD; unbacked ids: %s '
+                    '(task 3033 — no work entry is written for these)',
+                    self.task_id, len(done_step_ids), len(committed_step_ids),
+                    unbacked,
+                )
+            #
+            # ATTRIBUTION MUST MATCH WHAT HAPPENED. This branch is ALSO reached
+            # on a review/amendment RE-ENTRY (execute_iterations > 0), where the
+            # steps were completed by an IMPLEMENTER in an earlier EXECUTE pass
+            # — not pre-satisfied by an architect at authoring time. Writing the
+            # authoring-time claim there would put a false statement in the
+            # durable record the reconciler and future architects read (exactly
+            # the harm the honest 'architect' label avoids on the authoring
+            # path), re-list step ids the implementer entries already attribute,
+            # and repeat once per review cycle. On re-entry the merge-recovery
+            # motivation is already satisfied by those earlier work entries, so
+            # write nothing — unless the log carries no work entry at all, in
+            # which case fall through to an entry whose summary says only what
+            # is true of the re-entry rather than dropping the has_work signal.
+            # That fallback keeps agent='architect' deliberately: it is the only
+            # agent value _iteration_entry_is_work's execute_skipped clause
+            # recognises, so any other label would write an entry that cannot
+            # restore the very has_work signal it exists for.
+            reentry = self.metrics.execute_iterations > 0
+            prior_work = False
+            if reentry:
+                prior_entries, _corrupted = self.artifacts.read_iteration_log()
+                prior_work = any(_iteration_entry_is_work(e) for e in prior_entries)
+                if prior_work:
+                    logger.info(
+                        'Task %s: EXECUTE skip at re-entry (iteration %s) — '
+                        'earlier work entries already establish has_work; no '
+                        'execute_skipped entry written (task 3033)',
+                        self.task_id, self.metrics.execute_iterations,
+                    )
+            if committed_step_ids and not prior_work:
+                self.artifacts.append_iteration_log({
+                    'iteration': self.metrics.execute_iterations,
+                    'agent': 'architect',
+                    'event': 'execute_skipped',
+                    'steps_completed': committed_step_ids,
+                    'committed': True,
+                    'summary': (
+                        'EXECUTE skipped — no pending steps at re-entry; the '
+                        'named steps carry commits on this branch'
+                        if reentry else
+                        'EXECUTE skipped — every plan step pre-satisfied at '
+                        'authoring time via mark_step_committed'
+                    ),
+                    'source': 'orchestrator',
+                })
+            return WorkflowOutcome.DONE
+
+        # The `pending` probe above IS this loop's first "is there work?"
+        # check: nothing between it and here mutates the plan, so re-reading
+        # would be a redundant plan.json read that also DOUBLE-COUNTS the
+        # check for anything observing get_pending_steps() — which silently
+        # cost the first implementer iteration in the progress-resume
+        # accounting suite, whose stub answers a canned sequence one call at a
+        # time. Short-circuit the first evaluation onto the result already in
+        # hand; every loop-back after that re-reads exactly as before.
+        reuse_entry_probe = True
+        while reuse_entry_probe or self.artifacts.get_pending_steps():
+            reuse_entry_probe = False
             if (
                 self.metrics.execute_iterations - self.metrics.progress_resume_total
                 >= self.config.max_execute_iterations
@@ -6789,6 +8220,58 @@ class TaskWorkflow:
         except Exception:
             logger.warning(
                 'WIP-tip detection failed; treating as no WIP commits',
+                exc_info=True,
+            )
+            return []
+
+    async def _detect_committed_branch_work(self) -> list[dict]:
+        """Detect EVERY commit this branch carries beyond its base (task 3033).
+
+        The ARCHITECT-facing counterpart of the implementer-facing
+        :meth:`_detect_tip_wip_commits` above. Both share the one git
+        primitive (``git_ops.get_commit_subjects``) and the same best-effort
+        posture; only the filter policy differs, and it differs deliberately
+        in two ways:
+
+        - **No ``is_wip_safety_commit`` filter.** ``_detect_tip_wip_commits``
+          stops at the first non-WIP subject, so it cannot see the ordinary
+          ``feat(...)``/``test(...)`` commits an already-committed-green branch
+          is actually made of — precisely the scenario this detector exists to
+          surface (the architect is re-invoked against a branch whose work has
+          already landed, e.g. the canonical ``complete_not_on_main_replan`` /
+          ``lost_plan_reconstruction`` cases).
+        - **No dedup against already-``done`` plan steps.** That dedup is
+          correct for the implementer's attribution loop (don't re-surface an
+          already-attributed commit every iteration — task 2386), but wrong
+          here: the architect is RE-AUTHORING the plan from scratch, so every
+          branch commit is candidate provenance for a step that does not exist
+          yet.
+
+        Proves ONLY that commits exist on this branch — never that they
+        satisfy any plan step. VERIFY remains the semantic gate: a step
+        pre-satisfied against a commit that does not actually implement it
+        surfaces as a VERIFY failure, never a silent green.
+
+        Best-effort and defensive, mirroring its sibling: returns ``[]`` on any
+        missing collaborator (``worktree``/``git_ops``/``artifacts``), an unset
+        ``base_commit``, or any git error — a false negative here just reverts
+        to today's baseline briefing and must never sink PLAN.
+
+        Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for
+        ``base_commit..HEAD``.
+        """
+        if self.worktree is None or self.git_ops is None or self.artifacts is None:
+            return []
+        base = self.artifacts.read_base_commit()
+        if not base:
+            return []
+        try:
+            commits = await self.git_ops.get_commit_subjects(self.worktree, base)
+            return [{'sha': sha, 'subject': subject} for sha, subject in commits]
+        except Exception:
+            logger.warning(
+                'Committed-branch-work detection failed; treating as no '
+                'committed work (task 3033)',
                 exc_info=True,
             )
             return []
@@ -8244,6 +9727,36 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # window. (A defensive clear in the harness _run_slot finally covers
         # abnormal exits before this point.)
         self.scheduler.clear_merge_phase(self.task_id)
+        # Task 2991: discharge the DURABLE merge-phase-liveness stamp at the same
+        # boundary — the pre-enqueue window the orphan reaper's
+        # _has_fresh_merge_phase gate protects is over, so a lingering fresh
+        # stamp would briefly defer an unrelated stranded divergence orphan.
+        # Unlike the in-memory grace stamp above, this one is deliberately NOT
+        # cleared defensively in the harness _run_slot finally: an abnormal exit
+        # before this point must LEAVE the stamp so the reaper keeps deferring
+        # across the crash/restart/redispatch window.
+        #
+        # KNOWN, ACCEPTED GAP (review amendment): discharging here leaves the
+        # POST-enqueue window (queue wait + worker rebase/verify/merge) with no
+        # durable liveness signal — the stamp is gone and routing.latest stays
+        # stale, since the merge worker makes no LLM calls either. In-process
+        # that window IS covered: the task is still in _dispatched, so
+        # is_actively_held short-circuits the reaper. After a restart it is
+        # NOT: Harness._recover_pending_merges rebuilds the request from the
+        # merge journal and hands it to the WORKER, which never re-enters
+        # _run_merge_phase (nothing re-stamps), and _reconcile_stranded_in_
+        # progress LEAVEs — does not re-dispatch — a task that has an open
+        # escalation, which the merge-entry divergence L0 is. So a restart
+        # while the merge is queued/in-flight still promotes that L0.
+        # Accepted here rather than fixed: closing it means moving the
+        # discharge to the merge terminal outcome, which changes the
+        # stamp/clear pairing this task deliberately co-located with task
+        # 2753's in-memory clear_merge_phase (pinned by TestEnqueueClearWiring)
+        # — filed as follow-up work. The gap is pinned meanwhile by
+        # test_orphan_l0_reaper.py::...::
+        # test_post_enqueue_restart_still_promotes_known_accepted_gap, so it is
+        # visible in the suite instead of silently absent from it.
+        await self._clear_merge_phase_entered()
 
         # Soft-cancel hook: detach the workflow waiter instead of cancelling
         # the future so the primary entry (and any remaining peers) stay alive.
@@ -9169,6 +10682,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         - All pass → genuine cross-member INTERACTION: emit train_derailed
           (verdict='interaction'), escalate the train, land nothing.
         - Some fail → land each passer, block each failer (steps 12/14).
+
+        Delivered-capability guard (task 3057, seam 11):
+          A passer's solo verify + ``advance_main`` prove its DELTA reached
+          main; they say nothing about whether the member's DECLARED
+          ``metadata.delivered_checks`` capability is present there.  Each
+          passer's done-stamp is therefore gated on
+          :meth:`_member_delivered_checks_withhold`, and a withheld passer
+          ``continue``\\ s — never raises — WITHOUT appending to ``landed_ids``
+          and WITHOUT emitting ``train_merged``, so it is never REPORTED as
+          attributed.  Its write-ahead ``LandedRow`` stays unconsumed (the only
+          record of the crash-window intent) and the passer is REVERTED TO
+          PENDING via :meth:`_revert_withheld_member` for the scheduler to
+          re-dispatch — NOT left parked for the stranded sweep, which provably
+          cannot reach a ``'merge-deferred'`` task (see that method).  The
+          decision is per-member: a blocked member never aborts its siblings,
+          and neither does a failed revert.
         """
         # Sort members by their metadata train 'order' (root→tip) so that the
         # predecessor_ref computation is correct regardless of caller-side ordering.
@@ -9323,6 +10852,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 landed_sha: str = (
                     (outcome.advanced_sha if outcome else None) or r.merge_sha
                 )
+                # task 3057 (seam 11): passing solo and advancing main proves
+                # the member's DELTA landed — never that its DECLARED
+                # capability is what landed.  On a withholding we `continue`
+                # rather than raise, deliberately WITHOUT appending to
+                # landed_ids and WITHOUT emitting train_merged, so a member
+                # whose capability is unverifiable is never REPORTED as
+                # attributed.  Per-member by construction: a blocked member
+                # never aborts its siblings' attribution.  The write-ahead
+                # LandedRow is left unconsumed, and the passer is REVERTED TO
+                # PENDING — its only recovery edge, since the stranded sweep
+                # provably cannot reach a merge-deferred task (see
+                # _revert_withheld_member).
+                block = await self._member_delivered_checks_withhold(
+                    r.member_id, site='train-attribution-solo-passer',
+                )
+                if block is not None:
+                    await self._revert_withheld_member(
+                        r.member_id, train_id=train_id,
+                        site='train-attribution-solo-passer',
+                        reason=block.reason,
+                    )
+                    continue
                 await self.scheduler.mark_done(
                     r.member_id,
                     kind='merged',
@@ -10525,6 +12076,85 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         an empty string immediately — the caller treats this as "no
         resolution" and the workflow proceeds to ESCALATED/BLOCKED
         via its normal path.
+
+        **Bounded (task 3170, fix C + review fixes D1/D2/D3).** The level-0
+        wait is bounded by an IDLE window
+
+            timeouts.steward + steward_completion_timeout
+
+        refreshed for as long as the steward is observably working (its
+        progress counter advancing — see :meth:`_steward_progress_counter`), so
+        it trips ONLY on a genuinely SILENT producer.  Both terms are what they
+        are for a reason, and the refresh is what makes the "future producer
+        bug" framing below true rather than aspirational:
+
+        - ``timeouts.steward`` is the ENFORCED per-SUBPROCESS ceiling — the
+          longest a healthy steward can be silent WITHIN one agent subprocess,
+          since past it ``invoke_agent`` itself SIGTERM/SIGKILLs the process
+          group (cli_invoke.py:2184-2206).  Any window shorter than it is
+          guaranteed to fire on healthy stewards.  It is emphatically NOT a
+          bound on one ``_invoke_with_session`` call: that delegates to
+          ``invoke_with_cap_retry``, which may run up to 16 subprocesses with
+          cap cooldowns between them behind a single return, so the progress
+          signal MUST tick per subprocess attempt rather than per completed
+          invocation — which is exactly what ``metrics.subprocess_attempts``
+          does (review fix D4).  Without that tick, an all-accounts-capped
+          steward reads as silent for hours and this backstop kills a working
+          producer.
+        - ``steward_completion_timeout`` is kept in its DOCUMENTED role
+          (config.py:211-222 — the post-invocation drain grace) as the slack
+          for the steward to publish/dismiss after its invocation returns or
+          is killed, rather than misused as the whole bound.
+        - The refresh covers the retry tail: a healthy steward can occupy
+          several full invocation ceilings on ONE escalation, because the
+          timeout-kill path re-handles the still-pending record
+          (steward.py:399-412).  Refreshing bounds each legitimate retry by
+          its own window without hard-coding the ``steward_max_attempts +
+          steward_max_timeouts_per_escalation`` multiplier, so the bound
+          self-maintains if either knob changes.
+
+        No new config knob and no new validator were added: the existing
+        ``timeouts.steward >= steward_completion_timeout`` invariant
+        (config.py:4071-4081) already forces this window above ``2x
+        steward_completion_timeout`` for every config that constructs at all,
+        and an operator who raises ``timeouts.steward`` widens the wait bound
+        in lockstep for free.
+
+        The wait relies on the same PRODUCER invariant its sibling waiter
+        :meth:`_await_steward_completion` does:
+
+            A steward give-up ALWAYS dismisses its own L0 before publishing
+            an outcome.  No pending L0 survives a steward give-up.
+
+        This path is woken ONLY by that dismissal (``EscalationQueue.resolve``
+        → ``_resolve_callback`` → ``harness._on_escalation_resolved`` →
+        ``_escalation_events[task_id].set()``); it never reads the steward
+        outcome channel.  The idle window therefore exists to make the wait
+        non-strandable if any FUTURE producer bug breaks that invariant — as
+        task 2248's wip-gated give-up branches did, parking the workflow
+        forever while the steward re-handled the capped escalation at loop
+        speed.
+
+        On expiry it FIRST stops the steward and clears the reference, and
+        only then logs loudly, emits an ``escalation_resolved`` event with
+        ``outcome='steward_wait_timeout'``, DISMISSES the orphan L0(s) — so
+        the next ESCALATED entry cannot re-strand on the same records — and
+        falls through to the unchanged tail below.  Stopping first is a safety
+        requirement, not tidiness: the steward runs its agent in the SAME
+        worktree (``cwd = self.worktree``, steward.py:542, 590) that the
+        resumed implementer edits and commits in, so dismissing or resuming
+        beside a live steward agent means two agents committing in one git
+        worktree.  The tail then yields exactly two dispositions:
+        ``_StewardReescalated`` (blocking, with the already-open L1) when one
+        is open, or the collected resolutions (resuming) when none is.  It
+        deliberately does NOT call :meth:`_mark_blocked`, which would file a
+        fresh L0 and could add a SECOND full grace window for what is a pure
+        wait-timeout.
+
+        On BOTH exits it then calls :meth:`_drain_steward_outcomes`: whatever
+        the steward published while this waiter held the wait is never consumed
+        here, and would otherwise be replayed to a later ``_mark_blocked`` in
+        this same workflow as if freshly published.
         """
         if self.escalation_queue is None:
             logger.warning(
@@ -10550,7 +12180,51 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if pending_high_sev:
             raise _StewardReescalated(pending_high_sev)
 
-        # Wait for level-0 pending escalations to clear
+        # Wait for level-0 pending escalations to clear, BOUNDED by a derived
+        # window (task 3170, fix C + review fix D1).  See the method docstring
+        # for the disposition.  Both terms are load-bearing, neither is
+        # arbitrary:
+        #
+        #   timeouts.steward             the ENFORCED per-SUBPROCESS ceiling —
+        #                                the longest a HEALTHY steward can be
+        #                                silent within ONE agent subprocess,
+        #                                since past it invoke_agent itself
+        #                                SIGTERM/SIGKILLs the process group
+        #                                (cli_invoke.py:2184-2206).  Any window
+        #                                shorter than this is guaranteed to fire
+        #                                on healthy stewards.  Cap-retry
+        #                                cooldowns stack MORE subprocesses
+        #                                behind one _invoke_with_session call;
+        #                                the per-attempt progress tick (review
+        #                                fix D4) is what keeps them visible.
+        #   steward_completion_timeout   kept in its DOCUMENTED role
+        #                                (config.py:211-222, the post-invocation
+        #                                drain grace) as the slack for the
+        #                                steward to publish/dismiss after its
+        #                                invocation returns or is killed.
+        #
+        # Deliberately NO new config knob and NO new validator: the existing
+        # `timeouts.steward >= steward_completion_timeout` invariant
+        # (config.py:4071-4081) already forces this window to >= 2x
+        # steward_completion_timeout for every config that constructs at all,
+        # and an operator who raises timeouts.steward widens the wait bound in
+        # lockstep for free.
+        #
+        # The window is an IDLE deadline, not an overall one (review fix D2):
+        # it is refreshed whenever the steward is observably still working, so
+        # only a GENUINELY SILENT producer trips the give-up path.  A healthy
+        # steward can legitimately occupy several full invocation ceilings on
+        # ONE escalation — the timeout-kill path re-handles the still-pending
+        # record (steward.py:399-412) — and refreshing on the counter bounds
+        # each legitimate retry by its own window without hard-coding the
+        # steward_max_attempts + steward_max_timeouts_per_escalation multiplier.
+        # The same argument covers the cap-retry tail (review fix D4): the
+        # counter ticks per SUBPROCESS attempt, so an all-accounts-capped
+        # steward waiting out cooldowns keeps refreshing instead of being
+        # mistaken for a dead producer and killed mid-work.
+        window = self.config.timeouts.steward + self.config.steward_completion_timeout
+        deadline = asyncio.get_event_loop().time() + window
+        last_progress = self._steward_progress_counter()
         while True:
             pending_l0 = self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=0,
@@ -10558,7 +12232,100 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if not pending_l0:
                 break
             self._escalation_event.clear()
-            await self._escalation_event.wait()
+            remaining = deadline - asyncio.get_event_loop().time()
+            try:
+                if remaining <= 0:
+                    raise TimeoutError  # noqa: TRY301 — uniform expiry handling
+                await asyncio.wait_for(self._escalation_event.wait(), remaining)
+            except TimeoutError:  # asyncio.TimeoutError is an alias since 3.11
+                # Before giving up: is the steward observably still working?
+                # A counter that ADVANCED means one more invocation legitimately
+                # completed inside this window, so extend rather than fire.  A
+                # None counter (no steward, or a fake without metrics) means no
+                # signal is available and degrades to a plain fixed deadline; a
+                # counter that went backwards or non-monotonic is treated as no
+                # progress, never as an extension.
+                progress = self._steward_progress_counter()
+                if (
+                    progress is not None
+                    and last_progress is not None
+                    and progress > last_progress
+                ):
+                    logger.info(
+                        'Task %s: steward still working (invocations %d → %d) '
+                        '— extending the ESCALATED wait by another %.0fs idle '
+                        'window rather than giving up',
+                        self.task_id, last_progress, progress, window,
+                    )
+                    last_progress = progress
+                    deadline = asyncio.get_event_loop().time() + window
+                    continue
+                # Give-up decided.  STOP THE STEWARD FIRST — before the event
+                # emit, before the orphan dismissal, before the break (review
+                # fix D3).  Ordering is load-bearing, not stylistic:
+                # TaskSteward invokes its agent with cwd = self.worktree
+                # (steward.py:542, 590), the SAME worktree the resumed
+                # implementer edits and commits in, so stopping first closes
+                # the two-agents-one-worktree window entirely rather than
+                # narrowing it.  stop() cancels the loop task (steward.py:
+                # 209-217) and on the stock `steward: "claude"` backend the
+                # resulting CancelledError propagates into
+                # cli_invoke.py:_run_subprocess, whose handler (:2240-2252)
+                # terminates the agent's whole process group — so the in-flight
+                # agent genuinely stops writing rather than merely being
+                # detached from.  Clearing the reference (the existing
+                # stop-then-clear idiom, cf. :5319-5320 / :5363-5364) makes a
+                # later _mark_blocked build a FRESH steward through
+                # _ensure_steward_started instead of awaiting a cancelled loop
+                # that can never publish.  Suppressed because this is cleanup on
+                # an already-degraded path: a failing stop() must not convert a
+                # wait-timeout into a workflow crash.
+                if self._steward is not None:
+                    with contextlib.suppress(Exception):
+                        await self._steward.stop()
+                    self._steward = None
+                orphan_ids = [e.id for e in pending_l0]
+                logger.warning(
+                    'Task %s: steward did not resolve %d level-0 escalation(s) '
+                    'within the ESCALATED wait window (%.0fs = timeouts.steward '
+                    '%.0fs + steward_completion_timeout %.0fs) — dismissing the '
+                    'orphan(s) and unblocking the ESCALATED wait: %s',
+                    self.task_id, len(orphan_ids), window,
+                    self.config.timeouts.steward,
+                    self.config.steward_completion_timeout,
+                    ', '.join(orphan_ids),
+                )
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_resolved,
+                        task_id=self.task_id, phase=self.state.value,
+                        data={
+                            'outcome': 'steward_wait_timeout',
+                            'escalation_ids': orphan_ids,
+                        },
+                    )
+                # Uphold the same "no pending L0 survives a give-up"
+                # invariant fix A establishes on the producer side.  Leaving
+                # them pending would re-strand the NEXT ESCALATED entry on
+                # the same records for another full window.
+                for esc in pending_l0:
+                    self.escalation_queue.resolve(
+                        esc.id,
+                        'Auto-dismissed: steward did not resolve within the '
+                        'ESCALATED wait window (timeouts.steward + '
+                        'steward_completion_timeout) — unblocking the '
+                        'ESCALATED wait',
+                        dismiss=True,
+                        resolved_by='auto-dismissed',
+                    )
+                break
+
+        # Whatever the steward published while THIS waiter held the wait is
+        # never consumed by it (see _drain_steward_outcomes) — drain it here,
+        # covering both the normal-clear and the timeout exit above, so a
+        # later _mark_blocked in this same workflow cannot pop a stale
+        # outcome out of _await_steward_completion.
+        self._drain_steward_outcomes()
 
         # Check for level-1 re-escalation (steward gave up)
         if self.escalation_queue.has_open_l1(self.task_id):
@@ -10796,10 +12563,181 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return False
         return self._has_prior_implementation(wt_head=wt_head).has_work
 
+    async def _delivered_checks_block(
+        self,
+        task_id: str,
+        metadata: Mapping[str, Any] | None,
+        *,
+        site: str,
+        main_sha: str | None = None,
+    ) -> DeliveredChecksBlock | None:
+        """Workflow-side binding of the ONE shared mark-done decision (task 3057).
+
+        The twin of :meth:`~orchestrator.harness.Harness._delivered_checks_block`,
+        so the workflow's attribution-shaped stamp seams cannot drift from the
+        harness's. A non-``None`` result means **do NOT stamp done at this
+        site** — take that site's EXISTING "no landing evidence" path instead.
+
+        ``project_root``, deliberately NOT ``self.worktree``: the ``grep`` kind
+        evaluates the COMMITTED tree at ``ref=main_sha``, so a worktree path
+        would silently audit the wrong tree — and would usually still pass,
+        leaving the guard looking armed while proving nothing about ``main``.
+
+        Inertness (no ``delivered_checks``) and the kill switch live in
+        :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+        ALONE; workflow sites delegate unconditionally rather than
+        re-implementing either locally. ``main_sha`` lets a seam that has
+        ALREADY resolved a main SHA forward it, so the guard audits the SAME
+        main that seam's other evidence test used with no second git call.
+
+        Never raises.
+        """
+        return await gate_mark_done_on_delivered_checks(
+            task_id,
+            metadata,
+            git_ops=self.git_ops,
+            project_root=str(self.config.project_root),
+            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+            enabled=self.config.delivered_checks.enabled,
+            main_sha=main_sha,
+            site=site,
+            log=logger,
+        )
+
+    async def _revert_withheld_member(
+        self, mid: str, *, train_id: str, site: str, reason: str,
+    ) -> None:
+        """Hand a withheld train member back to the scheduler (task 3057).
+
+        The withheld member's ONLY recovery edge, shared by the two workflow
+        seams that stamp OTHER members (the inline ``_mark_member_done``
+        closure and :meth:`_attribute_train_failure`'s solo-passer arm) so
+        they cannot drift apart, and mirroring
+        ``harness.build_train_callback_factory``'s identically-named inner
+        coroutine so all four train seams stay one behaviour.
+
+        A withheld member sits at ``'merge-deferred'``, which is unreachable
+        by every recovery path: the harness's stranded sweep excludes that
+        status (``_RECONCILE_SWEEP_STATUSES``) and ``_reconcile_one_stranded``
+        early-returns on it, the train already advanced main so the merge
+        worker will not re-drive it, and ``_WARM_LANE_RECLAIM_PROTECTED_STATUSES``
+        contains it so even the leaked warm lane cannot be reclaimed. The
+        revert is safe precisely BECAUSE this seam fires AFTER the merge
+        advanced main, so PRD § 9.8's "the worktree must survive for the
+        train-merge worker" rationale for the park has expired. Termination is
+        guaranteed rather than assumed: a re-dispatched member that
+        re-implements and merges completes through :meth:`_finalise_merged_done`,
+        which task 3057 design decision 2 deliberately leaves unguarded, so
+        even a permanently-ERRORing check descriptor cannot produce an
+        infinite withhold/revert cycle.
+
+        NEVER raises: a failed recovery edge must not reach the merge worker's
+        post-advance flip loop as a false ``TRAIN_PARTIAL_FLIP``, nor abort
+        the attribution loop before its remaining members. When the revert
+        itself fails the member stays merge-deferred — no worse than before
+        this edge existed — and that is logged rather than escalated.
+        """
+        try:
+            await self.scheduler.set_task_status(mid, 'pending')
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'Task %s: train %r member %s (%s) — delivered-checks withheld '
+                'but the revert to pending FAILED; member remains '
+                'merge-deferred and will need operator attention',
+                self.task_id, train_id, mid, site, exc_info=True,
+            )
+            return
+        logger.warning(
+            'Task %s: train %r member %s (%s) — delivered_checks not '
+            'verifiably on main (%s); NOT stamping done, reverted to pending '
+            'for re-dispatch (LandedRow retained for the reconciler)',
+            self.task_id, train_id, mid, site, reason,
+        )
+
+    async def _member_delivered_checks_withhold(
+        self, mid: str, *, site: str,
+    ) -> DeliveredChecksBlock | None:
+        """Non-``None`` => do NOT stamp train member *mid* done here (task 3057).
+
+        The shared binding for the two workflow seams that stamp OTHER
+        members' rows (the inline ``_mark_member_done`` closure and
+        ``_attribute_train_failure``'s solo-passer arm), so those two cannot
+        drift apart — and so a future third member-stamping seam has a
+        one-line adoption path rather than a block to hand-copy.
+
+        Unlike the self-task seams, the metadata is not in scope here: a
+        member id is, so this costs ONE ``scheduler.get_task(mid)``
+        round-trip. Because that read precedes the shared decision, the kill
+        switch is re-checked LOCALLY first (task 3057 review) — at this seam
+        alone, delegating it to
+        :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+        would leave the pre-read's fail-safe arms live on a disarmed fleet.
+        The check-less case still short-circuits inside the shared gate with
+        zero I/O beyond that read.
+
+        Returns the :class:`DeliveredChecksBlock` rather than a bool so the
+        caller's recovery log can name the REASON — an operator seeing a
+        member bounced back to pending needs to know whether a check FAILED
+        (the capability is genuinely absent) or the guard ERRORED (it could
+        not tell), because those call for very different responses.
+
+        Fail-safe in ALL directions, and it NEVER propagates an exception to
+        the caller: an unreadable member row, an absent member, or an errored
+        guard all WITHHOLD. Stamping done on unknown metadata is the exact
+        failure this task exists to close, and a raise escaping a train-flip
+        callback would be misread by the merge worker's post-advance loop as a
+        ``TRAIN_PARTIAL_FLIP`` — a capability check must never be ABLE to
+        fabricate one. Those fail-safe arms synthesise ``reason='errored'`` —
+        accurate for all three (they ARE errors), and each already emits its
+        own distinct WARNING naming the specific cause, so no diagnostic
+        detail is lost by the collapse.
+        """
+        if not self.config.delivered_checks.enabled:
+            # Kill switch, checked BEFORE the metadata pre-read (task 3057
+            # review) — see the note below on why delegating it to
+            # `gate_mark_done_on_delivered_checks` alone is not sufficient at
+            # THIS seam. A disarmed fleet must reproduce the pre-3057
+            # behaviour exactly, and the pre-read's fail-safe arms synthesise a
+            # block without ever reaching the gate, so a transient
+            # `scheduler.get_task` failure would otherwise still withhold the
+            # stamp and revert the member to pending with the switch off.
+            logger.debug(
+                'Task %s: delivered_checks.enabled=False — member guard inert '
+                'for %s (%s)', self.task_id, mid, site,
+            )
+            return None
+        try:
+            member = await self.scheduler.get_task(mid)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'Task %s: could not read member %s metadata for the '
+                'delivered-checks guard (%s) — withholding the done-stamp',
+                self.task_id, mid, site, exc_info=True,
+            )
+            return DeliveredChecksBlock(reason='errored')
+        if member is None:
+            logger.warning(
+                'Task %s: member %s has no scheduler task row (%s) — '
+                'withholding the done-stamp',
+                self.task_id, mid, site,
+            )
+            return DeliveredChecksBlock(reason='errored')
+        try:
+            return await self._delivered_checks_block(
+                mid, (member.get('metadata') or {}), site=site,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'Task %s: delivered-checks guard errored for member %s (%s) '
+                '— withholding the done-stamp',
+                self.task_id, mid, site, exc_info=True,
+            )
+            return DeliveredChecksBlock(reason='errored')
+
     async def _finalise_recovery_done(
         self, *, basis: str, sha: str, kind: str, note: str,
         files: list[str] | None = None,
-    ) -> WorkflowOutcome:
+    ) -> WorkflowOutcome | None:
         """Shared DONE-finalisation for all already-merged guards (PRD α, MP-2).
 
         The sole writer of :attr:`_merge_recovery_basis`.  Every already-merged
@@ -10830,6 +12768,31 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         provenance basis": a future guard that calls this chokepoint without
         a valid basis fails loudly instead of silently producing a
         phantom-done.
+
+        **Delivered-capability guard** (task 3057, seams 4+7 of eleven).
+        A journal row or a branch-on-main probe proves only that SOMETHING of
+        this branch reached ``main`` — never that THIS task's declared
+        capability (``metadata.delivered_checks``) survived to it. The guard
+        sits HERE, at the SINGLE chokepoint all six recovery stamps funnel
+        through (3x journal ``kind='merged'`` + 3x fallback
+        ``kind='found_on_main'``), rather than at the six call sites,
+        precisely so a future SEVENTH recovery arm cannot be added unguarded —
+        the failure mode that re-opened this defect class eight times.
+
+        Returning ``None`` means "capability not verifiably on main — withhold
+        the recovery and let the workflow actually deliver it". It is placed
+        AFTER the MP-2 ``AssertionError`` (so a malformed caller still fails
+        loudly rather than being masked by a capability withholding) and
+        BEFORE the ``_merge_recovery_basis`` write, so a withheld recovery
+        leaves ZERO side effects: no basis marker, no DONE phase, no
+        metadata-files reconcile, no ``mark_done``. All three callers are
+        already typed ``WorkflowOutcome | None`` where ``None`` already means
+        "no recovery — proceed with the phase", so the withholding needs no
+        new state machine.
+
+        The helper resolves ``main_sha`` itself, which is why the journal arm
+        (where no main SHA is in scope) needs no plumbing and both bases stay
+        uniform.
         """
         if basis not in ('journal', 'fallback') or not sha:
             raise AssertionError(
@@ -10837,6 +12800,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 f"(basis='journal'|'fallback' and a truthy sha) — got "
                 f'basis={basis!r}, sha={sha!r} (task {self.task_id})'
             )
+        if await self._delivered_checks_block(
+            self.task_id, (self.task.get('metadata') or {}),
+            site=f'workflow-recovery-{basis}',
+        ) is not None:
+            return None
         self._merge_recovery_basis = basis
         self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done(override_files=files)
@@ -10869,7 +12837,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Returns WorkflowOutcome.DONE if the branch is already merged to main AND
         there is prior implementation work.  Returns None in all other cases
-        (branch not merged, no prior work, missing worktree/git_ops, exceptions).
+        (branch not merged, no prior work, missing worktree/git_ops, exceptions,
+        or — task 3057 — the shared :meth:`_finalise_recovery_done` chokepoint
+        withholding the recovery because the task's declared
+        ``metadata.delivered_checks`` are not verifiably present on main).
         """
         row: LandedRow | None = MergeProvenance.lookup(self.task_id)
         if row is not None:
@@ -11027,8 +12998,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         already merged AND ``base_commit..wt_head`` is a non-empty diff.
         Returns ``None`` in all other cases (external worktree, not on main,
         on main but a zero-diff branch — a fresh, re-dispatched, or
-        otherwise stale/unadvanced branch point) so the caller proceeds with
-        the normal execute/verify/review loop.
+        otherwise stale/unadvanced branch point, or — task 3057 — the
+        chokepoint withholding the recovery because the task's declared
+        ``metadata.delivered_checks`` are not verifiably present on main) so
+        the caller proceeds with the normal execute/verify/review loop.
         """
         if self._worktree_external:
             return None
@@ -11094,8 +13067,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Returns ``WorkflowOutcome.DONE`` (via the shared
         :meth:`_finalise_recovery_done` chokepoint, MP-2) when the branch is
         already merged AND there is prior implementation work. Returns
-        ``None`` in all other cases (not an ancestor, or a spurious merge
-        signal) so the caller proceeds with the merge-retry loop.
+        ``None`` in all other cases (not an ancestor, a spurious merge
+        signal, or — task 3057 — the chokepoint withholding the recovery
+        because the task's declared ``metadata.delivered_checks`` are not
+        verifiably present on main) so the caller proceeds with the
+        merge-retry loop, which is already how ``_run_merge_phase`` reads a
+        ``None`` result.
         """
         row: LandedRow | None = MergeProvenance.lookup(self.task_id)
         if row is not None:
@@ -11382,7 +13359,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
             raise
 
-    async def _check_scope_invariant(self) -> None:
+    async def _check_scope_invariant(
+        self, *, backend_metadata: dict | None = None,
+    ) -> None:
         """Tripwire (task 2505): warn + escalate if ``plan.files`` and
         ``metadata.files`` diverge at LOCK-MODULE granularity at MERGE entry.
 
@@ -11413,12 +13392,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ``None`` — e.g. a transient backend hiccup) is treated as "cannot
         check" and skipped, not "divergent" — a read failure must not wedge
         an otherwise-valid merge or false-escalate.
+
+        Args:
+            backend_metadata: Optional pre-read backend metadata blob. The
+                merge-entry caller passes the blob
+                :meth:`_stamp_merge_phase_entered` just read (review
+                amendment), which is the SAME data this check would otherwise
+                fetch — two back-to-back ``get_task`` round-trips (15s timeout
+                each) for one blob, on the merge hot path. Threading it also
+                removes a small inconsistency: the two reads happened at
+                different instants, so the stamp and this check could see
+                different snapshots of the same task. Anything that is not a
+                dict (including ``None`` — the stamp could not read) falls
+                back to this method's own ``get_task``, preserving the
+                fail-safe above unchanged.
         """
-        fresh_task = await self.scheduler.get_task(self.task_id)
-        if fresh_task is None:
-            return
+        if isinstance(backend_metadata, dict):
+            metadata = backend_metadata
+        else:
+            fresh_task = await self.scheduler.get_task(self.task_id)
+            if fresh_task is None:
+                return
+            metadata = fresh_task.get('metadata') or {}
         plan_files = sanitize_files_for_persist(self.plan.get('files', []))
-        metadata_files = list((fresh_task.get('metadata') or {}).get('files') or [])
+        metadata_files = list(metadata.get('files') or [])
         plan_modules = set(files_to_modules(plan_files, self.config.lock_depth))
         metadata_modules = set(
             files_to_modules(metadata_files, self.config.lock_depth)
@@ -12788,7 +14785,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         return await self.git_ops.worktree_has_unsaved_work(self.worktree, self.task_id)
 
     async def _ensure_steward_started(self) -> None:
-        """Start the steward lazily on first call, if factory was provided."""
+        """Start the steward lazily on first call, if factory was provided.
+
+        The channel wired below is read by ONE of this workflow's two steward
+        waiters.  :meth:`_await_steward_completion` (reached via
+        ``_mark_blocked``) consumes it; :meth:`_wait_for_resolution` (reached
+        via ``run()``'s ESCALATED branch) does not — it is escalation-queue-only
+        and is woken solely by the steward dismissing its L0.  Both therefore
+        depend on the SAME producer invariant (task 3170):
+
+            A steward give-up ALWAYS dismisses its own L0 before publishing an
+            outcome.  No pending L0 survives a steward give-up.
+
+        A new steward early return that publishes without dismissing is
+        invisible to the ESCALATED waiter and parks the workflow forever — see
+        ``TaskSteward._handle_escalation``, which owns that obligation.
+        """
         if self._steward is not None:
             return
         if not self._steward_factory or not self.worktree:
@@ -12948,14 +14960,191 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return True
         return isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present
 
-    async def _await_steward_completion(self) -> StewardOutcome:
+    def _steward_work_outstanding(self) -> bool:
+        """Whether there is anything for :meth:`_await_steward_completion` to
+        wait ON — its ``skip_if_idle`` gate, used by the post-merge success
+        tail (task 3170).
+
+        Two things count as outstanding: a pending level-0 escalation (the
+        steward does not un-pend a record while it works on one, so "pending"
+        covers both queued and in-flight), or an unread outcome already sitting
+        on the channel (instantly consumable).
+
+        With neither, the success tail would otherwise block for the FULL
+        ``steward_completion_timeout`` — 900s on stock config — waiting for a
+        publish that is never coming, at the finish line of every task that had
+        an escalation.  That was previously masked: the outcome the steward
+        published during the ESCALATED cycle stayed on the channel and made the
+        call return instantly.  :meth:`_wait_for_resolution` now drains it (it
+        must — replaying it into a later ``_mark_blocked`` is a spurious
+        requeue), so the "nothing to wait for" case has to be stated
+        explicitly rather than ridden on a leftover.
+
+        The narrow window where the steward's AGENT has already resolved the
+        L0 via MCP but the invocation has not yet returned to publish is NOT
+        covered — and was not covered before either, since the stale outcome
+        short-circuited this same call.  The success tail's contract is
+        "give queued steward work a chance to finish", not "join the steward".
+        """
+        if self.escalation_queue is not None and self.escalation_queue.get_by_task(
+            self.task_id, status='pending', level=0,
+        ):
+            return True
+        channel = self._steward_outcome_channel
+        return channel is not None and not channel.empty()
+
+    def _steward_progress_counter(self) -> int | None:
+        """Monotonic "the steward is still working" signal, or ``None`` when no
+        signal is available (task 3170, review fix D2).
+
+        Sums two public ``TaskSteward.metrics`` counters, because neither alone
+        covers the whole of "the steward is alive":
+
+        - ``invocations`` increments after EVERY invocation returns
+          (steward.py:597, and on the pre-triage path) — one tick per completed
+          invocation, including each timeout-kill retry.  That is the "one more
+          invocation ceiling legitimately consumed" event
+          :meth:`_wait_for_resolution` needs in order to extend its idle window
+          without hard-coding the ``steward_max_attempts +
+          steward_max_timeouts_per_escalation`` multiplier.
+        - ``subprocess_attempts`` increments at the START of every agent
+          subprocess attempt (``TaskSteward._invoke_agent_counted``, task 3170
+          review fix D4).  This is load-bearing, not redundant:
+          ``_invoke_with_session`` delegates to ``invoke_with_cap_retry``, which
+          runs up to ``_MAX_CAP_RETRIES`` (16) subprocess attempts behind ONE
+          return, sleeping a cap cooldown (<= 300s, cli_invoke.py:1295/1367)
+          between them while it waits for a usage-cap reset.  ``invocations``
+          cannot move during that window, so an all-accounts-capped steward — a
+          routine, designed-for condition — would read as SILENT for as long as
+          the retry loop is patient, and the waiter would kill a healthy steward
+          mid-work.  Ticking per ATTEMPT caps the longest legitimate silence at
+          one cooldown plus one enforced ``timeouts.steward`` ceiling, which
+          fits inside the waiter's window.
+
+        Both counters are monotonically non-decreasing, so their sum is too —
+        which is all the caller's ``progress > last_progress`` comparison
+        requires.  The absolute value is meaningless; only its movement is read.
+
+        Read through a defensive ``getattr`` chain: no steward, no ``metrics``,
+        or NEITHER counter present as an ``int`` all mean "no progress signal
+        available" and return ``None``, which degrades the caller to a plain
+        fixed deadline rather than breaking it.  A counter that is present but
+        not a usable ``int`` contributes 0 rather than poisoning the other
+        (older fakes and hand-rolled test doubles expose only ``invocations``,
+        and must keep working).  ``bool`` is excluded explicitly — it is an
+        ``int`` subclass, and a truthy flag masquerading as a counter would read
+        as progress exactly once and never again.
+        """
+        steward = self._steward
+        if steward is None:
+            return None
+        metrics = getattr(steward, 'metrics', None)
+        if metrics is None:
+            return None
+        total: int | None = None
+        for name in ('invocations', 'subprocess_attempts'):
+            value = getattr(metrics, name, None)
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            total = value if total is None else total + value
+        return total
+
+    def _drain_steward_outcomes(self) -> StewardOutcome | None:
+        """Non-blockingly empty the steward outcome channel and LOG what was
+        there, returning the most severe drained outcome (task 3170).
+
+        This exists for :meth:`_wait_for_resolution` — the run()-ESCALATED
+        waiter, which is escalation-queue-only and never consumes the channel.
+        Anything the steward published while that waiter held the wait would
+        otherwise sit on the channel indefinitely, and a LATER
+        ``_mark_blocked`` in the same workflow would pop it out of
+        :meth:`_await_steward_completion` as though it had just been
+        published.  A stale ``StewardInterrupted(wip_commits_present=True)`` is
+        exactly the task-2060 resume-plan outcome, so the consequence is a
+        spurious ``_requeue()`` driven by an already-dispositioned escalation
+        cycle.  (The hazard pre-dates task 3170 — ``StewardResolved`` is
+        published on every steward success — but fix A makes it reachable far
+        more often.)
+
+        **Drain-and-log ONLY — deliberately does NOT route on the drained
+        value.**  Every actionable variant is already fully determined by the
+        escalation-queue state ``_wait_for_resolution``'s tail reads:
+        ``StewardReescalatedL1``/``StewardBudgetExhausted`` ⇒ the L0 is
+        dismissed and an L1 is open ⇒ ``has_open_l1``; ``StewardResolved`` ⇒
+        the L0 is resolved; ``StewardInterrupted`` ⇒ the L0 is dismissed by the
+        producer-side give-up contract with no L1.  Routing here would add a
+        SECOND parallel outcome contract on a path that has none — precisely
+        the asymmetry this task exists to remove.  The return value is for
+        callers/tests that want to observe what was drained, not to branch on.
+
+        Reduction reuses :meth:`_outcome_severity` rather than adding a
+        parallel ranking.  A ``None`` channel (no steward was ever started for
+        this workflow) is a no-op returning ``None``.
+        """
+        channel = self._steward_outcome_channel
+        if channel is None:
+            return None
+        drained: list[StewardOutcome] = []
+        while True:
+            try:
+                drained.append(channel.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if not drained:
+            return None
+        most_severe = max(drained, key=self._outcome_severity)
+        logger.info(
+            'Task %s: drained %d unconsumed steward outcome(s) after the '
+            'ESCALATED wait (most severe: %r) — the escalation-queue state '
+            'already determined this cycle\'s disposition; draining only '
+            'prevents a later _mark_blocked from replaying them',
+            self.task_id, len(drained), most_severe,
+        )
+        return most_severe
+
+    async def _await_steward_completion(
+        self, *, skip_if_idle: bool = False,
+    ) -> StewardOutcome:
         """Wait for the steward to publish an outcome, with a grace period
         (task 2248 / W9-delta, SO-1).
+
+        *skip_if_idle* (task 3170) is passed by the post-merge success tail,
+        whose contract is "give queued steward work a chance to finish" rather
+        than "join the steward": with nothing outstanding
+        (:meth:`_steward_work_outstanding`) it returns the same synthesized
+        default as the no-channel case instead of burning the whole grace
+        window on a publish that is never coming.  ``_mark_blocked`` never
+        passes it — there the wait IS the point, and an L0 it just filed is
+        outstanding by construction.
 
         Races ``self._steward_outcome_channel.get()`` against the soft-cancel
         event and the configured grace deadline — replaces the old
         escalation-queue file-polling loop entirely (no more re-reading
         ``_pending_l0()``; the channel is the sole synchronization signal).
+
+        This is ONE of the workflow's two steward waiters, and both rest on the
+        same producer invariant (task 3170): *a steward give-up ALWAYS dismisses
+        its own L0 before publishing an outcome*.  Its sibling
+        :meth:`_wait_for_resolution` (``run()``'s ESCALATED branch) never reads
+        this channel — the dismissal is the only thing that wakes it — so a new
+        steward early return that publishes without dismissing would satisfy
+        this waiter while stranding that one.  The dismissal loops on this path
+        (``_mark_blocked``'s, and the ``has_open_l1`` override's below) are
+        idempotent backstops over an already-dismissed record, not the primary
+        mechanism.
+
+        The two waiters share that PRODUCER invariant but deliberately DIVERGE
+        on their bound — do not "re-converge" them onto one knob, which is
+        exactly the defect review fix D1 removed.  This one is a
+        post-completion drain grace (``steward_completion_timeout`` alone,
+        which is precisely what config.py:211-222 defines that knob as, and
+        the right scale for "the task is finished, let the steward drain").
+        :meth:`_wait_for_resolution` instead waits on a steward that is
+        actively working an escalation, where the relevant scale is the
+        per-invocation ceiling — so it uses an idle window of
+        ``timeouts.steward + steward_completion_timeout``, refreshed on
+        observable progress.  Sharing a knob gave that backstop a value a
+        healthy steward routinely exceeds.
 
         A steward is only ever started (and the channel only ever created)
         by :meth:`_ensure_steward_started` when there is real pending work
@@ -13001,6 +15190,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         channel = self._steward_outcome_channel
         if channel is None:
+            return StewardInterrupted('timeout', wip_commits_present=False)
+        if skip_if_idle and not self._steward_work_outstanding():
+            logger.info(
+                'Task %s: no outstanding steward work — skipping the '
+                'completion grace window', self.task_id,
+            )
             return StewardInterrupted('timeout', wip_commits_present=False)
 
         timeout = self.config.steward_completion_timeout

@@ -37,6 +37,144 @@ _STAGE3_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools='search, get_entity, get_episodes, get_status, get_tasks, get_task'
 )
 
+# ---------------------------------------------------------------------------
+# Shared escalation-store boundary (task 3163, plans/escalation-store-ambiguity-prd.md)
+# ---------------------------------------------------------------------------
+# The BODY below is identical for all three stages — store identity, the missing
+# read tools, and the "an empty result is not evidence of absence" rule hold
+# everywhere — but the SANCTIONED-ACTION clause varies by stage capability,
+# which is exactly the case the recon_self_model render_*_section() precedent
+# exists for. So the note is RENDERED via render_escalation_boundary_note()
+# rather than pasted: only Stage 2 holds the FIX D escalate_blocker path.
+#
+# The companion mechanism is DISALLOW_ESCALATION_READS in cli_stage_runner.py,
+# which denies the escalation READ tools in every stage. This paragraph is not
+# decorative: `--disallowed-tools` OMITS a denied tool from the agent's listing
+# rather than rejecting the call, so without it the agent gets no explanation
+# for the missing tool and can conclude the escalation surface does not exist.
+#
+# MUST NOT contain the string '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. Not an f-string: it is interpolated INTO f-strings, and
+# braces inside an interpolated value are not re-parsed by the enclosing
+# f-string, so its own text needs no {{/}} escaping.
+ESCALATION_BOUNDARY_NOTE = """\
+## Escalation Store Boundary
+Your `mcp__escalation__*` connection serves the RECONCILIATION escalation store \
+only — never a project's escalation queue. A question of the form "was an \
+escalation ever filed for task X?" CANNOT be answered from this stage: the \
+escalation READ tools are not available to you here, and any empty or missing \
+escalation result you encounter is NOT evidence that no escalation exists. It \
+means only that you are looking in the wrong store. Never report, infer, or \
+flag "no escalation was filed for task X" on the strength of this connection; \
+if a finding depends on that question, record what you actually observed and \
+hand the question on rather than asserting an absence.\
+"""
+
+# Per-stage sanctioned-action clauses appended to ESCALATION_BOUNDARY_NOTE.
+# Keep these two mutually exclusive: a stage is either told about the one write
+# path it may take, or told plainly that it has none. Never both, never neither.
+_ESCALATION_BOUNDARY_SANCTIONED_WRITE = (
+    'The one sanctioned escalation action in this stage is the write path '
+    '(`mcp__escalation__escalate_blocker`) for the Stale Flag Escalation (FIX D) case.'
+)
+
+_ESCALATION_BOUNDARY_NO_ACTION = (
+    'No escalation action is sanctioned in this stage: do not file escalations '
+    'here. Record what you actually observed through the recon_report channel '
+    '(`mcp__recon-report__add_finding`) and let the reconciliation harness route '
+    'it from there.'
+)
+
+# The one concrete case the boundary note above exists for (task 3023), rendered
+# as a SUBSECTION of it rather than as a second top-level block elsewhere in the
+# prompt. Everything general — store identity, the missing escalation read tools,
+# "an empty result is not evidence of absence", "never flag 'no escalation was
+# filed for task X'" — is stated ONCE, in ESCALATION_BOUNDARY_NOTE (INV-5); this
+# constant adds only what is NOT already there: the POSITIVE closure rule read
+# off the task record, and the incident lineage.
+#
+# Do NOT restate the pending-only semantics of `get_pending_escalations` here, or
+# present any `mcp__escalation__*` read as a probe the stage ran or could run: the
+# escalation READ tools are denied to every stage (DISALLOW_ESCALATION_READS in
+# cli_stage_runner.py) and the denial OMITS them from the tool listing, so
+# describing them as available contradicts both the note above and the stage's
+# actual tool surface. The bare token `get_task_escalations` is retained
+# deliberately — registry source_assertion #2 of
+# `deterministic_gate_escalation_record_archived_not_missing`
+# (config/recon_code_fix_premise_registry.yaml) reads this file's text — and is
+# described accurately, as an ORCHESTRATOR-side lookup no stage can reach.
+#
+# NOTE: a PLAIN (non-f) string interpolated into the stage f-strings, so its
+# literal braces need no doubling. Keep it free of bare recon-report tool call
+# examples (see test_recon_report_guidance_drift.py, which scans the assembled
+# stage prompts and requires every such example to carry `run_id=`).
+_GATE_CLOSURE_ARCHIVE_GUIDANCE = """\
+### Deterministic-gate closure is established from the TASK RECORD
+Scope: a `done` task with `task_kind='deterministic'`, `metadata.gate_escalated_at` \
+set, and a `done_provenance.kind` of `deterministic-gate` or `deterministic-milestone`.
+
+Call `mcp__fused-memory__get_task(task_id)` — a READ you do hold. `status == 'done'` \
+PLUS `metadata.gate_escalated_at` set PLUS one of those `done_provenance.kind` values \
+IS LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Do not flag such \
+a task, do not file remediation work against it, and do not write a memory asserting a \
+missing escalation record. An archive-inclusive `get_task_escalations` lookup that would \
+confirm the record directly does exist, but only on the ORCHESTRATOR-side escalation \
+server, which is not part of your tool surface — that changes nothing about the rule \
+here, which needs no escalation lookup at all.
+
+Incident lineage, so you recognise this pattern rather than re-deriving it: dark_factory \
+tasks 2841, 2842, 2844, 2846, 2919, 2954, 2955, 2958, 2999, 3005, 3006 and reify tasks \
+5330, 5341, 5349, 5352, 5353 were all filed on the false premise that these gates closed \
+without an escalation record. The orchestrator side (`deterministic_runner.py` / \
+`harness.py`) already queries the archive inclusively and is NOT the defect — do not file \
+work against it.\
+"""
+
+
+def render_escalation_boundary_note(*, can_escalate: bool) -> str:
+    """Render the escalation-store boundary note for one stage.
+
+    Follows the :func:`render_source_completion_section` precedent
+    (reconciliation/recon_self_model.py): one shared stage-agnostic body plus a
+    single clause selected by what the stage is actually sanctioned to do, with
+    a keyword-only capability flag.
+
+    The clause is parameterized because the FIX D Stale Flag Escalation is a
+    **Stage 2 mechanism only** — its prompt text lives in prompts/stage2.py and
+    its flag-relay driver in stages/task_knowledge_sync.py, inside
+    ``class TaskKnowledgeSync``, not ``class IntegrityCheck``. Stage 1 and
+    Stage 3 have no FIX D path and no other sanctioned escalation write, so
+    they get the no-action variant.
+
+    This matters beyond tidiness: ``escalate_blocker`` is deliberately NOT in
+    any disallow list (see DISALLOW_ESCALATION_READS in cli_stage_runner.py,
+    which denies only the READ tools), so the tool really is callable from every
+    stage. Naming it in a stage's prompt is therefore a live positive license,
+    not inert prose — and Stage 3 declares itself read-only two lines earlier.
+    Never tell a stage about an action it is not sanctioned to take
+    (loud-over-silent), and never license a durable write from a read-only
+    stage.
+
+    Args:
+        can_escalate: True for Stage 2, which holds the FIX D escalate_blocker
+            path; False for Stage 1 and Stage 3, which hold no sanctioned
+            escalation action.
+
+    Returns:
+        ESCALATION_BOUNDARY_NOTE, the matching sanctioned-action clause, and the
+        deterministic-gate closure subsection (:data:`_GATE_CLOSURE_ARCHIVE_GUIDANCE`,
+        task 3023) — the one concrete case this boundary exists for, rendered here
+        so the shared core still appears exactly once (INV-5) instead of being
+        restated by a second block elsewhere in the prompt.
+    """
+    clause = (
+        _ESCALATION_BOUNDARY_SANCTIONED_WRITE
+        if can_escalate
+        else _ESCALATION_BOUNDARY_NO_ACTION
+    )
+    return f'{ESCALATION_BOUNDARY_NOTE} {clause}\n\n{_GATE_CLOSURE_ARCHIVE_GUIDANCE}'
+
 # Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
 # invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
 # writes under their `memories_*` stats; only the stat-key tokens differ between stages.

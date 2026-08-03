@@ -141,6 +141,63 @@ def test_build_claude_argv_expands_deny_list_when_schema_and_wildcard() -> None:
         _cleanup(temp_files)
 
 
+def test_build_claude_argv_resume_keeps_json_schema_and_denylist() -> None:
+    """RESUME + output_schema: the schema survives, the system prompt does not.
+
+    This asymmetry is load-bearing for every caller that carries an output
+    contract across a cap-retry resume (cli_invoke.py:1270-1272 re-invokes with
+    resume_session_id set and all other kwargs intact):
+
+      --system-prompt-file  DROPPED on resume  (:1501-1503, inside the branch)
+      --json-schema         ALWAYS emitted     (:1552-1553, outside the branch)
+
+    So a prose-carried contract silently evaporates on resume while a
+    schema-carried one is undroppable — which is why the reconciliation judge was
+    migrated onto output_schema (task 3067).  The existing resume test above
+    cannot pin this: it passes output_schema=None.  Also confirms the wildcard
+    deny-list expansion applies on the resume path too, so the synthetic
+    StructuredOutput tool the schema rides on is not blocked.
+
+    If this test fails, the premise of the judge migration is broken — escalate
+    rather than editing the assertions.
+    """
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='dropped on resume',
+        max_turns=10,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=['*'],
+        mcp_config=None,
+        output_schema={'type': 'object'},
+        effort=None,
+        resume_session_id='resume-abc',
+        session_id='sess-ignored',
+    )
+    try:
+        # The system prompt (and its pre-allocated session id) are gone...
+        assert temp_files == [], f'resume path must create no sysprompt file; got {temp_files!r}'
+        assert '--system-prompt-file' not in cmd
+        assert '--session-id' not in cmd
+        assert '--resume' in cmd
+        assert cmd[cmd.index('--resume') + 1] == 'resume-abc'
+
+        # ...but the schema is still there, serialized immediately after the flag.
+        assert '--json-schema' in cmd
+        assert cmd[cmd.index('--json-schema') + 1] == json.dumps({'type': 'object'})
+
+        # ...and the wildcard was expanded, not emitted literally, so the
+        # synthetic StructuredOutput tool is never denied.
+        idx = cmd.index('--disallowed-tools')
+        values = cmd[idx + 1:cmd.index('--json-schema', idx)]
+        assert values == _REAL_BUILTIN_TOOLS_DENYLIST, f'got {values!r}'
+        assert '*' not in values
+        assert 'StructuredOutput' not in values
+    finally:
+        _cleanup(temp_files)
+
+
 def test_build_claude_argv_strict_mcp_config_emits_flag_after_mcp_config() -> None:
     """strict_mcp_config=True (with an mcp_config) appends --strict-mcp-config
     immediately after the --mcp-config <path> pair — the recon-watch isolation

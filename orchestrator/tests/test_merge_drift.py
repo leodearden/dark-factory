@@ -39,12 +39,14 @@ mirroring task β's test_merge_gates.py:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.verify import VerifyResult
 
 
@@ -338,4 +340,164 @@ def test_merge_queue_reexports_identical_objects() -> None:
         assert mq_obj is md_obj, (
             f'{name}: orchestrator.merge_queue.{name} and '
             f'orchestrator.merge_drift.{name} must be the identical object'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3018 (steps 11-12): a LIVE drift-check throwaway worktree must survive a
+# concurrent periodic reap.
+#
+# Sibling of TestColdShadowVerifyHoldsLaneLease in test_merge_shadow.py — the
+# drift detective creates its throwaway `_merge-<uuid>` worktree through the
+# very same `create_throwaway_verify_worktree` primitive and runs a full merge
+# verify inside it, so it inherits the identical exposure: the tree is neither
+# registered in `_owned_merge_worktrees` (the reap's owned-ledger skip misses
+# it) nor touched by `_touch_owned_merge_worktrees` (its measured age is real
+# elapsed time), leaving the per-lane merge-verify flock consulted by
+# `remove_merge_worktree_guarded` as its only liveness protection.
+#
+# Deliberately uses a REAL git repo + REAL throwaway worktree (not the
+# MagicMock git_ops the reach-back tests above use) so `lane_lock_path(wt)`
+# names a real file and the flock contention is genuine — a mocked git_ops
+# cannot exercise a real lock.  The pool half is built the way the existing
+# TestReachBackRouting tests build it: a real HostAllocator plus a fake remote,
+# which is what gets DriftDetector.check past its `local is None or remote is
+# None` INCONCLUSIVE early-return and into the LocalRunner that reaches back to
+# the patched `orchestrator.merge_queue.run_scoped_verification`.
+# ---------------------------------------------------------------------------
+
+
+async def _setup_drift_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+async def _drift_head_sha(repo: Path) -> str:
+    rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0
+    return out.strip()
+
+
+@pytest.fixture
+def drift_git_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_drift_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def drift_git_ops(drift_git_repo: Path) -> GitOps:
+    git_config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+    return GitOps(git_config, drift_git_repo)
+
+
+@pytest.mark.asyncio
+class TestDriftCheckHoldsLaneLease:
+    """_run_drift_check must hold merge_verify_lease(lane_dir=wt) (task 3018).
+
+    The lane flock is the codebase's canonical "this tree is live" signal — it
+    is exactly what `remove_merge_worktree_guarded`'s acquire-then-remove C1
+    primitive consults, and therefore what the periodic reap routes its
+    removals through.  Holding it across the drift verify makes the throwaway
+    tree's protection independent of how long that verify runs, rather than
+    resting on an age heuristic.
+    """
+
+    async def test_live_drift_check_worktree_survives_concurrent_reap(
+        self, drift_git_ops: GitOps, drift_git_repo: Path,
+    ) -> None:
+        """A periodic reap firing mid drift-check must be REFUSED, and the tree
+        must still be cleaned up once the check returns.
+
+        Three assertions, in order of load-bearingness:
+
+        (a) the simulated sweep's outcome is ``'skipped_lease_held'`` — a
+            concurrent periodic reap CANNOT delete the checkout out from under
+            a running drift verify.  This is the assertion that goes RED today:
+            with no lease held, the sweep acquires the uncontended
+            ``<wt>.lock`` and returns ``'removed'``.
+        (b) the worktree still existed at that moment (so the skip is real, not
+            an artefact of the tree already being gone).
+        (c) AFTER `_run_drift_check` returns the worktree is GONE — pinning
+            that the lease is released BEFORE the existing
+            ``finally: cleanup_merge_worktree(wt)``.  If the lease wrapped the
+            finally too, the guarded removal's NON-BLOCKING acquire would fail
+            against OURSELVES and return ``'skipped_lease_held'``, leaking the
+            very tree the finally exists to remove — a worse leak than the one
+            being fixed.  (c) passes vacuously in the RED state, which is why
+            (a) leads.
+
+        `_run_drift_check` catches and logs every exception per its docstring
+        contract ("this detective control never crashes the worker"), so these
+        assertions read the outcome RECORDED by the fake rather than relying on
+        the function raising.
+        """
+        from orchestrator.merge_drift import _run_drift_check
+        from orchestrator.verify_runner import HostAllocator
+
+        head = await _drift_head_sha(drift_git_ops.project_root)
+        recorded: list[tuple[str, bool, Path]] = []
+
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+
+        async def _reaping_scoped(worktree: Path, *args, **kwargs) -> VerifyResult:
+            # Simulate the task-3018 periodic sweep firing WHILE the drift
+            # verify is running, via the very primitive
+            # reap_orphaned_merge_worktrees routes its removals through.
+            outcome = await drift_git_ops.remove_merge_worktree_guarded(
+                worktree, reason='periodic-reap-sim',
+            )
+            recorded.append((outcome, worktree.exists(), worktree))
+            return pass_result
+
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        allocator = HostAllocator([fake_remote], quarantine=set())
+
+        req = MagicMock()
+        req.task_id = 'task-3018-drift-lease'
+        req.task_files = ['src/foo.py']
+        req.module_configs = []
+        req.config = OrchestratorConfig(project_root=drift_git_repo)
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _reaping_scoped,
+        ):
+            await _run_drift_check(
+                drift_git_ops, req, head, None, None, set(), allocator=allocator,
+            )
+
+        assert recorded, (
+            'the patched run_scoped_verification never ran, so the concurrent '
+            'reap was never simulated — the test proves nothing'
+        )
+        outcome, existed_mid_verify, wt = recorded[0]
+        assert outcome == 'skipped_lease_held', (
+            f'a periodic reap firing during a LIVE drift check must be refused '
+            f'by the lane flock, got {outcome!r} — the throwaway worktree at '
+            f'{wt} would have been deleted out from under the running verify'
+        )
+        assert existed_mid_verify is True, (
+            f'the throwaway worktree {wt} must still exist at the moment the '
+            f'reap is refused (otherwise the skip is vacuous)'
+        )
+        assert not wt.exists(), (
+            f'the lease must be released BEFORE the finally-block '
+            f'cleanup_merge_worktree, else the cleanup skips on our own lease '
+            f'and leaks {wt}'
         )

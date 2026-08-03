@@ -38,9 +38,26 @@ from shared.task_metadata import (
 )
 
 
+def _assert_only_test_owned_registry_keys(added: set[str]) -> None:
+    """Fail if a test registered a metadata key it does not own.
+
+    Registry keys are OWNED by the module that registers them (see
+    `register_metadata_submodel` in shared/src/shared/task_metadata.py).
+    Tests in this file must register `<name>_stub` keys only: registering a
+    production key collides with the real registrant in a cross-package
+    pytest co-run (task 3352), where that module was already imported and the
+    key is already bound to the real model.
+    """
+    assert all(key.endswith('_stub') for key in added), (
+        'tests in this file must register test-owned <name>_stub keys; got '
+        f'{sorted(added)} (registering a production key collides in a '
+        'cross-package pytest co-run — task 3352)'
+    )
+
+
 @pytest.fixture(autouse=True)
 def _reset_metadata_registry_state():
-    """Snapshot and restore task_metadata's module-global registry/migrations.
+    """Snapshot/restore task_metadata's module-global registry/migrations.
 
     register_metadata_submodel and the migration registry mutate module-global
     dicts; without this, TestSubmodelRegistry / TestMigrations / the registry
@@ -48,18 +65,31 @@ def _reset_metadata_registry_state():
     tests. Uses getattr/hasattr defensively since _SUBMODEL_REGISTRY and
     _MIGRATIONS are added incrementally by later steps in this file's own
     TDD sequence.
+
+    Teardown does two things: it restores the snapshot, AND it enforces key
+    ownership (task 3352) — every key a test ADDED to the registry must be a
+    test-owned `<name>_stub` key, never one a production module registers.
+    See _assert_only_test_owned_registry_keys.
     """
     had_registry = hasattr(task_metadata_module, '_SUBMODEL_REGISTRY')
     registry_snapshot = dict(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {}))
     had_migrations = hasattr(task_metadata_module, '_MIGRATIONS')
     migrations_snapshot = dict(getattr(task_metadata_module, '_MIGRATIONS', {}))
     yield
+    # Ordering is load-bearing in BOTH directions: `added` must be diffed
+    # BEFORE any restore (a post-restore diff is always empty, i.e. a silently
+    # vacuous guard), and the assertion must fire AFTER both restores (an
+    # assertion raised before the _MIGRATIONS restore would skip it and leak
+    # migrations into later tests).
+    added = set(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {})) - set(registry_snapshot)
     if had_registry:
         task_metadata_module._SUBMODEL_REGISTRY.clear()
         task_metadata_module._SUBMODEL_REGISTRY.update(registry_snapshot)
     if had_migrations:
         task_metadata_module._MIGRATIONS.clear()
         task_metadata_module._MIGRATIONS.update(migrations_snapshot)
+    if had_registry:
+        _assert_only_test_owned_registry_keys(added)
 
 
 class TestBeforeDone:
@@ -843,25 +873,36 @@ class _DeployStateStub(BaseModel):
     phase: str
 
 
+# Test-owned registry key. Deliberately NOT the production 'deploy_state'
+# (registered by shared/deploy_state.py) — mirrors
+# TestListValuedSubmodelSlice._KEY = 'delivered_checks_stub'. See
+# _assert_only_test_owned_registry_keys above and task 3352.
+_DEPLOY_STATE_STUB_KEY = 'deploy_state_stub'
+
+
 class TestSubmodelRegistry:
     """The W10 extension point: register_metadata_submodel + _SUBMODEL_REGISTRY."""
 
     def test_register_new_key_stored_in_registry(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        assert task_metadata_module._SUBMODEL_REGISTRY['deploy_state'] is _DeployStateStub
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        assert (
+            task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+        )
 
     def test_register_same_model_twice_is_idempotent(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        register_metadata_submodel('deploy_state', _DeployStateStub)  # no raise
-        assert task_metadata_module._SUBMODEL_REGISTRY['deploy_state'] is _DeployStateStub
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)  # no raise
+        assert (
+            task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+        )
 
     def test_register_different_model_same_key_raises(self):
         class _OtherDeployStateStub(BaseModel):
             phase: str
 
-        register_metadata_submodel('deploy_state', _DeployStateStub)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         with pytest.raises(ValueError):
-            register_metadata_submodel('deploy_state', _OtherDeployStateStub)
+            register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _OtherDeployStateStub)
 
 
 class TestMilestoneRegistration:
@@ -1182,24 +1223,29 @@ class TestParseMetadataCore:
         assert warnings == []
 
     def test_registered_submodel_slice_validated_and_attached_no_warnings(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': {'phase': 'rollout'}}, direction='write')
-        assert isinstance(model.deploy_state, _DeployStateStub)  # type: ignore[attr-defined]
-        assert model.deploy_state.phase == 'rollout'  # type: ignore[attr-defined]
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: {'phase': 'rollout'}}, direction='write'
+        )
+        slice_value = getattr(model, _DEPLOY_STATE_STUB_KEY)
+        assert isinstance(slice_value, _DeployStateStub)
+        assert slice_value.phase == 'rollout'
         assert warnings == []
 
     def test_registered_submodel_round_trips_as_plain_dict_via_model_dump(self):
-        # model.deploy_state is a _DeployStateStub instance (asserted above),
-        # stored in TaskMetadata.__pydantic_extra__ since 'deploy_state' is
+        # model.deploy_state_stub is a _DeployStateStub instance (asserted
+        # above), stored in TaskMetadata.__pydantic_extra__ since the key is
         # not a declared TaskMetadata field. I1 round-trip preservation
         # requires model_dump() to re-emit it as a plain dict — not leave a
         # BaseModel instance sitting in the "JSON-serializable blob" output.
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': {'phase': 'rollout'}}, direction='write')
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: {'phase': 'rollout'}}, direction='write'
+        )
         assert warnings == []
         dumped = model.model_dump()
-        assert dumped['deploy_state'] == {'phase': 'rollout'}
-        assert not isinstance(dumped['deploy_state'], BaseModel)
+        assert dumped[_DEPLOY_STATE_STUB_KEY] == {'phase': 'rollout'}
+        assert not isinstance(dumped[_DEPLOY_STATE_STUB_KEY], BaseModel)
 
     def test_unknown_top_level_key_survives_round_trip(self):
         # x_-prefixed is the sanctioned silent namespace regardless of the
@@ -1332,42 +1378,46 @@ class TestParseMetadataFailurePolicy:
             parse_metadata(blob, direction='write', enforce=True)
 
     def test_invalid_registered_submodel_slice_write_enforce_raises(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         with pytest.raises(ValidationError):
-            parse_metadata({'deploy_state': {}}, direction='write', enforce=True)
+            parse_metadata({_DEPLOY_STATE_STUB_KEY: {}}, direction='write', enforce=True)
 
     def test_invalid_registered_submodel_slice_warn_mode_accepts_raw(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': {}}, direction='write', enforce=False)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: {}}, direction='write', enforce=False
+        )
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
-        assert warnings[0].field == 'deploy_state'
-        assert model.model_dump()['deploy_state'] == {}
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == {}
 
     # A registered slice whose *value* isn't a mapping at all (list/str/etc.)
     # can't be splatted as `submodel(**value)` — that raises TypeError, not
     # ValidationError. parse_metadata must absorb this the same way as any
     # other malformed sub-model, never raising outside write+enforce=True.
     def test_registered_submodel_slice_non_mapping_value_read_warns_never_raises(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': [1, 2]}, direction='read')
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='read')
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
-        assert warnings[0].field == 'deploy_state'
-        assert model.model_dump()['deploy_state'] == [1, 2]
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == [1, 2]
 
     def test_registered_submodel_slice_non_mapping_value_write_warn_mode_accepts(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': 'x'}, direction='write', enforce=False)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: 'x'}, direction='write', enforce=False
+        )
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
-        assert warnings[0].field == 'deploy_state'
-        assert model.model_dump()['deploy_state'] == 'x'
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == 'x'
 
     def test_registered_submodel_slice_non_mapping_value_write_enforce_raises(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         with pytest.raises((ValidationError, TypeError)):
-            parse_metadata({'deploy_state': [1, 2]}, direction='write', enforce=True)
+            parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='write', enforce=True)
 
     def test_x_prefixed_unknown_key_silent_zero_warnings(self):
         model, warnings = parse_metadata({'x_experimental': 'v'}, direction='write')
@@ -1381,7 +1431,7 @@ class TestParseMetadataFailurePolicy:
         assert warnings[0].field == 'mystery_field'
         assert model.model_dump()['mystery_field'] == 'v'
 
-    # A representative spread of the 34 Tier-A blessed conventional keys
+    # A representative spread of the 39 Tier-A blessed conventional keys
     # (see _BLESSED_METADATA_KEYS), plus one genuine control key
     # (mystery_zzz) that must still warn. RED: none of the blessed keys are
     # skipped yet, so each one currently emits its own unknown_key warning.
@@ -1434,7 +1484,7 @@ class TestParseMetadataFailurePolicy:
 
     # Table-driven over the FULL _BLESSED_METADATA_KEYS frozenset (imported
     # directly), rather than the hand-maintained partial sample above (which
-    # only covers 25 of the 34 entries). Every key gets its own parametrized
+    # only covers 25 of the 39 entries). Every key gets its own parametrized
     # case, so a typo'd or accidentally-unskipped entry fails immediately
     # instead of silently reappearing as unknown_key census noise, and the
     # test stays in lockstep as the allowlist grows -- no manual sample to
@@ -1488,6 +1538,34 @@ class TestParseMetadataFailurePolicy:
         )
         assert 'cross_repo_project' not in unknown_key_fields, (
             f'Expected no unknown_key warning for cross_repo_project; got: {sorted(unknown_key_fields)}'
+        )
+
+    def test_human_curator_gate_metadata_keys_are_blessed(self):
+        """The human-curator-gate contract must not census-warn (task 3341).
+
+        human_curator_gate marks a deterministic pure gate whose resolution
+        requires human CONTENT adjudication, not merely a closed escalation
+        record; human_curator_adjudicated_at is the ISO-8601 stamp proving the
+        per-entry review happened. Both are read by DeterministicRunner's
+        pure-gate resume guard, which refuses to drive such a task to done
+        without the stamp — so both are load-bearing Tier-A conventions.
+        Unblessed, every real human-curator-gate task would manufacture a
+        code=unknown_key census line. RED until both are added to
+        _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata(
+            {
+                'human_curator_gate': True,
+                'human_curator_adjudicated_at': '2026-07-31T09:00:00+00:00',
+            },
+            direction='read',
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'human_curator_gate' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for human_curator_gate; got: {sorted(unknown_key_fields)}'
+        )
+        assert 'human_curator_adjudicated_at' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for human_curator_adjudicated_at; got: {sorted(unknown_key_fields)}'
         )
 
     def test_deterministic_invariant_violation_write_enforce_raises(self):
@@ -1628,3 +1706,21 @@ class TestListValuedSubmodelSlice:
             'at': None,
             'after_secs': 604800,
         }
+
+
+class TestRegistryKeyOwnershipGuard:
+    """Task 3352: the autouse fixture's teardown key-ownership guard.
+
+    Replaces the deleted AST drift scan. The predicate is a plain function so
+    it has direct RED/GREEN coverage instead of shipping as a bare assert
+    buried in fixture teardown.
+    """
+
+    def test_production_key_addition_is_rejected(self):
+        with pytest.raises(AssertionError, match='deploy_state'):
+            _assert_only_test_owned_registry_keys({'deploy_state'})
+
+    def test_test_owned_stub_keys_are_accepted(self):
+        _assert_only_test_owned_registry_keys(
+            {_DEPLOY_STATE_STUB_KEY, TestListValuedSubmodelSlice._KEY}
+        )

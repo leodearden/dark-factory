@@ -149,6 +149,111 @@ class TestLoadQueueEscalations:
         assert loaded['worktree'] == '/home/leo/src/proj/.worktrees/3'
         assert loaded['extra_field'] == 'should-survive'
 
+    # -- the opt-in ``skipped`` out-parameter -------------------------------
+    #
+    # Skipping an unparseable file is correct — one corrupt escalation must not
+    # crash a queue scan.  Doing it with no channel back to the caller is not:
+    # the reader holds both the path and the exception at the failure point and
+    # threw both away into a log line no payload consumer can read (INV-2,
+    # ``structured-facts-at-failure``).  ``skipped`` is that channel.
+
+    def test_skipped_out_parameter_records_unparseable_files(self, tmp_path):
+        """An opted-in caller learns WHICH file was dropped and WHY."""
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
+        bad = esc_dir / 'esc-bad-1.json'
+        bad.write_text('this is not json {{{')
+
+        skipped: list = []
+        result = load_queue_escalations(esc_dir, skipped=skipped)
+
+        # The return value is untouched — this is a second channel, not a
+        # change to what the reader yields.
+        assert len(result) == 1
+        assert result[0]['id'] == 'esc-good-1'
+        assert len(skipped) == 1
+        assert skipped[0]['path'] == bad
+        assert isinstance(skipped[0]['error'], str) and skipped[0]['error']
+
+    def test_skipped_records_os_errors_not_just_decode_errors(self, tmp_path):
+        """BOTH arms of ``except (JSONDecodeError, OSError)`` report, not just JSON.
+
+        ``Path.glob('*.json')`` yields directories too, so a directory named
+        ``weird.json`` makes ``read_text()`` raise ``IsADirectoryError`` — a
+        deterministic OSError needing no permission games or monkeypatching.
+        A reader that only reported the decode arm would still lose every
+        unreadable/permission-denied file silently, which is the more likely
+        production failure of the two.
+        """
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
+        weird = esc_dir / 'weird.json'
+        weird.mkdir()
+
+        skipped: list = []
+        result = load_queue_escalations(esc_dir, skipped=skipped)
+
+        assert [r['id'] for r in result] == ['esc-good-1']
+        assert len(skipped) == 1
+        assert skipped[0]['path'] == weird
+        assert isinstance(skipped[0]['error'], str) and skipped[0]['error']
+
+    def test_skipped_accumulator_is_appended_not_replaced(self, tmp_path):
+        """Entries are APPENDED, so one list can span several queue dirs.
+
+        ``build_escalation_queues`` calls this reader once per orchestrator
+        root; a caller that wants the whole fleet's skips in one list must be
+        able to reuse the accumulator rather than merge N of them.
+        """
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        bad = esc_dir / 'esc-bad-1.json'
+        bad.write_text('this is not json {{{')
+
+        sentinel = {'path': tmp_path / 'from-an-earlier-dir.json', 'error': 'earlier'}
+        skipped: list = [sentinel]
+        load_queue_escalations(esc_dir, skipped=skipped)
+
+        assert len(skipped) == 2
+        assert skipped[0] is sentinel
+        assert skipped[1]['path'] == bad
+
+    def test_omitting_skipped_leaves_behaviour_unchanged(self, tmp_path, caplog):
+        """The default path is byte-identical to today — the back-compat pin.
+
+        Neither of the two ``build_escalation_queues`` call sites opts in, so
+        for the escalation views the WARNING log stays the only signal.  (Named
+        by function, not by line: a line-number citation in this file is stale
+        the moment anything above it moves — the diff that added this test
+        pushed those very calls down ~28 lines.)
+
+        This asserts the un-opted-in call still returns only the valid record,
+        still does not raise, and still logs — i.e. that the new keyword is
+        additive and no existing caller had to change.
+        """
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
+        (esc_dir / 'esc-bad-1.json').write_text('this is not json {{{')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.escalations'):
+            result = load_queue_escalations(esc_dir)
+
+        assert len(result) == 1
+        assert result[0]['id'] == 'esc-good-1'
+        assert any('esc-bad-1' in rec.message for rec in caplog.records), \
+            'the WARNING must survive for callers that do not opt in'
+
 
 # ---------------------------------------------------------------------------
 # Tests for resolve_owning_project — worktree-prefix arm (step 3)

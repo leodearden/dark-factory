@@ -103,7 +103,13 @@ class MarkerLifecycle:
     deleter: str
 
 
-# One entry per MARKER_KINDS value. The GC-on-terminal subset (deleter ==
+# A SUPERSET of MARKER_KINDS: one entry per MARKER_KINDS value, plus
+# mem0_tombstone (task 3041), which is deliberately in NEITHER MARKER_KINDS
+# constant. Its ledger task_id column holds a Mem0 memory uuid rather than a
+# Taskmaster task id, so it must never enter recon_ledger.MARKER_KINDS (which
+# drives gc()'s terminal-task DELETE arm and marker_task_ids()) nor this
+# module's MARKER_KINDS — but its lifecycle still belongs documented here.
+# The GC-on-terminal subset (deleter ==
 # DELETER_GC) is exactly recon_ledger.MARKER_KINDS — the per-task marker
 # kinds ReconLedgerStore.gc() is *eligible* to delete once their task_id goes
 # terminal (its record_kind IN (...) clause matches on these three kinds).
@@ -183,6 +189,16 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
             "(metadata.kind='cycle_summary')"
         ),
         deleter=DELETER_POOL_TRIM,
+    ),
+    # Not a MARKER_KINDS member — see the superset note above.
+    'mem0_tombstone': MarkerLifecycle(
+        writer=(
+            'Python, from mem0_tombstone.record_mem0_deletion_tombstone — one '
+            'per CONFIRMED recon-initiated Mem0 delete (both the marker-GC '
+            'sweeps and the cycle_summary pool-cap trim), keyed by the deleted '
+            "record's memory uuid"
+        ),
+        deleter=DELETER_TTL,
     ),
 }
 
@@ -476,6 +492,21 @@ def render_cycle_summary_section() -> str:
         'deleting the oldest members once the cap is exceeded — a summary '
         'written without this tag is invisible to that trim and the pool grows '
         'unboundedly.\n\n'
+        'IMPORTANT — a missing older cycle_summary mirror is NOT data loss. '
+        'That Mem0 pool is CAP-BOUNDED (cap=2 per stage per project), and the '
+        'trim runs inside `write_cycle_summary` itself, so every cycle evicts '
+        "an older mirror seconds after writing the new one. A mirror for any "
+        'run older than the last couple of cycles is EXPECTED to be absent. '
+        'The Mem0 record is a best-effort searchable copy; the AUTHORITATIVE '
+        'record is the ReconLedgerStore cycle_summary row — check it with '
+        '`get_cycle_summary_presence`, never by looking for the mirror.\n\n'
+        'Any recon-initiated Mem0 deletion now leaves a TOMBSTONE, returned by '
+        "`get_memory_by_id` on its not-found branch as a `'tombstone'` key "
+        'naming the sweep that deleted the record, the run that did it, and the '
+        "victim's metadata. Before reporting a missing memory as silent loss, "
+        'consult it: a tombstone means the record was deliberately reaped by a '
+        'named sweep. Reporting a capped-pool eviction as fleet-wide data loss '
+        'is a real failure mode — it happened (recon gate 165, task 3041).\n\n'
         "The `record_type` metadata key discriminates cycle_summary writers by "
         "purpose, not by shape: `'ledger_stamp'` marks Python's deterministic "
         "code mirror described above; `'narrative'` marks the distinct "
@@ -531,8 +562,13 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
     The tool-holding recon stage ALREADY holds the memory-mutation tools
     (add_memory / delete_memory / merge_entities): per
     reconciliation/cli_stage_runner.py, DISALLOW_MEMORY_WRITES is folded into
-    STAGE3_DISALLOWED ONLY (STAGE1_DISALLOWED = DISALLOW_TASK_WRITES +
-    DISALLOW_BUILTIN; STAGE2_DISALLOWED = DISALLOW_BUILTIN). So both Stage 1 and
+    STAGE3_DISALLOWED ONLY — neither Stage 1 nor Stage 2 denies it.  That is the
+    only per-stage fact this section needs, so the composition of the three
+    STAGE*_DISALLOWED lists is deliberately NOT restated here: cli_stage_runner.py
+    owns them, they grow additively, and a mirrored inventory in a docstring goes
+    stale silently.  (Exactly that failure mode is what hid the Stage-2
+    escalation-read gap until task 3163 — read the lists at their source.)
+    So both Stage 1 and
     Stage 2 can COMPLETE safe memory merges inline instead of filing a task to
     ask someone else to do work they can already do — cutting the redundant
     relay-then-bounce class off at its origin — and file ONLY the residual

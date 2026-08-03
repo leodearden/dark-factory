@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 from shared.branch_names import canonical_queued_branch_name
 
 from orchestrator.git_ops import MergeResult
-from orchestrator.merge_disposition import MergeFailureDisposition
+from orchestrator.merge_disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.verify import VerifyResult
 
 if TYPE_CHECKING:
@@ -821,10 +821,20 @@ class MergeRequest:
     Threaded from ``merge_request(retry_failed_only=...)`` (escalation server)
     onto the ``MergeRequest`` the merge worker dequeues, so it is visible on
     ``req`` inside the worker's post-merge verify retry path
-    (:func:`orchestrator.merge_queue._run_post_merge_verify`).  Default
-    ``False`` is a strict no-op — the retry-set primitive that consumes this
-    flag ships separately (reify, PRD task D2); until then every retry path
-    behaves byte-identically regardless of this value."""
+    (:func:`orchestrator.merge_queue._run_post_merge_verify`).
+
+    When set, DF BUILDS THE SUBSET ITSELF (task 3059): on a classified
+    infra-transient attempt-0 red it derives the {did-not-pass} set from that
+    attempt's own per-test results plus a ``cargo nextest list`` planned probe,
+    corroborates the content-tree OID against reify's
+    ``target/reify-verify-attempt.json`` stamp, and ships the resulting
+    ``REIFY_VERIFY_RETRY_*`` contract in the retry's ``verify_env``.  reify's
+    ``verify.sh`` is the CONSUMER of that contract, not the producer of the
+    subset.  Every fail-safe route (no sidecar, no plan, a rebased tree) falls
+    back to a FULL re-verify.
+
+    Default ``False`` remains a strict no-op: no payload is built, no probe is
+    run, and every retry path behaves byte-identically."""
 
 
 @dataclass(frozen=True)
@@ -948,6 +958,17 @@ class MergeOutcome:
     Defaults to INDETERMINATE, preserving today's behaviour for callers that
     do not yet populate it (β routing/surfacing + γ runs.db event depend on
     this field, keying off α alone — no dependency inversion)."""
+    skew_evidence: SkewEvidence | None = None
+    """The bundle GATHERED by ``classify_merge_failure_disposition``
+    (``ClassificationResult.observed_evidence``), carried so the step-18
+    ``merge_attempt`` emit can persist bounded evidence into runs.db (task 3178).
+
+    A non-None value is NOT a skew verdict — read ``disposition`` for that; see
+    ``ClassificationResult`` for the full contract. The distinction is
+    load-bearing HERE because it is what the emit guard keys on: an adjudicated
+    INDETERMINATE (evidence exists) emits a row, a skipped or fail-open one
+    (nothing gathered) emits none. ``None`` for callers that do not populate
+    it."""
 
 
 @dataclass

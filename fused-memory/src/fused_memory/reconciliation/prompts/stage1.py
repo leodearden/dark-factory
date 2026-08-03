@@ -4,6 +4,7 @@ from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
     get_recon_report_tool_guidance,
+    render_escalation_boundary_note,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_entity_standing_decision_schema_section,
@@ -50,6 +51,8 @@ presence check (see ## Pre-Check: Already-Reconstructed Stage 2 Summaries below)
 You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
 `mcp__fused-memory__get_task` is permitted as a read-only verification call (see \
 ## Terminal-State Pre-Check Discipline below).
+
+{render_escalation_boundary_note(can_escalate=False)}
 
 ## Your Consolidation Tasks
 1. **Within Mem0**: Identify duplicates, contradictions, and stale entries. Merge or delete.
@@ -108,6 +111,30 @@ IDs — Graphiti returns `{{status: deleted}}` and silently no-ops, providing no
 This is a recurrent failure that reinforcement memories alone have not prevented; \
 this section is the canonical enforcement point for UUID resolution. \
 (Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
+
+**Consolidation deletes MUST name the survivor.** When you delete a duplicate in favour \
+of a surviving entry, pass `replacement_memory_id=<the surviving entry's full 36-char UUID>` \
+to `delete_memory`. Task metadata that still cites the doomed entry is repointed to that \
+survivor BEFORE the delete runs — and the delete is REFUSED outright if any live \
+(non-terminal) task still cites it and you supplied no concrete replacement. Terminal \
+(done/cancelled) citers are reported back to you on the result, never rewritten.
+
+**COPY the survivor's UUID from the search result — never reconstruct it.** The value must \
+also (a) RESOLVE in the store and (b) differ from the id you are deleting. A well-formed \
+but nonexistent id is refused (`CitationReplacementNotFound`) rather than written into \
+every citation — repointing to a phantom strands those pointers exactly as the delete \
+itself would, and by then the original is gone. Passing the doomed id as its own \
+replacement is refused too (`CitationReplacementInvalid`): a self-repoint reports success \
+while every citation still addresses the entry you just destroyed. Same discipline as \
+step 2 above — read the full 36 characters out of the result's `id` field verbatim.
+
+**A `search(...)` instruction is never an acceptable replacement value.** Do not pass — or \
+write into any task's metadata — a value like `'re-derive the current canonical entry via \
+search(query=...)'`. It is rejected mechanically (`CitationReplacementInvalid`), because \
+re-deriving at read time resolves back to the superseded cluster members the consolidation \
+was collapsing, routing dispatch into exactly the contradictory advice you just removed. \
+Only a concrete UUID forwards. \
+(Regression-pinned in fused-memory/tests/test_delete_memory_citation_guard.py.)
 
 ## Terminal-State Pre-Check Discipline
 Before writing a `temporal_fact` whose content states or implies that a task reached a \

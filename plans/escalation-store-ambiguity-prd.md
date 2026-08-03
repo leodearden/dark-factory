@@ -186,6 +186,121 @@ and accept an optional `project_root` assertion that errors on mismatch.
 
 5. **No in-process consumer changes.** See §2.6.
 
+### Amendment (2026-07-30) — §5.1's β name and envelope, ratified
+
+Recorded because two remediation paths for the `get_task_escalations` /
+`get_task_escalation_history` collision were adjudicated independently and
+neither cross-referenced the other. **Decision: option (b) — β keeps its own
+name and its envelope.** Ratified by the PRD owner 2026-07-30 against
+escalation `esc-3230-1` (gate task 3230).
+
+**The collision.** Task 3023, planned 2026-07-24 — four days before this PRD
+existed — landed `get_task_escalations(task_id, status=None, level=None,
+agent_role=None, compact=False) -> list[dict]` in `escalation/server.py`: a
+1:1 delegation to `queue.get_by_task(...)` over the same primitive β targets.
+Neither side was at fault; the two plans could not have seen each other.
+
+**The losing path, recorded so it is not re-derived.** Task 3023's steward
+adjudicated the collision in `esc-3023-6` (resolved, archived 2026-07-29;
+Graphiti episode `8296f70b-1908-49eb-9f0f-03eeca44d0e9`) and recommended
+option (a): keep the landed `get_task_escalations`, re-scope β to adopt it,
+ship no second tool. Their argument, in their order of weight:
+
+1. **Name semantics.** `..._history` connotes past/archived, but the tool
+   returns pending AND archived. In a subsystem whose documented failure mode
+   is agents trusting a tool name's implied semantics, a name that
+   under-promises its own scope is the wrong choice.
+2. **The landed tool exceeds β's spec** — it already answers open question 2
+   (`level`: yes), adds `agent_role`, adds a `compact` projection deliberately
+   shape-compatible with `get_pending_escalations`, and carries the
+   evidence-of-absence contract in its docstring. β is therefore a strict
+   *restriction* of it, plus an envelope.
+3. Blast radius does **not** decide it — they measured ~13 references to β's
+   name against ~8 to the landed name, and called them comparable.
+
+They deliberately did not execute it: option (a) renames a tool this PRD names
+in §6.2 and overturns a §5 resolved decision, which needs the owner's assent
+rather than a steward's unilateral edit from an adjacent task.
+
+**Why (b) was affirmed.**
+
+1. §5.1's closing sentence and §6.2's rendered block are decisions of record,
+   and §6.2 puts the literal string `get_task_escalation_history` into every
+   escalation tool's description via γ3 — so the name is a **contract**, not an
+   incidental label. (a) requires amending both; (b) requires amending neither.
+2. **The steward's decisive argument is one this PRD already answers.** §5.1's
+   doctrine is that a tool's true nature is declared in its DESCRIPTION, not
+   inferred from its shape — and §6.2 applies exactly that to a *semantic*
+   (pending-vs-ever-filed) confusion. β's shipped docstring opens "Every
+   escalation ever filed for a task" and "ARCHIVE-INCLUSIVE … Returns pending
+   AND resolved/dismissed records". A name that under-promises, corrected by an
+   explicit description, is this PRD's own prescribed remedy.
+3. **The duplication (a) feared did not materialise.** β as shipped is an
+   eight-line delegation to `get_task_escalations` plus a docstring that
+   contrasts the two explicitly: `get_task_escalations` is the general
+   FILTERABLE form; β is the un-narrowable one. β deliberately has **no**
+   `status` parameter, so a caller cannot silently recreate the false-absence
+   trap β exists to remove.
+
+Conceded to the steward: two tools where one is a strict subset of the other is
+a smell, and the name concern is real. If the name is observed to mislead in
+practice, (a) remains a clean rename against landed code — the arguments above
+survive that reversal, so re-read this note rather than re-deriving it.
+
+**Standing tax of the second tool, discovered while implementing β.**
+`create_server` backs both the orchestrator and the reconciliation queues, and
+recon-stage gating is a DENY list only (`DISALLOW_ESCALATION_READS`,
+`reconciliation/cli_stage_runner.py`) — there is no allow-list. So **every**
+tool accession on that server must be classified there in the same change, or
+it is reachable from every recon stage pointed at the wrong store. β is
+strictly worse than a bare list if left unclassified: its envelope echoes
+`task_id` and `level_filter` back, so a `count: 0` against the wrong store
+reads as an *attributable* answer rather than the artefact it is. β denies
+itself to all three stages.
+
+### Amendment (2026-07-30) — the deferred-INV-5 concern, closed
+
+The steward observed that §5.1's own reasoning appears to boomerang: it refused
+an envelope for `get_pending_escalations` because five skill files perform list
+operations on the result, and §6.2 then directs those same skills at the
+archive-inclusive tool — so they would inherit the lock-step cost §5.1 avoided,
+merely deferred. That does not hold, for three reasons worth pinning down:
+
+- **Nothing forces a migration.** `get_pending_escalations` keeps
+  `list[dict[str, Any]]` unchanged, so no existing skill prose breaks. The five
+  files are not edited in lock-step with anything.
+- **It is a different question at a different call site.** "What is open now?"
+  and "was one ever filed?" are separate reads; a skill adopts the second
+  additively, when it has that question, independently of the others.
+- **The adapter is one subscript.** β returns the delegate's list unmodified
+  under `escalations`, so `result['escalations']` is byte-identical to what a
+  bare-list tool would have returned. Adoption costs a key lookup, not a shape
+  migration.
+
+**Correction to §5.1's framing while we are here.** "Five skill files" reads as
+a lock-step block; measured, it is five *independent* consumers of one return
+type, each calling the tool differently — `escalation-watcher`
+(`level=2, compact=True`, L2-only drain), `escalation-watcher-auto` (two
+unfiltered calls, then a level-1/level-2 set-difference), `recon-escalation-watcher`
+(no `level` arg — the recon queue is flat — against **8103**), `merge-queue`
+(a liveness probe that never reads the contents), and `unblock`
+(`task_id=`-scoped). There is no shared passage to hoist into a common
+reference; the differing arguments, level filters and *stores* are the whole
+content of each usage. The genuinely duplicated thing across them is **store
+identity** — restated in `escalation-watcher/SKILL.md:22,995` and throughout
+`recon-escalation-watcher/SKILL.md` — and γ3 dedups exactly that, at a strictly
+better seam: rendered once from `StoreIdentity`, delivered in the description at
+the point of use, reaching interactive and fleet callers the skills do not
+cover, and unable to drift because it derives from the live `queue_dir`. The
+skills-side follow-up is therefore a **deletion** sweep once γ3 lands (§10
+already names `recon-escalation-watcher/SKILL.md:295-297`), not a new include
+layer.
+
+INV-5 would bite if a future change made the envelope non-additive — if β
+reshaped its ELEMENTS, or if `get_pending_escalations` were later given an
+envelope so both had to move together. Neither is in this PRD's scope; a task
+proposing either must re-open this note.
+
 ## 6. Contract (γ) — B + H
 
 ### 6.1 Store identity
@@ -224,6 +339,12 @@ does not exist. To ask whether an escalation was EVER filed for a task
 ```
 
 Rendered from **one** helper consumed by all tools (INV-5: one site plus a call).
+
+The tool name in that last sentence is a **contract**, not a label: it is the
+reason β's name could not be changed unilaterally when task 3023 landed a
+sibling tool over the same primitive. That collision is adjudicated in §5's
+"Amendment (2026-07-30) — §5.1's β name and envelope, ratified"; read it before
+proposing a rename.
 
 ### 6.3 Guard semantics
 
@@ -302,7 +423,12 @@ No waivers required.
 - Namespacing task ids across projects — the real cure for flavor 4, but a
   far larger change; the guard plus the description mitigate it.
 - Retiring `skills/recon-escalation-watcher/SKILL.md:295-297` once γ3 makes it
-  obsolete — a docs follow-up, not load-bearing.
+  obsolete — a docs follow-up, not load-bearing. **Owned by task 3266**, which
+  depends on γ3 and also carries the positive half (point the reader at the
+  rendered `THIS ENDPOINT SERVES` block rather than deleting the warning and
+  leaving nothing). Measured 2026-07-30: this is the *only* such bullet across
+  the five escalation-consuming skills — 3266 pins the two look-alikes that
+  must NOT be swept with it.
 - Adjudicating pump-web-ui `esc-18-1` or the reify gate tasks. They belong to
   other owners; this PRD only removes the mechanism that produced them.
 
@@ -315,10 +441,67 @@ No waivers required.
    during β — additive either way.
 3. **Whether γ3's identity block also lands on the merge/halt tools** served by
    the same server, or only the escalation-semantic ones. Decide during γ3.
+
+   *Widened during α (task 3163): decide the whole degraded-read surface, not only
+   the merge/halt identity block.* α denies just the two escalation READ tools
+   (`DISALLOW_ESCALATION_READS`) — the ones the three incidents actually misread.
+   But the recon-wired server is built by
+   `reconciliation/harness.py::_start_escalation_server` (`:2011-2016`) as
+   `create_escalation_server(self._escalation_queue)` — queue positional only, so
+   `harness`, `merge_queue`, `event_store`, `orch_config` and
+   `merge_inflight_registry` all stay `None`. Measured standalone behaviour of the
+   still-reachable non-escalation reads:
+
+   | tool | standalone return | shape |
+   |---|---|---|
+   | `get_task_runtime_state` | `{'offline': False, 'tasks': []}` — `escalation/server.py:1674-1675` returns `TaskRuntimeSnapshot()`, whose defaults are `offline=False`, `tasks=[]` | **silent false absence** — positively asserts "online, nothing running" |
+   | `get_merge_queue` | `{'error': 'Merge queue not available — orchestrator not running'}` (`server.py:1693-1694`) | loud, self-describing |
+   | `get_merge_halt_status` | `{'wired': False, 'error': 'escalation server running standalone'}` (`server.py:1648-1649`) | loud, self-describing |
+
+   The merge/halt pair therefore already fails loudly and needs nothing beyond the
+   identity block. `get_task_runtime_state` is the outlier: it reproduces the exact
+   categorical-empty failure mode this PRD exists to close, since a stage reading
+   `tasks: []` as "no task is running" is the same inference the three incidents
+   made from `[]` — and it is worse than `[]`, because `offline: False` asserts the
+   snapshot is live. That stages reach for this server unprompted is not
+   hypothetical: OQ4 below records a live Stage-2 transcript calling
+   `mcp__escalation__merge_status` on its own initiative. So γ3 should decide
+   `get_task_runtime_state` explicitly — either give it the same
+   never-silently-empty treatment as the escalation reads (deny it to stages, or
+   make the standalone envelope declare itself unwired the way
+   `get_merge_halt_status` does), or record why an unconditional empty-but-live
+   snapshot is safe here. α covers this case verbally only, via the
+   `ESCALATION_BOUNDARY_NOTE` "serves the RECONCILIATION store only" sentence;
+   nothing mechanical does.
 4. **Does `--disallowed-tools` reject a denied MCP tool on call, or omit it from
-   the listing?** Not verified; `cli_invoke.py:1537` passes the list straight to
-   the CLI, and MCP tool names in these lists are production-proven
-   (`mcp__fused-memory__delete_entity`). α's signal and B8 are worded to hold
-   under either. If it turns out to be *omission*, α should additionally keep the
-   prompt paragraph so the agent understands the boundary rather than merely
-   finding the tool missing. Decide during α by inspecting one live stage spawn.
+   the listing?** **RESOLVED during α (task 3163): OMISSION.** A denied tool is
+   simply absent from the agent's visible tool set; there is no rejection event
+   and no error message.
+
+   *Method (reproducible).* Recon stages run in deferred-tools mode, so a stage
+   transcript carries the agent's visible tool set in its
+   `attachment.type == 'deferred_tools_delta'` → `addedNames` payload. Across
+   five live recon-stage transcripts under
+   `~/.claude/projects/-home-leo-src-dark-factory/`, the denied names are absent
+   from that listing and track each stage's disallow list exactly:
+
+   | transcript | stage | tools listed | absent from listing |
+   |---|---|---|---|
+   | `e8e4fe99`, `aaeeb70c` | 3 | 80 | builtins, `…__delete_entity`, `…__submit_task`, `…__add_memory`, `…__write_entity_standing_decision` |
+   | `e22890a3` | 1 | 93 | builtins, `…__submit_task` (memory writes present — matches STAGE1) |
+   | `ec23af49`, `43f8155c` | 2 | 100 | builtins, `…__write_entity_standing_decision` only |
+
+   *Consequence.* Because it is omission rather than rejection, the agent gets no
+   explanation for the missing tool — it would find the escalation surface simply
+   gone and could conclude it does not exist, or route around it. This is exactly
+   the branch anticipated above: α's prompt paragraph is therefore **load-bearing
+   and ships** (`ESCALATION_BOUNDARY_NOTE`, rendered into all three stage
+   prompts). Per G6 branch 4, α's user-observable signal and boundary test B8 are
+   NOT reworded into a rejection claim — they were written to hold under either
+   outcome, and this verdict is recorded as an annotation, not a rewrite.
+
+   *Two corroborating observations.* Both escalation read tools were PRESENT in
+   all five listings pre-change — direct evidence of the live bug α closes. And
+   one Stage-2 transcript (`ec23af49`) called `mcp__escalation__merge_status`
+   unprompted, evidencing that stages do reach for escalation-server tools on
+   their own initiative rather than only when instructed.

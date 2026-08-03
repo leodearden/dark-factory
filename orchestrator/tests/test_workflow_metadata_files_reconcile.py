@@ -313,12 +313,30 @@ async def test_reconcile_writes_empty_files_on_git_error_fail_open(tmp_path: Pat
 async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path):
     """Directory-shaped entries from git diff are stripped before persisting.
 
-    ``git diff --name-only`` can return extension-less files (e.g. Dockerfile)
-    or non-allowlisted dotfiles (e.g. .gitignore).  Both are present in this
-    repo.  ``is_file_path`` classifies them as directory-shaped, so they would
-    cause the update_task lock-charter guard (changes #2/#3) to return a
-    LockCharterViolation — silently rejected (return value ignored at line 1343)
-    — leaving stale plan.files and potentially tripping the phantom-done gate.
+    After the 2026-07-28 allowlist widening (reify #5726 / dark_factory #3117)
+    the ONLY directory-shaped output ``git diff --name-only`` can realistically
+    produce is an **extension-less tracked file** — measured: of 2124 tracked
+    paths in this repo, zero have a non-allowlisted extension, and 7 are
+    extension-less (``LICENSE``, ``hooks/pre-commit``,
+    ``fused-memory/docker/Dockerfile``, ...).  Both fixture entries below are
+    therefore real ``git ls-files`` paths that git genuinely emits in a diff,
+    not synthetic directory names: ``git diff --name-only`` lists *files*, never
+    bare directories.
+
+    Note the classification rule is per-segment-extension, NOT "dotfiles as a
+    class" — ``.gitignore`` IS file-shaped now (``gitignore`` is allowlisted).
+    The converse case (a leading-dot segment that stays directory-shaped, e.g.
+    ``.worktrees``) is pinned in the predicate suites themselves
+    (``test_leading_dot_directories_stay_directories`` in both
+    ``shared/tests/test_locking.py`` and
+    ``fused-memory/tests/test_lock_charter_guard.py``) and deliberately is NOT
+    re-asserted here, because such a path cannot appear in a merge diff.
+
+    ``is_file_path`` classifies extension-less entries as directory-shaped, so
+    they would cause the update_task lock-charter guard (changes #2/#3) to return
+    a LockCharterViolation — silently rejected (return value ignored at line
+    1343) — leaving stale plan.files and potentially tripping the phantom-done
+    gate.
 
     The fix applies ``strip_directory_locks`` to the diff output before writing,
     mirroring the change-#1 scheduler._persist_files_metadata fix.
@@ -328,11 +346,12 @@ async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path
     )
     wf._base_commit = 'a' * 40
     wf._merge_sha = 'b' * 40
-    # Mixed: Dockerfile and .gitignore are directory-shaped; the .py files are file-level.
+    # Mixed: both extension-less tracked files (Dockerfile, hooks/pre-commit) are
+    # directory-shaped to is_file_path; the .py files are file-level.
     get_merge_commit_diff_files.return_value = (
         [
             'fused-memory/docker/Dockerfile',
-            '.gitignore',
+            'hooks/pre-commit',
             'src/landed.py',
             'orchestrator/src/orchestrator/workflow.py',
         ],

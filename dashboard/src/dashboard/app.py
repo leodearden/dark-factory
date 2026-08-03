@@ -59,10 +59,14 @@ from dashboard.data.costs import (
     aggregate_cost_trend,
 )
 from dashboard.data.db import DbPool
-from dashboard.data.escalation_analytics import build_escalation_analytics
+from dashboard.data.escalation_analytics import (
+    archive_scan_succeeded,
+    build_escalation_analytics,
+)
 from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
@@ -389,14 +393,129 @@ async def health() -> dict:
 
 
 _THREAD_LIMIT = 50
-_DB_PROBE_TIMEOUT = 5.0
+# Per-DB probe deadline. Invariant (machine-checked by
+# test_healthz_budget_is_structurally_deliverable):
+#   _DB_PROBE_TIMEOUT * len(_healthz_db_targets(...)) <= _HEALTHZ_TOTAL_BUDGET
+#   0.9 * 3 = 2.7 <= 3.0, leaving 0.3s of slack so the total deadline is a
+#   real backstop for non-probe overhead rather than a bound that coincides
+#   exactly with the sum of the parts. Raising either constant requires
+#   raising the other.
+_DB_PROBE_TIMEOUT = 0.9
+# Whole-handler deadline, strictly below the tightest real caller
+# (`curl -sf --max-time 5` in dark-factory-dashboard-watchdog.service:6),
+# leaving ~2s of headroom for HTTP connect/serialisation so the degraded
+# verdict is actually deliverable to that caller instead of arriving behind it
+# (measured before this budget existed: 503 delivered at 50.6s).
+_HEALTHZ_TOTAL_BUDGET = 3.0
+
+
+def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
+    """The (name, path) pairs /healthz probes.
+
+    Kept introspectable (rather than inlined in the handler) so the budget
+    invariant above can be checked against however many DBs are actually
+    probed instead of a hard-coded count.
+    """
+    return [
+        ('reconciliation', config.reconciliation_db),
+        ('write_journal', config.write_journal_db),
+        ('runs', config.runs_db),
+    ]
+
+
+# Abandoned _probe_db tasks (see below) — the event loop only holds a WEAK
+# reference to a Task, so an unreferenced one can be garbage-collected
+# mid-flight; this set holds the strong reference until each task's own
+# done-callback removes it.
+_ABANDONED_PROBES: set[asyncio.Task] = set()
+
+
+def _discard_abandoned_probe(task: asyncio.Task) -> None:
+    _ABANDONED_PROBES.discard(task)
+    if not task.cancelled():
+        task.exception()  # consume so "exception was never retrieved" isn't logged
+
+
+async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
+    """Probe one database under a single deadline covering acquire + execute + fetch.
+
+    Returns 'ok' | 'failed' | 'timeout' | 'error' | 'unavailable'. Never
+    raises: a /healthz probe must always yield a verdict for its DB.
+
+    'timeout' means the probe did not finish inside *budget*. 'error' means
+    it finished fast by RAISING (corrupt DB, connection closed under us,
+    disk I/O error) — a distinct fact, kept distinct because the handler
+    keys `checks['deadline_exceeded']` on 'timeout' and would otherwise tell
+    the operator a ~0ms failure blew the deadline. Only the status string
+    reaches the payload, so the exception itself is logged at WARNING with
+    exc_info; without that it would be unrecoverable anywhere.
+
+    Runs the probe in its own task and, on expiry, ABANDONS it rather than
+    awaiting its cancellation. A deadline wrapped around `async with
+    conn.execute(...)` is not actually hang-free: when it fires mid-fetch,
+    the cancellation is consumed unwinding into the cursor's `__aexit__`,
+    which issues a NEW `await cursor.close()` that nothing will cancel a
+    second time. `asyncio.wait_for`/`asyncio.timeout` both await that
+    cancelled operation's unwinding, reintroducing the hazard.
+    `asyncio.wait(..., timeout=budget)` returns at the deadline WITHOUT
+    awaiting the task, so a hung cleanup can never block this handler.
+
+    Cancelling the abandoned task does NOT stop aiosqlite's underlying
+    worker thread — a wedged connection stays wedged and will simply time
+    out again on the next /healthz call. That's intended: /healthz reports,
+    it does not repair, and per-DB caps mean a poisoned connection costs one
+    _DB_PROBE_TIMEOUT, never the whole handler.
+    """
+
+    async def _inner() -> str:
+        conn = await pool.get(db_path)
+        if conn is None:
+            return 'unavailable'
+        # Explicit await + close on the success path only — no `async with`,
+        # so cancellation never triggers a second, uncancellable close().
+        cursor = await conn.execute('SELECT 1')
+        row = await cursor.fetchone()
+        await cursor.close()
+        return 'ok' if row is not None else 'failed'
+
+    task = asyncio.create_task(_inner())
+    done, _pending = await asyncio.wait({task}, timeout=budget)
+    if task not in done:
+        task.cancel()  # fire-and-forget — do NOT await the unwinding
+        _ABANDONED_PROBES.add(task)
+        task.add_done_callback(_discard_abandoned_probe)
+        return 'timeout'  # ONLY a real budget expiry is a 'timeout'
+    try:
+        return task.result()
+    except Exception:
+        # The payload can only carry a status string, so the exception itself
+        # would be unrecoverable if it were not logged here (INV-2
+        # structured-facts-at-failure).
+        logger.warning('/healthz probe failed for %s', db_path, exc_info=True)
+        return 'error'
 
 
 @app.get('/healthz')
 async def healthz(request: Request) -> JSONResponse:
-    """Deep health check — detects thread leaks and unresponsive DB connections."""
+    """Deep health check — detects thread leaks and unresponsive DB connections.
+
+    A deep diagnostic/readiness surface — deliberately NOT a liveness probe,
+    and deliberately wired to nothing that kills (see
+    plans/dashboard-availability-prd.md task epsilon, Resolved-decision 1).
+    Always returns a verdict within `_HEALTHZ_TOTAL_BUDGET` seconds, no
+    matter how badly a backing DB connection is wedged, and states that
+    budget plus whether any probe hit its deadline in the response
+    (`checks['budget_seconds']` / `checks['deadline_exceeded']`) so an
+    operator reading a 503 doesn't have to read the source to recover facts
+    the handler already had in hand.
+
+    `checks['deadline_exceeded']` reflects budget expiry ONLY. A probe that
+    fails fast by raising is reported as `'error'` (with the exception
+    logged), not `'timeout'`, so the field means what it says.
+    """
     checks: dict = {}
     healthy = True
+    deadline_exceeded = False
 
     thread_count = threading.active_count()
     threads_ok = thread_count < _THREAD_LIMIT
@@ -408,26 +527,33 @@ async def healthz(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     checks['connections'] = {'open': pool.open_count}
 
-    for name, db_path in [
-        ('reconciliation', config.reconciliation_db),
-        ('write_journal', config.write_journal_db),
-        ('runs', config.runs_db),
-    ]:
-        conn = await pool.get(db_path)
-        if conn is None:
-            checks[f'db_{name}'] = 'unavailable'
-            continue
-        try:
-            async with conn.execute('SELECT 1') as cursor:
-                row = await asyncio.wait_for(cursor.fetchone(), timeout=_DB_PROBE_TIMEOUT)
-            checks[f'db_{name}'] = 'ok' if row is not None else 'failed'
-            if row is None:
-                healthy = False
-        except Exception:
-            checks[f'db_{name}'] = 'timeout'
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _HEALTHZ_TOTAL_BUDGET
+    for name, db_path in _healthz_db_targets(config):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            checks[f'db_{name}'] = 'deadline_exceeded'
             healthy = False
+            deadline_exceeded = True
+            continue
+        # _probe_db covers acquire + execute + fetch under ONE deadline, so a
+        # stalled pool.get() (per-path open-lock contention, a slow
+        # aiosqlite.connect()) can't hang the handler any more than a slow
+        # query can.
+        status = await _probe_db(pool, db_path, min(remaining, _DB_PROBE_TIMEOUT))
+        checks[f'db_{name}'] = status
+        if status not in ('ok', 'unavailable'):
+            healthy = False
+        # Load-bearing: keyed on 'timeout' ALONE. _probe_db reports a probe
+        # that raised as 'error', which flips healthy above but must not
+        # claim the handler blew its budget — folding 'error' back into
+        # 'timeout' here would silently re-break this flag.
+        if status == 'timeout':
+            deadline_exceeded = True
 
     checks['uptime_seconds'] = round(time.monotonic() - request.app.state.start_time, 1)
+    checks['budget_seconds'] = _HEALTHZ_TOTAL_BUDGET
+    checks['deadline_exceeded'] = deadline_exceeded
 
     return JSONResponse(
         content={'status': 'healthy' if healthy else 'degraded', 'checks': checks},
@@ -1395,6 +1521,32 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     within the TTL window are free. No clock read here — the aggregator
     resolves `now` once internally via resolve_now (clock-discipline guard
     scans dashboard/data/*.py + app.py; resolve_now is the sanctioned site).
+
+    A scan that reached NO archive at all is served but NOT cached
+    (cache_ok=archive_scan_succeeded), matching api_memory_evals'
+    root_scan_succeeded gate — the two routes are one idiom and are kept so
+    deliberately. Both decline to cache a build that walked nothing: it is
+    O(1) to re-derive (one negative is_dir stat per project), while caching it
+    keeps the tab reporting an empty archive for a full TTL window after the
+    volume mounts, and the archive is the thing most likely to appear on the
+    next poll. The only asymmetry is that memory-evals has ONE root, so
+    "reached nothing" and "reached not everything" coincide there.
+
+    A PARTIAL scan IS cached, and archives_present: false rides along in the
+    payload as the diagnostic. That is not a concession — keyed on
+    archives_present (all) instead, this cache is dead in the installed
+    config: measured 2026-08-01 against the unit's own
+    DASHBOARD_KNOWN_PROJECT_ROOTS (9 roots), 2 roots have no data/escalations
+    dir while the other 7 hold ~9.1k records, so the predicate never passes,
+    the 60s TTL never stores anything, and every 3s poll re-runs the whole
+    multi-second walk. Trade-off actually being accepted: an archive that
+    disappears mid-life leaves that project's panel up to one TTL window
+    stale — the right side of it, since the alternative costs the full
+    re-walk on every poll, forever, for every ordinary multi-project config.
+
+    Deliberately NOT keyed on parse_failures: that counts unparseable records
+    and is permanent for a corrupt file, so gating on it would defeat the
+    cache forever in front of the very walk it protects.
     """
     config: DashboardConfig = request.app.state.config
     project_dirs = _analytics_project_dirs(config)
@@ -1403,8 +1555,66 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     async def _refresh() -> dict:
         return await asyncio.to_thread(build_escalation_analytics, project_dirs)
 
-    result = await _analytics_cache.get_or_refresh(key, _refresh)
+    result = await _analytics_cache.get_or_refresh(
+        key, _refresh, cache_ok=archive_scan_succeeded,
+    )
     return JSONResponse({'ESCALATION_ANALYTICS': result})
+
+
+# ---------------------------------------------------------------------------
+# Memory-evals TTL cache (mirrors _analytics_cache above)
+# ---------------------------------------------------------------------------
+
+_MEMORY_EVALS_TTL_SECONDS = 60.0
+_memory_evals_cache: TTLCache[dict] = TTLCache(ttl_seconds=lambda: _MEMORY_EVALS_TTL_SECONDS)
+
+
+def _memory_evals_cache_clear() -> None:
+    """Clear the memory-evals TTL cache (test hook)."""
+    _memory_evals_cache.clear()
+
+
+@app.get('/api/v2/dashboard/memory-evals')
+async def api_memory_evals(request: Request) -> JSONResponse:
+    """MEMORY_EVALS — metric trends, verdicts, limits provenance and escalation parity.
+
+    The artifact scan (every metrics-*.json across every eval dir, plus the
+    limits/verdicts artifacts and the escalation queue) runs in a worker thread
+    via asyncio.to_thread behind a ~60s single-flight TTL cache, so a cold scan
+    never blocks the event loop and repeated polls within the window are free.
+    No clock read here — the aggregator resolves `now` once internally via
+    resolve_now (clock-discipline guard scans dashboard/data/*.py + app.py;
+    resolve_now is the sanctioned site).
+
+    A scan that never REACHED the tree is served but NOT cached (cache_ok=
+    root_scan_succeeded), mirroring how _load_task_cards declines to cache an
+    offline marker: an absent root and an unwalkable one are both O(1) to
+    re-derive, so re-checking each poll costs nothing, while caching them
+    would keep reporting "no evals have ever run" for a full TTL window after
+    the tree lands. A degraded ROW (a corrupt metrics file, an unknown kind)
+    IS still cached — the walk happened, re-running it would not fix it, and
+    that walk is the expensive thing this cache exists to prevent.
+
+    Same idiom as api_escalation_analytics' archive_scan_succeeded: both
+    routes decline to cache only a scan that reached NOTHING. The asymmetry
+    is that memory-evals has ONE root, so "reached nothing" and "reached not
+    everything" coincide here; analytics has N and must distinguish them.
+
+    The escalation source is config.reconciliation_escalations_dir: memory-eval
+    regressions are filed onto the 8103 recon queue (memory-eval-program.md
+    M3), which is the same queue the Escalations tab renders — so a linked
+    alarm and its escalation cannot disagree.
+    """
+    config: DashboardConfig = request.app.state.config
+    memory_evals_dir = config.memory_evals_dir
+    escalations_dir = config.reconciliation_escalations_dir
+    key = f'{memory_evals_dir}|{escalations_dir}'
+
+    async def _refresh() -> dict:
+        return await asyncio.to_thread(build_memory_evals, memory_evals_dir, escalations_dir)
+
+    result = await _memory_evals_cache.get_or_refresh(key, _refresh, cache_ok=root_scan_succeeded)
+    return JSONResponse(redux_api.shape_memory_evals(**result))
 
 
 # Tests import these helpers directly.
@@ -1419,4 +1629,5 @@ __all__: Sequence[str] = (
     '_task_cards_cache_clear',
     '_load_task_cards',
     '_analytics_cache_clear',
+    '_memory_evals_cache_clear',
 )

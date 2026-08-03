@@ -37,6 +37,16 @@ if str(_TESTS_DIR) not in sys.path:
 # ``Path('config.yaml')`` fallback no longer resolves to the operational config).
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd orchestrator && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so this suite wires
+# the defence itself.  APPEND the repo root, never insert(0, ...): at sys.path[0]
+# it would make orchestrator/, shared/ etc. resolve as namespace packages
+# pointing at the project folder instead of src/<pkg>/, and the src dirs
+# inserted above would lose.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
 # Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
 # Must be set BEFORE any `orchestrator.merge_queue` import so the module-level
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
@@ -48,6 +58,10 @@ from _orch_helpers import (  # noqa: E402
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
+)
+from df_pytest_isolation import (  # noqa: E402
+    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
@@ -290,8 +304,90 @@ def code_default_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
 
 
+#: Guaranteed-absent path for the autouse warm-lane script-dir pin below.
+#: A fixed literal rather than a ``tmp_path`` child ON PURPOSE: the directory is
+#: only ever required NOT to exist and is never written to, so requesting
+#: ``tmp_path`` would make pytest allocate a numbered temp dir for every test in
+#: the orchestrator suite (thousands, times every xdist worker) purely to have a
+#: name to point at.  The only consumer is
+#: :meth:`GitOps._resolve_warm_lane_script`, which just calls ``.exists()``.
+_ABSENT_WARM_LANE_SCRIPT_DIR = "/nonexistent/df-warm-lane-scripts"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_warm_lane_script_dir(monkeypatch):
+    """Pin dark-factory's warm-lane script directory ABSENT for every test.
+
+    Task 3072 (PRD ``warm-lane-infra-repatriation-prd.md`` leaf α) gives
+    ``GitOps`` a two-step resolution order for warm-lane scripts:
+    ``<project_root>/scripts/<name>`` first, then dark-factory's own copies
+    under ``orchestrator/scripts/warm-lane/``.
+
+    That second step is a hazard for the existing suite.  About 200 tests
+    across ``test_git_ops.py``, ``test_warm_lane_pool.py``,
+    ``test_pool_storage_guard.py``, ``test_warm_lane_disk_guard.py``,
+    ``test_warm_lane_soft_floor.py``, ``test_warm_lane_integration_gate.py``,
+    ``test_prune_registrations_chokepoint.py`` and ``test_reconcile_stranded.py``
+    build a synthetic ``tmp_path`` repo with no ``scripts/`` directory and
+    assert the resulting "script absent → fail-soft sentinel" behaviour.  With
+    an unconditional repo-relative fallback, every one of those tests would
+    begin executing dark-factory's REAL warm-lane scripts (``rm -rf`` on lane
+    target dirs, ``flock`` acquisition, ``df`` probes) against ``tmp_path`` —
+    non-hermetic and destructive.
+
+    Pinning the fallback root at a guaranteed-absent directory keeps all of
+    them byte-identical.  Same shape and same reasoning as the autouse
+    ``_isolate_orch_config`` above.
+
+    **Test hermeticity only.**  Production never sets
+    ``ORCH_WARM_LANE_SCRIPT_DIR``; the repo-relative default is what actually
+    ships, and it is pinned by
+    ``test_warm_lane_script_resolution.py::TestResolveWarmLaneScript::
+    test_unset_env_falls_back_to_the_repo_relative_directory``.  Tests that
+    genuinely exercise resolution opt in via ``df_warm_lane_script_dir`` below.
+    """
+    monkeypatch.setenv(
+        "ORCH_WARM_LANE_SCRIPT_DIR", _ABSENT_WARM_LANE_SCRIPT_DIR,
+    )
+
+
+@pytest.fixture
+def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
+    """Opt-in: re-point the dark-factory warm-lane script root at a stub dir.
+
+    Counterpart to the autouse ``_isolate_warm_lane_script_dir`` above, which
+    runs first and pins the root absent; this fixture runs after it and wins
+    for the tests that DO exercise resolution (task 3072's B7/B8 cases).
+
+    Returns a factory.  Called with no argument it creates and pins a fresh
+    ``<tmp_path>/df-warm-lane-scripts`` directory and returns it; called with a
+    path it pins that path instead (which need not exist — pinning a
+    nonexistent directory is how the "neither location" case is set up)::
+
+        def test_something(df_warm_lane_script_dir):
+            df_dir = df_warm_lane_script_dir()
+            (df_dir / 'warm-lane-gc.sh').write_text(...)
+
+    **Test hermeticity only** — production resolution is repo-relative and
+    reads no environment variable.
+    """
+    def _pin(path: Path | None = None) -> Path:
+        if path is None:
+            path = tmp_path / "df-warm-lane-scripts"
+            path.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("ORCH_WARM_LANE_SCRIPT_DIR", str(path))
+        return path
+
+    return _pin
+
+
 def pytest_configure(config: pytest.Config) -> None:
-    """Register the ``real_psi_reader`` opt-out marker (task 2418).
+    """Refuse an unsafe ``--basetemp``, then register ``real_psi_reader`` (task 2418).
+
+    The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
+    marker below: it aborts collection when ``--basetemp`` points inside a live
+    task worktree, where every git command this suite runs would resolve against
+    the enclosing worktree's repo (task 3355, incident esc-3072-3).
 
     ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
     list is outside this task's locked scope, so the marker used by the
@@ -303,6 +399,7 @@ def pytest_configure(config: pytest.Config) -> None:
     ``addopts`` doesn't set that flag, so this is precautionary rather than
     load-bearing yet.
     """
+    reject_unsafe_basetemp(config)
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
@@ -640,6 +737,20 @@ def _drain_async_mock_coroutines():
     """
     yield
     drain_async_mock_coroutines()
+
+
+@pytest.fixture
+def steward_worktree(tmp_path: Path) -> Path:
+    """Single-source the ``tmp_path``-rooted worktree dir for the ``_make_steward`` helpers.
+
+    This single-sources the literal; it is a convention, not an enforced
+    invariant — a test can still build its own path and pass that instead.
+    Lives in conftest.py because that is the only module every call-site file
+    reaches without a cross-module import, which would collide with their
+    function-local-import convention.  Does NOT create the directory —
+    ``_make_steward`` mkdir's it.
+    """
+    return tmp_path / 'wt'
 
 
 @pytest.fixture

@@ -91,7 +91,10 @@ def make_gate_mock(**overrides) -> MagicMock:
 
             def _slot_detect_cap_hit(stderr, output, backend='claude'):
                 hit = gate.detect_cap_hit(
-                    stderr, output, backend, oauth_token=slot.token,
+                    stderr,
+                    output,
+                    backend,
+                    oauth_token=slot.token,
                 )
                 if hit:
                     slot._settled = True

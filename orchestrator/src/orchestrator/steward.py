@@ -10,7 +10,24 @@ Lifecycle:
 - Each escalation either resumes the existing session or creates a fresh one.
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
 - Each escalation gets up to steward_max_attempts total attempts (default 1) before re-escalating to level-1.
+- **Every give-up path dismisses its own L0 before publishing an outcome**
+  (task 3170) — via ``_auto_escalate_to_human`` when it files an L1, via
+  ``_dismiss_capped_l0`` when it deliberately does not (the wip-gated,
+  task-2060 resume-plan branches).  No pending L0 survives a steward give-up.
+- A capped escalation is TERMINAL for this steward: ``_mark_capped`` records
+  it and ``_handle_escalation`` becomes a no-op for that id.
 - Stopped by the workflow after task completion + grace period.
+
+The give-up contract is load-bearing for BOTH workflow waiters, which is why
+it lives here rather than in either consumer.  ``_mark_blocked`` →
+``_await_steward_completion`` reads the published outcome off the in-process
+channel; ``run()``'s ESCALATED branch → ``_wait_for_resolution`` is
+escalation-queue-only and is woken ONLY by the dismissal (``resolve`` →
+``_resolve_callback`` → ``harness._on_escalation_resolved`` →
+``_escalation_events[task_id].set()``).  A new early return that publishes
+without dismissing is therefore invisible to the second waiter — it parks the
+workflow forever while this steward re-handles the record at loop speed, which
+is exactly what task 2248 shipped.
 """
 
 from __future__ import annotations
@@ -83,6 +100,16 @@ class StewardMetrics:
     escalations_reescalated: int = 0
     timeouts_recovered: int = 0
     empty_outputs_recovered: int = 0
+    # Subprocess-level liveness counter (task 3170, review fix D4).  Bumped at
+    # the START of every agent subprocess attempt — including each cap-hit
+    # failover retry INSIDE one `invoke_with_cap_retry` call, which `invocations`
+    # cannot see because that counter is bumped only after the whole retry loop
+    # returns (:597).  Under an all-accounts-capped window the retry loop sleeps
+    # a cooldown (<= _MAX_CAP_COOLDOWN_SECS, 300s) between attempts and can span
+    # hours, so `invocations` alone reads a perfectly HEALTHY steward as silent.
+    # See TaskWorkflow._steward_progress_counter, whose idle-window refresh
+    # consumes this.
+    subprocess_attempts: int = 0
 
 
 class TaskSteward:
@@ -120,6 +147,22 @@ class TaskSteward:
         self._retry_counts: dict[str, int] = {}
         self._timeout_counts: dict[str, int] = {}
         self._empty_output_counts: dict[str, int] = {}
+        # Escalations this steward has permanently given up on — TERMINAL for
+        # THIS steward, never re-handled (task 3170, fix B).  Before this
+        # existed nothing recorded that a cap had already fired, so ANY early
+        # return from _handle_escalation left the record pending,
+        # _next_escalation re-returned it from a synchronous read, and
+        # _run_loop re-handled it at loop speed with no sleep and no state
+        # change (1,183,854 identical log lines in 20.5h on reify 5189, each
+        # iteration also awaiting a `git rev-list` subprocess via the wip
+        # probe).  Populated by _mark_capped at every cap-fire early return
+        # and honoured at three sites: _handle_escalation's early return,
+        # _next_escalation's filter, and the watcher's --exclude-id argv.
+        self._capped_escalations: set[str] = set()
+        # Loud-ONCE guard for the capped-only idle state (see
+        # _log_capped_idle_once).  Reset whenever a non-capped escalation is
+        # handled, so a later relapse into the idle state logs again.
+        self._capped_idle_logged = False
         self.metrics = StewardMetrics()
 
         # Outcome channel (task 2248 / W9-delta): the workflow registers a
@@ -204,6 +247,12 @@ class TaskSteward:
         - ``_loop_error_count``: an unconditional backstop on the generic
           ``except Exception`` path so any other persistent failure (MCP
           unreachable, etc.) is bounded.
+        - ``_capped_escalations`` (task 3170): an escalation this steward has
+          given up on is TERMINAL for it, so ``_next_escalation`` filters it
+          out and this loop falls into its 1s backoff instead of re-handling
+          it forever.  Entry into that idle state is announced once via
+          ``_log_capped_idle_once`` — the flag is cleared below whenever a
+          live escalation is handled.
         """
         from orchestrator.git_ops import WorktreeMissing
 
@@ -216,10 +265,13 @@ class TaskSteward:
                     break
                 if escalation is None:
                     # Transient failure (watcher crash, non-level-0 event,
-                    # parse error).  Brief backoff before retrying.
+                    # parse error) OR the capped-only idle state.  Brief
+                    # backoff before retrying either way.
+                    self._log_capped_idle_once()
                     await asyncio.sleep(1)
                     continue
                 await self._handle_escalation(escalation)
+                self._capped_idle_logged = False  # a live escalation ends the idle state
                 loop_error_count = 0  # reset on a clean iteration
             except asyncio.CancelledError:
                 raise
@@ -281,15 +333,35 @@ class TaskSteward:
 
         Checks for already-pending escalations before starting the watcher
         to avoid a race between escalation submission and watcher startup.
+
+        Escalations in ``_capped_escalations`` are filtered out of BOTH the
+        synchronous read and the watcher's return (task 3170, fix B): a record
+        this steward has already given up on is terminal, so re-picking it at
+        ANY rate is wasted work — and, worse, a capped record sitting at the
+        head of the pending list would keep blocking genuinely new escalations
+        behind it.  Returning ``None`` here routes ``_run_loop`` into its
+        existing 1s backoff instead.
         """
-        pending = self.escalation_queue.get_by_task(
-            self.task_id, status='pending', level=0,
-        )
+        pending = [
+            e for e in self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=0,
+            )
+            if e.id not in self._capped_escalations
+        ]
         if pending:
             return pending[0]
 
+        # Everything pending was filtered out as capped: this steward is now
+        # idle holding escalations only the workflow can dispose of, and is
+        # about to BLOCK on the watcher.  Announce it here rather than only on
+        # `_run_loop`'s None path — in the steady state the watcher blocks on
+        # inotify and never returns, so the None path is not reached.
+        self._log_capped_idle_once()
+
         esc = await self._watch_for_escalation()
         if esc is not None and esc.level != 0:
+            return None
+        if esc is not None and esc.id in self._capped_escalations:
             return None
         return esc
 
@@ -304,6 +376,18 @@ class TaskSteward:
             '--task-id', self.task_id,
             '--level', '0',
         ]
+        # Load-bearing (task 3170, fix B): without this, a capped-but-still-
+        # pending record turns every watcher call into "returns instantly, loop
+        # re-spins" — the watcher arms inotify then runs _initial_scan, which
+        # emits an already-pending match immediately and exits.  Excluding the
+        # capped ids makes the watcher BLOCK on inotify (zero CPU) until
+        # genuinely new work arrives, instead of respawning a subprocess per
+        # loop iteration.  `--exclude-id` is repeatable and already documented
+        # as excluding "from initial scan AND event loop"
+        # (escalation/watcher.py:199-201), so no change is needed there.
+        # Sorted for a deterministic argv.
+        for capped_id in sorted(self._capped_escalations):
+            cmd.extend(['--exclude-id', capped_id])
 
         proc = None
         pgid: int | None = None
@@ -346,7 +430,32 @@ class TaskSteward:
     # ------------------------------------------------------------------
 
     async def _handle_escalation(self, escalation: Escalation) -> None:
-        """Handle a single escalation via the persistent session."""
+        """Handle a single escalation via the persistent session.
+
+        **Every give-up path below dismisses its own L0 before publishing an
+        outcome** (task 3170) — ``_auto_escalate_to_human`` does it as part of
+        filing the L1, and the two wip-gated branches (which deliberately file
+        no L1, per task-2060 resume-plan semantics) do it via
+        ``_dismiss_capped_l0``.  No pending L0 may survive a give-up: the
+        ``run()``-ESCALATED waiter never reads the outcome channel, so a
+        publish-without-dismiss is invisible to it and strands the workflow.
+        Any NEW early return added here inherits that obligation.
+
+        A capped escalation is TERMINAL for this steward (task 3170, fix B):
+        once any guard below has fired, ``_mark_capped`` records the id and
+        this method becomes a no-op for it.  The early return sits ABOVE the
+        "handling escalation" info log deliberately — a capped record must
+        produce no further log lines at all, which is the O(1)-not-O(10^6)
+        signal that distinguishes a healthy idle steward from the spin this
+        guard exists to prevent.
+        """
+        if escalation.id in self._capped_escalations:
+            logger.debug(
+                f'Steward for task {self.task_id}: {escalation.id} already '
+                f'capped — not re-handling (terminal for this steward)'
+            )
+            return
+
         logger.info(
             f'Steward for task {self.task_id}: handling escalation '
             f'{escalation.id} [{escalation.category}] — {escalation.summary}'
@@ -364,6 +473,7 @@ class TaskSteward:
                 escalation,
                 f'Worktree missing: {self.worktree} — task abandoned',
             )
+            self._mark_capped(escalation.id)
             self._stopped = True
             return
 
@@ -375,6 +485,7 @@ class TaskSteward:
                 f'${self.config.steward_lifetime_budget:.2f})',
                 outcome=StewardBudgetExhausted(),
             )
+            self._mark_capped(escalation.id)
             return
 
         # Guard: per-escalation retry limit
@@ -385,8 +496,16 @@ class TaskSteward:
             if wip:
                 # Task-2060 lesson: a wall-clock kill with partial WIP commits
                 # must resume the plan, not be triaged as "steward failed" via
-                # an L1. Skip _auto_escalate_to_human entirely — the workflow's
-                # _mark_blocked dismisses the still-pending L0 and re-pends.
+                # an L1.  Skip _auto_escalate_to_human entirely — but still
+                # dismiss the L0 first, per the converged give-up contract
+                # (task 3170; see this method's docstring).  Dismiss-THEN-
+                # publish: the dismissal wakes the run()-ESCALATED waiter via
+                # the resolve callback, the publish hands the typed outcome to
+                # the _mark_blocked waiter.  Both downstream dismissal sites
+                # (_mark_blocked's loop, _await_steward_completion's override)
+                # remain as idempotent backstops — EscalationQueue.resolve is a
+                # documented no-op on a non-pending record.
+                self._dismiss_capped_l0(escalation, 'attempt_cap')
                 self._publish_outcome(outcome)
             else:
                 self._auto_escalate_to_human(
@@ -394,6 +513,9 @@ class TaskSteward:
                     f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
                     outcome=outcome,
                 )
+            # Marked for BOTH branches: the give-up is terminal for this
+            # steward regardless of whether it filed an L1.
+            self._mark_capped(escalation.id)
             return
 
         # Guard: per-escalation timeout-kill cap
@@ -402,6 +524,10 @@ class TaskSteward:
             wip = await self._wip_probe() if self._wip_probe else False
             outcome = StewardInterrupted(reason='timeout', wip_commits_present=wip)
             if wip:
+                # Same converged give-up contract as the attempt-cap branch
+                # above (task 3170): dismiss THEN publish, so neither wip
+                # branch can drift from the other.
+                self._dismiss_capped_l0(escalation, 'timeout')
                 self._publish_outcome(outcome)
             else:
                 self._auto_escalate_to_human(
@@ -409,6 +535,7 @@ class TaskSteward:
                     f'Invocation repeatedly timed out ({timeout_count}/{self.config.steward_max_timeouts_per_escalation})',
                     outcome=outcome,
                 )
+            self._mark_capped(escalation.id)
             return
 
         # Guard: per-escalation empty-output cap
@@ -419,6 +546,7 @@ class TaskSteward:
                 f'Invocation repeatedly produced no output '
                 f'({empty_output_count}/{self.config.steward_max_empty_outputs_per_escalation})',
             )
+            self._mark_capped(escalation.id)
             return
 
         cwd = self.worktree
@@ -572,6 +700,35 @@ class TaskSteward:
     # Session-aware invocation with cap-hit recovery
     # ------------------------------------------------------------------
 
+    async def _invoke_agent_counted(self, **kwargs):
+        """``invoke_fn`` shim that records a subprocess-level liveness tick.
+
+        Task 3170, review fix D4.  ``metrics.invocations`` is bumped only after
+        :meth:`_invoke_with_session` returns (:597), i.e. after the WHOLE
+        ``invoke_with_cap_retry`` loop finishes.  That loop legitimately runs up
+        to ``_MAX_CAP_RETRIES`` (16) subprocess attempts behind that single
+        return, sleeping an exponential cooldown (capped at 300s) between them
+        while it waits for a usage-cap reset — a routine, designed-for condition
+        here.  A steward parked in that wait is HEALTHY but invisible to
+        ``invocations``, and
+        :meth:`TaskWorkflow._wait_for_resolution`'s idle window would expire on
+        it and kill the agent mid-work.
+
+        Bumping at the START of each attempt (before awaiting the subprocess)
+        is what makes the signal sound: the longest gap between two ticks is one
+        cap cooldown plus one enforced invocation ceiling
+        (``timeouts.steward``), which stays inside the waiter's
+        ``timeouts.steward + steward_completion_timeout`` window rather than
+        exceeding it by an unbounded multiple of the cap-retry count.
+
+        Kwargs are forwarded verbatim to :func:`invoke_agent` — including the
+        ``backend`` kwarg ``invoke_with_cap_retry`` injects for custom
+        ``invoke_fn`` callers (cli_invoke.py:1079-1086), whose disposition is
+        unchanged by this shim.
+        """
+        self.metrics.subprocess_attempts += 1
+        return await invoke_agent(**kwargs)
+
     async def _invoke_with_session(
         self,
         prompt: str,
@@ -672,7 +829,11 @@ class TaskSteward:
         result = await invoke_with_cap_retry(
             self.usage_gate,
             f'Steward for task {self.task_id}',
-            invoke_fn=invoke_agent,
+            # _invoke_agent_counted, not invoke_agent directly: the shim ticks
+            # metrics.subprocess_attempts once per subprocess attempt so a
+            # steward parked in this loop's cap-retry cooldowns stays visibly
+            # ALIVE to the ESCALATED waiter's idle window (task 3170, fix D4).
+            invoke_fn=self._invoke_agent_counted,
             config_dir=self._config_dir,
             backend=self.config.backends.steward,
             max_cap_retries=_MAX_CAP_RETRIES,
@@ -790,7 +951,10 @@ class TaskSteward:
             result = await invoke_with_cap_retry(
                 self.usage_gate,
                 f'Steward for task {self.task_id} [pre-triage]',
-                invoke_fn=invoke_agent,
+                # Counted for the same reason as _invoke_with_session's call
+                # (task 3170, fix D4): pre-triage runs inside the ESCALATED
+                # wait and can itself sit in cap-retry cooldowns.
+                invoke_fn=self._invoke_agent_counted,
                 prompt=prompt,
                 system_prompt=TRIAGE.system_prompt,
                 cwd=self.config.project_root,
@@ -857,6 +1021,83 @@ class TaskSteward:
                     f'{len(triage_result["skipped"])} skipped'
                 ),
             },
+        )
+
+    # ------------------------------------------------------------------
+    # Give-up without an L1 hand-off (task-2060 resume-plan branches)
+    # ------------------------------------------------------------------
+
+    def _log_capped_idle_once(self) -> None:
+        """Announce the capped-only idle state, once per entry into it.
+
+        Making this state EXPLICIT is the point (task 3170, fix B): the
+        incident's tell was a million identical lines with no state change,
+        and the fix's success signal is the opposite — silence.  Silence is
+        indistinguishable from a wedged steward in journald, so the
+        transition into "idle, holding capped escalations the workflow has
+        not disposed of yet" is logged loudly exactly once.  ``_run_loop``
+        clears the flag whenever it handles a live escalation, so a later
+        relapse into this state is announced again rather than swallowed.
+        """
+        if not self._capped_escalations or self._capped_idle_logged:
+            return
+        self._capped_idle_logged = True
+        logger.warning(
+            f'Steward for task {self.task_id}: idle with '
+            f'{len(self._capped_escalations)} capped escalation(s) awaiting '
+            f'workflow disposition; not re-handling '
+            f'({", ".join(sorted(self._capped_escalations))})'
+        )
+
+    def _mark_capped(self, escalation_id: str) -> None:
+        """Record that this steward has permanently given up on *escalation_id*.
+
+        Called from EVERY cap-fire early return in :meth:`_handle_escalation`
+        — not just the two wip-gated branches — so the busy-loop shape is
+        unreachable from any future early return added there (task 3170,
+        fix B).  ``_capped_escalations`` is deliberately per-steward, not
+        persisted: it means "terminal for THIS steward", and a fresh steward
+        for the same task is entitled to try again.
+        """
+        self._capped_escalations.add(escalation_id)
+
+    def _dismiss_capped_l0(self, escalation: Escalation, reason: str) -> None:
+        """Dismiss *escalation* on a give-up that files no L1 (task 3170).
+
+        The wip-gated cap branches deliberately skip
+        :meth:`_auto_escalate_to_human` (task-2060: a resumable interruption
+        must not be triaged as "steward failed").  They must still uphold the
+        converged give-up contract that both workflow waiters depend on —
+        **no pending L0 survives a steward give-up** — so this is the
+        L1-free half of what ``_auto_escalate_to_human`` does: the same
+        ``resolve(..., dismiss=True)`` call and the same three-dict counter
+        cleanup, minus the level-1 submission.
+
+        Going through ``EscalationQueue.resolve`` (never a direct file write)
+        is load-bearing: it fires the queue's ``_resolve_callback``, which the
+        harness wires to ``_escalation_events[task_id].set()`` — the ONLY
+        signal that wakes ``TaskWorkflow._wait_for_resolution`` on the
+        ``run()``-ESCALATED path.
+        """
+        self.escalation_queue.resolve(
+            escalation.id,
+            f'Auto-dismissed: steward interrupted ({reason}) with WIP present '
+            f'— resuming plan, not escalating',
+            dismiss=True,
+            resolved_by='auto-dismissed',
+        )
+
+        # Same cleanup as _auto_escalate_to_human: cap-fire paths skip the
+        # success-path cleanup, so the dicts would otherwise retain stale
+        # entries for this escalation id.
+        self._retry_counts.pop(escalation.id, None)
+        self._timeout_counts.pop(escalation.id, None)
+        self._empty_output_counts.pop(escalation.id, None)
+
+        logger.warning(
+            f'Steward for task {self.task_id}: gave up on {escalation.id} '
+            f'({reason}) with WIP present — dismissed the L0 and published a '
+            f'resume-plan interruption (no L1 filed)'
         )
 
     # ------------------------------------------------------------------

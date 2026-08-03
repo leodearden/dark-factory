@@ -27,11 +27,15 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import dataclasses
+import logging
+import traceback
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import MERGE_RESULT_TIMEOUT
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
@@ -126,6 +130,55 @@ def _make_request(
     )
 
 
+async def _await_outcome(
+    fut: asyncio.Future[MergeOutcome],
+    *,
+    label: str,
+    timeout: float = MERGE_RESULT_TIMEOUT,
+) -> MergeOutcome:
+    """Await a ``MergeRequest.result`` future, failing LOUDLY -- by name --
+    on deadline instead of letting a real timeout masquerade as ``None``
+    (task 3477).
+
+    The shape this replaces --
+    ``with contextlib.suppress(TimeoutError): outcome = await
+    asyncio.wait_for(fut, timeout=N)`` followed by
+    ``assert outcome is not None and outcome.status == ...`` -- converts a
+    genuine pipeline hang or a missing cascade into a confusing
+    ``outcome is None`` assertion failure. That shape is exactly what
+    flaked in TestRunnerUnavailableHeadCascade and
+    TestCascadeFiresRemoteCancel: under load, the fixed real-time deadline
+    was reached before the merge pipeline resolved, TimeoutError was
+    swallowed, and the next hard assertion fired on a still-None outcome --
+    reporting a timeout as if it were a wrong-value bug.
+
+    The default *timeout* (45s) is ``_orch_helpers.MERGE_RESULT_TIMEOUT``
+    (task 2376's shared, never-narrow merge-pipeline result-wait ceiling),
+    not a fresh literal -- so callers inherit the same generous,
+    load-tolerant budget already established for test_merge_queue.py,
+    test_merge_speculation.py and test_concurrent_verify_boundary.py.
+    """
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except TimeoutError:
+        pytest.fail(
+            f'{label}: MergeOutcome never resolved within {timeout}s -- '
+            f'the merge pipeline never completed this request. This is a '
+            f'real hang or a genuinely missing cascade, NOT a None outcome.'
+        )
+
+
+# task 3477 amend: both cascade classes below perform the SAME five sequential
+# real-time waits (2 gates + 2 _await_outcome + 1 worker_task teardown) at
+# MERGE_RESULT_TIMEOUT (45s) each -- a 225s worst case -- plus git-fixture setup
+# and an unbounded worker.stop(). 180 was too tight: it would itself os._exit()
+# the xdist worker (pyproject timeout_method = "thread", --max-worker-restart=0)
+# before the loud _await_outcome failure this task added could ever report. The
+# class mark MUST clear the full 225s budget, not just the pyproject 60s default.
+# Derived, not literal, so the two marks cannot drift apart the way they just did.
+CASCADE_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
+
+
 # ---------------------------------------------------------------------------
 # (d) OrchestratorConfig builders: single-host vs two-host
 # ---------------------------------------------------------------------------
@@ -172,9 +225,74 @@ def _mock_verify_result(passed: bool) -> VerifyResult:
     )
 
 
+_VERIFY_RESULT_FIELD_NAMES = {f.name for f in dataclasses.fields(VerifyResult)}
+
+
+def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
+    """Return a MagicMock(spec=VerifyResult) seeded from a REAL VerifyResult's
+    field defaults, with **overrides layered on top (task 3477).
+
+    Why not a bare ``MagicMock(passed=..., summary=..., ...)``: an
+    unconfigured attribute READ on a bare MagicMock auto-vivifies a truthy
+    child Mock rather than returning a real default. Every one of this
+    file's inline VerifyResult-shaped doubles omitted ``cause_hint``, so
+    merge_disposition.py's ``_extract_failing_tests_and_candidate_files``
+    (:218-221) joins ``verify_result.cause_hint`` and
+    ``verify_result.test_output`` via ``str.join`` — which raised
+    ``TypeError: sequence item 0: expected str instance, MagicMock found``
+    on every FAILING double. ``classify_merge_failure_disposition``
+    (:710-719) swallows that into a silent fail-open (WARNING +
+    INDETERMINATE), so the affected tests only APPEARED to exercise
+    disposition classification.
+
+    Why ``spec=VerifyResult``: it makes a future unknown-attribute READ
+    fail loudly (``AttributeError``) instead of auto-vivifying — the
+    root-cause fix, not just a ``cause_hint=''`` patch for today's one
+    known field. Seeding from ``dataclasses.fields(VerifyResult)`` (rather
+    than a hardcoded attr list) means a field added to VerifyResult in
+    future is picked up automatically, so this factory does not itself
+    drift out of sync the way the file's inline doubles did.
+
+    Why this stays a MagicMock and not a real VerifyResult instance: a real
+    dataclass would also make ``.failure_report()`` return a real string
+    instead of a Mock. merge_queue.py:703's ``isinstance(s, str)`` filter
+    currently discards the Mock; a real string would pass through and
+    append a ``## Test Failures`` block to the rendered ``reason`` at
+    merge_queue.py:3020/3041/3078 — assertion churn well beyond this
+    factory's fidelity-only scope. Seeding a MagicMock from real defaults
+    confines the behaviour delta to exactly the fields callers read.
+
+    Deliberately does NOT special-case a ``verify_skipped`` kwarg: that
+    field lives on MergeOutcome (merge_types.py:945), not VerifyResult, and
+    is never read off a VerifyResult anywhere in src/ — callers migrating
+    off the old inline doubles should simply drop it rather than pass it
+    through **overrides.
+
+    **overrides are validated against VerifyResult's real field names
+    before being applied (task 3477 amend). ``spec=`` alone only makes
+    unconfigured *reads* fail loudly; a ``spec=`` (not ``spec_set=``) mock
+    still accepts an unknown attribute WRITE via plain ``setattr`` — so a
+    typo'd override (or a leftover ``verify_skipped=``) would silently
+    produce a double whose real field keeps its seeded default instead of
+    raising, which is exactly the class of silent drift this factory
+    exists to eliminate.
+    """
+    if unknown := set(overrides) - _VERIFY_RESULT_FIELD_NAMES:
+        raise TypeError(
+            f'_fake_verify_result: not VerifyResult fields: {sorted(unknown)}'
+        )
+    real = _mock_verify_result(passed)
+    fake = MagicMock(spec=VerifyResult)
+    for f in dataclasses.fields(VerifyResult):
+        setattr(fake, f.name, getattr(real, f.name))
+    for key, value in overrides.items():
+        setattr(fake, key, value)
+    return fake
+
+
 def _mock_verify_pass() -> AsyncMock:
     """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=MagicMock(passed=True, summary=''))
+    return AsyncMock(return_value=_fake_verify_result(passed=True, summary=''))
 
 
 def _gated_runner(
@@ -1913,8 +2031,7 @@ class TestOverlapSignal:
         async def _gated_local_verify(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(passed=True, summary='', test_output='', lint_output='',
-                             type_output='', category='')
+            return _fake_verify_result(passed=True, summary='', test_output='', category='')
 
         # ── Branches ───────────────────────────────────────────────────────
         wt_a = await _make_branch_with_file(git_ops, 'task/ov-a', 'ov_a.py', 'a = 1\n')
@@ -2065,8 +2182,7 @@ class TestLastItemOfBurstFinalizes:
         async def _gated_local_verify(*args: Any, **kwargs: Any) -> MagicMock:
             gate_entered.set()
             await gate_release.wait()
-            return MagicMock(passed=True, summary='', test_output='',
-                             lint_output='', type_output='', category='')
+            return _fake_verify_result(passed=True, summary='', test_output='', category='')
 
         # Remote runner exists (→ free_host_count()>1 so the fill loop continues
         # past the local dispatch) but is never used by this single-item burst.
@@ -2182,27 +2298,14 @@ class TestChainInvalidationUnderOverlap:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # N+1's re-dispatched local verify (GREEN step-20 cascade path)
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -2364,27 +2467,14 @@ class TestChainInvalidationUnderOverlap:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # N+1's re-dispatched local verify (cascade path)
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -2582,11 +2672,7 @@ class TestHaltAndUnavailable:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # N+1's remote verify: gated (passes when released)
         gated_remote = _gated_runner(
@@ -2697,11 +2783,7 @@ class TestHaltAndUnavailable:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # N+1's remote runner: gates on entered, then raises RunnerUnavailable
         async def _unavailable_side(*args: Any, **kwargs: Any) -> Any:
@@ -3332,6 +3414,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(CASCADE_TEST_TIMEOUT)  # task 3477 amend: see CASCADE_TEST_TIMEOUT -- derived so this cannot drift from TestCascadeFiresRemoteCancel's identical wait profile
 class TestRunnerUnavailableHeadCascade:
     """RUNNER_UNAVAILABLE on the HEAD triggers the head-failure cascade.
 
@@ -3394,16 +3477,7 @@ class TestRunnerUnavailableHeadCascade:
                 await gate_a_release.wait()
                 raise RunnerUnavailable('simulated host failure for cascade test')
             # Re-dispatched verifies (N and N+1 after cascade re-merge): pass
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── Branches ─────────────────────────────────────────────────────────
         wt_a = await _make_branch_with_file(git_ops, 'task/rucascade-a', 'rucascade_a.py', 'a=1\n')
@@ -3430,9 +3504,6 @@ class TestRunnerUnavailableHeadCascade:
             config=config, result=loop.create_future(), lane='normal',
         )
 
-        outcome_a: MergeOutcome | None = None
-        outcome_b: MergeOutcome | None = None
-
         with patch('orchestrator.merge_queue.run_scoped_verification', _local_verify_side_effect):
             worker_task = asyncio.create_task(worker.run())
 
@@ -3441,8 +3512,11 @@ class TestRunnerUnavailableHeadCascade:
 
             # Wait for N's local verify to enter AND N+1's remote verify to enter.
             # This confirms both are in-flight simultaneously.
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # NOTE (task 3477): widened from 15.0s -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention even though the
+            # underlying cascade logic is correct (timing flake, not a bug).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
 
             # Both verifies are now in-flight.  Release N's gate → RunnerUnavailable.
             # _finalize_inflight(N) returns False → head-failure cascade fires:
@@ -3455,19 +3529,20 @@ class TestRunnerUnavailableHeadCascade:
             # can unblock even if cancel() arrives slightly late.
             gate_b_release.set()
 
-            # Wait for both to resolve.
-            with contextlib.suppress(TimeoutError):
-                outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            # Wait for both to resolve. A real timeout now fails loudly by
+            # name (task 3477) instead of leaving outcome_X as a confusing
+            # None that the assertions below would misreport.
+            outcome_a = await _await_outcome(req_a.result, label='N (RUNNER_UNAVAILABLE head)')
+            outcome_b = await _await_outcome(req_b.result, label='N+1 (speculative downstream)')
 
             await worker.stop()
 
+        # NOTE (task 3477): widened from 5.0s, matching the gate/outcome waits above.
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            await asyncio.wait_for(worker_task, timeout=45.0)
 
         # ── N (RUNNER_UNAVAILABLE head): must land 'done' after re-dispatch ──
-        assert outcome_a is not None and outcome_a.status == 'done', (
+        assert outcome_a.status == 'done', (
             f'Expected N (RUNNER_UNAVAILABLE head) to resolve "done" after '
             f're-merge re-dispatch, got {outcome_a!r}. '
             'The head-failure cascade should re-merge N onto actual main '
@@ -3475,7 +3550,7 @@ class TestRunnerUnavailableHeadCascade:
         )
 
         # ── N+1 (speculative downstream): must land 'done' after cascade ─────
-        assert outcome_b is not None and outcome_b.status == 'done', (
+        assert outcome_b.status == 'done', (
             f'Expected N+1 (speculative downstream) to resolve "done" after '
             f'cascade re-merge re-dispatch, got {outcome_b!r}. '
             'If the cascade did not fire, N+1 would stay in _inflight with a '
@@ -3879,6 +3954,7 @@ class TestStopDrainFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(CASCADE_TEST_TIMEOUT)  # task 3477 amend: see CASCADE_TEST_TIMEOUT -- derived so this cannot drift from TestRunnerUnavailableHeadCascade's identical wait profile (was a bare 180, too tight for the 225s worst case below)
 class TestCascadeFiresRemoteCancel:
     """_verifier_loop head-failure cascade fires remote cancel BEFORE task.cancel().
 
@@ -3926,27 +4002,14 @@ class TestCascadeFiresRemoteCancel:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # N+1 re-dispatched locally after cascade (pass immediately)
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: id-liveness fake ────────────────────────────
         gate_b_release = asyncio.Event()
@@ -3980,8 +4043,6 @@ class TestCascadeFiresRemoteCancel:
             config=config, result=loop.create_future(), lane='normal',
         )
 
-        outcome_b: MergeOutcome | None = None
-
         with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
             worker_task = asyncio.create_task(worker.run())
 
@@ -3989,14 +4050,19 @@ class TestCascadeFiresRemoteCancel:
             await q.put(req_b)
 
             # Wait for both verifies to enter (true concurrent overlap)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # NOTE (task 3477): widened from 15.0s -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention even though the
+            # underlying cascade logic is correct (timing flake, not a bug).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
 
             # N's verify fails → triggers head-failure cascade for N+1
             gate_a_release.set()
 
-            # N must resolve with a fail status
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            # N must resolve with a fail status. Routed through _await_outcome
+            # (task 3477) so a real timeout reports by name instead of raising
+            # a bare TimeoutError, matching outcome_b's wait below.
+            outcome_a = await _await_outcome(req_a.result, label='N (gated local fail)')
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail, got status={outcome_a.status!r}.'
             )
@@ -4006,17 +4072,20 @@ class TestCascadeFiresRemoteCancel:
             # run_merge_verify coroutine so the test can complete cleanly).
             gate_b_release.set()
 
-            # Wait for N+1 to resolve 'done' after cascade re-merge/re-verify
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=10.0)
+            # Wait for N+1 to resolve 'done' after cascade re-merge/re-verify.
+            # A real timeout now fails loudly by name (task 3477) instead of
+            # leaving outcome_b as a confusing None that the assertion below
+            # would misreport.
+            outcome_b = await _await_outcome(req_b.result, label='N+1 (cascade re-merge/re-verify)')
 
             await worker.stop()
 
+        # NOTE (task 3477): widened from 5.0s, matching the gate/outcome waits above.
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            await asyncio.wait_for(worker_task, timeout=45.0)
 
         # ── N+1 must resolve done (cascade re-merged and re-verified) ────────
-        assert outcome_b is not None and outcome_b.status == 'done', (
+        assert outcome_b.status == 'done', (
             f'Expected N+1 to resolve "done" after cascade re-merge/re-verify, '
             f'got {outcome_b!r}.'
         )
@@ -4092,27 +4161,14 @@ class TestCascadeErrorContainment:
                 # N's verify: gate and fail
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
             # Any subsequent call (req_c's local verify) passes immediately.
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -4308,26 +4364,13 @@ class TestCascadeErrorContainment:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
+                return _fake_verify_result(
                     passed=False,
                     summary='test_failure',
                     test_output='FAILED',
-                    lint_output='',
-                    type_output='',
                     category='test_failure',
-                    timed_out=False,
-                    verify_skipped=False,
                 )
-            return MagicMock(
-                passed=True,
-                summary='ok',
-                test_output='ok',
-                lint_output='',
-                type_output='',
-                category='',
-                timed_out=False,
-                verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         # ── N+1's remote verify: gated ────────────────────────────────────────
         gate_b_release = asyncio.Event()
@@ -4551,11 +4594,17 @@ class TestRedispatchSpeculativeConservation:
         self,
         git_ops: GitOps,
         config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The I4 speculation-slot identity holds at every heartbeat-observable
         point while a genuinely speculative item sits parked on
         ``_redispatch``, and no ``merge_resource_leak`` escalation ever fires.
+
+        Also (task 3477): the disposition classifier must not silently
+        degrade to its fail-open path while processing this test's failing
+        VerifyResult double — see the caplog guard at the end of this test.
         """
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_disposition')
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
         _local_calls: list[int] = [0]
@@ -4567,16 +4616,14 @@ class TestRedispatchSpeculativeConservation:
                 # A's verify: gate, then FAIL.
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='test_failure', test_output='FAILED',
-                    lint_output='', type_output='', category='test_failure',
-                    timed_out=False, verify_skipped=False,
+                return _fake_verify_result(
+                    passed=False,
+                    summary='test_failure',
+                    test_output='FAILED',
+                    category='test_failure',
                 )
             # B's re-dispatched local verify (after the previous_failed remerge).
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok', lint_output='',
-                type_output='', category='', timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True, summary='ok', test_output='ok', category='')
 
         wt_a = await _make_branch_with_file(git_ops, 'task/rc-a', 'rc_a.py', 'a = 1\n')
         wt_b = await _make_branch_with_file(git_ops, 'task/rc-b', 'rc_b.py', 'b = 2\n')
@@ -4740,6 +4787,30 @@ class TestRedispatchSpeculativeConservation:
         assert 'rc_b.py' in main_files, 'B (rc_b.py) must land on main after remerge'
         assert 'rc_a.py' not in main_files, 'A (rc_a.py) must NOT land (verify failed)'
 
+        # task 3477: A's VerifyResult double (passed=False) reaches
+        # classify_merge_failure_disposition via the real post-merge-verify
+        # path. That classifier must complete honestly, not silently degrade
+        # to its fail-open path (merge_disposition.py:710-719) because the
+        # double's cause_hint/test_output shape confused
+        # _extract_failing_tests_and_candidate_files. This guard is what
+        # proves the (b) fidelity fix actually reached this call site — any
+        # future double built without a real cause_hint re-trips it.
+        fail_open_records = [
+            r for r in caplog.records
+            if 'internal error; degrading to INDETERMINATE (fail-open, I3)' in r.message
+        ]
+        assert fail_open_records == [], (
+            'classify_merge_failure_disposition degraded to the silent '
+            'fail-open path while classifying A\'s failing verify — the '
+            'VerifyResult double reached _extract_failing_tests_and_'
+            'candidate_files and raised instead of returning a real '
+            'disposition. Offending record(s):\n' + '\n'.join(
+                ''.join(traceback.format_exception(*r.exc_info))
+                if r.exc_info else r.message
+                for r in fail_open_records
+            )
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 2096: _finalizing_head speculative-permit accounting THROUGHOUT the
@@ -4901,4 +4972,142 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
         assert worker.speculation_accounting_violations() == [], (
             'speculation-slot identity must hold after the finalizing head '
             'releases its permit in the finally clause.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3477 step-1 RED: _fake_verify_result factory contract
+# ---------------------------------------------------------------------------
+#
+# None of the 18 inline VerifyResult-shaped `MagicMock(passed=..., summary=...,
+# test_output=..., ...)` doubles in this file set `cause_hint`, so an
+# unconfigured attribute read on a bare MagicMock auto-vivifies a truthy
+# child Mock instead of a real string. Every FAILING double reaches
+# merge_disposition.py:218-221's
+# `'\n'.join(part for part in (verify_result.cause_hint, verify_result.test_output) if part)`,
+# which raises `TypeError: sequence item 0: expected str instance, MagicMock
+# found`. classify_merge_failure_disposition (merge_disposition.py:710-719)
+# swallows that into a silent fail-open — WARNING
+# "classify_merge_failure_disposition: internal error; degrading to
+# INDETERMINATE (fail-open, I3)" — so the affected tests only APPEAR to
+# exercise disposition classification. `_fake_verify_result` (GREEN:
+# task 3477 step-2, added beside `_mock_verify_result` above) fixes this at
+# the source: a `MagicMock(spec=VerifyResult)` seeded from a REAL
+# VerifyResult's field defaults, so `cause_hint` (and every other field) is
+# authoritative and future fields are picked up automatically.
+# ---------------------------------------------------------------------------
+
+
+class TestFakeVerifyResultFidelity:
+    """`_fake_verify_result` doubles must survive the real disposition-
+    classification extraction path, unlike a bare `MagicMock(passed=...)`.
+    """
+
+    def test_failing_double_survives_disposition_extraction(self) -> None:
+        """A failing `_fake_verify_result` double must not TypeError inside
+        `_extract_failing_tests_and_candidate_files`.
+
+        RED (pre task-3477 step-2): NameError: name '_fake_verify_result' is
+        not defined.
+        """
+        from orchestrator.merge_disposition import (
+            _extract_failing_tests_and_candidate_files,
+        )
+
+        double = _fake_verify_result(
+            passed=False,
+            summary='test_failure',
+            test_output='FAILED',
+            category='test_failure',
+        )
+
+        failing_tests, candidate_files = _extract_failing_tests_and_candidate_files(
+            double,
+        )
+        assert (failing_tests, candidate_files) == ((), ()), (
+            f'Expected an uninformative failing double to degrade to the '
+            f'honest empty-candidate-set return, not raise or manufacture a '
+            f'false candidate; got {(failing_tests, candidate_files)!r}.'
+        )
+
+        # Root-cause pin: a bare MagicMock auto-vivifies `.cause_hint` as a
+        # truthy child Mock (not a str) — that is the whole bug. The factory
+        # must seed a real string default (VerifyResult's own default: '')
+        # instead.
+        assert isinstance(double.cause_hint, str), (
+            f'Expected double.cause_hint to be a real str (the VerifyResult '
+            f'default is \'\'), not an auto-vivified MagicMock child; got '
+            f'{double.cause_hint!r} ({type(double.cause_hint)!r}). This is '
+            f'the root cause of the file-wide fail-open: '
+            f'_extract_failing_tests_and_candidate_files joins '
+            f'(cause_hint, test_output) and str.join rejects a non-str item.'
+        )
+
+    def test_rejects_unknown_override_field(self) -> None:
+        """An override key that is not a real VerifyResult field must raise
+        immediately, not silently no-op (task 3477 amend).
+
+        ``spec=VerifyResult`` alone only guards unconfigured *reads*; a
+        plain ``setattr`` on a ``spec=`` (not ``spec_set=``) mock still
+        accepts an unknown attribute WRITE. Without this validation, a
+        typo'd override (e.g. ``categoy=`` for ``category=``) or a
+        leftover ``verify_skipped=`` would silently produce a double whose
+        real field keeps its seeded default instead of raising -- the same
+        class of silent drift this factory exists to eliminate.
+        """
+        with pytest.raises(TypeError, match='verify_skipped'):
+            _fake_verify_result(passed=False, verify_skipped=True)
+
+
+# ---------------------------------------------------------------------------
+# task 3477 step-5: _await_outcome loud-timeout contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAwaitOutcomeHelper:
+    """`_await_outcome` must report a real timeout AS a timeout.
+
+    The previous shape in this file --
+    ``with contextlib.suppress(TimeoutError): outcome = await
+    asyncio.wait_for(fut, timeout=N)`` followed by
+    ``assert outcome is not None and outcome.status == ...`` -- converts a
+    genuine pipeline hang into a confusing ``outcome is None`` assertion
+    failure, hiding whether the pipeline actually hung or the cascade never
+    fired. ``_await_outcome`` closes that gap by failing loudly, by name,
+    at the deadline instead.
+    """
+
+    async def test_await_outcome_returns_resolved_outcome(self) -> None:
+        """An already-resolved future's value is returned unchanged."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        sentinel = object()
+        fut.set_result(sentinel)
+
+        result = await _await_outcome(fut, label='N (already resolved)')
+
+        assert result is sentinel, (
+            f'Expected _await_outcome to return the resolved future value '
+            f'unchanged, got {result!r}.'
+        )
+
+    async def test_await_outcome_fails_loudly_on_deadline(self) -> None:
+        """A future that never resolves must pytest.fail -- by name, with
+        the deadline -- rather than let the caller observe a bare None.
+
+        RED (pre task-3477 step-6): NameError: name '_await_outcome' is not
+        defined.
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+
+        with pytest.raises(pytest.fail.Exception, match='cascade-N-await') as exc_info:
+            await _await_outcome(fut, label='cascade-N-await', timeout=0.05)
+
+        assert '0.05' in str(exc_info.value), (
+            f'Expected the failure message to name the deadline (0.05s), '
+            f'got {exc_info.value!r}. A real timeout must report AS a '
+            f'timeout -- naming the label and the deadline -- not surface '
+            f'as a confusing `outcome is None`.'
         )

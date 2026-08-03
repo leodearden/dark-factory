@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
 import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from orchestrator.agents.invoke import invoke_agent
 
@@ -317,16 +318,88 @@ PLAN_QUALITY_RUBRIC: dict[str, Any] = {
 }
 
 
+def is_scorable_plan(plan: object) -> TypeGuard[dict]:
+    """THE single test for "does this artifact carry content worth scoring?".
+
+    A plan with no steps is not a plan — whether it is absent (``None``), empty
+    (``{}``), not a dict at all, or the header-only stub ``create_plan`` writes
+    on the architect's FIRST plan-tools call (``plan_tools._create_plan``: a
+    TRUTHY dict with ``task_id`` / ``title`` / ``analysis`` / ``files`` and
+    ``steps: []``).
+
+    Deliberately shared by :func:`score_plan_structure`'s ``0.0``
+    short-circuit and by ``run_architect_eval``'s cap-taint predicate. Those
+    were once two independent tests — raw dict truthiness in the runner versus
+    ``not plan.get('steps')`` here — and they disagreed exactly on the
+    header-only stub, so a session cap landing right after ``create_plan`` left
+    the cell UNtainted and then floored it to a fabricated ``0.0``. Making both
+    call sites literally this function makes that drift structurally impossible.
+
+    Note this is a different question from the ``has_steps`` RUBRIC criterion
+    (:func:`_plan_has_steps`), which is scored per-plan against a real plan; do
+    not conflate the two roles.
+
+    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so it also carries
+    the ``isinstance`` narrowing the inline guard it replaced used to give
+    :func:`score_plan_structure`.
+    """
+    return isinstance(plan, dict) and bool(plan.get('steps'))
+
+
+def clamp_unit_score(score: float) -> float:
+    """THE output-range contract shared by the two plan-quality instruments.
+
+    :func:`score_plan_structure` and :func:`judge_plan_quality` are a
+    two-instrument pair reduced onto ONE axis (``EvalMetrics.plan_quality``) —
+    exactly the shape :func:`is_scorable_plan` (above) already solved for
+    scorability. That function's docstring records the rule: "making both call
+    sites literally this function makes that drift structurally impossible."
+    The range invariant gets the same treatment within THIS pair — the ONE
+    named contract both plan-quality instruments call, rather than a copied
+    expression the two can silently drift apart on the next time either is
+    edited. This is also THE canonical explanation of the schema-gap/NaN
+    reasoning below — other call sites in this module and its tests point
+    back here rather than restating it, so the rationale cannot drift out of
+    step with itself across copies the way the clamp expression used to.
+
+    Scoped to this instrument pair, not the whole ``evals`` package: the
+    identical ``round(min(max(x, 0.0), 1.0), 4)`` idiom still exists verbatim
+    at ``scoring.py``'s recovery rubric and ``metrics.py``'s composite blend —
+    different instruments, on different axes, deliberately left unmigrated
+    here to avoid widening this fix's blast radius (see this task's plan). A
+    future unification of those is a separate decision, not an oversight of
+    this one.
+
+    Covers a real schema gap: ``PLAN_QUALITY_SCHEMA`` declares
+    ``{'minimum': 0.0, 'maximum': 1.0}``, but that only constrains the
+    ``structured_output`` delivery path — the documented
+    ``result.structured_output or json.loads(result.output)`` fallback in
+    :func:`judge_plan_quality` bypasses schema enforcement entirely, so an
+    out-of-range judge answer reaches this runtime clamp regardless of which
+    path delivered it.
+
+    Clamps to ``[0, 1]`` and rounds to 4 decimal places — the precision
+    :func:`score_plan_structure` has always used. Does NOT handle NaN: ``min``/
+    ``max`` are ordering operations and NaN is unordered, so a NaN input passes
+    straight through unclamped (``round(min(max(nan, 0.0), 1.0), 4)`` is
+    ``nan``). A caller with untrusted input (:func:`judge_plan_quality`) must
+    check for that itself before calling this.
+    """
+    return round(min(max(score, 0.0), 1.0), 4)
+
+
 def score_plan_structure(
     plan: dict | None, rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
 ) -> float:
     """Deterministic structural plan-quality score in ``[0, 1]``.
 
     Reads ONLY the produced plan dict — no LLM, no worktree, no transcript. A
-    plan with no steps (empty / ``None`` / empty ``steps`` list) is not a plan
-    and scores ``0.0`` outright. Otherwise returns the weight-weighted fraction
-    of satisfied structural criteria,
-    ``round(satisfied_weight / total_weight, 4)``, clamped to ``[0, 1]``.
+    plan that is not :func:`is_scorable_plan` (empty / ``None`` / no steps /
+    the header-only ``create_plan`` stub) is not a plan and scores ``0.0``
+    outright. Otherwise returns the weight-weighted fraction
+    of satisfied structural criteria, ``satisfied_weight / total_weight``, put
+    through :func:`clamp_unit_score` — the ``[0, 1]``/4dp contract this
+    function and :func:`judge_plan_quality` share.
 
     This is the ALWAYS-non-sentinel floor :func:`run_architect_eval` degrades to
     when the LLM plan judge fails, so an architect-eval run never emits a null
@@ -336,7 +409,11 @@ def score_plan_structure(
     name, or a non-positive total weight — the rubric is code-owned, so a typo
     must fail loudly (structured-facts-at-failure / loud-over-silent).
     """
-    if not plan or not isinstance(plan, dict) or not plan.get('steps'):
+    # Exactly equivalent to the former inline
+    # ``not plan or not isinstance(plan, dict) or not plan.get('steps')``
+    # (an empty dict and a None both fail the steps test), now expressed via the
+    # ONE predicate the runner's taint decision also consults.
+    if not is_scorable_plan(plan):
         return 0.0
     criteria = rubric.get('criteria') or []
     if not criteria:
@@ -360,7 +437,7 @@ def score_plan_structure(
     if total_weight <= 0.0:
         raise ValueError('plan-quality rubric total weight must be > 0')
     score = satisfied_weight / total_weight
-    return round(min(max(score, 0.0), 1.0), 4)
+    return clamp_unit_score(score)
 
 
 @dataclass
@@ -371,13 +448,19 @@ class PlanQualityVerdict:
     plan, or ``None`` — the parse-failure sentinel — when the judge output could
     not be parsed. ``run_architect_eval`` treats ``None`` as its signal to
     degrade to the deterministic :func:`score_plan_structure` floor, so the
-    persisted ``plan_quality`` is ALWAYS a non-sentinel float even when the
-    judge fails.
+    persisted ``plan_quality`` is a non-sentinel float even when the judge
+    fails (a judge failure never nulls a cell that has a real plan behind it).
     """
 
     plan_quality: float | None
     per_criterion: dict[str, Any]
     reasoning: str
+    # Set when the JUDGE'S OWN invocation was refused at the transport layer (a
+    # 429 cap hit / auth failure), so this ``None`` plan_quality is an INFRA
+    # failure — we never got a judgement — rather than an unparseable answer.
+    # Trailing and defaulted, so every existing 3-arg construction (including
+    # the parse-failure fallback below) is unaffected and keeps reading None.
+    invocation_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -395,7 +478,7 @@ PLAN_QUALITY_SCHEMA = {
 
 
 async def judge_plan_quality(
-    plan: dict,
+    plan: dict | None,
     reference_diff: str,
     task: dict,
     rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
@@ -411,9 +494,98 @@ async def judge_plan_quality(
     semantic judge scores the SAME named structural signals
     :func:`score_plan_structure` weights deterministically.
 
+    THE ANTI-FABRICATION FLOOR APPLIES UNIFORMLY, WHICHEVER SCORING PATH RUNS
+    (task 3303). An artifact that is not :func:`is_scorable_plan` carries
+    nothing to judge, so this function refuses it up front — before a prompt is
+    built, before ``invoke_agent`` — and returns the deterministic floor
+    instead. The guard is the SAME predicate :func:`score_plan_structure`
+    short-circuits on and ``run_architect_eval`` gates on, so the three cannot
+    drift; and the refusal's score is DERIVED by calling
+    :func:`score_plan_structure` — with THIS call's own *rubric*, not the module
+    default — rather than hardcoding ``0.0``, so a future change to the floor's
+    semantics (including a rubric-sensitive one) carries this path with it
+    structurally rather than by convention. Without it, this instrument's
+    coherence rested entirely on its ONE caller remembering to gate, and any
+    second caller (a backfill/re-scoring script, a new eval path, ``prompt_opt``,
+    a resume wave) silently re-opened the reported defect: the 2026-07-29 cell
+    ``reify_task_12__architect-opus-high__52c66767.json`` records
+    ``plan_steps=0`` alongside ``plan_quality=0.31`` — a value the floor cannot
+    even express (its outputs are multiples of ``0.125``), so it can only have
+    come from an ungated judge scoring an empty artifact.
+
+    That refusal is ``plan_quality=0.0``-not-``None`` DELIBERATELY: ``None``
+    means "no judgement available, degrade to the floor" (parse failure /
+    transport refusal), whereas here the judgement is definite and no infra
+    failure occurred. ``invocation_error`` stays ``None`` for the same reason —
+    nothing was refused at the transport layer. Keeping the two apart preserves
+    the content-failure / infra-failure distinction tasks 3118 and 3302 turn on:
+    a stepless plan from a healthy architect is a real reliability signal worth
+    ``0.0``, never a cap-tainted exclusion.
+
+    A successfully parsed ``plan_quality`` is put through
+    :func:`clamp_unit_score` rather than returned as a raw float — see that
+    function's docstring for why a runtime clamp is still needed despite
+    ``PLAN_QUALITY_SCHEMA``'s declared bounds, and for the NaN-is-unorderable
+    mechanics behind the exception below. The parse contract is one rule with
+    two LOUD exceptions (never silent — each leaves one WARNING naming the
+    cell): an out-of-range-but-orderable answer (e.g. ``1.5``) is clamped and
+    the WARNING names the raw and clamped values; a non-finite, unorderable
+    answer (``NaN``) degrades to the ``None`` sentinel instead, exactly like a
+    parse failure. ``+/-Infinity`` IS orderable, so it takes the ordinary
+    clamp path (``1.0``/``0.0``), not the NaN one.
+
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
-    sentinel :func:`run_architect_eval` degrades on), never a crash.
+    sentinel :func:`run_architect_eval` degrades on), never a crash. When the
+    judge's OWN invocation was refused at the transport layer (a 429 cap hit /
+    auth failure) the verdict additionally carries ``invocation_error``, so that
+    infra cause stays distinguishable from an unparseable answer; the caller
+    still degrades to the deterministic structural floor, which remains a
+    legitimate content-derived score whenever a real plan exists.
     """
+    # Name WHICH cell to go look at, whichever key the caller populated:
+    # ``run_architect_eval`` passes ``id``, but a second caller — precisely the
+    # scenario BOTH warnings below defend against — may carry only ``name``
+    # (``run_judge`` and the prompt builder further down both key off ``name``
+    # first). Falling through absent AND empty values means a malformed task
+    # dict degrades a log line rather than crashing an anti-fabrication guard
+    # or an out-of-range check. Hoisted here so the unjudgeable-artifact guard
+    # and the out-of-range parse-block check below name the same cell the
+    # same way.
+    cell = task.get('id') or task.get('name') or 'unknown'
+
+    if not is_scorable_plan(plan):
+        # THIS call's rubric, not the module default. Today the floor
+        # short-circuits on ``is_scorable_plan`` before it ever reads a rubric,
+        # so every rubric yields 0.0 here and the argument is inert — but
+        # dropping it would make "the score is DERIVED from the floor" true of
+        # only ONE of the floor's two arguments, and would silently re-open the
+        # two-instrument disagreement 3303 closes the day that short-circuit
+        # becomes rubric-sensitive (a rubric-defined minimum, or criteria that
+        # change what "unscorable" means).
+        floor = score_plan_structure(plan, rubric=rubric)
+        # LOUD, not a silent 0.0: reaching here means a caller did NOT gate,
+        # which is exactly how the reported cell was written. WARNING matches
+        # ``run_architect_eval``'s own no-scorable-plan log and the
+        # transport-refusal log below — an expected-but-notable degradation,
+        # not an error. It cannot double-log through the normal path because
+        # the runner's own ``is_scorable_plan`` gate short-circuits before the
+        # judge is ever awaited.
+        logger.warning(
+            f'Plan judge asked to score an UNJUDGEABLE artifact for {cell}: '
+            f'the plan carries no steps '
+            f'(is_scorable_plan=False) — LLM judge SKIPPED, scored on the '
+            f'deterministic structural floor ({floor}). The caller did not '
+            f'gate; run_architect_eval does (task 3302/3303).'
+        )
+        return PlanQualityVerdict(
+            plan_quality=floor,
+            per_criterion={},
+            reasoning=(
+                'plan carries no steps — not a judgeable artifact; scored on '
+                f'the deterministic structural floor ({floor})'
+            ),
+        )
+
     task_name = task.get('name', task.get('id', 'unknown'))
     task_desc = task.get('task_definition', {}).get('description', '')
 
@@ -466,12 +638,71 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
         output_schema=PLAN_QUALITY_SCHEMA,
     )
 
+    # Was the JUDGE ITSELF refused at the transport layer? Checked BEFORE the
+    # parse block, because a 429 body is not JSON and would otherwise land in
+    # the parse-failure fallback — making an infra refusal indistinguishable
+    # from a judge that answered badly. Local import: keeps judge.py's
+    # module-level import surface unchanged (and there is no cycle either way —
+    # metrics.py does not import judge).
+    from .metrics import detect_invocation_error
+
+    invocation_error = detect_invocation_error(result)
+    if invocation_error:
+        logger.warning(
+            f'Plan judge invocation REFUSED at the transport layer: '
+            f'{invocation_error}'
+        )
+        return PlanQualityVerdict(
+            plan_quality=None,
+            per_criterion={},
+            reasoning=f'plan judge invocation refused: {invocation_error}',
+            invocation_error=invocation_error,
+        )
+
     # Parse verdict — structured_output first, else json.loads(output); a
     # missing/None/non-numeric plan_quality degrades to the None sentinel.
     try:
         verdict = result.structured_output or json.loads(result.output)
         raw_quality = verdict['plan_quality']
-        plan_quality = float(raw_quality) if raw_quality is not None else None
+        if raw_quality is None:
+            plan_quality = None
+        else:
+            raw_quality = float(raw_quality)
+            # NaN is unorderable, so clamp_unit_score cannot enforce [0, 1] on
+            # it (see that function's docstring for the mechanics) — checked
+            # BEFORE the clamp, not after. +/-Infinity IS orderable and falls
+            # through to the clamp + out-of-range warning below instead: a
+            # judge answering infinity clearly means "as high/low as it
+            # goes", the same intent-preserving reasoning that governs any
+            # other out-of-range-but-orderable answer.
+            if math.isnan(raw_quality):
+                logger.warning(
+                    f'Plan judge for {cell} answered a non-finite '
+                    f'plan_quality (NaN) — not a real judgement, degraded to '
+                    f'the None sentinel (run_architect_eval falls back to '
+                    f'the deterministic structural floor).'
+                )
+                return PlanQualityVerdict(
+                    plan_quality=None,
+                    per_criterion={},
+                    reasoning=(
+                        f'Plan judge answered a non-finite plan_quality '
+                        f'(NaN) for {cell}'
+                    ),
+                )
+            plan_quality = clamp_unit_score(raw_quality)
+            # See clamp_unit_score's docstring for why the schema bound alone
+            # (structured_output-only) does not stop an out-of-range answer
+            # reaching here. LOUD, not silent: the value is still corrected,
+            # but an operator must be able to see that the judge answered
+            # OUTSIDE its declared contract, not just read the
+            # silently-corrected output.
+            if raw_quality < 0.0 or raw_quality > 1.0:
+                logger.warning(
+                    f'Plan judge for {cell} answered OUTSIDE its declared '
+                    f'[0, 1] contract (raw plan_quality={raw_quality!r}) — '
+                    f'clamped to {plan_quality!r}.'
+                )
     except (json.JSONDecodeError, TypeError, KeyError, ValueError):
         logger.warning(
             f'Plan judge produced unparseable output: {str(result.output)[:200]}'

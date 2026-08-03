@@ -592,6 +592,15 @@ git:
   # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
   iact_prefix: "_iact-"
 
+# Deep merge-ahead chains (task 3183).  chain_cap is the single gate for the
+# whole feature: the maximum number of queued items one verify may cover as a
+# chain.  0 (shipped default) is the KILL SWITCH — byte-identical to pre-PRD
+# merge behaviour.  Green-tier hot-reloadable, so enable/retune/kill never needs
+# a restart; set it with scripts/merge-deep-set-cap.sh.  Dispatch contract and
+# cap-staging plan: plans/deep-merge-ahead-prd.md.
+merge_deep:
+  chain_cap: 0
+
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is
 # confirmed on the target project's main (mirrors git.offline_lane_infra_enabled).
@@ -601,6 +610,19 @@ chronic_flake:
   window: 20
   rate_limit_days: 7
   ledger_relpath: "data/verify-logs/flaky-ledger.jsonl"
+
+# Zero-progress requeue backstop (task 3068, origin incident reify
+# esc-5556-1).  Files a blocking L1 when one task requeues `threshold` times
+# CONSECUTIVELY without invoking a single agent AND that streak spans at least
+# `min_span_seconds` — a class the per-task requeue cap cannot see by design.
+# See orchestrator/src/orchestrator/zero_progress_requeue.py (module docstring)
+# for the full causal chain and why both halves of the predicate are needed.
+# Shipped ENABLED (unlike chronic_flake): it reads only TaskReport fields that
+# already exist, so no substrate gating is needed.
+zero_progress_requeue:
+  enabled: true
+  threshold: 5
+  min_span_seconds: 900.0
 
 # Autonomous dry-run unblock hook
 unblock_auto:

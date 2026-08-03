@@ -12,7 +12,7 @@ presence in stored text is positive evidence of that harness defect. See
 leak looks like and this script's sole leak oracle.
 
 The defect has two manifestations. Sibling-argument loss is silent and is now
-refused at the write boundary by ``middleware/toolcall_xml_guard``. Content
+refused at the write boundary by ``fused_memory.server.markup_tripwire``. Content
 self-duplication is the visible one, and it is already in the corpus: records
 9f2d2ae6 and c759c53b are the recorded specimens. This script is how that
 backlog gets found and fixed.

@@ -127,36 +127,52 @@ failure class this whole task exists to kill.
 | Change | What it does |
 |---|---|
 | `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens. |
-| `fused_memory/middleware/toolcall_xml_guard.py` | Live rejection at the MCP write boundary. |
+| `fused_memory/server/markup_tripwire.py` (task 3141 — NOT this task) | Live rejection at the MCP write boundary. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
 | `Mem0Backend.scan_payload_text` → `MemoryService.scan_memory_content` → `scan_memory_content` MCP tool | The missing read capability (§3). |
 | `fused-memory/scripts/sweep_toolcall_xml_leak.py` | The corpus sweep (§5). |
 | `GraphitiBackend.redact_episode_content` + MCP tool | The residual-episode path (§6). |
 
-### The boundary rejection
+### The boundary rejection — owned by task 3141, not by this task
 
-`submit_task`, `update_task`, `add_memory`, and `add_episode` now **reject** a
-call whose text carries a leaked fragment, returning
-`error_type = 'ToolCallXmlLeakError'` before anything is persisted.
+`submit_task`, `update_task`, `add_memory`, and `add_episode` **reject** a call
+whose text carries a leaked fragment, returning
+`error_type = 'McpEnvelopeMarkupWriteRejected'` before anything is persisted.
+Opt-out: `metadata={'allow_mcp_markup': True}` — load-bearing rather than
+theoretical, since this task's own description quotes every sentinel verbatim
+and this document could not otherwise be filed as a task.
 
-Three properties are deliberate:
+That guard is `fused_memory/server/markup_tripwire.py`, delivered by task 3141.
+**This task deliberately ships no write-boundary guard of its own.** An earlier
+revision of this branch did, and it had to be withdrawn: it would have been a
+second enumeration of the envelope literals at the same four call sites, which
+directly contradicts the invariant 3141 states in `markup_tripwire.py` and in
+the `add_memory` docstring — that module is *"deliberately the only place in the
+package that enumerates the literals."* Two rival guards at one boundary is
+precisely the drift this task exists to close, not to reproduce.
 
-- **It rejects rather than sanitizes.** Silently stripping the fragment would
-  be a *second* silent mutation of user content layered on the first.
-- **The message names the sibling-argument risk.** It states explicitly that a
-  sentinel in `description` means parameters such as `priority` may have been
-  silently dropped. That sentence is the whole payoff of the root cause: it
-  converts the invisible vector-1 failure into a visible one at the moment it
-  happens.
-- **It runs before routing derivation.** `inject_execution_class` and
-  `inject_operational_routing` derive routing *from the text fields*. Rejecting
-  after them would coerce routing from a description the harness had already
-  truncated — a second wrong value stacked on the first.
+The division of labour that survives is real and worth stating, because the two
+detectors are calibrated in **opposite** directions on purpose:
 
-Opt-out: `metadata={'allow_toolcall_xml': True}`, mirroring the established
-`allow_near_duplicate` convention. This is load-bearing rather than
-theoretical — task 3083's own description quotes every sentinel verbatim and
-would otherwise have been unfileable, and this document could not be filed as
-a task either.
+| | `markup_tripwire` (3141) | `utils/toolcall_xml_leak` (this task) |
+|---|---|---|
+| Runs at | write time, before persistence | over already-stored content |
+| Method | bare substring scan | precise regex, requires real whitespace |
+| Calibration | over-reports to maximise recall | under-reports to avoid false positives |
+| Cost of a false positive | a retry | an unnecessary rewrite of stored memory |
+
+Neither is redundant, and they must not be collapsed. A write-time false
+positive costs the caller one retry; a sweep-time false positive silently
+rewrites content a user wrote. That asymmetry is the whole justification for
+maintaining two detectors, and it is why the sweep does not simply reuse the
+tripwire's pattern list.
+
+One diagnostic did not survive the withdrawal and is worth recovering later:
+the retired guard's message named the **sibling-argument risk** explicitly —
+that a sentinel in `description` means parameters such as `priority` may have
+been silently dropped. That sentence converts the invisible vector-1 failure
+into a visible one at the moment it happens, and `matched_pattern` plus a
+200-character excerpt does not convey it. Folding it into
+`markup_tripwire.build_markup_block` is a clean, self-contained follow-up.
 
 ---
 

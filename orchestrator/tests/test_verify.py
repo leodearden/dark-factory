@@ -4826,6 +4826,17 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         this test appended a synthetic ``--config <path>`` the real config
         does not have, which ``_scope_command`` harvested as a dangling flag
         with its value dropped — masked by the startswith/contains asserts).
+
+        Task 3061: the trailing ``check_bare_magicmock_config.py`` clause is
+        now PRESERVED unscoped and verbatim — it is a sibling checker
+        asserting a whole-directory invariant, and dropping it made that gate
+        invisible to scoped pre-merge verify. The full-string assert still
+        does its original job: the tail survives as one intact clause, so a
+        flag harvested out of it into ruff's own argv would still fail here.
+        The reprojection assert is now doubly load-bearing — ``_reproject_str``
+        must inject ``--project shared`` into the head DESPITE the appended
+        tail, or the depless-workspace-root breakage this test guards would
+        return by a different route.
         """
         cfg = self._make_config(
             tmp_path,
@@ -4839,9 +4850,11 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         )
         result = _build_fallback_config(['tests/scripts/test_orchestrator_watchdog.py'], cfg)
         assert result is not None
-        assert (
-            result.lint_command
-            == 'uv run --project shared ruff check tests/scripts/test_orchestrator_watchdog.py'
+        assert result.lint_command == (
+            'uv run --project shared ruff check tests/scripts/test_orchestrator_watchdog.py'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py '
+            'shared/tests escalation/tests fused-memory/tests orchestrator/tests '
+            'dashboard/tests'
         )
 
 
@@ -5500,6 +5513,82 @@ class TestRunScopedVerificationForwardsWorktreeToFallback:
             f'Expected _build_fallback_config to be called with worktree={tmp_path!r}; '
             f'got {captured.get("worktree")!r}'
         )
+
+
+class TestRunScopedVerificationOptsFallbackIntoSegmentedTest:
+    """The fallback branch asks `run_verification` to SEGMENT its test chain (task 3338).
+
+    Segmentation is opt-in and default-OFF: making `run_verification` segment
+    any chain it is handed would silently change the global tail, the
+    cargo-scoped path, `merge_queue._run_unscoped_typechecks` and every
+    module_configs run — a wide, unrequested change in a function dozens of
+    tests stub. The reported defect (esc-3062-2) is the FALLBACK path, so only
+    this call site opts in.
+
+    The flag goes on the `run_verification` call, NOT on
+    `_build_fallback_config`'s: the NOTE at that call site records (and
+    `TestRunScopedVerificationForwardsWorktreeToFallback` enforces) that its
+    test double is a fixed `(task_files, config=None, worktree=None)` fake with
+    no `**kwargs` catch-all, so any new keyword there breaks task 2344's test.
+
+    `role='merge'` is deliberately EXCLUDED (amendment). The trade inverts on
+    the merge lane: the per-segment diagnostic exists so a task agent can read
+    its own result rather than prove an unrelated red unrelated, but a merge
+    failure goes to a human who has the whole chain anyway — while the cost
+    (running seven more suites, up to the full budget, with the queue blocked)
+    lands on the path this module already treats as latency-critical.
+    """
+
+    @staticmethod
+    async def _await_kwargs(tmp_path: Path, role) -> dict:
+        (tmp_path / 'shared').mkdir(exist_ok=True)
+        (tmp_path / 'shared' / 'thing.py').write_text('x = 1\n')
+
+        fallback = ModuleConfig(
+            prefix='__fallback__',
+            test_command='cd shared && uv run pytest tests/ && uv run pytest tests/scripts/',
+            lint_command=None,
+            type_check_command=None,
+        )
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        run_verification_double = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify._build_fallback_config', return_value=fallback), \
+             patch('orchestrator.verify.run_verification', new=run_verification_double):
+            await run_scoped_verification(
+                tmp_path,
+                OrchestratorConfig(project_root=tmp_path),
+                [],
+                task_files=['shared/thing.py'],
+                role=role,
+            )
+
+        assert run_verification_double.await_count == 1
+        await_args = run_verification_double.await_args
+        assert await_args is not None, 'run_verification was not awaited'
+        # `.kwargs` is a Mapping; copy so the annotation is an honest dict.
+        return dict(await_args.kwargs)
+
+    @pytest.mark.asyncio
+    async def test_fallback_branch_passes_segment_chained_test_true(self, tmp_path: Path) -> None:
+        assert (await self._await_kwargs(tmp_path, 'task')).get('segment_chained_test') is True
+
+    @pytest.mark.asyncio
+    async def test_merge_role_fallback_keeps_the_fail_fast_chain(self, tmp_path: Path) -> None:
+        """A red merge verify must still stop at the first subproject.
+
+        Not a style preference: without the gate, a merge verify whose first
+        subproject goes red runs the remaining seven suites before reporting,
+        holding the merge queue for up to the full resolved budget (3600s warm /
+        5400s cold) on every red attempt — and budget exhaustion is strictly
+        MORE likely once every segment always runs.
+        """
+        kwargs = await self._await_kwargs(tmp_path, 'merge')
+        assert kwargs.get('segment_chained_test') is False
+        # The gate must key on `role`, not on some other merge-ish signal that
+        # a caller could set independently.
+        assert kwargs.get('role') == 'merge'
 
 
 class TestBuildFallbackConfigDataModule:
@@ -8902,3 +8991,105 @@ class TestTrivialPassEscalatedEventContract:
             )
         assert rec.events_of(EventType.trivial_pass_escalated) == []
         assert result.trivial is True
+
+
+class TestWithJunitxmlStr:
+    """_with_junitxml_str(cmd, junit_path) — the string wrapper around
+    parse_config_command -> with_junitxml -> render, joining verify.py's
+    established `*_str` family (_serial_pytest_str, _with_pytest_timeout_str,
+    _govern_cpu_str, _reproject_str, _cargo_scope_str).
+
+    Task 3218 part 1b. The logic previously lived inline in a closure inside
+    ``run_verification``, which made it untestable in isolation and left the
+    capability loss it can cause — a merge run that was supposed to collect
+    junit silently not collecting it — with nowhere to be reported from.
+    Extracting it gives that INFO a home at the point of ACTUAL loss, which
+    covers every cause of the no-op (raw-retained chain, OPAQUE, non-pytest),
+    not just tail preservation.
+    """
+
+    _JUNIT = '/abs/j.xml'
+
+    def test_injects_into_a_structured_pytest_command(self):
+        from orchestrator.verify import _with_junitxml_str
+
+        result = _with_junitxml_str('uv run pytest tests/', self._JUNIT)
+        assert result is not None
+        assert f'--junitxml {self._JUNIT}' in result
+
+    def test_none_input_returns_none(self):
+        from orchestrator.verify import _with_junitxml_str
+
+        assert _with_junitxml_str(None, self._JUNIT) is None
+
+    @pytest.mark.parametrize(
+        'cmd',
+        [
+            'ruff check src/',
+            'true',
+            'uv run --directory orchestrator ruff check src/',
+        ],
+        ids=['non-pytest-ruff', 'opaque-true', 'non-round-tripping-directory'],
+    )
+    def test_noop_is_byte_identical(self, cmd: str):
+        """The parse->render round-trip must be SKIPPED, not merely produce
+        an equal string: a from-scratch render is only argv-equivalent, so
+        the identity-check guard is what keeps a no-op byte-identical.
+
+        Asserted with ``is``, not ``==``. Equality cannot pin this: the first
+        two inputs happen to round-trip byte-identically, so an ``==`` version
+        of this test still passes with the ``rewritten is parsed`` guard
+        DELETED and the function always re-rendering. Identity is the only
+        assertion that distinguishes "returned the caller's own string" from
+        "rebuilt an equal one".
+
+        The third input is the case where the two come apart even under
+        ``==``: ``render`` re-emits a uv ``--directory X`` as a leading ``cd X
+        &&``, so a re-render would return ``'cd orchestrator && uv run ruff
+        check src/'`` — a different string for the same argv.
+        """
+        from orchestrator.verify import _with_junitxml_str
+
+        assert _with_junitxml_str(cmd, self._JUNIT) is cmd
+
+    def test_suppressed_injection_on_a_pytest_chain_is_logged(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """The capability loss must be VISIBLE, not silent.
+
+        A raw-retained pytest chain parses as ToolKind.PYTEST but
+        ``with_junitxml`` is a documented no-op on it — so this run was
+        expected to produce a junit report and will not. Exactly one INFO
+        record, naming the junit path and saying no report will be collected.
+        """
+        from orchestrator.verify import _with_junitxml_str
+
+        cmd = 'cd a && uv run pytest tests/ && cd ../b && uv run pytest tests/'
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            result = _with_junitxml_str(cmd, self._JUNIT)
+
+        assert result is cmd, "the no-op must still return the caller's own string"
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1, f'expected exactly one record, got {[r.message for r in records]}'
+        assert records[0].levelno == logging.INFO
+        assert self._JUNIT in records[0].getMessage()
+        assert 'junit' in records[0].getMessage().lower()
+
+    @pytest.mark.parametrize(
+        'cmd',
+        ['uv run pytest tests/', 'ruff check src/', 'true'],
+        ids=['successful-injection', 'non-pytest-ruff', 'opaque-true'],
+    )
+    def test_silent_on_the_ordinary_paths(
+        self, cmd: str, caplog: pytest.LogCaptureFixture,
+    ):
+        """No record for a successful injection, and none for a command that
+        was never eligible to produce junit in the first place — otherwise
+        the log fires on every lint/type leg and trains operators to ignore it.
+        """
+        from orchestrator.verify import _with_junitxml_str
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            _with_junitxml_str(cmd, self._JUNIT)
+
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []

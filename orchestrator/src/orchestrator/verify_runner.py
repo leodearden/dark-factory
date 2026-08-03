@@ -1779,10 +1779,13 @@ def retry_scope_event_fields(verify_env: Mapping[str, str]) -> dict[str, Any]:
     if verify_env.get('REIFY_VERIFY_RETRY_SCOPE') != 'failed_only':
         return {'retry_scope': None, 'retry_subset_sizes': None}
     # Narrowed failed-only retry — per-suite subset sizes.  run_all/gui come
-    # from the comma-delimited env values (count NON-EMPTY tokens to dodge the
-    # ''.split(',') == [''] pitfall so an empty subset counts 0).
-    run_all = len([t for t in verify_env.get('REIFY_RUN_ALL_MEMBER_SUBSET', '').split(',') if t])
-    gui = len([t for t in verify_env.get('REIFY_GUI_RETRY_SPECS', '').split(',') if t])
+    # from the SPACE-delimited env values.  `merge_queue._build_retry_verify_env`
+    # is the SINGLE SOURCE OF TRUTH for that format (reify word-splits both, and
+    # the gui shell-safety allowlist excludes ','); counting the same way here is
+    # what keeps producer and reader from drifting apart again.  Argless
+    # `str.split()` already drops empties, so '' counts 0 with no extra filter.
+    run_all = len(verify_env.get('REIFY_RUN_ALL_MEMBER_SUBSET', '').split())
+    gui = len(verify_env.get('REIFY_GUI_RETRY_SPECS', '').split())
 
     def _nextest_subset_size(path_str: str | None) -> int | None:
         """Line-count a nextest filter file, or None on any read failure.
