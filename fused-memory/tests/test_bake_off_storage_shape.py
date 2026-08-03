@@ -4416,19 +4416,48 @@ class TestCommittedReportMarkdown:
             )
         assert checked, 'no arm fired the pin, so this test asserted nothing'
 
-    def test_the_prose_bullet_agrees_with_the_table_cell(self):
-        """The per-shape bullet restates the rate in words.  It went through
-        the same formatter, so it could contradict the column it summarizes."""
+    def test_the_prose_bullet_restates_the_same_rate_as_the_table_cell(self):
+        """The bullet and the table cell are INDEPENDENT lookups.
+
+        ``render_markdown`` reads ``arms[f'{shape}+pin']`` for the bullet
+        (bake_off_storage_shape.py:2039) but formats the row from whichever
+        arm the table loop is on (:2013).  Cross-wiring the bullet to the
+        pin-OFF arm would make the artifact's prose contradict the column it
+        summarizes, and byte-identity with the committed JSON could not
+        notice: both sides render through the same function, so the wrong
+        value would be written to the committed markdown too.
+
+        Compared as extracted VALUES rather than as a sentence, so rewording
+        the bullet is free — only the number has to agree.
+        """
         mod = _mod()
-        report = _committed_report()
         rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        pin_column = mod.DECISION_TABLE_COLUMNS.index('pin changed window')
+
+        by_arm = {}
+        for row in _decision_table_rows(rendered):
+            cells = [cell.strip() for cell in row.strip('|').split('|')]
+            by_arm[cells[0]] = cells[pin_column]
 
         for shape in mod.ARM_SHAPES:
-            rate = report['arms'][f'{shape}+pin']['pin']['window_changed_rate']
-            assert (
-                f'- **`{shape}`** — the pin changed {mod._pin_cell(rate)} of '
-                f'the measured windows;'
-            ) in rendered
+            bullets = [
+                line for line in rendered.splitlines()
+                if line.startswith('- ') and f'`{shape}`' in line
+                and 'pin' in line
+            ]
+            # Exactly one, so a reworded bullet fails loudly here rather than
+            # silently reducing the check below to a no-op.
+            assert len(bullets) == 1, f'{shape}: {len(bullets)} pin bullets'
+
+            cell = by_arm[f'{shape}+pin']
+            assert cell != mod._NO_MEASUREMENT, (
+                f'{shape}+pin rendered as unmeasured, so this assertion '
+                f'cannot tell the two arms apart'
+            )
+            assert cell in bullets[0].split(), (
+                f'{shape}: table says {cell!r} for {shape}+pin, but the '
+                f'prose bullet does not restate it: {bullets[0]!r}'
+            )
 
     def test_it_renders_byte_identically_from_the_committed_json(self):
         """The markdown is a pure function of the JSON, so the two cannot have
