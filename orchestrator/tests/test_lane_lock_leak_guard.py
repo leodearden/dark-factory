@@ -296,7 +296,7 @@ def wait_for_lane_lock_holder(
     assertion (e.g. ``assert pid in holders``) reports the real list the
     kernel returned.  On timeout, returns the LAST snapshot read instead of
     raising — mirroring :func:`wait_until`'s deliberate return-don't-raise
-    contract (:222-241) — so the caller's assertion still carries the genuine
+    contract — so the caller's assertion still carries the genuine
     kernel-observed evidence rather than a helper-internal traceback.
 
     *read_holders* defaults to ``None`` and is resolved to the module-global
@@ -304,7 +304,8 @@ def wait_for_lane_lock_holder(
     function body, not a def-time default), so a ``monkeypatch.setattr`` on
     this module's ``lane_lock_holder_pids`` attribute is honoured — the same
     module-attribute stubbing seam this suite already uses on
-    ``git_ops_mod.acquire_merge_verify_flock`` (e.g. :834-848).
+    ``git_ops_mod.acquire_merge_verify_flock`` inside
+    ``TestCancelledAcquireNeverOrphansTheLaneLock._stub_acquire``.
     """
     reader = read_holders if read_holders is not None else lane_lock_holder_pids
     deadline = time.monotonic() + timeout
@@ -339,11 +340,11 @@ def lane_is_free(lock_path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# `wait_for_lane_lock_holder` — the bounded-poll idiom already used above
-# (:147-161, :167-174), factored out and given a name so the fixture's own
-# attribution gate (step-4) and the flaky test's staging read (step-7) can
-# share ONE settle bound instead of each hand-rolling — or, as the flaky
-# assertion did, omitting — one.
+# `wait_for_lane_lock_holder` — the bounded-poll idiom already used above, in
+# the startup and teardown polls of `foreign_lane_lock_holder`, factored out
+# and given a name so the fixture's own attribution gate (step-4) and the
+# flaky test's staging read (step-7) can share ONE settle bound instead of
+# each hand-rolling — or, as the flaky assertion did, omitting — one.
 #
 # Pinned here in isolation against an INJECTED fake reader, so these cases are
 # deterministic and touch no real lock; the real-lock fixture behaviour is
