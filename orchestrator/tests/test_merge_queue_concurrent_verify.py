@@ -184,6 +184,16 @@ async def _await_outcome(
 HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
 
 
+# task 3492: two classes are deliberately left WITHOUT a HEAVY_BARRIER_TEST_TIMEOUT
+# mark, so the omission reads as a decision, not an oversight:
+#   - TestRunInflightVerifyAbortPoll: four test_* methods at 45s each -- 45s
+#     worst-METHOD, under the 60s pyproject ceiling. A class-wide SUM would
+#     wrongly flag this class at 180s; per-method max is the correct unit
+#     because pytest-timeout applies the mark to each method independently.
+#   - TestAwaitOutcomeHelper: 45s nominal (_await_outcome's default), but the
+#     future under test is pre-resolved, so real elapsed time is ~0.
+
+
 # task 3492: known-name table for _worst_per_method_wait_budget below. These
 # are this module's own numeric constants -- referenced directly (not
 # re-derived) so the audit helper can never drift from the values the marks
@@ -1921,6 +1931,7 @@ class TestFinalizeInflightNonPass:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 60s worst case (30+30) -- exactly AT the 60s pyproject ceiling with zero headroom, plus unbounded worker.stop()/worker_task teardown
 class TestSingleHostSerialByteIdentical:
     """SINGLE-HOST serial byte-identical via the restructured _verifier_loop.
 
@@ -2077,6 +2088,7 @@ class TestSingleHostSerialByteIdentical:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 135s worst case
 class TestOverlapSignal:
     """Two-host overlap: both verifies enter before either is released.
 
@@ -2354,6 +2366,7 @@ class TestLastItemOfBurstFinalizes:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 200s worst case (task 2350 widened this region to 45.0)
 class TestChainInvalidationUnderOverlap:
     """N's verify fails while N+1 is in-flight: N+1 aborted, re-merged, re-verifies done.
 
@@ -2740,6 +2753,7 @@ class TestChainInvalidationUnderOverlap:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 65s worst case
 class TestHaltAndUnavailable:
     """step-21 RED tests: halt aborts all in-flight; RUNNER_UNAVAILABLE quarantine.
 
@@ -3687,6 +3701,7 @@ class TestRunnerUnavailableHeadCascade:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 90s worst case
 class TestRunInflightVerifyRemoteCancelOnAbort:
     """_run_inflight_verify abort paths fire remote cancel before cancelling verify.
 
@@ -4217,6 +4232,7 @@ class TestCascadeFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 205s worst case (task 2350 widened this region to 45.0)
 class TestCascadeErrorContainment:
     """Per-entry exception in the head-failure cascade MUST NOT kill _verifier_loop.
 
@@ -4663,6 +4679,7 @@ class _FakeEscalationQueue:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 65s worst case, includes a loop.time() + 15.0 deadline-bounded poll loop (~4670-4672) invisible to the automated scan -- a deliberate over-mark the guard alone would not have demanded
 class TestRedispatchSpeculativeConservation:
     """Signal/e2e regression lock (task 2063): a genuinely speculative item
     parked on ``_redispatch`` must stay counted by
