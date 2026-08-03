@@ -128,7 +128,19 @@ class DashboardConfig:
 
     host: str = '127.0.0.1'
     port: int = 8080
-    project_root: Path = field(default_factory=lambda: Path('/home/leo/src/dark-factory'))
+    # Derived from cwd, never a hardcoded absolute path (task 3503): a literal
+    # silently pointed every un-configured consumer on every other host at one
+    # developer's checkout.
+    #
+    # Production behaviour is UNCHANGED because of a two-sided contract, and the
+    # units are the load-bearing half: both dashboard/dark-factory-dashboard.service
+    # and scripts/dashboard.service.template pin WorkingDirectory to the repo root
+    # and neither sets DASHBOARD_PROJECT_ROOT, so cwd resolves to exactly what the
+    # literal returned.  A future edit that drops or changes WorkingDirectory
+    # therefore silently relocates every derived DB path (burndown, metrics, runs,
+    # escalations, memory-evals) — from_env() logs the cwd-derived root at INFO so
+    # that relocation is at least visible in the journal.
+    project_root: Path = field(default_factory=Path.cwd)
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
     known_project_roots: list[Path] = field(default_factory=list)
     escalation_urls: dict[str, str] = field(default_factory=dict)
