@@ -3072,8 +3072,17 @@ class Harness:
           - 'stale'         — (now - started_at) >= freshness_window_secs, OR
                               started_at is missing/unparseable (fail-safe).
           - 'capped'        — resume_count >= max_resumes_per_task (B7).
+          - 'reseeded'      — the stashed config dir is gone on disk: warm-lane
+                              acquire ALWAYS re-seeds from base
+                              (docs/prds/warm-lane-pool-cow-seeding.md §9.3/
+                              §9.5), which wipes <lane>/.task/ and the whole
+                              transcript store with it. An EXPECTED fallback,
+                              not a corroboration failure (task 3256) — it
+                              does not feed the fallback-storm streak.
           - 'no_transcript' — no stashed config_dir, no session_id, or the
-                              transcript is absent on disk (B4 reseed/wipe).
+                              config dir survives but this session's
+                              transcript is absent — a genuine corroboration
+                              failure.
           - 'eligible'      — all corroboration passed; inject the session.
         """
         cfg = self.config.session_resume
@@ -3100,12 +3109,28 @@ class Harness:
         # reseed/wipe of .task between boot and re-dispatch is detected.
         # transcript_exists is itself total (any glob error → False), so no
         # outer try/except is needed here to uphold this method's I3 totality:
-        # a non-empty config_dir str makes Path() safe, and a missing/absent
-        # transcript degrades to the 'no_transcript' fallback below.
+        # a non-empty config_dir str makes Path() safe, and any absent
+        # transcript degrades to one of the two ineligible reasons below.
+        #
+        # A failed corroboration is then split (task 3256) on whether the
+        # config dir that HELD the transcript still exists: its absence is
+        # positive evidence that the whole store was wiped by an acquire
+        # reseed ('reseeded', expected), while a surviving dir missing only
+        # this session's transcript is a genuine failure ('no_transcript').
+        # A never-stashed config_dir / session_id stays 'no_transcript': a
+        # reseed clears the out-of-lane meta root together with the lane
+        # (PRD I2), so it destroys the sidecar WITH the transcript and yields
+        # no adoption at all — an adopted session with no config dir is
+        # pathological and must stay loud.
         session_id = session.get('session_id')
         if not config_dir or not session_id:
             return (False, 'no_transcript')
         if not transcript_exists(Path(config_dir), session_id):
+            # Path.exists() is total (it swallows OSError and returns False),
+            # so nothing can escape this method; an unreadable path therefore
+            # fails toward 'reseeded'.
+            if not Path(config_dir).exists():
+                return (False, 'reseeded')
             return (False, 'no_transcript')
         return (True, 'eligible')
 
