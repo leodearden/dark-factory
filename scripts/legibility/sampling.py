@@ -51,14 +51,14 @@ from legibility import digest  # noqa: E402
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 from legibility.inventory import (  # noqa: E402
     SessionRecord,
-    _iter_json_lines,
     enumerate_sessions,
+    iter_json_lines,
     resolve_agent_transcript_roots,
 )
 
 logger = logging.getLogger('legibility.sampling')
 
-# _iter_json_lines lives in legibility.inventory — this module reuses that
+# iter_json_lines lives in legibility.inventory — this module reuses that
 # single fire-and-forget-transcript-read implementation rather than keeping
 # its own byte-for-byte copy (a future fix to the graceful-degrade contract
 # then only needs to land in one place).
@@ -228,7 +228,7 @@ def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any]
     locate its first non-sidechain, non-meta user turn
     (reviewer_comprehensive/performance, task 2573 amendment pass #2).
     This helper folds both searches into the SAME iteration over
-    :func:`legibility.inventory._iter_json_lines`, so a session transcript
+    :func:`legibility.inventory.iter_json_lines`, so a session transcript
     is read once instead of twice. :func:`score_signals` and
     :func:`_find_first_user_turn` both delegate to this function, so every
     other caller (including the direct unit tests of :func:`score_signals`)
@@ -237,7 +237,7 @@ def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any]
     tool_error = not_found = self_correct = df_guard = interrupt = 0
     first_turn: dict[str, Any] | None = None
     try:
-        for record in _iter_json_lines(path):
+        for record in iter_json_lines(path):
             if _has_tool_error(record):
                 tool_error += 1
 
