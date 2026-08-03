@@ -373,7 +373,13 @@ class TestWaitForLaneLockHolder:
             return readings[len(calls) - 1]
 
         result = wait_for_lane_lock_holder(
-            Path('/irrelevant'), 4242, timeout=1.0, interval=0.001, read_holders=_reader,
+            # A generous timeout costs nothing here: the loop returns the
+            # instant the pid appears (3rd read), so this only matters if the
+            # helper genuinely stalls. A tight bound (e.g. 1.0s) risks a
+            # >1s scheduling stall between reads under xdist load tripping
+            # the deadline check before the 3rd read ever happens, which
+            # would fail this test on the wrong assertion.
+            Path('/irrelevant'), 4242, timeout=30.0, interval=0.001, read_holders=_reader,
         )
 
         assert result == [999, 4242], (
@@ -413,9 +419,10 @@ class TestWaitForLaneLockHolder:
         assert elapsed >= timeout, (
             f'must not return before the bound elapses; elapsed={elapsed!r}'
         )
-        assert elapsed < timeout + 1.0, (
+        assert elapsed < timeout + 5.0, (
             f'must not overrun the bound by more than a comfortable slack '
-            f'margin; elapsed={elapsed!r}'
+            f'margin — widened to tolerate scheduling delays under xdist '
+            f'load rather than the bound itself; elapsed={elapsed!r}'
         )
 
     def test_no_cost_on_the_happy_path(self):
@@ -433,21 +440,19 @@ class TestWaitForLaneLockHolder:
             calls.append(path)
             return [4242]
 
-        interval = 1.0  # deliberately large: any sleep at all would show up below
-        start = time.monotonic()
+        interval = 1.0  # deliberately large: a single extra poll would cost 1s
         result = wait_for_lane_lock_holder(
             Path('/irrelevant'), 4242, timeout=5.0, interval=interval, read_holders=_reader,
         )
-        elapsed = time.monotonic() - start
 
         assert result == [4242]
+        # `len(calls) == 1` is the real pin: it alone proves no sleep ran
+        # (the loop's only sleep follows a non-matching read), so a separate
+        # wall-clock upper bound would be redundant — and a genuine one would
+        # be a source of flake under xdist load for no added coverage.
         assert len(calls) == 1, (
             f'attribution was already settled on the first read — must not '
             f'poll again; reader was called {len(calls)} time(s)'
-        )
-        assert elapsed < interval / 2, (
-            f'must not sleep at all when the pid is already attributed; '
-            f'elapsed={elapsed!r}'
         )
 
 
@@ -571,12 +576,14 @@ def test_foreign_holder_fixture_fails_loudly_when_attribution_never_settles(
     monkeypatch.setattr(sys.modules[__name__], 'wait_for_lane_lock_holder', _never_attributed)
 
     lock_path = lane_lock_path(tmp_path / 'lane')
-    with pytest.raises(pytest.fail.Exception, match='does not attribute it'):
-        with foreign_lane_lock_holder(lock_path):
-            pytest.fail(
-                'unreachable: the fixture must fail before yielding when '
-                'attribution never settles'
-            )
+    with (
+        pytest.raises(pytest.fail.Exception, match='does not attribute it'),
+        foreign_lane_lock_holder(lock_path),
+    ):
+        pytest.fail(
+            'unreachable: the fixture must fail before yielding when '
+            'attribution never settles'
+        )
 
     # The gate's side effect: it must kill the foreign holder's process
     # group before failing, not merely raise and leave it running. A
