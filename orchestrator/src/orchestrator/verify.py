@@ -7433,6 +7433,96 @@ async def confirm_merge_verify_flake_suppressible(
         return None
 
 
+# ---------------------------------------------------------------------------
+# Main-probe isolated-flake confirm gate (task 3597)
+# ---------------------------------------------------------------------------
+
+#: Generous per-test timeout (seconds) injected into the main-probe confirm
+#: gate's isolated re-run command via ``_with_pytest_timeout_str``. A
+#: SEPARATE constant from ``_SWEEP_CONFIRM_TIMEOUT_SECS`` /
+#: ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` so the three are retuned on their own
+#: signals. Same rationale as both: ``-o addopts=`` clears pyproject
+#: ``addopts`` but NOT the ``[tool.pytest.ini_options] timeout=60`` default,
+#: so without this explicit override a still-loaded host can starve the
+#: isolated confirm run into a false "still fails" verdict — and here that
+#: false verdict would mean a false red-main verdict (BLOCKED awaiting a
+#: hotfix for a main that is actually green) survives untouched.
+_MAIN_PROBE_CONFIRM_TIMEOUT_SECS: int = 300
+
+
+async def _main_probe_failure_is_isolated_flake(
+    probe_worktree: Path,
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    main_result: VerifyResult,
+) -> list[str] | None:
+    """CONFIRM GATE: did *main_result*'s named failures pass on isolated re-run?
+
+    Called by ``verify_failure_is_preexisting_on_main`` immediately before it
+    would return ``(True, main_sha)`` — i.e. after the main probe's
+    (category, normalised cause_hint) signature has already matched the
+    branch's. A CPU-starvation load flake can starve the SAME
+    timing-sensitive test on both the task branch and the main probe,
+    matching signatures on a main that is actually green (ground truth:
+    esc-3514-2 / task 3514 — 12 named failures on an aborted xdist run, all
+    passing in isolation, main was not broken). This gate re-runs JUST the
+    node-ids named in *main_result*'s own failing output — scoped,
+    forced-serial (``-p no:xdist -o addopts=``), generous-timeout — inside
+    the ALREADY-OPEN *probe_worktree* pinned at main (SAME-TREE, no second
+    ``git worktree add``; the caller owns the worktree's lifecycle).
+
+    Returns:
+        ``list[str]`` — every named failing test on THIS main tip
+        demonstrably PASSED on isolated re-run. The caller MAY downgrade its
+        verdict to ``(False, '')``, which is ``verify_failure_is_preexisting_on_main``'s
+        own documented fail-safe return.
+
+        ``None`` — every other (fail-safe) path; the caller keeps today's
+        ``(True, main_sha)`` verdict unchanged. Covers: no recoverable
+        node-id in ``main_result.test_output`` (an opaque/lint/type
+        failure); a node-id that maps to no discovered subproject (or
+        *module_configs* is empty); an isolated re-run that still fails,
+        times out, or hits an infra-sentinel category
+        (``INFRA_TRANSIENT_CATEGORIES`` — never trusted as confirmation)
+        after ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` attempts; and any unexpected
+        exception (never raises).
+
+    ONE-WAY RATCHET: this gate can only downgrade a verdict that an isolated
+    re-run has POSITIVELY shown green. Every degraded path preserves today's
+    verdict, so nothing about a genuinely red main changes.
+
+    Node-id -> subproject mapping delegates to
+    ``_group_node_ids_by_subproject`` over ``{mc.prefix: mc for mc in
+    module_configs}`` — the FOURTH call site (after
+    ``confirm_main_tip_failure_is_real``,
+    ``_sweep_failure_reproduces_in_isolation``, and
+    ``confirm_merge_verify_flake_suppressible``). The isolated re-run engine
+    is ``_run_isolated_confirm_group`` (the bounded
+    ``_SWEEP_CONFIRM_MAX_ATTEMPTS``-attempt loop, ``role='task'`` by
+    default via ``run_verification``'s own default), unchanged.
+    """
+    node_ids = _extract_failing_test_ids(main_result.test_output)
+    mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
+    groups = _group_node_ids_by_subproject(
+        probe_worktree, mc_by_prefix, node_ids,
+        log_label='verify_failure_is_preexisting_on_main confirm gate',
+    )
+    for prefix, group_node_ids in groups.items():
+        mc = mc_by_prefix[prefix]
+        scoped_cmd = _with_pytest_timeout_str(
+            _serial_pytest_str(
+                _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+            ),
+            _MAIN_PROBE_CONFIRM_TIMEOUT_SECS,
+        )
+        scoped_mc = replace(
+            mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+        )
+        if not await _run_isolated_confirm_group(probe_worktree, config, scoped_mc):
+            return None
+    return node_ids
+
+
 def _merge_flake_suppressed_pass(
     failing_result: VerifyResult, node_ids: list[str],
 ) -> VerifyResult:
