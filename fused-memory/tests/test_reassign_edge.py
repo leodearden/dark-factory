@@ -17,14 +17,18 @@ Covers (layered like test_merge_entities.py):
 from __future__ import annotations
 
 import contextlib
-import os
-import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import extract_cypher, extract_params
-from falkordb import FalkorDB as _SyncFalkorDB
+from _fm_helpers import (
+    FALKOR_HOST,
+    FALKOR_PORT,
+    extract_cypher,
+    extract_params,
+    falkor_skipif,
+    unique_graph_name,
+)
 from falkordb.asyncio import FalkorDB
 from graphiti_core.errors import EdgeNotFoundError
 
@@ -392,28 +396,10 @@ class TestReassignEdgePostMove:
 # sys.modules['conftest'] collision documented in _fm_helpers.py.
 # ---------------------------------------------------------------------------
 
-FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
-FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
-
-
-def _falkor_available() -> bool:
-    """FalkorDB-native reachability probe (mirrors test_merge_entities.py)."""
-    try:
-        client = _SyncFalkorDB(host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2)
-        try:
-            client.select_graph('_probe').query('RETURN 1')
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
-        return True
-    except Exception:
-        return False
-
-
 @pytest_asyncio.fixture
 async def reassign_edge_live_graph():
     """Provision a throwaway, uniquely-named FalkorDB graph, yield it, clean up."""
-    graph_name = f'_test_3009_reassign_edge_{uuid.uuid4().hex[:8]}'
+    graph_name = unique_graph_name('3009_reassign_edge')
     client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
     with contextlib.suppress(Exception):
         stale = client.select_graph(graph_name)
@@ -428,7 +414,7 @@ async def reassign_edge_live_graph():
             await client.aclose()
 
 
-@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@falkor_skipif()
 @pytest.mark.timeout(15)
 @pytest.mark.integration
 class TestReassignEdgeLiveFalkorDB:
