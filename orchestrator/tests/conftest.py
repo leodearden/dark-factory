@@ -6,6 +6,7 @@ without conflicting with sibling subprojects' conftests under
 `sys.modules['conftest']`.
 """
 import itertools
+import json
 import os
 import sys
 from pathlib import Path
@@ -810,6 +811,7 @@ def make_steward(tmp_path: Path):
         task: dict | None = None,
         event_store=None,
         cost_store=None,
+        escalation_queue=None,
     ):
         from orchestrator.steward import TaskSteward
 
@@ -833,7 +835,10 @@ def make_steward(tmp_path: Path):
                     'and let the fixture own the dir.'
                 )
         worktree.mkdir(parents=True, exist_ok=True)
-        (worktree / '.task').mkdir(exist_ok=True)
+        task_dir = worktree / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'metadata.json').write_text(json.dumps({'task_id': task['id']}))
+        (task_dir / 'plan.json').write_text(json.dumps({'steps': []}))
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         project_root = tmp_path / 'project'
@@ -867,15 +872,29 @@ def make_steward(tmp_path: Path):
         for k, v in (config_overrides or {}).items():
             setattr(config, k, v)
 
-        queue = MagicMock()
-        queue.make_id.return_value = 'esc-42-1'
-        queue.get_by_task.return_value = []
-        queue.get.return_value = None
+        if escalation_queue is None:
+            queue = MagicMock()
+            queue.make_id.return_value = 'esc-42-1'
+            queue.get_by_task.return_value = []
+            queue.get.return_value = None
+            # Derived from the (already per-build) fixture-owned worktree rather
+            # than a flat tmp_path literal: steward.py reads queue_dir into the
+            # escalation-watcher argv, so two builds sharing one would be shared
+            # mutable state.  A caller-supplied queue owns its own directory and
+            # is never re-stamped.
+            queue.queue_dir = worktree.parent / f'{worktree.name}-escalations'
+            queue.queue_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            queue = escalation_queue
 
         briefing = AsyncMock()
         briefing.build_steward_initial_prompt = AsyncMock(return_value='initial prompt')
+        briefing.build_steward_continuation_prompt = AsyncMock(
+            return_value='continuation prompt'
+        )
 
         mcp = MagicMock()
+        mcp.url = 'http://localhost:8002'
         mcp.mcp_config_json.return_value = {'mcpServers': {}}
 
         return TaskSteward(
