@@ -43,6 +43,20 @@ roughly half of what ``ruff check scripts/`` covers — re-open the gap without
 anything going red. The two gated directories are separately asserted to be
 PRESENT in the derived set, so a pruning bug cannot shrink coverage silently.
 
+THE DERIVATION ITSELF IS GUARDED, because a sweep is only as good as its
+containment. This file's first draft walked the filesystem and pruned by
+directory NAME, which held in a task worktree and collapsed anywhere else:
+measured with that walk, this worktree yielded 6 probe paths and 0 shadows,
+while the canonical ``project_root`` clone every operator is told to make
+yielded 2356 probe paths and 369 shadows — foreign checkouts
+(``.eval-worktrees`` 218, ``.worktrees-orphaned`` 104, ``.claude`` 41) plus the
+``graphiti`` and ``mem0`` submodules (4 + 2), each carrying its own
+``[tool.ruff]`` and so failing parity against the baseline. Because that
+contamination is invisible from inside a worktree, the containment of
+``_nonmember_probe_paths`` and ``_shadowing_configs`` is pinned against a
+SYNTHETIC repo built per-test rather than against the ambient checkout — an
+ambient bound would have been born green here and proved nothing.
+
 WHAT TEST (b) COMPARES, AND WHY THE ROOT TABLE MAY DECLARE NOTHING ELSE. Only
 ``[tool.ruff].line-length`` and ``[tool.ruff.lint].{select,ignore}`` are held
 equal to every member. Any OTHER key at the root would be an eighth, unenforced
@@ -74,6 +88,7 @@ on merge full-verify.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -269,6 +284,194 @@ def test_nonmember_dirs_resolve_the_member_ruff_rule_set() -> None:
             'orchestrator.yaml, so the gate reports "All checks passed!" while running a '
             'rule set nobody chose.'
         )
+
+
+# --- Synthetic-repo fixture for the containment guard below --------------------
+#
+# One directory per hostile class MEASURED in the canonical project_root clone,
+# so the guard fails for a named reason rather than on a set diff. Built with a
+# real `git init` / `git worktree add` / mode-160000 gitlink rather than mocked,
+# because the property under test is what GIT considers part of this repository —
+# a mock would just restate the derivation's own assumptions back at it.
+
+_FIXTURE_ROOT_PYPROJECT = """[tool.uv.workspace]
+members = ["memberpkg"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "SIM", "I"]
+ignore = ["E501"]
+"""
+
+# A foreign checkout's own table, deliberately DIFFERENT from the fixture root's:
+# if containment regresses, the leaked file resolves this instead and the parity
+# half of this guard would go red too — the graphiti/mem0 shape exactly.
+_FIXTURE_FOREIGN_PYPROJECT = '[tool.ruff]\nline-length = 120\n'
+
+# What the derivation must see: the fixture root (it holds root_mod.py) and the
+# one genuine tracked non-member directory. Everything else is out of repo.
+_FIXTURE_EXPECTED_PROBES = frozenset({PROBE_BASENAME, f'tooling/{PROBE_BASENAME}'})
+
+# Prefixes that must contribute NOTHING, each asserted separately below.
+_FIXTURE_FOREIGN_PREFIXES = ('vendored/', 'nested/', '.eval-worktrees/')
+
+
+def _git(cwd: pathlib.Path, *args: str) -> str:
+    """Run git in *cwd* with a scrubbed environment, FAILING loudly on non-zero.
+
+    ``GIT_*`` is stripped because pytest may run under a hook or wrapper that
+    exports ``GIT_DIR`` / ``GIT_INDEX_FILE``, which would silently redirect these
+    calls at the surrounding dark-factory checkout instead of the fixture.
+    Identity and signing are pinned inline so the fixture does not depend on the
+    ambient user's git config, and commits use ``--no-verify`` so this repo's own
+    hooks never run against a throwaway tree.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    proc = subprocess.run(
+        [
+            'git',
+            '-c', 'user.email=fixture@example.invalid',
+            '-c', 'user.name=ruff config fixture',
+            '-c', 'commit.gpgsign=false',
+            '-c', 'init.defaultBranch=main',
+            *args,
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        f'`git {" ".join(args)}` failed in {cwd} with rc={proc.returncode}.\n'
+        f'stdout: {proc.stdout!r}\nstderr: {proc.stderr!r}\n'
+        'This is a FIXTURE CONSTRUCTION failure, not the contract under test. This guard '
+        'deliberately FAILS rather than skipping when git is unavailable or refuses, for the '
+        'same reason the module docstring gives for ruff: a guard that skips itself away is a '
+        'green check that never ran.'
+    )
+    return proc.stdout
+
+
+def _write(root: pathlib.Path, relative: str, text: str) -> None:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _hostile_fixture_repo(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Build a throwaway repo holding one directory per measured hostile class."""
+    root = tmp_path / 'fixture_repo'
+    root.mkdir()
+    _git(root, 'init', '-q')
+
+    # In-repo content the derivation MUST see.
+    _write(root, 'pyproject.toml', _FIXTURE_ROOT_PYPROJECT)
+    _write(root, '.gitignore', '.eval-worktrees/\n')
+    _write(root, 'root_mod.py', 'x = 1\n')
+    _write(root, 'tooling/tool.py', 'x = 1\n')
+
+    # A workspace member: present and tracked, but SUBTRACTED by _member_roots.
+    _write(root, 'memberpkg/pyproject.toml', _FIXTURE_FOREIGN_PYPROJECT)
+    _write(root, 'memberpkg/mod.py', 'x = 1\n')
+
+    # CLASS 1 — a gitlink SUBMODULE (the graphiti / mem0 shape). Registered at
+    # mode 160000 rather than via `git submodule add`, which needs
+    # protocol.file.allow on current git and would make this fixture
+    # configuration-dependent.
+    _write(root, 'vendored/pyproject.toml', _FIXTURE_FOREIGN_PYPROJECT)
+    _write(root, 'vendored/vend.py', 'x = 1\n')
+    _git(root / 'vendored', 'init', '-q')
+    _git(root / 'vendored', 'add', '-A')
+    _git(root / 'vendored', 'commit', '--no-verify', '-q', '-m', 'vendored')
+    gitlink_sha = _git(root / 'vendored', 'rev-parse', 'HEAD').strip()
+
+    _git(
+        root, 'add', 'pyproject.toml', '.gitignore', 'root_mod.py',
+        'tooling/tool.py', 'memberpkg/pyproject.toml', 'memberpkg/mod.py',
+    )
+    _git(root, 'update-index', '--add', '--cacheinfo', f'160000,{gitlink_sha},vendored')
+    _git(root, 'commit', '--no-verify', '-q', '-m', 'fixture')
+
+    # CLASS 2 — a NESTED CHECKOUT: a real `git worktree add`, which is precisely
+    # what .worktrees/, .claude/worktrees/ and .worktrees-orphaned/ are. It must
+    # be a VALID gitfile: measured, git recurses into a directory whose .git file
+    # DANGLES and lists its contents, so a hand-written stub .git file would make
+    # this fixture assert something git never does in practice.
+    _git(root, 'worktree', 'add', '--detach', '-q', 'nested', 'HEAD')
+
+    # CLASS 3 — a GITIGNORED foreign root, the .eval-worktrees/ shape: the single
+    # largest contributor in the canonical clone (218 shadows) and one no
+    # directory-name prune list in this file ever named.
+    _write(root, '.eval-worktrees/run1/pyproject.toml', _FIXTURE_FOREIGN_PYPROJECT)
+    _write(root, '.eval-worktrees/run1/run.py', 'x = 1\n')
+
+    return root
+
+
+def test_the_derivation_excludes_submodules_and_foreign_checkouts(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The swept set must be GIT's view of this repo, identical in every checkout."""
+    root = _hostile_fixture_repo(tmp_path)
+
+    probe_paths = set(_nonmember_probe_paths(root=root))
+    shadows = set(_shadowing_configs(root=root))
+
+    # Per-class containment FIRST, so a regression names WHICH class leaked
+    # rather than only printing a set diff. Measured against the first-draft
+    # iterdir walk, this fixture leaked all three: 7 probe paths and 4 shadows.
+    derived = probe_paths | shadows
+    for prefix, class_name, evidence in (
+        (
+            'vendored/',
+            'gitlink submodule',
+            'graphiti and mem0 are mode-160000 entries in the canonical clone; their contents '
+            'are not files of this repository and they declare their own [tool.ruff]',
+        ),
+        (
+            'nested/',
+            'nested checkout',
+            '.worktrees/, .claude/worktrees/ and .worktrees-orphaned/ are each a FULL checkout '
+            'of this repo, so descending into one rediscovers every member pyproject.toml under '
+            'a non-member prefix — 104 + 41 shadows measured in the canonical clone',
+        ),
+        (
+            '.eval-worktrees/',
+            'gitignored foreign root',
+            'the largest single contributor measured in the canonical clone (218 shadows, 1330 '
+            'probe paths) and one that no directory-name prune list in this file ever named',
+        ),
+    ):
+        leaked = sorted(path for path in derived if path.startswith(prefix))
+        assert not leaked, (
+            f'The derivation leaked {leaked} from {prefix} — the {class_name} class. {evidence}. '
+            'The swept set must be what `git ls-files --cached --others --exclude-standard` '
+            'reports, which excludes submodule contents, nested checkouts and ignored roots '
+            'for free; a filesystem walk pruned by directory NAME holds inside a task worktree '
+            'and collapses in the canonical clone, where both other tests in this file fail.'
+        )
+
+    assert probe_paths == set(_FIXTURE_EXPECTED_PROBES), (
+        f'_nonmember_probe_paths derived {sorted(probe_paths)} from the synthetic repo, but the '
+        f'only non-member Python this repo actually contains is {sorted(_FIXTURE_EXPECTED_PROBES)} '
+        '(the root, holding root_mod.py, and tooling/). Compared as an EXACT set, not a bound: '
+        'an over-collecting derivation probes foreign checkouts whose own [tool.ruff] differs '
+        'from the baseline, and an under-collecting one silently shrinks this file to nothing. '
+        'If the member subtraction regressed instead, memberpkg/ will be in the diff.'
+    )
+
+    assert not shadows, (
+        f'_shadowing_configs derived {sorted(shadows)} from the synthetic repo, which contains no '
+        'shadowing config at all: the fixture root pyproject.toml IS the table under test, '
+        'memberpkg/pyproject.toml is a workspace member and is subtracted, and every other one '
+        'lives inside the submodule, the nested checkout or the ignored root — none of which is '
+        'a file of this repository. Any entry here means the sweep is reporting foreign configs '
+        'as live shadows, which makes the guard fail in the canonical clone for a reason no '
+        'operator can act on.'
+    )
 
 
 def test_root_ruff_config_matches_every_workspace_member() -> None:
