@@ -24,6 +24,8 @@ from __future__ import annotations
 import itertools
 import json
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 from audit_combine_gate_marker_loss import (
@@ -1207,3 +1209,190 @@ def test_audit_project_mismatch_reaches_the_report_and_the_json(tmp_path, make_t
     assert audit.project_id_mismatch in format_report([audit])
     payload = json.loads(format_json([audit]))
     assert payload["projects"][0]["project_id_mismatch"] == audit.project_id_mismatch
+
+
+# ---------------------------------------------------------------------------
+# main() — CLI contract, exercised by SUBPROCESS.
+#
+# Pure functions get direct pytest coverage above; main() gets subprocess
+# coverage, following the precedent's stated split. Shelling out to the script
+# path is also what proves the flat-sibling `_task_db_scan` import resolves for
+# a DIRECTLY-EXECUTED script (never `python -m`).
+#   exit 0 = no live findings; 1 = a live finding or a project_id mismatch;
+#   2 = no root resolved; 3 = roots resolved but NOTHING was scanned.
+# ---------------------------------------------------------------------------
+
+_SCRIPT = str(Path(__file__).parent.parent / "audit_combine_gate_marker_loss.py")
+
+
+def _run_cli(*args):
+    return subprocess.run(
+        [sys.executable, _SCRIPT, *args], capture_output=True, text=True
+    )
+
+
+def test_main_exit_0_when_every_finding_is_terminal(tmp_path, make_tasks_db):
+    """THE DOCUMENTED STEADY STATE. The ~67 terminal combine targets were
+    deliberately left un-remediated; if they drove the exit code this detector
+    would be permanently red and therefore ignored."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 50, "status": "done", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "dark_factory", "task_id": 50,
+                  "metadata": {"source": "prd", "task_kind": "normal"}}],
+    )
+
+    result = _run_cli("--project-root", str(root), "--project-id", "dark_factory")
+
+    assert result.returncode == 0
+    assert "50" in result.stdout          # still REPORTED in full
+    assert "COVERAGE" in result.stdout
+    assert "FIDELITY" in result.stdout
+
+
+def test_main_exit_1_and_ranks_a_live_delivered_checks_loss_first(
+        tmp_path, make_tasks_db):
+    """The user-observable signal from the task description: a NON-TERMINAL
+    delivered_checks loss exits 1 and is ranked FIRST in stdout."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[
+            {"id": 60, "status": "pending", "metadata": _WIPE_SIGNATURE},
+            {"id": 61, "status": "pending", "metadata": _WIPE_SIGNATURE},
+        ],
+        tickets=[{"project_id": "dark_factory", "task_id": 61,
+                  "metadata": {"source": "prd"}}],
+        manifests=[("plans/s-prd.capability-manifest.yaml", _manifest_doc(60))],
+    )
+
+    result = _run_cli("--project-root", str(root), "--project-id", "dark_factory")
+
+    assert result.returncode == 1
+    first = next(ln for ln in result.stdout.splitlines() if "task_id=" in ln)
+    assert "key=delivered_checks" in first
+    assert f"severity={SEVERITY_GATE_REMOVING}" in first
+
+
+def test_main_exit_2_when_no_project_root_resolves(tmp_path):
+    """Nothing resolvable -> exit 2, empty stdout, reason on stderr."""
+    result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
+
+    assert result.returncode == 2
+    assert result.stdout.strip() == ""
+    assert "no project root" in result.stderr.lower()
+
+
+def test_main_exit_3_when_roots_resolve_but_nothing_is_scanned(tmp_path):
+    """A resolvable-but-unreadable tasks.db is NOT a clean run. Exit 3 keeps it
+    distinct from 0, per docs/legibility/design-invariants.md."""
+    root = tmp_path / "corrupt"
+    (root / ".taskmaster" / "tasks").mkdir(parents=True)
+    (root / ".taskmaster" / "tasks" / "tasks.db").write_text("this is not a database")
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 3
+    assert "not a clean result" in result.stderr.lower()
+
+
+def test_main_exit_1_on_a_project_id_mismatch(tmp_path, make_tasks_db):
+    """A mis-derived project_id must never print a clean-looking wall."""
+    root = _make_project(
+        tmp_path, make_tasks_db, name="wrongly-named",
+        tasks=[{"id": 70, "status": "done", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "reify", "task_id": 70, "metadata": {"source": "prd"}}],
+    )
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 1
+    assert "PROJECT_ID MISMATCH" in result.stdout
+
+
+def test_main_json_flag_carries_coverage(tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 80, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "dark_factory", "task_id": 80,
+                  "metadata": {"source": "prd"}}],
+    )
+
+    result = _run_cli("--project-root", str(root), "--project-id", "dark_factory", "--json")
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    project = payload["projects"][0]
+    assert project["coverage"]["total_combine_targets"] == 1
+    assert project["findings"][0]["task_id"] == 80
+
+
+def test_main_project_root_is_repeatable(tmp_path, make_tasks_db):
+    a = _make_project(tmp_path, make_tasks_db, name="a",
+                      tasks=[{"id": 1, "status": "done", "metadata": _WIPE_SIGNATURE}])
+    b = _make_project(tmp_path, make_tasks_db, name="b",
+                      tasks=[{"id": 2, "status": "done", "metadata": _WIPE_SIGNATURE}])
+
+    result = _run_cli("--project-root", str(a), "--project-root", str(b), "--json")
+
+    payload = json.loads(result.stdout)
+    assert [p["project_root"] for p in payload["projects"]] == [str(a), str(b)]
+
+
+def test_main_project_id_overrides_derivation(tmp_path, make_tasks_db):
+    """--project-id wins over the directory-name derivation."""
+    root = _make_project(
+        tmp_path, make_tasks_db, name="wrongly-named",
+        tasks=[{"id": 90, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "reify", "task_id": 90, "metadata": {"source": "prd"}}],
+    )
+
+    result = _run_cli("--project-root", str(root), "--project-id", "reify", "--json")
+
+    payload = json.loads(result.stdout)
+    assert payload["projects"][0]["project_id"] == "reify"
+    assert payload["projects"][0]["project_id_mismatch"] is None
+    assert payload["projects"][0]["findings"][0]["key"] == "source"
+
+
+def test_main_report_on_stdout_warnings_on_stderr(tmp_path, make_tasks_db):
+    """The report is stdout; every warning is stderr, so a pipe stays clean."""
+    good = _make_project(tmp_path, make_tasks_db, name="good",
+                         tasks=[{"id": 1, "status": "done", "metadata": _WIPE_SIGNATURE}])
+    bad = tmp_path / "bad"
+    (bad / ".taskmaster" / "tasks").mkdir(parents=True)
+    (bad / ".taskmaster" / "tasks" / "tasks.db").write_text("not a database")
+
+    result = _run_cli("--project-root", str(good), "--project-root", str(bad), "--json")
+
+    assert json.loads(result.stdout)          # stdout is pure payload
+    assert "warning" in result.stderr.lower()
+
+
+def test_main_run_is_strictly_read_only(tmp_path, make_tasks_db):
+    """THE READ-ONLY CLAIM, CHECKED. Every input database's mtime AND sha256
+    are captured before and after a full run and must be unchanged."""
+    import hashlib
+
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 95, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "dark_factory", "task_id": 95,
+                  "metadata": {"source": "prd"}}],
+        manifests=[("plans/t-prd.capability-manifest.yaml", _manifest_doc(95))],
+    )
+    inputs = [
+        root / ".taskmaster" / "tasks" / "tasks.db",
+        root / "data" / "reconciliation" / "tickets.db",
+        root / "plans" / "t-prd.capability-manifest.yaml",
+    ]
+
+    def fingerprint():
+        return {
+            str(p): (p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
+            for p in inputs
+        }
+
+    before = fingerprint()
+    _run_cli("--project-root", str(root), "--project-id", "dark_factory")
+
+    assert fingerprint() == before
