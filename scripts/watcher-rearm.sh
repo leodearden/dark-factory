@@ -5,9 +5,15 @@
 #
 # Solves the watcher-loop-harness-mismatch cluster (agent-legibility survey
 # S2): callers no longer hand-maintain a growing --exclude-id list across
-# re-arms -- this wrapper owns a persisted --exclude-file (default
-# "<queue-dir>/.watcher-rearm-exclude-l<level>") that a loop caller appends
-# a deliberately-pending id to instead of rebuilding the whole list.
+# re-arms -- this wrapper owns a persisted --exclude-file that a loop caller
+# appends a deliberately-pending id to instead of rebuilding the whole list.
+# The default is "<queue-dir>/.watcher-rearm-exclude-l<level>" when --level
+# is set, and "<queue-dir>/.watcher-rearm-exclude" (no suffix) when it is
+# not -- the level-less form serving flat, level-less queues such as the
+# reconciliation queue. Both are dotfiles that do NOT end in ".json", which
+# is what keeps them invisible to the watcher's own esc-*.json glob and to
+# the dashboard's broader *.json glob over the same recon directory; keep
+# that property if you ever change these names.
 #
 # Usage:
 #   watcher-rearm.sh [--level N] [--queue-dir DIR] [--timeout SECS]
@@ -143,7 +149,8 @@ if [ -z "$QUEUE_DIR" ]; then
 fi
 
 # Wrapper-owned exclude-file: an explicit --exclude-file wins, else default
-# to a per-level path inside the queue dir. Always exists once we proceed
+# to a path inside the queue dir -- per-level when --level is set, and the
+# suffix-less form for a level-less (match-all) watch. Always exists once we proceed
 # past --check, so a caller can append a deliberately-pending id without
 # checking first. Appended ids are NEVER pruned, so the file grows by one
 # line per resolved escalation over a long-lived orchestrator's lifetime --
@@ -152,7 +159,13 @@ fi
 # unbounded growth is harmless in practice. A future pass could periodically
 # drop lines whose esc-<id>.json no longer exists in the queue dir if this
 # ever becomes a real problem.
-EXCLUDE_FILE="${EXCLUDE_FILE_ARG:-$QUEUE_DIR/.watcher-rearm-exclude-l$LEVEL}"
+if [ -n "$EXCLUDE_FILE_ARG" ]; then
+    EXCLUDE_FILE="$EXCLUDE_FILE_ARG"
+elif [ -n "$LEVEL" ]; then
+    EXCLUDE_FILE="$QUEUE_DIR/.watcher-rearm-exclude-l$LEVEL"
+else
+    EXCLUDE_FILE="$QUEUE_DIR/.watcher-rearm-exclude"
+fi
 
 if [ "$CHECK" -eq 1 ]; then
     # Render an unset LEVEL as the explicit token `<all>` rather than an
