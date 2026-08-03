@@ -227,7 +227,7 @@ from legibility.inventory import iter_json_lines  # type: ignore[reportMissingIm
 from shared.memory_eval_metrics import (  # noqa: E402
     RUN_STAMP_ENV_VAR,
     MetricSchemaError,
-    metrics_artifact_path,
+    eval_dir,
     report_artifact_path,
     run_stamp,
 )
@@ -986,8 +986,12 @@ def write_corpus(
     The layout is delegated, never restated: ``report_artifact_path`` already
     produces ``<root>/<eval_id>/report-<STAMP>.txt``, so it is called
     verbatim, and the two artifacts with no helper are placed in the directory
-    it implies (the sibling probe's ``metrics_artifact_path(..., 'ignored').parent``
-    idiom).
+    it implies — obtained from ``eval_dir(out_root, EVAL_ID)``, the helper
+    ``shared.memory_eval_metrics`` exposes for callers that need only the
+    directory. It replaces the older
+    ``metrics_artifact_path(..., 'ignored').parent`` idiom, which now raises
+    ``MetricSchemaError``: the path helpers validate their stamp, and this
+    call site was the one caller they had left stamp-unvalidated for.
 
     Serialization mirrors ``serialize_metric_series`` — ``sort_keys=True``,
     ``ensure_ascii=False``, trailing newline — so two identical runs are
@@ -1000,7 +1004,7 @@ def write_corpus(
     """
     stamp = validate_stamp(stamp, what='--stamp') if stamp else run_stamp()
     report_path = report_artifact_path(out_root, EVAL_ID, stamp)
-    directory = metrics_artifact_path(out_root, EVAL_ID, 'ignored').parent
+    directory = eval_dir(out_root, EVAL_ID)
     directory.mkdir(parents=True, exist_ok=True)
 
     corpus_path = directory / f'corpus-{stamp}.jsonl'
