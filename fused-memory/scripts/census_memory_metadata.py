@@ -858,10 +858,17 @@ def _regen_command(params: dict[str, Any]) -> str:
     with CLI defaults. Task 3507: the committed artifact was generated with
     a non-default ``--top-n``, but the header still printed the bare command
     -- following it silently truncated the markdown ~4,800 rows shorter
-    while the run still exited 0. Emitting every flag that departs from its
-    argparse default keeps the documented command able to reproduce
-    whatever artifact it is embedded in, no matter which flags were
-    non-default for that run.
+    while the run still exited 0. Reconstructs the three flags actually
+    recorded in ``report['params']`` -- ``--project-id``, ``--page-size``
+    and ``--top-n`` -- emitting each one that departs from its argparse
+    default.
+
+    ``--max-pages``, ``--json-out``, ``--md-out`` and ``--config`` are never
+    recorded in ``params`` -- none of the four shape the census's
+    *content*, so :func:`build_report` never receives them and this
+    function has nothing to reconstruct them from. If a run used a
+    non-default value for one of those, reproducing it exactly is the
+    caller's responsibility, not this header's.
     """
     parts = ['uv run python scripts/census_memory_metadata.py']
     projects = params.get('projects') or []
