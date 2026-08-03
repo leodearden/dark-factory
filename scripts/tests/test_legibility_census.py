@@ -2851,8 +2851,11 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_ht
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint --
     shared by census.py's submit_task and escalate_info posters via this one
-    function). httpx is imported lazily and is not importable in this test
-    env, so a fake `httpx` module is injected via sys.modules."""
+    function). httpx is imported lazily, but it IS importable here -- a
+    direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
+    task 2965) -- so an un-faked call would really hit the network. The
+    shared `install_fake_httpx` fixture substitutes a stub so the outbound
+    request shape is assertable without a live listener on :8002."""
     captured_kwargs = {}
     rpc_response = {
         "jsonrpc": "2.0",

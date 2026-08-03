@@ -581,10 +581,10 @@ def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
     (http://localhost:8002). httpx is installed today, and a real fused-memory
     MCP server listens on :8002 on any machine running the stack -- so the
     test flapped pass/fail with that live server's connection state instead of
-    testing this module. Injecting a failing `httpx` module (the same
-    sys.modules convention used by
-    test_default_status_fetcher_sends_streamable_http_accept_headers below)
-    makes the "unreachable" premise true by construction.
+    testing this module. Injecting a failing `httpx` module (via the shared
+    `install_fake_httpx` fixture, as
+    test_default_status_fetcher_sends_streamable_http_accept_headers below
+    also does) makes the "unreachable" premise true by construction.
     """
     def _fake_post(url, **kwargs):
         raise OSError("[Errno 111] Connection refused")
@@ -615,10 +615,12 @@ def test_default_status_fetcher_sends_streamable_http_accept_headers(
     ("Not Acceptable: Client must accept application/json") any tools/call
     POST whose Accept header doesn't include both application/json and
     text/event-stream -- verified live against a local MCP /mcp endpoint.
-    default_status_fetcher's httpx import is lazy (httpx is not a scripts/
-    dependency, though it is importable in this test env as a transitive
-    one), so a fake `httpx` module is injected into sys.modules for the
-    duration of this test to capture the outbound call without a network."""
+    default_status_fetcher's httpx import is lazy, but httpx is genuinely
+    available here: a DIRECT dependency of `shared` (shared/pyproject.toml,
+    `httpx>=0.27`, task 2965), not a transitive one. So the real POST would
+    actually go out; the shared `install_fake_httpx` fixture substitutes a
+    stub to capture the outbound call without a network, and without
+    depending on whatever is listening on localhost:8002."""
     captured_kwargs = {}
     rpc_response = {
         "jsonrpc": "2.0",
