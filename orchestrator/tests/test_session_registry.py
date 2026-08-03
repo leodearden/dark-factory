@@ -3565,7 +3565,7 @@ def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
     # The discriminator is a FIELD holding a normalized queue path, never a
     # namespace prefix baked into the id.
     assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
-    assert 'esc-5914-1' == listed[0].id
+    assert listed[0].id == 'esc-5914-1'
 
 
 def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
