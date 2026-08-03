@@ -1,14 +1,67 @@
-"""Static guard: every pytest marker applied under orchestrator/tests/ must be
-registered, so a typo fails loudly instead of silently degrading to an
-unknown-marker warning forever (task 3532, follow-up to task 3506).
+"""Static guard: every pytest marker APPLIED under orchestrator/tests/ must be
+REGISTERED, so a typo (e.g. ``@pytest.mark.slwo``) fails loudly at collection
+instead of silently degrading to an unknown-marker warning forever (task 3532,
+follow-up to task 3506 — escalation agent-followup-3506).
 
-This module is built incrementally. This stage unit-tests the pure marker-
-application extractor, ``_applied_marker_names``, against synthetic source
-strings only — no disk I/O, no pytest config.
+WHY NOT ``--strict-markers``. The task offered two options; this module is
+option (b), and the choice was a MEASUREMENT, not a preference. On pytest
+9.0.3 (the version this project resolves), ``--strict-markers`` placed in
+``[tool.pytest.ini_options] addopts`` is INERT: a planted
+``@pytest.mark.slwo`` test collects clean, emits only
+``PytestUnknownMarkWarning``, and PASSES — exit 0 — even though
+``pytestconfig.option.strict_markers`` reads True and ``getini('addopts')``
+contains the flag, i.e. addopts IS parsed and the option IS set; it simply
+does not gate collection. The identical flag on the COMMAND LINE does gate:
+``Failed: 'slwo' not found in `markers` configuration option``, exit 2.
+Reproduced in a bare, conftest-free project on pytest 9.0.3, in both the
+addopts string form and the TOML-list form. Shipping ``--strict-markers`` in
+addopts would therefore look like enforcement while enforcing nothing — worse
+than doing nothing, since it would stop the next reader from looking. See
+``orchestrator/pyproject.toml``'s comment above ``markers = [`` for the short
+version of this note.
+
+WHAT "REGISTERED" MEANS. The effective set from ``Config.getini('markers')``
+— NOT a ``tomllib`` read of pyproject.toml's ``markers`` list.
+``real_psi_reader`` is registered dynamically at ``tests/conftest.py:403``
+(task 2418) via ``config.addinivalue_line('markers', ...)``, deliberately
+outside pyproject.toml's locked scope; a TOML-only comparison would
+false-fail on it. ``test_conftest_registered_markers_count_as_registered``
+below pins this so the guard can't later be "simplified" back into a
+TOML-only read.
+
+WHY A STATIC DISK SWEEP, not a ``pytest_collection_modifyitems`` / live
+``session.items`` walk. ``verify_plan.classify_file`` is purely path-based,
+so a diff touching only THIS file produces a FILE_SCOPED run of exactly this
+file; ``session.items`` would then hold only this module's own items, and the
+guard would pass while checking nothing else — the exact silent-vacuity trap
+this repo refuses (cf. ``test_warm_lane_bash_bucket_placement.py``). A disk
+sweep of ``tests_dir.rglob('*.py')`` reads every file regardless of what a
+given invocation happened to collect.
+
+RESIDUAL GAPS, deliberately out of scope and recorded rather than silently
+omitted:
+* a typo inside an ``-m`` EXPRESSION (``-m 'not slwo'``) stays silent —
+  pytest never validates marker EXPRESSIONS, under ``--strict-markers`` or
+  here;
+* ``pytest.param(marks=...)`` and ``item.add_marker(...)`` are not swept —
+  zero uses under ``orchestrator/tests/`` today (grep-verified);
+* an aliased pytest import (``import pytest as _pytest``) would not be
+  recognised as a marker application — two such aliases exist today
+  (test_overlap_footprint.py, test_multihost_verify_integration.py) but both
+  use the alias only for ``.raises``, never ``.mark``, so this is a real but
+  currently-inert gap;
+* sibling packages (shared, fused-memory, escalation) have their own markers
+  (e.g. ``integration``) and no equivalent guard.
+
+This module is built in two halves, in that order: unit tests of the pure
+static helpers against synthetic strings/trees (``TestAppliedMarkerNames``,
+``TestUnregisteredMarkers``), then the wired guard against the REAL tree and
+the REAL pytest config (``TestMarkerRegistrationDrift``).
 """
 from __future__ import annotations
 
 import ast
+import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -405,3 +458,105 @@ class TestUnregisteredMarkers:
         assert _unregistered_markers(tmp_path, frozenset({'slow'})) == {
             'slwo': {'nested/test_nested.py'},
         }
+
+
+# ---------------------------------------------------------------------------
+# The wired guard — REAL tests/ tree vs REAL pytest config
+# ---------------------------------------------------------------------------
+
+# Resolved from THIS FILE, never the process CWD: merge-verify runs pytest
+# from the orchestrator/ cwd (orchestrator/orchestrator.yaml) while a plain
+# `pytest orchestrator/tests` runs from the repo root, and this must resolve
+# identically under both. Same idiom as test_warm_lane_bash_bucket_placement.py.
+TESTS_DIR = Path(__file__).resolve().parent
+ORCH_PYPROJECT = Path(__file__).resolve().parents[1] / 'pyproject.toml'
+
+#: A floor, not an equality — 494 measured at authorship time — so adding
+#: test files over time never breaks this guard.
+_MIN_EXPECTED_TEST_FILES = 400
+
+#: One witness marker per extraction path this module supports, so a broken
+#: extractor that returns an empty/partial set cannot make the drift guard
+#: below pass vacuously.
+_WITNESS_MARKER_NAMES = frozenset({
+    'slow',               # function decorator
+    'warm_lane_bash',     # module-level pytestmark, list form
+    'real_psi_reader',    # function decorator; registered via conftest.py:403
+    'asyncio',            # module-level AND class-level pytestmark
+    'timeout',
+    'xdist_group',
+    'parametrize',
+    'exercise_merge_verify',
+})
+
+
+class TestMarkerRegistrationDrift:
+    """The deliverable guard, wired to the REAL tests/ tree and REAL config.
+
+    No test here currently fails — every marker applied under
+    orchestrator/tests/ today is already registered (task 3532's premise) —
+    so this class is green on arrival. Its value is entirely in failing on
+    the NEXT typo; ``TestUnregisteredMarkers`` above already carries the
+    burden of proving the underlying mechanism can actually fail.
+    """
+
+    def test_every_marker_applied_under_tests_is_registered(self, pytestconfig):
+        """THE guard."""
+        registered = _registered_marker_names(pytestconfig.getini('markers'))
+        unregistered = _unregistered_markers(TESTS_DIR, registered)
+        assert unregistered == {}, (
+            f'The following pytest markers are applied under {TESTS_DIR} but '
+            f'are not registered: {unregistered!r}. A name that looks like a '
+            f'typo of an existing marker probably is one. Register it either '
+            f"in orchestrator/pyproject.toml's [tool.pytest.ini_options] "
+            f"markers list, or via config.addinivalue_line('markers', ...) "
+            f'in tests/conftest.py.'
+        )
+
+    def test_the_sweep_is_not_vacuous(self):
+        """A broken extractor returning ``frozenset()`` would make the guard
+        above pass forever. In the spirit of
+        test_warm_lane_bash_bucket_placement.py's live ``--collect-only``
+        probe, pin that the sweep actually visits the real tree and actually
+        finds markers spanning every extraction path this module supports.
+        """
+        files = sorted(TESTS_DIR.rglob('*.py'))
+        assert len(files) >= _MIN_EXPECTED_TEST_FILES, (
+            f'only found {len(files)} .py files under {TESTS_DIR}, expected '
+            f'at least {_MIN_EXPECTED_TEST_FILES}. The sweep may be looking '
+            f'in the wrong place.'
+        )
+        applied: set[str] = set()
+        for path in files:
+            applied |= _applied_marker_names(path.read_text())
+        missing_witnesses = _WITNESS_MARKER_NAMES - applied
+        assert not missing_witnesses, (
+            f'expected witness markers {sorted(missing_witnesses)} were not '
+            f'found while sweeping {TESTS_DIR} — the extractor may be broken.'
+        )
+
+    def test_conftest_registered_markers_count_as_registered(self, pytestconfig):
+        """Pins the second critical finding: "registered" means the
+        EFFECTIVE ``getini('markers')`` set, not a bare ``tomllib`` read of
+        pyproject.toml. ``real_psi_reader`` is registered dynamically at
+        tests/conftest.py:403 (task 2418), deliberately outside
+        pyproject.toml's locked scope. A future reader "simplifying" this
+        guard into a bare TOML comparison would produce a false failure on
+        day one.
+        """
+        with ORCH_PYPROJECT.open('rb') as handle:
+            toml_data = tomllib.load(handle)
+        toml_markers = _registered_marker_names(
+            toml_data['tool']['pytest']['ini_options'].get('markers', [])
+        )
+        assert 'real_psi_reader' not in toml_markers, (
+            "real_psi_reader unexpectedly appears in pyproject.toml's markers "
+            "list — if it was added there, this test (and its rationale) is "
+            "stale and should be revisited, not silenced."
+        )
+        effective = _registered_marker_names(pytestconfig.getini('markers'))
+        assert 'real_psi_reader' in effective, (
+            'real_psi_reader is absent from the effective getini(markers) '
+            'set — tests/conftest.py may have stopped registering it '
+            '(task 2418).'
+        )
