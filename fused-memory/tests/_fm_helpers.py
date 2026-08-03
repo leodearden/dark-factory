@@ -658,6 +658,45 @@ FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
 FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
 
 
+def _falkor_available() -> bool:
+    """Probe whether a FalkorDB instance is reachable at FALKOR_HOST:FALKOR_PORT.
+
+    Uses the falkordb-native sync client rather than ``redis`` because redis is
+    not a declared dependency of fused-memory — only a transitive of
+    graphiti-core[falkordb]. If falkordb ever switches transport, this probe
+    fails loudly instead of silently disappearing.
+
+    Imports FalkorDB lazily (rather than at module scope, as the six forks did)
+    for two reasons, both load-bearing and both already established by
+    ``_qdrant_available`` above. (1) conftest.py imports this module every test
+    session, so a module-scope falkordb import would be paid even by sessions
+    that never touch FalkorDB; in a single test module the import was scoped to
+    that module's own collection. (2) The lazy form resolves the name at call
+    time, which is what lets tests deterministically patch
+    ``falkordb.FalkorDB`` and unit-test this contract with no live service.
+
+    Deliberately NOT cached: each consuming module pays its own bounded ~2s
+    probe at its own collection time, exactly as before. Memoising would be a
+    behaviour change disguised as a refactor — test_integration_marker_real_service.py
+    reasons explicitly about the up-to-~2s-per-module cost, and a cache would
+    break the call-time-tracking property that ``falkor_skipif`` relies on.
+    """
+    from falkordb import FalkorDB
+
+    try:
+        client = FalkorDB(
+            host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2
+        )
+        try:
+            client.select_graph('_probe').query('RETURN 1')
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+        return True
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
