@@ -3,11 +3,11 @@
 Task 3445. ``scripts/orchestrator.yaml`` declared only ``test_command``, so
 every diff confined to ``scripts/`` cleared the LINT check without ruff ever
 running — 71 tracked ``.py`` files (operator tooling, the ``scripts/legibility/``
-monitors, 40 test modules) gated by nothing. Task 3456 closed the identical
-TYPE gap, which 3445 measured and recorded in that yaml as knowingly-open
-rather than leaving it a silent absence; the burn-down had to land first,
-because declaring a red command here is a fleet-wide outage, not a transient
-failure.
+monitors, this directory's own test suite) gated by nothing. Task 3456 closed
+the identical TYPE gap, which 3445 measured and recorded in that yaml as
+knowingly-open rather than leaving it a silent absence; the burn-down had to
+land first, because declaring a red command here is a fleet-wide outage, not a
+transient failure.
 
 Omitting ``lint_command`` or ``type_check_command`` does not leave a fallback
 in place, it DELETES the gate: ``verify_plan._derive_module_runs`` emits an
@@ -332,14 +332,50 @@ def _ruff_exclude_flags(cmd: str) -> list[str]:
 def _pytest_targets(cmd: str) -> list[str]:
     """The directories/files *cmd*'s pytest segment actually collects.
 
-    Same thin-wrapper shape as ``_ruff_targets``. EXACT-ELEMENT membership is
-    load-bearing here rather than merely tidy: ``'scripts/'`` is a SUBSTRING of
-    ``'tests/scripts/'``, so a naive ``'scripts/tests/' in cmd`` is the only
-    spelling that would work by substring and ``'tests/scripts/' in cmd`` is
-    satisfied by a command targeting neither tree correctly. Splitting out the
-    positional targets is what lets the two near-homograph trees be told apart.
+    Same thin-wrapper shape as ``_ruff_targets``, but NOT for the same reason,
+    and an earlier draft of this docstring copied ``_targets``' justification
+    across without re-deriving it. ``_targets`` is defending against a
+    SUBSTRING relation between its two targets — ``'scripts/'`` really is a
+    substring of ``'tests/scripts/'``, which is the LINT/TYPE case, where the
+    target is the bare ``scripts/``. The two PYTEST targets here are
+    ``'scripts/tests/'`` and ``'tests/scripts/'``, and NEITHER is a substring
+    of the other, so that particular confusion cannot arise on this pair.
+
+    Exact-element membership is still load-bearing, for a different and real
+    reason: a substring check cannot tell a DIRECTORY target apart from a file
+    or a flag that merely MENTIONS the same path. Both
+    ``pytest scripts/tests/test_census_trigger.py`` and
+    ``pytest tests/scripts/ --ignore=scripts/tests/`` satisfy
+    ``'scripts/tests/' in cmd`` while collecting something other than that
+    directory — the second one collects the exact opposite of what the
+    substring appears to prove. Splitting out the positional targets is what
+    makes "the directory is collected" a claim about what pytest will actually
+    do rather than about which characters occur in the string.
     """
     return _targets(cmd, _PYTEST)
+
+
+def _dir_key(target: str) -> str:
+    """*target* with any trailing slash removed, for directory comparison.
+
+    The exact-element property ``_pytest_targets`` provides is kept; only the
+    trailing-slash COUPLING is relaxed. ``'scripts/tests/'`` and
+    ``'scripts/tests'`` name the same directory to pytest, and the production
+    deriver is not committed to either spelling: ``verify_plan``'s
+    ``_fallback_pytest_targets`` already maps a touched conftest to its PARENT
+    DIRECTORY, which yields the slashless form. If the module path ever adopts
+    that same (strictly better-scoped) shape, a literal ``'scripts/tests/'``
+    comparison would fail with a message accusing the author of leaving the
+    directory ungated at the moment coverage actually improved — the mirror of
+    the false-positive the lint test designs around when it chooses membership
+    over list equality.
+    """
+    return target.rstrip('/')
+
+
+def _dir_keys(targets: list[str]) -> list[str]:
+    """``_dir_key`` over a target list, order and multiplicity preserved."""
+    return [_dir_key(t) for t in targets]
 
 
 def test_scripts_diff_is_lint_gated() -> None:
@@ -502,10 +538,14 @@ def test_scripts_diff_is_lint_gated() -> None:
         f'lint_command {mc.lint_command!r} (task 3445). These two directories '
         f'are distinct trees; a shared command means one of them is linting the '
         f'other and its own files are gated by nothing. The two test_commands '
-        f'are held distinct by their own assertion — see '
-        'test_scripts_full_suite_pytest_covers_scripts_tests (6), which pins '
-        'that separately and for a different reason; nothing about this repo '
-        'licenses duplicating a command across these two configs'
+        f'are held distinct by their own assertions — see '
+        'test_scripts_full_suite_pytest_covers_scripts_tests, whose TARGET '
+        'assertions (5) and (6) carry that claim: this config must collect '
+        'BOTH test trees while the sibling collects only its own. (Its '
+        'byte-inequality check is a redundant restatement of those two, kept '
+        'for the diagnostic, so read the target assertions for the actual '
+        'contract.) Nothing about this repo licenses duplicating a command '
+        'across these two configs'
     )
 
 
@@ -740,10 +780,14 @@ def test_scripts_diff_is_type_gated() -> None:
         f'type_check_command {mc.type_check_command!r} (task 3456). A shared '
         f'command means one of them is type-checking the other and its own '
         f'files are gated by nothing. The two test_commands are held distinct '
-        f'by their own assertion — see '
-        'test_scripts_full_suite_pytest_covers_scripts_tests (6), which pins '
-        'that separately and for a different reason; nothing about this repo '
-        'licenses duplicating a command across these two configs'
+        f'by their own assertions — see '
+        'test_scripts_full_suite_pytest_covers_scripts_tests, whose TARGET '
+        'assertions (5) and (6) carry that claim: this config must collect '
+        'BOTH test trees while the sibling collects only its own. (Its '
+        'byte-inequality check is a redundant restatement of those two, kept '
+        'for the diagnostic, so read the target assertions for the actual '
+        'contract.) Nothing about this repo licenses duplicating a command '
+        'across these two configs'
     )
 
 
@@ -753,9 +797,12 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
     The TEST third of the contract ``test_scripts_diff_is_lint_gated`` and
     ``test_scripts_diff_is_type_gated`` pin for LINT and TYPE, closing the gap
     task 3445 recorded in ``scripts/orchestrator.yaml`` and task 3460 fixed.
-    ``scripts/tests/`` holds 40 test modules, and the declared
+    ``scripts/tests/`` holds this module's own test suite, and the declared
     ``test_command`` targeted only ``tests/scripts/`` — the SIBLING tree — so
-    under FULL_SUITE those 40 modules never ran.
+    under FULL_SUITE that whole suite never ran. (Deliberately stated without a
+    module COUNT: the claim is "a whole tree was ungated", which is true at any
+    size, and a hard-coded count of a directory's contents rots on the next
+    test file added — this file already carried one that was stale at HEAD.)
 
     Unlike the lint/type gaps this is NOT a vacuous-pass: the command was
     present and green, it simply collected the wrong tree. That makes it
@@ -830,19 +877,22 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
         f'at all: {_VACUOUS_PASS}'
     )
     production_targets = _pytest_targets(executed_production.test_command)
-    assert OWN_TESTS_DIR in production_targets, (
+    assert _dir_key(OWN_TESTS_DIR) in _dir_keys(production_targets), (
         f'a diff touching the PRODUCTION module {SAMPLE_TOUCHED_PRODUCTION_FILE!r} '
         f'executes pytest over {production_targets!r}, which does not include '
         f'{OWN_TESTS_DIR!r} (task 3460). verify_plan._derive_module_runs arm 3 — '
         f'the task-3294 source-only floor — runs the owning module config\'s '
-        f'test_command VERBATIM for a source-only diff, so this module\'s own 40 '
+        f'test_command VERBATIM for a source-only diff, so this module\'s own '
         f'test modules under {OWN_TESTS_DIR} never run for the very diffs they '
         f'cover; scripts/tests/test_census_trigger.py is the direct counterpart '
         f'of this file. This is NOT a vacuous pass — the command is present and '
         f'exits 0 — it simply collects the {SIBLING_TESTS_DIR} tree instead, '
         f'which is why the claim is made on the TARGETS and not on presence. '
-        f'Exact-element membership is deliberate: {MODULE_PREFIX + "/"!r} is a '
-        f'SUBSTRING of {SIBLING_TESTS_DIR!r}'
+        f'The check is exact-element on the positional targets rather than a '
+        f'substring of the command, because `pytest {OWN_TESTS_DIR}test_x.py` '
+        f'and `--ignore={OWN_TESTS_DIR}` both CONTAIN {OWN_TESTS_DIR!r} while '
+        f'collecting something else — see _pytest_targets. A trailing slash is '
+        'not required: _dir_key normalizes it away'
     )
 
     # (3) CONFTEST TRIGGER (arm 1) — the sharpest case, because the touched
@@ -853,14 +903,19 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
         f'{SAMPLE_TOUCHED_CONFTEST!r} (task 3460): {_VACUOUS_PASS}'
     )
     conftest_targets = _pytest_targets(executed_conftest.test_command)
-    assert OWN_TESTS_DIR in conftest_targets, (
+    assert _dir_key(OWN_TESTS_DIR) in _dir_keys(conftest_targets), (
         f'touching {SAMPLE_TOUCHED_CONFTEST!r} executes pytest over '
         f'{conftest_targets!r}, which does not include {OWN_TESTS_DIR!r} '
         f'(task 3460). verify_plan._derive_module_runs\' CONFTEST trigger '
         f'widens to FULL_SUITE precisely BECAUSE a conftest change can affect '
         f'every test in its directory — and then runs a command that collects a '
         'different directory entirely, so the widening buys nothing for the '
-        'suite it was widened for'
+        'suite it was widened for. Note the SLASHLESS spelling '
+        f'{_dir_key(OWN_TESTS_DIR)!r} satisfies this assertion: '
+        'verify_plan._fallback_pytest_targets already maps a touched conftest '
+        'to its parent DIRECTORY in that form, and _dir_key normalizes the '
+        'trailing slash away so adopting that better-scoped shape here would '
+        'not read as a regression'
     )
 
     # (4) MERGE FULL BREADTH — the leg the repo root actually enables with
@@ -890,19 +945,19 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
     # is also what (2) and (3) render — so asserting on the DECLARED value here
     # covers all three paths from one place.
     declared_targets = _pytest_targets(mc.test_command)
-    assert OWN_TESTS_DIR in declared_targets, (
+    assert _dir_key(OWN_TESTS_DIR) in _dir_keys(declared_targets), (
         f'{MODULE_PREFIX}/orchestrator.yaml declares test_command='
         f'{mc.test_command!r}, whose pytest targets are {declared_targets!r} — '
         f'{OWN_TESTS_DIR!r} is not among them (task 3460). '
         f'verify_plan._derive_full_suite_runs runs this value VERBATIM and '
-        f'unscoped under merge-role merge_verify_breadth="full", so the 40 test '
-        f'modules under {OWN_TESTS_DIR} are ungated on the merge path too'
+        f'unscoped under merge-role merge_verify_breadth="full", so every test '
+        f'module under {OWN_TESTS_DIR} is ungated on the merge path too'
     )
 
     # (5) NON-REGRESSION — why this is a UNION and not a SWAP. See the
     # docstring: tests/scripts/ tests scripts/ PRODUCTION code, and arm 3 runs
     # this command verbatim for every scripts/ production diff.
-    assert SIBLING_TESTS_DIR in declared_targets, (
+    assert _dir_key(SIBLING_TESTS_DIR) in _dir_keys(declared_targets), (
         f'{MODULE_PREFIX}/orchestrator.yaml declares test_command='
         f'{mc.test_command!r}, whose pytest targets are {declared_targets!r} — '
         f'{SIBLING_TESTS_DIR!r} is no longer among them (task 3460). Adding '
@@ -928,6 +983,16 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
         f'{SIBLING_PREFIX}/orchestrator.yaml is no longer discovered, so the '
         'anti-copy-paste comparison below cannot be made (task 3460)'
     )
+    # REDUNDANT BY CONSTRUCTION, kept only as a better first diagnostic — do not
+    # mistake it for independent coverage. It is strictly IMPLIED by the two
+    # assertions that bracket it: the declared targets must contain both
+    # directories (above) while the sibling's must be exactly the one (below),
+    # and two commands with different positional-target lists cannot be
+    # byte-identical. What it buys is the failure MESSAGE: when the mis-fix is a
+    # wholesale copy-paste of one config's command into the other, this fires
+    # first and names that directly, instead of leaving a reader to infer it
+    # from two target lists. The claim itself is carried by the target
+    # assertions, which is where the lint/type tests' cross-references point.
     assert mc.test_command != sibling.test_command, (
         f'{MODULE_PREFIX} and {SIBLING_PREFIX} declare a BYTE-IDENTICAL '
         f'test_command {mc.test_command!r} (task 3460). They were identical '
@@ -942,10 +1007,11 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
         f'comparison above is satisfied for the wrong reason'
     )
     sibling_targets = _pytest_targets(sibling.test_command)
-    assert sibling_targets == [SIBLING_TESTS_DIR], (
+    assert _dir_keys(sibling_targets) == [_dir_key(SIBLING_TESTS_DIR)], (
         f'{SIBLING_PREFIX}/orchestrator.yaml declares test_command='
         f'{sibling.test_command!r}, whose pytest targets are '
         f'{sibling_targets!r}, expected exactly {[SIBLING_TESTS_DIR]!r} '
+        f'(trailing slash optional — compared through _dir_key) '
         f'(task 3460). The {MODULE_PREFIX} gap must be closed on the '
         f'{MODULE_PREFIX} module config — widening the SIBLING to also collect '
         f'{OWN_TESTS_DIR} does NOT close it, because derive_modules -> '
@@ -956,3 +1022,115 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
         'because a legitimate strengthening of the sibling does not exist: this '
         'assertion exists to reject exactly that mis-fix'
     )
+
+
+def _root_scripts_suites_pytest_targets() -> list[str]:
+    """Positional targets of the fleet chain's pytest segment for the scripts suites.
+
+    Read through the PRODUCTION loader — ``OrchestratorConfig(project_root=...)``
+    exposes the repo-root ``test_command``, which is the same value
+    ``verify._build_fallback_config`` receives as its ``config`` — rather than
+    by ``yaml.safe_load``, for the reason the module docstring records.
+
+    The segment is selected by CONTENT (the one pytest segment whose targets
+    name either scripts test tree) and not by POSITION ("the trailing
+    segment"). A future subproject appended after it would silently move a
+    positional pick onto the wrong segment, and the guard would then be
+    checking something else entirely while still reporting green — the same
+    reports-green failure mode this whole file exists to prevent.
+    """
+    root_cmd = OrchestratorConfig(project_root=REPO_ROOT).test_command
+    assert root_cmd, (
+        f'the repo-root orchestrator config declares test_command={root_cmd!r}, '
+        'so the fleet chain gates nothing and the comparison below would be '
+        'satisfied vacuously'
+    )
+    wanted = {_dir_key(OWN_TESTS_DIR), _dir_key(SIBLING_TESTS_DIR)}
+    segments = [s for s in verify_cmd.split_top_level_and(root_cmd) if _PYTEST in s]
+    matching = [s for s in segments if wanted & set(_dir_keys(_targets(s, _PYTEST)))]
+    assert len(matching) == 1, (
+        f'expected exactly one pytest segment naming {sorted(wanted)!r} in the '
+        f'repo-root fleet chain, got {matching!r} out of {segments!r}. Zero '
+        f'means the chain no longer runs either scripts test tree at all; more '
+        'than one means the two trees were split across segments, which this '
+        'guard cannot compare as a single unit'
+    )
+    return _targets(matching[0], _PYTEST)
+
+
+def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites() -> None:
+    """The fleet chain and the ``scripts`` module config must name the SAME suites.
+
+    Both yamls ASSERT this coupling in prose and, until this guard, nothing
+    enforced it. ``dark-factory-orchestrator.yaml``: "The two are kept spelled
+    identically deliberately, so this path and that one cannot drift into
+    different notions of 'the scripts suites'; if you widen one, widen the
+    other." ``scripts/orchestrator.yaml``: "The target ORDER and spelling copy
+    the repo-root fleet chain's trailing segment verbatim, so the fallback path
+    and this module config cannot drift."
+
+    ``test_scripts_full_suite_pytest_covers_scripts_tests`` above reads only
+    ``discovered['scripts'].test_command``, so it cannot see the root chain;
+    dropping ``scripts/tests/`` from the chain would leave a documented
+    invariant silently violated — a documented-but-ungated claim, which is the
+    exact defect class task 3460 exists to close, reintroduced one file over.
+
+    NOT covered by ``tests/scripts/test_fallback_verify_config.py::
+    test_fallback_verify_runs_tests_scripts`` next door: that one asserts only
+    that SOME pytest segment mentions ``tests/scripts``, which a chain that
+    dropped ``scripts/tests/`` entirely still satisfies.
+
+    SET equality on the normalized targets. Equality because the claim the two
+    comment blocks make is BIDIRECTIONAL — widening either side alone is
+    precisely what must fail — and a set because pytest collects directories
+    order-insensitively, so pinning ORDER would reject a harmless reordering
+    with a message about coverage. The yamls' "same order" wording is a
+    readability convention, not a correctness property, and is deliberately
+    not encoded as one here.
+
+    The chain is DEFENCE-IN-DEPTH only — ``run_scoped_verification`` reaches
+    ``_build_fallback_config`` solely past its ``if module_configs:`` check, and
+    a ``scripts/**`` diff always routes to the ``scripts`` module config
+    instead — so this guard is about keeping the two spellings honest, not
+    about the chain gating scripts/ diffs. It does not license "fixing" a
+    scripts/ coverage question in the root yaml.
+    """
+    root_targets = _root_scripts_suites_pytest_targets()
+
+    discovered = _discovered()
+    assert MODULE_PREFIX in discovered, (
+        f'{MODULE_PREFIX}/orchestrator.yaml is not discovered by the production '
+        f'config._discover_module_configs walk. Discovered: {sorted(discovered)}'
+    )
+    mc = discovered[MODULE_PREFIX]
+    assert mc.test_command, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares test_command='
+        f'{mc.test_command!r}, so there is nothing to compare the fleet chain '
+        'against and the equality below would be satisfied for the wrong reason'
+    )
+    module_targets = _pytest_targets(mc.test_command)
+
+    assert set(_dir_keys(root_targets)) == set(_dir_keys(module_targets)), (
+        f'the repo-root fleet chain\'s scripts-suites pytest segment targets '
+        f'{root_targets!r} while {MODULE_PREFIX}/orchestrator.yaml\'s '
+        f'test_command targets {module_targets!r} (task 3460). BOTH yamls state '
+        f'in prose that these are kept identical and that widening one means '
+        f'widening the other; this guard is what makes that a property rather '
+        f'than an aspiration. Fix the drift or delete the claim from both '
+        f'comment blocks — do not leave a documented invariant ungated, which '
+        'is the defect class task 3460 closed'
+    )
+
+    # Belt and braces: identical-but-empty would satisfy the equality above.
+    # This is the claim the equality is FOR, stated directly, so a chain and a
+    # module config that drifted together still fail here with a message about
+    # coverage rather than about agreement.
+    for required in (OWN_TESTS_DIR, SIBLING_TESTS_DIR):
+        assert _dir_key(required) in _dir_keys(root_targets), (
+            f'{required!r} is not among the fleet chain\'s scripts-suites '
+            f'pytest targets {root_targets!r} (task 3460). Both trees must run: '
+            f'{SIBLING_TESTS_DIR} tests {MODULE_PREFIX}/ PRODUCTION code '
+            f'(test_orchestrator_watchdog.py <-> scripts/orchestrator-watchdog.py, '
+            f'test_spawn_claude.py, ...) and {OWN_TESTS_DIR} is that directory\'s '
+            'own suite, so dropping either trades one coverage gap for another'
+        )
