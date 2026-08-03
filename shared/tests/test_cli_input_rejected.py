@@ -409,3 +409,210 @@ class TestCliInputRejectedIsNeverReportedAsACapHit:
         )
         # ...and the gate's cap-detected transition is not taken by any route.
         gate._handle_cap_detected.assert_not_called()
+
+
+class _CountingCli:
+    """Scripted ``invoke_fn`` that returns *results* in order, recording each
+    call's kwargs, and REPEATS the last result once the script is exhausted.
+
+    Modelled on ``test_model_not_found.py::_CountingModelNotFoundCli``: it must
+    tolerate over-invocation rather than raising, because an unbounded-retry
+    regression should surface as a call-count assertion (or the
+    ``max_cap_retries`` bound) rather than as an opaque StopIteration from the
+    fake.
+    """
+
+    def __init__(self, *results: AgentResult) -> None:
+        self._results = list(results)
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs: object) -> AgentResult:
+        self.calls.append(dict(kwargs))
+        idx = min(len(self.calls) - 1, len(self._results) - 1)
+        return self._results[idx]
+
+
+def _rejected(duration_ms: int = 2100) -> AgentResult:
+    """A pre-turn CLI rejection.  Defaults to a SUB-5s duration, i.e. inside
+    the heuristic cap-safety-net window, so these drives also pin that the new
+    retry branch sits ABOVE that net."""
+    return _parse_claude_output(_fast_exit_subprocess(duration_ms=duration_ms))
+
+
+def _plain_empty_output() -> AgentResult:
+    """The generic empty-output failure -- same shape, no marker on stderr."""
+    return _parse_claude_output(_fast_exit_subprocess(stderr='some unrelated noise\n'))
+
+
+def _succeeded() -> AgentResult:
+    return AgentResult(
+        success=True,
+        output='the real answer',
+        turns=7,
+        cost_usd=0.42,
+        duration_ms=31_000,
+        session_id='sess-success',
+    )
+
+
+@pytest.mark.asyncio
+class TestInvokeWithCapRetryRetriesCliInputRejectedOnce:
+    """DEFECT A, transport layer: the agent was never asked anything and
+    nothing was billed, so a pre-turn rejection is a FREE retry candidate.
+
+    Retrying once here is the single seam that covers every consumer at once
+    (workflow, steward, dry_run_unblock, judge, curator) -- none of which can
+    distinguish this failure today.  The retry is deliberately BOUNDED at one:
+    a second consecutive rejection is deterministic, not a glitch, and must
+    reach a human instead of looping.
+    """
+
+    async def test_rejection_then_success_retries_once_and_returns_the_success(self):
+        gate = make_gate_mock(account_count=2)
+        cli = _CountingCli(_rejected(), _succeeded())
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            returned = await invoke_with_cap_retry(
+                gate,
+                'test[reject-then-ok]',
+                invoke_fn=cli,
+                max_cap_retries=2,
+                backend='claude',
+                prompt='the original prompt',
+                session_id='sess-original',
+            )
+
+        assert len(cli.calls) == 2, (
+            f'expected exactly one bounded retry (2 calls), got {len(cli.calls)}'
+        )
+        assert returned.success is True
+        assert returned.output == 'the real answer'
+
+    async def test_retry_is_fresh_not_a_resume_and_reuses_no_session_id(self):
+        """A rejected attempt may already have committed its pre-allocated
+        UUID to disk, so reusing it makes the CLI exit instantly with
+        'Session ID ... is already in use' (the reify-3604 wedge)."""
+        gate = make_gate_mock(account_count=2)
+        cli = _CountingCli(_rejected(), _succeeded())
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            await invoke_with_cap_retry(
+                gate,
+                'test[reject-fresh]',
+                invoke_fn=cli,
+                max_cap_retries=2,
+                backend='claude',
+                prompt='the original prompt',
+                session_id='sess-original',
+            )
+
+        first, retry = cli.calls
+        assert 'resume_session_id' not in retry, (
+            'the retry must be FRESH -- there is no session to resume, the CLI '
+            'never started one'
+        )
+        assert retry['session_id'] != first['session_id'], (
+            'a regenerated session_id is what avoids the reify-3604 '
+            '"Session ID ... is already in use" collision'
+        )
+        assert retry['session_id']
+
+    async def test_no_session_id_is_invented_when_the_caller_passed_none(self):
+        gate = make_gate_mock(account_count=2)
+        cli = _CountingCli(_rejected(), _succeeded())
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            await invoke_with_cap_retry(
+                gate,
+                'test[reject-no-session]',
+                invoke_fn=cli,
+                max_cap_retries=2,
+                backend='claude',
+                prompt='the original prompt',
+            )
+
+        assert len(cli.calls) == 2
+        assert not cli.calls[1].get('session_id')
+
+    async def test_retry_carries_the_original_prompt(self):
+        """NOT CAP_HIT_RESUME_PROMPT / CRASH_RECOVERY_RESUME_PROMPT: those
+        continue an existing session, and here no session ever existed."""
+        gate = make_gate_mock(account_count=2)
+        cli = _CountingCli(_rejected(), _succeeded())
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            await invoke_with_cap_retry(
+                gate,
+                'test[reject-prompt]',
+                invoke_fn=cli,
+                max_cap_retries=2,
+                backend='claude',
+                prompt='the original prompt',
+            )
+
+        assert cli.calls[1]['prompt'] == 'the original prompt'
+
+    async def test_two_consecutive_rejections_are_bounded_and_returned(self):
+        """BOUNDEDNESS: a second consecutive rejection is deterministic, not a
+        glitch -- return it for normal steward handling rather than looping."""
+        gate = make_gate_mock(account_count=2)
+        cli = _CountingCli(_rejected(), _rejected())
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            returned = await invoke_with_cap_retry(
+                gate,
+                'test[reject-twice]',
+                invoke_fn=cli,
+                max_cap_retries=2,
+                backend='claude',
+                prompt='the original prompt',
+            )
+
+        assert len(cli.calls) == 2, (
+            f'expected the retry budget to stop at 2 calls, got {len(cli.calls)}'
+        )
+        assert returned.success is False
+        assert returned.subtype == 'error_cli_input_rejected'
+
+    async def test_neither_scenario_mutates_account_phase_and_the_slot_settles(self):
+        gate = make_gate_mock(account_count=2)
+        slots = TestCliInputRejectedIsNeverReportedAsACapHit._capture_slots(gate)
+        cli = _CountingCli(_rejected(), _rejected())
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            await invoke_with_cap_retry(
+                gate,
+                'test[reject-no-mutation]',
+                invoke_fn=cli,
+                max_cap_retries=2,
+                backend='claude',
+                prompt='the original prompt',
+            )
+
+        gate._handle_cap_detected.assert_not_called()
+        gate._handle_auth_failure.assert_not_called()
+        assert gate.confirm_account_ok.called, 'every attempt must settle its slot'
+        assert all(slot._settled for slot in slots), 'a probe slot was left dangling'
+
+    async def test_plain_empty_output_is_not_retried_by_this_branch(self):
+        """NARROWNESS: the new retry must not widen into the generic
+        empty-output bucket, which has its own (steward-owned) retry policy."""
+        gate = make_gate_mock(account_count=2)
+        cli = _CountingCli(_plain_empty_output(), _succeeded())
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            returned = await invoke_with_cap_retry(
+                gate,
+                'test[plain-empty]',
+                invoke_fn=cli,
+                max_cap_retries=2,
+                backend='claude',
+                prompt='the original prompt',
+            )
+
+        assert len(cli.calls) == 1, (
+            f'a plain empty-output failure must NOT be retried here, got '
+            f'{len(cli.calls)} calls'
+        )
+        assert returned.success is False
+        assert returned.subtype == 'error_empty_output'
