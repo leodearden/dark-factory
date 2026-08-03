@@ -20,9 +20,12 @@ merge-verify time.
 from __future__ import annotations
 
 from shared.cli_invoke import (
+    AgentFailureKind,
     AgentResult,
     _parse_claude_output,
     _SubprocessResult,
+    build_failure_message,
+    classify_agent_failure,
     is_cli_invocation_rejected,
     is_zero_output_timeout,
 )
@@ -177,3 +180,81 @@ class TestParseClaudeOutputMintsCliInputRejectedSubtype:
         result = _parse_claude_output(_fast_exit_subprocess())
         assert result.timed_out is False
         assert is_zero_output_timeout(result) is False
+
+
+class TestClassifyAgentFailureCliInputRejected:
+    """The escalation summary an operator reads is built from
+    ``classify_agent_failure(...).summary``.  For a pre-turn rejection the
+    generic EMPTY_OUTPUT rule's FIXED string ('agent returned empty output')
+    actively misdescribes the cause and discards the only evidence there is —
+    the CLI's own stderr line.  This suite pins the distinct kind and a
+    cause-carrying summary.
+    """
+
+    @staticmethod
+    def _fast_exit_result() -> AgentResult:
+        return _parse_claude_output(_fast_exit_subprocess())
+
+    def test_kind_value_is_stable(self):
+        assert AgentFailureKind.CLI_INPUT_REJECTED.value == 'cli_input_rejected'
+
+    def test_fast_exit_classifies_as_cli_input_rejected(self):
+        cls = classify_agent_failure(self._fast_exit_result())
+        assert cls.kind is AgentFailureKind.CLI_INPUT_REJECTED
+        assert cls.kind is not AgentFailureKind.EMPTY_OUTPUT
+
+    def test_summary_carries_the_real_cli_error_line(self):
+        cls = classify_agent_failure(self._fast_exit_result())
+        assert 'Input must be provided' in cls.summary, (
+            f'the summary must embed the CLI stderr cause, got {cls.summary!r}'
+        )
+        assert cls.summary != 'agent returned empty output'
+
+    def test_diagnostic_detail_still_dumps_every_signal(self):
+        cls = classify_agent_failure(self._fast_exit_result())
+        assert "subtype='error_cli_input_rejected'" in cls.diagnostic_detail
+        assert 'turns=' in cls.diagnostic_detail
+        assert 'cost_usd=' in cls.diagnostic_detail
+        assert 'timed_out=' in cls.diagnostic_detail
+        assert 'Input must be provided' in cls.diagnostic_detail
+
+    def test_summary_falls_back_to_the_last_stderr_line_never_a_fabrication(self):
+        """When the subtype is set but no stderr line matches (defensive: a
+        caller stamped the subtype by hand), the cause must degrade to real
+        observed text, never to an invented string."""
+        cls = classify_agent_failure(
+            AgentResult(
+                success=False,
+                output='',
+                subtype='error_cli_input_rejected',
+                stderr='some other terminal noise\n',
+            )
+        )
+        assert cls.kind is AgentFailureKind.CLI_INPUT_REJECTED
+        assert 'some other terminal noise' in cls.summary
+
+    def test_timeout_rule_still_outranks_the_new_rule(self):
+        """PRECEDENCE: a killed run carrying the marker is still TIMED_OUT."""
+        cls = classify_agent_failure(
+            AgentResult(
+                success=False,
+                output='',
+                subtype='error_cli_input_rejected',
+                stderr=FAST_EXIT_STDERR,
+                timed_out=True,
+            )
+        )
+        assert cls.kind is AgentFailureKind.TIMED_OUT
+
+    def test_plain_empty_output_still_classifies_as_empty_output(self):
+        """REGRESSION: the existing generic rule is untouched."""
+        cls = classify_agent_failure(
+            _parse_claude_output(_fast_exit_subprocess(stderr='unrelated\n'))
+        )
+        assert cls.kind is AgentFailureKind.EMPTY_OUTPUT
+        assert cls.summary == 'agent returned empty output'
+
+    def test_build_failure_message_embeds_the_stderr_cause(self):
+        message = build_failure_message('architect', self._fast_exit_result())
+        assert message.startswith('architect failed: ')
+        assert 'Input must be provided' in message
