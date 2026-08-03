@@ -1965,6 +1965,54 @@ class TestSessionResumeGuard:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reason'] == 'no_transcript'
 
+    async def test_unreadable_config_dir_stays_no_transcript(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A config dir that is PRESENT but UNREADABLE (EACCES on a parent,
+        ELOOP, a stale NFS handle) is a filesystem fault, not a lane wipe, and
+        must stay a loud 'no_transcript' (task 3256 amendment).
+
+        Keying the split on ``Path.exists()`` is wrong in BOTH directions: it
+        swallows exactly {ENOENT, ENOTDIR, EBADF, ELOOP} into False, filing a
+        symlink loop or bad fd under the silent, storm-exempt 'reseeded' arm,
+        and it RE-RAISES every other OSError — the EACCES injected here — out
+        through the guard's documented never-raises I3 contract. Either way a
+        genuine filesystem fault stops surfacing as the systematic breakage
+        INV-4 exists to catch. Only ENOENT/ENOTDIR is evidence of a wipe.
+
+        The error is INJECTED rather than produced with ``chmod(0o000)`` so
+        the test is deterministic and still meaningful when the suite runs as
+        root (a root process can stat through a 0o000 parent).
+        """
+        session = {
+            'session_id': 'uuid-eacces',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        blocked = tmp_path / 'unreadable' / 'claude-config-x'
+        blocked.mkdir(parents=True)
+        real_stat = Path.stat
+
+        def fake_stat(self: Path, *args, **kwargs):
+            if self == blocked:
+                raise PermissionError(13, 'Permission denied')
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'stat', fake_stat)
+        harness.config.session_resume = SessionResumeConfig()
+
+        resume_id = await _drive_session_slot(
+            harness, 'ur1', session, config_dir=blocked
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'no_transcript'
+
     async def test_no_config_dir_falls_back_no_transcript(self, harness: Harness):
         """No stashed config_dir at all → cannot corroborate → 'no_transcript'."""
         session = {
@@ -2007,11 +2055,18 @@ class TestSessionResumeGuard:
 
 @pytest.mark.asyncio
 class TestSessionResumeStorm:
-    """γ fallback-storm escape (INV-4, task 2774): a per-boot RUN of
-    consecutive session_resume_fallback degradations reaching
-    fallback_storm_threshold files ONE deduped L1 escalation. The streak is
-    consecutive-per-boot (reset by any eligible resume); capped/disabled do
-    NOT feed it. Filing is best-effort — a None queue never raises (I3).
+    """γ fallback-storm escape (INV-4, task 2774, narrowed by task 3256): a RUN
+    of UNEXPLAINED session_resume_fallback degradations reaching
+    fallback_storm_threshold files ONE deduped L1 escalation.
+
+    The streak is a rolling CHAIN, not a per-boot running total: consecutive
+    means chained within storm_window_secs, so a gap at least that long decays
+    it to 0 (an eligible resume also resets it outright, and clears the chain's
+    comparison stamp). Three degradations are excluded from it — 'disabled'
+    (silent kill switch), 'capped' (by-design throttling) and 'reseeded'
+    (by-design lane wipe) — leaving only the genuine corroboration failures
+    {stale, no_transcript}. Filing is best-effort — a None queue never raises
+    (I3).
     """
 
     @staticmethod
@@ -2202,6 +2257,49 @@ class TestSessionResumeStorm:
         await _drive_session_slot(harness, 'd2', self._stale_session('uuid-d2'))
 
         # Decayed to 0, then re-incremented — NOT 3, so no L1.
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_reseeded_fallbacks_do_not_refresh_the_chain_stamp(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A reseeded fallback must leave ``_last_session_resume_fallback_at``
+        untouched, not just the streak counter (task 3256 amendment).
+
+        The stamp is the chain's comparison point, so refreshing it on a
+        by-design reseed would keep the chain alive across an arbitrarily long
+        drip: two genuine failures hours apart could then still chain into a
+        false storm, re-opening the exact hole the decay window closes. That
+        is one refactor away — hoisting ``now = time.monotonic()`` above the
+        reason dispatch — and every other test in this class stays green
+        under it, so the stamp identity is pinned directly here.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=2, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        # One genuine fallback opens the chain: streak=1, stamp set.
+        await _drive_session_slot(harness, 'cs0', self._stale_session('uuid-cs0'))
+        assert harness._session_resume_fallback_streak == 1
+        stamp = harness._last_session_resume_fallback_at
+        assert stamp is not None
+
+        # A drip of reseeds moves NEITHER the counter nor the stamp.
+        for i in range(3):
+            await _drive_session_slot(
+                harness, f'csr{i}', self._fresh_session(f'uuid-csr{i}'),
+                config_dir=tmp_path / f'gone{i}' / 'claude-config-x',
+            )
+        assert harness._session_resume_fallback_streak == 1
+        assert harness._last_session_resume_fallback_at == stamp
+
+        # So when the clock passes the window, the NEXT genuine fallback is
+        # measured against the first one and decays — reaching 1, not the
+        # threshold of 2.
+        harness._last_session_resume_fallback_at = stamp - 120
+        await _drive_session_slot(harness, 'cs1', self._stale_session('uuid-cs1'))
+
         assert harness._session_resume_fallback_streak == 1
         assert harness._escalation_queue.submit.call_count == 0
 

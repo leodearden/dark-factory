@@ -3078,22 +3078,28 @@ class Harness:
         input degrades to an ineligible ``(False, <reason>)`` so the caller
         falls back to a fresh dispatch — this method NEVER raises.
 
-        Reasons (checked in this order):
+        Reasons, in branch order:
           - 'disabled'      — the session_resume kill switch is off (B6).
           - 'stale'         — (now - started_at) >= freshness_window_secs, OR
                               started_at is missing/unparseable (fail-safe).
           - 'capped'        — resume_count >= max_resumes_per_task (B7).
-          - 'reseeded'      — the stashed config dir is gone on disk: warm-lane
-                              acquire ALWAYS re-seeds from base
+        Then transcript corroboration, which resolves three ways. Note
+        'no_transcript' is listed first because it is reached BOTH before the
+        transcript glob (nothing to corroborate with) and after it (the store
+        survived but this session's file is missing):
+          - 'no_transcript' — no stashed config_dir, no session_id, the config
+                              dir survives but this session's transcript is
+                              absent, or the dir is present-but-unreadable
+                              (a filesystem fault is NOT a wipe) — a genuine
+                              corroboration failure.
+          - 'reseeded'      — the stashed config dir is PROVABLY gone on disk
+                              (ENOENT/ENOTDIR): warm-lane acquire ALWAYS
+                              re-seeds from base
                               (docs/prds/warm-lane-pool-cow-seeding.md §9.3/
                               §9.5), which wipes <lane>/.task/ and the whole
                               transcript store with it. An EXPECTED fallback,
                               not a corroboration failure (task 3256) — it
                               does not feed the fallback-storm streak.
-          - 'no_transcript' — no stashed config_dir, no session_id, or the
-                              config dir survives but this session's
-                              transcript is absent — a genuine corroboration
-                              failure.
           - 'eligible'      — all corroboration passed; inject the session.
         """
         cfg = self.config.session_resume
@@ -3124,7 +3130,7 @@ class Harness:
         # transcript degrades to one of the two ineligible reasons below.
         #
         # A failed corroboration is then split (task 3256) on whether the
-        # config dir that HELD the transcript still exists: its absence is
+        # config dir that HELD the transcript is PROVABLY gone: its absence is
         # positive evidence that the whole store was wiped by an acquire
         # reseed ('reseeded', expected), while a surviving dir missing only
         # this session's transcript is a genuine failure ('no_transcript').
@@ -3137,11 +3143,25 @@ class Harness:
         if not config_dir or not session_id:
             return (False, 'no_transcript')
         if not transcript_exists(Path(config_dir), session_id):
-            # Path.exists() is total (it swallows OSError and returns False),
-            # so nothing can escape this method; an unreadable path therefore
-            # fails toward 'reseeded'.
-            if not Path(config_dir).exists():
+            # Discriminate "PROVABLY gone" from "there but unreadable", and do
+            # it with an explicit stat rather than Path.exists(), which is
+            # wrong for this seam in both directions: it swallows exactly
+            # {ENOENT, ENOTDIR, EBADF, ELOOP} into False — so a symlink loop
+            # or bad fd would read as a wipe and land in the SILENT,
+            # storm-exempt 'reseeded' arm — and it RE-RAISES every other
+            # OSError (EACCES on a parent, ESTALE, EIO), which would escape
+            # this method and break the never-raises I3 contract above.
+            # Either way a genuine filesystem fault stops surfacing as the
+            # systematic breakage INV-4 exists to catch. So: only ENOENT/
+            # ENOTDIR earns 'reseeded'; everything else falls through to the
+            # LOUD arm, caught here so the method stays total (ValueError
+            # covers the NUL-bearing path that os.stat rejects outright).
+            try:
+                Path(config_dir).stat()
+            except (FileNotFoundError, NotADirectoryError):
                 return (False, 'reseeded')
+            except (OSError, ValueError):
+                pass  # unreadable/faulted != wiped — stay loud
             return (False, 'no_transcript')
         return (True, 'eligible')
 
