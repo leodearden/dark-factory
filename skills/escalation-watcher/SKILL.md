@@ -252,12 +252,21 @@ already reads it breaks.
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
   [--task-id <task_id>] [--escalation-id <escalation_id>] [--session-id watcher-<project>-$$] \
-  [--severity <esc.severity>]
+  [--severity <esc.severity>] [--escalations-dir <project_root>/data/escalations]
 ```
 
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
   escalation id (`esc-42-1`) is usually the natural choice. Re-filing the same id overwrites the
   prior record rather than duplicating it (`write-decision` always writes the whole file).
+  **INTERIM RULE — check before you overwrite.** Decision ids are fleet-global, so *another*
+  watcher (notably the recon watcher, which runs its own queue) may already have filed a decision
+  for the same underlying human gate under this id. Before filing, check whether a decision for
+  that id already exists and is still `open`; if it is, do **not** overwrite it — a second watcher
+  observing the same gate must enrich or no-op, never clobber richer context or downgrade an
+  existing record's severity. Park your own record and add the id to your handled set instead.
+  (Observed with `esc-5914-1`, where both queues surfaced the same reify gate; that duplicate
+  landing on one id is the *correct* outcome — one question, one cockpit row — but only if the
+  second filer doesn't degrade the first one's record.)
 - **`--text`**: the one-line question a human needs to answer — the same summary you'd otherwise
   only give in-session or in the digest.
 - **`--task-id` / `--escalation-id` / `--session-id`**: thread through whatever you have — the
@@ -267,6 +276,14 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
   under stale awaiting-input sessions.
+- **`--escalations-dir`**: the escalation **queue** your `--escalation-id` belongs to — for this
+  watcher, `<project_root>/data/escalations`. It must name the SAME queue you later pass to
+  `reap-decisions` (below). Decision records are fleet-global while an escalation id
+  (`esc-<taskid>-<n>`) is unique only *within* one queue, and a project can run several
+  (dark_factory also runs `data/reconciliation/escalations` over the same id namespace), so this is
+  what lets the reaper join a decision back to the right per-queue id namespace instead of matching
+  an unrelated same-named escalation. Stored normalized, so any spelling of the same directory
+  works. Omitting it files a queue-less record — see the reaper caveat below.
 - The verb always files `state=open` and prints the filed id on success for your own cross-link
   (e.g. into the digest line). It is fail-soft — a registry fault is logged and swallowed, never
   raised, so filing a decision can never crash the watch loop or block the park itself.
@@ -292,6 +309,13 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py rea
 This closes (`answered`/`dropped`) any `state=open`, `escalation_id`-bearing decision whose
 escalation has since resolved (`resolved` → `answered`) or been dismissed (`dismissed` →
 `dropped`) — regardless of who resolved it: this session, `/unblock`, an L2 cascade, or the human.
+The join is scoped on **two** axes, project *and* queue: a decision stamped (via
+`write-decision --escalations-dir`) with a queue **other** than the `--escalations-dir` you pass
+here is skipped outright, so your reaper can never close the recon watcher's decisions against
+your own same-named escalations. A decision filed **without** `--escalations-dir` — every record
+predating that flag — falls back to project-only scoping and therefore has **no** such protection:
+it can still be closed by whichever queue's reaper reaches it first. That is the reason to always
+pass the flag when filing.
 It is read-only with respect to escalations (it only ever writes the decision's own state field)
 and fail-soft, exactly like `write-decision` — a registry fault is logged and swallowed, never
 raised, so it can never crash the watch loop. A decision filed with **no** `escalation_id` (e.g.
