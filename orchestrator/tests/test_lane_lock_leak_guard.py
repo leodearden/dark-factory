@@ -522,6 +522,32 @@ def test_foreign_holder_fixture_survives_a_transient_empty_holder_read(
     )
 
 
+def test_foreign_holder_bounds_clear_measured_spawn_latency():
+    """Both foreign-holder bounds must clear a MEASURED worst-case spawn latency.
+
+    Not a guess: task 3451 measured worst-case happy-path subprocess spawn
+    latency on this host at 4.71s (n=3: 2.13/3.10/4.71) at load-per-core 6.6.
+    Any bound near 5s is within noise of that measured worst case — which is
+    exactly how ``_FOREIGN_HOLDER_STARTUP_SECS = 5.0`` produced the flake
+    this task fixes. Both bounds here only gate how long a genuinely BROKEN
+    staging takes to fail; they can never make a broken staging pass, so
+    widening them buys safety margin at zero cost to a healthy run, while
+    tightening either back below the measured worst case buys nothing but
+    another full-suite flake — hence pinning the floor as an invariant,
+    following task 3451's own headroom-invariant precedent
+    (``test_set_started_grace_floor_clears_measured_happy_path_latency``).
+    """
+    assert _FOREIGN_HOLDER_STARTUP_SECS >= 8.0, (
+        f'must clear the measured worst-case happy-path spawn latency '
+        f'(4.71s at load-per-core 6.6, task 3451) with real margin; '
+        f'got {_FOREIGN_HOLDER_STARTUP_SECS}'
+    )
+    assert _FOREIGN_HOLDER_ATTRIBUTION_SECS >= 8.0, (
+        f'must clear the same measured worst-case happy-path spawn latency '
+        f'with real margin; got {_FOREIGN_HOLDER_ATTRIBUTION_SECS}'
+    )
+
+
 @pytest.mark.asyncio
 async def test_scaffold_real_git_fixtures_available(real_git_ops):
     """Smoke pin: the imported real-git fixtures resolve in THIS module.
