@@ -941,6 +941,13 @@ def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
     )
 
 
+def _ensure_output_parents(*paths) -> None:
+    """Create the parent directory of every non-``None`` output path."""
+    for path in paths:
+        if path is not None:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
 _VALID_ENTRY_SEVERITIES = ("high", "medium", "low")
 """codebook.py's own ``_ENTRY_SCHEMA["severity"]`` enum, duplicated here
 since codebook.py is NOT modified by this module (see the module
@@ -1142,6 +1149,43 @@ def run_census(
             detail=reason,
         )
         return CensusOutcome(status="deferred", reason=reason)
+
+    # Every output parent, created ONCE, here -- not at each of the four
+    # write sites below. Three reasons, in order of how much they cost when
+    # ignored:
+    #
+    # (1) FAIL-FAST. On 2026-08-03 a census of /home/leo/src/reify mined to
+    #     saturation (~12.5h, ~$100) and only THEN died on its first output
+    #     write: `[Errno 2] No such file or directory:
+    #     '/home/leo/src/reify/plans/confusion-census-2026-08-02-payloads.json'`
+    #     -- reify simply has no plans/ directory. Creating (or failing to
+    #     create) the parents before mining means an un-creatable output path
+    #     costs nothing instead of a whole mining run.
+    # (2) ONE PLACE. report_path, the dry-run payloads, codebook_path and
+    #     census_state_path are four writers of the SAME run's outputs; a
+    #     mkdir at each is lockstep duplication (INV-5) that drifts the moment
+    #     a fifth output is added. Note this covers codebook.dump and
+    #     advance_census_state too, not just the two write_text calls: both
+    #     write atomically via `tempfile.mkstemp(dir=os.path.dirname(path))`,
+    #     which raises the same FileNotFoundError on a missing directory as
+    #     write_text does. reify tripped only the plans/ pair because main()
+    #     loads its config from <root>/docs/legibility/legibility.yaml, so
+    #     that directory necessarily existed; a target reached via --config
+    #     pointing elsewhere trips the codebook/state pair identically.
+    #     dark-factory's own plans/ + docs/legibility/ are the ONLY reason
+    #     none of this was ever hit before.
+    # (3) AFTER THE GATE. Sitting below the headroom-defer return rather than
+    #     at the top of run_census keeps the DEFER branch side-effect-free --
+    #     a deferred census creates no empty directories in the target
+    #     project.
+    #
+    # Creating an empty directory is not persisted census state, so the
+    # documented report -> codebook.dump -> advance_census_state ordering
+    # invariant (see this function's docstring and the comments at those
+    # three sites) is untouched by this call.
+    _ensure_output_parents(
+        report_path, codebook_path, census_state_path, dry_run_payloads_path,
+    )
 
     mining_result = mine_to_saturation(
         batch_source,
