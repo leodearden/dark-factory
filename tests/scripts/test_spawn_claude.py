@@ -790,7 +790,16 @@ def test_genuine_launcher_failure_yields_127(
     fail_term.chmod(0o755)
 
     env = _base_env(bin_dir, terminal_name)
-    result = _run_spawn(env, tmp_path, timeout=15)
+    # Task 3599: dropped the fixed timeout=15 pin -- measured happy path
+    # 1.36-2.19s per param (n=6) at load-per-core 2.2 in this worktree, yet
+    # the old 15s bound was exceeded under merge-verify contention
+    # (escalation esc-3495-1, log
+    # data/verify-logs/3495/attempt-1.scripts.test-20260803T151949_260976Z.log).
+    # This was the only _run_spawn call in the file that LOWERED the bound
+    # below the default for a load-SENSITIVE assertion, and gained nothing
+    # by doing so: the contract is returncode == 127, not a latency SLA.
+    # Now inherits _run_spawn's load-scaled 30s default.
+    result = _run_spawn(env, tmp_path)
     assert result.returncode == 127, (
         f"[{terminal_name}] Genuine launcher failure must yield 127, "
         f"got {result.returncode}\nstderr: {result.stderr.decode()}"
@@ -839,7 +848,7 @@ def test_bad_usage_yields_2(tmp_path: pathlib.Path) -> None:
     result = subprocess.run(
         [str(SPAWN_SCRIPT), "only-one-arg"],
         capture_output=True,
-        timeout=5,
+        timeout=_spawn_run_budget(5),
     )
     assert result.returncode == 2, (
         f"Bad usage must yield 2, got {result.returncode}"
@@ -1192,9 +1201,15 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
     # Must-not-hang guard, not a latency SLA -- mirrors
     # test_window_close_yields_129_not_hang's Popen+wait(timeout) pattern.
     # Pre-impl this hangs forever (unbounded await_sentinel), so a bounded
-    # wait cleanly separates pass/fail from an infinite hang.
+    # wait cleanly separates pass/fail from an infinite hang. Task 3599:
+    # the bound is now load-scaled via _spawn_run_budget -- the same
+    # whole-invocation wall-clock policy _run_spawn itself uses, reached
+    # here via Popen+wait instead of subprocess.run. The rc==144 verdict IS
+    # load-sensitive (it needs the watchdog to flag AND the parent to
+    # exit), unlike the SPAWN_STARTED_GRACE_SECS pin above, which stays
+    # fixed on its own, different channel.
     try:
-        rc = proc.wait(timeout=20)
+        rc = proc.wait(timeout=_spawn_run_budget(20))
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
@@ -2656,16 +2671,11 @@ def test_tmux_backend_stamps_display_record(tmp_path: pathlib.Path) -> None:
     env["CLAUDE_SPAWN_BACKEND"] = "tmux"
     env["CLAUDE_SPAWN_PROJECT"] = "proj"
 
-    # Use a distinctive, non-empty title (unlike _run_spawn's hardcoded "")
-    # so the wm_title assertion below actually exercises the wiring instead
-    # of trivially matching an empty default.
+    # Use a distinctive, non-empty title so the wm_title assertion below
+    # actually exercises the wiring instead of trivially matching an empty
+    # default.
     title = "tmux-lane-display-test"
-    result = subprocess.run(
-        [str(SPAWN_SCRIPT), str(tmp_path), "false", title, "test prompt"],
-        env=env,
-        capture_output=True,
-        timeout=30,
-    )
+    result = _run_spawn(env, tmp_path, title=title)
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
