@@ -995,6 +995,14 @@ def apply_topic_anchor(
     Returns the input list unchanged (same contents, same order) when nothing
     is pinnable — the pin is not a rewrite.
 
+    ``canonical is True`` is NOT re-checked here.  β's
+    ``invalid_canonical_type`` rule is bool identity — a truthy ``1`` is a
+    FATAL violation at the write boundary — and that rule is enforced once,
+    at index-construction time, by :func:`build_canonical_by_topic`, which
+    skips any record whose flag is not the bool.  Re-asserting it on the
+    already-filtered index would be a branch the module's own wiring cannot
+    reach, guarding a state the index cannot contain.
+
     Pure: never mutates *hits*, *canonical_by_topic*, or any record.
     """
     present_ids = {hit.record_id for hit in hits}
@@ -1010,15 +1018,6 @@ def apply_topic_anchor(
         canonical = canonical_by_topic.get(topic)
         if canonical is None:
             continue
-        if canonical.metadata.get('canonical') is not True:
-            raise ValueError(
-                f'the record registered as canonical for topic {topic!r} '
-                f'({canonical.record_id!r}) does not carry canonical is True — '
-                f'β\'s invalid_canonical_type rule is bool identity, so a truthy '
-                f'value is a FATAL violation at the write boundary. Anchoring on '
-                f'it would report a discoverability win for a shape production '
-                f'cannot store.'
-            )
         if canonical.record_id in present_ids:
             continue  # already ranked — never duplicated
         pinned.append(canonical)
@@ -2274,6 +2273,32 @@ BLIND_AUTHORING_PROTOCOL = (
 )
 
 
+async def _gather_all(coroutines: Any) -> list[Any]:
+    """``gather``, but never leaving a sibling coroutine in flight on failure.
+
+    A bare ``asyncio.gather`` propagates the FIRST exception immediately and
+    leaves every sibling running.  On the seeding side that is a real leak,
+    not a tidiness point: control unwinds to :func:`run_bake_off`'s ``finally``,
+    which closes the service and then drops the ephemeral collections — and an
+    orphan write still in flight inside mem0's client can land AFTER the drop,
+    recreating the collection under the reaped prefix.  That is precisely the
+    leak the ISOLATION block above says cannot happen.
+
+    ``return_exceptions=True`` makes every coroutine reach a terminal state
+    before this returns, so nothing survives into teardown; the first failure
+    is then re-raised UNCHANGED, so callers still see a plain
+    :class:`SeedingError` / :class:`MeasurementError` rather than the
+    ``ExceptionGroup`` a ``TaskGroup`` would hand them.
+
+    Results keep input order, so callers can zip them back against their keys.
+    """
+    outcomes = await asyncio.gather(*coroutines, return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    return list(outcomes)
+
+
 class SeedingError(RuntimeError):
     """A seeded record could not be mapped back to its stored id.
 
@@ -2499,7 +2524,7 @@ async def seed_arm(
             )
         seeded.by_stored_id[results[0]['id']] = record
 
-    await asyncio.gather(*(_write(record) for record in seeded.records))
+    await _gather_all(_write(record) for record in seeded.records)
     return seeded
 
 
@@ -2567,6 +2592,7 @@ async def fetch_arm(
     probes: list[tuple[str, dict[str, Any]]],
     *,
     limit: int = DEFAULT_SEARCH_LIMIT,
+    concurrency: int = SEED_CONCURRENCY,
 ) -> dict[str, dict[str, list[ScoredHit]]]:
     """Every ranked list this arm needs, fetched ONCE.
 
@@ -2576,23 +2602,37 @@ async def fetch_arm(
 
     Guard probes drop the probing write's own record — see
     :data:`GUARD_FETCH_LIMIT`.
+
+    Bounded-concurrent, at the same :data:`SEED_CONCURRENCY` the write side
+    uses and for the same reason: serially this is 236 queries + 15 probes of
+    embed-then-ANN round trips PER ARM, and the read side had no reason to be
+    the only half paying that wall clock.  Determinism is untouched — every
+    ``_search`` is independent, and the results are keyed by ``query_id`` /
+    ``cluster_id`` rather than by arrival order, so what comes back is
+    identical whatever order it arrives in.
     """
-    fetched_queries: dict[str, list[ScoredHit]] = {}
-    for query in queries:
-        fetched_queries[query.query_id] = await _search(
-            backend, seeded, query.text, limit=limit,
-        )
+    semaphore = asyncio.Semaphore(concurrency)
 
-    fetched_probes: dict[str, list[ScoredHit]] = {}
-    for cluster_id, probe in probes:
+    async def _bounded_search(text: str, *, limit: int) -> list[ScoredHit]:
+        async with semaphore:
+            return await _search(backend, seeded, text, limit=limit)
+
+    async def _query_hits(query: Query) -> tuple[str, list[ScoredHit]]:
+        return query.query_id, await _bounded_search(query.text, limit=limit)
+
+    async def _probe_hits(
+        cluster_id: str, probe: dict[str, Any],
+    ) -> tuple[str, list[ScoredHit]]:
         own = probe_own_record_ids(seeded, probe['memory_id'])
-        raw = await _search(
-            backend, seeded, probe['content'], limit=guard_fetch_limit(own),
+        raw = await _bounded_search(
+            probe['content'], limit=guard_fetch_limit(own),
         )
-        fetched_probes[cluster_id] = [
-            hit for hit in raw if hit.record.record_id not in own
-        ]
+        return cluster_id, [hit for hit in raw if hit.record.record_id not in own]
 
+    fetched_queries = dict(await _gather_all(_query_hits(q) for q in queries))
+    fetched_probes = dict(
+        await _gather_all(_probe_hits(cid, probe) for cid, probe in probes)
+    )
     return {'queries': fetched_queries, 'probes': fetched_probes}
 
 

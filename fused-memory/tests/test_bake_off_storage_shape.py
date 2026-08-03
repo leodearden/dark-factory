@@ -1344,17 +1344,14 @@ class TestTopicAnchorCanonicalIsBoolIdentity:
     a pin that accepted it would anchor on records the write boundary would
     have rejected — and E2 would report a discoverability win for a shape
     production cannot store.
+
+    The rejecting half is asserted where the rule is ENFORCED —
+    `build_canonical_by_topic`, the sole producer of the index this function
+    reads (see TestBuildCanonicalByTopic below).  `apply_topic_anchor` used to
+    re-check it on the already-filtered index; that branch was unreachable
+    through the module's own wiring, so the only thing that could exercise it
+    was a hand-built dict no caller constructs.
     """
-
-    def test_a_truthy_one_is_not_accepted_as_canonical(self):
-        mod = _mod()
-        impostor = _anchor_hit('impostor', topic='alpha', canonical=1)
-
-        with pytest.raises(ValueError, match='canonical'):
-            mod.apply_topic_anchor(
-                [_anchor_hit('peer-1', topic='alpha')],
-                canonical_by_topic={'alpha': impostor},
-            )
 
     def test_a_real_bool_true_is_accepted(self):
         mod = _mod()
@@ -1411,6 +1408,25 @@ class TestBuildCanonicalByTopic:
         ])
 
         assert index == {}
+
+    def test_a_truthy_one_never_enters_the_index(self):
+        """Bool identity, mirroring β's `invalid_canonical_type`.
+
+        This is where the rule is enforced, and it is enforced ONCE: an
+        impostor that never enters the index can never be pinned, so
+        `apply_topic_anchor` needs no re-check downstream.  A truthy `1` is a
+        FATAL violation at β's write boundary, so anchoring on one would
+        report a discoverability win for a shape production cannot store.
+        """
+        mod = _mod()
+        impostor = _anchor_hit('impostor', topic='alpha', canonical=1)
+
+        index = mod.build_canonical_by_topic([impostor])
+
+        assert index == {}
+        # And therefore nothing to pin — the invariant, end to end.
+        hits = [_anchor_hit('peer-1', topic='alpha')]
+        assert mod.apply_topic_anchor(hits, canonical_by_topic=index) is hits
 
     def test_the_index_is_deterministic_across_input_orderings(self):
         mod = _mod()
@@ -3060,27 +3076,51 @@ class _FakeInstance:
 class _FakeMem0:
     """The Mem0Backend surface the driver touches, and nothing else."""
 
-    def __init__(self, *, search_raises_on: int | None = None):
+    def __init__(
+        self,
+        *,
+        search_raises_on: int | None = None,
+        add_returns_no_id_on: int | None = None,
+        add_ticks: int = 1,
+    ):
         self.added: list[tuple[str, str]] = []            # (project_id, content)
         self.searches: list[tuple[str, str, int]] = []    # (project_id, query, limit)
         self.instances: dict[str, _FakeInstance] = {}
         self.inflight = 0
         self.max_inflight = 0
+        self.search_inflight = 0
+        self.max_search_inflight = 0
         self._search_raises_on = search_raises_on
+        #: 1-based ordinal of an `add` that returns a result with no id — the
+        #: shape that makes `seed_arm._write` raise SeedingError.
+        self._add_returns_no_id_on = add_returns_no_id_on
+        #: Event-loop ticks a successful `add` parks for.  >1 keeps a sibling
+        #: measurably in flight past the moment a failing peer raises, which
+        #: is the only way to tell "awaited every write" from "propagated and
+        #: left them running".
+        self._add_ticks = add_ticks
+        self._add_calls = 0
         self._stored: dict[str, list[dict]] = {}
 
     async def _get_instance(self, scope):
         return self.instances.setdefault(scope.project_id, _FakeInstance())
 
     async def add(self, content, scope, metadata=None):
+        self._add_calls += 1
+        ordinal = self._add_calls
         self.inflight += 1
         self.max_inflight = max(self.max_inflight, self.inflight)
         try:
+            if ordinal == self._add_returns_no_id_on:
+                # Fails WITHOUT suspending, so its peers are still parked below
+                # when `seed_arm` sees the error.
+                return {'results': []}
             # A REAL suspension point.  Without one, every scheduling policy
             # looks bounded because nothing ever overlaps; with it, an
             # unbounded gather parks all N tasks here at once and
             # `max_inflight` reaches N.
-            await asyncio.sleep(0)
+            for _ in range(self._add_ticks):
+                await asyncio.sleep(0)
             bucket = self._stored.setdefault(scope.project_id, [])
             stored_id = f'{scope.project_id}-{len(bucket):04d}'
             bucket.append({'id': stored_id, 'memory': content,
@@ -3095,13 +3135,23 @@ class _FakeMem0:
         if (self._search_raises_on is not None
                 and len(self.searches) >= self._search_raises_on):
             raise RuntimeError('qdrant went away mid-run')
-        await asyncio.sleep(0)
-        bucket = self._stored.get(scope.project_id, [])
-        return {'results': [
-            {'id': item['id'], 'memory': item['memory'],
-             'metadata': item['metadata'], 'score': round(0.99 - 0.01 * rank, 4)}
-            for rank, item in enumerate(bucket[:limit])
-        ]}
+        self.search_inflight += 1
+        self.max_search_inflight = max(
+            self.max_search_inflight, self.search_inflight,
+        )
+        try:
+            # Same reason as `add`: without a real suspension point the read
+            # side cannot be observed to overlap at all, and a serial fetch
+            # would be indistinguishable from a bounded-concurrent one.
+            await asyncio.sleep(0)
+            bucket = self._stored.get(scope.project_id, [])
+            return {'results': [
+                {'id': item['id'], 'memory': item['memory'],
+                 'metadata': item['metadata'], 'score': round(0.99 - 0.01 * rank, 4)}
+                for rank, item in enumerate(bucket[:limit])
+            ]}
+        finally:
+            self.search_inflight -= 1
 
 
 class _FakeMemoryService:
@@ -3109,10 +3159,16 @@ class _FakeMemoryService:
 
     instances: list = []
     search_raises_on: int | None = None
+    add_returns_no_id_on: int | None = None
+    add_ticks: int = 1
 
     def __init__(self, config):
         self.config = config
-        self.mem0 = _FakeMem0(search_raises_on=type(self).search_raises_on)
+        self.mem0 = _FakeMem0(
+            search_raises_on=type(self).search_raises_on,
+            add_returns_no_id_on=type(self).add_returns_no_id_on,
+            add_ticks=type(self).add_ticks,
+        )
         self.initialized = False
         self.closed = False
         # `config` is held by REFERENCE, so reading `config.queue.data_dir`
@@ -3145,7 +3201,13 @@ class _DropRecorder:
         return {name for call in self.calls for name in call}
 
 
-def _install_driver_doubles(monkeypatch, *, search_raises_on: int | None = None):
+def _install_driver_doubles(
+    monkeypatch,
+    *,
+    search_raises_on: int | None = None,
+    add_returns_no_id_on: int | None = None,
+    add_ticks: int = 1,
+):
     """Patch the three seams the driver reaches through, at their source.
 
     The driver imports ``FusedMemoryConfig`` and ``MemoryService``
@@ -3160,6 +3222,8 @@ def _install_driver_doubles(monkeypatch, *, search_raises_on: int | None = None)
 
     _FakeMemoryService.instances = []
     _FakeMemoryService.search_raises_on = search_raises_on
+    _FakeMemoryService.add_returns_no_id_on = add_returns_no_id_on
+    _FakeMemoryService.add_ticks = add_ticks
     monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _driver_config)
     monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
     drops = _DropRecorder()
@@ -3518,6 +3582,72 @@ class TestRunBakeOffWiring:
         )
         assert smallest_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
         assert mem0.max_inflight <= mod.SEED_CONCURRENCY
+
+    async def test_fetching_is_concurrent_and_bounded_like_seeding(
+        self, monkeypatch,
+    ):
+        """The read side pays the same round-trip tax as the write side.
+
+        Serially this is one embed+ANN round trip per query and per probe, per
+        arm — 251 of them at full size, 753 across the three arms — while the
+        write side was deliberately bounded-concurrent for exactly that
+        reason.  Concurrency is safe here because every `_search` is
+        independent and the results are keyed by `query_id`/`cluster_id`, not
+        by arrival order, so nothing about determinism changes.
+
+        Both halves are asserted: it OVERLAPS at all (a serial fetch never
+        exceeds 1 in flight), and it stays UNDER the same bound seeding uses
+        (an unbounded gather would open every query's embedding request at
+        once, which is the failure the seed bound exists to prevent).
+        """
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        mem0 = _FakeMemoryService.instances[-1].mem0
+        per_arm = len(mem0.searches) / len(mod.ARM_SHAPES)
+        assert per_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
+        assert mem0.max_search_inflight > 1
+        assert mem0.max_search_inflight <= mod.SEED_CONCURRENCY
+
+    async def test_a_failed_seed_leaves_no_write_in_flight_past_teardown(
+        self, monkeypatch,
+    ):
+        """An orphan write can recreate the collection teardown just dropped.
+
+        A bare `gather` propagates the first SeedingError IMMEDIATELY and
+        leaves its siblings running.  Control unwinds to `run_bake_off`'s
+        `finally`, which closes the service and then drops the ephemeral
+        collections — and a write still in flight inside mem0's client can
+        land AFTER the drop, recreating the collection under the
+        `_test_e2_bakeoff` prefix and leaking exactly what the module's
+        ISOLATION block says cannot leak.
+
+        Asserted as "nothing is in flight when the raise arrives", which is
+        the property that makes the ordering safe, rather than as "a
+        TaskGroup was used", which is an implementation.  The exception type
+        is pinned too: callers catch SeedingError, and an ExceptionGroup
+        wrapper would be a silent contract change.
+        """
+        mod = _mod()
+        drops = _install_driver_doubles(
+            monkeypatch, add_returns_no_id_on=1, add_ticks=5,
+        )
+
+        with pytest.raises(mod.SeedingError):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        mem0 = _FakeMemoryService.instances[-1].mem0
+        assert mem0.inflight == 0, (
+            f'{mem0.inflight} seeding write(s) still in flight when teardown '
+            f'dropped the collections'
+        )
+        # The bound had to actually bite, or "nothing in flight" is vacuous:
+        # a run whose every write completed before the raise proves nothing.
+        assert mem0.max_inflight > 1
+        # Teardown really did run underneath the raise.
+        assert len(drops.calls) == 2
 
     async def test_the_pin_variants_reuse_their_shapes_hits_instead_of_requerying(
         self, monkeypatch,
