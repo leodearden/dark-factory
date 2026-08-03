@@ -74,6 +74,25 @@ SIBLING_PREFIX = 'tests/scripts'
 # for the derive_modules -> for_module routing assertions below.
 SAMPLE_TOUCHED_FILE = 'scripts/tests/test_census_trigger.py'
 
+# The two DIRECTORY targets the pytest gate is about, spelled with the trailing
+# slash the commands actually carry. Kept as named constants because the two
+# strings are near-homographs and a transposition between them is exactly the
+# defect `test_scripts_full_suite_pytest_covers_scripts_tests` guards against.
+OWN_TESTS_DIR = 'scripts/tests/'
+SIBLING_TESTS_DIR = 'tests/scripts/'
+
+# A real tracked PRODUCTION module under scripts/, whose only tests live in
+# scripts/tests/test_census_trigger.py. Load-bearing that this is production
+# and not a test file: verify_plan._derive_module_runs arm 3 (the task-3294
+# source-only floor) runs the owning module's test_command VERBATIM for a diff
+# like this one, whereas a touched scripts/tests/test_*.py takes the FILE_SCOPED
+# arm instead and narrows correctly even with the gap open. The FULL_SUITE
+# claim is therefore only falsifiable through a production file.
+SAMPLE_TOUCHED_PRODUCTION_FILE = 'scripts/legibility/census_trigger.py'
+
+# scripts/tests/ own conftest — the CONFTEST trigger for this very directory.
+SAMPLE_TOUCHED_CONFTEST = 'scripts/tests/conftest.py'
+
 # The mechanism, restated once so each failure message can point at it. By
 # SYMBOL, not file:line — see the module docstring: the line pins this string
 # originally carried were all stale at HEAD and sent readers to unrelated code.
@@ -186,6 +205,22 @@ def _executed_for_touched(files: list[str]):
 _RUFF = 'ruff check'
 _PYRIGHT = 'pyright'
 
+# pytest's invocation is `pytest <targets>` with no subcommand, so — like
+# pyright's and unlike ruff's — the anchor is the program name itself. Note the
+# anchor placement is what excludes the pre-anchor positional `shared` of
+# `uv run --project shared pytest ...` from the target list.
+#
+# Deliberately absent from _NARROWING_FLAGS below: that table is consulted only
+# by _narrowing_flag_args, which is never called for pytest. pytest narrows a
+# directory target through -k/-m/--deselect/--ignore rather than through the
+# exclude spellings ruff and pyright use, and listing a set nothing checks
+# would read as coverage while checking nothing — the same objection the
+# _NARROWING_FLAGS comment already records against copying ruff's flags to
+# pyright. The pytest gate's real failure mode is a MISSING target, which
+# assertions (2)-(5) of test_scripts_full_suite_pytest_covers_scripts_tests
+# test directly.
+_PYTEST = 'pytest'
+
 # Flag PREFIXES that narrow what a directory-wide target actually gets checked,
 # per checker. Prefix-matched, so each entry covers both the `--flag value` and
 # the `--flag=value` spelling.
@@ -279,6 +314,19 @@ def _ruff_targets(cmd: str) -> list[str]:
 
 def _ruff_exclude_flags(cmd: str) -> list[str]:
     return _narrowing_flag_args(cmd, _RUFF)
+
+
+def _pytest_targets(cmd: str) -> list[str]:
+    """The directories/files *cmd*'s pytest segment actually collects.
+
+    Same thin-wrapper shape as ``_ruff_targets``. EXACT-ELEMENT membership is
+    load-bearing here rather than merely tidy: ``'scripts/'`` is a SUBSTRING of
+    ``'tests/scripts/'``, so a naive ``'scripts/tests/' in cmd`` is the only
+    spelling that would work by substring and ``'tests/scripts/' in cmd`` is
+    satisfied by a command targeting neither tree correctly. Splitting out the
+    positional targets is what lets the two near-homograph trees be told apart.
+    """
+    return _targets(cmd, _PYTEST)
 
 
 def test_scripts_diff_is_lint_gated() -> None:
@@ -679,4 +727,215 @@ def test_scripts_diff_is_type_gated() -> None:
         f'files are gated by nothing. Note the two test_commands ARE '
         'byte-identical by design — that is a different, already-recorded issue '
         'and is not license to duplicate this one'
+    )
+
+
+def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
+    """A FULL_SUITE pytest run for the ``scripts`` module must collect scripts/tests/.
+
+    The TEST third of the contract ``test_scripts_diff_is_lint_gated`` and
+    ``test_scripts_diff_is_type_gated`` pin for LINT and TYPE, closing the gap
+    task 3445 recorded in ``scripts/orchestrator.yaml`` and task 3460 fixed.
+    ``scripts/tests/`` holds 40 test modules, and the declared
+    ``test_command`` targeted only ``tests/scripts/`` — the SIBLING tree — so
+    under FULL_SUITE those 40 modules never ran.
+
+    Unlike the lint/type gaps this is NOT a vacuous-pass: the command was
+    present and green, it simply collected the wrong tree. That makes it
+    strictly harder to notice, because no check reports skipped and no command
+    is None — which is why the claim has to be made on the TARGETS rather than
+    on presence.
+
+    THREE production paths reach the FULL_SUITE form, and all three were
+    affected; each is asserted separately because each is derived by a
+    different symbol and a regression could restore any one of them alone:
+
+      (2) ``verify_plan._derive_module_runs`` arm 3 — the task-3294 source-only
+          floor — runs the owning module's ``test_command`` VERBATIM for ANY
+          ``scripts/`` production diff. Measured before the fix: touching
+          ``scripts/legibility/census_trigger.py`` rendered
+          ``pytest tests/scripts/`` at scope ``full_suite``, reason "pytest:
+          source-only diff — owning-module full suite (task role)". Its own
+          tests in ``scripts/tests/test_census_trigger.py`` never ran.
+      (3) The same function's CONFTEST trigger (arm 1). Touching
+          ``scripts/tests/conftest.py`` — the conftest of the very directory —
+          also rendered ``pytest tests/scripts/``.
+      (4) ``verify_plan._derive_full_suite_runs``, the merge-role
+          ``merge_verify_breadth='full'`` deriver the repo root actually
+          enables, which never consults the diff at all.
+
+    Only the arm-4b FILE_SCOPED path (a touched ``scripts/tests/test_*.py``)
+    narrowed correctly, which is why (2) uses a PRODUCTION file: a test file
+    would take that arm and the claim would be unfalsifiable.
+
+    (5) is the reason this is a UNION and not a SWAP, and it is a real
+    assertion rather than a note: ``tests/scripts/`` genuinely tests
+    ``scripts/`` PRODUCTION code (``test_orchestrator_watchdog.py`` <->
+    ``scripts/orchestrator-watchdog.py``, ``test_spawn_claude.py``,
+    ``test_check_dashboard_unit_parity.py``,
+    ``test_restart_all_orchestrators.py``, ...). Because arm 3 runs this
+    command verbatim for every ``scripts/`` production diff, narrowing to
+    ``scripts/tests/`` alone would STOP running those tests for exactly the
+    diffs they cover — trading one coverage gap for another. Coverage must be
+    monotone in the diff, the same principle task 3294 encoded when it moved
+    the floor above the collectable-test branch.
+
+    Asserted STRUCTURALLY through the production ``derive_verify_plan`` ->
+    ``_executed_module_configs_from_plan`` bridge, never by ``yaml.safe_load``
+    and never by an exit code, for the reasons the module docstring records.
+    Cited by SYMBOL, never by file:line, for the same reason.
+    """
+    discovered = _discovered()
+
+    # (1) PRECONDITION. Asserted so a discovery regression cannot make every
+    # assertion below vacuous — an absent config would raise a KeyError with no
+    # explanation, and a None test_command would make _pytest_targets fail on a
+    # TypeError rather than on the claim.
+    assert MODULE_PREFIX in discovered, (
+        f'{MODULE_PREFIX}/orchestrator.yaml is not discovered by the production '
+        f'config._discover_module_configs walk, so nothing below can gate a '
+        f'{MODULE_PREFIX}/ diff. Discovered: {sorted(discovered)}'
+    )
+    mc = discovered[MODULE_PREFIX]
+    assert mc.test_command, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares test_command='
+        f'{mc.test_command!r}. A falsy test_command is not "tests deferred to '
+        f'another config" — verify_plan._derive_module_runs emits a SKIPPED '
+        f'PlannedRun with cmd=None for it, and {_VACUOUS_PASS}'
+    )
+
+    # (2) TASK-ROLE ARM 3 — the task-3294 source-only floor, which runs the
+    # declared command VERBATIM for any scripts/ production diff.
+    executed_production = _executed_for_touched([SAMPLE_TOUCHED_PRODUCTION_FILE])
+    assert executed_production.test_command is not None, (
+        f'executed test_command is None for a diff touching '
+        f'{SAMPLE_TOUCHED_PRODUCTION_FILE!r} (task 3460), so pytest is not run '
+        f'at all: {_VACUOUS_PASS}'
+    )
+    production_targets = _pytest_targets(executed_production.test_command)
+    assert OWN_TESTS_DIR in production_targets, (
+        f'a diff touching the PRODUCTION module {SAMPLE_TOUCHED_PRODUCTION_FILE!r} '
+        f'executes pytest over {production_targets!r}, which does not include '
+        f'{OWN_TESTS_DIR!r} (task 3460). verify_plan._derive_module_runs arm 3 — '
+        f'the task-3294 source-only floor — runs the owning module config\'s '
+        f'test_command VERBATIM for a source-only diff, so this module\'s own 40 '
+        f'test modules under {OWN_TESTS_DIR} never run for the very diffs they '
+        f'cover; scripts/tests/test_census_trigger.py is the direct counterpart '
+        f'of this file. This is NOT a vacuous pass — the command is present and '
+        f'exits 0 — it simply collects the {SIBLING_TESTS_DIR} tree instead, '
+        f'which is why the claim is made on the TARGETS and not on presence. '
+        f'Exact-element membership is deliberate: {MODULE_PREFIX + "/"!r} is a '
+        f'SUBSTRING of {SIBLING_TESTS_DIR!r}'
+    )
+
+    # (3) CONFTEST TRIGGER (arm 1) — the sharpest case, because the touched
+    # file IS scripts/tests/'s own conftest.
+    executed_conftest = _executed_for_touched([SAMPLE_TOUCHED_CONFTEST])
+    assert executed_conftest.test_command is not None, (
+        f'executed test_command is None for a diff touching '
+        f'{SAMPLE_TOUCHED_CONFTEST!r} (task 3460): {_VACUOUS_PASS}'
+    )
+    conftest_targets = _pytest_targets(executed_conftest.test_command)
+    assert OWN_TESTS_DIR in conftest_targets, (
+        f'touching {SAMPLE_TOUCHED_CONFTEST!r} executes pytest over '
+        f'{conftest_targets!r}, which does not include {OWN_TESTS_DIR!r} '
+        f'(task 3460). verify_plan._derive_module_runs\' CONFTEST trigger '
+        f'widens to FULL_SUITE precisely BECAUSE a conftest change can affect '
+        f'every test in its directory — and then runs a command that collects a '
+        'different directory entirely, so the widening buys nothing for the '
+        'suite it was widened for'
+    )
+
+    # (4) MERGE FULL BREADTH — the leg the repo root actually enables with
+    # merge_verify_breadth: "full". Derived by a DIFFERENT symbol from (2)/(3)
+    # and never consults the diff, so it is asserted separately.
+    full_suite_runs = verify_plan._derive_full_suite_runs(mc, role='merge')
+    pytest_runs = [r for r in full_suite_runs if r.reason.startswith('pytest:')]
+    assert len(pytest_runs) == 1, (
+        f'verify_plan._derive_full_suite_runs({MODULE_PREFIX!r}, role="merge") '
+        f'emitted {len(pytest_runs)} pytest PlannedRuns, expected exactly 1: '
+        f'{[r.reason for r in full_suite_runs]!r}'
+    )
+    pytest_run = pytest_runs[0]
+    assert (
+        pytest_run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
+        and pytest_run.cmd is not None
+    ), (
+        f'verify_plan._derive_full_suite_runs({MODULE_PREFIX!r}, role="merge") '
+        f'planned the pytest slot as scope_kind={pytest_run.scope_kind!r} '
+        f'cmd={pytest_run.cmd!r} (task 3460). Under the repo root\'s '
+        f'merge_verify_breadth="full" this slot must run the declared command '
+        f'FULL_SUITE and unconditionally; a SKIPPED slot renders back to None '
+        f'and {_VACUOUS_PASS}'
+    )
+
+    # The command that FULL_SUITE slot runs is mc.test_command VERBATIM — which
+    # is also what (2) and (3) render — so asserting on the DECLARED value here
+    # covers all three paths from one place.
+    declared_targets = _pytest_targets(mc.test_command)
+    assert OWN_TESTS_DIR in declared_targets, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares test_command='
+        f'{mc.test_command!r}, whose pytest targets are {declared_targets!r} — '
+        f'{OWN_TESTS_DIR!r} is not among them (task 3460). '
+        f'verify_plan._derive_full_suite_runs runs this value VERBATIM and '
+        f'unscoped under merge-role merge_verify_breadth="full", so the 40 test '
+        f'modules under {OWN_TESTS_DIR} are ungated on the merge path too'
+    )
+
+    # (5) NON-REGRESSION — why this is a UNION and not a SWAP. See the
+    # docstring: tests/scripts/ tests scripts/ PRODUCTION code, and arm 3 runs
+    # this command verbatim for every scripts/ production diff.
+    assert SIBLING_TESTS_DIR in declared_targets, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares test_command='
+        f'{mc.test_command!r}, whose pytest targets are {declared_targets!r} — '
+        f'{SIBLING_TESTS_DIR!r} is no longer among them (task 3460). Adding '
+        f'{OWN_TESTS_DIR!r} must be ADDITIVE: {SIBLING_TESTS_DIR} genuinely '
+        f'tests {MODULE_PREFIX}/ PRODUCTION code '
+        f'(test_orchestrator_watchdog.py <-> scripts/orchestrator-watchdog.py, '
+        f'test_spawn_claude.py, test_check_dashboard_unit_parity.py, '
+        f'test_restart_all_orchestrators.py, ...), and '
+        f'verify_plan._derive_module_runs arm 3 runs this command verbatim for '
+        f'every {MODULE_PREFIX}/ production diff — so dropping it stops running '
+        'those tests for exactly the diffs they cover, trading one coverage gap '
+        'for another. Coverage must be MONOTONE in the diff'
+    )
+
+    # (6) ANTI-COPY-PASTE, completing the family test_scripts_diff_is_lint_gated
+    # and test_scripts_diff_is_type_gated already guard for the other two
+    # commands. Both halves matter: the gap must not be "closed" by widening the
+    # SIBLING config instead of this one, which would leave a scripts/-only diff
+    # — routed by derive_modules -> for_module's longest-prefix walk to prefix
+    # `scripts`, never to `tests/scripts` — still running the wrong tree.
+    sibling = discovered.get(SIBLING_PREFIX)
+    assert sibling is not None, (
+        f'{SIBLING_PREFIX}/orchestrator.yaml is no longer discovered, so the '
+        'anti-copy-paste comparison below cannot be made (task 3460)'
+    )
+    assert mc.test_command != sibling.test_command, (
+        f'{MODULE_PREFIX} and {SIBLING_PREFIX} declare a BYTE-IDENTICAL '
+        f'test_command {mc.test_command!r} (task 3460). They were identical '
+        f'before this task, and that IS the defect: {MODULE_PREFIX} was running '
+        f'the sibling\'s suite and none of its own. The two directories are '
+        f'distinct trees and {MODULE_PREFIX} must additionally collect '
+        f'{OWN_TESTS_DIR}'
+    )
+    assert sibling.test_command, (
+        f'{SIBLING_PREFIX}/orchestrator.yaml declares test_command='
+        f'{sibling.test_command!r} (task 3460), so it now gates nothing and the '
+        f'comparison above is satisfied for the wrong reason'
+    )
+    sibling_targets = _pytest_targets(sibling.test_command)
+    assert sibling_targets == [SIBLING_TESTS_DIR], (
+        f'{SIBLING_PREFIX}/orchestrator.yaml declares test_command='
+        f'{sibling.test_command!r}, whose pytest targets are '
+        f'{sibling_targets!r}, expected exactly {[SIBLING_TESTS_DIR]!r} '
+        f'(task 3460). The {MODULE_PREFIX} gap must be closed on the '
+        f'{MODULE_PREFIX} module config — widening the SIBLING to also collect '
+        f'{OWN_TESTS_DIR} does NOT close it, because derive_modules -> '
+        f'OrchestratorConfig.for_module\'s longest-prefix walk routes every '
+        f'{MODULE_PREFIX}/** path to prefix {MODULE_PREFIX!r} and never to '
+        f'{SIBLING_PREFIX!r}, so a {MODULE_PREFIX}/-only diff would never reach '
+        'the widened command. Equality rather than membership here precisely '
+        'because a legitimate strengthening of the sibling does not exist: this '
+        'assertion exists to reject exactly that mis-fix'
     )
