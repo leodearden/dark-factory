@@ -19,6 +19,9 @@ merge-verify time.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
@@ -26,9 +29,18 @@ from shared.cli_invoke import (
     _SubprocessResult,
     build_failure_message,
     classify_agent_failure,
+    invoke_with_cap_retry,
     is_cli_invocation_rejected,
     is_zero_output_timeout,
 )
+from shared.invocation_outcome import (
+    CLI_INPUT_REQUIRED_MARKERS,
+    OK,
+    CapHit,
+    CliLocalError,
+    classify_invocation,
+)
+from shared.testing import make_gate_mock
 
 # The two stderr lines observed verbatim in esc-3118-1 (2026-07-28 ~16:31Z).
 FAST_EXIT_STDERR = (
@@ -258,3 +270,142 @@ class TestClassifyAgentFailureCliInputRejected:
         message = build_failure_message('architect', self._fast_exit_result())
         assert message.startswith('architect failed: ')
         assert 'Input must be provided' in message
+
+
+class TestClassifyInvocationCliInputRejectedIsNotACap:
+    """The SUB-5s hazard: ``invoke_with_cap_retry``'s heuristic cap safety-net
+    fires on ``not success and cost_usd == 0 and turns <= 1 and
+    duration_ms < 5000``.  The observed instance escaped it only by accident
+    (duration_ms=17331), but the CLI's stdin wait is just 3s, so a faster
+    fast-exit lands INSIDE that window.
+
+    Because ``classify_invocation`` currently returns ``Failure('unclassified')``
+    for this shape, the net's ``isinstance(outcome, (CliLocalError,
+    ServerError))`` escape does not fire and the run is reported as a SYNTHETIC
+    CAP HIT — churning the whole OAuth pool through compounding cooldowns for a
+    local argument-validation error the API never even saw.  The CLI exits
+    BEFORE contacting the API here, so a cap message is impossible by
+    construction; this must classify as ``CliLocalError``.
+    """
+
+    def test_marker_table_is_non_empty(self):
+        """Guard the guard: an empty table would make every assertion below
+        vacuous rather than failing."""
+        assert CLI_INPUT_REQUIRED_MARKERS
+
+    def test_fast_exit_classifies_as_cli_local_error_not_unclassified(self):
+        result = _parse_claude_output(_fast_exit_subprocess())
+        outcome = classify_invocation(result, strict_confirm=True, backend='claude')
+        assert isinstance(outcome, CliLocalError), (
+            f'expected CliLocalError so the cap safety-net escape fires, got '
+            f'{outcome!r} -- an unclassified outcome is reported as a synthetic cap'
+        )
+        assert outcome.marker in CLI_INPUT_REQUIRED_MARKERS
+        assert not isinstance(outcome, CapHit)
+
+    def test_cli_local_error_outranks_co_occurring_cap_text(self):
+        """PRECEDENCE (reify-3604's structural fix, extended): even when the
+        output ALSO carries cap-like text, the local rejection wins."""
+        outcome = classify_invocation(
+            AgentResult(
+                success=False,
+                output="You've hit your usage limit. Your plan resets in 3h.",
+                stderr=FAST_EXIT_STDERR,
+            ),
+            strict_confirm=True,
+            backend='claude',
+        )
+        assert isinstance(outcome, CliLocalError)
+        assert not isinstance(outcome, CapHit)
+
+    def test_successful_run_quoting_the_marker_is_still_ok(self):
+        """The ``if result.success`` short-circuit must keep protecting a run
+        that merely QUOTES the marker text (e.g. an agent discussing this very
+        failure mode) from being misclassified as a local CLI error."""
+        outcome = classify_invocation(
+            AgentResult(
+                success=True,
+                output=(
+                    'I diagnosed the failure: the CLI printed "Error: Input must '
+                    'be provided either through stdin or as a prompt argument '
+                    'when using --print".'
+                ),
+            ),
+            strict_confirm=True,
+            backend='claude',
+        )
+        assert isinstance(outcome, OK)
+
+
+@pytest.mark.asyncio
+class TestCliInputRejectedIsNeverReportedAsACapHit:
+    """End-to-end consumer side: a sub-5s fast-exit driven through
+    ``invoke_with_cap_retry`` must never mark an account capped."""
+
+    @staticmethod
+    def _capture_slots(gate) -> list:
+        """Wrap ``gate.invoke_slot`` so every yielded slot is captured.
+
+        ``make_gate_mock`` builds a fresh slot per ``__aenter__`` inside its
+        own closure, so the only way to assert on what production passed to
+        ``slot.report(...)`` is to intercept the context manager here.
+        """
+        slots: list = []
+        inner = gate.invoke_slot
+
+        def _wrap(*args, **kwargs):
+            cm = inner(*args, **kwargs)
+            aenter = cm.__aenter__
+
+            async def _capturing_aenter(*a, **kw):
+                slot = await aenter(*a, **kw)
+                slots.append(slot)
+                return slot
+
+            cm.__aenter__ = AsyncMock(side_effect=_capturing_aenter)
+            return cm
+
+        gate.invoke_slot = MagicMock(side_effect=_wrap)
+        return slots
+
+    @staticmethod
+    def _fast_variant() -> AgentResult:
+        """duration_ms=2100 -- deliberately INSIDE the pre-existing ``< 5000``
+        heuristic cap-safety-net window, unlike the 17331ms observed instance
+        that escaped it by luck."""
+        return _parse_claude_output(_fast_exit_subprocess(duration_ms=2100))
+
+    async def test_no_account_is_ever_reported_capped(self):
+        gate = make_gate_mock(account_count=2)
+        slots = self._capture_slots(gate)
+        result = self._fast_variant()
+        calls: list[dict] = []
+
+        async def fake_invoke(**kwargs) -> AgentResult:
+            calls.append(kwargs)
+            return result
+
+        # max_cap_retries is a second, independent bound: if the synthetic-cap
+        # path ever fires, this turns what would be an unbounded pool-churn
+        # loop into a loud AllAccountsCappedException instead of a hang.
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            returned = await invoke_with_cap_retry(
+                gate,
+                'test[cli-input-rejected]',
+                invoke_fn=fake_invoke,
+                max_cap_retries=2,
+                backend='claude',
+                prompt='hi',
+            )
+
+        assert returned.success is False, 'the rejection is returned to the caller as-is'
+        assert calls, 'the fake CLI was never invoked'
+        # No CapHit may be handed to slot.report() -- the direct observable.
+        reported = [
+            call.args[0] for slot in slots for call in slot.report.call_args_list if call.args
+        ]
+        assert not any(isinstance(outcome, CapHit) for outcome in reported), (
+            f'a pre-turn CLI rejection was reported as a cap hit: {reported!r}'
+        )
+        # ...and the gate's cap-detected transition is not taken by any route.
+        gate._handle_cap_detected.assert_not_called()
