@@ -890,7 +890,11 @@ class TestGroupedReadPassThrough:
 
         grouped = mod.apply_grouped_read(hits, records_by_id, contested_ids=contested)
 
-        assert grouped == hits  # identity, not merely equal-length
+        # Identity of the ELEMENTS, not value equality: `ArmRecord` is a
+        # frozen dataclass, so `==` is field-wise and a transform that rebuilt
+        # equal-valued copies — allocating on every no-op call, which the hot
+        # read path makes per query per arm — would satisfy `==`.
+        assert all(g is h for g, h in zip(grouped, hits, strict=True))
 
     def test_an_empty_hit_list_is_returned_empty(self):
         assert _mod().apply_grouped_read([], {}, contested_ids=set()) == []
@@ -1004,10 +1008,11 @@ class TestGroupedReadIsArmLocalAndPure:
         assert set(records_by_id) == {PARENT, 'child-a'}
 
     def test_the_transform_is_synchronous_and_deterministic(self):
-        import inspect  # noqa: PLC0415
-
+        # No `iscoroutinefunction` assertion: calling the function and
+        # iterating the result — which the body does below — already fails
+        # loudly on a coroutine, so introspecting the function object first
+        # only restates it.
         mod = _mod()
-        assert not inspect.iscoroutinefunction(mod.apply_grouped_read)
 
         parent, _ = _hit(PARENT, canonical=True, content='CANON')
         child, _ = _hit('child-a', parent_id=PARENT, kind='amendment')
@@ -1130,7 +1135,10 @@ class TestTopicAnchorIdentityCases:
 
         pinned = mod.apply_topic_anchor(hits, canonical_by_topic={'alpha': canonical})
 
-        assert pinned == hits  # identity — the pin is not a rewrite
+        # The documented early-out is `return hits` (bake_off_storage_shape
+        # .py:1019), so assert the LIST is the same object — `==` would also
+        # pass on `return list(hits)`, which is a rewrite.
+        assert pinned is hits
 
     def test_a_topic_with_no_registered_canonical_pins_nothing(self):
         mod = _mod()
@@ -2917,10 +2925,17 @@ class _FakeMemoryService:
         self.mem0 = _FakeMem0(search_raises_on=type(self).search_raises_on)
         self.initialized = False
         self.closed = False
+        # `config` is held by REFERENCE, so reading `config.queue.data_dir`
+        # after the run cannot tell "repointed before the queue was built"
+        # apart from "repointed afterwards, too late".  Snapshot it at the
+        # moment the real `initialize()` constructs its `DurableWriteQueue` —
+        # that is when attaching to the shared path would do the damage.
+        self.queue_data_dir_at_initialize: str | None = None
         type(self).instances.append(self)
 
     async def initialize(self):
         self.initialized = True
+        self.queue_data_dir_at_initialize = self.config.queue.data_dir
 
     async def close(self):
         self.closed = True
@@ -3025,6 +3040,81 @@ class TestEphemeralCollectionIdentity:
         assert mod.ephemeral_collections(suffix='utest')['b_grouped'] == expected
 
 
+class TestGuardProbeSelfDrop:
+    """Pure functions only — no driver, no doubles, so this class is not
+    asyncio-marked."""
+
+    def test_every_arms_replay_window_is_at_least_GUARD_TOP_K_deep(self):
+        """The two invariants — drop ALL of the probe's own records, and
+        replay over 5 — are enforced in different places and drifted apart
+        once already (the fixed +1).
+
+        The arithmetic half is NOT what is asserted here: `guard_fetch_limit`
+        is literally `GUARD_TOP_K + len(own)`, so `depth - len(own) >= 5` is
+        an identity that holds for an empty or wrong `own` too, and asserting
+        it would test nothing.  What can actually regress, and did, is the
+        set: `probe_own_record_ids` resolves provenance, and an id-equality
+        filter silently returns nothing on the two decomposed shapes
+        (bake_off_storage_shape.py:2538-2551).  So assert the set against an
+        independent re-derivation from the fixtures, that it is non-empty,
+        that decomposition really does split one write across several records
+        — the fact that makes a fixed +1 wrong — and that the arm still holds
+        a full GUARD_TOP_K window of records the probe does not own.
+        """
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+        # Re-derived from the CLAIMS, never from `seeded.records_by_source` —
+        # otherwise this compares the index against itself.
+        source_of = {claim.claim_id: claim.source_memory_id for claim in claims}
+
+        own_sizes: dict[str, dict[str, int]] = {}
+        for shape in ('status_quo', 'c_peers', 'b_grouped'):
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+            own_sizes[shape] = {}
+            for cluster_id in sorted(clusters):
+                probe = mod.select_probing_write(clusters[cluster_id])
+                if probe is None:
+                    continue
+                memory_id = probe['memory_id']
+                own = mod.probe_own_record_ids(seeded, memory_id)
+                expected = {memory_id} | {
+                    record.record_id for record in records
+                    if any(
+                        source_of.get(claim_id) == memory_id
+                        for claim_id in record.claim_ids
+                    )
+                }
+
+                assert own == expected, (
+                    f'{shape}/{cluster_id}: the self-drop set is {own}, but '
+                    f'the probing write really occupies {expected} in this '
+                    f'arm — the difference is a free self-match'
+                )
+                assert own, f'{shape}/{cluster_id}: nothing to drop'
+                own_sizes[shape][cluster_id] = len(own)
+
+                # The over-fetch is worthless if the arm cannot supply a full
+                # window of records the probe does NOT own.
+                non_own = [r for r in records if r.record_id not in own]
+                assert len(non_own) >= mod.GUARD_TOP_K, (
+                    f'{shape}/{cluster_id}: only {len(non_own)} records the '
+                    f'probe does not own, so the replay cannot be '
+                    f'{mod.GUARD_TOP_K} deep however far the fetch reaches'
+                )
+
+        # Why the floor had to become dynamic: a decomposed arm splits one
+        # write across MORE than one record, so a fixed +1 would leave those
+        # arms replaying over a shorter window than the baseline.
+        assert any(
+            own_sizes[shape][cluster_id] > own_sizes['status_quo'][cluster_id]
+            for shape in ('c_peers', 'b_grouped')
+            for cluster_id in own_sizes[shape]
+        ), 'no arm splits a probing write across several records'
+
+
 @pytest.mark.asyncio
 class TestRunBakeOffWiring:
     """What the driver does to the world, measured through doubles."""
@@ -3067,6 +3157,67 @@ class TestRunBakeOffWiring:
 
         config = _FakeMemoryService.instances[-1].config
         assert config.embedder.providers.openai.api_key is None
+
+    async def test_it_never_attaches_to_the_shared_durable_write_queue(
+        self, monkeypatch,
+    ):
+        """The data-loss guard at bake_off_storage_shape.py:2947-2967.
+
+        `config.queue.data_dir` comes out of the schema RELATIVE
+        (`./data/queue`), so run from the repo root — the natural cwd — an
+        un-repointed run initialises the live server's own queue DB:
+        `_recover_in_flight()` flips the other process's in-flight rows back
+        to pending, workers drain real user writes through the backend whose
+        prefix was just repointed at `_test_e2_bakeoff_*`, and the
+        `drop_collections` in the driver's `finally` then destroys them.
+        Silent data loss on the production memory store, invisible in the
+        artifact and the logs.
+
+        Deleting the two repoint lines broke no test in this suite until this
+        one existed, which is what `_driver_config`'s `./data/queue` was put
+        there for.
+        """
+        import tempfile  # noqa: PLC0415
+
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        shared = _driver_config().queue.data_dir
+
+        await mod.run_bake_off(**_SMALL_RUN)
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        # Read at `initialize()`, not after the run: the repoint has to have
+        # happened BEFORE the queue is built to be worth anything, and the
+        # config is held by reference so an after-the-fact read cannot tell
+        # the two apart.
+        attached = [
+            service.queue_data_dir_at_initialize
+            for service in _FakeMemoryService.instances
+        ]
+        assert len(attached) == 2 and all(a is not None for a in attached)
+
+        for a in attached:
+            assert a != shared, (
+                f'the run attached to the shared queue path {shared!r} — a '
+                f'real MemoryService would have recovered and drained the '
+                f"live server's in-flight writes into this experiment's "
+                f'collections'
+            )
+            path = Path(a)
+            assert path.is_absolute(), (
+                f'{a!r} is relative, so it still resolves against whatever '
+                f'cwd the run happens to have — the exact failure mode'
+            )
+            assert path.is_relative_to(Path(tempfile.gettempdir()))
+            # Outside the checkout, so no run leaves queue state in a tree
+            # nothing sweeps...
+            assert not path.is_relative_to(SCRIPT_PATH.parent.parent)
+            # ...and the run removes it rather than accumulating scratch.
+            assert not path.exists()
+
+        # Per-RUN, so two bake-offs cannot share a queue with each other
+        # either — which a fixed path outside the checkout would still allow.
+        assert attached[0] != attached[1]
 
     async def test_it_copies_the_config_rather_than_mutating_the_callers(
         self, monkeypatch,
@@ -3178,38 +3329,6 @@ class TestRunBakeOffWiring:
         assert probe_limits
         assert min(probe_limits) >= mod.GUARD_FETCH_LIMIT
         assert max(probe_limits) > mod.GUARD_FETCH_LIMIT
-
-    async def test_every_arms_replay_window_is_at_least_GUARD_TOP_K_deep(
-        self, monkeypatch,
-    ):
-        """The two invariants — drop ALL of the probe's own records, and
-        replay over 5 — are enforced in different places and drifted apart
-        once already (the fixed +1).  Tie them together: for EVERY arm and
-        EVERY probe, what survives the self-drop must still be 5 deep, or the
-        guard column measures how finely an arm was decomposed rather than
-        how well it guards."""
-        mod = _mod()
-        clusters = mod.load_calibration_clusters()
-        claims = mod.load_arm_claims()
-        topics = mod.load_registry_topics()
-
-        for shape in ('status_quo', 'c_peers', 'b_grouped'):
-            records = mod.materialize_arm(shape, clusters, claims, topics, [])
-            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
-            for cluster_id in sorted(clusters):
-                probe = mod.select_probing_write(clusters[cluster_id])
-                if probe is None:
-                    continue
-                own = mod.probe_own_record_ids(seeded, probe['memory_id'])
-                depth = mod.guard_fetch_limit(own)
-                # A store returning a FULL page of `depth` hits is the best
-                # case; after dropping every own record it must still leave a
-                # full GUARD_TOP_K window for the replay.
-                assert depth - len(own) >= mod.GUARD_TOP_K, (
-                    f'{shape}/{cluster_id}: fetch depth {depth} minus '
-                    f'{len(own)} own records leaves fewer than '
-                    f'{mod.GUARD_TOP_K} for the replay'
-                )
 
     async def test_the_probing_write_is_never_its_own_guard_match(
         self, monkeypatch,
@@ -4092,13 +4211,17 @@ class TestMain:
         mod = _mod()
         _install_driver_doubles(monkeypatch)
 
-        mod.main([
+        code = mod.main([
             '--query-set', str(tmp_path / 'absent.jsonl'),
             '--project-suffix', 'utest',
             '--json-out', str(tmp_path / 'r.json'), '--md-out', str(tmp_path / 'r.md'),
         ])
 
         assert 'absent.jsonl' in capsys.readouterr().err
+        # Reporting the failure on stderr but still returning 0 is the worse
+        # half of "silently": the run looks successful and a stale or absent
+        # artifact gets published as if it were a fresh measurement.
+        assert code == 2
 
 
 # ===========================================================================
