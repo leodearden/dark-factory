@@ -637,3 +637,93 @@ class TestMakeStewardFixture:
             f'expected fused_memory.project_id to be a real str, got '
             f'{type(fused_memory.project_id).__name__!r}'
         )
+
+    # --- collaborator + worktree defaults, and the queue-override channel (3514) ---
+
+    def test_queue_dir_is_a_real_created_dir_and_unique_per_build(
+        self, make_steward, tmp_path,
+    ):
+        """The mock queue's ``queue_dir`` is real, created, sandboxed, and per-build.
+
+        ``steward.py`` reads ``escalation_queue.queue_dir`` into the escalation-
+        watcher argv, so it is real mutable state — the same reason
+        ``test_repeated_default_builds_are_isolated`` pins the worktree.  Two
+        default builds sharing one queue dir would be exactly that shared state,
+        so it is derived from the fixture-owned (already per-build) worktree
+        rather than a flat ``tmp_path/'escalations'`` literal.
+        """
+        first, second = make_steward(), make_steward()
+
+        for steward in (first, second):
+            qd = steward.escalation_queue.queue_dir
+            assert isinstance(qd, Path), (
+                f'expected queue_dir to be a real Path, got {type(qd).__name__!r}'
+            )
+            assert qd.is_dir(), f'expected make_steward to create queue_dir {qd}'
+            assert qd.resolve().is_relative_to(tmp_path.resolve()), (
+                f'queue_dir must stay under tmp_path={tmp_path} so pytest reclaims it, got {qd}'
+            )
+
+        assert first.escalation_queue.queue_dir != second.escalation_queue.queue_dir, (
+            'repeated default make_steward() builds must not share a queue_dir — '
+            'the escalation-watcher argv is built from it'
+        )
+
+    def test_mcp_url_is_a_real_string(self, make_steward):
+        """``mcp.url`` is a real ``str``, not an unconfigured child ``MagicMock``."""
+        url = make_steward().mcp.url
+        assert isinstance(url, str), f'expected mcp.url to be a real str, got {type(url).__name__!r}'
+
+    @pytest.mark.asyncio
+    async def test_briefing_continuation_prompt_is_awaitable(self, make_steward):
+        """``briefing.build_steward_continuation_prompt`` is awaitable, not a plain ``MagicMock``.
+
+        Same reassignment hazard as ``test_briefing_initial_prompt_is_awaitable``:
+        ``briefing`` is an ``AsyncMock``, but this attribute is *reassigned*, and
+        reassigning it with a bare ``MagicMock`` would make the steward's
+        ``await`` raise ``TypeError`` at the re-escalation call site.
+        """
+        steward = make_steward()
+
+        assert await steward.briefing.build_steward_continuation_prompt(steward.task) is not None
+
+    def test_default_worktree_task_dir_is_seeded(self, make_steward):
+        """The fixture-owned worktree's ``.task/`` carries parseable metadata + plan files.
+
+        Union-of-defaults with the folded-in ``test_steward.py`` worktree fixture.
+        ``steward.py`` reads neither file, so this is inert for existing
+        consumers — it exists so a call site that *does* read them (the retired
+        fixture's reason for writing them) finds valid JSON rather than a
+        missing path.
+        """
+        import json
+
+        task_dir = make_steward().worktree / '.task'
+
+        for name in ('metadata.json', 'plan.json'):
+            path = task_dir / name
+            assert path.is_file(), f'expected make_steward to seed {path}'
+            json.loads(path.read_text())  # raises if not valid JSON
+
+    def test_caller_supplied_escalation_queue_is_used_verbatim(self, make_steward, tmp_path):
+        """``escalation_queue=`` replaces the mock queue and keeps its own directory.
+
+        ``test_steward.py``'s ``steward_with_real_queue`` substitutes a real
+        filesystem-backed ``EscalationQueue`` to assert on-disk write locations.
+        The fixture must not build a mock queue at all in that case, and must not
+        stamp its own derived ``queue_dir`` over the one the caller's queue owns.
+        """
+        from escalation.queue import EscalationQueue
+
+        own_dir = tmp_path / 'caller-escalations'
+        real_queue = EscalationQueue(own_dir)
+
+        steward = make_steward(escalation_queue=real_queue)
+
+        assert steward.escalation_queue is real_queue, (
+            'make_steward(escalation_queue=...) must use the caller queue verbatim'
+        )
+        assert real_queue.queue_dir == own_dir, (
+            f'the fixture must not re-stamp queue_dir on a caller-supplied queue — '
+            f'expected {own_dir}, got {real_queue.queue_dir}'
+        )
