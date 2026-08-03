@@ -1935,6 +1935,173 @@ class TestRun:
         ]
         assert [call.args[0] for call in scrolls] == ['dark_factory', 'reify']
 
+    # -- source (1)'s page cap, owned rather than inherited ------------------
+
+    @pytest.mark.asyncio
+    async def test_the_canonical_scroll_passes_an_explicit_limit(self):
+        """The cap has to be a number this module can compare against.
+
+        ``MemoryService.get_memories_by_metadata`` returns a bare list and
+        defaults to 1000 — the ``truncated``/``total`` self-disclosure lives
+        on the MCP wrapper, not the service method this script calls. An
+        implicit default is a cap nothing can detect.
+        """
+        service = _run_service()
+        report = await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=False,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=(),
+        )
+        scrolls = [
+            call for call in service.get_memories_by_metadata.await_args_list
+            if call.args[1] == {'canonical': True}
+        ]
+        assert [call.kwargs.get('limit') for call in scrolls] == [
+            _mod.CANONICAL_SCROLL_LIMIT
+        ]
+        block = report['sources']['canonical_scroll']
+        assert block['limit'] == _mod.CANONICAL_SCROLL_LIMIT
+        assert block['truncated'] is False
+        assert report['skips']['canonical_scroll_truncated'] == []
+
+    @pytest.mark.asyncio
+    async def test_a_full_page_is_reported_as_possibly_truncated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A silent prefix would read as complete coverage.
+
+        ``record_count`` and ``bounded: True`` cannot tell a full scroll from
+        a truncated one, so a page that comes back exactly at the limit is
+        declared short rather than assumed whole. Over-reporting at exactly
+        the cap is the safe direction: one dismissable bucket entry against a
+        coverage hole nobody would ever see.
+        """
+        monkeypatch.setattr(_mod, 'CANONICAL_SCROLL_LIMIT', 2)
+        service = _run_service({'dark_factory': [
+            _scroll_record(M1, 'topic-one'),
+            _scroll_record(M2, 'topic-two'),
+        ]})
+        report = await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=False,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=(),
+        )
+        assert report['sources']['canonical_scroll']['truncated'] is True
+        entries = report['skips']['canonical_scroll_truncated']
+        assert [entry['project_id'] for entry in entries] == ['dark_factory']
+        assert entries[0]['value'] == 2
+
+    # -- what an id-bounded normalization could NOT reach --------------------
+
+    @pytest.mark.asyncio
+    async def test_records_left_on_the_legacy_spelling_are_counted(self):
+        """Half-normalizing a topic is worse than not normalizing it.
+
+        The sweep rewrites only the enumerated members of a cluster, so a
+        record sharing the legacy spelling from outside the three sources
+        keeps it — and the claim ends up filed under two exact-match topic
+        values, which is strictly worse for
+        ``get_memories_by_metadata({'topic': T})`` than the uniform legacy
+        state was. Without this bucket a reader cannot tell a fully
+        normalized topic from a half-normalized one.
+        """
+        service = _run_service()
+        service.store[M1] = {'topic': 'topic_one'}
+        service.count_memories_by_metadata.side_effect = (
+            lambda project_id, filters: 4 if filters == {'topic': 'topic_one'} else 0
+        )
+        report = await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=True,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=(_gate('topic-one', members=(M1,)),),
+        )
+        assert report['outcomes'].get('stamped') == 1
+        entry = _only(report['skips']['legacy_topic_spelling_remains'])
+        assert entry['legacy_topic'] == 'topic_one'
+        assert entry['topic'] == 'topic-one'
+        assert entry['project_id'] == 'dark_factory'
+        assert entry['residue_count'] == 4
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_does_not_count_its_own_targets_as_residue(self):
+        """The number must mean the same thing in both modes.
+
+        In a dry run this sweep's own targets still carry the legacy value and
+        so land in the count; in an apply run the ones that landed no longer
+        do. Subtracting exactly the rehearsed ones is what keeps a dry run
+        from inventing residue it is about to remove.
+        """
+        service = _run_service()
+        service.store[M1] = {'topic': 'topic_one'}
+        service.count_memories_by_metadata.side_effect = (
+            lambda project_id, filters: 1 if filters == {'topic': 'topic_one'} else 0
+        )
+        report = await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=False,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=(_gate('topic-one', members=(M1,)),),
+        )
+        assert report['outcomes'].get('would_stamp') == 1
+        assert report['skips']['legacy_topic_spelling_remains'] == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_residue_probe_says_unknown_rather_than_nothing(self):
+        """Unknown residue is not zero residue, and the bucket has to say so."""
+        service = _run_service()
+        service.store[M1] = {'topic': 'topic_one'}
+
+        def _count(project_id, filters):
+            if filters == {'topic': 'topic_one'}:
+                raise TimeoutError('qdrant count timed out')
+            return 0
+
+        service.count_memories_by_metadata.side_effect = _count
+        report = await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=True,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=(_gate('topic-one', members=(M1,)),),
+        )
+        entry = _only(report['skips']['legacy_topic_spelling_remains'])
+        assert 'TimeoutError' in entry['error']
+        assert 'residue_count' not in entry, 'a failed probe reports no number'
+        assert 'UNKNOWN' in entry['note']
+
+    @pytest.mark.asyncio
+    async def test_no_normalization_means_no_residue_probe_at_all(self):
+        """One count per normalized spelling — none when nothing normalized."""
+        service = _run_service()
+        service.store[M1] = {}
+        report = await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=True,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=(_gate('topic-one', members=(M1,)),),
+        )
+        assert report['outcomes'].get('stamped') == 1
+        residue_probes = [
+            call for call in service.count_memories_by_metadata.await_args_list
+            if 'canonical' not in call.args[1]
+        ]
+        assert residue_probes == []
+        assert report['skips']['legacy_topic_spelling_remains'] == []
+
     @pytest.mark.asyncio
     async def test_all_three_sources_join_into_one_work_list(self):
         """The join is the deliverable — one topic namespace, three inputs."""
