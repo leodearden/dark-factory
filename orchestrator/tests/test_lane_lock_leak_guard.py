@@ -518,6 +518,12 @@ def test_foreign_holder_fixture_survives_a_transient_empty_holder_read(
 
     lock_path = lane_lock_path(tmp_path / 'lane')
     with foreign_lane_lock_holder(lock_path) as child:
+        # Captured BEFORE the bare read below adds its own call, and before
+        # the `with` exits and teardown adds more still — otherwise a
+        # post-block count could not tell "the fixture polled" from "the
+        # test's own read plus teardown's poll happened to add up to >1",
+        # which a fixture that never polls at all would also satisfy.
+        calls_at_yield = len(calls)
         holders = lane_lock_holder_pids(lock_path)  # deliberately a bare single read
         assert child.pid in holders, (
             f'the fixture must not yield until the KERNEL names the child as '
@@ -527,12 +533,12 @@ def test_foreign_holder_fixture_survives_a_transient_empty_holder_read(
             f'defeat it; got holders={holders!r}'
         )
 
-    assert len(calls) > 1, (
+    assert calls_at_yield >= 2, (
         f'the fixture must actually have read lane_lock_holder_pids more '
-        f'than once — absorbing the injected empty read, then settling on a '
-        f'real one — or a fixture that merely happened to skip the bad read '
-        f'would pass this test vacuously; reader was called {len(calls)} '
-        f'time(s)'
+        f'than once BEFORE yielding — absorbing the injected empty read, '
+        f'then settling on a real one — or a fixture that merely happened '
+        f'to skip the bad read would pass this test vacuously; the fixture '
+        f'read it {calls_at_yield} time(s) before yielding'
     )
 
 
