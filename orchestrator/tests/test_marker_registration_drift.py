@@ -8,7 +8,105 @@ strings only — no disk I/O, no pytest config.
 """
 from __future__ import annotations
 
+import ast
+
 import pytest
+
+
+def _marker_name(element: ast.expr) -> str | None:
+    """The marker name in a ``pytest.mark.NAME`` / ``pytest.mark.NAME(...)`` element.
+
+    Mirrors ``orchestrator.pytest_markers._marker_name`` BY CONSTRUCTION, not
+    by import — see the module docstring's note on the two modules'
+    deliberately opposite fail-safe polarities. Anything else — a bare
+    constant, a local name, an unrelated attribute chain — yields None and is
+    skipped silently, without suppressing its siblings.
+    """
+    if isinstance(element, ast.Call):
+        element = element.func
+    if not isinstance(element, ast.Attribute):
+        return None
+    owner = element.value
+    if (
+        isinstance(owner, ast.Attribute)
+        and owner.attr == 'mark'
+        and isinstance(owner.value, ast.Name)
+        and owner.value.id == 'pytest'
+    ):
+        return element.attr
+    return None
+
+
+def _is_pytestmark_target(node: ast.expr) -> bool:
+    """True iff *node* is the bare name ``pytestmark``."""
+    return isinstance(node, ast.Name) and node.id == 'pytestmark'
+
+
+def _pytestmark_value(statement: ast.stmt) -> ast.expr | None:
+    """The value *statement* binds to ``pytestmark``, else None.
+
+    Covers both the plain ``pytestmark = ...`` and the annotated
+    ``pytestmark: list = ...`` spellings; an annotation with no value binds
+    nothing. Anything other than an ``Assign``/``AnnAssign`` — including
+    every ``ast.expr`` node ``ast.walk`` also yields — falls through to None.
+    """
+    if isinstance(statement, ast.Assign):
+        if any(_is_pytestmark_target(target) for target in statement.targets):
+            return statement.value
+        return None
+    if isinstance(statement, ast.AnnAssign) and _is_pytestmark_target(statement.target):
+        return statement.value
+    return None
+
+
+def _names_from_marker_value(value: ast.expr) -> frozenset[str]:
+    """Accepted value shapes: a bare element, or a list/tuple of elements."""
+    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
+    return frozenset(
+        name for name in (_marker_name(element) for element in elements) if name is not None
+    )
+
+
+def _applied_marker_names(source: str) -> frozenset[str]:
+    """Every pytest marker name *source* APPLIES via a decorator or ``pytestmark``.
+
+    An UPPER-BOUND sweep: walked with ``ast.walk`` (not just ``tree.body``),
+    so class-level ``pytestmark`` and decorators on nested classes are
+    reached — the deliberate difference from
+    ``orchestrator.pytest_markers.module_level_marker_names``, which walks
+    only ``tree.body`` because its contract is a module-wide LOWER bound.
+    Collects from two node kinds: the ``decorator_list`` of every
+    ``FunctionDef``/``AsyncFunctionDef``/``ClassDef``, and the value of any
+    ``Assign``/``AnnAssign`` binding the name ``pytestmark`` (unpacking a
+    ``List``/``Tuple`` value into its elements).
+
+    KNOWN LIMITATIONS, acknowledged rather than silently omitted:
+    ``pytest.param(marks=...)`` and ``item.add_marker(...)`` are not swept —
+    zero uses under ``orchestrator/tests/`` today (grep-verified); nor is a
+    marker applied through an aliased pytest import
+    (``import pytest as _pytest``) — two such aliases exist today
+    (test_overlap_footprint.py, test_multihost_verify_integration.py) but
+    both use the alias only for ``.raises``, never ``.mark``, so this is a
+    real but currently-inert gap.
+
+    LOUD ON FAILURE — the OPPOSITE of ``pytest_markers``' fail-safe polarity:
+    a ``SyntaxError`` from ``ast.parse`` is left to propagate rather than
+    being swallowed into an empty set, because a silent empty set here would
+    make a drift guard built on top of this silently vacuous.
+    """
+    tree = ast.parse(source)
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            for decorator in node.decorator_list:
+                name = _marker_name(decorator)
+                if name is not None:
+                    names.add(name)
+        elif isinstance(node, ast.Assign | ast.AnnAssign):
+            value = _pytestmark_value(node)
+            if value is not None:
+                names |= _names_from_marker_value(value)
+    return frozenset(names)
 
 
 class TestAppliedMarkerNames:
