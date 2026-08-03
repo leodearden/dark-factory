@@ -35,12 +35,23 @@ the yaml with ``yaml.safe_load`` would be weaker still — it would pass even if
 a routing regression made the config unreachable.
 
 PLACEMENT IS LOAD-BEARING, NOT STYLISTIC. This file lives in ``tests/scripts/``
-rather than ``scripts/tests/`` because under FULL_SUITE — a conftest/test-data
-trigger, or merge-role ``merge_verify_breadth: full`` — the ``scripts`` module
-config runs its ``test_command`` VERBATIM, and that command targets
-``tests/scripts/``, not ``scripts/tests/``. The repo-root fleet chain likewise
-ends in ``pytest tests/scripts/``. A guard against a vacuous gate that itself
-never runs on merge full-verify would be vacuous in the same way.
+rather than ``scripts/tests/``, and the CONCLUSION outlived the reason that
+originally justified it. That reason was that under FULL_SUITE the ``scripts``
+module config ran its ``test_command`` verbatim against ``tests/scripts/``
+only, and the repo-root fleet chain likewise ended in ``pytest tests/scripts/``
+— so a guard placed in ``scripts/tests/`` would never have run on merge
+full-verify, vacuous in the same way as the gate it guards. BOTH of those facts
+are now FALSE: task 3384 (commit 1eaaf26ab9) made the root chain's trailing
+segment ``pytest tests/scripts/ scripts/tests/``, and task 3460 did the same
+for this module config — which is what
+``test_scripts_full_suite_pytest_covers_scripts_tests`` below exists to pin.
+
+Keep the file here anyway. Both directories now run under FULL_SUITE, so either
+home would execute — but ``tests/scripts/`` is ADDITIONALLY covered by its own
+registered module config (``tests/scripts/orchestrator.yaml``), so it remains
+the strictly safer home for a guard whose entire purpose is to be unable to go
+unrun. A guard that depends on the very command it asserts about is one edit
+away from silencing itself.
 
 Importing ``orchestrator.config`` from this suite is established precedent —
 see ``test_tests_scripts_module_config.py`` and ``test_fallback_verify_config.py``
@@ -62,12 +73,14 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 MODULE_PREFIX = 'scripts'
 
-# The near-homograph sibling. `scripts/orchestrator.yaml`'s test_command is
-# already byte-identical to this module's (a fact tests/scripts/orchestrator.yaml
-# documents about itself), so a copy-pasted lint_command left pointing here is
-# the realistic wrong fix — see assertion (5), which is the ONLY place that
-# copy-paste is detectable (assertion (4) cannot see it; the reason is recorded
-# there).
+# The near-homograph sibling. The two module configs' test_commands were
+# byte-identical until task 3460 (a fact tests/scripts/orchestrator.yaml
+# documented about itself, and which was itself the coverage defect 3460
+# closed), so a copy-pasted lint_command left pointing here is the realistic
+# wrong fix — see assertion (5), which is the ONLY place that copy-paste is
+# detectable (assertion (4) cannot see it; the reason is recorded there). The
+# copy-paste risk is unchanged by 3460: the two commands still differ by a
+# single added target, and the directory names remain near-homographs.
 SIBLING_PREFIX = 'tests/scripts'
 
 # A real tracked file under scripts/, used as the representative touched-file
@@ -488,9 +501,11 @@ def test_scripts_diff_is_lint_gated() -> None:
         f'{MODULE_PREFIX} and {SIBLING_PREFIX} declare a BYTE-IDENTICAL '
         f'lint_command {mc.lint_command!r} (task 3445). These two directories '
         f'are distinct trees; a shared command means one of them is linting the '
-        f'other and its own files are gated by nothing. Note the two '
-        f'test_commands ARE byte-identical by design — that is a different, '
-        'already-recorded issue and is not license to duplicate this one'
+        f'other and its own files are gated by nothing. The two test_commands '
+        f'are held distinct by their own assertion — see '
+        'test_scripts_full_suite_pytest_covers_scripts_tests (6), which pins '
+        'that separately and for a different reason; nothing about this repo '
+        'licenses duplicating a command across these two configs'
     )
 
 
@@ -724,9 +739,11 @@ def test_scripts_diff_is_type_gated() -> None:
         f'{MODULE_PREFIX} and {SIBLING_PREFIX} declare a BYTE-IDENTICAL '
         f'type_check_command {mc.type_check_command!r} (task 3456). A shared '
         f'command means one of them is type-checking the other and its own '
-        f'files are gated by nothing. Note the two test_commands ARE '
-        'byte-identical by design — that is a different, already-recorded issue '
-        'and is not license to duplicate this one'
+        f'files are gated by nothing. The two test_commands are held distinct '
+        f'by their own assertion — see '
+        'test_scripts_full_suite_pytest_covers_scripts_tests (6), which pins '
+        'that separately and for a different reason; nothing about this repo '
+        'licenses duplicating a command across these two configs'
     )
 
 
