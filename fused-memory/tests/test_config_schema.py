@@ -1509,6 +1509,7 @@ class TestProceduralTopicGuardClustersDefault:
         assert 'pytest-xdist-serial-override' in topic_ids
         assert 'architect-report-task-already-done-main-reachability' in topic_ids
         assert 'architect-plan-revalidation-requeue-lock' in topic_ids
+        assert 'ruff-format-not-an-enforced-gate' in topic_ids
 
     def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
@@ -1648,6 +1649,33 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         result = find_matching_topic_cluster(note, clusters)
         assert result is not None
         assert result[0].topic_id == 'architect-plan-revalidation-requeue-lock'
+
+
+class TestRuffFormatNotAnEnforcedGateCluster:
+    """Topic-guard cluster for the "`ruff format` is not an enforced gate;
+    only `ruff check` / pyright gate commits" family (gate task 3342, still
+    blocked -- its ~14-entry cluster awaits a consolidation ruling).
+
+    Unlike every earlier seed, this cluster's corpus spans BOTH
+    ``procedural_knowledge`` (11 entries) and ``preferences_and_norms`` (3
+    entries: 210be257, e8c5eb3f, c565afd0) -- which is why it kept growing
+    uncaught. Phrases are literal substrings drawn verbatim from those
+    entries' stored content (the module convention), so the seed stays
+    auditable against the corpus it was derived from.
+    """
+
+    def test_cluster_present_with_expected_phrases_and_hint(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        cluster = next(c for c in clusters if c.topic_id == 'ruff-format-not-an-enforced-gate')
+        assert cluster.phrases == [
+            'ruff format',
+            'ruff check',
+            'enforced gate',
+            'enforced lint gate',
+            'format-clean',
+        ]
+        assert cluster.min_phrase_hits == 2
+        assert '3342' in cluster.hint
 
 
 class TestWriteTriageConfig:
