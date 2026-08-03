@@ -1434,8 +1434,8 @@ class TestMapAdvanceFailureParkLockContended:
         from orchestrator.config import GitConfig
         from orchestrator.merge_gates import _STALE_LOCK_FLOOR_S
 
-        assert _STALE_LOCK_FLOOR_S == pytest.approx(
-            GitConfig().merge_park_lock_grace_seconds
+        assert GitConfig().merge_park_lock_grace_seconds == pytest.approx(
+            _STALE_LOCK_FLOOR_S
         ), (
             '_STALE_LOCK_FLOOR_S must track '
             'GitConfig.merge_park_lock_grace_seconds\'s default (this repo\'s '

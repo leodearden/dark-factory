@@ -14105,15 +14105,15 @@ class TestAdvanceMainIndexLockStandoff:
         carries the information.
 
         LIVE-COMMIT SHAPE: a lock created moments ago, whose holder simply
-        outlives the grace.  It must be reported as young.
+        outlives the grace.  Its reported age must exclude the stand-off.
         """
         merge_result = await self._make_merge(
             git_ops, 'lock-initial-age', 'lock_initial_age.py',
         )
         (git_ops.project_root / 'README.md').write_text('# dirty for initial age\n')
 
-        # A short-but-real grace so the stand-off genuinely runs and
-        # `waited_seconds` is comfortably larger than the lock's ~0s age.
+        # A short-but-real grace so the stand-off genuinely runs and the two
+        # probes are separated by a measurable interval.
         git_ops.config.merge_park_lock_grace_seconds = 1.5
 
         lock_path = git_ops.project_root / '.git' / 'index.lock'
@@ -14132,16 +14132,28 @@ class TestAdvanceMainIndexLockStandoff:
             'the pre-wait observation must reach the side channel; got keys '
             f'{sorted(info)!r}'
         )
-        # NOT a tight timing tolerance: a just-created file's age is ~0.00Xs
-        # while `waited_seconds` is >= ~1.0s by construction of the poll loop
-        # — three orders of magnitude apart.  Do not tighten further.
-        assert info['initial_age_seconds'] < 1.0, (
-            'a lock created moments ago must be reported as YOUNG at the '
-            f'first probe; got {info["initial_age_seconds"]!r}'
-        )
-        assert info['initial_age_seconds'] < info['waited_seconds'], (
-            'the first-probe age must not be contaminated by the stand-off — '
-            f'got initial={info["initial_age_seconds"]!r} '
+        # Deliberately NOT an absolute bound on `initial_age_seconds`.  The
+        # first probe sits behind advance_main's whole preamble (merge-base,
+        # rev-parse, unmerged-state and symbolic-ref subprocesses), so on a
+        # loaded box — 16 xdist workers — a lock created "moments ago" can
+        # legitimately read >1s old at that probe.  Bounding it by a constant
+        # measures the preamble, not the behaviour, and flakes.
+        #
+        # The load-independent fact: `age_seconds` and `initial_age_seconds`
+        # come from the SAME `time.time() - mtime` expression over the SAME
+        # (never rewritten) mtime, so their difference is exactly the interval
+        # between the two probes — and the entire stand-off lies inside it.
+        # The bug this pins (re-probing AFTER the wait and calling the result
+        # "initial") collapses that difference to ~0, whatever the load.  The
+        # epsilon absorbs time.time()/time.monotonic() source skew only.
+        assert (
+            info['age_seconds'] - info['initial_age_seconds']
+            >= info['waited_seconds'] - 0.05
+        ), (
+            'the first-probe age must predate the stand-off, so the post-wait '
+            're-probe must be older by at least the wait; got '
+            f'initial={info["initial_age_seconds"]!r} '
+            f'age={info["age_seconds"]!r} '
             f'waited={info["waited_seconds"]!r}'
         )
         assert info['grace_seconds'] == 1.5, (
