@@ -27,9 +27,16 @@ import sqlite3
 from pathlib import Path
 
 from audit_combine_gate_marker_loss import (
+    SEVERITY_BENIGN,
+    SEVERITY_DISPATCH,
+    SEVERITY_GATE_REMOVING,
+    SEVERITY_INFORMATIONAL,
+    SEVERITY_PROVENANCE,
     CombineTarget,
     ManifestExpectation,
+    _severity_rank,
     build_manifest_index,
+    classify_gap,
     load_combine_targets,
     load_ticket_expectations,
     tickets_db_path,
@@ -570,3 +577,104 @@ def test_build_manifest_index_no_manifest_dirs_returns_empty(tmp_path):
     failures: list[str] = []
     assert build_manifest_index(str(tmp_path), parse_failures=failures) == {}
     assert failures == []
+
+
+# ---------------------------------------------------------------------------
+# classify_gap — RANK BY CONSUMER, NOT BY GAP SIZE.
+#
+# task_kind is the single most COMMON gap (all 24 live victims lost it) but is
+# load-bearing only in the rare deterministic case. Ranking by frequency would
+# bury the delivered_checks losses — the only ones that silently remove a
+# mark-done gate — under a wall of benign rows. These tests are what make the
+# consumer ordering mechanical rather than aspirational.
+# ---------------------------------------------------------------------------
+
+def test_classify_gap_delivered_checks_is_gate_removing(tmp_path):
+    """Rank 0: wiping delivered_checks removes the mark-done gate outright."""
+    severity, reason = classify_gap("delivered_checks", [{"name": "x", "kind": "grep"}])
+
+    assert severity == SEVERITY_GATE_REMOVING
+    assert reason
+
+
+def test_classify_gap_prd_keys_are_provenance(tmp_path):
+    """Rank 1: prd_path / prd_task_label are provenance, not a gate."""
+    for key in ("prd_path", "prd_task_label"):
+        severity, reason = classify_gap(key, "plans/some-prd.md")
+        assert severity == SEVERITY_PROVENANCE, key
+        assert reason, key
+
+
+def test_classify_gap_task_kind_deterministic_is_dispatch(tmp_path):
+    """Rank 2: only a 'deterministic' expected value changes dispatch."""
+    severity, reason = classify_gap("task_kind", "deterministic")
+
+    assert severity == SEVERITY_DISPATCH
+    assert reason
+
+
+def test_classify_gap_task_kind_normal_is_benign_with_a_stated_reason(tmp_path):
+    """LOWEST rank. Scheduler.is_deterministic() (scheduler.py:2046) tests
+    `metadata.get('task_kind') == 'deterministic'`, so an ABSENT task_kind is
+    behaviourally byte-identical to task_kind='normal'. Losing it therefore
+    changes nothing, and the demotion prints its own reason rather than asking
+    a reader to take it on trust."""
+    for value in ("normal", "", "something-else", None, 17):
+        severity, reason = classify_gap("task_kind", value)
+        assert severity == SEVERITY_BENIGN, value
+        assert "deterministic" in reason, value
+
+
+def test_classify_gap_task_kind_branch_inspects_the_expected_value(tmp_path):
+    """The task_kind branch keys on the EXPECTED VALUE, not the key name — the
+    same key yields two different severities."""
+    assert classify_gap("task_kind", "deterministic")[0] != classify_gap("task_kind", "normal")[0]
+
+
+def test_classify_gap_other_known_keys_are_informational(tmp_path):
+    """Every other submit-payload key is informational: real provenance loss,
+    but no consumer that gates or dispatches."""
+    for key in ("source", "spawn_context", "spawned_from", "escalation_id",
+                "suggestion_hash", "execution_class", "complexity", "modules", "files"):
+        severity, reason = classify_gap(key, "whatever")
+        assert severity == SEVERITY_INFORMATIONAL, key
+        assert reason, key
+
+
+def test_classify_gap_unknown_key_falls_through_informational(tmp_path):
+    """An unforeseen key must not raise — the metadata vocabulary grows."""
+    severity, reason = classify_gap("some_future_key_nobody_has_written_yet", {"a": 1})
+
+    assert severity == SEVERITY_INFORMATIONAL
+    assert reason
+
+
+def test_severity_rank_orders_gate_removing_first(tmp_path):
+    """Strict rank order: gate-removing < provenance < dispatch <
+    informational < benign."""
+    ordered = [
+        SEVERITY_GATE_REMOVING,
+        SEVERITY_PROVENANCE,
+        SEVERITY_DISPATCH,
+        SEVERITY_INFORMATIONAL,
+        SEVERITY_BENIGN,
+    ]
+    ranks = [_severity_rank(s) for s in ordered]
+
+    assert ranks == sorted(ranks)
+    assert len(set(ranks)) == len(ordered)
+    assert _severity_rank(SEVERITY_GATE_REMOVING) == 0
+
+
+def test_severity_rank_fails_soft_on_an_unknown_severity(tmp_path):
+    """An unknown severity sorts LAST rather than raising, mirroring
+    _source_rank in audit_wiped_metadata_files.py."""
+    assert _severity_rank("not-a-severity") > _severity_rank(SEVERITY_BENIGN)
+
+
+def test_severity_constants_are_distinct_strings(tmp_path):
+    """Module-level str constants, all distinct — no accidental aliasing."""
+    constants = [SEVERITY_GATE_REMOVING, SEVERITY_PROVENANCE, SEVERITY_DISPATCH,
+                 SEVERITY_INFORMATIONAL, SEVERITY_BENIGN]
+    assert all(isinstance(c, str) for c in constants)
+    assert len(set(constants)) == len(constants)
