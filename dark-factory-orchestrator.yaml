@@ -414,39 +414,6 @@ verify_cold_preprovision_command: "uv sync --all-packages"
 # invariant I3 preserves this explicit override until then).
 verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
 
-# Dispatch-admission gate (PsiAdmissionConfig; tasks 2327/2328). PROVISIONAL
-# TUNING, Leo 2026-08-03 — applied to BOTH this project and reify so the two
-# heavyweights on this shared 32-core host throttle symmetrically. Green-tier
-# hot-reloadable, so retune via reload_config without a restart.
-#
-# cpu_some_avg10: the shipped default 85.0 has NEVER fired on this host. Measured
-# CPU PSI `some` avg10, two 1 Hz samples: 2026-07-31 (load ~85) min 5.5 / med 46.3
-# / max 68.9; 2026-08-03 (load ~190) min 62.2 / med 66.8 / max 74.1. The
-# distribution SLIDES with load rather than spreading, so every value below 62 is
-# a total gate on a busy day and every value above 69 is dead on a quiet one.
-# Fraction of ticks the gate would hold — 55: 22.2%/100%, 60: 13.9%/100%,
-# 65: 1.9%/68.1%, 70: 0.0%/13.5%, 75: 0%/0%. 70 is the only value inert when
-# quiet yet engaged when busy. NOTE CPU PSI `full` is always 0.00 by kernel
-# definition (something is always runnable) — only `some` is usable for CPU.
-#
-# min_inflight_floor: raised 1 -> 3. The gate defers NEW dispatch while saturated;
-# in-flight drains only as tasks finish, so the floor is "always allow dispatch
-# below N", a safety net rather than a target. It is PER-ORCHESTRATOR, and seven
-# orchestrator services run on this host.
-#
-# mem_some_avg10 (15.0), mem_full_avg10 (3.0) and io_some_avg10 (40.0) LEFT AT
-# DEFAULTS deliberately — mem_full=3.0 is exactly the operator's P1 target
-# expressed as a threshold, and both memory axes are correctly specified as hard
-# trips that should fire only when P1 is actually breached.
-#
-# DURABLE FIX PENDING: task 3590 adds a runqueue-ratio axis, because a fixed
-# CPU-PSI threshold is fragile — the variable tracks load instead of
-# discriminating it (runqueue ratio: 2.4x quiet vs 7.1x busy, ~3x separation
-# where CPU PSI gives ~1.4x).
-psi_admission:
-  cpu_some_avg10: 70.0
-  min_inflight_floor: 3
-
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:
