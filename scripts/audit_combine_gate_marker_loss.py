@@ -479,3 +479,224 @@ def classify_gap(key: str, expected_value: object) -> tuple[str, str]:
         SEVERITY_INFORMATIONAL,
         "provenance/bookkeeping key with no gating or dispatch consumer",
     )
+
+
+# ---------------------------------------------------------------------------
+# The audit itself.
+# ---------------------------------------------------------------------------
+
+# Where a lost key's expectation came from. 'none' is a FIRST-CLASS value, not
+# an absence: a combine target no source can speak for is still reported, so a
+# partial sweep can never read as complete.
+SOURCE_TICKET = "ticket"
+SOURCE_MANIFEST = "manifest"
+SOURCE_NONE = "none"
+
+# Statuses meaning the task is finished and will not be dispatched again.
+#
+# MEASURED SPLIT that validates this constant exactly (live store, 2026-08-03,
+# 91 combine targets): done=63 + cancelled=4 = the 67 terminal targets that
+# were deliberately left un-remediated; pending=21 + in-progress=2 + blocked=1
+# = the 24 live victims that were hand-remediated the same day. The exit code
+# keys on NON-terminal findings only — if the terminal backlog drove it, this
+# detector would be permanently red and therefore ignored, destroying its value
+# as a re-runnable regression check. Terminal findings are suppressed from the
+# EXIT CODE, never from the report.
+TERMINAL_STATUSES = ("done", "cancelled")
+
+# The pseudo-key used for a target no comparison source can speak for. It is
+# reported as a finding rather than dropped, because "we could not check this
+# task" and "this task is fine" are opposite outcomes.
+NO_COMPARISON_SOURCE_KEY = "(no comparison source)"
+
+_NO_COMPARISON_SOURCE_REASON = (
+    "no created ticket and no capability manifest binds this task, so its "
+    "pre-combine metadata cannot be reconstructed at all; this row asserts "
+    "UNKNOWN, neither clean nor damaged"
+)
+
+
+class Finding(NamedTuple):
+    """One metadata key a comparison source expected but live metadata lacks.
+
+    ``expected_source`` is per-KEY, not per-task: a single task can carry a
+    manifest-sourced ``delivered_checks`` finding beside a ticket-sourced
+    ``source`` finding, and the two claims rest on different evidence.
+
+    ``terminal`` mirrors :data:`TERMINAL_STATUSES` and is what keeps the
+    long-lived terminal backlog out of the exit code.
+    """
+
+    tag: str
+    task_id: int
+    status: str
+    key: str
+    severity: str
+    expected_source: str
+    terminal: bool
+    reason: str
+
+
+class AuditCoverage(NamedTuple):
+    """How much of the combine population the audit could actually see.
+
+    ALWAYS reported, including when zero findings are produced. Measured
+    live: 25 of 91 combine targets have no created ticket, so the finding
+    list is an OBSERVABLE SUBSET and never "the damaged population".
+    Presenting it as complete would be a no-silent-fail-soft violation
+    (docs/legibility/design-invariants.md).
+    """
+
+    total_combine_targets: int
+    targets_with_ticket: int
+    targets_with_manifest: int
+    targets_without_comparison_source: int
+    manifest_parse_failures: int
+
+
+class ProjectAudit(NamedTuple):
+    """One project's audit result: what was found, and what could be seen."""
+
+    project_root: str
+    project_id: str
+    findings: list[Finding]
+    coverage: AuditCoverage
+
+
+def _finding_sort_key(finding: Finding) -> tuple[int, int, str, str]:
+    """Gate-removing first, then NUMERIC task id so 100 follows 20.
+
+    Numeric-safe with the precedent's try/except fallback
+    (``_candidate_sort_key``): a non-numeric task id sorts under 0 by its
+    string form rather than aborting the sort mid-report.
+    """
+    rank = _severity_rank(finding.severity)
+    try:
+        return (rank, int(finding.task_id), "", finding.key)
+    except (TypeError, ValueError):
+        return (rank, 0, str(finding.task_id), finding.key)
+
+
+def _expected_from_manifest(expectation: ManifestExpectation) -> dict[str, object]:
+    """The metadata keys a manifest binding implies, for the union below.
+
+    ``delivered_checks`` is contributed ONLY when the manifest binds at least
+    one mechanical check, because ``commit_planning`` skips the stamp entirely
+    when the mechanical list is empty (manifest_stamping.py's
+    ``if not mechanical:`` guard). Contributing it unconditionally would
+    manufacture a GATE-REMOVING false positive for every manual-only manifest.
+    """
+    expected: dict[str, object] = {
+        "prd_path": expectation.prd_path,
+        "prd_task_label": expectation.label,
+    }
+    if expectation.delivered_check_names:
+        expected["delivered_checks"] = list(expectation.delivered_check_names)
+    return expected
+
+
+def audit_project(project_root: str, project_id: str) -> ProjectAudit:
+    """Audit one project root for curator-combine metadata loss.
+
+    Reads the task store, the ticket store and every capability manifest, all
+    READ-ONLY, unions the two comparison sources with PER-KEY provenance, and
+    reports each key a source expected but live metadata no longer carries.
+
+    Only ``expected_keys - live_keys`` is ever claimed — never value drift.
+    The ticket is a SUBMIT-TIME snapshot, so a key legitimately added between
+    submit and combine is invisible to it and comparing values would surface
+    those benign post-submit edits as findings.
+
+    Where both sources speak, the TICKET wins shared keys (it is the closer
+    record of what the task actually held) except ``delivered_checks``, which
+    the manifest owns — a submit payload rarely carries it, since
+    ``commit_planning`` stamps it after the fact.
+
+    A missing tickets.db or an unreadable manifest degrades to the remaining
+    source rather than aborting; a target no source covers is still emitted,
+    carrying :data:`SOURCE_NONE`.
+    """
+    targets = load_combine_targets(str(tasks_db_path(project_root)))
+    ticket_expectations = load_ticket_expectations(
+        str(tickets_db_path(project_root)), project_id
+    )
+    parse_failures: list[str] = []
+    manifest_index = build_manifest_index(project_root, parse_failures=parse_failures)
+
+    findings: list[Finding] = []
+    with_ticket = 0
+    with_manifest = 0
+    without_source = 0
+
+    for target in targets.values():
+        key_id = str(target.task_id)
+        ticket = ticket_expectations.get(key_id)
+        manifest = manifest_index.get(key_id)
+        if ticket is not None:
+            with_ticket += 1
+        if manifest is not None:
+            with_manifest += 1
+
+        terminal = target.status in TERMINAL_STATUSES
+        if ticket is None and manifest is None:
+            without_source += 1
+            findings.append(
+                Finding(
+                    tag=target.tag,
+                    task_id=target.task_id,
+                    status=target.status,
+                    key=NO_COMPARISON_SOURCE_KEY,
+                    severity=SEVERITY_INFORMATIONAL,
+                    expected_source=SOURCE_NONE,
+                    terminal=terminal,
+                    reason=_NO_COMPARISON_SOURCE_REASON,
+                )
+            )
+            continue
+
+        # Union with per-key provenance. Manifest first, then the ticket
+        # overwrites the keys it also speaks for, then delivered_checks is
+        # restored to the manifest — see this function's docstring.
+        expected: dict[str, object] = {}
+        source_of: dict[str, str] = {}
+        if manifest is not None:
+            for key, value in _expected_from_manifest(manifest).items():
+                expected[key] = value
+                source_of[key] = SOURCE_MANIFEST
+        if ticket is not None:
+            for key, value in ticket.items():
+                expected[key] = value
+                source_of[key] = SOURCE_TICKET
+        if manifest is not None and manifest.delivered_check_names:
+            expected["delivered_checks"] = list(manifest.delivered_check_names)
+            source_of["delivered_checks"] = SOURCE_MANIFEST
+
+        live = set(target.metadata_keys)
+        for key in expected.keys() - live:
+            severity, reason = classify_gap(key, expected[key])
+            findings.append(
+                Finding(
+                    tag=target.tag,
+                    task_id=target.task_id,
+                    status=target.status,
+                    key=key,
+                    severity=severity,
+                    expected_source=source_of[key],
+                    terminal=terminal,
+                    reason=reason,
+                )
+            )
+
+    findings.sort(key=_finding_sort_key)
+    return ProjectAudit(
+        project_root=project_root,
+        project_id=project_id,
+        findings=findings,
+        coverage=AuditCoverage(
+            total_combine_targets=len(targets),
+            targets_with_ticket=with_ticket,
+            targets_with_manifest=with_manifest,
+            targets_without_comparison_source=without_source,
+            manifest_parse_failures=len(parse_failures),
+        ),
+    )
