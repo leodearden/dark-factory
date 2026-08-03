@@ -790,10 +790,10 @@ GROUPED_ROLE = 'grouped'
 
 def _render_grouped_document(
     canonical: ArmRecord,
-    amendments: list[ArmRecord],
+    children: list[ArmRecord],
     sighting_count: int,
 ) -> str:
-    """Canonical body, then amendment digests, then a sighting COUNT.
+    """Canonical body, then child digests, then a sighting COUNT.
 
     Sightings are counted rather than pasted because that is precisely the
     cost claim grouping makes (PRD D4): a grouped read is supposed to be
@@ -801,10 +801,19 @@ def _render_grouped_document(
     "seen it again" entries collapse to a number.  Pasting them would make
     the tokens-per-query metric measure a concatenation and quietly hand
     arm (b) a loss it did not earn.
+
+    Each child is labelled with its OWN ``kind``, not with a fixed
+    ``[amendment]``.  ``apply_grouped_read`` passes non-sighting children of
+    every kind through this parameter, so a fixed label renamed a child of
+    any third kind into an amendment — misattributing what the record is,
+    inside the transform that calls itself the executable specification of
+    PRD D6.  A child with no ``kind`` at all falls back to ``[child]``, which
+    says only what is actually known.
     """
     parts = [canonical.content]
-    for amendment in amendments:
-        parts.append(f'[amendment] {amendment.content}')
+    for child in children:
+        kind = child.metadata.get('kind') or 'child'
+        parts.append(f'[{kind}] {child.content}')
     if sighting_count:
         parts.append(f'[sightings: {sighting_count}]')
     return '\n'.join(parts)
@@ -2966,11 +2975,23 @@ async def run_bake_off(
     queue_dir = tempfile.mkdtemp(prefix='e2-bakeoff-queue-')
     config.queue.data_dir = queue_dir
 
-    drop_collections(collections.values(), qdrant_url=qdrant_url)
+    # Everything acquired above is released in the `finally` below, so the
+    # acquisition sits INSIDE the try: `initialize()` raising — an unreachable
+    # Qdrant, a missing key, a durable-queue recovery failure — is precisely
+    # the case where the argument above about this queue never outliving the
+    # run has to hold, and a teardown that only ran on success leaked the
+    # directory and skipped `close()` on a half-built service.
+    #
+    # `close()` is called unguarded: `MemoryService.close()` routes every
+    # sub-close through `_safe_close`, which is time-boxed and logs without
+    # re-raising, so it is already safe on a partially-initialised service —
+    # wrapping it in a blanket suppress would only hide a real close failure
+    # on the happy path.
     memory = MemoryService(config)
-    await memory.initialize()
     arms: dict[str, Any] = {}
     try:
+        drop_collections(collections.values(), qdrant_url=qdrant_url)
+        await memory.initialize()
         guard_threshold = resolve_guard_threshold(memory)
         for shape in ARM_SHAPES:
             seeded = _index_arm(

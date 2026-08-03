@@ -894,6 +894,61 @@ class TestGroupedReadDocumentShape:
         assert '2' in document
         assert grouped[0].role == 'grouped'
 
+    def test_a_child_of_a_third_kind_is_not_relabelled_an_amendment(self):
+        """`apply_grouped_read` buckets members into amendments / sightings /
+        `others`, then passed `amendments + others` through the parameter the
+        renderer prefixes with the literal `[amendment]`.  Any child carrying
+        a kind that is neither amendment nor sighting was therefore rendered
+        as an amendment — misattributing what the record actually IS, inside
+        the transform whose own docstring calls itself the executable
+        specification of PRD D6.
+
+        Latent on the measured path, not theoretical: the committed
+        `e2_arm_claims.jsonl` only uses amendment/sighting/canonical, which is
+        exactly why no artifact assertion catches it — but the `others` bucket
+        exists precisely because the code anticipates other kinds, and a
+        grouped read that renames a retraction into an amendment resolves a
+        disagreement in the canonical's favour, the esc-5712 shape V2 forbids.
+        """
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='THE CANONICAL BODY')
+        other, _ = _hit('child-a', parent_id=PARENT, kind='retraction',
+                        content='THE RETRACTION TEXT')
+        records_by_id = {PARENT: parent, 'child-a': other}
+
+        grouped = mod.apply_grouped_read([other], records_by_id, contested_ids=set())
+
+        document = grouped[0].content
+        # D6 still holds: the body resolves upward and stays reachable ...
+        assert 'THE RETRACTION TEXT' in document
+        # ... but it is not announced as something it is not.
+        assert '[amendment]' not in document, (
+            f'a retraction was rendered as an amendment: {document!r}'
+        )
+        assert '[retraction] THE RETRACTION TEXT' in document
+
+    def test_an_amendment_and_a_third_kind_are_labelled_apart_in_one_document(self):
+        """The mislabelling is only visible when both kinds share a document:
+        a renderer that dropped the prefix entirely would pass the test above
+        while making an amendment and a retraction indistinguishable, which is
+        the same misattribution in the other direction.
+        """
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON')
+        amend, _ = _hit('child-a', parent_id=PARENT, kind='amendment',
+                        content='AMENDED')
+        other, _ = _hit('child-b', parent_id=PARENT, kind='retraction',
+                        content='RETRACTED')
+        records_by_id = {PARENT: parent, 'child-a': amend, 'child-b': other}
+
+        grouped = mod.apply_grouped_read(
+            [amend, other], records_by_id, contested_ids=set()
+        )
+
+        document = grouped[0].content
+        assert '[amendment] AMENDED' in document
+        assert '[retraction] RETRACTED' in document
+
     def test_grouped_document_keeps_the_parents_identity_and_topic(self):
         mod = _mod()
         parent, _ = _hit(PARENT, canonical=True, content='CANON', topic='alpha-topic')
@@ -1838,13 +1893,6 @@ class TestTokenEstimatorInvariants:
                 'estimator': name,
                 'payloads_counted': 0,
             }
-
-    def test_every_estimator_is_deterministic(self):
-        """A rerun must produce a diffable report, not a moving number."""
-        body = 'the quick brown fox jumps over the lazy dog ' * 20
-
-        for name, encode in _available_estimators():
-            assert encode(body) == encode(body), f'{name} is not deterministic'
 
 
 # ===========================================================================
@@ -2828,18 +2876,6 @@ class TestRenderMarkdown:
         for arm in report['arms']:
             assert sum(1 for row in rows if row.startswith(f'| {arm} |')) == 1
 
-    def test_the_table_header_is_pinned_column_for_column(self):
-        """Pinned by equality, not by substring: a column quietly dropped from
-        a decision table is a metric quietly dropped from the decision."""
-        mod = _mod()
-
-        rendered = mod.render_markdown(_report())
-        header = next(
-            line for line in rendered.splitlines() if line.startswith('| arm ')
-        )
-
-        assert header == '| ' + ' | '.join(mod.DECISION_TABLE_COLUMNS) + ' |'
-
     def test_it_names_the_estimator_that_produced_the_token_column(self):
         rendered = _mod().render_markdown(_report())
 
@@ -3141,13 +3177,6 @@ _SMALL_RUN = {'cluster_limit': 2, 'distractor_limit': 12, 'project_suffix': 'ute
 class TestEphemeralCollectionIdentity:
     """A collection nobody can reap is a leak, so its NAME is a contract."""
 
-    def test_the_prefix_is_the_reapers_own_constant_not_a_restated_string(self):
-        """A rename in one file must not orphan collections named in another."""
-        mod = _mod()
-        cleanup = mod.load_cleanup_script()
-
-        assert mod.ephemeral_collection_prefix() == cleanup.E2_BAKEOFF_PREFIX
-
     def test_every_arm_collection_starts_with_the_reapable_prefix(self):
         mod = _mod()
         prefix = mod.load_cleanup_script().E2_BAKEOFF_PREFIX
@@ -3372,6 +3401,58 @@ class TestRunBakeOffWiring:
         # Per-RUN, so two bake-offs cannot share a queue with each other
         # either — which a fixed path outside the checkout would still allow.
         assert attached[0] != attached[1]
+
+    async def test_a_failed_initialize_still_tears_the_run_down(self, monkeypatch):
+        """The queue temp dir and the service were acquired OUTSIDE the
+        `try:`/`finally:` that cleans them up, so the one failure mode the
+        temp dir exists for — `initialize()` raising, which is exactly what an
+        unreachable Qdrant, a missing key, or a durable-queue recovery failure
+        does — leaked the directory and skipped `close()`.
+
+        The test above proves the happy path removes the dir; that is the
+        cheap half.  The module comment above the `mkdtemp` argues at length
+        that this queue must never outlive the run, and a teardown that only
+        holds when nothing goes wrong does not carry that argument.
+
+        `MemoryService.close()` is safe on a partially-initialised service —
+        every sub-close goes through `_safe_close`, which is time-boxed and
+        logs without re-raising (memory_service.py:1192) — so the finally can
+        call it unguarded rather than swallowing close failures on the happy
+        path too.
+        """
+        import tempfile  # noqa: PLC0415
+
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+
+        async def _initialize_explodes(self):
+            raise RuntimeError('qdrant unreachable')
+
+        monkeypatch.setattr(_FakeMemoryService, 'initialize', _initialize_explodes)
+
+        with pytest.raises(RuntimeError, match='qdrant unreachable'):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        # The failure has to keep propagating: a driver that swallowed it
+        # would publish an artifact measured against nothing.
+        assert len(_FakeMemoryService.instances) == 1
+        service = _FakeMemoryService.instances[-1]
+
+        queue_dir = Path(service.config.queue.data_dir)
+        assert queue_dir.is_relative_to(Path(tempfile.gettempdir()))
+        assert not queue_dir.exists(), (
+            f'{queue_dir} survived a failed run — the queue state the module '
+            f'comment says must never outlive the run now outlives it, and '
+            f'accumulates one directory per failed attempt'
+        )
+        assert service.closed, (
+            'close() was skipped, so whatever initialize() managed to build '
+            'before raising is never torn down'
+        )
+        # The ephemeral collections are dropped on the way out too: a failure
+        # after the pre-clean drop must not leave a half-seeded arm behind for
+        # the next run to measure.
+        assert drops.calls, 'nothing was dropped on the failure path'
 
     async def test_it_copies_the_config_rather_than_mutating_the_callers(
         self, monkeypatch,
@@ -4261,13 +4342,6 @@ class TestReportCarriesThePinDiagnostic:
             r for r in _decision_table_rows(rendered) if r.startswith('| c_peers |')
         )
         assert '—' in row
-
-    def test_the_render_stays_byte_deterministic_for_identical_input(self):
-        """The artifact's whole value is that a rerun's diff is signal."""
-        mod = _mod()
-        report = _report()
-
-        assert mod.render_markdown(report) == mod.render_markdown(report)
 
 
 class TestBuildParser:

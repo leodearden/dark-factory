@@ -122,10 +122,17 @@ LIVE_COLLECTIONS = (
 
 
 class TestPrefixAgreement:
-    """One home for the string, or a rename orphans collections forever."""
+    """This module owns the prefixes, and the tuple is what the cron deletes.
 
-    def test_the_bake_off_reads_its_prefix_from_this_module(self):
-        assert _bake_off().ephemeral_collection_prefix() == _mod().E2_BAKEOFF_PREFIX
+    The cross-file half — that the bake-off's seeded names really are
+    reapable — is asserted where it can actually fail, over the names
+    `ephemeral_collections()` builds
+    (test_bake_off_storage_shape.py::test_every_arm_collection_starts_with_the_reapable_prefix).
+    Comparing `ephemeral_collection_prefix()` against `E2_BAKEOFF_PREFIX`
+    here could not: that function's whole body is
+    `return load_cleanup_script().E2_BAKEOFF_PREFIX`, so both sides read the
+    same attribute of this same module and a rename moves them together.
+    """
 
     def test_the_reaped_prefixes_are_pinned_by_equality(self):
         """By equality, not membership: this tuple is the complete list of
