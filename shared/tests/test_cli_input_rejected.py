@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
@@ -790,14 +791,13 @@ class TestNonBlankPromptPrecondition:
 
     async def _assert_no_dispatch(self, prompt, **kwargs):
         run_patch, argv_patch = self._patched_dispatch()
-        with run_patch as run_mock, argv_patch as argv_mock:
-            with pytest.raises(ValueError):
-                await invoke_claude_agent(
-                    prompt=prompt,
-                    system_prompt='sys',
-                    cwd=Path('/tmp'),
-                    **kwargs,
-                )
+        with run_patch as run_mock, argv_patch as argv_mock, pytest.raises(ValueError):
+            await invoke_claude_agent(
+                prompt=prompt,
+                system_prompt='sys',
+                cwd=Path('/tmp'),
+                **kwargs,
+            )
         run_mock.assert_not_called()
         argv_mock.assert_not_called()
 

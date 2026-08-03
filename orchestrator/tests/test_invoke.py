@@ -1932,19 +1932,20 @@ class TestSandboxPathRejectsBlankPrompt:
         argv_mock = MagicMock(return_value=(['claude', '--print'], []))
         backend_p, wrap_p, run_p, argv_p = self._sandbox_patches(run_mock, argv_mock)
 
-        with backend_p, wrap_p, run_p, argv_p:
-            with pytest.raises(ValueError):
-                await _invoke_claude_with_sandbox(
-                    prompt=prompt, system_prompt='sys', cwd=tmp_path,
-                    model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
-                    allowed_tools=None, disallowed_tools=None,
-                    mcp_config=None, output_schema=None,
-                    permission_mode='bypassPermissions',
-                    sandbox_modules=['m'],
-                    effort=None, timeout_seconds=30.0,
-                )
+        with backend_p, wrap_p, run_p, argv_p, pytest.raises(ValueError):
+            await _invoke_claude_with_sandbox(
+                prompt=prompt, system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+            )
 
-        argv_mock.assert_not_called(), 'no temp files may be created for a blank prompt'
+        # No temp files may be created and no subprocess spawned for a blank
+        # prompt: the guard has to fire strictly before build_claude_argv.
+        argv_mock.assert_not_called()
         run_mock.assert_not_called()
 
     async def test_empty_prompt_raises_before_argv_or_subprocess(self, tmp_path):

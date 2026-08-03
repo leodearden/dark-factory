@@ -1456,8 +1456,9 @@ async def test_call_judge_cli_input_rejected_raises_infra_error(mock_journal):
     """
     from unittest.mock import AsyncMock
 
-    from fused_memory.reconciliation.judge import JudgeInfraError
     from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JudgeInfraError
 
     fake_gate = make_gate_mock()
     config = _make_judge_config(
@@ -1481,9 +1482,8 @@ async def test_call_judge_cli_input_rejected_raises_infra_error(mock_journal):
         'fused_memory.reconciliation.judge.invoke_with_cap_retry',
         new_callable=AsyncMock,
         return_value=rejected_result,
-    ):
-        with pytest.raises(JudgeInfraError) as excinfo:
-            await judge._call_judge_cli('Evaluate this run.')
+    ), pytest.raises(JudgeInfraError) as excinfo:
+        await judge._call_judge_cli('Evaluate this run.')
 
     assert 'Input must be provided' in str(excinfo.value), (
         f'the raised message must carry the CLI stderr cause, got {excinfo.value!r}'

@@ -1063,13 +1063,13 @@ class TestEdgeCases:
         with (
             patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock) as mock_inv,
             patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+            pytest.raises(ValueError, match='non-empty'),
         ):
-            with pytest.raises(ValueError, match='non-empty'):
-                await invoke_with_cap_retry(
-                    gate, 'test-no-prompt',
-                    system_prompt='sys', cwd=Path('/tmp'),
-                    # NOTE: no prompt= keyword
-                )
+            await invoke_with_cap_retry(
+                gate, 'test-no-prompt',
+                system_prompt='sys', cwd=Path('/tmp'),
+                # NOTE: no prompt= keyword
+            )
 
         # Nothing was dispatched and no account slot was consumed.
         mock_inv.assert_not_called()
