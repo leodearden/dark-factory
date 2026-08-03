@@ -2195,6 +2195,8 @@ class TestSessionResumeStorm:
         assert harness._session_resume_fallback_streak == 2
 
         # ...then the clock jumps past the window before the 3rd arrives.
+        # (The assert also pins that a genuine fallback stamped the chain point.)
+        assert harness._last_session_resume_fallback_at is not None
         harness._last_session_resume_fallback_at -= 120
 
         await _drive_session_slot(harness, 'd2', self._stale_session('uuid-d2'))
