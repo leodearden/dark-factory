@@ -153,6 +153,29 @@ _GAP_EXCLUDED_ALT = (
     r'until|after|before)\b)'
 )
 
+# Tokens SNAPSHOT_STATUS_PHRASE_RE's open-class gap may not absorb because
+# they START ANOTHER TASK REFERENCE. Kept separate from _GAP_EXCLUDED_ALT
+# above: that list is about words which INVERT the assertion, this one is
+# about words which RE-SUBJECT it, and the two want independent rationale.
+#
+# Without this, the gap could span an intervening reference and bind the
+# phrase to the wrong task — and because re.finditer is non-overlapping, the
+# first (wrong) match consumed the inner reference so the CORRECT id was
+# never extracted either: 'Task 5 blocks task 9 in blocked status' yielded
+# {5} (over-selection on 5, silent under-selection on 9) where it must yield
+# {9}. The token vocabulary mirrors TASK_REF_RE's own ('task'/'df'/digits);
+# its third alternative, a literal '#', needs no exclusion because the gap's
+# '\w+' cannot match '#' in the first place.
+#
+# The '\w*\b' tail makes this DELIBERATELY WIDER than TASK_REF_RE: 'tasks'
+# is refused as a gap word even though the plural is not itself a reference
+# (TASK_REF_RE anchors '\btask\b'). The cost is under-selection on shapes
+# like 'Task 5 blocks tasks 9 in blocked status' (now set(), previously the
+# wrong {5}) — the fail-safe direction this module prefers throughout, and
+# pinned by a test rather than left implicit. (amendment,
+# reviewer_comprehensive correctness-precision finding, task 3042)
+_GAP_NO_TASK_REF = r'(?!(?:task|df|\d)\w*\b)'
+
 # The union of both marker classes. Derived from the two constants above
 # rather than hand-written, so the gate (SNAPSHOT_STATUS_RE) and the
 # anchored matchers can never drift apart again — before task 3042 they were
@@ -237,7 +260,9 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
 # 3042). An earlier version of this comment claimed the 'status' noun meant
 # the open-class gap "costs no precision". That was an overstatement, and a
 # future maintainer would have relied on it. The status-noun requirement
-# removes most but not all binding ambiguity; two shapes still bind wrongly:
+# removes most but not all binding ambiguity. Four shapes have been
+# identified; (1), (2) and (4) are now EXCLUDED, and (3) alone still binds
+# and is pinned by a documented-behaviour test rather than claimed away:
 #
 # (1) A following HEAD NOUN, where 'status' is a modifier rather than the
 #     phrase head: 'Task 142 is tracked in the pending status report' — a
@@ -269,11 +294,26 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
 #     matching at this altitude. Documented as known behaviour (with a test
 #     pinning it) rather than claimed away, so the trade-off stays visible.
 #     Widening the gap beyond {0,3} words would make this strictly worse.
+# (4) An intervening TASK REFERENCE absorbed by the gap, which RE-SUBJECTS
+#     the assertion onto a different task: 'Task 5 blocks task 9 in blocked
+#     status' and 'Task 5 supersedes task 9 in pending status' both yielded
+#     {5}. Strictly worse than a plain over-selection, because re.finditer
+#     is non-overlapping — the wrong match consumed the inner 'task 9', so
+#     the CORRECT id was silently never extracted either. One match, both
+#     error directions at once. Now EXCLUDED via _GAP_NO_TASK_REF above.
+#     The bug needed BOTH a <=3-word gap and a word-initial reference token:
+#     'df 9' was affected identically, '#9' never was (the gap's '\w+'
+#     cannot match '#'), and a 4+-word gap ('Task 5 depends on task 9 in
+#     active status') was already out of reach. (amendment,
+#     reviewer_comprehensive correctness-precision finding, task 3042)
 SNAPSHOT_STATUS_PHRASE_RE: re.Pattern[str] = re.compile(
     TASK_REF_RE.pattern
-    # the gap is open-class BUT may not absorb negation or past-exit
-    # qualifiers — those invert the assertion (see residual (3) above)
-    + r'(?:\s+' + _GAP_EXCLUDED_ALT + r'\w+){0,3}?\s+in\s+(?:an?\s+|the\s+)?'
+    # The gap is open-class BUT may absorb neither negation / past-exit
+    # qualifiers (residual (2) — they INVERT the assertion) nor the opening
+    # token of another task reference (residual (4) — it RE-SUBJECTS the
+    # assertion). Both are per-gap-word negative lookaheads.
+    + r'(?:\s+' + _GAP_EXCLUDED_ALT + _GAP_NO_TASK_REF + r'\w+){0,3}?'
+    + r'\s+in\s+(?:an?\s+|the\s+)?'
     + _STATUS_MARKER_ALT + r'\s+status\b'
     # the span must END the noun phrase — else 'status' is a modifier of a
     # following head noun ('status report'), not the phrase head

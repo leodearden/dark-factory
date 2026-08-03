@@ -437,6 +437,112 @@ class TestExtractSnapshotEdgeTaskIds:
         assert result == {5}
 
     @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Task 5 blocks task 9 in blocked status', {9}),
+            ('Task 5 supersedes task 9 in pending status', {9}),
+            ('Task 5 unblocks task 9 in in-progress status', {9}),
+            # the 'df N' spelling of a reference was affected identically
+            ('Task 5 supersedes df 9 in pending status', {9}),
+            # ...and the OUTER reference's spelling is irrelevant to the bug
+            ('df 5 blocks task 9 in blocked status', {9}),
+            ('#5 blocks task 9 in blocked status', {9}),
+            # both error directions plus an unrelated individual-form id
+            (
+                'Task 5 blocks task 9 in blocked status and task 11 is pending',
+                {9, 11},
+            ),
+        ],
+    )
+    def test_status_phrase_gap_does_not_absorb_intervening_task_reference(
+        self, fact, expected
+    ):
+        """An intervening task reference must not be swallowed by the gap.
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). SNAPSHOT_STATUS_PHRASE_RE's open-class {0,3}
+        gap could span a whole second task reference, so the 'in <marker>
+        status' phrase bound to the OUTER task rather than the one it
+        actually describes.
+
+        This is strictly worse than an ordinary over-selection, because
+        re.finditer is non-overlapping: the wrong match CONSUMED the inner
+        reference, so the correct id was never extracted either. One match
+        produced both error directions at once — 'Task 5 blocks task 9 in
+        blocked status' yielded {5} where it must yield {9}: over-selection
+        on 5 (a permanently-true historical fact the sweep would retire the
+        moment 5 went terminal) AND silent under-selection on 9 (the edge
+        that genuinely IS a blocked-status snapshot, invisible to the
+        sweep). Every case here yielded the outer id before _GAP_NO_TASK_REF
+        was wired into the gap.
+
+        The last case pins that the fix is local to the phrase path: 'task
+        11 is pending' is still picked up by INDIVIDUAL_SNAPSHOT_RE, so the
+        expected set is {9, 11} and not merely {9}.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Task 5 depends on task 9 in active status', {9}),
+            ('Task 5 blocks #9 in blocked status', {9}),
+        ],
+    )
+    def test_intervening_reference_shapes_that_bounded_the_bug(
+        self, fact, expected
+    ):
+        """The two shapes an intervening reference could NOT be absorbed in.
+
+        Unlike the cases above, these two were already correct before
+        _GAP_NO_TASK_REF existed — they are boundary pins, not regression
+        evidence, and are labelled as such deliberately. They record what
+        bounded the bug, so a future widening reintroduces a failure here
+        rather than silently resurrecting it:
+
+        - a 4+-word gap ('depends', 'on', 'task', '9') exceeds {0,3}, so
+          widening the gap bound would re-open this class;
+        - '#9' cannot be absorbed because the gap's '\\w+' does not match
+          '#', so admitting punctuation into the gap token class would too.
+
+        Both must keep yielding the INNER id.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    def test_task_ref_exclusion_is_word_initial_not_substring(self):
+        """'Task 5 is multitasked in blocked status' -> {5}.
+
+        _GAP_NO_TASK_REF is a per-gap-word lookahead anchored at the START
+        of the gap word, not a substring test: an ordinary open-class word
+        that merely CONTAINS 'task' must still pass, or the guard would have
+        cost recall rather than only precision. Same shape of pin as
+        test_status_phrase_still_matches_non_negated_qualifiers.
+        """
+        assert (
+            extract_snapshot_edge_task_ids('Task 5 is multitasked in blocked status')
+            == {5}
+        )
+
+    def test_plural_list_noun_in_gap_is_a_documented_under_selection(self):
+        """'Task 5 blocks tasks 9 in blocked status' -> set().
+
+        DOCUMENTED KNOWN BEHAVIOUR. _GAP_NO_TASK_REF's '\\w*\\b' tail makes
+        its vocabulary deliberately WIDER than TASK_REF_RE's: 'tasks' is
+        excluded from the gap even though the plural is not itself a
+        reference (TASK_REF_RE's '\\btask\\b' does not match it). So this
+        fact now yields nothing at all rather than the wrong {5} it yielded
+        before.
+
+        That is the fail-safe direction this module prefers throughout —
+        under-selection self-heals next cycle or is caught by Stage 2,
+        whereas over-selection wrongly retires a true fact. Pinned so the
+        trade is visible; narrowing the tail to '\\b' would trade it back.
+        """
+        assert extract_snapshot_edge_task_ids(
+            'Task 5 blocks tasks 9 in blocked status'
+        ) == set()
+
+    @pytest.mark.parametrize(
         'fact',
         [
             'Task 5 is in the active branch',
