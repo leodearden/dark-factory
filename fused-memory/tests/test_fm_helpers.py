@@ -681,6 +681,43 @@ class TestFalkorHelpers:
         monkeypatch.setattr(_fm_helpers, '_falkor_available', lambda: True)
         assert _fm_helpers.falkor_skipif().args[0] is False
 
+    def test_unique_graph_name_shape(self):
+        """unique_graph_name(slug) is '_test_<slug>_<8 lowercase hex>'.
+
+        Asserted as a regex on the CONTRACT rather than a fixed string, since
+        the suffix is random; this pins the prefix, the slug placement and the
+        8-hex width all at once.
+        """
+        import re
+
+        from _fm_helpers import unique_graph_name
+
+        assert re.fullmatch(r'_test_myslug_[0-9a-f]{8}', unique_graph_name('myslug'))
+
+    def test_unique_graph_name_is_unique_per_call(self):
+        """Two calls with the same slug return different names.
+
+        This is the whole point of the idiom: concurrent runs (pytest-xdist
+        -n auto, a CI matrix against one shared FalkorDB) must never share a
+        graph and wipe each other's fixtures.
+        """
+        from _fm_helpers import unique_graph_name
+
+        assert unique_graph_name('myslug') != unique_graph_name('myslug')
+
+    def test_unique_graph_name_preserves_existing_namespace(self):
+        """The helper reproduces the migrated modules' existing graph-name namespace.
+
+        Byte-compatibility check: the migration must not silently rename live
+        graphs, and the 'task id in the graph name' convention (which makes an
+        orphaned graph from a killed run traceable to a module) must survive.
+        """
+        from _fm_helpers import unique_graph_name
+
+        assert unique_graph_name('530_list_indices_integration').startswith(
+            '_test_530_list_indices_integration_'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for the shared poll_until() helper (task 2377)
