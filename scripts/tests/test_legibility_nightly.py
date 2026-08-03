@@ -834,24 +834,19 @@ class _FakeHttpxResponse:
         pass
 
 
-def test_default_poster_sends_streamable_http_accept_headers(monkeypatch):
+def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
     """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint).
     `_default_poster`'s httpx import is lazy (httpx is not importable in
     this test env), so a fake `httpx` module is injected via sys.modules."""
-    import sys
-
     captured_kwargs = {}
-
-    fake_httpx = type(sys)('httpx')
 
     def _fake_post(url, **kwargs):
         captured_kwargs.update(kwargs)
         return _FakeHttpxResponse()
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    install_fake_httpx(_fake_post)
 
     nightly._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
 

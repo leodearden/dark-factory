@@ -2846,15 +2846,13 @@ class _FakeHttpxResponse:
         return self._payload
 
 
-def test_post_mcp_tool_call_sends_streamable_http_accept_headers(monkeypatch):
+def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_httpx):
     """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint --
     shared by census.py's submit_task and escalate_info posters via this one
     function). httpx is imported lazily and is not importable in this test
     env, so a fake `httpx` module is injected via sys.modules."""
-    import sys
-
     captured_kwargs = {}
     rpc_response = {
         "jsonrpc": "2.0",
@@ -2862,14 +2860,11 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(monkeypatch):
         "result": {"structuredContent": {"ok": True}},
     }
 
-    fake_httpx = type(sys)("httpx")
-
     def _fake_post(url, **kwargs):
         captured_kwargs.update(kwargs)
         return _FakeHttpxResponse(rpc_response)
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    install_fake_httpx(_fake_post)
 
     result = mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
 
