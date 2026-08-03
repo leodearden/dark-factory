@@ -43,6 +43,7 @@ no-silent-fail-soft violation in docs/legibility/design-invariants.md.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 import sys
@@ -904,3 +905,131 @@ def format_json(audits: list[ProjectAudit]) -> str:
             ],
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI.
+# ---------------------------------------------------------------------------
+
+# Named rather than spelled inline so the epilog, main()'s docstring and the
+# returns can never drift into disagreeing about what a number means. Each
+# denotes EXACTLY ONE outcome -- that is the whole reason 3 exists rather than
+# being folded into 0.
+EXIT_OK = 0                # audited; no LIVE findings and no id mismatch
+EXIT_LIVE_FINDINGS = 1     # a non-terminal finding, or the project_id guard fired
+EXIT_NO_ROOT = 2           # no project root resolved to a readable tasks.db
+EXIT_NOTHING_SCANNED = 3   # roots resolved but EVERY one failed to audit
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "READ-ONLY audit of curator-combine metadata loss: reports every "
+            "task bearing the combine signature whose pre-combine metadata "
+            "keys can be shown missing against an independent source (its "
+            "creating ticket, or a capability manifest). Reporting only -- "
+            "never mutates a task, ticket, or manifest. Remediation is a "
+            "separate, individually-reviewed follow-up."
+        ),
+        epilog=(
+            "exit codes: 0 = audited, no LIVE findings; 1 = at least one "
+            "NON-TERMINAL finding, or the project-id mismatch guard fired; "
+            "2 = no project root resolved to a readable tasks.db; 3 = roots "
+            "resolved but every one failed to audit, so NOTHING was scanned "
+            "(never treat 3 as a clean run). Terminal (done/cancelled) "
+            "findings are always reported but never affect the exit code."
+        ),
+    )
+    parser.add_argument(
+        "--project-root", dest="project_roots", action="append",
+        help=(
+            "Project root to audit (resolves <root>/.taskmaster/tasks/tasks.db, "
+            "<root>/data/reconciliation/tickets.db, <root>/plans and "
+            "<root>/docs/prds). May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--project-id", dest="project_id", default=None,
+        help=(
+            "Override the tickets.db project_id (default: %(default)s, i.e. "
+            "derived from the project root's directory name with '-' mapped "
+            "to '_'). A wrong id matches zero tickets and would make every "
+            "combine target look wiped, so a mismatch is reported loudly."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit a JSON object (findings plus coverage) instead of a report.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Exit codes: 0 = audited, no LIVE findings; 1 = at least one NON-TERMINAL
+    finding or a fired project-id mismatch guard; 2 = no project root resolved
+    to a readable tasks.db; 3 = roots resolved but EVERY one failed to audit,
+    so NOTHING was scanned.
+
+    3 exists because 0 would otherwise be returned for two opposite outcomes --
+    "audited everything, found nothing" and "audited nothing at all" -- and a
+    CI/cron consumer reading only the exit code would take a total failure for
+    a clean run. That is exactly the silent fail-soft this module refuses to do
+    (see the module docstring).
+
+    1 keys on NON-TERMINAL findings only. The ~67 terminal combine targets
+    were deliberately left un-remediated; if they drove the exit code this
+    detector would be permanently red and therefore ignored, destroying its
+    value as a re-runnable regression check. They are still printed in full.
+
+    A single unreadable project (a corrupt/locked tasks.db) does NOT abort the
+    sweep: it is logged to stderr and skipped so every other project is still
+    audited, and a trailing warning states that the results are incomplete.
+    """
+    args = _build_parser().parse_args(argv)
+
+    roots = discover_project_roots(project_roots=args.project_roots)
+    if not roots:
+        print(
+            "no project root resolvable with a readable tasks.db (checked "
+            "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
+            "dark-factory default)",
+            file=sys.stderr,
+        )
+        return EXIT_NO_ROOT
+
+    audits: list[ProjectAudit] = []
+    unreadable: list[str] = []
+    for root in roots:
+        try:
+            audits.append(audit_project(root, args.project_id))
+        except sqlite3.Error as exc:
+            print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
+            unreadable.append(root)
+
+    if unreadable:
+        print(
+            f"warning: {len(unreadable)} project(s) skipped due to read errors "
+            "(see warnings above); results below are incomplete",
+            file=sys.stderr,
+        )
+
+    print(format_json(audits) if args.json else format_report(audits))
+
+    if unreadable and not audits:
+        # Nothing was scanned at all -- never report that as a clean sweep.
+        print(
+            "error: every resolved project was unreadable; NOTHING was "
+            "audited (this is not a clean result)",
+            file=sys.stderr,
+        )
+        return EXIT_NOTHING_SCANNED
+
+    live = any(not f.terminal for a in audits for f in a.findings)
+    mismatch = any(a.project_id_mismatch for a in audits)
+    return EXIT_LIVE_FINDINGS if (live or mismatch) else EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
