@@ -21,6 +21,8 @@ the test controls exactly.
 """
 from __future__ import annotations
 
+import itertools
+
 from audit_combine_gate_marker_loss import (
     CombineTarget,
     load_combine_targets,
@@ -106,12 +108,22 @@ def test_load_combine_targets_metadata_keys_are_a_tuple(make_tasks_db):
 # regression names the exact shape that broke.
 # ---------------------------------------------------------------------------
 
+# `make_tasks_db` defaults to the name 'tasks.db' inside a single tmp_path, so
+# two calls in ONE test would collide on "table tasks already exists". A
+# counter gives each call its own file, which is what lets the matrix below be
+# asserted row-by-row rather than as one opaque loop.
+_DB_SEQ = itertools.count()
+
+
 def _survives_alongside(make_tasks_db, bad_metadata):
     """Seed a bad row next to a good combine row; return the surviving keys."""
-    db = make_tasks_db([
-        {"id": 1, "status": "done", "metadata": bad_metadata},
-        {"id": 2, "status": "done", "metadata": _WIPE_SIGNATURE},
-    ])
+    db = make_tasks_db(
+        [
+            {"id": 1, "status": "done", "metadata": bad_metadata},
+            {"id": 2, "status": "done", "metadata": _WIPE_SIGNATURE},
+        ],
+        name=f"tasks-{next(_DB_SEQ)}.db",
+    )
     return set(load_combine_targets(str(db)))
 
 
