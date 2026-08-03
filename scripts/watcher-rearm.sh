@@ -10,9 +10,13 @@
 # a deliberately-pending id to instead of rebuilding the whole list.
 #
 # Usage:
-#   watcher-rearm.sh --level N [--queue-dir DIR] [--timeout SECS]
+#   watcher-rearm.sh [--level N] [--queue-dir DIR] [--timeout SECS]
 #                     [--exclude-file PATH] [--baseline]
 #                     [--ntfy-url URL] [--task-id ID] [--check]
+#
+# --level is OPTIONAL. Omitting it selects escalation.watcher's match-all
+# mode, for flat queues whose escalations carry no level worth filtering
+# (the reconciliation queue -- see skills/recon-escalation-watcher).
 #
 # Env:
 #   DARK_FACTORY_ROOT     required; repo root used to locate the escalation
@@ -39,8 +43,8 @@
 # invocation outcome, so callers can grep the outcome without disturbing the
 # watcher's JSON on stdout -- do NOT pipe `2>&1` if you parse stdout as JSON.
 # NOTE: usage/guard failures (exit 2 -- missing DARK_FACTORY_ROOT, an
-# unresolved queue dir, missing --level, or a bad flag) return BEFORE the
-# watcher is ever invoked, so they print a plain stderr diagnostic instead of
+# unresolved queue dir, or a bad flag) return BEFORE the watcher is ever
+# invoked, so they print a plain stderr diagnostic instead of
 # this marker -- do not grep for the marker to detect a usage error, check
 # for exit code 2 instead.
 #
@@ -137,10 +141,6 @@ if [ -z "$QUEUE_DIR" ]; then
     echo "watcher-rearm.sh: no queue dir resolved -- pass --queue-dir or set PROJECT_ROOT" >&2
     exit 2
 fi
-if [ -z "$LEVEL" ]; then
-    echo "watcher-rearm.sh: --level is required" >&2
-    exit 2
-fi
 
 # Wrapper-owned exclude-file: an explicit --exclude-file wins, else default
 # to a per-level path inside the queue dir. Always exists once we proceed
@@ -155,7 +155,10 @@ fi
 EXCLUDE_FILE="${EXCLUDE_FILE_ARG:-$QUEUE_DIR/.watcher-rearm-exclude-l$LEVEL}"
 
 if [ "$CHECK" -eq 1 ]; then
-    echo "watcher-rearm.sh: would watch queue-dir=$QUEUE_DIR level=$LEVEL timeout=$TIMEOUT exclude-file=$EXCLUDE_FILE"
+    # Render an unset LEVEL as the explicit token `<all>` rather than an
+    # empty `level=`, which a human doing a dry-run would misread as an
+    # unset-variable bug instead of the deliberate match-all mode.
+    echo "watcher-rearm.sh: would watch queue-dir=$QUEUE_DIR level=${LEVEL:-<all>} timeout=$TIMEOUT exclude-file=$EXCLUDE_FILE"
     exit 0
 fi
 
@@ -178,7 +181,12 @@ else
     WATCHER_CMD=(uv run --project "$DARK_FACTORY_ROOT/escalation" python)
 fi
 
-WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --level "$LEVEL" --timeout "$TIMEOUT" --exclude-file "$EXCLUDE_FILE")
+WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --timeout "$TIMEOUT" --exclude-file "$EXCLUDE_FILE")
+# --level is OMITTED entirely when unset, never passed as an empty value:
+# escalation.watcher declares it `type=int`, so `--level ""` would crash
+# argparse. Omission selects the module's already-supported match-all mode
+# (default=None at watcher.py:192; _matches at watcher.py:67).
+[ -n "$LEVEL" ] && WATCHER_ARGS+=(--level "$LEVEL")
 [ -n "$NTFY_URL" ] && WATCHER_ARGS+=(--ntfy-url "$NTFY_URL")
 [ -n "$TASK_ID" ] && WATCHER_ARGS+=(--task-id "$TASK_ID")
 [ "$BASELINE" -eq 1 ] && WATCHER_ARGS+=(--baseline)
