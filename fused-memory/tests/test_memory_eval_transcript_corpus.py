@@ -1218,7 +1218,7 @@ class TestZeroSearchCasesAreDistinguishableEndToEnd:
 
 FIXTURE_MAIN = (
     FIXTURE_ARCHIVE / '4242' / '-home-leo-src-dark-factory--worktrees-4242'
-    / '11111111-2222-3333-4444-555555555555.jsonl.gz'
+    / '11111111-2222-3333-4444-555555555555.jsonl'
 )
 
 
@@ -1289,7 +1289,7 @@ class TestSingleTranscriptMode:
         subagent = (
             FIXTURE_ARCHIVE / '4242' / '-home-leo-src-dark-factory--worktrees-4242'
             / '11111111-2222-3333-4444-555555555555' / 'subagents'
-            / 'agent-abc123def4567890.jsonl.gz'
+            / 'agent-abc123def4567890.jsonl'
         )
         _, coverage, records = self._cli(subagent, tmp_path / 'single')
 

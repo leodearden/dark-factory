@@ -347,8 +347,8 @@ extractor (`docs/prds/memory-eval-program.md` §5 leaf θ, decision D9, task
 (via `--archive-root` and `--transcript`) and asserted end-to-end in
 `fused-memory/tests/test_memory_eval_transcript_corpus.py`.
 
-Unlike the two fixtures above this one is a directory of gzipped JSONL, not
-a single file: the extractor's provenance parsing reads task/session/subagent
+Unlike the two fixtures above this one is a directory of JSONL files, not a
+single file: the extractor's provenance parsing reads task/session/subagent
 identity **out of the path**, so a flat fixture could not exercise it.
 
 ### Purpose
@@ -365,25 +365,45 @@ Its round-trip is one half of the capability manifest's
 `coverage-report-discloses-failures` check
 (`docs/prds/memory-eval-program.capability-manifest.yaml`); the other half is
 an all-unparseable-input case, which is built in a temp dir because a
-deliberately-corrupt `.gz` is not something to commit.
+deliberately-corrupt transcript is not something to commit.
 
 ### Layout
 
-Mirrors what `shared/src/shared/transcript_archive.py` writes, both variants:
+Mirrors the two path shapes `shared/src/shared/transcript_archive.py`
+writes:
 
 ```
 transcript_corpus/
 └── 4242/                                            # <task_id>
     └── -home-leo-src-dark-factory--worktrees-4242/  # <encoded cwd>
-        ├── 11111111-…-555555555555.jsonl.gz         # main session
+        ├── 11111111-…-555555555555.jsonl            # main session
         └── 11111111-…-555555555555/
             └── subagents/
-                └── agent-abc123def4567890.jsonl.gz  # subagent session
+                └── agent-abc123def4567890.jsonl     # subagent session
 ```
 
 Task id, session id, `is_subagent` and the subagent id are all recovered
 from these path components — never from the record bodies — so renaming a
 directory changes what the extractor reports.
+
+**Why plain `.jsonl` and not the live archive's `.jsonl.gz`.** The
+extractor accepts both suffixes (`scan_archive` globs `*.jsonl.gz` and
+`*.jsonl`; `load_transcript` / `iter_json_lines` pick the reader off the
+suffix), so the committed copy is uncompressed for two reasons. First,
+`.gz` is a binary blob: a fixture whose whole value is that its authored
+facts are *reviewable* must be readable in a diff, and the line-by-line
+table below is only auditable against a plain file. Second, the
+`gz` extension is absent from the α/γ lock-charter extension allowlist
+(`shared/src/shared/locking.py::CODE_EXTENSIONS`, mirrored in
+`fused_memory.middleware.lock_charter_guard` and reify's
+`scripts/lock-charter-guard.sh`), so committing a tracked `.gz` fails
+`fused-memory/tests/test_lock_charter_guard.py
+::test_every_tracked_extension_is_allowlisted` — widening that vector is a
+coordinated cross-repo change (α leads, γ mirrors) that this fixture does
+not need. The **gzip** read path is still covered end to end: every
+archive-scan test writes real gzipped transcripts into a temp tree
+(`_write_transcript`), including the corrupt-gz and partially-written
+cases.
 
 ### What each line exercises
 
@@ -465,9 +485,9 @@ no write or mutation of the live memory corpus.
 
 ### Regenerating
 
-The `.gz` files are written with `mtime=0` so the committed bytes are
-reproducible. They are small (< 1 KB each) and hand-authored; edit by
-decompressing, changing the JSONL, and recompressing with `mtime=0`.
+The two `.jsonl` files are plain text and hand-authored (< 1 KB each) —
+edit them directly, no decompress/recompress step. Keep them uncompressed:
+see "Why plain `.jsonl` and not the live archive's `.jsonl.gz`" above.
 Changing a query, an id, or a score will fail the round-trip test by
 design — the test asserts the fixture's authored facts verbatim, which is
 what makes it a fixture rather than a smoke test.
