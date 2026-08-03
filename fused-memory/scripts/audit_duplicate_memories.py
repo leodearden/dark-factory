@@ -817,7 +817,11 @@ def ann_pairs_from_neighbors(
             category at all). Counted separately from
             ``below_threshold_dropped`` because the cause and the fix differ:
             those hits were never eligible, so the recall was lost to missing
-            calibration, not to a cutoff doing its job.
+            calibration, not to a cutoff doing its job. Reads zero when the
+            caller passed the same mapping to ``fetch_ann_neighbors``, which
+            then never issues the query at all and counts the RECORD under
+            ``ann_query_skipped_uncalibrated`` instead — the same loss,
+            attributed to the layer that actually declined it.
 
         A self-hit is dropped silently: a record is always its own nearest
         neighbour, which is expected rather than a loss.
@@ -2244,7 +2248,7 @@ def categories_without_own_cutoff(
 def resolve_ann_threshold(
     memory_service: Any,
     override: float | None = None,
-    categories: Iterable[str] = (),
+    categories: Iterable[str] = _ALL_CATEGORIES,
 ) -> tuple[dict[str, float], dict[str, int]]:
     """Resolve the ANN cosine cutoff PER CATEGORY. READ, never invented.
 
@@ -2282,8 +2286,14 @@ def resolve_ann_threshold(
         override: Operator-supplied ``--ann-threshold``. Wins when given,
             including over an uncalibrated config.
         categories: The categories actually being swept. Nothing is resolved
-            for a category that was not asked for, so an empty iterable
-            yields an empty mapping — the caller passes its swept tuple.
+            for a category that was not asked for. Defaults to
+            ``_ALL_CATEGORIES``, matching :func:`build_sweep_plan`'s default
+            for the same argument — an empty DEFAULT would have silently
+            disabled the whole ANN path for an omitting caller, with a
+            zero-filled disclosure and no ERROR, which is precisely the
+            silently missing detector this function exists to prevent.
+            Passing an empty iterable EXPLICITLY still yields an empty
+            mapping: asking for nothing is a caller's choice, not a default.
 
     Returns:
         ``({category: threshold}, disclosure)``. A category is present only
@@ -2344,6 +2354,20 @@ def resolve_ann_threshold(
     }
 
 
+_ANN_QUERY_DISCLOSURE_KEYS: tuple[str, ...] = (
+    'ann_query_errors',
+    'ann_query_skipped_uncalibrated',
+)
+"""Every way the ANN QUERY layer loses a record, enumerated ONCE.
+
+A FOURTH sibling of ``_ANN_DISCLOSURE_KEYS`` / ``_PLAN_DISCLOSURE_KEYS`` /
+``_LIVENESS_DISCLOSURE_KEYS``, and kept separate for the same reason: these
+are properties of what was ASKED (a query that failed, a query never issued),
+while ``_ANN_DISCLOSURE_KEYS`` counts what came BACK. Same contract as its
+siblings: every key always present, always an int, always zero-filled on a
+clean run — an absent counter is indistinguishable from "not measured".
+"""
+
 _ANN_QUERY_CONCURRENCY = 16
 """ANN queries in flight at once.
 
@@ -2364,6 +2388,7 @@ async def fetch_ann_neighbors(
     *,
     top_k: int,
     score_threshold: float,
+    cutoff_by_category: Mapping[str, float] | None = None,
     concurrency: int = _ANN_QUERY_CONCURRENCY,
 ) -> tuple[dict[Any, list[dict[str, Any]]], dict[str, int]]:
     """ANN neighbours for each record, queried with the record's OWN vector.
@@ -2392,7 +2417,20 @@ async def fetch_ann_neighbors(
         records: Normalised records, each optionally carrying ``'vector'``.
         top_k: Neighbours wanted per record. The query asks for ``top_k + 1``
             so the record's own guaranteed self-hit does not consume a slot.
-        score_threshold: Cutoff pushed down into Qdrant.
+        score_threshold: Cutoff pushed down into Qdrant. Deliberately the
+            MIN-of-cutoffs floor rather than each record's own cutoff: a
+            tighter per-record push-down would drop hits at the DB before
+            ``ann_pairs_from_neighbors`` could count them as
+            ``below_threshold_dropped``, trading disclosure for speed.
+        cutoff_by_category: The resolved ``{category: cutoff}`` mapping, when
+            the caller has one. A record whose category is ABSENT from it is
+            uncalibrated — every hit it could return would be discarded by
+            ``ann_pairs_from_neighbors``, so the query is NOT ISSUED at all
+            and the record is counted under
+            ``ann_query_skipped_uncalibrated``. That is a pure cost saving:
+            it removes queries whose results can never form a pair, and never
+            removes a query whose results could. ``None`` (the default) keeps
+            the pre-3357 behaviour of querying every record with a vector.
         concurrency: Max queries in flight (see
             :data:`_ANN_QUERY_CONCURRENCY`).
 
@@ -2400,17 +2438,44 @@ async def fetch_ann_neighbors(
         ``({memory_id: [{'id', 'score'}, ...]}, disclosure)``, with records in
         input order so two identical runs produce identical output. A record
         with no vector is skipped (``ann_pairs_from_neighbors`` counts it as
-        ``missing_vector``). *disclosure* carries ``ann_query_errors``: a
-        failure on one record is logged and counted, and the sweep continues,
-        so one bad point never costs the whole scan.
+        ``missing_vector``). *disclosure* carries:
+
+          - ``ann_query_errors`` — a failure on one record is logged and
+            counted, and the sweep continues, so one bad point never costs
+            the whole scan.
+          - ``ann_query_skipped_uncalibrated`` — records never queried
+            because their category has no cutoff. Counted HERE, per RECORD,
+            rather than left to ``ann_pairs_from_neighbors``'s per-HIT
+            ``uncalibrated_category_dropped``, which necessarily reads zero
+            for a record that was never asked: the recall lost to missing
+            calibration stays a counted number either way.
     """
     from qdrant_client.http import models as qmodels  # noqa: PLC0415
 
     from fused_memory.models.scope import Scope  # noqa: PLC0415
 
     neighbors: dict[Any, list[dict[str, Any]]] = {}
-    disclosure = {'ann_query_errors': 0}
-    queryable = [r for r in records if r.get('vector') is not None]
+    disclosure = dict.fromkeys(_ANN_QUERY_DISCLOSURE_KEYS, 0)
+    with_vectors = [r for r in records if r.get('vector') is not None]
+    if cutoff_by_category is None:
+        queryable = with_vectors
+    else:
+        # A record whose category has no cutoff can contribute no pair, so
+        # its query is pure cost. Counted, never silently dropped.
+        queryable = [
+            r for r in with_vectors
+            if isinstance(r.get('category'), str) and r['category'] in cutoff_by_category
+        ]
+        skipped = len(with_vectors) - len(queryable)
+        disclosure['ann_query_skipped_uncalibrated'] = skipped
+        if skipped:
+            logger.warning(
+                'Skipped the ANN query for %d record(s) whose category has no '
+                'resolved cutoff: every hit would have been discarded as '
+                'uncalibrated. Recall lost to missing calibration, not to a '
+                'cutoff — counted as ann_query_skipped_uncalibrated.',
+                skipped,
+            )
     if not queryable:
         return neighbors, disclosure
 
@@ -2595,6 +2660,11 @@ async def _run(args: argparse.Namespace) -> int:
             neighbors, query_disclosure = await fetch_ann_neighbors(
                 memory, args.project_id, records,
                 top_k=args.ann_top_k, score_threshold=ann_threshold,
+                # The same mapping that gates the pairs below. A record in a
+                # category it does not cover is never queried: its hits could
+                # only ever be discarded, so the query is cost with no
+                # possible pair. The skip is counted, not silent.
+                cutoff_by_category=ann_thresholds,
             )
             disclosures.update(query_disclosure)
             # The MAPPING, not the floor: the floor only shaped what Qdrant
@@ -2609,7 +2679,7 @@ async def _run(args: argparse.Namespace) -> int:
             ann_scores = ann_scores_for_pairs(records, neighbors, ann_pairs)
         else:
             disclosures.update(dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0))
-            disclosures['ann_query_errors'] = 0
+            disclosures.update(dict.fromkeys(_ANN_QUERY_DISCLOSURE_KEYS, 0))
 
         plan = build_sweep_plan(
             records, threshold=args.threshold, categories=categories,

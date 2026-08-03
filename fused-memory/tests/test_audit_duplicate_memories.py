@@ -44,6 +44,7 @@ cluster_memories_by_pairs = _mod.cluster_memories_by_pairs
 ann_pairs_from_neighbors = _mod.ann_pairs_from_neighbors
 ann_scores_for_pairs = _mod.ann_scores_for_pairs
 _ANN_DISCLOSURE_KEYS = _mod._ANN_DISCLOSURE_KEYS
+_ANN_QUERY_DISCLOSURE_KEYS = _mod._ANN_QUERY_DISCLOSURE_KEYS
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
 build_sweep_plan = _mod.build_sweep_plan
@@ -1150,6 +1151,24 @@ class TestAnnPairsPerCategoryThreshold:
         assert pairs == []
         assert disclosure['below_threshold_dropped'] == 1
         assert disclosure['uncalibrated_category_dropped'] == 0
+
+    def test_a_zero_cutoff_in_the_mapping_is_honoured_not_read_as_absent(self):
+        """0.0 is a MEASURED cutoff; absence is the only spelling of absent.
+
+        A `if not cutoff` screen instead of `if cutoff is None` would silently
+        disable a category the calibration actually measured, and count its
+        hits as uncalibrated — a wrong reason for a wrong outcome.
+        """
+        memories = self._memories([_PK, _PK])
+        neighbors = {'m0': [_hit('m1', 0.0)]}
+
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, {_PK: 0.0})
+
+        assert pairs == [(0, 1)], 'a hit exactly at the cutoff is INCLUSIVE'
+        assert disclosure['uncalibrated_category_dropped'] == 0, (
+            'a measured 0.0 must not read as "this category has no cutoff"'
+        )
+        assert disclosure['below_threshold_dropped'] == 0
 
     def test_scalar_threshold_behaves_exactly_as_before(self):
         """Every pre-3357 caller and test keeps its meaning."""
@@ -2458,15 +2477,46 @@ class TestResolveAnnThreshold:
                 _config_double(None, None), categories=_SWEPT_CATEGORIES,
             )
 
-        assert resolved == {}, 'must not fabricate a threshold'
-        assert not resolved, (
-            'an empty mapping is how the caller detects "disable the whole '
-            'ANN path" — there is no per-category cutoff to run on'
+        assert resolved == {}, (
+            'must not fabricate a threshold; an empty mapping is how the '
+            'caller detects "disable the whole ANN path"'
         )
         assert disclosure['ann_disabled_uncalibrated'] == 3
         assert any(r.levelno >= logging.ERROR for r in caplog.records), (
             'an uncalibrated ANN path must be loud, not silent'
         )
+
+    def test_the_swept_categories_are_the_default(self):
+        """An omitting caller must sweep every category, never none.
+
+        An empty DEFAULT would return ({}, {both counters: 0}) — the ANN path
+        fully disabled, with a zeroed disclosure and no ERROR, which is the
+        silently missing detector this module forbids. It also has to agree
+        with build_sweep_plan's default for the same argument.
+        """
+        import inspect  # noqa: PLC0415
+
+        service = _config_double(0.4242424242, None)
+        resolved, disclosure = resolve_ann_threshold(service)
+
+        assert set(resolved) == set(_ALL_CATEGORIES), (
+            'omitting `categories` must resolve for the whole sweep'
+        )
+        assert disclosure['ann_pooled_fallback_categories'] == len(_ALL_CATEGORIES)
+        assert (
+            inspect.signature(resolve_ann_threshold).parameters['categories'].default
+            is inspect.signature(build_sweep_plan).parameters['categories'].default
+        ), 'the two defaults must not drift apart'
+
+    def test_an_explicitly_empty_sweep_still_resolves_nothing(self):
+        """Asking for nothing is a caller's choice; defaulting to it was not."""
+        resolved, disclosure = resolve_ann_threshold(
+            _config_double(0.4242424242, None), categories=(),
+        )
+        assert resolved == {}
+        assert disclosure == {
+            'ann_disabled_uncalibrated': 0, 'ann_pooled_fallback_categories': 0,
+        }
 
     def test_category_with_no_cutoff_is_absent_not_guessed(self, caplog):
         """A partially-calibrated config disables ONLY the uncovered category.
@@ -2477,7 +2527,7 @@ class TestResolveAnnThreshold:
         """
         import logging  # noqa: PLC0415
 
-        with caplog.at_level(logging.WARNING, logger='audit_duplicate_memories'):
+        with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
             resolved, disclosure = resolve_ann_threshold(
                 _config_double(None, {'procedural_knowledge': 0.8888}),
                 categories=('procedural_knowledge', 'observations_and_summaries'),
@@ -2487,6 +2537,16 @@ class TestResolveAnnThreshold:
         assert 'observations_and_summaries' not in resolved
         assert disclosure['ann_disabled_uncalibrated'] == 1
         assert disclosure['ann_pooled_fallback_categories'] == 0
+        errors = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR
+        )
+        assert 'observations_and_summaries' in errors, (
+            'a disabled category must be named, not just tallied — the same '
+            'contract the pooled fallback already keeps'
+        )
+        assert 'procedural_knowledge' not in errors, (
+            'a category with its own measured cutoff is not disabled'
+        )
 
     def test_pooled_fallback_is_warned_by_name(self, caplog):
         """The weaker evidence is named in the log, not just tallied."""
@@ -2643,6 +2703,47 @@ class TestCategoriesWithoutOwnCutoff:
         assert categories_without_own_cutoff(
             _config_double(0.42, {_PK: 0.9}), _SWEPT_CATEGORIES,
         ) == frozenset({_OS, _PN})
+
+    def test_a_junk_map_value_is_unevidenced_exactly_as_the_resolver_reads_it(self):
+        """The `_calibrated_float` screen must apply to map VALUES here too.
+
+        The resolver already refuses a bool / string / Mock leaf and falls the
+        category back to the pooled cutoff. If this predicate accepted the
+        same junk as a cutoff, the category would be gated by the pooled
+        number yet REPORTED as evidenced — and therefore eligible for --apply
+        deletion. That is the two readers of one config disagreeing, which is
+        the whole reason `_write_triage_cutoffs` is a single function.
+        """
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        for junk in ('0.9', True, False, object(), None, MagicMock().unspecced_attr):
+            service = _config_double(0.42, {_PK: junk})
+
+            unevidenced = categories_without_own_cutoff(service, _SWEPT_CATEGORIES)
+            resolved, disclosure = resolve_ann_threshold(
+                service, categories=_SWEPT_CATEGORIES,
+            )
+
+            assert unevidenced == frozenset(_SWEPT_CATEGORIES), (
+                f'{junk!r} is not a measured cutoff, so {_PK} is un-evidenced'
+            )
+            assert resolved[_PK] == 0.42 and disclosure[
+                'ann_pooled_fallback_categories'
+            ] == 3, f'{junk!r}: the resolver must agree it fell back'
+
+    def test_a_measured_zero_cutoff_is_evidence_like_any_other_number(self):
+        """0.0 is a number the calibration could derive, not a missing one.
+
+        A `not cutoff` screen anywhere in this pair would read it as absent
+        and fence a category that actually has its own measurement.
+        """
+        service = _config_double(0.42, {_PK: 0.0})
+
+        assert categories_without_own_cutoff(service, _SWEPT_CATEGORIES) == frozenset(
+            {_OS, _PN},
+        )
+        resolved, _ = resolve_ann_threshold(service, categories=_SWEPT_CATEGORIES)
+        assert resolved[_PK] == 0.0
 
 
 @pytest.mark.asyncio
@@ -2831,6 +2932,124 @@ class TestFetchAnnNeighborsCategoryFilter:
         )
 
         assert query_points.await_args_list[0].kwargs['query_filter'] is None
+
+
+@pytest.mark.asyncio
+class TestFetchAnnNeighborsSkipsUncalibratedCategories:
+    """A query whose every hit is pre-doomed is cost, not recall.
+
+    ``ann_pairs_from_neighbors`` discards every hit on a record whose category
+    has no cutoff. Issuing those queries at all spends a whole set of Qdrant
+    round-trips on results that can never form a pair — so they are skipped,
+    and the skip is COUNTED rather than silently absorbed.
+    """
+
+    def _service(self, query_points):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        client = MagicMock()
+        client.query_points = query_points
+        service = MagicMock()
+        service.config.mem0.collection_prefix = 'mem0'
+        service.mem0._get_async_qdrant = AsyncMock(return_value=client)
+        return service
+
+    def _records(self):
+        return [
+            {'id': 'a', 'vector': [0.1], 'category': _PK},
+            {'id': 'b', 'vector': [0.2], 'category': _OS},
+            {'id': 'c', 'vector': [0.3]},
+        ]
+
+    async def _fetch(self, query_points, **kwargs):
+        return await fetch_ann_neighbors(
+            self._service(query_points), 'dark_factory', self._records(),
+            top_k=5, score_threshold=0.88, **kwargs,
+        )
+
+    async def test_only_calibrated_categories_are_queried(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+
+        _neighbors, disclosure = await self._fetch(
+            query_points, cutoff_by_category={_PK: 0.9},
+        )
+
+        assert query_points.await_count == 1, 'two doomed queries must not be issued'
+        assert query_points.await_args_list[0].kwargs['query'] == [0.1]
+        assert disclosure['ann_query_skipped_uncalibrated'] == 2, (
+            'the categoryless record is uncalibrated by the same rule'
+        )
+
+    async def test_the_skip_is_disclosed_and_the_counter_is_always_present(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+
+        for mapping in (None, {_PK: 0.9, _OS: 0.9}, {_PK: 0.9}):
+            _neighbors, disclosure = await self._fetch(
+                query_points, cutoff_by_category=mapping,
+            )
+            assert set(disclosure) == set(_ANN_QUERY_DISCLOSURE_KEYS), (
+                'an absent counter is indistinguishable from "not measured"'
+            )
+            assert all(isinstance(v, int) for v in disclosure.values())
+
+    async def test_no_mapping_keeps_the_pre_3357_behaviour(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+
+        _neighbors, disclosure = await self._fetch(query_points)
+
+        assert query_points.await_count == 3, 'every record with a vector is queried'
+        assert disclosure['ann_query_skipped_uncalibrated'] == 0
+
+    async def test_a_fully_calibrated_sweep_skips_nothing(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+
+        _neighbors, disclosure = await self._fetch(
+            query_points, cutoff_by_category={_PK: 0.9, _OS: 0.9},
+        )
+
+        assert query_points.await_count == 2, 'only the categoryless record is doomed'
+        assert disclosure['ann_query_skipped_uncalibrated'] == 1
+
+    async def test_a_skipped_record_forms_no_pair_either_way(self):
+        """The optimization removes cost, never a candidate.
+
+        Whatever the skipped record would have returned, the pair filter was
+        always going to discard it — so the pairs are identical with and
+        without the skip, and only the attribution of the loss moves.
+        """
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        memories = [
+            {'id': 'a', 'vector': [0.1], 'category': _PK},
+            {'id': 'b', 'vector': [0.2], 'category': _OS},
+        ]
+        cutoffs = {_PK: 0.9}
+        unqueried = AsyncMock(return_value=types.SimpleNamespace(points=[]))
+        service = self._service(unqueried)
+
+        skipped_neighbors, skip_disclosure = await fetch_ann_neighbors(
+            service, 'dark_factory', memories, top_k=5, score_threshold=0.9,
+            cutoff_by_category=cutoffs,
+        )
+        # What the OLD path would have handed the pair filter: b queried, and
+        # its (ineligible) hit returned.
+        queried_neighbors = {**skipped_neighbors, 'b': [_hit('a', 0.99)]}
+
+        assert ann_pairs_from_neighbors(memories, skipped_neighbors, cutoffs)[0] == (
+            ann_pairs_from_neighbors(memories, queried_neighbors, cutoffs)[0]
+        ), 'skipping a doomed query must not change which pairs form'
+        assert skip_disclosure['ann_query_skipped_uncalibrated'] == 1
+        assert ann_pairs_from_neighbors(memories, queried_neighbors, cutoffs)[1][
+            'uncalibrated_category_dropped'
+        ] == 1, 'the loss the skip now accounts for, measured the old way'
 
 
 @pytest.mark.asyncio
@@ -3972,6 +4191,51 @@ class TestRunApplyAnnOnlyClusters:
         )
         assert rc == 1, 'the pre-existing nothing-applicable guard aborts loudly'
 
+    async def test_deletion_happens_only_in_the_evidenced_category(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Two identical cliques, one corpus, ONE of them evidenced.
+
+        The per-group category check is otherwise only ever exercised on a
+        single-category sweep, where "fence everything" and "fence the
+        un-evidenced group" are indistinguishable. Here they are not: the
+        procedural_knowledge clique deletes and the observations_and_summaries
+        one is withheld, in the same run.
+        """
+        raw = {
+            _PK: [
+                _raw('p1', 'alpha one', self._OLD, category=_PK, vector=[1.0, 0.0]),
+                _raw('p2', 'beta two', self._MID, category=_PK, vector=[0.0, 1.0]),
+            ],
+            _OS: [
+                _raw('o1', 'gamma three', self._OLD, category=_OS, vector=[0.5, 0.5]),
+                _raw('o2', 'delta four', self._MID, category=_OS, vector=[0.6, 0.4]),
+            ],
+        }
+        ann_hits = {
+            (1.0, 0.0): [('p2', 0.95)], (0.0, 1.0): [('p1', 0.95)],
+            (0.5, 0.5): [('o2', 0.95)], (0.6, 0.4): [('o1', 0.95)],
+        }
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path,
+            '--categories', _PK, _OS,
+            t_high_by_category={_PK: 0.9},
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['clusters_total'] == 2, 'both cliques are detected and reported'
+        assert sorted(plan['delete_candidates']) == ['o2', 'p2'], (
+            'the report never narrows — only the irreversible path does'
+        )
+        assert service.deleted == ['p2'], (
+            'only the category whose cutoff was measured on its own pairs'
+        )
+        withheld = plan['apply_withheld_groups']
+        assert [g['category'] for g in withheld] == [_OS]
+        assert withheld[0]['withheld_ids'] == ['o2']
+        assert withheld[0]['reason'] == 'ann_cutoff_not_evidenced_for_category'
+        assert rc == 0, 'something applicable remained, so the sweep succeeds'
+
     async def test_a_lexical_span_still_applies_under_an_override(
         self, monkeypatch, tmp_path,
     ):
@@ -4034,12 +4298,20 @@ class TestRunApplyAnnOnlyClusters:
             (0.0, 1.0, 0.0): [('m1', 0.95), ('m3', 0.95)],
             (0.0, 0.0, 1.0): [('m2', 0.95)],
         }
-        rc, service = await self._invoke(monkeypatch, raw, ann_hits, tmp_path)
+        # EVIDENCED category: without its own cutoff the un-evidenced-category
+        # gate would withhold this cluster too, and the test would pass even
+        # if the chained-cluster guard it exists for regressed entirely.
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path, t_high_by_category={_PK: 0.9},
+        )
         plan = json.loads(capsys.readouterr().out)
 
         assert set(plan['near_duplicate_groups'][0]['member_ids']) == {'m1', 'm2', 'm3'}
         assert plan['delete_candidates'] == ['m2', 'm3'], 'still reported'
         assert plan['apply_withheld_clusters'] == 1
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_chained_without_lexical_span_or_ann_clique'
+        ), 'withheld for TRANSITIVITY, not for a missing per-category cutoff'
         assert service.deleted == [], 'the chain never reaches delete_memory'
         assert rc == 1, 'nothing applicable remains, so the empty-plan guard holds'
 
@@ -4078,13 +4350,18 @@ class TestRunApplyAnnOnlyClusters:
         ]}
         # a2 <-> b1: the single cross-cluster ANN pair.
         ann_hits = {(0.9, 0.1): [('b1', 0.95)], (0.0, 1.0): [('a2', 0.95)]}
+        # EVIDENCED, so the withholding can only be the merge guard's doing.
         rc, service = await self._invoke(
             monkeypatch, raw, ann_hits, tmp_path, '--threshold', '0.75',
+            t_high_by_category={_PK: 0.9},
         )
         plan = json.loads(capsys.readouterr().out)
 
         assert len(plan['near_duplicate_groups']) == 1, 'ANN merged the two halves'
         assert plan['apply_withheld_clusters'] == 1
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_chained_without_lexical_span_or_ann_clique'
+        ), 'the merge is not lexically spanning and is not an ANN clique'
         assert service.deleted == [], (
             'a lexical pair inside the merge does not corroborate the merge'
         )
