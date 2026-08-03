@@ -614,6 +614,34 @@ class TestFalkorHelpers:
         assert _falkor_port_from_env() == 7000
         assert isinstance(_falkor_port_from_env(), int)
 
+    def test_falkor_port_from_env_treats_empty_as_unset(self, monkeypatch):
+        """An empty FALKOR_PORT takes the default instead of exploding.
+
+        ``FALKOR_PORT: ${FALKOR_PORT}`` in a compose/CI template with the
+        variable unset produces exactly this shape. Since conftest.py imports
+        _fm_helpers on every session, a ValueError here would abort the entire
+        run — including the unit lane, which never touches FalkorDB.
+        """
+        from _fm_helpers import _falkor_port_from_env
+
+        monkeypatch.setenv('FALKOR_PORT', '')
+
+        assert _falkor_port_from_env() == 6379
+
+    def test_falkor_port_from_env_rejects_non_integer(self, monkeypatch):
+        """A malformed FALKOR_PORT fails loudly, naming the variable and value.
+
+        Not silently defaulted: a typo'd port must not be papered over into a
+        probe against 6379. The RuntimeError replaces a bare ``int()``
+        ValueError whose traceback pointed into a shared helper.
+        """
+        from _fm_helpers import _falkor_port_from_env
+
+        monkeypatch.setenv('FALKOR_PORT', 'notaport')
+
+        with pytest.raises(RuntimeError, match=r"FALKOR_PORT.*'notaport'"):
+            _falkor_port_from_env()
+
     def test_falkor_constants_are_derived_from_env(self):
         """The module constants are derived through the helpers, not hardcoded.
 

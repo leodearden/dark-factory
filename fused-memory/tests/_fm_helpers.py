@@ -672,16 +672,30 @@ def _falkor_port_from_env() -> int:
     """Derive the FalkorDB port from FALKOR_PORT, defaulting to 6379.
 
     The ``int()`` is load-bearing, not cosmetic: ``os.environ`` yields str, and
-    ``FalkorDB(port='6379')`` fails or misbehaves on a str port. All six forks
-    wrote the coercion for exactly this reason. It is now genuinely pinned by
-    ``test_falkor_port_from_env_coerces_to_int``, which overrides the variable;
-    the previous test asserted only the literal default, so dropping the
-    ``int()`` would have gone unnoticed.
+    ``FalkorDB(port='6379')`` fails or misbehaves on a str port.
 
-    See ``_falkor_host_from_env`` for why the derivation is a named function
-    rather than an inline expression.
+    Unset *or empty* takes the default. Empty is what a CI template like
+    ``FALKOR_PORT: ${FALKOR_PORT}`` produces when the variable is not set, and
+    it is the same shape ``known_project_roots_from_env`` (models/scope.py)
+    already treats as unset.
+
+    A non-empty, non-numeric value is an operator error and raises
+    ``RuntimeError`` naming the offending value. conftest.py imports this
+    module on every session, so a bare ``ValueError`` out of ``int()`` would
+    abort the whole run — including the unit lane, which never touches
+    FalkorDB — with a traceback into a shared helper rather than a message
+    anyone can act on.
     """
-    return int(os.environ.get('FALKOR_PORT', '6379'))
+    raw = os.environ.get('FALKOR_PORT', '').strip()
+    if not raw:
+        return 6379
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(
+            f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
+            f'default (6379), or set it to the port your FalkorDB listens on.'
+        ) from None
 
 
 # Evaluated once at import, exactly as the six forks evaluated their own copies
