@@ -451,18 +451,12 @@ class TestGzAwareReader:
 class TestPublicIterJsonLines:
     """``iter_json_lines`` is PUBLIC — the single low-level transcript reader.
 
-    Promoted from the former underscore name for task 3214: the memory-eval
-    retro corpus extractor
+    The memory-eval retro corpus extractor
     (``fused-memory/scripts/memory_eval_transcript_corpus.py``) consumes it
-    from a DIFFERENT package, and a cross-package consumer of an underscore
-    name is a standing invitation for the next author to copy the function
-    instead — the outcome the reuse invariant exists to prevent.
-
-    Task 3214 left the underscore name behind as a transitional alias with a
-    named removal condition; task 3433 migrated the last two in-package
-    callers (``sampling.py``, ``check_transcript_persistence.py``) to the
-    public name and removed it. These tests pin the public behaviour and that
-    the alias stays gone, so one function cannot regrow a second live name.
+    from a DIFFERENT package, which is why the name is public: a cross-package
+    consumer of an underscore name is a standing invitation for the next
+    author to copy the function instead — the outcome the reuse invariant
+    exists to prevent.
     """
 
     RECORDS = [
@@ -484,13 +478,6 @@ class TestPublicIterJsonLines:
 
     def test_public_name_exists(self):
         assert callable(mod.iter_json_lines)
-
-    def test_deprecated_alias_is_removed(self):
-        # Task 3214 promoted this reader and left `_iter_json_lines` as a
-        # transitional alias with a named removal condition; task 3433
-        # migrated the last two callers and removed it. A reintroduced alias
-        # is a second live name for one function with no owner.
-        assert not hasattr(mod, '_iter_json_lines')
 
     def test_plain_jsonl_skips_blank_and_corrupt_lines(self, tmp_path):
         path = tmp_path / 'session.jsonl'

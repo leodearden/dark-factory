@@ -20,7 +20,7 @@ dispatch gate.
 | ε scheduled runner + M3 | (stamped) | flag-marker systemd quadruple; direct `EscalationQueue` filing (D4); dedup reusing `has_open_l1` (INV-5); `eval_regression` in the `CATEGORIES` doc list + the watcher's SKILL.md triage row (INV-1); storm escape + runner-failure self-escalation (INV-4/INV-2); first-run grandfather snapshot (D1/INV-3) | PASS |
 | ζ E7 telemetry | (stamped) | `caller_agent_id`/`caller_task_id` declared as first-class search params distinct from the `agent_id` **filter** (INV-1); briefing threading; `_MEMORY_INSTRUCTIONS` pinned to the real param names (INV-5); hint-execution journaling; `prune_write_ops` retention; journal-drop visibility counter (INV-4) | PASS |
 | η write-after-miss | (stamped) | ζ's ids+scores+caller rows upstream; **replays** the production pure guard `find_near_duplicate_memory` rather than re-implementing similarity (INV-5); metric wired into ε's evaluation; structured incident evidence (INV-2) | PASS |
-| θ retro transcript corpus | (stamped) | one-shot script over the live agent-transcript archive; reuses `load_transcript` / `iter_json_lines` — no third parser (D9/INV-5); coverage report distinguishes wholesale parse failure from an empty archive (INV-2/4) | PASS |
+| θ retro transcript corpus | (stamped) | one-shot script over the live agent-transcript archive; reuses `load_transcript` / `_iter_json_lines` — no third parser (D9/INV-5); coverage report distinguishes wholesale parse failure from an empty archive (INV-2/4) | PASS |
 
 ## Bindings that needed work
 
