@@ -24,12 +24,25 @@ machine-readable contract tokens the Python side actually reads
 ``"action": "task_created"`` record shape). Per the
 ``test_recon_gate_closure_guidance.py`` house rule, prose wording beyond
 those tokens is intentionally NOT pinned here.
+
+It also pins the code-side layer: the pure ``_count_valid_task_created_records``
+helper, and the deterministic upward-only repair
+``TaskKnowledgeSync._apply_post_flight_guards`` performs when the
+self-reported ``tasks_created`` undercounts the ``task_created_records``
+ground truth — the exact shape of the run-507bc25b regression.
 """
 
 from __future__ import annotations
 
+import logging
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
+from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.reconciliation import StageId, StageReport
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.prompts.stage2 import (
     STAGE2_SYSTEM_PROMPT,
     build_stage2_system_prompt,
@@ -38,6 +51,7 @@ from fused_memory.reconciliation.recon_self_model import (
     render_task_creation_accounting_section,
 )
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    TaskKnowledgeSync,
     _count_valid_task_created_records,
 )
 
