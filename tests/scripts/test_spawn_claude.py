@@ -384,6 +384,44 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     return env
 
 
+# _SPAWN_RUN_CAP_SECS: derived, not tuned. Worst-case single-test
+# composition on this channel is one _run_spawn/proc.wait budget plus at
+# most one _wait_for_path_scaled readiness gate (verified across every
+# _wait_for_path* call site: :2570/:2751/:2818 each follow a _run_spawn),
+# so 120 + _READINESS_WAIT_CAP_SECS (30) = 150s, 2x headroom inside the
+# governing --timeout=300 (scripts/orchestrator.yaml:17 -- the repo-root
+# pyproject.toml sets no timeout and shared/pyproject.toml's timeout=60
+# does not govern this file). Measured happy path for the flaking test:
+# 1.36-2.19s per param (n=6) at load-per-core 2.2, so 120 is ~55x.
+#
+# Deliberately LARGER than _READINESS_WAIT_CAP_SECS (30): a readiness-wait
+# cap is paid in full on the failure path, whereas a subprocess wall-clock
+# bound is paid only when the child genuinely hangs -- the happy path
+# returns the instant the child exits. At the load-per-core 6.6 task 3451
+# documented for this host, base 30 scales to ceil(30*6.6)=198, so a cap of
+# 30 or 60 would discard most of the headroom this change exists to buy.
+_SPAWN_RUN_CAP_SECS = 120
+
+
+def _spawn_run_budget(base_secs: int) -> int:
+    """Load-scale a whole-invocation must-not-hang bound, floored and capped.
+
+    This is a must-not-hang guard, NOT a latency SLA -- every _run_spawn
+    caller's real contract is an exit code, not a wall-clock duration.
+
+    Returns the budget so the policy is assertable with zero sleeping,
+    which is why no source-grepping meta-test is needed to pin the fix
+    (same rationale as _wait_for_path_scaled above and _set_started_grace
+    below).
+
+    Delegates entirely to _load_scaled_grace, which floors at base_secs: an
+    idle host is byte-identical to the pre-existing fixed pins at every
+    _run_spawn call site, so this change can only lengthen a budget under
+    contention, never shorten one.
+    """
+    return _load_scaled_grace(base_secs, cap_secs=_SPAWN_RUN_CAP_SECS)
+
+
 def _run_spawn(
     env: dict[str, str],
     cwd: pathlib.Path,
