@@ -415,7 +415,7 @@ finish_failed_to_start() {
 # form -- and its body must END at a line that is a bare `}` at column 0.
 # Nothing else is pinned: where this function sits in the file does not matter,
 # and `()` and `{` need not share a line. Break either anchor and the
-# extraction fails loudly rather than quietly stopping covering this copy.
+# extraction fails loudly, rather than quietly ceasing to cover this copy.
 _encode_cwd() {
   local e="${1//\//-}"
   e="${e//./-}"
