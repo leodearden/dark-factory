@@ -78,10 +78,12 @@ no worktree).
 1. Drain all pending recon escalations
 2. Start the watcher: `scripts/watcher-rearm.sh` (background task, recon queue
    dir, NO --level, --timeout 3600)
-3. Wait for it to exit. TWO exit paths — tell them apart, don't assume a fire:
+3. Wait for it to exit. THREE exit paths — tell them apart, don't assume a fire:
      FIRED   (exit 0, escalation JSON on stdout) → go to 4
      CEILING (exit 124, NO escalation payload)   → the bounded slice just
              expired; SKIP step 4 and fall through to the drain (5)
+     KILLED / ERROR (any OTHER rc: 137|143|144, or 2 for a usage/env
+             failure) → STOP and report to the human; do NOT re-arm
 4. Read the escalation from watcher output; fetch full detail via MCP
 5. Drain any other pending escalations
 6. Handle each
@@ -90,18 +92,31 @@ no worktree).
 8. Go to 2
 ```
 
-**Distinguishing the two exits at step 3.** The wrapper emits a machine-readable
+**Distinguishing the exits at step 3.** The wrapper emits a machine-readable
 `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line to
 **stderr** on every run — use it rather than inventing your own vocabulary. A
 `CEILING` wake carries no escalation payload; reading it as a fired-but-empty
 escalation is the mistake this step exists to prevent. It is not an error and
 needs no report — just re-drain and re-arm.
 
+`KILLED` (137/143/144) and `ERROR` (any other rc) are **not** re-arm paths.
+Report to the human and stop the loop: something killed the watcher or the
+launch itself failed, and neither self-heals by trying again. The one you are
+most likely to hit is **exit 2** — a usage/env guard, most often an unset
+`DARK_FACTORY_ROOT` (thrice-observed startup failure,
+`plans/confusion-census-2026-07-24.md` §1.5). It returns *instantly*, before
+the watcher is ever invoked, so falling through to "re-drain and re-arm" turns
+a mis-configured launch into a hot busy-loop of failed invocations — and this
+queue's **sole closer** would never actually be watching. Note that exit 2
+prints a plain stderr diagnostic and **no** `WATCHER_REARM_OUTCOME` marker
+(`scripts/watcher-rearm.sh` header, lines 59-63), so check the exit **code**
+first; do not infer "no marker" means the run is still in flight.
+
 Also: **exit 0 with EMPTY stdout is a non-fire**, never proof an escalation was
 printed. `escalation.watcher` installs a SIGTERM handler that converts a
 SIGTERM into a clean `sys.exit(0)`, so a killed watcher surfaces as
 `FIRED exit=0` with nothing on stdout (`scripts/watcher-rearm.sh` header,
-lines 57-64). Check for non-empty stdout before treating exit 0 as a fire —
+lines 65-72). Check for non-empty stdout before treating exit 0 as a fire —
 this queue's **sole closer** must not silently skip a cycle on a caught signal.
 
 ### Draining
@@ -123,68 +138,67 @@ cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
 Run as a **background task** (`run_in_background`). `scripts/watcher-rearm.sh` is
 the canonical bounded-wait + re-arm wrapper around `escalation.watcher`, shared
 with the sibling `escalation-watcher` skill; task 3530 made its `--level`
-optional precisely so this flat queue could reuse it. **Omit `--level`** — recon
-escalations have no level field worth filtering, and omitting the flag selects
-the watcher's match-all mode. The watcher uses inotify and exits after the first
-new escalation file, printing its JSON to stdout.
+optional precisely so this flat queue could reuse it. The watcher uses inotify
+and exits after the first new escalation file, printing its JSON to stdout — so
+do **not** pipe `2>&1` when you parse that stdout as the escalation JSON, or the
+wrapper's stderr `WATCHER_REARM_OUTCOME` line lands in your parse and corrupts it.
 
-The wrapper preserves the underlying watcher's exit code (`0`=fired,
-`124`=timeout) and emits a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR>
-exit=<rc>` line to **stderr** on every run — so do **not** pipe `2>&1` when you
-parse stdout as the escalation JSON, or you'll corrupt the parse.
+**The shared wrapper contract is documented once — read it there, not here.**
+`skills/escalation-watcher/SKILL.md` §"Starting the watcher" covers everything
+identical for every caller: the preserved exit codes and the
+`WATCHER_REARM_OUTCOME` marker, the Bash-tool timeout sizing rules, and the
+wrapper-owned exclude-file mechanics (one esc-id per line, bare or
+`.json`-suffixed; re-read every poll, so an append needs no restart; it also
+suppresses event-loop wakes from dedupe rewrites; the repeatable `--exclude-id`
+does the same for a single id but does not scale). `scripts/watcher-rearm.sh`'s
+own header is the authoritative copy. Only this queue's **deltas** are below.
 
-**Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds
-per slice. Run as a **background** task it is exempt from the Bash tool's
-foreground timeouts, so use the long canonical slice: `--timeout 3600` yields at
-most one heartbeat wake per hour (`CEILING`) while a real escalation still fires
-instantly via inotify. Only **foreground** calls (e.g. debugging) are governed by
-the harness timeouts — size the Bash `timeout` parameter to at least
-`(--timeout + 60s) × 1000` ms there, or cap the slice at `--timeout 540` on a
-machine without a raised `BASH_MAX_TIMEOUT_MS`.
+**Delta 1 — omit `--level`.** Recon escalations have no level field worth
+filtering, and omitting the flag selects the watcher's match-all mode. Because
+an omitted flag is otherwise invisible, the wrapper declares the level it
+resolved on stderr at the top of every run — `level=<all>` here, `level=2` for
+the sibling. Read it back from the output rather than assuming.
 
-**Re-arming over deliberately-pending items:** the watcher's initial scan emits
-the oldest matching pending escalation and exits immediately. Any item you
-deliberately left pending (Priority 3 "leave pending, tell the human") sits in
-the queue and causes every subsequent watcher start to instantly re-fire on it,
-degenerating into a busy-loop. The fix is the **wrapper-owned exclude-file**,
-and you do not name its path yourself. With no `--level`,
-`scripts/watcher-rearm.sh` defaults it to `<queue-dir>/.watcher-rearm-exclude`
-(the levelled sibling's `-l<level>` suffix dropped), creates it if absent,
-always wires it into the watcher invocation, and prints the resolved path to
-stderr on every run; pass `--check` for a dry-run print of that path without
-starting the watcher. An explicit `--exclude-file` still overrides it.
+**Delta 2 — the exclude path has no level suffix.** With no `--level` the
+wrapper-owned default is `<queue-dir>/.watcher-rearm-exclude`: the levelled
+sibling's `-l<level>` suffix dropped, *not* a separate recon-only name. You
+never name this path yourself — the wrapper creates it if absent, always wires
+it into the watcher invocation, and prints the resolved path to stderr on every
+run (`--check` dry-runs that resolution without starting the watcher). An
+explicit `--exclude-file` still overrides it. Being a dotfile keeps it out of
+the watcher's own `esc-*.json` glob (`_initial_scan`, `watcher.py:85`; the same
+pattern gates `EscalationQueue`'s reads,
+`escalation/src/escalation/queue.py:431` and `:509`) — and, a constraint unique
+to *this* directory, it must not end in `.json`, because the dashboard's
+read-only recon subsection globs the broader `*.json` (not `esc-*.json`) over
+this same path (`dashboard/src/dashboard/data/escalations.py:89`); a
+`.json`-suffixed name would surface there as a phantom escalation record.
 
-Append one esc-id per line — both the bare id (`esc-recon-abc-1`) and the
-`.json`-suffixed form are accepted. `current_excludes()`
-(`escalation/src/escalation/watcher.py:224-225`) calls `_read_exclude_file` on
-every invocation — once for the initial scan (`watcher.py:246`) and again on
-every poll of the event loop (`watcher.py:269`) — so it excludes only the ids
-you actually listed, with no masking window, and the parked set can grow
-mid-run just by appending a line, no watcher restart needed. It also suppresses
-event-loop wakes from dedupe rewrites of those files (MOVED_TO events on an
-excluded file are silently ignored). The underlying `--exclude-id <esc-id>`
-flag (repeatable) does the same for a single id, but hand-maintaining a growing
-list of them does not scale at this queue's size — prefer the file.
+**Delta 3 — as sole closer, you depend on the exclude file's failure mode.**
+The initial scan emits the oldest matching pending escalation and exits
+immediately, so any item you deliberately left pending (Priority 3 "leave
+pending, tell the human") re-fires on every watcher start and degenerates into
+a busy-loop. Append with `echo <esc-id> >> <path>`: `_read_exclude_file`'s
+docstring (`watcher.py:128-132`) blesses a single short-line append as atomic
+on POSIX, and a torn multi-write append is self-healing on the next poll.
+`current_excludes()` (`watcher.py:224-225`) re-reads the file on the initial
+scan (`watcher.py:246`) and on every event-loop poll (`watcher.py:269`), so the
+parked set grows mid-run with no restart and nothing beyond the ids you listed
+is ever masked. The reader is **fail-open** — a missing or unreadable file
+yields an empty set, retried next poll (`watcher.py:134-140`) — so a lost
+exclude file degrades to re-firing on parked items: noisy, never silent, which
+is the only acceptable failure direction for this queue's sole closer (contrast
+`--baseline` below, which fails silent). Blank lines and `#` comments are
+skipped (`watcher.py:143-146`), so the file can be annotated.
 
-That name is a dotfile, so the watcher's own `esc-*.json` glob safely
-ignores it (`_initial_scan`, `watcher.py:85`; the same pattern gates
-`EscalationQueue`'s reads, `escalation/src/escalation/queue.py:431` and
-`:509`). It also does not end in `.json`, which matters because the
-dashboard's read-only recon subsection globs the broader `*.json` (not
-`esc-*.json`) over this same directory
-(`dashboard/src/dashboard/data/escalations.py:89`) — a `.json`-suffixed
-name would surface there as a phantom escalation record.
-
-Append with `echo <esc-id> >> <path>`: `_read_exclude_file`'s docstring
-(`watcher.py:128-132`) blesses a single short-line append as atomic on
-POSIX, and a torn multi-write append is self-healing on the next poll.
-Because the file is re-read on every poll, the parked set can grow
-mid-run with no watcher restart. The reader is fail-open — a missing or
-unreadable file yields an empty set, retried next poll
-(`watcher.py:134-140`) — so a lost exclude file just degrades to
-re-firing on parked items: noisy, never silent. Blank lines and `#`
-comments are skipped (`watcher.py:143-146`), so the file can be
-annotated.
+**Slice length (recon delta on the shared timeout rules).** In the background
+the wrapper is exempt from the Bash tool's foreground timeouts, so this skill
+uses the long canonical slice `--timeout 3600`: at most one heartbeat wake per
+hour (`CEILING`) while a real escalation still fires instantly via inotify. Only
+**foreground** calls (e.g. debugging) are governed by the harness timeouts —
+there, size the Bash `timeout` to at least `(--timeout + 60s) × 1000` ms, or cap
+the slice at `--timeout 540` on a machine without a raised `BASH_MAX_TIMEOUT_MS`;
+the sibling skill's §"Starting the watcher" has the full rules.
 
 **`--baseline` is NOT safe for this loop — do not reach for it here**,
 even though `escalation.watcher` accepts it as a flag. `_snapshot_pending_ids()`
