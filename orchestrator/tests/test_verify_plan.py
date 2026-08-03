@@ -77,17 +77,15 @@ _MODULE_LINT_COMMANDS = {
 # ``DF_CONFIG_PATH``.
 _DF_CONFIG_PATH = Path(__file__).resolve().parents[2] / 'dark-factory-orchestrator.yaml'
 
-# FROZEN ILLUSTRATIVE SNAPSHOT, not a live mirror — dark-factory-orchestrator.yaml:lint_command
-# (a key name, not a line number: line numbers drift as the yaml's comment
-# block grows — this constant's old ``:50`` label was accurate at commit
-# c23468f627 and is now off by 48 lines). The live lint_command has drifted
-# further still: it additionally lints ``sampler cockpit`` and checks
-# ``sampler/tests cockpit/tests``. Only _ROOT_TEST_COMMAND is guarded against
-# the committed yaml (TestRootTestCommandLiveConfigDrift below) — re-syncing
-# this one is deliberately deferred because it is not a literal-only edit: it
-# would invalidate the exact-output golden in
-# test_root_lint_chain_scopes_ruff_and_keeps_the_checker. Follow-up:
-# agent-followup-3495 (ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19).
+# FROZEN ILLUSTRATIVE SNAPSHOT, not a live mirror —
+# dark-factory-orchestrator.yaml:lint_command (a key name, not a line number
+# — see _ROOT_TEST_COMMAND below for why). Known stale, deliberately frozen:
+# re-syncing this one is not a literal-only edit — it would invalidate the
+# exact-output golden in test_root_lint_chain_scopes_ruff_and_keeps_the_checker.
+# Only _ROOT_TEST_COMMAND is guarded against the committed yaml
+# (TestRootTestCommandLiveConfigDrift below); TestFrozenRootCommandsKeepTheirScopingShape
+# below pins that this one's structural head hasn't moved. Live drift and
+# re-sync tracked by ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19 (agent-followup-3495).
 _ROOT_LINT_COMMAND = (
     'uv run ruff check shared escalation fused-memory orchestrator dashboard'
     ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
@@ -96,25 +94,24 @@ _ROOT_LINT_COMMAND = (
 
 # FROZEN ILLUSTRATIVE SNAPSHOT, not a live mirror —
 # dark-factory-orchestrator.yaml:type_check_command (a key name, not a line
-# number: this constant's old ``:51`` label was accurate at commit
-# c23468f627 and is now off by 91 lines). The live type_check_command has
-# drifted further still: it now chains 7 pyright segments (one per
-# subproject), not the 3 below. Only _ROOT_TEST_COMMAND is guarded against
-# the committed yaml (TestRootTestCommandLiveConfigDrift below) — re-syncing
-# this one is deliberately deferred because it is not a literal-only edit: it
-# would turn the ``(_ROOT_TYPE_CHECK_COMMAND, 'pyright', 4, logging.DEBUG)``
-# case in TestDroppedChainClausesAreLogged._DROP_CASES into a different
-# count. Follow-up: agent-followup-3495 (ticket
-# tkt_0RS0C6DZXK29SRSRSZ08CQ4R19).
+# number — see _ROOT_TEST_COMMAND below for why). Known stale, deliberately
+# frozen: re-syncing this one is not a literal-only edit — it would turn the
+# ``(_ROOT_TYPE_CHECK_COMMAND, 'pyright', 4, logging.DEBUG)`` case in
+# TestDroppedChainClausesAreLogged._DROP_CASES into a different count. Only
+# _ROOT_TEST_COMMAND is guarded against the committed yaml
+# (TestRootTestCommandLiveConfigDrift below); TestFrozenRootCommandsKeepTheirScopingShape
+# below pins that this one's structural head hasn't moved. Live drift and
+# re-sync tracked by ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19 (agent-followup-3495).
 _ROOT_TYPE_CHECK_COMMAND = (
     'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
     ' && cd ../dashboard && npx pyright'
 )
 
-# dark-factory-orchestrator.yaml:test_command (a key name, not a line number:
-# this constant's old ``:41`` label was accurate at commit c23468f627 and is
-# now off by 31 lines — the label format was itself the drift vector). Kept
-# honest by TestRootTestCommandLiveConfigDrift below.
+# dark-factory-orchestrator.yaml:test_command (a key name, not a line number
+# — line-number labels drift as the yaml's comment block grows, which is
+# exactly how this constant's old ``:41`` label went stale). Kept honest by
+# TestRootTestCommandLiveConfigDrift below, which re-derives the live value
+# on every run rather than restating it here.
 _ROOT_TEST_COMMAND = (
     'cd shared && uv run pytest tests/ --timeout=300'
     ' && cd ../escalation && uv run pytest tests/ --timeout=300'
@@ -2542,16 +2539,28 @@ class TestRootTestCommandLiveConfigDrift:
 
     A sibling of ``test_verify_cmd.py``'s
     ``TestSplitAndChainSegmentsLiveConfigDrift`` (task 3338, commit
-    8999ad8c93), deliberately duplicated here rather than imported or shared
-    via a conftest helper: a guard only protects the hand-copy that lives in
-    its own module, and each test module keeps its own copy of the root
-    ``test_command`` for its own corpus. That is not a hypothetical — it is
-    why this guard is needed at all. This module's ``_ROOT_TEST_COMMAND``
-    silently drifted out of sync with the live yaml (missing the
-    ``scripts/tests/`` target ``test_command`` gained), while
-    ``test_verify_cmd.py``'s identical constant was re-synced the moment its
-    own guard went red. Leaning on that sibling guard instead of adding this
-    one would leave this module's copy unprotected again.
+    8999ad8c93). The constant and the guard are duplicated here rather than
+    imported from that module or hoisted into a shared conftest helper —
+    that is a scope call for task 3495, not an architecture verdict: this
+    suite's own conftest.py module docstring already documents avoiding
+    plain (non-fixture) names shared across test modules via conftest.py
+    itself, to dodge ``sys.modules['conftest']`` collisions with sibling
+    subprojects' own conftests under this repo's ``--import-mode=importlib``
+    addopts (pyproject.toml) — see conftest.py's own ``_orch_helpers.py``
+    workaround for that exact problem. The safer shared home would be a new,
+    uniquely-named module (e.g. ``tests/_root_config.py``), and creating or
+    editing either that or conftest.py is a file outside the two this task
+    holds locks for (this module and ``test_verify_cmd.py``) — out of scope
+    for a documentation-accuracy pass. Filed as a follow-up:
+    agent-followup-3495-conftest-hoist (ticket tkt_0RS0KSXR1H74KTQBXBTDECJ1EM).
+
+    Given each module keeps its own hand-copy today, a guard only protects
+    the copy living in its own module — demonstrated, not hypothetical: this
+    module's ``_ROOT_TEST_COMMAND`` silently drifted out of sync with the
+    live yaml (missing the ``scripts/tests/`` target ``test_command``
+    gained), while ``test_verify_cmd.py``'s identical constant was re-synced
+    the moment its own guard went red. Leaning on that sibling guard instead
+    of adding this one would leave this module's copy unprotected again.
     """
 
     @staticmethod
@@ -2566,4 +2575,42 @@ class TestRootTestCommandLiveConfigDrift:
             "'root-test-fan-out' case in TestDroppedChainClausesAreLogged."
             '_DROP_CASES, and the truncation golden in '
             'test_root_test_fan_out_still_truncates.'
+        )
+
+
+class TestFrozenRootCommandsKeepTheirScopingShape:
+    """Cheap structural pin for the two FROZEN root command snapshots.
+
+    ``_ROOT_LINT_COMMAND`` / ``_ROOT_TYPE_CHECK_COMMAND`` are deliberately
+    NOT kept byte-equal to the live yaml (see the FROZEN ILLUSTRATIVE
+    SNAPSHOT comments above them): a full re-sync is deferred to ticket
+    tkt_0RS0C6DZXK29SRSRSZ08CQ4R19 because it invalidates exact-output
+    goldens elsewhere in this module. Deferred is not the same as unguarded:
+    a GROWING target list (the live lint_command gaining ``sampler
+    cockpit``) is the expected, already-tolerated drift, but a change to the
+    command's STRUCTURAL HEAD — which tool runs first, in which cwd — would
+    silently invalidate test_root_lint_chain_scopes_ruff_and_keeps_the_checker
+    and test_root_type_check_fan_out_still_truncates regardless of the
+    deferred re-sync. This pin catches that narrower, cheaper-to-check case
+    without committing to the full literal re-sync.
+    """
+
+    def test_live_lint_command_still_starts_with_the_frozen_prefix(self):
+        live = yaml.safe_load(_DF_CONFIG_PATH.read_text(encoding='utf-8'))['lint_command']
+        assert live.startswith('uv run ruff check '), (
+            "dark-factory-orchestrator.yaml:lint_command's structural head "
+            'has changed shape, not just grown its target list — re-derive '
+            'test_root_lint_chain_scopes_ruff_and_keeps_the_checker and bump '
+            'ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19, not just '
+            '_ROOT_LINT_COMMAND.'
+        )
+
+    def test_live_type_check_command_still_starts_with_the_frozen_prefix(self):
+        live = yaml.safe_load(_DF_CONFIG_PATH.read_text(encoding='utf-8'))['type_check_command']
+        assert live.startswith('cd fused-memory && npx pyright'), (
+            "dark-factory-orchestrator.yaml:type_check_command's structural "
+            'head has changed shape, not just added pyright segments — '
+            're-derive test_root_type_check_fan_out_still_truncates and bump '
+            'ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19, not just '
+            '_ROOT_TYPE_CHECK_COMMAND.'
         )
