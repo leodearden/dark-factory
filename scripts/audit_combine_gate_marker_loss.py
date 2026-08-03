@@ -357,3 +357,125 @@ def build_manifest_index(
                 bound_by=(str(path),),
             )
     return index
+
+
+# ---------------------------------------------------------------------------
+# Severity — RANKED BY CONSUMER, NOT BY GAP SIZE.
+#
+# Every constant below names the CONCRETE CODE that reads the lost key, with a
+# file citation, because that consumer is the entire justification for the
+# rank. Ranking by how often a key is lost would invert the report: task_kind
+# is the most common gap (all 24 live victims lost it) yet is load-bearing
+# only in the rare deterministic case, so a frequency ranking would bury the
+# two delivered_checks losses — the only ones that silently remove a mark-done
+# gate — under two dozen benign rows.
+# ---------------------------------------------------------------------------
+
+# Consumer: orchestrator/src/orchestrator/delivered_checks.py —
+# gate_mark_done_on_delivered_checks (:377) and verify_delivered_checks_on_main
+# (:198) both read metadata.delivered_checks. Wiping it does not fail the gate,
+# it DELETES the gate: the task closes with no check ever run.
+SEVERITY_GATE_REMOVING = "gate_removing"
+
+# Consumer: PRD provenance. prd_path / prd_task_label are how a task is traced
+# back to the PRD and manifest label that authored it (and how the manifest
+# stamper re-finds its sidecar). Losing them orphans the task from its PRD;
+# nothing silently stops gating.
+SEVERITY_PROVENANCE = "provenance"
+
+# Consumer: Scheduler.is_deterministic (orchestrator/src/orchestrator/
+# scheduler.py:2046) — the single source of truth routing a task to
+# DeterministicRunner, to the no-lock module path, and to the restart
+# stamp-clear. Only applies when the expected value IS 'deterministic'.
+SEVERITY_DISPATCH = "dispatch"
+
+# Real provenance loss with no gating or dispatch consumer.
+SEVERITY_INFORMATIONAL = "informational"
+
+# NO BEHAVIOURAL CONSEQUENCE AT ALL. Scheduler.is_deterministic (scheduler.py:
+# 2046) is exactly `metadata.get('task_kind') == 'deterministic'`, so an ABSENT
+# task_kind is byte-identical in behaviour to task_kind='normal'. A lost
+# non-deterministic task_kind therefore changes nothing, and is demoted BELOW
+# informational so it cannot crowd out a finding that matters.
+SEVERITY_BENIGN = "benign"
+
+# Highest-consequence FIRST. This tuple IS the report's sort order.
+_SEVERITY_PRECEDENCE = (
+    SEVERITY_GATE_REMOVING,
+    SEVERITY_PROVENANCE,
+    SEVERITY_DISPATCH,
+    SEVERITY_INFORMATIONAL,
+    SEVERITY_BENIGN,
+)
+
+# The task_kind value that is actually load-bearing (scheduler.py:2046).
+TASK_KIND_DETERMINISTIC = "deterministic"
+
+# Keys whose loss is provenance-grade.
+_PROVENANCE_KEYS = ("prd_path", "prd_task_label")
+
+# The gate-removing key.
+_GATE_KEY = "delivered_checks"
+
+_BENIGN_TASK_KIND_REASON = (
+    "Scheduler.is_deterministic() (scheduler.py:2046) tests "
+    "metadata.get('task_kind') == 'deterministic', so an ABSENT task_kind is "
+    "behaviourally identical to the non-deterministic value that was lost; "
+    "nothing dispatches differently"
+)
+
+
+def _severity_rank(severity: str) -> int:
+    """Position of *severity* in :data:`_SEVERITY_PRECEDENCE`, gate-removing 0.
+
+    Fails soft on an unknown value by returning ``len(_SEVERITY_PRECEDENCE)``,
+    so a severity added later sorts LAST instead of raising mid-report —
+    mirroring ``_source_rank`` in ``audit_wiped_metadata_files.py``.
+    """
+    try:
+        return _SEVERITY_PRECEDENCE.index(severity)
+    except ValueError:
+        return len(_SEVERITY_PRECEDENCE)
+
+
+def classify_gap(key: str, expected_value: object) -> tuple[str, str]:
+    """Classify one lost metadata *key* as ``(severity, reason)``.
+
+    *expected_value* is what the comparison source says the key held. It is
+    INSPECTED, not merely carried: the ``task_kind`` branch resolves to two
+    different severities for the same key depending on whether the lost value
+    was ``'deterministic'``. Reporting on the key name alone would rank all 24
+    live task_kind losses as dispatch-affecting when only a handful are.
+
+    An unforeseen key falls through to :data:`SEVERITY_INFORMATIONAL` rather
+    than raising — the metadata vocabulary grows (docs/task-authoring.md's
+    Tier-C ``x_`` namespace is open by design), and a sweep must not abort on
+    a key this script has not been taught about.
+    """
+    if key == _GATE_KEY:
+        return (
+            SEVERITY_GATE_REMOVING,
+            "removes the gate_mark_done_on_delivered_checks / "
+            "verify_delivered_checks_on_main mark-done gate "
+            "(orchestrator/src/orchestrator/delivered_checks.py); the task "
+            "closes with the check never run",
+        )
+    if key in _PROVENANCE_KEYS:
+        return (
+            SEVERITY_PROVENANCE,
+            "orphans the task from the PRD and manifest label that authored "
+            "it; the manifest stamper can no longer re-find its sidecar",
+        )
+    if key == "task_kind":
+        if expected_value == TASK_KIND_DETERMINISTIC:
+            return (
+                SEVERITY_DISPATCH,
+                "Scheduler.is_deterministic() (scheduler.py:2046) no longer "
+                "routes this task to DeterministicRunner, the no-lock module "
+                "path, or the restart stamp-clear",
+            )
+        return (SEVERITY_BENIGN, _BENIGN_TASK_KIND_REASON)
+    return (
+        SEVERITY_INFORMATIONAL,
+        "provenance/bookkeeping key with no gating or dispatch consumer",
+    )
