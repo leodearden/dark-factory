@@ -944,6 +944,70 @@ class TestPlanCalibrationClusters:
         assert len(plan.member_memory_ids) == 2
         assert _reasons(skips) == ['cluster_without_canonical']
 
+    def test_a_second_canonical_row_is_reported_not_discarded(self):
+        """Two ``canonical`` rows for one cluster is ambiguity, not noise.
+
+        Keeping only the first would make the extra row vanish from the
+        artifact entirely — neither stamped nor skipped — and this module
+        reports ambiguity rather than resolving it everywhere else. The DF
+        manifest's rule for gates 3036/3092 applies: every id gets the topic,
+        none gets ``canonical``.
+
+        Latent against the committed fixture (20 clusters, exactly one
+        ``canonical`` row each) but the fixture grows under zeta/3130, and
+        nothing else pins one-canonical-per-cluster.
+        """
+        first = 'aaaaaaaa-0000-4000-8000-000000000001'
+        second = 'aaaaaaaa-0000-4000-8000-00000000000f'
+        rows = [
+            _row(CLUSTER_A, first, 'canonical'),
+            _row(CLUSTER_A, second, 'canonical'),
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000002', 'duplicate'),
+        ]
+        plans, skips = _mod.plan_calibration_clusters(
+            rows, _registry(_entry('architect-plan-files-write-set', CLUSTER_A))
+        )
+        plan = _only(plans)
+        assert plan.canonical_plural is True
+        assert plan.canonical_memory_id is None, 'neither competitor may be crowned'
+        assert set(plan.member_memory_ids) == {
+            first, second, 'aaaaaaaa-0000-4000-8000-000000000002',
+        }, 'the demoted canonicals still get the topic'
+        assert _reasons(skips) == ['canonical_plural']
+        assert skips[0]['canonical_memory_ids'] == sorted([first, second])
+        assert skips[0]['cluster_id'] == CLUSTER_A
+
+    def test_a_plural_cluster_is_not_also_reported_as_canonical_less(self):
+        """One cluster, one verdict.
+
+        ``canonical_memory_id`` is ``None`` in both the plural and the
+        none-at-all case, so a naive check would file BOTH skips and describe
+        a cluster with two canonicals as having none.
+        """
+        rows = [
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000001', 'canonical'),
+            _row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-00000000000f', 'canonical'),
+        ]
+        _plans, skips = _mod.plan_calibration_clusters(
+            rows, _registry(_entry('architect-plan-files-write-set', CLUSTER_A))
+        )
+        assert 'cluster_without_canonical' not in _reasons(skips)
+
+    def test_a_repeated_canonical_id_is_not_a_disagreement(self):
+        """The same id labeled canonical twice is one opinion, stated twice."""
+        only_one = 'aaaaaaaa-0000-4000-8000-000000000001'
+        rows = [
+            _row(CLUSTER_A, only_one, 'canonical'),
+            _row(CLUSTER_A, only_one, 'canonical'),
+        ]
+        plans, skips = _mod.plan_calibration_clusters(
+            rows, _registry(_entry('architect-plan-files-write-set', CLUSTER_A))
+        )
+        plan = _only(plans)
+        assert plan.canonical_memory_id == only_one
+        assert plan.canonical_plural is False
+        assert skips == []
+
     def test_project_id_comes_from_the_registry_entry(self):
         """Sources span two corpora; project cannot be a run-level constant."""
         rows = [_row(CLUSTER_A, 'aaaaaaaa-0000-4000-8000-000000000002', 'duplicate')]
