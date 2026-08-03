@@ -9,6 +9,7 @@ strings only — no disk I/O, no pytest config.
 from __future__ import annotations
 
 import ast
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,51 @@ def _applied_marker_names(source: str) -> frozenset[str]:
             if value is not None:
                 names |= _names_from_marker_value(value)
     return frozenset(names)
+
+
+def _registered_marker_names(ini_lines: Sequence[str]) -> frozenset[str]:
+    """Normalises ``Config.getini('markers')`` entries exactly as pytest's own
+    ``MarkGenerator`` does: ``line.split(':', 1)[0].split('(', 1)[0].strip()``.
+
+    Needed because a custom entry arrives as ``'slow: marks heavyweight ...'``
+    while a builtin arrives WITH a call signature, e.g. ``'parametrize(argnames,
+    argvalues): call a test ...'`` — the second split strips that signature
+    too. A bare name with neither shape is returned unchanged (stripped).
+    """
+    return frozenset(line.split(':', 1)[0].split('(', 1)[0].strip() for line in ini_lines)
+
+
+def _unregistered_markers(tests_dir: Path, registered: frozenset[str]) -> dict[str, set[str]]:
+    """``{marker_name: {relative file paths}}`` for every marker applied under
+    *tests_dir* that is absent from *registered*.
+
+    Sweeps every ``*.py`` file from DISK (``sorted(tests_dir.rglob('*.py'))``
+    — sorted for deterministic failure messages under xdist), never pytest's
+    own collection, so the result does not depend on what any one invocation
+    happened to collect (see the module docstring's rejected-alternative
+    note). Reported paths are relative to *tests_dir*.
+
+    A file that fails to parse or read (``SyntaxError``/``OSError``) is
+    re-raised as an ``AssertionError`` naming the offending file — never
+    swallowed, never silently skipped, the same loud-on-failure polarity as
+    ``_applied_marker_names`` itself. Returns ``{}`` when every applied
+    marker is registered.
+    """
+    unregistered: dict[str, set[str]] = {}
+    for path in sorted(tests_dir.rglob('*.py')):
+        relative = str(path.relative_to(tests_dir))
+        try:
+            applied = _applied_marker_names(path.read_text())
+        except (SyntaxError, OSError) as exc:
+            raise AssertionError(
+                f'{relative} could not be read/parsed while sweeping '
+                f'{tests_dir} for applied pytest markers: {exc!r}. Fix the '
+                f'file — a silently-skipped file would make this guard '
+                f'vacuous for it.'
+            ) from exc
+        for name in applied - registered:
+            unregistered.setdefault(name, set()).add(relative)
+    return unregistered
 
 
 class TestAppliedMarkerNames:
