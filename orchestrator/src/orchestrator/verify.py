@@ -7501,25 +7501,62 @@ async def _main_probe_failure_is_isolated_flake(
     ``_SWEEP_CONFIRM_MAX_ATTEMPTS``-attempt loop, ``role='task'`` by
     default via ``run_verification``'s own default), unchanged.
     """
-    node_ids = _extract_failing_test_ids(main_result.test_output)
-    mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
-    groups = _group_node_ids_by_subproject(
-        probe_worktree, mc_by_prefix, node_ids,
-        log_label='verify_failure_is_preexisting_on_main confirm gate',
-    )
-    for prefix, group_node_ids in groups.items():
-        mc = mc_by_prefix[prefix]
-        scoped_cmd = _with_pytest_timeout_str(
-            _serial_pytest_str(
-                _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-            ),
-            _MAIN_PROBE_CONFIRM_TIMEOUT_SECS,
-        )
-        scoped_mc = replace(
-            mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
-        )
-        if not await _run_isolated_confirm_group(probe_worktree, config, scoped_mc):
+    try:
+        node_ids = _extract_failing_test_ids(main_result.test_output)
+        if not node_ids:
             return None
+
+        mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
+        groups = _group_node_ids_by_subproject(
+            probe_worktree, mc_by_prefix, node_ids,
+            log_label='verify_failure_is_preexisting_on_main confirm gate',
+        )
+        # `not groups`, NOT `is None`: both sentinels must keep today's
+        # verdict. Falling into the groups.items() loop with an empty dict
+        # would run ZERO isolated re-runs and then `return node_ids` — a
+        # full downgrade on zero evidence. Mirrors the same defensive guard
+        # in confirm_merge_verify_flake_suppressible /
+        # _sweep_failure_reproduces_in_isolation.
+        if not groups:
+            shown = node_ids[:10]
+            extra = len(node_ids) - len(shown)
+            logger.info(
+                'verify_failure_is_preexisting_on_main confirm gate: node-id '
+                '-> subproject mapping yielded nothing usable (%r) for %s%s '
+                'in %s — unconfirmable, keeping the preexisting verdict',
+                groups, shown, f' (+{extra} more)' if extra else '', probe_worktree,
+            )
+            return None
+
+        for prefix, group_node_ids in groups.items():
+            mc = mc_by_prefix[prefix]
+            scoped_cmd = _with_pytest_timeout_str(
+                _serial_pytest_str(
+                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                ),
+                _MAIN_PROBE_CONFIRM_TIMEOUT_SECS,
+            )
+            scoped_mc = replace(
+                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            )
+            if not await _run_isolated_confirm_group(probe_worktree, config, scoped_mc):
+                return None
+
+        logger.warning(
+            'verify_failure_is_preexisting_on_main confirm gate: %s passed on '
+            'isolated re-run on the main probe — main is not red for these '
+            'tests',
+            node_ids,
+        )
+        return node_ids
+
+    except Exception:
+        logger.warning(
+            'verify_failure_is_preexisting_on_main confirm gate: unexpected '
+            'error — keeping the preexisting verdict',
+            exc_info=True,
+        )
+        return None
     return node_ids
 
 
