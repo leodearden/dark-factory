@@ -1234,9 +1234,11 @@ class TestMem0BackendScanPayloadText:
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(return_value=([], None))
 
-        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
-            with pytest.raises(ValueError, match='strictly positive'):
-                await backend.scan_payload_text(scope=Scope(project_id='p'), limit=limit)
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(ValueError, match='strictly positive'),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), limit=limit)
 
         mock_client.scroll.assert_not_awaited()
 

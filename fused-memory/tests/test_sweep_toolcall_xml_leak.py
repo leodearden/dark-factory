@@ -1159,9 +1159,8 @@ class TestCarriedMetadata:
         from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 
         assert MEM0_MANAGED_METADATA_KEYS <= _mod._MEM0_OWNED_KEYS
-        assert _mod._MEM0_OWNED_KEYS - MEM0_MANAGED_METADATA_KEYS == {
-            'id', 'memory', 'content', 'category',
-        }
+        owned_beyond_mem0 = _mod._MEM0_OWNED_KEYS - MEM0_MANAGED_METADATA_KEYS
+        assert owned_beyond_mem0 == {'id', 'memory', 'content', 'category'}
 
     def test_a_bare_payload_drops_and_preserves_nothing(self):
         metadata, dropped = _mod.carried_metadata(

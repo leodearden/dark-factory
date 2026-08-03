@@ -130,8 +130,8 @@ import sys
 from typing import Any
 
 from fused_memory.backends.mem0_client import (
-    MEM0_MANAGED_METADATA_KEYS,
     _MEM0_TEXT_KEYS,
+    MEM0_MANAGED_METADATA_KEYS,
 )
 from fused_memory.memory_metadata import validate_memory_metadata
 from fused_memory.models import MEM0_PRIMARY, MemoryCategory
