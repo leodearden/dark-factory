@@ -1,0 +1,86 @@
+"""Contract tests for the shared ``install_fake_httpx`` fixture (task 3376).
+
+These assert real runtime behaviour — ``sys.modules`` mutation and its
+restoration at teardown — not documentation.  The fixture deduplicates six
+copies of the same fake-httpx idiom across four files in this directory; if it
+silently stopped shadowing the real module, or silently leaked the stub past
+teardown, every one of those call-sites would degrade quietly.  Hence a direct
+test of the fixture itself rather than trusting its six consumers.
+
+Ordering matters: ``test_install_fake_httpx_is_restored_after_teardown`` must
+run AFTER a test that used the fixture, so it observes the post-teardown state.
+pytest collects in file order, so it is placed last.
+"""
+import sys
+
+
+def test_install_fake_httpx_shadows_the_real_module_for_lazy_imports(
+    install_fake_httpx,
+):
+    """The stub must satisfy a function-local ``import httpx``, not just a dict read.
+
+    All six production call-sites reach httpx through a lazy, function-local
+    ``import httpx`` (``default_status_fetcher``, ``_default_poster``, ...).
+    Asserting only ``sys.modules['httpx'] is fake`` would also pass against a
+    stub that the real import machinery bypasses, so the identity check is made
+    on the binding produced by an actual ``import`` statement.
+    """
+    calls = []
+
+    def _spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 'sentinel-response'
+
+    fake = install_fake_httpx(post=_spy)
+
+    assert fake.post is _spy
+    assert fake.__name__ == 'httpx'
+    assert sys.modules['httpx'] is fake
+
+    def _lazy_import_site():
+        import httpx
+
+        return httpx
+
+    resolved = _lazy_import_site()
+    assert resolved is fake, 'a function-local `import httpx` must resolve to the stub'
+
+    assert resolved.post('http://example.invalid', json={'k': 'v'}) == 'sentinel-response'
+    assert calls == [(('http://example.invalid',), {'json': {'k': 'v'}})]
+
+
+def test_install_fake_httpx_accepts_post_positionally(install_fake_httpx):
+    """The six call-sites pass the poster positionally; pin that spelling."""
+
+    def _spy(*args, **kwargs):
+        return None
+
+    fake = install_fake_httpx(_spy)
+
+    assert fake.post is _spy
+    assert sys.modules['httpx'] is fake
+
+
+def test_install_fake_httpx_is_restored_after_teardown():
+    """After a fixture-using test, ``httpx`` must be absent or the GENUINE package.
+
+    This is what forces ``monkeypatch.setitem`` over a raw
+    ``sys.modules['httpx'] = ...`` assignment: a raw assignment leaves the stub
+    installed for every subsequent test in the session, which would poison any
+    later test that legitimately imports httpx.
+    """
+    leaked = sys.modules.get('httpx')
+    if leaked is None:
+        return  # monkeypatch deleted a key it had created — correct restoration.
+
+    assert getattr(leaked, '__file__', None) is not None, (
+        'a stub module leaked past fixture teardown (no __file__)'
+    )
+    assert hasattr(leaked, 'Client'), (
+        'a stub module leaked past fixture teardown (no httpx.Client)'
+    )
+    # The real package must still be usable, not a husk left behind by a stub.
+    import httpx
+
+    assert httpx is leaked
+    assert isinstance(getattr(httpx, '__version__', None), str)
