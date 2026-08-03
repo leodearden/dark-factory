@@ -697,6 +697,24 @@ def _falkor_available() -> bool:
         return False
 
 
+def falkor_skipif(reason: str = 'FalkorDB not reachable'):
+    """Return a ``pytest.mark.skipif`` marker gated on `_falkor_available()`.
+
+    A factory rather than a module-level marker constant: _fm_helpers is
+    imported by conftest.py on every test session, so evaluating the probe at
+    import time would run a bounded ~2s connection attempt even for sessions
+    that never touch FalkorDB. Calling this from a module's ``pytestmark`` —
+    or as a class/function decorator, which four of the six migrated modules
+    do — instead defers the probe to that module's own collection time,
+    identical timing to each file's previous local copy.
+
+    Resolves ``_falkor_available`` through the module global at call time
+    rather than capturing it, so the marker tracks whatever the probe
+    currently reports. tests/test_fm_helpers.py pins that property.
+    """
+    return pytest.mark.skipif(not _falkor_available(), reason=reason)
+
+
 # ---------------------------------------------------------------------------
 # Shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
