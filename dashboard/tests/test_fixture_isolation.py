@@ -26,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from _dashboard_helpers import apply_isolated_env
 from starlette.testclient import TestClient
 
 # tests/ -> dashboard/ -> repo root
@@ -94,3 +95,59 @@ class TestLifespanProjectRootIsolation:
     def test_module_scoped_client_is_isolated(self, _client, tmp_path_factory):
         """A module-scoped ``TestClient`` fixture — the ~15-site idiom in this suite."""
         _assert_lifespan_config_is_isolated(tmp_path_factory.getbasetemp())
+
+
+class TestApplyIsolatedEnvNeutralizesAmbientRuntimeDirs:
+    """``DASHBOARD_PROJECT_ROOT`` alone is not sufficient isolation.
+
+    ``DashboardConfig._runtime_data_dir`` (config.py) reads
+    ``RECONCILIATION_DATA_DIR`` / ``QUEUE_DATA_DIR`` straight from
+    ``os.environ`` and they WIN over ``project_root`` for ``reconciliation_db``,
+    ``tickets_db``, ``write_queue_db``, ``write_journal_db`` and
+    ``reconciliation_escalations_dir``.  ``reconciliation_db`` and
+    ``tickets_db`` are exactly the two read-only ``DbPool.get()`` opens in
+    ``_metrics_loop`` that produced the task-3466 ``SQLITE_READONLY_RECOVERY``,
+    so leaving them ambient would leave that incident's own trigger path
+    un-isolated.
+
+    Ambient presence is live, not hypothetical: the orchestrator's managed
+    fused-memory spawn (``orchestrator/src/orchestrator/mcp_lifecycle.py``)
+    injects both into managed subprocess environments.  This test simulates
+    that environment with decoy values pointing OUTSIDE the isolated root.
+    """
+
+    def test_decoy_runtime_dirs_do_not_survive(self, tmp_path):
+        from dashboard.config import DashboardConfig
+
+        decoy = tmp_path / 'decoy'
+        isolated_root = tmp_path / 'isolated'
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv('RECONCILIATION_DATA_DIR', str(decoy / 'recon'))
+            mp.setenv('QUEUE_DATA_DIR', str(decoy / 'q'))
+
+            apply_isolated_env(mp, isolated_root)
+            cfg = DashboardConfig.from_env()
+
+            # These are LAZY properties: _runtime_data_dir re-reads os.environ on
+            # every access, so the config object captures nothing.  Reading them
+            # after the MonkeyPatch context exits would observe the restored
+            # (decoy-free) environment and pass vacuously — the assertions MUST
+            # stay inside this block.
+            derived = {
+                'reconciliation_db': cfg.reconciliation_db,
+                'tickets_db': cfg.tickets_db,
+                'write_journal_db': cfg.write_journal_db,
+                'reconciliation_escalations_dir': cfg.reconciliation_escalations_dir,
+                'write_queue_db': cfg.write_queue_db,
+            }
+
+            for label, path in derived.items():
+                assert not path.is_relative_to(decoy), (
+                    f'{label} {path} followed the ambient decoy env var '
+                    f'out of the isolated root'
+                )
+                assert path.is_relative_to(cfg.project_root), (
+                    f'{label} {path} is not under the isolated project_root '
+                    f'{cfg.project_root}'
+                )
