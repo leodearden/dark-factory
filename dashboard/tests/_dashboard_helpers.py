@@ -27,11 +27,33 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     this every ``TestClient(app)`` in the suite wrote into the operator's live
     ``data/burndown/``.
 
+    Also DELETES ``RECONCILIATION_DATA_DIR`` and ``QUEUE_DATA_DIR``.  Those are
+    read straight from ``os.environ`` by ``DashboardConfig._runtime_data_dir``
+    and WIN over ``project_root`` for ``reconciliation_db``, ``tickets_db``,
+    ``write_queue_db``, ``write_journal_db`` and
+    ``reconciliation_escalations_dir`` — so setting only
+    ``DASHBOARD_PROJECT_ROOT`` would leave them pointed wherever the ambient
+    environment says.  ``reconciliation_db`` and ``tickets_db`` are exactly the
+    two read-only ``DbPool.get()`` opens in ``_metrics_loop`` that produced the
+    task-3466 ``SQLITE_READONLY_RECOVERY``, so that gap would leave the
+    incident's own trigger path un-isolated.  Ambient presence is live, not
+    hypothetical: the orchestrator's managed fused-memory spawn
+    (``orchestrator/src/orchestrator/mcp_lifecycle.py``) injects both.
+
+    DELETE rather than redirect, deliberately.  Deleting makes the config fall
+    back to ``project_root``-relative paths, which keeps
+    ``test_scaffold.py``'s ``TestConfigDefaults.test_config_derived_paths``
+    assertions valid — and in fact makes them hermetic, since today they
+    silently depend on the ambient environment happening to have these unset.
+    Redirecting under *root* would instead break them.
+
     A plain function rather than a fixture so the env contract is directly
     unit-testable against a simulated operator environment — a session-scoped
     autouse fixture cannot be re-run from inside a test.
     """
     mp.setenv('DASHBOARD_PROJECT_ROOT', str(root))
+    mp.delenv('RECONCILIATION_DATA_DIR', raising=False)
+    mp.delenv('QUEUE_DATA_DIR', raising=False)
 
 
 RECONCILIATION_SCHEMA = """
