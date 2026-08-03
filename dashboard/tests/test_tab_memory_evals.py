@@ -654,30 +654,16 @@ def test_index_html_registers_tab_memory_evals_load_order(
         'app.jsx renders MemoryTab, which renders MemoryEvalsSection.',
     )
 
-    # (e) one uniform cache-buster across every /static/redux/* asset,
-    #     including the styles.css <link> — mirrors the guards in
-    #     test_index_html.py:593 (floor 37) and test_tab_escalations.py:487.
-    versions = set(
-        re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)
-    )
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: '
-        f'{sorted(versions)} — bump all of them uniformly, the stylesheet '
-        '<link> included.'
-    )
-    v = int(next(iter(versions)))
-    assert v >= 38, (
-        f'index.html cache-buster version is {v}, expected >= 38 (proves the '
-        'uniform bump for the memory-evals section actually reaches '
-        'already-open browsers; the previous floor, 37, proved task 3332\'s '
-        '`const API` collision fix).'
-    )
+    # NOTE: no cache-buster assertion here. The "all /static/redux/?v= share
+    # ONE version" check is asserted once, canonically, in test_index_html.py —
+    # it was replicated across five test modules, each with its own stale
+    # monotonic floor, so every dashboard change re-failed several byte-identical
+    # copies. The monotonic floor this task needs lives in
+    # test_index_html_cache_buster_floor below.
 
 
-def test_index_html_cache_buster_bumped_for_the_memory_eval_ui_fixes(
-    index_html_body: str,
-) -> None:
-    """The cache-buster must be bumped, uniformly, for this task's .jsx edits.
+def test_index_html_cache_buster_floor(index_html_body: str) -> None:
+    """Every /static/redux/* asset must be at or past this task's version.
 
     Two of the three fixes in task 3470 are pure edits to .jsx bundles that an
     already-open dashboard has ALREADY cached — tab_memory_evals.jsx (per-eval
@@ -691,26 +677,31 @@ def test_index_html_cache_buster_bumped_for_the_memory_eval_ui_fixes(
 
     Bumping is therefore part of the fix, not a cosmetic afterthought, so it is
     pinned by a test like every prior bump was.
+
+    Scope, deliberately: the FLOOR only. Whether the versions are UNIFORM is one
+    property of index.html, and asserting it here too made this the sixth
+    byte-identical copy of that check (test_index_html.py, test_esc_flow_diagram
+    .py, test_tab_escalation_analytics.py, test_scheduler_page.py, and twice in
+    this module) — so any partial bump failed six tests with six different stale
+    floors in the message, and a reader had to diff them to find the
+    authoritative one. Uniformity is now asserted once, in test_index_html.py.
+    A floor stated as `min(...)` needs no uniformity precondition to be sound:
+    it is the strictly stronger claim under mixed versions, since the oldest
+    asset is the one that would still serve stale module code.
     """
-    versions = set(
-        re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)
+    versions = {
+        int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)
+    }
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    # Uniformity first: a PARTIAL bump is the real failure mode here. It would
-    # refetch some bundles and serve others from cache, mixing old and new
-    # module code in one page — strictly worse than not bumping at all.
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: '
-        f'{sorted(versions)} — every /static/redux/* asset must carry the '
-        'SAME version, the styles.css <link> included, not just the two .jsx '
-        'files this task edits.'
-    )
-    v = int(next(iter(versions)))
-    assert v >= 42, (
-        f'index.html cache-buster version is {v}, expected >= 42 so task '
-        "3470's tab_memory_evals.jsx and tab_escalations.jsx fixes actually "
-        'reach already-open browsers. This floor supersedes the two it '
-        'subsumes: >= 41 (test_index_html.py) and >= 38 (the memory-evals '
-        'section landing in task 3216).'
+    assert min(versions) >= 42, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        "expected >= 42 so task 3470's tab_memory_evals.jsx and "
+        'tab_escalations.jsx fixes actually reach already-open browsers. This '
+        'floor supersedes the two it subsumes: >= 41 (test_index_html.py) and '
+        '>= 38 (the memory-evals section landing in task 3216).'
     )
 
 
@@ -1531,24 +1522,29 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
         'null for a zero-length array, leaving a blank 26px box.'
     )
 
-    # (c) FOUR structurally distinct trend states. A fourth arm is required
-    #     rather than folding no-runs into the gap message because
+    # (c) FIVE structurally distinct trend states. A separate no-runs arm is
+    #     required rather than folding it into the gap message because
     #     "no chart — 0 of 0 runs produced no sample" is a nonsense sentence
     #     that reads as a bug — the very failure this suppression path exists
-    #     to prevent.
+    #     to prevent.  A separate mismatch arm is required for the same reason,
+    #     one payload shape further out: labels and values are PARALLEL arrays
+    #     (memory_evals.py:955,993), so a disagreement makes every other
+    #     sentence this cell could produce untrustworthy.
     testids = (
         'memory-eval-trend-chart',
         'memory-eval-trend-no-kind',
+        'memory-eval-trend-mismatch',
         'memory-eval-trend-no-runs',
         'memory-eval-trend-gaps',
     )
-    assert len(set(testids)) == len(testids), 'the four trend testids must be distinct.'
+    assert len(set(testids)) == len(testids), 'the five trend testids must be distinct.'
     for testid in testids:
         assert f'data-testid="{testid}"' in code, (
             f'the trend cell must render a `data-testid="{testid}"` arm. The '
-            'four states — drawn chart, unrenderable kind, no runs yet, and '
-            'holed series — must be structurally distinguishable, so a '
-            'rewording cannot silently collapse two of them into one.'
+            'five states — drawn chart, unrenderable kind, labels/values length '
+            'disagreement, no runs yet, and holed series — must be structurally '
+            'distinguishable, so a rewording cannot silently collapse two of '
+            'them into one.'
         )
 
     # (d) the existing guards must SURVIVE, re-asserted here so a later
@@ -1561,6 +1557,52 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     assert re.search(r'\{\s*gaps\b', code), (
         'the `gaps` count must still reach a render position — adding the '
         'no-runs state must not cost the holed-series disclosure.'
+    )
+
+    # (e) ONE series count feeds every disclosure in this cell.  Measuring the
+    #     state from `trend.values` while the footer counts `trend.labels` lets
+    #     a payload where the two disagree render the mutually contradictory
+    #     pair "no runs yet — nothing to chart" next to "N pts": the same
+    #     reads-as-a-bug outcome this state was added to prevent, moved one
+    #     line down.
+    assert re.search(r'\{\s*' + re.escape(points_local) + r'\s*\}', row_body), (
+        f'the series-length local `{points_local}` never reaches a bare '
+        '`{<local>}` render position, so the footer count is derived from some '
+        'OTHER measurement than the one the trend states are gated on.'
+    )
+    stray = re.search(r'\{[^{}]*trend\.labels[^{}]*\.length[^{}]*\}', row_body)
+    assert stray is None, (
+        f'a render expression still counts `trend.labels` directly: '
+        f'{stray.group(0)!r}. Every count in this cell must read the single '
+        f'`{points_local}` local, or a labels/values disagreement prints two '
+        'contradictory sentences side by side.'
+    )
+
+    # ...and the disagreement itself is NAMED rather than silently reconciled
+    #    by picking one array's length over the other.
+    mismatch_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*\.length\s*!==\s*[^;\n]*;', row_body
+    )
+    assert mismatch_decl is not None, (
+        'MemoryEvalMetricRow never compares the labels and values lengths. They '
+        'are parallel arrays built from one `runs` list server-side '
+        '(memory_evals.py:955,993); a payload where they disagree is malformed, '
+        'and nothing this cell says about the series would be trustworthy.'
+    )
+    mismatch_local = mismatch_decl.group(1)
+    assert re.search(r'\b' + re.escape(mismatch_local) + r'\b', gate_decl.group(0)), (
+        f'the chart gate {gate_decl.group(0).strip()!r} does not consume '
+        f'`{mismatch_local}`, so a malformed series is still drawn — against a '
+        'title derived from the other, differently-sized array.'
+    )
+    assert re.search(
+        re.escape(mismatch_local)
+        + r'[\s\S]{0,400}?data-testid="memory-eval-trend-mismatch"',
+        row_body,
+    ), (
+        f'`{mismatch_local}` does not gate the '
+        '`data-testid="memory-eval-trend-mismatch"` arm, so the disagreement is '
+        'measured but never stated.'
     )
 
 

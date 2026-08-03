@@ -501,16 +501,21 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
         'tab_escalations.jsx must load before app.jsx so EscalationsTab is set on window.DF_TABS.',
     )
 
-    # (g) All /static/redux/ v= cache-busters share one version >= 10
-    import re as _re
-    versions = set(_re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
-        'bump all of them uniformly to the same value.'
+    # (g) every /static/redux/ cache-buster is at or past this tab's floor.
+    #     FLOOR only: whether the versions are UNIFORM is asserted once,
+    #     canonically, in test_index_html.py. It was replicated byte-identically
+    #     across five test modules, each with its own stale monotonic floor, so a
+    #     partial bump failed five tests with five different floors in the
+    #     message. `min(...)` is the strictly stronger floor claim under mixed
+    #     versions anyway — the OLDEST asset is the one that serves stale code.
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    v = int(next(iter(versions)))
-    assert v >= 10, (
-        f'index.html cache-buster version is {v}, expected >= 10.'
+    assert min(versions) >= 10, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        'expected >= 10 (the floor tab_escalations.jsx landed at).'
     )
 
 
