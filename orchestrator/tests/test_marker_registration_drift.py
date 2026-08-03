@@ -176,9 +176,9 @@ def _registered_marker_names(ini_lines: Sequence[str]) -> frozenset[str]:
     return frozenset(line.split(':', 1)[0].split('(', 1)[0].strip() for line in ini_lines)
 
 
-def _unregistered_markers(tests_dir: Path, registered: frozenset[str]) -> dict[str, set[str]]:
-    """``{marker_name: {relative file paths}}`` for every marker applied under
-    *tests_dir* that is absent from *registered*.
+def _sweep_applied_markers(tests_dir: Path) -> dict[str, set[str]]:
+    """``{marker_name: {relative file paths}}`` for EVERY marker applied
+    anywhere under *tests_dir* — unfiltered by any notion of "registered".
 
     Sweeps every ``*.py`` file from DISK (``sorted(tests_dir.rglob('*.py'))``
     — sorted for deterministic failure messages under xdist), never pytest's
@@ -189,14 +189,19 @@ def _unregistered_markers(tests_dir: Path, registered: frozenset[str]) -> dict[s
     A file that fails to parse or read (``SyntaxError``/``OSError``) is
     re-raised as an ``AssertionError`` naming the offending file — never
     swallowed, never silently skipped, the same loud-on-failure polarity as
-    ``_applied_marker_names`` itself. Returns ``{}`` when every applied
-    marker is registered.
+    ``_applied_marker_names`` itself.
+
+    Factored out of ``_unregistered_markers`` (task 3532 amendment pass,
+    reviewer finding: sweeping the real ~494-file tree measured at ~5.6s, and
+    ``TestMarkerRegistrationDrift`` was paying that cost independently in two
+    tests) so callers that need the full applied-marker map — the drift diff
+    and the real-tree non-vacuity check alike — can share ONE pass.
     """
-    unregistered: dict[str, set[str]] = {}
+    applied: dict[str, set[str]] = {}
     for path in sorted(tests_dir.rglob('*.py')):
         relative = str(path.relative_to(tests_dir))
         try:
-            applied = _applied_marker_names(path.read_text())
+            names = _applied_marker_names(path.read_text())
         except (SyntaxError, OSError) as exc:
             raise AssertionError(
                 f'{relative} could not be read/parsed while sweeping '
@@ -204,9 +209,21 @@ def _unregistered_markers(tests_dir: Path, registered: frozenset[str]) -> dict[s
                 f'file — a silently-skipped file would make this guard '
                 f'vacuous for it.'
             ) from exc
-        for name in applied - registered:
-            unregistered.setdefault(name, set()).add(relative)
-    return unregistered
+        for name in names:
+            applied.setdefault(name, set()).add(relative)
+    return applied
+
+
+def _unregistered_markers(tests_dir: Path, registered: frozenset[str]) -> dict[str, set[str]]:
+    """``{marker_name: {relative file paths}}`` for every marker applied under
+    *tests_dir* that is absent from *registered*.
+
+    A thin filter over :func:`_sweep_applied_markers` — see that function for
+    the sweep-and-loud-failure contract this delegates to. Returns ``{}``
+    when every applied marker is registered.
+    """
+    swept = _sweep_applied_markers(tests_dir)
+    return {name: files for name, files in swept.items() if name not in registered}
 
 
 class TestAppliedMarkerNames:
@@ -282,6 +299,24 @@ class TestAppliedMarkerNames:
     def test_module_level_pytestmark_tuple(self):
         source = 'import pytest\n\npytestmark = (pytest.mark.asyncio, pytest.mark.slow)\n'
         assert _applied_marker_names(source) == frozenset({'asyncio', 'slow'})
+
+    def test_module_level_pytestmark_annotated_assignment(self):
+        """``pytestmark: list = [...]`` — the ``AnnAssign``-with-value
+        spelling ``_pytestmark_value``'s own docstring documents but which no
+        prior case here exercised (reviewer finding, task 3532 amendment
+        pass)."""
+        source = 'import pytest\n\npytestmark: list = [pytest.mark.slow]\n'
+        assert _applied_marker_names(source) == frozenset({'slow'})
+
+    def test_module_level_pytestmark_bare_annotation_binds_nothing(self):
+        """``pytestmark: list`` with NO value binds nothing — the other
+        ``_pytestmark_value``-documented ``AnnAssign`` case with no prior
+        coverage (reviewer finding, task 3532 amendment pass). This is the
+        branch that would silently under-sweep if it ever regressed to
+        treating a bare annotation as an applied marker.
+        """
+        source = 'import pytest\n\npytestmark: list\n'
+        assert _applied_marker_names(source) == frozenset()
 
     def test_class_level_pytestmark(self):
         """``pytestmark = pytest.mark.asyncio`` bound INSIDE a class body —
@@ -363,6 +398,85 @@ class TestAppliedMarkerNames:
         """
         with pytest.raises(SyntaxError):
             _applied_marker_names('def f(:\n    pass\n')
+
+
+class TestMirrorsPytestMarkersByConstruction:
+    """Cross-checks that ``_marker_name``, ``_is_pytestmark_target`` and
+    ``_pytestmark_value`` above have not silently DRIFTED from
+    ``orchestrator.pytest_markers``' same-named originals they were mirrored
+    from BY CONSTRUCTION rather than by import (module docstring; reviewer
+    finding, task 3532 amendment pass).
+
+    WHY NOT JUST IMPORT THEM, addressing the finding directly: the three
+    functions here ARE pure, polarity-neutral AST-shape predicates — nothing
+    about them raises or swallows — so the module docstring's "opposite
+    fail-safe polarity" rationale genuinely does not cover them; that
+    rationale is about ``_applied_marker_names``/``_unregistered_markers``
+    (loud) versus ``module_level_marker_names`` (swallows ``SyntaxError``
+    into ``frozenset()``) — the SWEEP layer, not this shape-recognition
+    layer. But ``orchestrator.pytest_markers``'s module docstring separately
+    declares "This module's sole consumer is
+    ``verify_plan._derive_module_runs``" (a design decision this task's plan
+    weighed and kept), and even that module's own dedicated test,
+    test_pytest_marker_deselection.py, only ever imports its PUBLIC names
+    (``deselecting_expression_for_targets``, ``module_level_marker_names``,
+    etc.) — never these underscore-prefixed helpers. Importing the private
+    names here for production use would make this file the source module's
+    second real consumer while its docstring still claims one, and updating
+    that claim is outside this task's locked scope (pytest_markers.py is not
+    a file this task holds a lock on). A plain import was therefore not the
+    right fix to land unilaterally in this pass.
+
+    So instead: this class imports the source module's private predicates
+    LOCALLY, inside each test, for comparison ONLY — never for the guard's
+    own operation, which keeps mirroring them by construction as designed —
+    and asserts the two implementations agree on every shape below. This
+    converts the exact risk the finding named (a future fix to the source,
+    e.g. recognising an aliased ``import pytest as _pytest`` — a gap both
+    modules' docstrings already flag — landing there without a matching
+    update here) from a SILENT divergence into a LOUD, immediate test
+    failure, which is the same guarantee an import would have bought,
+    without relocating the "sole consumer" question to a file this task
+    cannot edit.
+    """
+
+    @pytest.mark.parametrize('source_expr', [
+        'pytest.mark.slow',
+        'pytest.mark.timeout(120)',
+        'pytest.mark',
+        'other.mark.thing',
+        'functools.wraps(f)',
+        'pytest.raises',
+    ])
+    def test_marker_name_matches_the_source_module(self, source_expr):
+        from orchestrator.pytest_markers import _marker_name as upstream_marker_name
+
+        element = ast.parse(source_expr, mode='eval').body
+        assert _marker_name(element) == upstream_marker_name(element)
+
+    @pytest.mark.parametrize('name_expr', ['pytestmark', 'not_pytestmark', 'x'])
+    def test_is_pytestmark_target_matches_the_source_module(self, name_expr):
+        from orchestrator.pytest_markers import _is_pytestmark_target as upstream
+
+        node = ast.parse(name_expr, mode='eval').body
+        assert _is_pytestmark_target(node) == upstream(node)
+
+    @pytest.mark.parametrize('source', [
+        'pytestmark = pytest.mark.slow\n',
+        'pytestmark: list = [pytest.mark.slow]\n',
+        'pytestmark: list\n',
+        'x = 1\n',
+        'x: int = 1\n',
+    ])
+    def test_pytestmark_value_matches_the_source_module(self, source):
+        from orchestrator.pytest_markers import _pytestmark_value as upstream
+
+        statement = ast.parse(source).body[0]
+        # Both implementations, given the SAME statement object, either
+        # return None or hand back the identical `statement.value` child —
+        # `is`, not `==`, is the precise check (ast nodes have no structural
+        # equality).
+        assert _pytestmark_value(statement) is upstream(statement)
 
 
 class TestUnregisteredMarkers:
@@ -448,6 +562,22 @@ class TestUnregisteredMarkers:
         with pytest.raises(AssertionError, match='test_broken.py'):
             _unregistered_markers(tmp_path, frozenset({'slow'}))
 
+    def test_an_unreadable_file_fails_loudly_naming_the_file(self, tmp_path: Path):
+        """The ``OSError`` half of the ``except (SyntaxError, OSError)``
+        branch — only the ``SyntaxError`` half had a case before (reviewer
+        finding, task 3532 amendment pass). A dangling symlink triggers
+        ``FileNotFoundError`` (an ``OSError`` subclass) on
+        ``Path.read_text()`` without being root-UID-dependent the way
+        ``chmod(0o000)`` would be (a root process can still read a 0o000
+        file, so that path wouldn't reliably raise here) — same technique as
+        test_merge_liveness.py's
+        ``test_unreadable_or_vanished_entry_does_not_raise``.
+        """
+        broken = tmp_path / 'test_dangling.py'
+        broken.symlink_to(tmp_path / 'does-not-exist-target.py')
+        with pytest.raises(AssertionError, match='test_dangling.py'):
+            _unregistered_markers(tmp_path, frozenset({'slow'}))
+
     def test_recurses_into_nested_subdirs_and_ignores_non_py_siblings(self, tmp_path: Path):
         nested = tmp_path / 'nested'
         nested.mkdir()
@@ -489,6 +619,40 @@ _WITNESS_MARKER_NAMES = frozenset({
     'exercise_merge_verify',
 })
 
+#: Markers CONTRIBUTED BY OPTIONAL PLUGINS, keyed by the plugin name
+#: ``PluginManager.hasplugin`` recognises for it — verified live against this
+#: project's ``pluginmanager.list_name_plugin()``: 'timeout', 'asyncio',
+#: 'xdist', 'anyio' are the registered names, NOT the PyPI distribution names
+#: ('pytest-timeout' etc., which ``hasplugin`` does not match). If the owning
+#: plugin is disabled for a given invocation (e.g. a debugging ``-p
+#: no:timeout`` run), its marker vanishes from ``getini('markers')`` even
+#: though nothing in the repo regressed (reviewer finding, task 3532
+#: amendment pass — reproduced live: ``uv run pytest
+#: tests/test_marker_registration_drift.py -p no:timeout`` alone turns
+#: 'timeout' into a reported "unregistered" marker across the 21 files that
+#: apply it).
+_PLUGIN_PROVIDED_MARKERS = {
+    'timeout': 'timeout',
+    'asyncio': 'asyncio',
+    'xdist_group': 'xdist',
+    'anyio': 'anyio',
+}
+
+
+@pytest.fixture(scope='module')
+def _real_tree_sweep() -> dict[str, set[str]]:
+    """The one on-disk applied-marker sweep of ``TESTS_DIR``, shared by every
+    test below that needs it.
+
+    Measured at ~5.6s for the ~494 files under orchestrator/tests/;
+    ``test_every_marker_applied_under_tests_is_registered`` and
+    ``test_the_sweep_is_not_vacuous`` used to each perform this independently
+    (~11s combined — uncomfortably close to this suite's 60s per-test
+    timeout under load, per the addopts loadavg note above) (reviewer
+    finding, task 3532 amendment pass).
+    """
+    return _sweep_applied_markers(TESTS_DIR)
+
 
 class TestMarkerRegistrationDrift:
     """The deliverable guard, wired to the REAL tests/ tree and REAL config.
@@ -500,20 +664,55 @@ class TestMarkerRegistrationDrift:
     burden of proving the underlying mechanism can actually fail.
     """
 
-    def test_every_marker_applied_under_tests_is_registered(self, pytestconfig):
+    @pytest.mark.timeout(120)
+    def test_every_marker_applied_under_tests_is_registered(
+        self, pytestconfig, _real_tree_sweep: dict[str, set[str]]
+    ):
         """THE guard."""
         registered = _registered_marker_names(pytestconfig.getini('markers'))
-        unregistered = _unregistered_markers(TESTS_DIR, registered)
+        unregistered = {
+            name: files for name, files in _real_tree_sweep.items() if name not in registered
+        }
+        if not unregistered:
+            return
+
+        # A marker can look "unregistered" purely because the plugin that
+        # contributes it was disabled for THIS invocation (e.g. `-p
+        # no:timeout`), not because anything in the repo regressed — that is
+        # an invocation artifact, not drift (reviewer finding, task 3532
+        # amendment pass).
+        disabled_plugin_markers = {
+            name: plugin
+            for name, plugin in _PLUGIN_PROVIDED_MARKERS.items()
+            if name in unregistered and not pytestconfig.pluginmanager.hasplugin(plugin)
+        }
+        if disabled_plugin_markers.keys() == unregistered.keys():
+            pytest.skip(
+                f'{sorted(disabled_plugin_markers)} are normally registered '
+                f'by plugin(s) {sorted(set(disabled_plugin_markers.values()))}, '
+                f"disabled in this invocation, so getini('markers') is "
+                f'incomplete here — a `-p no:<plugin>` invocation artifact, '
+                f'not evidence of an unregistered marker.'
+            )
+        note = (
+            f' NOTE: {sorted(disabled_plugin_markers)} above may instead be '
+            f'a `-p no:<plugin>` invocation artifact '
+            f'({sorted(set(disabled_plugin_markers.values()))} disabled) '
+            f'rather than a real gap — re-run with default plugin loading '
+            f'before editing any source file.'
+            if disabled_plugin_markers else ''
+        )
         assert unregistered == {}, (
             f'The following pytest markers are applied under {TESTS_DIR} but '
             f'are not registered: {unregistered!r}. A name that looks like a '
             f'typo of an existing marker probably is one. Register it either '
             f"in orchestrator/pyproject.toml's [tool.pytest.ini_options] "
             f"markers list, or via config.addinivalue_line('markers', ...) "
-            f'in tests/conftest.py.'
+            f'in tests/conftest.py.' + note
         )
 
-    def test_the_sweep_is_not_vacuous(self):
+    @pytest.mark.timeout(120)
+    def test_the_sweep_is_not_vacuous(self, _real_tree_sweep: dict[str, set[str]]):
         """A broken extractor returning ``frozenset()`` would make the guard
         above pass forever. In the spirit of
         test_warm_lane_bash_bucket_placement.py's live ``--collect-only``
@@ -526,10 +725,7 @@ class TestMarkerRegistrationDrift:
             f'at least {_MIN_EXPECTED_TEST_FILES}. The sweep may be looking '
             f'in the wrong place.'
         )
-        applied: set[str] = set()
-        for path in files:
-            applied |= _applied_marker_names(path.read_text())
-        missing_witnesses = _WITNESS_MARKER_NAMES - applied
+        missing_witnesses = _WITNESS_MARKER_NAMES - _real_tree_sweep.keys()
         assert not missing_witnesses, (
             f'expected witness markers {sorted(missing_witnesses)} were not '
             f'found while sweeping {TESTS_DIR} — the extractor may be broken.'
@@ -540,21 +736,30 @@ class TestMarkerRegistrationDrift:
         EFFECTIVE ``getini('markers')`` set, not a bare ``tomllib`` read of
         pyproject.toml. ``real_psi_reader`` is registered dynamically at
         tests/conftest.py:403 (task 2418), deliberately outside
-        pyproject.toml's locked scope. A future reader "simplifying" this
-        guard into a bare TOML comparison would produce a false failure on
-        day one.
+        pyproject.toml's locked scope.
+
+        The first assertion is structural — ``effective`` is a strict
+        superset of the TOML-declared set — rather than naming where any one
+        marker lives, so it survives a harmless refactor (e.g. moving
+        ``real_psi_reader``'s registration into pyproject.toml itself)
+        without going stale. It replaces a prior ``'real_psi_reader' not in
+        toml_markers`` assertion that pinned exactly that incidental
+        placement detail and would have turned red on such a refactor
+        (reviewer finding, task 3532 amendment pass). The second assertion
+        still names the concrete marker, so a genuine regression in
+        conftest's dynamic registration is still caught by name.
         """
         with ORCH_PYPROJECT.open('rb') as handle:
             toml_data = tomllib.load(handle)
         toml_markers = _registered_marker_names(
             toml_data['tool']['pytest']['ini_options'].get('markers', [])
         )
-        assert 'real_psi_reader' not in toml_markers, (
-            "real_psi_reader unexpectedly appears in pyproject.toml's markers "
-            "list — if it was added there, this test (and its rationale) is "
-            "stale and should be revisited, not silenced."
-        )
         effective = _registered_marker_names(pytestconfig.getini('markers'))
+        assert effective > toml_markers, (
+            "getini('markers') is not a strict superset of pyproject.toml's "
+            "markers list — plugin-contributed and/or conftest-registered "
+            'markers may have stopped being included in the effective set.'
+        )
         assert 'real_psi_reader' in effective, (
             'real_psi_reader is absent from the effective getini(markers) '
             'set — tests/conftest.py may have stopped registering it '
