@@ -1219,6 +1219,42 @@ class TestMem0BackendScanPayloadText:
 
         assert result == {'matches': [], 'scanned': 0, 'truncated': False}
 
+    @pytest.mark.parametrize('limit', [0, -1])
+    @pytest.mark.asyncio
+    async def test_a_non_positive_limit_raises_rather_than_walking_nothing(
+        self, backend, limit
+    ):
+        """``limit=0`` would make ``min(page_size, limit - scanned)`` request 0
+        points, so the walk returns ``{'matches': [], 'scanned': 0,
+        'truncated': False}`` — INDISTINGUISHABLE from a genuinely clean
+        corpus, and read by a caller's exit-code predicate as a complete,
+        successful sweep. Same no-silent-wrong-value rule that makes a scan
+        timeout propagate rather than collapse into an empty list.
+        """
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            with pytest.raises(ValueError, match='strictly positive'):
+                await backend.scan_payload_text(scope=Scope(project_id='p'), limit=limit)
+
+        mock_client.scroll.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_limit_of_one_still_scans(self, backend):
+        """The boundary is rejected BELOW 1, not at it — a 1-record probe is a
+        legitimate call and must not be caught by the guard."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], None)
+        )
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), limit=1)
+
+        assert result['scanned'] == 1
+        assert len(result['matches']) == 1
+
 
 # ---------------------------------------------------------------------------
 # TRIPWIRE: the un-indexed-field MatchText semantics the prefilter relies on.

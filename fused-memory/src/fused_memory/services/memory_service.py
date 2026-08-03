@@ -3736,6 +3736,15 @@ class MemoryService:
         sentinels are defined in exactly one place. The caller's collections
         are copied before use and never mutated.
 
+        A ``task_id`` filter is normalized to str on the COPY, exactly as
+        ``count_memories_by_metadata``/``get_memories_by_metadata`` do — see
+        ``_normalize_task_id_metadata``'s docstring. The backend turns every
+        filter entry into a ``MatchValue`` equality condition and Qdrant's
+        payload filter is TYPE-SENSITIVE, so without this an int ``task_id``
+        would match nothing and return an empty scan with no error: a
+        silently-wrong clean verdict, which is the exact failure class this
+        tool exists to eliminate.
+
         Returns ``{'matches': [...], 'scanned': int, 'truncated': bool}``.
 
         A Qdrant read-timeout is PROPAGATED (raises ``TimeoutError``), not
@@ -3744,10 +3753,14 @@ class MemoryService:
         ``{'error', 'error_type': 'TimeoutError'}`` by ``@mcp_tool_errors``.
         """
         scope = Scope(project_id=project_id)
+        scan_filters = None
+        if filters is not None:
+            scan_filters = dict(filters)
+            _normalize_task_id_metadata(scan_filters)
         return await self.mem0.scan_payload_text(
             scope=scope,
             needles=list(needles) if needles is not None else None,
-            filters=dict(filters) if filters is not None else None,
+            filters=scan_filters,
             exhaustive=exhaustive,
             limit=limit,
         )

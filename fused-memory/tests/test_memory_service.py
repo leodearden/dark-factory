@@ -9255,6 +9255,33 @@ class TestScanMemoryContent:
         with pytest.raises(TimeoutError):
             await svc.scan_memory_content(project_id='dark_factory')
 
+    @pytest.mark.asyncio
+    async def test_an_int_task_id_filter_is_normalized_to_str(self, mock_config):
+        """Matches the sibling metadata-matching read paths
+        (count_memories_by_metadata / get_memories_by_metadata).
+
+        The backend turns each filter entry into a MatchValue equality
+        condition and Qdrant's payload filter is TYPE-SENSITIVE, while the
+        write paths store task_id normalized to str. Without this,
+        `filters={'task_id': 3083}` returns zero matches with no error — a
+        silently-wrong empty result, which is the exact failure class this tool
+        exists to eliminate.
+        """
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        filters = {'task_id': 3083}
+
+        await svc.scan_memory_content(project_id='dark_factory', filters=filters)
+
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] == {'task_id': '3083'}
+        # The normalization happens on the COPY, never the caller's dict.
+        assert filters == {'task_id': 3083}
+
 
 class TestGetMemoriesByMetadata:
     """MemoryService.get_memories_by_metadata delegates to mem0.scroll_by_metadata."""

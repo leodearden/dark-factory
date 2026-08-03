@@ -699,9 +699,19 @@ class Mem0Backend:
                 both modes.
             exhaustive: Skip the prefilter and walk every point.
             page_size: Points per scroll request.
-            limit: Maximum number of points to WALK. When the walk stops
-                early, ``truncated`` is True and a WARNING is logged — the
-                truncation is never silent.
+            limit: Maximum number of points to WALK. Must be strictly positive
+                when given. When the walk stops early, ``truncated`` is True
+                and a WARNING is logged — the truncation is never silent.
+
+        Raises:
+            ValueError: If *limit* is non-positive. A ``limit`` of 0 would make
+                every scroll page request 0 points, so the walk would return
+                ``{'matches': [], 'scanned': 0, 'truncated': False}`` — a
+                result INDISTINGUISHABLE from a genuinely clean corpus, and one
+                that a caller's exit-code predicate reads as a complete,
+                successful sweep. Rejecting it is the same no-silent-wrong-value
+                rule that makes a scan timeout propagate rather than collapse
+                into an empty list.
 
         Returns:
             ``{'matches': [...], 'scanned': int, 'truncated': bool}`` where
@@ -716,6 +726,13 @@ class Mem0Backend:
                 count_by_metadata/scroll_by_metadata/get_point_by_id. A
                 timed-out scan must never be mistaken for a clean corpus.
         """
+        if limit is not None and limit <= 0:
+            raise ValueError(
+                f'scan_payload_text limit must be strictly positive, got {limit}; a '
+                'non-positive limit walks zero points and would report an empty '
+                'result as a clean corpus'
+            )
+
         from qdrant_client.http import models as qmodels  # noqa: PLC0415
 
         from fused_memory.utils.toolcall_xml_leak import (  # noqa: PLC0415

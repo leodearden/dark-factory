@@ -284,6 +284,19 @@ class TestResolveExitCode:
         success would make a silently partial sweep look complete."""
         assert _mod.resolve_exit_code(self._report(dry_run=False, truncated=True)) != 0
 
+    @pytest.mark.parametrize('flag', [
+        'content_lost_in_flight',
+        'skipped_not_mem0_routed',
+        'skipped_metadata_would_be_rejected',
+        'record_error',
+    ])
+    def test_every_per_record_failure_flag_exits_non_zero(self, flag):
+        """Each of these leaves a record a human still has to adjudicate, so
+        none of them may be reported as a clean sweep."""
+        report = self._report(dry_run=False, records=[{'id': 'x', flag: True}])
+
+        assert _mod.resolve_exit_code(report) != 0
+
 
 class TestBuildParser:
     """_build_parser — the CLI surface, testable without any live I/O."""
@@ -306,6 +319,23 @@ class TestBuildParser:
         assert args.project_id == 'reify'
         assert args.limit == 50
         assert args.config == '/tmp/c.yaml'
+
+    @pytest.mark.parametrize('bad', ['0', '-1'])
+    def test_a_non_positive_limit_is_refused_at_the_cli(self, bad, capsys):
+        """``--limit 0`` would request 0 points per scroll page, so the walk
+        returns ``{'matches': [], 'scanned': 0, 'truncated': False}`` — read by
+        ``resolve_exit_code`` as a complete, CLEAN sweep even under --apply. A
+        mistyped flag must not be able to certify a corpus it never looked at."""
+        with pytest.raises(SystemExit):
+            _mod._build_parser().parse_args(['--limit', bad])
+
+        assert 'strictly positive' in capsys.readouterr().err
+
+    def test_a_non_integer_limit_is_refused_at_the_cli(self, capsys):
+        with pytest.raises(SystemExit):
+            _mod._build_parser().parse_args(['--limit', 'lots'])
+
+        assert 'must be an integer' in capsys.readouterr().err
 
 
 # ===========================================================================
@@ -352,8 +382,25 @@ def _ok_response(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-def _service(matches, *, scanned=None, truncated=False) -> AsyncMock:
+def _service(
+    matches, *, scanned=None, truncated=False, enforce=False, enforce_kind_registry=False
+) -> AsyncMock:
+    """An AsyncMock ``MemoryService`` for the sweep.
+
+    ``config.memory_metadata`` is a REAL namespace with real bools, not a mock
+    attribute, because the sweep's metadata pre-flight reads those flags off the
+    live service (``resolve_metadata_enforcement``) and treats an unreadable
+    config as "assume enforcing" — the fail-safe direction, but one that would
+    silently turn every repair test into a skip. Both default to the SHIPPED
+    defaults (warn-mode, kind registry not enforced), so the mock matches what a
+    live sweep would actually see today.
+    """
     service = AsyncMock()
+    service.config = SimpleNamespace(
+        memory_metadata=SimpleNamespace(
+            enforce=enforce, enforce_kind_registry=enforce_kind_registry
+        )
+    )
     service.scan_memory_content = AsyncMock(
         return_value={
             'matches': matches,
@@ -880,6 +927,169 @@ class TestRunApplyPreflightCategoryGuard:
             assert 'skipped_not_mem0_routed' not in record, category
 
 
+class TestMetadataAcceptedPredicate:
+    """``metadata_accepted(metadata, *, enforce, enforce_kind_registry)`` — pure.
+
+    ``MemoryService.add_memory`` runs ``_apply_memory_metadata_validation``,
+    which raises ``MemoryMetadataValidationError`` when ``enforce`` is on and
+    any violation is fatal. Since the repair is delete-THEN-add, a rejection
+    discovered on the add lands after the only copy is already gone. The corpus
+    being swept is precisely the OLD, pre-vocabulary one, so this is a live
+    possibility rather than a theoretical one — and it is a pure sync shape
+    check, so there is no excuse for not running it first.
+    """
+
+    def test_warn_mode_accepts_even_fatal_shapes(self):
+        """``enforce=False`` is the shipped default and does NOT reject the
+        write, so blocking on it would refuse repairs the store would happily
+        have accepted."""
+        accepted, reason = _mod.metadata_accepted(
+            {'canonical': 1}, enforce=False, enforce_kind_registry=True
+        )
+
+        assert accepted is True
+        assert reason == ''
+
+    def test_enforcing_a_fatal_shape_is_refused_with_the_rule_named(self):
+        accepted, reason = _mod.metadata_accepted(
+            {'canonical': 1}, enforce=True, enforce_kind_registry=False
+        )
+
+        assert accepted is False
+        assert 'invalid_canonical_type' in reason
+
+    def test_clean_metadata_is_accepted_under_enforcement(self):
+        accepted, reason = _mod.metadata_accepted(
+            {'task_id': '3083', 'x_stage': 'stage1'},
+            enforce=True,
+            enforce_kind_registry=True,
+        )
+
+        assert accepted is True
+        assert reason == ''
+
+    def test_unknown_kind_is_fatal_only_when_the_registry_is_enforced(self):
+        """The carved-out flag is the whole reason ``enforce`` alone is not
+        enough: 242 of 329 live kind values are singletons, so treating an
+        unknown kind as fatal under plain ``enforce`` would skip most of the
+        corpus."""
+        meta = {'kind': 'observation'}
+
+        assert _mod.metadata_accepted(
+            meta, enforce=True, enforce_kind_registry=False
+        )[0] is True
+        assert _mod.metadata_accepted(
+            meta, enforce=True, enforce_kind_registry=True
+        )[0] is False
+
+    def test_the_callers_metadata_is_not_mutated(self):
+        """``validate_memory_metadata`` normalizes ``supersedes`` IN PLACE, so
+        the predicate must hand it a copy — otherwise a pure pre-flight would
+        silently rewrite the very dict the repair is about to send."""
+        meta = {'supersedes': 'a' * 8}
+        before = dict(meta)
+
+        _mod.metadata_accepted(meta, enforce=True, enforce_kind_registry=False)
+
+        assert meta == before
+
+
+class TestResolveMetadataEnforcement:
+    """The flags are READ off the live service, never assumed."""
+
+    def test_real_config_flags_are_read_through(self):
+        service = _service([], enforce=True, enforce_kind_registry=True)
+
+        assert _mod.resolve_metadata_enforcement(service) == (True, True)
+
+    def test_shipped_defaults_are_read_through(self):
+        assert _mod.resolve_metadata_enforcement(_service([])) == (False, False)
+
+    def test_an_unreadable_config_fails_safe_to_enforcing(self, caplog):
+        """A stub service must not be read as "enforcement off" — that would
+        re-open the post-delete rejection this pre-flight exists to close. Both
+        ON means a questionable record is skipped rather than destroyed, and it
+        is logged rather than silent."""
+        with caplog.at_level('WARNING'):
+            result = _mod.resolve_metadata_enforcement(SimpleNamespace())
+
+        assert result == (True, True)
+        assert 'could not read config.memory_metadata' in caplog.text
+
+
+class TestRunApplyPreflightMetadataGuard:
+    """A record whose carried metadata would be REJECTED is never deleted.
+
+    Without the pre-flight the sequence is delete → add → raise, and the record
+    ends up ``content_lost_in_flight`` with its text surviving only on stdout —
+    caused entirely by a condition that was checkable, synchronously, before
+    anything was destroyed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_metadata_that_would_be_rejected_is_skipped_before_the_delete(self):
+        service = _service(
+            [_match('r', _TAIL_LEAK, canonical=1)],
+            enforce=True,
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+        record = _record_for(report, 'r')
+        assert record['skipped_metadata_would_be_rejected'] is True
+        assert record['repaired'] is False
+        assert record['classification'] == 'repairable_tail'
+        # The content is still in the report, so a human can act on it.
+        assert record['content'] == _TAIL_LEAK
+        assert 'invalid_canonical_type' in record['error']
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_kind_is_skipped_only_when_the_registry_is_enforced(self):
+        """``_payload``'s ``kind='observation'`` is not in KIND_REGISTRY — the
+        realistic old-corpus shape this guard exists for."""
+        enforced = _service(
+            [_match('r', _TAIL_LEAK)], enforce=True, enforce_kind_registry=True
+        )
+        report = await _mod.run(_args(apply=True), enforced)
+        enforced.delete_memory.assert_not_awaited()
+        assert _record_for(report, 'r')['skipped_metadata_would_be_rejected'] is True
+
+        warn_only = _service([_match('r', _TAIL_LEAK)], enforce=True)
+        report = await _mod.run(_args(apply=True), warn_only)
+        warn_only.delete_memory.assert_awaited_once()
+        assert _record_for(report, 'r')['repaired'] is True
+
+    @pytest.mark.asyncio
+    async def test_warn_mode_still_repairs_so_the_guard_is_not_a_blanket_refusal(self):
+        """Warn-mode is the SHIPPED default, so a guard that blocked there would
+        make the whole sweep a no-op on the live fleet."""
+        service = _service([_match('r', _TAIL_LEAK, canonical=1)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_awaited_once()
+        record = _record_for(report, 'r')
+        assert record['repaired'] is True
+        assert 'skipped_metadata_would_be_rejected' not in record
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_never_skips_or_mutates(self):
+        """The pre-flight guards a delete; with no delete there is nothing to
+        guard, and the dry run must still CLASSIFY the record."""
+        service = _service([_match('r', _TAIL_LEAK, canonical=1)], enforce=True)
+
+        report = await _mod.run(_args(), service)
+
+        service.delete_memory.assert_not_awaited()
+        record = _record_for(report, 'r')
+        assert record['classification'] == 'repairable_tail'
+        assert 'skipped_metadata_would_be_rejected' not in record
+        assert _mod.resolve_exit_code(report) == 0
+
+
 class TestCarriedMetadata:
     """``carried_metadata(payload, memory_id) -> (metadata, dropped)`` — pure.
 
@@ -907,12 +1117,51 @@ class TestCarriedMetadata:
             assert owned not in metadata, owned
 
     def test_dropped_names_only_the_keys_carried_nowhere(self):
-        """``data``/``category``/``agent_id``/``run_id`` are carried as ARGUMENTS,
-        so reporting them as dropped would be a false alarm that buries the real
-        ones."""
+        """``data``/``category``/``agent_id``/``run_id``/``user_id`` are carried
+        as ARGUMENTS, so reporting them as dropped would be a false alarm that
+        buries the real ones.
+
+        ``user_id`` is the subtle one: mem0 writes that payload key from
+        ``Scope.mem0_user_id`` (mem0_client.py:203), which returns ``project_id``
+        verbatim (models/scope.py:399-404) — and the sweep passes
+        ``project_id=args.project_id``. So it round-trips, and naming it a loss
+        would be a per-record false alarm on EVERY repaired record.
+        """
         _metadata, dropped = _mod.carried_metadata(_payload(_BODY), 'old-id')
 
-        assert dropped == ['created_at', 'hash', 'updated_at', 'user_id']
+        assert dropped == ['created_at', 'hash', 'updated_at']
+
+    def test_the_original_creation_time_is_carried_as_provenance(self):
+        """The delete/re-add necessarily re-stamps ``created_at``, so without an
+        ``x_``-namespaced copy a repaired 2026-07-27 memory reappears as brand
+        new and the original recency ordering is unrecoverable from the store."""
+        metadata, dropped = _mod.carried_metadata(_payload(_BODY), 'old-id')
+
+        assert metadata['x_original_created_at'] == '2026-07-27T00:00:00+00:00'
+        # The KEY is still genuinely re-derived by the new write, so it stays
+        # named as dropped even though its VALUE survives.
+        assert 'created_at' in dropped
+
+    def test_a_payload_with_no_created_at_carries_no_empty_marker(self):
+        """A null provenance marker would be worse than none: it reads as
+        "the original had no creation time" rather than "nothing was carried"."""
+        metadata, _dropped = _mod.carried_metadata(
+            {'data': _BODY, 'category': 'observations_and_summaries'}, 'old-id'
+        )
+
+        assert 'x_original_created_at' not in metadata
+
+    def test_owned_keys_are_derived_from_the_shared_mem0_constant(self):
+        """INV-5: mem0's owned-key set has exactly one home. A hand-maintained
+        copy here would silently fail to grow when mem0's payload shape does,
+        and the repair would start forging a newly-owned key back into
+        metadata."""
+        from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
+        assert MEM0_MANAGED_METADATA_KEYS <= _mod._MEM0_OWNED_KEYS
+        assert _mod._MEM0_OWNED_KEYS - MEM0_MANAGED_METADATA_KEYS == {
+            'id', 'memory', 'content', 'category',
+        }
 
     def test_a_bare_payload_drops_and_preserves_nothing(self):
         metadata, dropped = _mod.carried_metadata(
@@ -992,7 +1241,7 @@ class TestRunApplyPreservesMetadata:
 
         record = _record_for(report, 'b')
         assert record['metadata_preserved'] == ['kind', 'task_id', 'x_stage']
-        assert record['metadata_dropped'] == ['created_at', 'hash', 'updated_at', 'user_id']
+        assert record['metadata_dropped'] == ['created_at', 'hash', 'updated_at']
 
     @pytest.mark.asyncio
     async def test_a_bare_payload_still_repairs_with_empty_preserved_and_dropped(self):
