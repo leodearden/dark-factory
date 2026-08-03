@@ -299,21 +299,6 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     return None
 
 
-# Concrete CLI/usage errors that exit instantly with no output but are NOT
-# usage caps. Matched case-insensitively against stderr/output so the
-# zero-cost cap heuristic doesn't misfire (and loop forever) on a local CLI
-# failure. Copied from cli_invoke.py:120 (NON_CAP_CLI_ERROR_MARKERS) — this
-# module owns the classification decision now, but that module's copy stays
-# in place until the beta (consumer-rewire) task removes it.
-NON_CAP_CLI_ERROR_MARKERS = [
-    'is already in use',  # --session-id collision (reify-3604)
-    'unrecognized arguments',
-    'unknown option',
-    'invalid value',
-    'no such file or directory',
-    'permission denied',
-]
-
 # The CLI rejected the invocation because no prompt ever reached it
 # (esc-3118-1, 2026-07-28 ~16:31Z).  The claude backend is 100%
 # stdin-dependent — ``build_claude_argv`` emits no positional prompt and no
@@ -324,9 +309,37 @@ NON_CAP_CLI_ERROR_MARKERS = [
 # ``shared.cli_invoke.is_cli_invocation_rejected``, which imports this table
 # lazily (this module imports cli_invoke at module top, so the reverse must
 # stay function-local).
+#
+# Defined ABOVE NON_CAP_CLI_ERROR_MARKERS because it is spliced into it.
 CLI_INPUT_REQUIRED_MARKERS = [
     'input must be provided either through stdin or as a prompt argument',
 ]
+
+# Concrete CLI/usage errors that exit instantly with no output but are NOT
+# usage caps. Matched case-insensitively against stderr/output so the
+# zero-cost cap heuristic doesn't misfire (and loop forever) on a local CLI
+# failure. This module is the SINGLE definition site (the mirrored copies in
+# cli_invoke.py / usage_gate.py were deleted in the single-source collapse;
+# shared/tests/test_invocation_outcome.py::TestSingleSourceOwnership asserts
+# they stay gone).
+#
+# CLI_INPUT_REQUIRED_MARKERS is spliced in (task 3143 / esc-3118-1) rather
+# than listed inline so the "prompt never reached stdin" strings have exactly
+# ONE definition, shared with cli_invoke's subtype minting and predicate.
+# They belong here for the same reason as every other entry: the CLI exits on
+# argument validation BEFORE contacting the API, so a usage cap cannot be the
+# cause — and without a positive non-cap attribution, invoke_with_cap_retry's
+# zero-cost/instant heuristic net reports a SYNTHETIC cap hit and churns the
+# whole account pool through compounding cooldowns for a local error the API
+# never saw.
+NON_CAP_CLI_ERROR_MARKERS = [
+    'is already in use',  # --session-id collision (reify-3604)
+    'unrecognized arguments',
+    'unknown option',
+    'invalid value',
+    'no such file or directory',
+    'permission denied',
+] + CLI_INPUT_REQUIRED_MARKERS
 
 # Substrings (case-insensitive) indicating the requested model does not
 # exist / is not available (task beta, plans/adaptive-model-routing-prd.md).
