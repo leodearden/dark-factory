@@ -15,32 +15,39 @@ const C = window.DF_CHARTS;
 
 // ── Cross-tab focus helpers (module scope) ──
 //
-// The pre-fetch seed, captured by IDENTITY at module-eval time.  data.js seeds
-// ESCALATIONS with zero subsections and `applyKey` replaces the reference
-// wholesale on the first successful poll — ESCALATIONS is deliberately NOT in
-// STABLE_ARRAY_KEYS (data.js:96-105).  Identity is therefore the only signal
-// available: a loaded-but-genuinely-empty queue and the pre-fetch seed are
-// structurally IDENTICAL payloads, so nothing about their contents can tell
-// them apart.
-//
-// The failure direction is chosen on purpose.  An endpoint stuck in data.js's
-// exponential backoff never replaces the seed, so the UI keeps WAITING (and
-// says so) rather than asserting a false "no longer in the queue" — the
-// stronger claim, on evidence that cannot support it.  Listening for
-// `df-data-refresh` instead would produce exactly that false miss: it fires
-// after Promise.all even when the escalations fetch failed.
-//
-// Bounded edge case: a first poll landing before Babel evaluates this file
-// makes the capture a real payload, so the next poll's replacement is what
-// clears the wait — at most one extra 3s tick.
-const ESC_SEED = DF.ESCALATIONS;
-
-// Stable empty payload for the unreachable `DF.ESCALATIONS` falsy case — see
-// the note at its use site in EscalationsTab.
+// Stable empty payload for the `DF.ESCALATIONS` falsy case.  Hoisted rather
+// than written inline as `|| { subsections: [], ... }` because `escalations` is
+// a dependency of the focus effect below: a fresh literal per render would make
+// an effect that is meant to fire on payload ARRIVAL re-run on every paint.
+// data.js's applyKey refuses null/undefined (data.js:153) so the fallback is
+// unreachable today; hoisting keeps it stable if a change ever makes it
+// reachable.
 const ESC_EMPTY = { subsections: [], summary: { by_level: {}, by_status: {} } };
 
-function escalationsLoaded(payload) {
-  return payload !== ESC_SEED;
+// Has the escalations payload ARRIVED, as opposed to still being data.js's
+// pre-fetch seed?  Read from data.js's per-key first-success marker, which is
+// the only sound signal:
+//
+//   * Not derivable from the payload's contents — the seed and a loaded but
+//     genuinely EMPTY queue are structurally identical by design (ESCALATIONS
+//     is deliberately not in STABLE_ARRAY_KEYS, data.js:96-105).
+//   * Not derivable from object identity either.  Capturing `DF.ESCALATIONS`
+//     at module-eval time and testing `payload !== SEED` races Babel: this is
+//     a `type="text/babel"` module evaluated after DOMContentLoaded, so
+//     startPolling()'s immediate first fetch can land BEFORE the capture,
+//     freezing a real payload as the "seed" — and nothing unfreezes it while
+//     polling is paused or the endpoint is in backoff, so the tab would claim
+//     "still loading" above a fully-populated queue, indefinitely.
+//   * Not derivable from the `df-data-refresh` event, which fires after
+//     Promise.all even when the escalations fetch FAILED — that reports
+//     arrival on a failure, producing a false miss.
+//
+// The failure direction is chosen on purpose: an endpoint stuck in backoff
+// never sets the marker, so the UI keeps WAITING (and says so) rather than
+// asserting a false "no longer in the queue" — the stronger claim, on evidence
+// that cannot support it.
+function escalationsLoaded() {
+  return !!(DF.__loaded && DF.__loaded.ESCALATIONS);
 }
 
 function findEscalationRow(escalations, id) {
@@ -308,13 +315,10 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 // ── EscalationsTab ──
 
 function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
-  // ESC_EMPTY is hoisted to module scope rather than written inline as
-  // `|| { subsections: [], ... }`. An inline literal would mint a FRESH object
-  // on every render, and `escalations` is now a dependency of the focus effect
-  // (below) — a new identity each render would re-run that effect forever.
-  // data.js's applyKey refuses null/undefined (data.js:153) so this fallback
-  // is unreachable today; hoisting it means a future change that makes it
-  // reachable degrades to a stable empty payload instead of a render loop.
+  // ESC_EMPTY is hoisted to module scope; see the note at its declaration.
+  // Note it is NOT a "loaded" signal: arrival is read from data.js's
+  // first-success marker (escalationsLoaded), so falling back to this
+  // placeholder cannot be mistaken for an arrived payload.
   const escalations = DF.ESCALATIONS || ESC_EMPTY;
 
   // Filter subsections by project when projectFilter is active.
@@ -384,9 +388,10 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   // the row and open the existing detail sidebar with it.
   //
   // The focus is consumed once a DECISION is REACHABLE, never before. Keyed on
-  // `escalations` as well as `focusId`, so while the payload is still the
-  // pre-fetch seed the effect declines to decide and re-runs on each poll —
-  // a cold load, or an endpoint in backoff, no longer silently eats the focus.
+  // `escalations` as well as `focusId`: while the payload is still the pre-fetch
+  // seed the effect declines to decide, and the dep's per-poll identity change
+  // (applyKey replaces the reference) is what re-runs it — so a cold load, or an
+  // endpoint in backoff, no longer silently eats the focus.
   //
   // Once the payload is in, both outcomes are reported. A miss is real: the
   // escalation may have resolved between the poll that produced the link and
@@ -395,7 +400,7 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   // recorded and rendered rather than dropped in silence.
   uE(() => {
     if (!focusId) return;
-    if (!escalationsLoaded(escalations)) return;
+    if (!escalationsLoaded()) return;
     const found = findEscalationRow(escalations, focusId);
     if (found) { setSelected(found); setFocusMiss(null); }
     else { setFocusMiss(focusId); }
@@ -416,7 +421,7 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
           saying "no longer in the queue" while the endpoint is still in
           backoff would be a false claim. Both name the id, so the operator
           can see which link they followed. */}
-      {focusId && !escalationsLoaded(escalations) && (
+      {focusId && !escalationsLoaded() && (
         <div className="badge" data-testid="esc-focus-pending" style={{ marginBottom: 8 }}>
           waiting for the escalation queue to load — will open{' '}
           <span className="mono">{focusId}</span> when it arrives

@@ -1009,21 +1009,40 @@ def test_focus_handoff_retries_then_reports_a_miss(
         'payload lands. A cold load drops the focus permanently.'
     )
 
-    # (d) a miss is RECORDED and REACHES RENDER, not merely stored.
+    # (d) a miss is RECORDED BY THE NO-ROW BRANCH into the state the miss
+    #     NOTICE renders — not merely stored somewhere.
+    #
+    #     Both anchors are load-bearing.  A loop over every `uS` declaration
+    #     asking only "is this setter called anywhere in the effect, and does
+    #     this state reach any JSX position?" is VACUOUS here: `setSelected` is
+    #     also called in this effect and `selected` also reaches render, it is
+    #     declared first, so such a loop binds to `selected` and passes — as it
+    #     did on the pre-fix code, which recorded no miss at all.
+    no_row_branch = re.search(r'\belse\b([\s\S]*)$', eff)
+    assert no_row_branch is not None, (
+        'the focus effect has no `else` branch: a lookup that found NO row must '
+        'take a distinct path, not fall through to the one a hit takes.'
+    )
+    branch = no_row_branch.group(1)
     miss_state = None
     for decl in re.finditer(r'const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*uS\(', code):
         state, setter = decl.group(1), decl.group(2)
-        setter_called = re.search(r'\b' + re.escape(setter) + r'\s*\(', eff)
-        reaches_render = re.search(
-            r'\{\s*' + re.escape(state) + r'\b', code
-        ) or re.search(r'\b' + re.escape(state) + r'\s*&&', code)
-        if setter_called and reaches_render:
-            miss_state = state
-            break
+        if not re.search(r'\b' + re.escape(setter) + r'\s*\(', branch):
+            continue
+        # ...and that same state must GATE the miss notice's subtree. Derived
+        # from the testid, not from the state's spelling, so a rename is free.
+        if not re.search(
+            r'\{\s*' + re.escape(state) + r'\s*&&[\s\S]{0,400}?data-testid="esc-focus-miss"',
+            code,
+        ):
+            continue
+        miss_state = state
+        break
     assert miss_state is not None, (
-        'no `uS` state whose setter the focus effect calls also reaches a JSX '
-        'render position. A miss must be DISPLAYED, not swallowed — the '
-        'operator clicked a link and is owed an answer either way.'
+        'no `uS` state is both written by the focus effect\'s no-row branch and '
+        'the gate on the `data-testid="esc-focus-miss"` subtree. A miss must be '
+        'recorded by the branch that observed it AND displayed — the operator '
+        'clicked a link and is owed an answer either way.'
     )
 
     # (e) both no-selection outcomes are visible, pinned by testid not by copy.
@@ -1040,4 +1059,88 @@ def test_focus_handoff_retries_then_reports_a_miss(
         'the focus effect must still call onFocusConsumed() once a decision is '
         'reachable — leaving the focus set would reopen a stale drawer on every '
         'later visit to this tab.'
+    )
+
+
+def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
+    data_js_body: str,
+    tab_escalations_jsx_code: str,
+) -> None:
+    """"Has the payload arrived?" must come from data.js, not from a captured ref.
+
+    The seed-identity form — capture `DF.ESCALATIONS` at module-eval time, then
+    test `payload !== SEED` — races Babel and can WEDGE.  data.js is a classic
+    script whose `startPolling()` fires its first fetch at load time
+    (`refreshDFData` before the interval); tab_escalations.jsx is
+    `type="text/babel"`, transpiled and evaluated after DOMContentLoaded.  So
+    the first escalations response can land BEFORE the capture runs, making the
+    captured "seed" a REAL payload.  Nothing then clears it while either
+    (a) `tw.pauseLive` was already on at load — `startPolling` bypasses
+    `__DF_PAUSE` for that first fetch, but every later `pollTick` is skipped —
+    or (b) the endpoint enters backoff (up to 60s) right after that first
+    success.  In those windows the tab renders a "still loading" notice directly
+    above a fully-populated escalation table and never consumes the cross-tab
+    focus: the same dead-link outcome the focus fix exists to remove, in a new
+    form.
+
+    The sound signal is a per-key FIRST-SUCCESS marker recorded where the apply
+    actually happens.  Asserted structurally, deriving the registry expression
+    and the key from the source rather than pinning either spelling.
+    """
+    code = tab_escalations_jsx_code
+
+    # (a) data.js records the marker inside applyKey — the one place that knows
+    #     a real server value was applied.
+    apply_body = _extract_function_body(data_js_body, 'applyKey')
+    assert apply_body, 'could not extract data.js\'s applyKey body.'
+    marker = re.search(r'([\w.$]+)\[\s*key\s*\]\s*=\s*true', apply_body)
+    assert marker is not None, (
+        'data.js\'s applyKey records no per-key first-success marker '
+        '(`<registry>[key] = true`). Without one, a consumer cannot tell a '
+        'pre-fetch seed from a loaded-but-empty payload: the two are '
+        'structurally identical by design, so nothing about a payload\'s '
+        'contents can distinguish them.'
+    )
+    registry = marker.group(1)
+    leaf = registry.split('.')[-1]
+
+    # (b) the marker means "a real value LANDED", so the null/undefined guard
+    #     must come first — a response that omits the key must not mark it.
+    guard = re.search(
+        r'if\s*\([^)]*value\s*===\s*(?:undefined|null)[\s\S]{0,120}?return', apply_body
+    )
+    assert guard is not None and guard.end() <= marker.start(), (
+        f'applyKey marks `{registry}[key]` before (or without) its '
+        'null/undefined early return, so the marker would claim arrival for a '
+        'response that omitted the key entirely.'
+    )
+
+    # (c) the registry is initialised at module scope, so the first applyKey
+    #     call has a target — the same reason every DF_DATA key is seeded.
+    assert re.search(rf'\b{re.escape(leaf)}\s*[:=]\s*\{{\s*\}}', data_js_body), (
+        f'data.js never initialises the `{leaf}` marker registry to an empty '
+        'object, so the first applyKey call would throw on a missing target.'
+    )
+
+    # (d) tab_escalations.jsx reads THAT marker, keyed on its own payload key.
+    loaded_body = _extract_function_body(code, 'escalationsLoaded')
+    assert loaded_body, 'could not extract the escalationsLoaded body.'
+    assert leaf in loaded_body, (
+        f'escalationsLoaded does not read data.js\'s `{leaf}` marker registry: '
+        f'{loaded_body.strip()!r}'
+    )
+    assert 'ESCALATIONS' in loaded_body, (
+        'escalationsLoaded must key the marker lookup on its own payload key, '
+        f'not on whatever landed last: {loaded_body.strip()!r}'
+    )
+
+    # (e) and the racy form is GONE: no module-scope (column-0) capture of
+    #     `DF.ESCALATIONS`. The component's own per-render read is indented and
+    #     is a different thing entirely.
+    seed_capture = re.search(r'^const\s+\w+\s*=\s*DF\.ESCALATIONS', code, re.M)
+    assert seed_capture is None, (
+        f'tab_escalations.jsx still captures `DF.ESCALATIONS` at module scope: '
+        f'{seed_capture.group(0)!r}. A first poll that resolves before this '
+        'module is evaluated freezes a real payload as the "seed", and paused '
+        'polling or endpoint backoff makes that wedge permanent.'
     )
