@@ -27,14 +27,22 @@ import sqlite3
 from pathlib import Path
 
 from audit_combine_gate_marker_loss import (
+    SOURCE_MANIFEST,
+    SOURCE_NONE,
+    SOURCE_TICKET,
     SEVERITY_BENIGN,
     SEVERITY_DISPATCH,
     SEVERITY_GATE_REMOVING,
     SEVERITY_INFORMATIONAL,
     SEVERITY_PROVENANCE,
+    TERMINAL_STATUSES,
+    AuditCoverage,
     CombineTarget,
+    Finding,
     ManifestExpectation,
+    ProjectAudit,
     _severity_rank,
+    audit_project,
     build_manifest_index,
     classify_gap,
     load_combine_targets,
@@ -678,3 +686,275 @@ def test_severity_constants_are_distinct_strings(tmp_path):
                  SEVERITY_INFORMATIONAL, SEVERITY_BENIGN]
     assert all(isinstance(c, str) for c in constants)
     assert len(set(constants)) == len(constants)
+
+
+# ---------------------------------------------------------------------------
+# audit_project — the join.
+#
+# Unions both comparison sources with PER-KEY provenance and emits one Finding
+# per key that a source expected but live metadata no longer carries.
+# ---------------------------------------------------------------------------
+
+def _make_project(tmp_path, make_tasks_db, *, name="proj", tasks=(), tickets=None,
+                  manifests=()):
+    """Build a synthetic project root with tasks.db, tickets.db and manifests."""
+    root = tmp_path / name
+    (root / ".taskmaster" / "tasks").mkdir(parents=True, exist_ok=True)
+    make_tasks_db(list(tasks), directory=root / ".taskmaster" / "tasks")
+    if tickets is not None:
+        (root / "data" / "reconciliation").mkdir(parents=True, exist_ok=True)
+        _make_tickets_db(root / "data" / "reconciliation", list(tickets))
+    for relpath, doc in manifests:
+        _write_manifest(root, relpath, doc)
+    return root
+
+
+def _manifest_doc(task_id, label="δ", prd="plans/x-prd.md", checks=(("gate", _GREP_CHECK),)):
+    return {
+        "prd": prd,
+        "schema_version": 1,
+        "tasks": [{"label": label, "task_id": task_id,
+                   "capabilities": [_capability(n, c) for n, c in checks]}],
+    }
+
+
+def _by_key(audit):
+    return {f.key: f for f in audit.findings}
+
+
+def test_audit_project_emits_one_finding_per_ticket_evidenced_lost_key(
+        tmp_path, make_tasks_db):
+    """(1) The ticket carried keys the live wipe signature no longer has."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 100, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "dark_factory", "task_id": 100, "metadata": {
+            "task_kind": "deterministic", "source": "prd", "spawn_context": "prd_decompose",
+        }}],
+    )
+
+    audit = audit_project(str(root), "dark_factory")
+
+    assert isinstance(audit, ProjectAudit)
+    assert set(_by_key(audit)) == {"task_kind", "source", "spawn_context"}
+    assert all(f.expected_source == SOURCE_TICKET for f in audit.findings)
+    assert all(isinstance(f, Finding) for f in audit.findings)
+    assert _by_key(audit)["task_kind"].severity == SEVERITY_DISPATCH
+
+
+def test_audit_project_finding_carries_the_full_record(tmp_path, make_tasks_db):
+    """Every Finding names tag/task_id/status/key/severity/source/terminal."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 100, "tag": "master", "status": "blocked",
+                "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "dark_factory", "task_id": 100,
+                  "metadata": {"source": "prd"}}],
+    )
+
+    finding = audit_project(str(root), "dark_factory").findings[0]
+
+    assert finding.tag == "master"
+    assert finding.task_id == 100
+    assert finding.status == "blocked"
+    assert finding.key == "source"
+    assert finding.severity == SEVERITY_INFORMATIONAL
+    assert finding.expected_source == SOURCE_TICKET
+    assert finding.terminal is False
+    assert finding.reason
+
+
+def test_audit_project_manifest_sourced_findings_without_a_ticket(tmp_path, make_tasks_db):
+    """(2) THE 3157/3319 SHAPE: no ticket at all, but a manifest binds the task,
+    so delivered_checks / prd_path / prd_task_label are still recoverable."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 3157, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[],
+        manifests=[("plans/m-prd.capability-manifest.yaml",
+                    _manifest_doc(3157, label="δ", prd="plans/m-prd.md"))],
+    )
+
+    audit = audit_project(str(root), "dark_factory")
+    by_key = _by_key(audit)
+
+    assert set(by_key) == {"delivered_checks", "prd_path", "prd_task_label"}
+    assert all(f.expected_source == SOURCE_MANIFEST for f in audit.findings)
+    assert by_key["delivered_checks"].severity == SEVERITY_GATE_REMOVING
+    assert by_key["prd_path"].severity == SEVERITY_PROVENANCE
+    assert audit.coverage.targets_with_manifest == 1
+    assert audit.coverage.targets_with_ticket == 0
+
+
+def test_audit_project_manifest_with_no_mechanical_checks_expects_no_delivered_checks(
+        tmp_path, make_tasks_db):
+    """commit_planning stamps metadata.delivered_checks only when at least one
+    MECHANICAL check exists (manifest_stamping.py: `if not mechanical: skip`).
+    A manual-only manifest must therefore never yield a gate-removing finding."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 42, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[],
+        manifests=[("plans/n-prd.capability-manifest.yaml",
+                    _manifest_doc(42, checks=(("manual-only", _MANUAL_CHECK),)))],
+    )
+
+    by_key = _by_key(audit_project(str(root), "dark_factory"))
+
+    assert "delivered_checks" not in by_key
+    assert set(by_key) == {"prd_path", "prd_task_label"}
+
+
+def test_audit_project_unions_both_sources_with_per_key_provenance(
+        tmp_path, make_tasks_db):
+    """Both sources speak: the ticket wins shared keys, but the manifest's
+    delivered_checks is KEPT (a submit payload rarely carries it)."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 7, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "dark_factory", "task_id": 7,
+                  "metadata": {"source": "prd", "prd_path": "plans/from-ticket.md"}}],
+        manifests=[("plans/o-prd.capability-manifest.yaml",
+                    _manifest_doc(7, prd="plans/from-manifest.md"))],
+    )
+
+    by_key = _by_key(audit_project(str(root), "dark_factory"))
+
+    assert set(by_key) == {"source", "prd_path", "prd_task_label", "delivered_checks"}
+    assert by_key["delivered_checks"].expected_source == SOURCE_MANIFEST
+    assert by_key["prd_path"].expected_source == SOURCE_TICKET
+    assert by_key["prd_task_label"].expected_source == SOURCE_MANIFEST
+    assert by_key["source"].expected_source == SOURCE_TICKET
+
+
+def test_audit_project_emits_a_none_row_when_no_source_covers_a_target(
+        tmp_path, make_tasks_db):
+    """(3) NEVER SILENTLY SKIPPED. A combine target with neither a ticket nor a
+    manifest is emitted with expected_source='none' and counted in coverage, so
+    a partial sweep can never read as complete."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 900, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[],
+    )
+
+    audit = audit_project(str(root), "dark_factory")
+
+    assert len(audit.findings) == 1
+    assert audit.findings[0].expected_source == SOURCE_NONE
+    assert audit.findings[0].task_id == 900
+    assert audit.coverage.targets_without_comparison_source == 1
+    assert audit.coverage.total_combine_targets == 1
+
+
+def test_audit_project_reports_key_loss_never_value_drift(tmp_path, make_tasks_db):
+    """(4) A key PRESENT in live metadata is not reported even when its VALUE
+    differs. The ticket is a submit-time snapshot, so comparing values would
+    surface benign post-submit edits as findings."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 8, "status": "pending", "metadata": {
+            **_WIPE_SIGNATURE, "task_kind": "normal", "source": "agent-followup"}}],
+        tickets=[{"project_id": "dark_factory", "task_id": 8, "metadata": {
+            "task_kind": "deterministic", "source": "prd"}}],
+    )
+
+    assert audit_project(str(root), "dark_factory").findings == []
+
+
+def test_audit_project_ignores_non_combine_tasks(tmp_path, make_tasks_db):
+    """(5) A task the curator never combined is not a target, ticket or no."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 9, "status": "pending", "metadata": {"source": "prd"}}],
+        tickets=[{"project_id": "dark_factory", "task_id": 9,
+                  "metadata": {"source": "prd", "task_kind": "deterministic"}}],
+    )
+
+    audit = audit_project(str(root), "dark_factory")
+
+    assert audit.findings == []
+    assert audit.coverage.total_combine_targets == 0
+
+
+def test_audit_project_sorts_gate_removing_first_then_numeric_task_id(
+        tmp_path, make_tasks_db):
+    """Gate-removing rows come FIRST regardless of task id, and within a
+    severity 100 follows 20 rather than preceding it (numeric, not lexical)."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[
+            {"id": 20, "status": "pending", "metadata": _WIPE_SIGNATURE},
+            {"id": 100, "status": "pending", "metadata": _WIPE_SIGNATURE},
+            {"id": 300, "status": "pending", "metadata": _WIPE_SIGNATURE},
+        ],
+        tickets=[
+            {"project_id": "dark_factory", "task_id": 20, "metadata": {"source": "prd"}},
+            {"project_id": "dark_factory", "task_id": 100, "metadata": {"source": "prd"}},
+        ],
+        manifests=[("plans/p-prd.capability-manifest.yaml", _manifest_doc(300))],
+    )
+
+    findings = audit_project(str(root), "dark_factory").findings
+
+    assert findings[0].severity == SEVERITY_GATE_REMOVING
+    assert findings[0].task_id == 300
+    informational = [f.task_id for f in findings if f.key == "source"]
+    assert informational == [20, 100]
+
+
+def test_audit_project_terminal_flag_tracks_status(tmp_path, make_tasks_db):
+    """done/cancelled are terminal; pending/in-progress/blocked are live."""
+    assert set(TERMINAL_STATUSES) == {"done", "cancelled"}
+    statuses = {1: "done", 2: "cancelled", 3: "pending", 4: "in-progress", 5: "blocked"}
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": i, "status": s, "metadata": _WIPE_SIGNATURE}
+               for i, s in statuses.items()],
+        tickets=[{"project_id": "dark_factory", "task_id": i, "metadata": {"source": "prd"}}
+                 for i in statuses],
+    )
+
+    terminal = {f.task_id: f.terminal for f in audit_project(str(root), "dark_factory").findings}
+
+    assert terminal == {1: True, 2: True, 3: False, 4: False, 5: False}
+
+
+def test_audit_project_coverage_counts_and_parse_failures(tmp_path, make_tasks_db):
+    """AuditCoverage names every population the report leans on."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[
+            {"id": 1, "status": "done", "metadata": _WIPE_SIGNATURE},
+            {"id": 2, "status": "done", "metadata": _WIPE_SIGNATURE},
+            {"id": 3, "status": "done", "metadata": _WIPE_SIGNATURE},
+            {"id": 4, "status": "done", "metadata": {"source": "prd"}},
+        ],
+        tickets=[{"project_id": "dark_factory", "task_id": 1, "metadata": {"source": "prd"}}],
+        manifests=[
+            ("plans/q-prd.capability-manifest.yaml", _manifest_doc(2)),
+            ("plans/broken-prd.capability-manifest.yaml", "prd: [unclosed\n  - nope"),
+        ],
+    )
+
+    coverage = audit_project(str(root), "dark_factory").coverage
+
+    assert isinstance(coverage, AuditCoverage)
+    assert coverage.total_combine_targets == 3
+    assert coverage.targets_with_ticket == 1
+    assert coverage.targets_with_manifest == 1
+    assert coverage.targets_without_comparison_source == 1
+    assert coverage.manifest_parse_failures == 1
+
+
+def test_audit_project_tolerates_a_missing_tickets_db(tmp_path, make_tasks_db):
+    """No tickets.db at all degrades to manifest-only, never a raise."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 11, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        manifests=[("plans/r-prd.capability-manifest.yaml", _manifest_doc(11))],
+    )
+
+    assert not (root / "data" / "reconciliation" / "tickets.db").exists()
+    assert set(_by_key(audit_project(str(root), "dark_factory"))) == {
+        "delivered_checks", "prd_path", "prd_task_label"}
