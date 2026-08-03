@@ -19,6 +19,7 @@ merge-verify time.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,6 +31,7 @@ from shared.cli_invoke import (
     _SubprocessResult,
     build_failure_message,
     classify_agent_failure,
+    invoke_claude_agent,
     invoke_with_cap_retry,
     is_cli_invocation_rejected,
     is_zero_output_timeout,
@@ -752,3 +754,132 @@ class TestInvokeWithCapRetryFastPathRetriesCliInputRejected:
             f'started_at describes the DISCARDED first attempt: {saved["started_at"]!r}'
         )
         assert saved['completed_at'] == 't2-done'
+
+
+@pytest.mark.asyncio
+class TestNonBlankPromptPrecondition:
+    """The other half of DEFECT A: make the failure impossible to cause from
+    OUR side.
+
+    The claude backend is 100% stdin-dependent -- ``build_claude_argv`` emits
+    ``['claude', '--print', '--output-format', 'json']`` with NO positional
+    prompt and no ``-`` marker -- so a blank prompt is piped happily
+    (``stdin_data = prompt.encode()``) and resurfaces only as the opaque CLI
+    argument error this task is classifying.  A blank prompt must therefore
+    fail LOUDLY at the boundary, before a subprocess is spawned, before temp
+    files are written, and before an account slot is consumed.
+    """
+
+    @staticmethod
+    def _patched_dispatch():
+        """Patch the subprocess spawn AND argv build so a leak past the guard
+        is visible as a call rather than a real ``claude`` process."""
+        return (
+            patch(
+                'shared.cli_invoke._run_subprocess',
+                new_callable=AsyncMock,
+                return_value=_SubprocessResult(
+                    stdout='', stderr='', returncode=0, duration_ms=10
+                ),
+            ),
+            patch(
+                'shared.cli_invoke.build_claude_argv',
+                return_value=(['claude', '--print'], []),
+            ),
+        )
+
+    async def _assert_no_dispatch(self, prompt, **kwargs):
+        run_patch, argv_patch = self._patched_dispatch()
+        with run_patch as run_mock, argv_patch as argv_mock:
+            with pytest.raises(ValueError):
+                await invoke_claude_agent(
+                    prompt=prompt,
+                    system_prompt='sys',
+                    cwd=Path('/tmp'),
+                    **kwargs,
+                )
+        run_mock.assert_not_called()
+        argv_mock.assert_not_called()
+
+    async def test_empty_prompt_raises_before_any_subprocess(self):
+        await self._assert_no_dispatch('')
+
+    async def test_whitespace_only_prompt_raises_before_any_subprocess(self):
+        await self._assert_no_dispatch('   \n\t  ')
+
+    async def test_guard_fires_even_with_no_resume_session(self):
+        """UNCONDITIONAL: today's only prompt guard fires exclusively when a
+        resume session IS set, which is why the plain (fresh-invocation) blank
+        prompt sails straight through to the CLI."""
+        await self._assert_no_dispatch('', resume_session_id=None)
+
+    async def test_blank_prompt_never_consumes_an_account_slot(self):
+        gate = make_gate_mock(account_count=2)
+        cli = _CountingCli(_succeeded())
+
+        with pytest.raises(ValueError):
+            await invoke_with_cap_retry(
+                gate,
+                'test[blank-prompt]',
+                invoke_fn=cli,
+                backend='claude',
+                prompt='  ',
+            )
+
+        gate.invoke_slot.assert_not_called()
+        assert cli.calls == []
+
+    async def test_resume_with_empty_prompt_still_raises_typeerror(self):
+        """REGRESSION: the existing resume-path contract is unchanged."""
+        gate = make_gate_mock(account_count=2)
+
+        with pytest.raises(TypeError):
+            await invoke_with_cap_retry(
+                gate,
+                'test[resume-empty]',
+                invoke_fn=_CountingCli(_succeeded()),
+                backend='claude',
+                prompt='',
+                resume_session_id='abc',
+            )
+
+    async def test_resume_with_whitespace_only_prompt_raises_typeerror(self):
+        """The resume guard's condition is strengthened to ``.strip()`` --
+        same exception, same message, one more shape caught."""
+        gate = make_gate_mock(account_count=2)
+
+        with pytest.raises(TypeError):
+            await invoke_with_cap_retry(
+                gate,
+                'test[resume-blank]',
+                invoke_fn=_CountingCli(_succeeded()),
+                backend='claude',
+                prompt='   ',
+                resume_session_id='abc',
+            )
+
+    async def test_a_normal_prompt_still_dispatches(self):
+        """REGRESSION: the guard must not narrow the happy path."""
+        run_patch, argv_patch = self._patched_dispatch()
+        with run_patch as run_mock, argv_patch:
+            await invoke_claude_agent(
+                prompt='a real prompt',
+                system_prompt='sys',
+                cwd=Path('/tmp'),
+            )
+        run_mock.assert_called_once()
+
+    async def test_a_normal_prompt_still_dispatches_through_cap_retry(self):
+        gate = make_gate_mock(account_count=2)
+        cli = _CountingCli(_succeeded())
+
+        returned = await invoke_with_cap_retry(
+            gate,
+            'test[normal-prompt]',
+            invoke_fn=cli,
+            backend='claude',
+            prompt='a real prompt',
+        )
+
+        assert returned.success is True
+        assert len(cli.calls) == 1
