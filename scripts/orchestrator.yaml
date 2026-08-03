@@ -111,11 +111,20 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # ~29% / ~20% spread WITHIN each pair on this host, and the two pairs were
 # taken at different times under different load, so the honest claim is
 # "roughly +1.5 to +2 minutes", not a multiple, and not a figure to plan a
-# tight timeout around. A third run of the union, on the amendment-pass tip
-# (1931 passed, 1 skipped, 310.33s, exit 0), came in FASTER than the slower run
-# of the command it replaced — which is the error bar made concrete, not a
-# revision of the delta: on this host the load at measurement time moves the
-# number more than the extra directory does. WHO PAYS IT is the sharper half: this is not a
+# tight timeout around. Two further runs of the union make that error bar
+# concrete rather than rhetorical — both exit 0, 1931 passed, 1 skipped:
+#
+#   run 3   310.33s pytest   (amendment-pass tip)
+#   run 4   914.61s pytest / 930.59s wall   (amendment-pass verification)
+#
+# Run 3 came in FASTER than the slower run of the command the union REPLACED;
+# run 4 is ~2.9x run 3 for a byte-identical command on a byte-identical tree.
+# Neither revises the delta — on this host the LOAD at measurement time moves
+# the number far more than the extra directory does, which is the whole reason
+# both are recorded instead of only the convenient one. For follow-up 3458 the
+# operative figure is run 4, not the mean: a budget sized off the 310-519s
+# range these comments recorded before it would have red-walled this very
+# verification pass. WHO PAYS IT is the sharper half: this is not a
 # merge-only cost, because verify_plan._derive_module_runs arm 3 runs this
 # command VERBATIM for any scripts/ production diff — so a one-line edit to an
 # operator script under scripts/ now pays the union where it used to pay
@@ -124,12 +133,15 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 #
 # verify_command_timeout_secs stays UNSET here, so this module keeps inheriting
 # the repo-root whole-fleet 3600s ceiling — see the note at the bottom of this
-# file; sizing it remains follow-up 3458's, which should start from the four
-# measured runs above (both the union and the command it replaced) rather than
-# re-deriving a baseline. The risk direction is safe: this command is strictly
-# longer than the one it replaces but the slower measured run is ~6.4x under
-# that ceiling, and guessing a tight budget here could red-wall every merge
-# repo-wide under load, which not setting one cannot.
+# file; sizing it remains follow-up 3458's, which should start from the six
+# measured runs above (four of the union, two of the command it replaced)
+# rather than re-deriving a baseline. The risk direction is safe, but the
+# margin is thinner than the early runs suggested: this command is strictly
+# longer than the one it replaces, and the SLOWEST observed run (930.59s wall)
+# is only ~3.9x under that ceiling, not the ~6.4x the first three runs implied.
+# Still safe unset — and that gap between ~3.9x and ~6.4x is exactly why the
+# knob is left unset rather than guessed at: a tight budget here red-walls
+# every merge repo-wide under load, which not setting one cannot.
 #
 # THE DUPLICATE-RUN COST IS NOT RESOLVED BY THIS CHANGE. tests/scripts/ still
 # executes twice per full verify — once from this config and once from the
@@ -270,4 +282,7 @@ type_check_command: "npx pyright scripts/"
 # checks — the same class of gap tests/scripts/ closed with its measured 600s
 # budget. Sizing it honestly needs multi-run measurement of the verbatim
 # FULL_SUITE command forms on this oversubscribed host, which task 3445 did not
-# perform; recorded here rather than guessed. Follow-up 3458.
+# perform; recorded here rather than guessed. Follow-up 3458 — which should NOT
+# read this note alone and conclude no measurement exists: task 3460 measured
+# the pytest form six times, and the MEASURED GREEN block above records every
+# run, including the 930.59s outlier that is the one a budget must survive.
