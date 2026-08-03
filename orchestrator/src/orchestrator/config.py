@@ -878,12 +878,16 @@ class SessionResumeConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'Consecutive per-boot session_resume_fallback degradations '
-            '(reset to 0 on any eligible resume) before one L1 escalation is '
-            'filed (INV-4 storm escape — suspected systematic clock skew / '
-            'wiped transcripts / mass reseed). Must be >= 1. Default 5 is '
-            'above both the resume cap and ordinary collision noise, so only '
-            'systematic corroboration breakage trips it.'
+            'Consecutive UNEXPLAINED session_resume_fallback degradations '
+            'before one L1 escalation is filed (INV-4 storm escape — '
+            'suspected systematic clock skew, or transcripts vanishing while '
+            'their config dir survives). Only reason in {stale, no_transcript} '
+            'counts: reason=reseeded is a by-design lane reseed and is '
+            'excluded, exactly as session_resume_capped is. The run is chained '
+            'within storm_window_secs (and reset to 0 on any eligible resume) '
+            'rather than accumulating unbounded per boot. Must be >= 1. '
+            'Default 5 is above both the resume cap and ordinary collision '
+            'noise, so only systematic corroboration breakage trips it.'
         ),
     )
     storm_window_secs: int = Field(
