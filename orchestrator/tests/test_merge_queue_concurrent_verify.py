@@ -24,6 +24,7 @@ This file starts with shared scaffolding only (pre-1).
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import collections
 import contextlib
@@ -181,6 +182,100 @@ async def _await_outcome(
 # audited by 3492, whose worst per-method budget is 205s
 # (TestCascadeErrorContainment), still comfortably under the 300s value below.
 HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
+
+
+# task 3492: known-name table for _worst_per_method_wait_budget below. These
+# are this module's own numeric constants -- referenced directly (not
+# re-derived) so the audit helper can never drift from the values the marks
+# themselves use.
+_KNOWN_WAIT_CONSTANTS: dict[str, float] = {
+    'MERGE_RESULT_TIMEOUT': float(MERGE_RESULT_TIMEOUT),
+    'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
+}
+
+
+def _resolve_wait_value(node: ast.expr | None) -> float:
+    """Resolve a single AST expression to a wait-budget number, or 0.0.
+
+    Conservative by construction: a literal number resolves directly; a
+    name reference resolves ONLY via ``_KNOWN_WAIT_CONSTANTS``; anything
+    else (a local variable, an attribute access, an arithmetic expression,
+    an unknown name) resolves to 0.0. Unknown means ignore, never guess.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        return _KNOWN_WAIT_CONSTANTS.get(node.id, 0.0)
+    return 0.0
+
+
+def _call_wait_budget(call: ast.Call) -> float:
+    """Return the wait-budget contribution of a single ``ast.Call`` node.
+
+    Recognises exactly two call shapes -- ``asyncio.wait_for(..., timeout=N)``
+    and ``_await_outcome(...)`` (whose hidden default is
+    ``MERGE_RESULT_TIMEOUT`` when no ``timeout=`` kwarg is given). Every
+    other call shape -- ``asyncio.sleep``, ``.wait()``, ``.result()``,
+    ``.join()``, attribute access, arithmetic, unknown names -- contributes
+    0.0 and is skipped silently (this is a conservative FLOOR, not a full
+    audit; see the plan's floor/superset design decision).
+    """
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr == 'wait_for':
+        for kw in call.keywords:
+            if kw.arg == 'timeout':
+                return _resolve_wait_value(kw.value)
+        if len(call.args) >= 2:
+            return _resolve_wait_value(call.args[1])
+        return 0.0
+    if isinstance(func, ast.Name) and func.id == '_await_outcome':
+        for kw in call.keywords:
+            if kw.arg == 'timeout':
+                return _resolve_wait_value(kw.value)
+        return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+    return 0.0
+
+
+def _method_wait_budget(fn: ast.AST) -> float:
+    """Sum every recognised wait-call contribution anywhere in *fn*'s body."""
+    return sum(
+        _call_wait_budget(node) for node in ast.walk(fn) if isinstance(node, ast.Call)
+    )
+
+
+def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
+    """Statically scan *source* and compute, per top-level ``Test*`` class,
+    the MAX over its ``test_*`` methods of that method's summed sequential
+    real-time wait budget (task 3492's audit engine).
+
+    pytest-timeout applies a class-level ``@pytest.mark.timeout`` mark to
+    EACH test method independently, not to the class total -- so the unit
+    that matters is per-method, not a class-wide sum (see the plan's design
+    decision: summing would false-positive on many-light-methods classes
+    like ``TestRunInflightVerifyAbortPoll`` and could dilute one heavy
+    method below the threshold).
+
+    Must never raise: a crash here would fail the whole suite over an
+    unrelated edit to this file. Unparseable source returns {}.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+
+    budgets: dict[str, float] = {}
+    for node in ast.iter_child_nodes(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name.startswith('Test')):
+            continue
+        method_budgets = [
+            _method_wait_budget(item)
+            for item in node.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name.startswith('test_')
+        ]
+        if method_budgets:
+            budgets[node.name] = max(method_budgets)
+    return budgets
 
 
 # ---------------------------------------------------------------------------
