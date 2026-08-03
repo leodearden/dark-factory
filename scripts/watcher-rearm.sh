@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # watcher-rearm.sh -- canonical bounded-wait + re-arm wrapper for
-# escalation.watcher, shared by skills/escalation-watcher/SKILL.md and
-# skills/escalation-watcher-auto/SKILL.md.
+# escalation.watcher, shared by skills/escalation-watcher/SKILL.md,
+# skills/escalation-watcher-auto/SKILL.md and
+# skills/recon-escalation-watcher/SKILL.md (the level-less caller).
 #
 # Solves the watcher-loop-harness-mismatch cluster (agent-legibility survey
 # S2): callers no longer hand-maintain a growing --exclude-id list across
@@ -23,6 +24,13 @@
 # --level is OPTIONAL. Omitting it selects escalation.watcher's match-all
 # mode, for flat queues whose escalations carry no level worth filtering
 # (the reconciliation queue -- see skills/recon-escalation-watcher).
+# Because omission is silent by construction, the resolved level is DECLARED
+# on stderr at the top of every run ("level=<all>" vs "level=2") and in the
+# --check dry-run line -- so a levelled caller (L0 steward / L1 auto-watcher
+# / L2 human, the consumer-per-level invariant at
+# escalation/src/escalation/models.py:3-9) that forgot --level can see it has
+# been switched into match-all mode instead of silently consuming another
+# consumer's escalations.
 #
 # Env:
 #   DARK_FACTORY_ROOT     required; repo root used to locate the escalation
@@ -177,7 +185,11 @@ fi
 
 mkdir -p "$(dirname "$EXCLUDE_FILE")"
 touch "$EXCLUDE_FILE"
-echo "watcher-rearm.sh: exclude-file=$EXCLUDE_FILE (append a deliberately-pending esc-id here to suppress it)" >&2
+# Declare the RESOLVED level on every live run, not just under --check: since
+# --level became optional, an accidentally-omitted flag would otherwise switch
+# a levelled caller into match-all mode with nothing in the runtime output
+# revealing that the filter is off (see the header note above).
+echo "watcher-rearm.sh: level=${LEVEL:-<all>} exclude-file=$EXCLUDE_FILE (append a deliberately-pending esc-id here to suppress it)" >&2
 
 # Interpreter prefix: WATCHER_REARM_PYTHON overrides the default `uv run`
 # invocation (tests inject sys.executable to drive the real module without

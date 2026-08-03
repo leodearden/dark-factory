@@ -17,6 +17,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
+
+import pytest
 
 from escalation.models import Escalation
 
@@ -85,16 +88,65 @@ def _write_pending(queue_dir, esc_id, task_id='1', level=2):
     return esc
 
 
-def test_fired_smoke(tmp_path):
-    """A pending L2 escalation already in the queue dir -> the wrapper
-    exits 0, passes the escalation JSON through to stdout untouched, and
-    emits the FIRED outcome line on stderr."""
+class _Mode(NamedTuple):
+    """One of the wrapper's two filtering modes, as a caller sees it.
+
+    The live smoke tests below come in levelled/level-less pairs that differ
+    ONLY in these four values, so the pair is expressed once here rather than
+    copied per test (a third mode costs one row, not a third copy).
+
+    level_args    -- the --level argv the caller passes (empty = omitted).
+    seeded_level  -- the level of the escalation seeded into the queue. The
+                     level-less case deliberately seeds 0, maximally distant
+                     from the levelled callers' 2, so a level-less test also
+                     fails if an implementation quietly DEFAULTS LEVEL rather
+                     than genuinely omitting the filter.
+    level_token   -- how the wrapper must render the resolved level, both in
+                     the --check dry-run line and in the live stderr preamble.
+                     `<all>` is deliberate: an empty `level=` would read as an
+                     unset-variable bug rather than the match-all mode.
+    exclude_name  -- the wrapper-OWNED default exclude-file basename for this
+                     mode. Both stay dotfiles that do not end in '.json',
+                     which is what keeps them invisible to the watcher's own
+                     esc-*.json glob (watcher.py:85) and to the dashboard's
+                     broader *.json recon glob (dashboard/.../escalations.py:89).
+    """
+
+    level_args: list[str]
+    seeded_level: int
+    level_token: str
+    exclude_name: str
+
+
+_MODES = [
+    pytest.param(
+        _Mode(['--level', '2'], 2, 'level=2', '.watcher-rearm-exclude-l2'),
+        id='levelled',
+    ),
+    pytest.param(
+        _Mode([], 0, 'level=<all>', '.watcher-rearm-exclude'),
+        id='level-less',
+    ),
+]
+
+
+@pytest.mark.parametrize('mode', _MODES)
+def test_pending_escalation_fires(tmp_path, mode):
+    """A pending escalation already in the queue dir -> the wrapper exits 0,
+    passes the escalation JSON through to stdout untouched, and emits the
+    FIRED outcome line on stderr.
+
+    Run for both modes: the level-less case pins that the wrapper drives
+    escalation.watcher's already-supported match-all mode (--level declared
+    type=int default=None at watcher.py:192; _matches treats None as
+    match-all at watcher.py:67), so the flat, level-less reconciliation
+    queue can reuse this wrapper."""
     queue_dir = tmp_path / 'queue'
     queue_dir.mkdir()
-    esc = _write_pending(queue_dir, 'esc-50-1', task_id='50', level=2)
+    esc = _write_pending(queue_dir, 'esc-50-1', task_id='50', level=mode.seeded_level)
 
     result = _run(
-        '--queue-dir', str(queue_dir), '--level', '2', '--timeout', '5',
+        '--queue-dir', str(queue_dir), *mode.level_args, '--timeout', '5',
         env=_live_env(REPO_ROOT),
     )
 
@@ -108,6 +160,12 @@ def test_fired_smoke(tmp_path):
     )
     assert 'WATCHER_REARM_OUTCOME: FIRED exit=0' in result.stderr, (
         f'Expected the FIRED outcome line on stderr; got {result.stderr!r}'
+    )
+    assert mode.level_token in result.stderr, (
+        f'Expected the LIVE run to declare its resolved level as '
+        f'{mode.level_token!r} on stderr -- since --level is optional, a '
+        f'caller that omitted it by accident must see match-all mode declared '
+        f'on every run, not only under --check; got {result.stderr!r}'
     )
 
 
@@ -135,55 +193,41 @@ def test_ceiling_smoke(tmp_path):
     )
 
 
-def test_level_less_invocation_fires(tmp_path):
-    """With NO --level, the wrapper must run the watcher in its already-
-    supported match-all mode (escalation.watcher declares --level
-    type=int default=None, and _matches treats None as match-all) so the
-    flat, level-less reconciliation queue can reuse this wrapper.
+@pytest.mark.parametrize('mode', _MODES)
+def test_check_dry_run_reports_resolved_mode(tmp_path, mode):
+    """`--check` must reach the dry-run branch in BOTH modes (level-less
+    must not exit 2 on a required-flag guard) and report what it resolved:
+    the queue dir, the level token, and the exclude-file path.
 
-    Seeded at level=0 deliberately: it is a valid Escalation level and is
-    maximally distant from the levelled callers' 2, so this also fails if
-    the implementation quietly defaults LEVEL rather than genuinely
-    omitting the filter."""
+    Both renderings of the level token are pinned here -- `level=2` and the
+    deliberate `level=<all>` -- so a regression to an empty `level=`, or to
+    a quietly-defaulted `level=2` on a level-less run, fails loudly. Same
+    for the two default exclude-file spellings: the level-less one must be
+    exactly `.watcher-rearm-exclude`, with the levelled `-l<level>` suffix
+    DROPPED rather than left dangling as a bare `-l`."""
     queue_dir = tmp_path / 'queue'
     queue_dir.mkdir()
-    esc = _write_pending(queue_dir, 'esc-52-1', task_id='52', level=0)
 
     result = _run(
-        '--queue-dir', str(queue_dir), '--timeout', '5',
+        '--check', '--queue-dir', str(queue_dir), *mode.level_args,
         env=_live_env(REPO_ROOT),
     )
 
     assert result.returncode == 0, (
-        f'Expected exit 0 from a level-less invocation; got {result.returncode}\n'
-        f'stdout={result.stdout!r} stderr={result.stderr!r}'
-    )
-    assert esc.id in result.stdout, (
-        f'Expected the escalation JSON on stdout; got stdout={result.stdout!r} '
-        f'stderr={result.stderr!r}'
-    )
-    assert 'WATCHER_REARM_OUTCOME: FIRED exit=0' in result.stderr, (
-        f'Expected the FIRED outcome line on stderr; got {result.stderr!r}'
-    )
-
-
-def test_level_less_check_dry_run_exits_zero(tmp_path):
-    """`--check` with no --level must reach the dry-run branch and report
-    the resolved paths, rather than exiting 2 on a required-flag guard."""
-    queue_dir = tmp_path / 'queue'
-    queue_dir.mkdir()
-
-    result = _run('--check', '--queue-dir', str(queue_dir), env=_live_env(REPO_ROOT))
-
-    assert result.returncode == 0, (
-        f'Expected exit 0 from a level-less --check; got {result.returncode}\n'
+        f'Expected exit 0 from --check; got {result.returncode}\n'
         f'stdout={result.stdout!r} stderr={result.stderr!r}'
     )
     assert str(queue_dir) in result.stdout, (
         f'Expected the resolved queue-dir on stdout; got {result.stdout!r}'
     )
-    assert 'exclude-file=' in result.stdout, (
-        f'Expected the resolved exclude-file on stdout; got {result.stdout!r}'
+    assert mode.level_token in result.stdout, (
+        f'Expected the dry-run to render the resolved level as '
+        f'{mode.level_token!r}; got {result.stdout!r}'
+    )
+    resolved = result.stdout.split('exclude-file=')[-1].strip()
+    assert resolved == str(queue_dir / mode.exclude_name), (
+        f'Expected --check to resolve exclude-file to '
+        f'{str(queue_dir / mode.exclude_name)!r}; got {resolved!r}'
     )
 
 
@@ -213,66 +257,27 @@ def test_explicit_level_still_filters(tmp_path):
     )
 
 
-def test_level_less_default_exclude_file_suppresses(tmp_path):
-    """Structural mirror of test_exclude_file_ownership_suppresses, for the
-    level-less mode: with no --level the wrapper's OWNED default exclude
-    path must be <queue_dir>/.watcher-rearm-exclude -- the levelled
-    '-l<level>' suffix DROPPED, not left dangling as a bare '-l'.
-
-    Like its sibling, suppression can only happen if the wrapper actually
-    WIRES that path into the watcher invocation, so this proves far more
-    than a --check output assertion could. The name stays a dotfile that
-    does not end in '.json', which is what keeps it invisible to both the
-    watcher's own esc-*.json glob (watcher.py:85) and the dashboard's
-    broader *.json recon glob (dashboard/.../escalations.py:89)."""
-    queue_dir = tmp_path / 'queue'
-    queue_dir.mkdir()
-    esc = _write_pending(queue_dir, 'esc-54-1', task_id='54', level=0)
-
-    default_exclude_file = queue_dir / '.watcher-rearm-exclude'
-    default_exclude_file.write_text(f'{esc.id}\n')
-
-    result = _run(
-        '--queue-dir', str(queue_dir), '--timeout', '1',
-        env=_live_env(REPO_ROOT),
-    )
-
-    assert result.returncode == 124, (
-        f'Expected exit 124 (pending item suppressed via the wrapper-owned '
-        f'level-less exclude-file); got {result.returncode}\n'
-        f'stdout={result.stdout!r} stderr={result.stderr!r}'
-    )
-    assert 'WATCHER_REARM_OUTCOME: CEILING exit=124' in result.stderr, (
-        f'Expected the CEILING outcome line on stderr; got {result.stderr!r}'
-    )
-    assert 'esc-' not in result.stdout, (
-        f'Expected no escalation JSON on stdout; got {result.stdout!r}'
-    )
-
-    check = _run('--check', '--queue-dir', str(queue_dir), env=_live_env(REPO_ROOT))
-    resolved = check.stdout.split('exclude-file=')[-1].strip()
-    assert resolved == str(default_exclude_file), (
-        f'Expected the level-less --check to resolve exclude-file to '
-        f'{str(default_exclude_file)!r} (no trailing "-l"); got {resolved!r}'
-    )
-
-
-def test_exclude_file_ownership_suppresses(tmp_path):
+@pytest.mark.parametrize('mode', _MODES)
+def test_exclude_file_ownership_suppresses(tmp_path, mode):
     """A pending escalation whose id is already listed in the wrapper's
-    OWNED default exclude-file (<queue_dir>/.watcher-rearm-exclude-l<level>)
-    must be suppressed even with no --exclude-file override on the command
-    line -- proving the wrapper defaults its own exclude-file path AND
-    wires it into the watcher invocation, not just computes it for --check
-    output."""
+    OWNED default exclude-file must be suppressed even with no
+    --exclude-file override on the command line -- proving the wrapper
+    defaults its own exclude-file path AND wires it into the watcher
+    invocation, not just computes it for --check output.
+
+    Run for both modes, so the level-less default
+    (<queue_dir>/.watcher-rearm-exclude) is proven WIRED IN, not merely
+    printed -- a far stronger claim than the --check assertion in
+    test_check_dry_run_reports_resolved_mode can make on its own."""
     queue_dir = tmp_path / 'queue'
     queue_dir.mkdir()
-    esc = _write_pending(queue_dir, 'esc-51-1', task_id='51', level=2)
+    esc = _write_pending(queue_dir, 'esc-51-1', task_id='51', level=mode.seeded_level)
 
-    default_exclude_file = queue_dir / '.watcher-rearm-exclude-l2'
+    default_exclude_file = queue_dir / mode.exclude_name
     default_exclude_file.write_text(f'{esc.id}\n')
 
     result = _run(
-        '--queue-dir', str(queue_dir), '--level', '2', '--timeout', '1',
+        '--queue-dir', str(queue_dir), *mode.level_args, '--timeout', '1',
         env=_live_env(REPO_ROOT),
     )
 
