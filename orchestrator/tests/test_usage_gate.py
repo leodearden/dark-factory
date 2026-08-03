@@ -224,6 +224,11 @@ class TestGateLifecycle:
         assert token is not None
         assert token.token == 'token-a'
 
+        # The uncap driver must be reaped deterministically, not left pending
+        # in the loop (and not GC-able mid-flight) — see step-2.
+        assert uncap_task.done()
+        assert not uncap_task.cancelled()
+
     @pytest.mark.asyncio
     async def test_pause_tracks_duration(self):
         gate = _make_gate(num_accounts=1)
