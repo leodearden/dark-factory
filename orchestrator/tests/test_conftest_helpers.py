@@ -509,3 +509,67 @@ class TestMakeStewardFixture:
                 f'every default worktree must stay under tmp_path={tmp_path}, got {wt}'
             )
             assert (wt / '.task').is_dir(), f'expected a .task subdirectory under {wt}'
+
+    # --- pass-through kwargs: task / event_store / cost_store (task 3514) ---
+
+    def test_task_kwarg_is_passed_through_and_drives_task_id(self, make_steward):
+        """``task=`` reaches ``steward.task`` verbatim and ``task_id`` derives from it.
+
+        The folded-in ``test_out_of_band_routing.py`` call sites vary
+        ``task['metadata']`` (``dispatch_count``, ``model_overrides``) and assert
+        on what reaches ``resolve_and_record_route``, so a hardcoded task dict
+        cannot serve them.  ``task_id`` must follow ``task['id']`` rather than
+        staying pinned at the default — a steward whose ``task_id`` disagreed
+        with ``task['id']`` would mis-key every artifact it writes.
+        """
+        task = {'id': '7', 'title': 't', 'description': 'd', 'metadata': {'dispatch_count': 2}}
+
+        steward = make_steward(task=task)
+
+        assert steward.task is task, (
+            'make_steward(task=...) must pass the caller dict through by identity, '
+            'so post-construction mutation of task["metadata"] is visible to the steward'
+        )
+        assert steward.task_id == '7', (
+            f"expected task_id to derive from task['id'], got {steward.task_id!r}"
+        )
+
+    def test_event_store_is_passed_through(self, make_steward):
+        """``event_store=`` reaches ``steward.event_store`` by identity."""
+        sentinel = MagicMock()
+
+        steward = make_steward(event_store=sentinel)
+
+        assert steward.event_store is sentinel, (
+            'make_steward(event_store=...) must forward the recorder verbatim — '
+            'the routing tests assert on events it records'
+        )
+
+    def test_cost_store_is_passed_through(self, make_steward):
+        """``cost_store=`` reaches ``steward.cost_store`` by identity."""
+        sentinel = MagicMock()
+
+        steward = make_steward(cost_store=sentinel)
+
+        assert steward.cost_store is sentinel, (
+            'make_steward(cost_store=...) must forward the store verbatim'
+        )
+
+    def test_passthrough_kwargs_default_to_todays_behaviour(self, make_steward):
+        """Omitting the new kwargs leaves the pre-3514 defaults exactly as they were.
+
+        The three already-migrated call sites pass none of them, so each new
+        kwarg must be strictly additive: no store injected, and the default
+        ``task_id`` unchanged.
+        """
+        steward = make_steward()
+
+        assert steward.event_store is None, (
+            'make_steward() with no event_store= must leave it unset (None)'
+        )
+        assert steward.cost_store is None, (
+            'make_steward() with no cost_store= must leave it unset (None)'
+        )
+        assert steward.task_id == '42', (
+            f'the default task_id must not move, got {steward.task_id!r}'
+        )
