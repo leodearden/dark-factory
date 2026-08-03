@@ -39,10 +39,11 @@ max_concurrent_tasks: 24
 # --timeout>60 — enforced by
 # tests/scripts/test_fallback_verify_config.py::test_fallback_verify_raises_per_test_timeout.
 # task 3384: this segment also runs ``scripts/tests/`` together with
-# ``tests/scripts/`` above — a near-homograph but DIFFERENT directory (~30
+# ``tests/scripts/`` above — a near-homograph but DIFFERENT directory (the
 # modules testing scripts/legibility/*, scripts/*.py census / trickle /
 # codebook / worktree-lifecycle tooling, e.g. test_census_trigger.py and
-# test_legibility_census.py). Neither the 5 subprojects' own tests/ dirs nor
+# test_legibility_census.py; the "~30" this read until task 3460's amendment
+# pass had drifted to 41 and is dropped rather than re-pinned). Neither the 5 subprojects' own tests/ dirs nor
 # tests/scripts/ itself ever collect scripts/tests/ (it is not a workspace
 # member and sits outside every subproject prefix), so it is folded into the
 # same ``--project shared`` pytest invocation (scripts/tests/ imports no
@@ -73,7 +74,14 @@ max_concurrent_tasks: 24
 # merge-role merge_verify_breadth="full" alike. The two are kept spelled
 # identically deliberately, so this path and that one cannot drift into
 # different notions of "the scripts suites"; if you widen one, widen the
-# other. Do NOT re-close it here: this segment still never runs for a
+# other. That coupling is GATED, not merely asserted here —
+# tests/scripts/test_scripts_module_config.py::
+# test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites reads
+# this segment through the production config loader and fails if either side
+# is widened or narrowed alone. (It compares the SET of directories, not their
+# order; "spelled identically" above is a readability convention for whoever
+# diffs the two files, since pytest collects directories order-insensitively.)
+# Do NOT re-close it here: this segment still never runs for a
 # scripts/** diff, so a change made here to fix a scripts/ coverage
 # question would be inert, and would read as a gate that is not one.
 test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300"

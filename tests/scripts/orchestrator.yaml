@@ -54,9 +54,13 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # directories, because tests/scripts/ tests scripts/ PRODUCTION code
 # (test_orchestrator_watchdog.py <-> scripts/orchestrator-watchdog.py,
 # test_spawn_claude.py, test_check_dashboard_unit_parity.py,
-# test_restart_all_orchestrators.py, ...) while scripts/tests/ holds 40 test
-# modules covering that same tree — so neither can be dropped from the owning
-# module's suite. This corrects, rather than merely amends, the claim this
+# test_restart_all_orchestrators.py, ...) while scripts/tests/ holds that
+# directory's own suite covering the same tree — so neither can be dropped from
+# the owning module's suite. (Deliberately stated without a module COUNT: the
+# "40" this sentence first shipped with was already stale at HEAD, and a
+# hard-coded count of a directory's contents rots on the next test file added.
+# The claim needs no number — it is "both trees cover scripts/", true at any
+# size.) This corrects, rather than merely amends, the claim this
 # block used to make: "scripts/ has no tests of its own and has always pointed
 # at this suite" was FALSE in its first clause, which is precisely the coverage
 # gap task 3460 closed.

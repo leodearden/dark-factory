@@ -15,7 +15,7 @@
 # "Failed to spawn: pytest" on a freshly-synced venv (e.g. a fresh _merge-* verify
 # worktree). shared is a member that declares pytest, and the scripts tests import
 # no first-party package, so its env suffices — pre-1 confirmed the
-# `uv run --project shared` environment does collect and run all 40 modules under
+# `uv run --project shared` environment does collect and run every module under
 # scripts/tests/. No --directory, so cwd stays at the worktree root and BOTH
 # relative target paths still resolve. Mirrors the other subprojects'
 # --project <member> convention.
@@ -26,8 +26,12 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # not a swap is not recoverable from the command alone.
 #
 # WHAT WAS CLOSED. This command used to target only tests/scripts/, while this
-# directory has 40 test modules of its own under scripts/tests/. All three
-# production paths that reach the FULL_SUITE form ran the wrong tree —
+# directory has a whole test suite of its own under scripts/tests/. (Stated
+# without a module COUNT deliberately: the claim is "a whole tree was ungated",
+# true at any size, and every hard-coded count of this directory rots on the
+# next test file added — the "40" this block first shipped with was already
+# stale at HEAD, inherited from task 3445.) All three production paths that
+# reach the FULL_SUITE form ran the wrong tree —
 # measured live through the derive_verify_plan ->
 # verify._executed_module_configs_from_plan bridge before the fix:
 #
@@ -65,10 +69,20 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # spelling copy the repo-root fleet chain's trailing segment
 # (`pytest tests/scripts/ scripts/tests/`, task 3384 / commit 1eaaf26ab9)
 # verbatim, so the fallback path and this module config cannot drift into two
-# different notions of "the scripts suites". Guarded by
-# tests/scripts/test_scripts_module_config.py::
-# test_scripts_full_suite_pytest_covers_scripts_tests, whose assertion (5) is
-# what rejects a future narrowing back to one directory.
+# different notions of "the scripts suites".
+#
+# BOTH of those claims are GATED, not merely asserted here — a
+# documented-but-ungated invariant is the same defect class this task closed.
+# In tests/scripts/test_scripts_module_config.py:
+#   * test_scripts_full_suite_pytest_covers_scripts_tests — assertion (5) is
+#     what rejects a future narrowing back to one directory.
+#   * test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites —
+#     the anti-drift half, added by this task's amendment pass: the fleet
+#     chain's scripts-suites pytest segment and this command must name the
+#     SAME set of directories, so widening either one alone fails. Order is
+#     deliberately NOT pinned there (pytest collects directories
+#     order-insensitively); "same order" above is a readability convention for
+#     the reader diffing the two files, not a correctness property.
 #
 # MEASURED GREEN BEFORE SWITCHING, on this exact string, two runs at base main
 # b3155c13c7 — non-optional, because verify.run_full_verification
@@ -83,12 +97,35 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # run-to-run spread is this oversubscribed host, the same effect
 # tests/scripts/orchestrator.yaml's budget block sizes against.
 #
+# THE COST DELTA, measured against the command this REPLACES rather than only
+# in absolutes, so follow-up 3458 sizes verify_command_timeout_secs from a
+# baseline instead of re-deriving one. The old `pytest tests/scripts/` form,
+# same flags, two runs on this same host:
+#
+#   run 1   exit 0    677 passed, 1 skipped   331.56s pytest / 339.09s wall
+#   run 2   exit 0    677 passed, 1 skipped   428.18s pytest / 436.92s wall
+#
+# So the union buys +1249 collected tests for roughly +100s of wall-clock
+# (~+25%) — scripts/tests/ is the larger tree by module count but far cheaper
+# per test. Read that delta with its error bars: ~25% is the SAME ORDER as the
+# ~29% / ~20% spread WITHIN each pair on this host, and the two pairs were
+# taken at different times under different load, so the honest claim is
+# "roughly +1.5 to +2 minutes", not a multiple, and not a figure to plan a
+# tight timeout around. WHO PAYS IT is the sharper half: this is not a
+# merge-only cost, because verify_plan._derive_module_runs arm 3 runs this
+# command VERBATIM for any scripts/ production diff — so a one-line edit to an
+# operator script under scripts/ now pays the union where it used to pay
+# tests/scripts/ alone. That is the trade this task deliberately makes: before
+# it, that same one-line edit ran NONE of the touched module's own tests.
+#
 # verify_command_timeout_secs stays UNSET here, so this module keeps inheriting
 # the repo-root whole-fleet 3600s ceiling — see the note at the bottom of this
-# file; sizing it remains follow-up 3458's. The risk direction is safe: this
-# command is strictly longer than the one it replaces but the slower measured
-# run is ~6.4x under that ceiling, and guessing a tight budget here could
-# red-wall every merge repo-wide under load, which not setting one cannot.
+# file; sizing it remains follow-up 3458's, which should start from the four
+# measured runs above (both the union and the command it replaced) rather than
+# re-deriving a baseline. The risk direction is safe: this command is strictly
+# longer than the one it replaces but the slower measured run is ~6.4x under
+# that ceiling, and guessing a tight budget here could red-wall every merge
+# repo-wide under load, which not setting one cannot.
 #
 # THE DUPLICATE-RUN COST IS NOT RESOLVED BY THIS CHANGE. tests/scripts/ still
 # executes twice per full verify — once from this config and once from the
@@ -99,6 +136,14 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # guard in run_full_verification — production code of a different class from a
 # yaml command edit. Note 3383's own "BYTE-IDENTICAL test_commands" framing is
 # now stale (these two commands differ); its substance survives unchanged.
+#
+# "Not resolved" UNDERSTATES it if read alone, so read it with the COST DELTA
+# block above: a full verify now collects tests/scripts/ twice AND
+# scripts/tests/ once, so this change did not merely leave the duplication in
+# place — it raised the absolute per-verify wall-clock (~+25%, measured) on top
+# of it. The duplicated leg is the smaller of the two trees by test count, but
+# it is duplicated on every review checkpoint, main-tip sweep and merge
+# full-verify, which is what makes 3383 worth doing rather than merely tidy.
 
 # LINT IS DECLARED DELIBERATELY (task 3445).
 #
