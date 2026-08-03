@@ -1099,3 +1099,240 @@ class TestMainProbeIsolatedFlakeConfirmGate:
         assert PROBE_NODE_ID in called_mc.test_command, called_mc.test_command
         assert called_mc.lint_command is None, called_mc.lint_command
         assert called_mc.type_check_command is None, called_mc.type_check_command
+
+    # -- step-3: FAIL-SAFE (None) paths --------------------------------------
+
+    def test_returns_none_when_isolated_rerun_still_fails(self, tmp_path: Path) -> None:
+        """(a) Isolated re-run FAILS on every attempt -> None (fail-safe: the
+        caller keeps today's preexisting verdict), and run_verification was
+        awaited exactly _SWEEP_CONFIRM_MAX_ATTEMPTS times — the bounded retry
+        from _run_isolated_confirm_group."""
+        from orchestrator import verify as verify_module
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            )
+        ]
+
+        still_failing = VerifyResult(
+            passed=False,
+            test_output=f'FAILED {PROBE_NODE_ID}\n',
+            lint_output='',
+            type_output='',
+            summary='test_failure',
+            cause_hint=f'FAILED {PROBE_NODE_ID}',
+            category='test_failure',
+        )
+        rv = AsyncMock(return_value=still_failing)
+
+        with patch.object(verify_module, 'run_verification', rv):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, module_configs, LOAD_FLAKE_MAIN_RESULT,
+                )
+            )
+
+        assert result is None, f'Expected None when isolated re-run still fails, got {result!r}'
+        assert rv.await_count == verify_module._SWEEP_CONFIRM_MAX_ATTEMPTS, (
+            f'Expected exactly {verify_module._SWEEP_CONFIRM_MAX_ATTEMPTS} attempts, '
+            f'got {rv.await_count}'
+        )
+
+    def test_returns_none_when_no_recoverable_node_id(self, tmp_path: Path) -> None:
+        """(b) main_result.test_output='' -> no extractable node-id -> None,
+        and run_verification is NEVER awaited (the cheap early-out pays no
+        subprocess)."""
+        from orchestrator import verify as verify_module
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            )
+        ]
+
+        opaque_main_result = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='opaque_failure',
+            cause_hint='opaque_failure',
+            category='opaque_failure',
+        )
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with patch.object(verify_module, 'run_verification', rv):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, module_configs, opaque_main_result,
+                )
+            )
+
+        assert result is None, f'Expected None (no recoverable node-id), got {result!r}'
+        rv.assert_not_awaited()
+
+    def test_returns_none_when_no_recoverable_node_id_lint_shaped(self, tmp_path: Path) -> None:
+        """(b) variant: a lint/type-shaped failure (test_output='', a
+        type_output naming a TS error) -> no extractable node-id -> None, and
+        run_verification is NEVER awaited."""
+        from orchestrator import verify as verify_module
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            )
+        ]
+
+        lint_shaped_main_result = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='error TS2769: foo.tsx:12',
+            summary='TS2769 compile_error',
+            cause_hint='error TS2769: foo.tsx:12',
+            category='compile_error',
+        )
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with patch.object(verify_module, 'run_verification', rv):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, module_configs, lint_shaped_main_result,
+                )
+            )
+
+        assert result is None, f'Expected None (no recoverable node-id), got {result!r}'
+        rv.assert_not_awaited()
+
+    def test_returns_none_when_node_id_unmappable(self, tmp_path: Path) -> None:
+        """(c) node-id present in the output but module_configs=[] (no
+        discovered subproject can own it — the shape every existing test in
+        this file uses) -> None, and run_verification is never awaited."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with patch.object(verify_module, 'run_verification', rv):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, [], LOAD_FLAKE_MAIN_RESULT,
+                )
+            )
+
+        assert result is None, f'Expected None (unmappable node-id), got {result!r}'
+        rv.assert_not_awaited()
+
+    def test_returns_none_when_isolated_rerun_is_internalerror(self, tmp_path: Path) -> None:
+        """(d) run_verification -> passed=True, category='pytest_internalerror'
+        (deliberately paired with passed=True to pin that the category check
+        is FIRST and independent of the passed flag) -> None."""
+        from orchestrator import verify as verify_module
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            )
+        ]
+
+        internalerror_result = VerifyResult(
+            passed=True,
+            test_output=(
+                'INTERNALERROR> Traceback (most recent call last):\n'
+                'INTERNALERROR>   KeyError: <WorkerController gw3>\n'
+            ),
+            lint_output='',
+            type_output='',
+            summary='pytest_internalerror',
+            cause_hint='INTERNALERROR> KeyError: <WorkerController gw3>',
+            category='pytest_internalerror',
+        )
+        rv = AsyncMock(return_value=internalerror_result)
+
+        with patch.object(verify_module, 'run_verification', rv):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, module_configs, LOAD_FLAKE_MAIN_RESULT,
+                )
+            )
+
+        assert result is None, (
+            f'Expected None on pytest_internalerror (unconfirmable), got {result!r}'
+        )
+
+    def test_returns_none_when_isolated_rerun_raises(self, tmp_path: Path) -> None:
+        """(e) run_verification raises RuntimeError on every attempt -> None,
+        and the helper does NOT propagate (never raises)."""
+        from orchestrator import verify as verify_module
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            )
+        ]
+
+        rv = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with patch.object(verify_module, 'run_verification', rv):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, module_configs, LOAD_FLAKE_MAIN_RESULT,
+                )
+            )
+
+        assert result is None, f'Expected None (never raises), got {result!r}'
