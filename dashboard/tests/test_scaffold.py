@@ -8,6 +8,37 @@ import pytest
 
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
 
+# The stable identifying substring of from_env()'s cwd-fallback INFO record
+# (dashboard/src/dashboard/config.py, task 3503).
+_FALLBACK_MARKER = 'DASHBOARD_PROJECT_ROOT unset'
+
+
+def _fallback_records(caplog):
+    """The ``from_env()`` cwd-fallback records in *caplog*, matched precisely.
+
+    Matches logger + level + marker rather than "any record from
+    ``dashboard.config``" or "any INFO from ``dashboard.config``", so that:
+
+    * the pre-existing ``_discover_escalation_urls`` WARNINGs in the same
+      module — which also name the project root — can neither satisfy the
+      positive assertion nor break it with a second match; and
+    * an unrelated INFO line added to ``config.py`` later cannot fail the
+      negative assertion with a misleading message.
+
+    Requiring INFO specifically is what pins the level choice: a future
+    "upgrade" to WARNING yields zero matches and fails the positive test.  INFO
+    and not WARNING is deliberate — the canonical deployment relies on the cwd
+    path by design (the systemd units pin ``WorkingDirectory`` on purpose), so
+    a WARNING would cry wolf on the supported configuration.
+    """
+    return [
+        r
+        for r in caplog.records
+        if r.name == 'dashboard.config'
+        and r.levelno == logging.INFO
+        and _FALLBACK_MARKER in r.getMessage()
+    ]
+
 
 @pytest.fixture
 def symlinked_dir(tmp_path):
@@ -32,12 +63,14 @@ class TestConfigDefaults:
         assert DEFAULT_FUSED_MEMORY_URLS == ('http://localhost:8002',)
 
     def test_config_defaults(self):
+        # project_root is deliberately NOT asserted here: `cfg.project_root ==
+        # Path.cwd().resolve()` merely restates default_factory=Path.cwd plus
+        # __post_init__'s .resolve() against themselves and cannot fail for any
+        # cwd.  test_default_project_root_tracks_cwd below owns that contract
+        # non-tautologically (task 3503).
         cfg = DashboardConfig()
         assert cfg.host == '127.0.0.1'
         assert cfg.port == 8080
-        # Machine-independent: the default is the process's cwd, not a literal
-        # pinned to one developer's checkout (task 3503).
-        assert cfg.project_root == Path.cwd().resolve()
         assert cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)
 
     def test_default_project_root_tracks_cwd(self, monkeypatch, tmp_path):
@@ -159,40 +192,24 @@ class TestConfigEnvOverrides:
     def test_unset_project_root_logs_the_cwd_fallback_at_info(
         self, monkeypatch, tmp_path, caplog
     ):
-        """An un-configured root must be observable, not an invisible fallback.
-
-        Scoped to the ``dashboard.config`` logger at INFO so the pre-existing
-        ``_discover_escalation_urls`` WARNINGs in the same module can neither
-        satisfy nor break these assertions.
-        """
+        """An un-configured root must be observable, not an invisible fallback."""
         monkeypatch.delenv('DASHBOARD_PROJECT_ROOT', raising=False)
         monkeypatch.chdir(tmp_path)
 
         with caplog.at_level(logging.INFO, logger='dashboard.config'):
             cfg = DashboardConfig.from_env()
 
-        # Filter on INFO level, not merely on "names the root": the pre-existing
-        # _discover_escalation_urls WARNING also names the root, so a
-        # level-agnostic filter would both be satisfied by it and be broken by
-        # it (two matches instead of one).  Requiring exactly one INFO record
-        # therefore pins BOTH that the fallback is logged and that it is logged
-        # at INFO — a future "upgrade" to WARNING yields zero INFO records and
-        # fails here.
-        #
-        # INFO, not WARNING, deliberately: the canonical deployment relies on
-        # the cwd path by design (WorkingDirectory is pinned on purpose), so a
-        # WARNING would cry wolf on the supported configuration.
-        fallback_records = [
-            r
-            for r in caplog.records
-            if r.name == 'dashboard.config'
-            and r.levelno == logging.INFO
-            and str(cfg.project_root) in r.getMessage()
-        ]
-        assert len(fallback_records) == 1, (
-            f'expected exactly one INFO record naming the cwd-derived root '
-            f'{cfg.project_root}, got '
+        records = _fallback_records(caplog)
+        assert len(records) == 1, (
+            f'expected exactly one fallback record, got '
             f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+        # The record must name the root the config ACTUALLY ended up with — a
+        # re-derived path that drifts from cfg.project_root would make the
+        # journal line point at a root the process is not using.
+        assert str(cfg.project_root) in records[0].getMessage(), (
+            f'fallback record does not name the resolved root '
+            f'{cfg.project_root}: {records[0].getMessage()}'
         )
 
     def test_set_project_root_logs_no_fallback(self, monkeypatch, tmp_path, caplog):
@@ -201,11 +218,16 @@ class TestConfigEnvOverrides:
         with caplog.at_level(logging.INFO, logger='dashboard.config'):
             DashboardConfig.from_env()
 
-        assert not [
-            r
-            for r in caplog.records
-            if r.name == 'dashboard.config' and r.levelno == logging.INFO
-        ], 'an explicitly-configured root must not emit a fallback record'
+        # Matched on the fallback record specifically, NOT on "any INFO from
+        # dashboard.config": an unrelated INFO line added to config.py later
+        # would otherwise fail this test with a misleading message.  Note the
+        # marker cannot be paired with the root here the way the positive test
+        # pairs them — a spuriously-emitted fallback record would name the
+        # cwd-derived root, not tmp_path, so a root-matching filter would miss
+        # exactly the regression this test exists to catch.
+        assert not _fallback_records(caplog), (
+            'an explicitly-configured root must not emit a fallback record'
+        )
 
 
 class TestManagedRuntimeEnvOverrides:

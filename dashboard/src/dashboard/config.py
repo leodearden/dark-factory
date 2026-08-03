@@ -253,9 +253,9 @@ class DashboardConfig:
         """Create config with DASHBOARD_-prefixed env var overrides.
 
         When ``DASHBOARD_PROJECT_ROOT`` is unset, the cwd-derived fallback root
-        (see the ``project_root`` field) is logged at INFO so the resolved root
-        is observable in the journal instead of being an invisible default —
-        every database path the dashboard opens hangs off it.
+        (see the ``project_root`` field) is logged at INFO — read off the
+        CONSTRUCTED config, so the journal always names the root the databases
+        actually hang off — instead of being an invisible default.
 
         INFO and not WARNING, deliberately: the canonical deployment relies on
         the cwd path BY DESIGN — the systemd units pin ``WorkingDirectory`` on
@@ -275,14 +275,24 @@ class DashboardConfig:
             kwargs['port'] = int(port)
         if (root := os.environ.get('DASHBOARD_PROJECT_ROOT')) is not None:
             kwargs['project_root'] = Path(root)
-        else:
-            logger.info(
-                'DASHBOARD_PROJECT_ROOT unset — using cwd-derived project_root %s '
-                '(all database paths are derived from it)',
-                Path.cwd().resolve(),
-            )
         if (urls := os.environ.get('DASHBOARD_FUSED_MEMORY_URLS')) is not None:
             kwargs['fused_memory_urls'] = [u.strip() for u in urls.split(',') if u.strip()]
         if (roots := os.environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS')) is not None:
             kwargs['known_project_roots'] = [Path(p.strip()) for p in roots.split(',') if p.strip()]
-        return cls(**kwargs)
+
+        config = cls(**kwargs)
+        if root is None:
+            # Log the CONSTRUCTED project_root, never a re-derivation of it.
+            # The fallback is `default_factory=Path.cwd` plus __post_init__'s
+            # .resolve(); re-computing `Path.cwd().resolve()` here would be a
+            # second copy of that derivation, and any future change to how the
+            # fallback root is computed (walking up to the repo root, honouring
+            # a different var) would silently make this line name a path the
+            # process is not actually using — in a message whose entire job is
+            # to be the one observable record of a silently-relocated data root.
+            logger.info(
+                'DASHBOARD_PROJECT_ROOT unset — using cwd-derived project_root %s '
+                '(all database paths are derived from it)',
+                config.project_root,
+            )
+        return config
