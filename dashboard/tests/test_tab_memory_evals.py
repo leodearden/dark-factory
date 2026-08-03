@@ -173,6 +173,65 @@ def _extract_function_body(src: str, fn_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helper: find the innermost `function` declaration enclosing an offset
+# ---------------------------------------------------------------------------
+
+
+def _enclosing_function(src: str, idx: int) -> tuple[str, list[str]] | None:
+    """Return ``(name, param_names)`` of the innermost ``function`` enclosing ``idx``.
+
+    Returns ``None`` when ``idx`` sits at module scope.
+
+    WHY A BRACE WALK AND NOT A REGEX SPAN.  The obvious spelling —
+    ``function\\s+(\\w+)\\s*\\(([^)]*)\\)\\s*\\{[\\s\\S]{0,300}?<call>`` — silently
+    matches ACROSS function boundaries: with a short helper declared just above
+    the one that actually makes the call, the bounded ``[\\s\\S]`` span reaches
+    past the helper's closing brace and attributes the call to the WRONG
+    function, along with the wrong parameter list.  Measured, not argued: over
+    the shipped ``provOpenKey`` / ``readProvOpen`` pair that span attributes
+    ``localStorage.getItem(key)`` to ``provOpenKey(evalId)`` and reports the
+    key as not-a-parameter — a false FAILURE against correct code.  The walk
+    below is exact.
+    """
+    best: tuple[str, list[str]] | None = None
+    best_start = -1
+    for m in re.finditer(r'\bfunction\s+(\w+)\s*\(', src):
+        paren_depth = 1
+        i = m.end()
+        while i < len(src) and paren_depth > 0:
+            if src[i] == '(':
+                paren_depth += 1
+            elif src[i] == ')':
+                paren_depth -= 1
+            i += 1
+        if paren_depth != 0:
+            continue
+        params_text = src[m.end() : i - 1]
+        start = src.find('{', i)
+        if start == -1:
+            continue
+        depth = 0
+        end = -1
+        for j in range(start, len(src)):
+            if src[j] == '{':
+                depth += 1
+            elif src[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end == -1:
+            continue
+        if start < idx < end and m.start() > best_start:
+            best_start = m.start()
+            best = (
+                m.group(1),
+                [p.strip() for p in params_text.split(',') if p.strip()],
+            )
+    return best
+
+
+# ---------------------------------------------------------------------------
 # Helper: extract a module-scope `const <name> = { ... }` / `[ ... ]` literal
 # ---------------------------------------------------------------------------
 
@@ -1674,10 +1733,11 @@ def test_limits_provenance_open_state_is_per_eval(
         'rather than per-section.'
     )
     initializer = state_decl.group(3)
-    read_helpers = [
-        m.group(1)
-        for m in re.finditer(r'function\s+(\w+)\s*\([^)]*\)\s*\{[\s\S]{0,300}?localStorage\.getItem\(', code)
-    ]
+    read_helpers = sorted({
+        fn[0]
+        for m in re.finditer(r'localStorage\.getItem\(', code)
+        if (fn := _enclosing_function(code, m.start())) is not None
+    })
     assert read_helpers, (
         'no function in tab_memory_evals.jsx reads localStorage — the '
         'provenance open state must still be PERSISTED across reloads.'
@@ -1723,14 +1783,17 @@ def test_limits_provenance_open_state_is_per_eval(
     #     key structurally unrepresentable, not merely absent today.
     for call in ('getItem', 'setItem'):
         sites = list(re.finditer(
-            r'function\s+(\w+)\s*\(([^)]*)\)\s*\{[\s\S]{0,300}?localStorage\.'
-            + call + r'\(\s*([\w.]+)',
-            code,
+            r'localStorage\.' + call + r'\(\s*([\w.]+)', code
         ))
         assert sites, f'no `localStorage.{call}(` call site found in tab_memory_evals.jsx.'
         for site in sites:
-            fn_name, params, first_arg = site.group(1), site.group(2), site.group(3)
-            param_names = [p.strip() for p in params.split(',') if p.strip()]
+            first_arg = site.group(1)
+            enclosing = _enclosing_function(code, site.start())
+            assert enclosing is not None, (
+                f'a `localStorage.{call}(` call sits at module scope — the '
+                'storage key must be a parameter of an enclosing helper.'
+            )
+            fn_name, param_names = enclosing
             assert first_arg in param_names, (
                 f'`{fn_name}` passes {first_arg!r} to localStorage.{call}() but '
                 f'its parameters are {param_names}. The storage key must be a '
