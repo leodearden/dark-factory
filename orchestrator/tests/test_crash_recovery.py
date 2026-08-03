@@ -1875,8 +1875,9 @@ class TestSessionResumeGuard:
     async def test_transcript_absent_falls_back_no_transcript(
         self, harness: Harness, tmp_path: Path
     ):
-        """config_dir stashed but the transcript jsonl was wiped (B4 foreign-
-        acquire reseed shape) → fallback reason 'no_transcript'.
+        """The config dir SURVIVES on disk but this session's transcript jsonl
+        is absent → fallback reason 'no_transcript' (a genuine corroboration
+        failure — distinct from the whole-store wipe, which is 'reseeded').
         """
         session = {
             'session_id': 'uuid-notr',
@@ -1889,6 +1890,73 @@ class TestSessionResumeGuard:
         harness.config.session_resume = SessionResumeConfig()
 
         resume_id = await _drive_session_slot(harness, 'n1', session, config_dir=empty_cfg)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'no_transcript'
+
+    async def test_wiped_config_dir_falls_back_reseeded(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The stashed config dir is GONE from disk → fallback reason
+        'reseeded' (task 3256).
+
+        Models the lane having been re-seeded between boot-time adoption and
+        re-dispatch: warm-lane acquire ALWAYS re-seeds from base, which wipes
+        ``<lane>/.task/`` (``git clean -xfd`` on the RECYCLE route,
+        ``rmtree(lane/'.task')`` on RESET_IN_PLACE_REATTACH) and with it the
+        whole ``claude-config-*`` transcript store. That is the always-reseed
+        invariant working as designed — an EXPECTED fallback, not a
+        corroboration failure — so it must be classified apart from
+        'no_transcript'.
+        """
+        session = {
+            'session_id': 'uuid-reseed',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        gone = tmp_path / 'gone' / 'claude-config-x'
+        assert not gone.exists()  # the reseed already swept the lane
+        harness.config.session_resume = SessionResumeConfig()
+
+        resume_id = await _drive_session_slot(harness, 'rs1', session, config_dir=gone)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        # The event type is UNCHANGED — the downgrade suppresses the
+        # escalation, not the telemetry channel (PRD open question 3).
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'reseeded'
+
+    async def test_surviving_config_dir_missing_transcript_stays_no_transcript(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A config dir that SURVIVES the lane's lifetime but has lost only
+        this session's transcript must NOT be swallowed by the new 'reseeded'
+        branch (task 3256) — it is a real, distinct failure mode and stays a
+        loud 'no_transcript' corroboration failure.
+        """
+        session = {
+            'session_id': 'uuid-survivor',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        # A REAL claude-config dir, with a projects/ tree holding some OTHER
+        # session's transcript but not this one's.
+        survivor = _make_transcript(tmp_path, 'uuid-other')
+        assert survivor.is_dir()
+        harness.config.session_resume = SessionResumeConfig()
+
+        resume_id = await _drive_session_slot(
+            harness, 'sv1', session, config_dir=survivor
+        )
 
         assert resume_id is None
         emits = _session_resume_emits(harness)
