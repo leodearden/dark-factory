@@ -639,6 +639,36 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
     return _stderr_has_cli_input_required(result.stderr)
 
 
+def require_non_blank_prompt(prompt: str | None, *, context: str) -> None:
+    """Raise ``ValueError`` when *prompt* is None, empty, or whitespace-only.
+
+    The other half of the esc-3118-1 fix: make the "prompt never reached the
+    CLI" failure impossible to cause from OUR side.
+
+    The claude backend is 100% stdin-dependent.  ``build_claude_argv`` emits
+    ``cmd = ['claude', '--print', '--output-format', 'json']`` and NEVER
+    appends a positional prompt or a ``-`` stdin marker (unlike the codex
+    backend in ``orchestrator/agents/invoke.py``, which passes its own input
+    argument).  The prompt is delivered solely by
+    ``stdin_data = prompt.encode()``, and a blank one pipes happily — the CLI
+    then exits on argument validation with an opaque
+    "Input must be provided either through stdin or as a prompt argument"
+    error, zero-cost and zero-turn, with no indication that WE sent nothing.
+
+    Called at every boundary that can originate an invocation, so the failure
+    surfaces at the caller that built the blank prompt — with *context* naming
+    it — instead of as an unattributable CLI error many layers away.
+    """
+    if prompt is None or not prompt.strip():
+        raise ValueError(
+            f'{context}: prompt must be a non-empty, non-whitespace string. '
+            f'The claude CLI receives the prompt ONLY via stdin (the argv carries '
+            f'no positional prompt), so a blank prompt is piped silently and the '
+            f'CLI rejects the invocation before any model turn with an opaque '
+            f'argument error (esc-3118-1). Got {prompt!r}.'
+        )
+
+
 def _should_retry_cli_input_rejected(result: AgentResult, retries_used: int) -> bool:
     """The SINGLE definition of the pre-turn-rejection retry policy.
 
@@ -1249,7 +1279,11 @@ async def invoke_with_cap_retry(
     # this swap: its resumed session must receive the real prompt, not the short
     # crash-recovery continuation prompt.
     if invoke_kwargs.get('resume_session_id'):
-        if not original_prompt:
+        # `.strip()` (task 3143): a whitespace-only prompt corrupts the
+        # fresh-fallback exactly as an empty one does — the CLI receives it via
+        # stdin and rejects the invocation before any model turn. Same
+        # TypeError, same message; one more shape caught.
+        if not original_prompt.strip():
             raise TypeError(
                 "invoke_with_cap_retry: 'prompt' must be a non-empty string when "
                 "'resume_session_id' is set.  The prompt is the real task context used "
@@ -1258,6 +1292,15 @@ async def invoke_with_cap_retry(
             )
         if not resume_delivers_prompt:
             invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
+    else:
+        # Non-resume invocation: the prompt IS the whole request, so a blank one
+        # is always a caller bug.  Raised here — before any invoke_slot is
+        # acquired — so a blank prompt never consumes an account slot, never
+        # burns a dispatch, and never reaches the CLI as an opaque argument
+        # error (esc-3118-1).  Deliberately NOT applied on the resume branch
+        # above, which has its own (TypeError) contract and legitimately
+        # overwrites `prompt` with a short continuation string.
+        require_non_blank_prompt(invoke_kwargs.get('prompt'), context=f'{label}')
     consecutive_cap_hits = 0
     cli_input_rejected_retries = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
@@ -2170,6 +2213,10 @@ async def _invoke_claude(
     strict_mcp_config: bool = False,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
+    # BEFORE build_claude_argv, which writes system-prompt / mcp-config temp
+    # files: a blank prompt can never produce a useful run, so failing here
+    # leaves nothing to clean up and never spawns a subprocess.
+    require_non_blank_prompt(prompt, context='_invoke_claude')
     cmd, temp_files = build_claude_argv(
         model=model,
         max_budget_usd=max_budget_usd,

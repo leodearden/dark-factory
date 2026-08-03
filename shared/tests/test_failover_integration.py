@@ -1046,52 +1046,33 @@ class TestEdgeCases:
         assert kwargs['input_tokens'] is None
         assert kwargs['output_tokens'] is None
 
-    async def test_no_prompt_key_defaults_to_empty(self):
-        """invoke_kwargs with no 'prompt' key -> original_prompt defaults to ''."""
-        make_gate(['A', 'B'])
+    async def test_no_prompt_key_is_rejected_loudly(self):
+        """invoke_kwargs with no 'prompt' key -> ValueError before any dispatch.
 
-        capped = make_result(session_id='sess-1', stderr=_cap_stderr())
-        ok = make_result(success=True, output='ok')
-
-        with (
-            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
-                  side_effect=[capped, ok]) as mock_inv,
-            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
-        ):
-            # When no prompt key, the default is '' and invoke_claude_agent is
-            # called without prompt kwarg initially (it would come from **invoke_kwargs)
-            # But invoke_claude_agent requires 'prompt' positional, so we must
-            # test that original_prompt captures '' when 'prompt' not in kwargs.
-            # Since invoke_claude_agent(**invoke_kwargs) requires prompt, we use
-            # the fallback behavior: on cap hit with no session_id,
-            # invoke_kwargs['prompt'] = original_prompt = ''
-            # With session_id, the resume path sets prompt = CAP_HIT_RESUME_PROMPT.
-            # On resume failure, it falls back to original_prompt = ''.
-            pass
-
-        # The actual behavior: original_prompt = invoke_kwargs.get('prompt', '')
-        # which is '' when prompt is not in kwargs. This is an internal detail
-        # that's hard to test end-to-end since invoke_claude_agent needs prompt.
-        # We test via a fresh invoke after resume failure:
-        gate2 = make_gate(['A', 'B', 'C'])
-        capped = make_result(session_id='sess-1', stderr=_cap_stderr())
-        failed = make_result(success=False, output='fail')
-        ok = make_result(success=True, output='ok')
+        SUPERSEDES test_no_prompt_key_defaults_to_empty (task 3143 /
+        esc-3118-1).  That test characterised the OLD behaviour: a missing
+        prompt silently defaulted to '' and was piped to the CLI, which — the
+        claude argv carrying no positional prompt — rejected the invocation
+        before any model turn with an opaque argument error, zero-cost and
+        zero-turn, with nothing indicating WE had sent nothing.  Defaulting a
+        missing prompt to '' is now a caller bug caught at the boundary, so the
+        silent-degradation path this asserted no longer exists.
+        """
+        gate = make_gate(['A', 'B', 'C'])
 
         with (
-            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
-                  side_effect=[capped, failed, ok]) as mock_inv,
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock) as mock_inv,
             patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
         ):
-            await invoke_with_cap_retry(
-                gate2, 'test-no-prompt',
-                system_prompt='sys', cwd=Path('/tmp'),
-                # NOTE: no prompt= keyword
-            )
+            with pytest.raises(ValueError, match='non-empty'):
+                await invoke_with_cap_retry(
+                    gate, 'test-no-prompt',
+                    system_prompt='sys', cwd=Path('/tmp'),
+                    # NOTE: no prompt= keyword
+                )
 
-        # Third call should use original_prompt which is '' (no prompt kwarg)
-        third = mock_inv.call_args_list[2]
-        assert third.kwargs.get('prompt') == ''
+        # Nothing was dispatched and no account slot was consumed.
+        mock_inv.assert_not_called()
 
     async def test_no_model_key_defaults_to_opus(self):
         """invoke_kwargs with no 'model' key -> model defaults to 'opus'."""
