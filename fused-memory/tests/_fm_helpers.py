@@ -7,15 +7,17 @@ module name so test files can `from _fm_helpers import X` without
 colliding with sibling subprojects' helpers.
 """
 
+import ast
 import asyncio
 import contextlib
 import functools
 import inspect
 import json
 import os
+import pathlib
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -1137,3 +1139,97 @@ async def reap_leaked_ticket_workers() -> int:
         if task.done():
             reaped += 1
     return reaped
+
+
+# ---------------------------------------------------------------------------
+# Shared AST migration-guard machinery (task 3502)
+# ---------------------------------------------------------------------------
+#
+# The "no test module may re-fork this helper" guards
+# (tests/test_falkor_probe_routing_guard.py; tests/test_falkor_index_barrier_guard.py
+# is the second consumer, migrated separately) each discover their own module
+# set from an AST predicate rather than a hand-written list. Only the predicate
+# differs, so the walk / prefilter / parse machinery lives here once: a fix to
+# the discriminator (an ast.Attribute chain the walker misses, a renamed API)
+# then lands in one place instead of being copy-pasted between guards — which
+# is precisely the drift those guards exist to prevent, one level up.
+#
+# The memoisation also collapses what would otherwise be one filesystem walk
+# and one parse of every test module PER GUARD into one of each per session.
+# ---------------------------------------------------------------------------
+
+TESTS_DIR = pathlib.Path(__file__).parent
+
+
+@functools.cache
+def _test_module_paths() -> tuple[pathlib.Path, ...]:
+    """Every ``test_*.py`` under the tests tree, sorted, memoised per session."""
+    return tuple(sorted(TESTS_DIR.glob('**/test_*.py')))
+
+
+@functools.cache
+def _test_module_source(path: pathlib.Path) -> str:
+    return path.read_text()
+
+
+@functools.cache
+def parse_test_module(path: pathlib.Path) -> ast.Module:
+    """Parse *path* into an ``ast.Module``, memoised per session.
+
+    Test sources do not change mid-session, so several guards asserting over
+    overlapping module sets can share one parse per file.
+    """
+    assert path.exists(), f'{path} not found'
+    return ast.parse(_test_module_source(path), filename=str(path))
+
+
+def calls_named(tree: ast.Module, name: str) -> list[ast.Call]:
+    """Every ``ast.Call`` in *tree* whose callee is ``name(...)`` or ``….name(...)``.
+
+    AST, not string grep: prose that merely mentions the name — a docstring
+    describing the helper a guard enforces — must not satisfy or trip a check.
+    """
+    found: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (isinstance(func, ast.Name) and func.id == name) or (
+            isinstance(func, ast.Attribute) and func.attr == name
+        ):
+            found.append(node)
+    return found
+
+
+def discover_test_modules(
+    predicate: Callable[[ast.Module], bool],
+    *,
+    exclude: Iterable[pathlib.Path] = (),
+    text_prefilter: str | None = None,
+) -> list[pathlib.Path]:
+    """Every test module whose AST satisfies *predicate*.
+
+    Discovery rather than a hand-maintained list is the point: the next module
+    that copy-pastes a guarded fixture is covered with no edit to the guard.
+
+    Args:
+        predicate: Applied to the parsed module; True selects it.
+        exclude: Paths to skip — normally the calling guard itself, which names
+            the guarded tokens in prose.
+        text_prefilter: Optional substring that must appear in the raw source
+            before the module is parsed at all. Only sound when it is a strict
+            superset of *predicate* (e.g. the identifier the predicate looks
+            for in an ast.Call, which cannot exist without appearing
+            literally), in which case it narrows the candidate set without
+            being able to hide a module.
+    """
+    excluded = {p.resolve() for p in exclude}
+    found: list[pathlib.Path] = []
+    for path in _test_module_paths():
+        if path.resolve() in excluded:
+            continue
+        if text_prefilter is not None and text_prefilter not in _test_module_source(path):
+            continue
+        if predicate(parse_test_module(path)):
+            found.append(path)
+    return found
