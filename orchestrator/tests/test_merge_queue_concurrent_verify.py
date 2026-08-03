@@ -31,6 +31,7 @@ import contextlib
 import dataclasses
 import logging
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -289,11 +290,69 @@ def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
 
 
 # task 3492: the pyproject-configured default per-test timeout ceiling that
-# every heavy-wait class in this module must clear. See
-# orchestrator/pyproject.toml:99 (`timeout = 60`) -- not a bare literal, so
-# this cannot drift from the real pytest-timeout configuration it guards
-# against.
+# every heavy-wait class in this module must clear. This is a hand-mirrored
+# copy of `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
+# (currently 60) -- it is still a literal and CAN drift if that setting
+# changes without a matching edit here; there is no automated link between
+# the two.
 PYPROJECT_DEFAULT_TIMEOUT = 60
+
+
+def _timeout_mark_offenders(
+    budgets: dict[str, float],
+    resolve: Callable[[str], object | None],
+) -> list[str]:
+    """Pure offender-accumulation for the timeout-mark coverage guard.
+
+    For each ``class_name -> budget`` pair at or above
+    ``PYPROJECT_DEFAULT_TIMEOUT``, resolve *class_name* via *resolve* and
+    check it carries a ``timeout`` mark whose value clears *budget*.
+    Returns one formatted offender string per failing class; an empty list
+    means every heavy class is adequately marked.
+
+    Extracted as a pure function (independent of ``globals()`` and this
+    module's real classes) so its three failure branches -- unresolvable
+    class name, missing mark, mark value too tight -- are each directly
+    testable with synthetic stubs, rather than only ever exercised by the
+    happy path over this module's own (now fully-marked) classes.
+    """
+    offenders: list[str] = []
+    for class_name, budget in sorted(budgets.items()):
+        if budget < PYPROJECT_DEFAULT_TIMEOUT:
+            continue
+
+        cls = resolve(class_name)
+        if cls is None:
+            offenders.append(
+                f'{class_name}: computed budget {budget}s, but the '
+                f'class could not be resolved from module globals to '
+                f'inspect its marks.'
+            )
+            continue
+
+        mark = next(
+            (m for m in getattr(cls, 'pytestmark', []) if m.name == 'timeout'),
+            None,
+        )
+        if mark is None:
+            offenders.append(
+                f'{class_name}: computed worst-case per-method wait '
+                f'budget is {budget}s (>= the '
+                f'{PYPROJECT_DEFAULT_TIMEOUT}s pyproject default), but '
+                f'the class carries no @pytest.mark.timeout mark at '
+                f'all.'
+            )
+            continue
+
+        mark_value = mark.args[0] if mark.args else None
+        if mark_value is None or mark_value < budget:
+            offenders.append(
+                f'{class_name}: computed worst-case per-method wait '
+                f'budget is {budget}s, but its @pytest.mark.timeout '
+                f'mark is only {mark_value!r} -- too tight to clear '
+                f'it.'
+            )
+    return offenders
 
 
 # ---------------------------------------------------------------------------
@@ -2088,7 +2147,7 @@ class TestSingleHostSerialByteIdentical:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 135s worst case
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 160s worst case per the automated scan (a control-flow-aware hand count over the mutually-exclusive try/except paths in test_both_verifies_enter_before_either_released would land at 135s; the scan sums both branches -- see _method_wait_budget's branch-summing note)
 class TestOverlapSignal:
     """Two-host overlap: both verifies enter before either is released.
 
@@ -5487,6 +5546,93 @@ if x:
 
 
 # ---------------------------------------------------------------------------
+# task 3492 amend: cover _timeout_mark_offenders' failure branches directly
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutMarkOffenders:
+    """`_timeout_mark_offenders` is the pure offender-accumulation loop
+    behind `TestTimeoutMarkCoverage`'s guard. Driven here from synthetic
+    stub classes (not this module's own, now fully-marked, classes) so its
+    failure branches -- no mark at all, a mark too tight for the budget,
+    and an unresolvable class name -- are each independently non-vacuous,
+    rather than only ever exercised by the happy path.
+    """
+
+    def test_class_with_no_pytestmark_is_one_offender(self) -> None:
+        """A resolved class with no `timeout` mark at all yields exactly
+        one offender naming the missing mark.
+        """
+
+        class _NoMark:
+            pass
+
+        offenders = _timeout_mark_offenders({'_NoMark': 200.0}, {'_NoMark': _NoMark}.get)
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert '_NoMark' in offenders[0]
+        assert 'no @pytest.mark.timeout mark' in offenders[0]
+
+    def test_mark_too_tight_for_budget_is_one_offender(self) -> None:
+        """A class carrying `@pytest.mark.timeout(60)` against a 200s
+        computed budget yields exactly one offender naming the too-tight
+        value -- this is the exact failure mode task 3477 hit (a mark
+        present but too tight to clear the real wait profile).
+        """
+
+        @pytest.mark.timeout(60)
+        class _TooTight:
+            pass
+
+        offenders = _timeout_mark_offenders({'_TooTight': 200.0}, {'_TooTight': _TooTight}.get)
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert '_TooTight' in offenders[0]
+        assert '60' in offenders[0]
+
+    def test_unresolvable_class_name_is_one_offender(self) -> None:
+        """A budgeted class name that *resolve* cannot look up (e.g. it was
+        renamed or removed after the scan ran) yields exactly one offender
+        rather than raising -- the guard degrades to a loud failure, never
+        a silent skip.
+        """
+        offenders = _timeout_mark_offenders({'DoesNotExist': 200.0}, {}.get)
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert 'DoesNotExist' in offenders[0]
+        assert 'could not be resolved' in offenders[0]
+
+    def test_adequate_mark_yields_no_offenders(self) -> None:
+        """A class whose mark value clears its computed budget yields no
+        offenders -- pins the happy path so it stays non-vacuous too.
+        """
+
+        @pytest.mark.timeout(300)
+        class _Adequate:
+            pass
+
+        offenders = _timeout_mark_offenders({'_Adequate': 200.0}, {'_Adequate': _Adequate}.get)
+
+        assert offenders == [], f'Expected no offenders, got {offenders!r}.'
+
+    def test_budget_below_threshold_is_skipped_even_with_no_mark(self) -> None:
+        """A class computing below `PYPROJECT_DEFAULT_TIMEOUT` is skipped
+        entirely, even carrying no mark at all -- only heavy classes are
+        subject to the guard.
+        """
+
+        class _LightNoMark:
+            pass
+
+        offenders = _timeout_mark_offenders(
+            {'_LightNoMark': PYPROJECT_DEFAULT_TIMEOUT - 1},
+            {'_LightNoMark': _LightNoMark}.get,
+        )
+
+        assert offenders == [], f'Expected no offenders below threshold, got {offenders!r}.'
+
+
+# ---------------------------------------------------------------------------
 # task 3492 step-3: enforced coverage invariant over THIS module's own source
 # ---------------------------------------------------------------------------
 
@@ -5525,43 +5671,7 @@ class TestTimeoutMarkCoverage:
         """
         source = Path(__file__).read_text()
         budgets = _worst_per_method_wait_budget(source)
-
-        offenders: list[str] = []
-        for class_name, budget in sorted(budgets.items()):
-            if budget < PYPROJECT_DEFAULT_TIMEOUT:
-                continue
-
-            cls = globals().get(class_name)
-            if cls is None:
-                offenders.append(
-                    f'{class_name}: computed budget {budget}s, but the '
-                    f'class could not be resolved from module globals to '
-                    f'inspect its marks.'
-                )
-                continue
-
-            mark = next(
-                (m for m in getattr(cls, 'pytestmark', []) if m.name == 'timeout'),
-                None,
-            )
-            if mark is None:
-                offenders.append(
-                    f'{class_name}: computed worst-case per-method wait '
-                    f'budget is {budget}s (>= the '
-                    f'{PYPROJECT_DEFAULT_TIMEOUT}s pyproject default), but '
-                    f'the class carries no @pytest.mark.timeout mark at '
-                    f'all.'
-                )
-                continue
-
-            mark_value = mark.args[0] if mark.args else None
-            if mark_value is None or mark_value < budget:
-                offenders.append(
-                    f'{class_name}: computed worst-case per-method wait '
-                    f'budget is {budget}s, but its @pytest.mark.timeout '
-                    f'mark is only {mark_value!r} -- too tight to clear '
-                    f'it.'
-                )
+        offenders = _timeout_mark_offenders(budgets, globals().get)
 
         assert not offenders, (
             'The following classes have a worst-case per-method wait '
