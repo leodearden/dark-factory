@@ -1336,3 +1336,157 @@ class TestMainProbeIsolatedFlakeConfirmGate:
             )
 
         assert result is None, f'Expected None (never raises), got {result!r}'
+
+
+# ---------------------------------------------------------------------------
+# task 3597: verify_failure_is_preexisting_on_main — end-to-end confirm-gate
+# integration. This is the LEAF SIGNAL this task exists to fix (ground
+# truth: esc-3514-2 / task 3514 — a CPU-starvation load flake starved the
+# SAME timing-sensitive test on both the task branch and the main probe,
+# matching signatures on a main that was actually green).
+# ---------------------------------------------------------------------------
+
+
+def _fmt_log(call) -> str:
+    """Render a mocked ``logger.<level>(fmt, *args)`` call to its final text,
+    so a substring assertion sees what an operator would actually read."""
+    args = call.args
+    if not args:
+        return ''
+    return (args[0] % args[1:]) if len(args) > 1 else str(args[0])
+
+
+class TestPreexistingVerdictDowngradedByIsolatedRerun:
+    """step-5/step-7: verify_failure_is_preexisting_on_main wired to
+    _main_probe_failure_is_isolated_flake — the load-flake downgrade and its
+    safety envelope (genuine red main preserved, unconfirmable keeps today's
+    verdict, gate never runs on non-match paths, cache-hit path untouched)."""
+
+    def _setup(self, tmp_path: Path):
+        """Shared fixture: real GitOps (get_main_sha AsyncMock'd) + a fake
+        ``orchestrator.git_ops._run`` that, on a ``git worktree add --detach
+        <path> <sha>`` (path at cmd[4] — the exact argv
+        GitOps.ephemeral_worktree issues), materializes an ``orchestrator/``
+        subproject layout under <path> so _group_node_ids_by_subproject can
+        map PROBE_NODE_ID. Mirrors test_verify_main_tip_sweep.py's
+        _make_confirm_fake_run for the MAIN_PROBE kind."""
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            )
+        ]
+
+        run_calls: list = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(list(cmd))
+            if 'worktree' in cmd and 'add' in cmd:
+                target = Path(cmd[4])
+                target.mkdir(parents=True, exist_ok=True)
+                for relpath, content in _PROBE_CONFIRM_PROJECT_LAYOUT.items():
+                    p = target / relpath
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content)
+            return (0, '', '')
+
+        return config, worktree, git_ops, module_configs, run_calls, _fake_run
+
+    def test_load_flake_signature_match_downgrades_to_false(self, tmp_path: Path) -> None:
+        """(step-5) Branch and main-probe share a load-flake signature
+        (category='test_failure', a '[gwN] node down' crash naming the same
+        node-id) that would reproduce -> (True, MAIN_SHA) pre-3597. The
+        confirm gate re-runs the named node-id in isolation on the probe
+        worktree; it passes -> downgrade to (False, ''), not cached, with a
+        loud WARNING and a durable _suppressed_flake_records entry.
+
+        RED today: the gate is not yet wired into
+        verify_failure_is_preexisting_on_main (step-6), so this returns
+        (True, MAIN_SHA) and caches it.
+        """
+        from orchestrator import verify as verify_module
+
+        config, worktree, git_ops, module_configs, _run_calls, fake_run = self._setup(tmp_path)
+
+        scoped_probe_mock = AsyncMock(return_value=LOAD_FLAKE_MAIN_RESULT)
+        isolated_rerun_mock = AsyncMock(return_value=PASSING_RESULT)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', scoped_probe_mock),
+            patch.object(verify_module, 'run_verification', isolated_rerun_mock),
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'logger') as mock_logger,
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, module_configs, ['src/foo.py'],
+                    LOAD_FLAKE_MAIN_RESULT, git_ops,
+                )
+            )
+
+            # (a) the downgrade, not the pre-3597 (True, MAIN_SHA)
+            assert result == (False, ''), (
+                f"Expected (False, '') — the isolated re-run confirmed a "
+                f'load flake, not a real preexisting main break; got {result!r}'
+            )
+
+            # (b) the isolated re-run actually ran in the probe worktree
+            isolated_rerun_mock.assert_awaited_once()
+            called_mc = isolated_rerun_mock.call_args.args[2]
+            assert '-p no:xdist' in called_mc.test_command, called_mc.test_command
+            assert '-o addopts=' in called_mc.test_command, called_mc.test_command
+            assert '--timeout 300' in called_mc.test_command, called_mc.test_command
+            assert PROBE_NODE_ID in called_mc.test_command, called_mc.test_command
+
+            # (c) part 1: the downgrade must not be cached
+            assert verify_module._PROBE_CACHE == {}, (
+                f'Downgraded verdict must NOT be cached (transient host '
+                f'state, not a fact about main); got {verify_module._PROBE_CACHE!r}'
+            )
+
+            # (d) exactly one new suppressed-flake record, tagged distinctly
+            # from task 2370's 'isolated_rerun'
+            new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+            assert len(new_records) == 1, f'Expected exactly 1 new record, got {new_records!r}'
+            record = new_records[0]
+            assert record['sha'] == MAIN_SHA, record
+            assert record['node_ids'] == [PROBE_NODE_ID], record
+            assert record['suppressed_via'] == 'main_probe_isolated_rerun', record
+
+            # (e) a WARNING naming the downgrade
+            warned = any(
+                MAIN_SHA[:8] in _fmt_log(call) or PROBE_NODE_ID in _fmt_log(call)
+                for call in mock_logger.warning.call_args_list
+            )
+            assert warned, (
+                f'Expected a WARNING naming the downgrade; got '
+                f'{[_fmt_log(c) for c in mock_logger.warning.call_args_list]!r}'
+            )
+
+            # (c) part 2: a second identical call re-probes (no cache entry
+            # survived the downgrade)
+            second_result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, module_configs, ['src/foo.py'],
+                    LOAD_FLAKE_MAIN_RESULT, git_ops,
+                )
+            )
+            assert second_result == (False, ''), second_result
+            assert scoped_probe_mock.await_count == 2, (
+                f'A second identical call must re-probe (no cache entry from '
+                f'the downgrade); got {scoped_probe_mock.await_count} probe calls'
+            )
