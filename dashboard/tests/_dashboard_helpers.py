@@ -14,6 +14,25 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+import pytest
+
+
+def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
+    """Point every DashboardConfig-derived path at *root* instead of the live checkout.
+
+    Sets ``DASHBOARD_PROJECT_ROOT``, which redirects ``burndown_db``,
+    ``metrics_db``, ``runs_db``, ``escalations_dir``, ``memory_evals_dir`` and
+    ``load_samples_db`` (task 3503).  The dashboard app's ``lifespan()`` opens
+    ``burndown_db`` and ``metrics_db`` as **writable WAL** stores, so without
+    this every ``TestClient(app)`` in the suite wrote into the operator's live
+    ``data/burndown/``.
+
+    A plain function rather than a fixture so the env contract is directly
+    unit-testable against a simulated operator environment — a session-scoped
+    autouse fixture cannot be re-run from inside a test.
+    """
+    mp.setenv('DASHBOARD_PROJECT_ROOT', str(root))
+
 
 RECONCILIATION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS watermarks (

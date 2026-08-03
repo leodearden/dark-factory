@@ -53,7 +53,7 @@ if str(REPO_ROOT) not in sys.path:
 import aiosqlite  # noqa: E402
 import httpx  # noqa: E402
 import pytest  # noqa: E402
-from _dashboard_helpers import RECONCILIATION_SCHEMA  # noqa: E402
+from _dashboard_helpers import RECONCILIATION_SCHEMA, apply_isolated_env  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
@@ -64,6 +64,44 @@ from starlette.testclient import TestClient  # noqa: E402
 def pytest_configure(config):
     """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
     reject_unsafe_basetemp(config)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _isolated_project_root(tmp_path_factory):
+    """Point the whole suite's DashboardConfig at a pytest-owned temp root.
+
+    Task 3503.  ``lifespan()`` opens **writable WAL** stores at
+    ``config.burndown_db`` / ``config.metrics_db`` and read-only-opens
+    ``config.reconciliation_db`` / ``config.tickets_db``.  Unset, those
+    resolved to the operator's live checkout, so merely running this suite
+    wrote live databases — and the read-only open of a live WAL database is
+    the path behind the task-3466 ``SQLITE_READONLY_RECOVERY`` incident.
+
+    SCOPE RATIONALE — session, not function.  ~15 ``TestClient(app)`` fixtures
+    in this suite are ``scope='module'``, and the built-in ``monkeypatch``
+    fixture is function-scoped, so they cannot request it; a function-scoped
+    autouse fixture would be instantiated only AFTER such a lifespan had
+    already opened the live databases.  pytest instantiates higher-scoped
+    fixtures first within a test's setup (autouse before non-autouse at the
+    same scope), so session-scoped autouse is the only scope that provably
+    precedes every ``TestClient(app)`` here.  It is also exhaustive by
+    construction: a new module that writes ``with TestClient(app)`` is covered
+    automatically, with nothing to remember and no source-grep lint needed.
+
+    This sets a DEFAULT, not a lock.  A function-scoped ``monkeypatch.setenv``
+    is created after — and torn down before — this fixture, so a test that
+    sets ``DASHBOARD_PROJECT_ROOT`` itself (test_durability.py:54,114;
+    test_scaffold.py:58,120,135) still wins.
+
+    ``pytest.MonkeyPatch.context()`` rather than the ``monkeypatch`` fixture:
+    the fixture is function-scoped and cannot be requested here.  The context
+    manager restores ``os.environ`` at session teardown, so this suite leaves
+    no env residue for sibling subproject suites in the same verify run.
+    """
+    root = tmp_path_factory.mktemp('dashboard_project_root')
+    with pytest.MonkeyPatch.context() as mp:
+        apply_isolated_env(mp, root)
+        yield root
 
 
 @pytest.fixture()
@@ -105,7 +143,11 @@ def two_url_config(tmp_path):
 
 @pytest.fixture()
 def client():
-    """Create a TestClient for the dashboard FastAPI app."""
+    """Create a TestClient for the dashboard FastAPI app.
+
+    Its lifespan runs against the session-scoped ``_isolated_project_root``
+    temp dir, never the operator's live checkout (task 3503).
+    """
     from dashboard.app import app
 
     with TestClient(app) as c:
@@ -119,6 +161,10 @@ def two_url_client(monkeypatch):
     Uses monkeypatch.setenv so DashboardConfig.from_env() inside the lifespan
     produces the two-URL list naturally — no post-hoc mutation of app.state.
     monkeypatch teardown restores os.environ automatically after each test.
+
+    Only the fused-memory URLs are overridden here; project_root still comes
+    from the session-scoped ``_isolated_project_root`` temp dir, so this
+    lifespan does not touch the operator's live checkout either (task 3503).
     """
     from dashboard.app import app
 
