@@ -1442,6 +1442,76 @@ def test_wait_for_path_scaled_cap_secs_override_widens_the_clamp(
 
 
 # ===========================================================================
+# Task 3599: _spawn_run_budget -- load-scaled must-not-hang guard for _run_spawn
+# ===========================================================================
+# FIFTH recurrence of the fixed-timeout-vs-load-dependent-startup flake class
+# in this file: task 2367 fixed-bumped a started-grace 1s/2s -> 3s/8s; task
+# 2733 added _load_scaled_grace; task 3451 added _set_started_grace; task 3486
+# added _wait_for_path_scaled for the readiness-gate family; task 3599 (here)
+# covers the whole-invocation wall-clock channel -- the `timeout` _run_spawn
+# hands to subprocess.run. Observed instance:
+# test_genuine_launcher_failure_yields_127[xterm] raising
+# subprocess.TimeoutExpired after a fixed 15s in merge worktree
+# _merge-dd5a8aa6 (escalation esc-3495-1, archived log
+# data/verify-logs/3495/attempt-1.scripts.test-20260803T151949_260976Z.log)
+# while passing in isolation.
+
+
+def test_spawn_run_budget_loaded_host_matches_load_scaled_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a loaded host, _spawn_run_budget matches _load_scaled_grace's own
+    output -- used as the oracle for cap_secs forwarding, so the
+    floor/scale/clamp/error-safe arithmetic already pinned by the
+    test_load_scaled_grace_* family is not re-derived here. That oracle
+    alone can't catch a bug shared by both functions, so a literal expected
+    value is also pinned (96.0 loadavg / 32 cores => load-per-core 3.0,
+    base 30 => ceil(30 * 3.0) = 90).
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _spawn_run_budget(30) == _load_scaled_grace(
+        30, cap_secs=_SPAWN_RUN_CAP_SECS
+    )
+    assert _spawn_run_budget(30) == 90
+
+
+def test_spawn_run_budget_idle_host_returns_base_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle host (load-per-core < 1) floors at base_secs unchanged.
+
+    Load-bearing safety property: an idle host is byte-identical to today's
+    fixed pins at every _run_spawn call site, so routing _run_spawn's
+    timeout through this function can only LENGTHEN a budget under
+    contention, never shorten one.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _spawn_run_budget(30) == 30
+    assert _spawn_run_budget(15) == 15
+
+
+def test_spawn_run_budget_clamps_to_spawn_run_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pathological load (load-per-core 100) clamps at _SPAWN_RUN_CAP_SECS
+    instead of growing unbounded, mirroring
+    test_load_scaled_grace_clamps_to_cap one layer up. _SPAWN_RUN_CAP_SECS
+    itself must leave headroom inside the governing --timeout=300
+    (scripts/orchestrator.yaml:17) even stacked with one
+    _wait_for_path_scaled readiness gate.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _spawn_run_budget(30) == _SPAWN_RUN_CAP_SECS == 120
+    assert _SPAWN_RUN_CAP_SECS + _READINESS_WAIT_CAP_SECS < 300
+
+
+# ===========================================================================
 # Task 3451: _set_started_grace -- shared started-grace policy for the
 # "must NOT be flagged failed-to-start" test family
 # ===========================================================================
