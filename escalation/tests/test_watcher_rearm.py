@@ -135,6 +135,84 @@ def test_ceiling_smoke(tmp_path):
     )
 
 
+def test_level_less_invocation_fires(tmp_path):
+    """With NO --level, the wrapper must run the watcher in its already-
+    supported match-all mode (escalation.watcher declares --level
+    type=int default=None, and _matches treats None as match-all) so the
+    flat, level-less reconciliation queue can reuse this wrapper.
+
+    Seeded at level=0 deliberately: it is a valid Escalation level and is
+    maximally distant from the levelled callers' 2, so this also fails if
+    the implementation quietly defaults LEVEL rather than genuinely
+    omitting the filter."""
+    queue_dir = tmp_path / 'queue'
+    queue_dir.mkdir()
+    esc = _write_pending(queue_dir, 'esc-52-1', task_id='52', level=0)
+
+    result = _run(
+        '--queue-dir', str(queue_dir), '--timeout', '5',
+        env=_live_env(REPO_ROOT),
+    )
+
+    assert result.returncode == 0, (
+        f'Expected exit 0 from a level-less invocation; got {result.returncode}\n'
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert esc.id in result.stdout, (
+        f'Expected the escalation JSON on stdout; got stdout={result.stdout!r} '
+        f'stderr={result.stderr!r}'
+    )
+    assert 'WATCHER_REARM_OUTCOME: FIRED exit=0' in result.stderr, (
+        f'Expected the FIRED outcome line on stderr; got {result.stderr!r}'
+    )
+
+
+def test_level_less_check_dry_run_exits_zero(tmp_path):
+    """`--check` with no --level must reach the dry-run branch and report
+    the resolved paths, rather than exiting 2 on a required-flag guard."""
+    queue_dir = tmp_path / 'queue'
+    queue_dir.mkdir()
+
+    result = _run('--check', '--queue-dir', str(queue_dir), env=_live_env(REPO_ROOT))
+
+    assert result.returncode == 0, (
+        f'Expected exit 0 from a level-less --check; got {result.returncode}\n'
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert str(queue_dir) in result.stdout, (
+        f'Expected the resolved queue-dir on stdout; got {result.stdout!r}'
+    )
+    assert 'exclude-file=' in result.stdout, (
+        f'Expected the resolved exclude-file on stdout; got {result.stdout!r}'
+    )
+
+
+def test_explicit_level_still_filters(tmp_path):
+    """Regression guard for the two existing sibling-skill callers
+    (skills/escalation-watcher and skills/escalation-watcher-auto, which
+    pass --level 2 / --level 1): making --level OPTIONAL must not make it
+    INERT. A pending level=0 item must not fire a --level 2 run."""
+    queue_dir = tmp_path / 'queue'
+    queue_dir.mkdir()
+    _write_pending(queue_dir, 'esc-53-1', task_id='53', level=0)
+
+    result = _run(
+        '--queue-dir', str(queue_dir), '--level', '2', '--timeout', '1',
+        env=_live_env(REPO_ROOT),
+    )
+
+    assert result.returncode == 124, (
+        f'Expected exit 124 (level=0 item filtered out by --level 2); got '
+        f'{result.returncode}\nstdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert 'WATCHER_REARM_OUTCOME: CEILING exit=124' in result.stderr, (
+        f'Expected the CEILING outcome line on stderr; got {result.stderr!r}'
+    )
+    assert 'esc-' not in result.stdout, (
+        f'Expected no escalation JSON on stdout; got {result.stdout!r}'
+    )
+
+
 def test_exclude_file_ownership_suppresses(tmp_path):
     """A pending escalation whose id is already listed in the wrapper's
     OWNED default exclude-file (<queue_dir>/.watcher-rearm-exclude-l<level>)
