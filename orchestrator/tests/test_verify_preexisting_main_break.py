@@ -990,6 +990,7 @@ class TestVerifyFailureIsPreexistingBaselineDiffFork:
             f'failing_test_ids=None must take the legacy probe path unchanged; got {result!r}'
         )
         baseline_mock.assert_not_awaited()
+        legacy_probe_mock.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1098,4 +1099,3 @@ class TestMainProbeIsolatedFlakeConfirmGate:
         assert PROBE_NODE_ID in called_mc.test_command, called_mc.test_command
         assert called_mc.lint_command is None, called_mc.lint_command
         assert called_mc.type_check_command is None, called_mc.type_check_command
-        legacy_probe_mock.assert_awaited_once()
