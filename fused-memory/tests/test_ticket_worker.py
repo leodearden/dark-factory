@@ -2450,6 +2450,10 @@ class TestCuratorWorkerTokenBudgetAccumulator:
         queue = ti._ticket_queues.setdefault(project_id, asyncio.Queue())
         queue.put_nowait(t1)
 
+        async def _ticket_resolved() -> bool:
+            row = await ticket_store.get(t1)
+            return row is not None and row['status'] != 'pending'
+
         try:
             with patch.object(
                 type(ti), '_get_curator',
@@ -2459,7 +2463,20 @@ class TestCuratorWorkerTokenBudgetAccumulator:
                 new=AsyncMock(return_value=taskmaster),
             ):
                 ti._start_worker_if_needed(project_id)
-                await asyncio.sleep(0.5)
+                # Bounded poll for the worker to resolve the ticket rather
+                # than a fixed sleep, which flakes under `-n auto` CPU
+                # oversubscription when the worker is scheduled late — the
+                # same cause, and the same fix, as the sibling lookahead
+                # test above. Waiting on 'pending' clearing rather than on
+                # 'created' directly keeps a genuine regression loud: a
+                # ticket resolved to 'failed' leaves the poll immediately
+                # and trips the status assertion below with the real
+                # status, instead of burning the whole timeout first.
+                await poll_until(
+                    _ticket_resolved,
+                    timeout=10.0,
+                    message='worker did not resolve the oversize ticket',
+                )
         finally:
             for t in list(ti._worker_tasks.values()):
                 if not t.done():
