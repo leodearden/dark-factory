@@ -95,6 +95,20 @@ from fused_memory.utils.toolcall_xml_leak import (  # noqa: E402
     detect_leak,
 )
 
+# LEAK_TAIL and detect_leak are re-exported deliberately: this module's public
+# surface predates the promotion of the detector into fused_memory, and callers
+# (plus the test suite's identity assertions) still reach for them here.
+__all__ = [
+    "LEAK_TAIL",
+    "LeakMatch",
+    "SCANNED_COLUMNS",
+    "detect_leak",
+    "format_json",
+    "format_report",
+    "main",
+    "scan_db",
+]
+
 # Task text columns scanned for leaks. `metadata` is deliberately excluded —
 # it legitimately stores remediation records (e.g. task 2865's
 # metadata.stage2_description_corruption_fix.stripped_fragment) that contain

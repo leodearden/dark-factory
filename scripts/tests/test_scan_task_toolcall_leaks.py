@@ -468,14 +468,14 @@ class TestDetectorIsTheSharedDefinition:
 
         assert scan_task_toolcall_leaks.detect_leak is toolcall_xml_leak.detect_leak
 
-    def test_patching_the_shared_detector_changes_the_script_behaviour(self, monkeypatch, tmp_path):
+    def test_patching_the_shared_detector_changes_the_script_behaviour(self, monkeypatch, make_tasks_db):
         """Delegation is real, not a same-valued copy captured at import."""
         import scan_task_toolcall_leaks
 
         monkeypatch.setattr(
             scan_task_toolcall_leaks, "detect_leak", lambda text: "SENTINEL" if text else None
         )
-        db_path = _make_db(tmp_path, [{"id": 7, "description": "totally clean prose"}])
+        db_path = make_tasks_db([{"id": 7, "description": "totally clean prose"}])
 
         matches = scan_db(str(db_path))
 
@@ -487,9 +487,9 @@ class TestGeneralizedShapesAreReportedByScanDb:
     """The task DB is subject to the identical harness bug, so the two Mem0
     generalizations must be visible through this script too."""
 
-    def test_closing_content_tag_leak_is_reported(self, tmp_path):
+    def test_closing_content_tag_leak_is_reported(self, make_tasks_db):
         fragment = _CLOSE_CONTENT + '\n<parameter name="priority">high'
-        db_path = _make_db(tmp_path, [{"id": 3083, "description": "Body prose." + fragment}])
+        db_path = make_tasks_db([{"id": 3083, "description": "Body prose." + fragment}])
 
         matches = scan_db(str(db_path))
 
@@ -497,9 +497,9 @@ class TestGeneralizedShapesAreReportedByScanDb:
             (3083, "description", fragment)
         ]
 
-    def test_bare_closing_invoke_tail_leak_is_reported(self, tmp_path):
+    def test_bare_closing_invoke_tail_leak_is_reported(self, make_tasks_db):
         fragment = _CLOSE_CONTENT + "\n" + _CLOSE_INVOKE
-        db_path = _make_db(tmp_path, [{"id": 3084, "details": "Body prose." + fragment}])
+        db_path = make_tasks_db([{"id": 3084, "details": "Body prose." + fragment}])
 
         matches = scan_db(str(db_path))
 
@@ -507,12 +507,12 @@ class TestGeneralizedShapesAreReportedByScanDb:
             (3084, "details", fragment)
         ]
 
-    def test_generalization_does_not_weaken_the_whitespace_discriminator(self, tmp_path):
+    def test_generalization_does_not_weaken_the_whitespace_discriminator(self, make_tasks_db):
         """Prose quoting the new shapes with an ESCAPED backslash-n stays clean."""
         rows = [
             {"id": 1, "description": "Quoted: `" + _CLOSE_CONTENT + "\\n" + _CLOSE_INVOKE + "` here."},
             {"id": 2, "description": "Adjacent:" + _CLOSE_CONTENT + _CLOSE_INVOKE},
         ]
-        db_path = _make_db(tmp_path, rows)
+        db_path = make_tasks_db(rows)
 
         assert scan_db(str(db_path)) == []
