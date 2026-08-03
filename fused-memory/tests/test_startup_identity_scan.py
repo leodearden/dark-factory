@@ -20,14 +20,19 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import extract_cypher, extract_params
-from falkordb import FalkorDB as _SyncFalkorDB
+from _fm_helpers import (
+    FALKOR_HOST,
+    FALKOR_PORT,
+    extract_cypher,
+    extract_params,
+    falkor_skipif,
+    unique_graph_name,
+)
 from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
@@ -51,33 +56,10 @@ from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantF
 # guarantee coverage in that case.
 # ---------------------------------------------------------------------------
 
-FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
-FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
-
-
-def _falkor_available() -> bool:
-    """FalkorDB-native reachability probe (mirrors test_merge_entities.py)."""
-    try:
-        client = _SyncFalkorDB(host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2)
-        try:
-            client.select_graph('_probe').query('RETURN 1')
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
-        return True
-    except Exception:
-        return False
-
-
 @pytest_asyncio.fixture
 async def startup_scan_live_graph():
-    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up.
-
-    A fresh graph name is minted on every invocation (rather than a shared
-    module-level constant) so this module's live tests never share state,
-    even under pytest-xdist or a shared FalkorDB instance.
-    """
-    graph_name = f'_test_2210_startup_scan_{uuid.uuid4().hex[:8]}'
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up."""
+    graph_name = unique_graph_name('2210_startup_scan')
     client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
     with contextlib.suppress(Exception):
         stale = client.select_graph(graph_name)
@@ -445,7 +427,7 @@ class TestInitializeSkipMaintenance:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@falkor_skipif()
 @pytest.mark.timeout(15)
 @pytest.mark.integration
 class TestScanDuplicateEntityNamesLiveFalkorDB:
@@ -493,7 +475,7 @@ class TestScanDuplicateEntityNamesLiveFalkorDB:
             await backend.close()
 
 
-@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@falkor_skipif()
 @pytest.mark.timeout(15)
 @pytest.mark.integration
 class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
