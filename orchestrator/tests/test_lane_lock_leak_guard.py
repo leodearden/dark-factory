@@ -125,9 +125,17 @@ def foreign_lane_lock_holder(lock_path: Path) -> Iterator[subprocess.Popen]:
     contention once the leak detector exists.  Any test that means "somebody
     else holds this lane" must use this helper.
 
-    Blocks until the child provably owns the lock (a zero-timeout probe
-    acquire returns ``None``), failing the test if that has not happened
-    within :data:`_FOREIGN_HOLDER_STARTUP_SECS`.
+    Blocks until TWO facts both hold, failing the test if either does not
+    settle in time: (1) the lock is HELD — a zero-timeout probe acquire
+    returns ``None`` — within :data:`_FOREIGN_HOLDER_STARTUP_SECS`; and (2)
+    ``/proc/locks`` NAMES ``child.pid`` as the FLOCK holder, within
+    :data:`_FOREIGN_HOLDER_ATTRIBUTION_SECS`.  Until task 3598, only the first
+    half was ever established, even though ``test_foreign_holder_is_contention_not_a_leak``'s
+    ``child.pid in holders`` assertion (and ``_lane_lock_holder_facts``'
+    raise-time re-read, at the point ``git_ops`` reports the timeout) both
+    depend on the second — so every "the foreign holder" assertion downstream
+    was racing ``/proc/locks`` settling under load rather than testing
+    genuine contention.
 
     Teardown kills the child's whole PROCESS GROUP, not just the child.
     Verified empirically: util-linux ``flock(1)`` FORKS the command rather than
@@ -170,6 +178,17 @@ def foreign_lane_lock_holder(lock_path: Path) -> Iterator[subprocess.Popen]:
                     f'be vacuous'
                 )
             time.sleep(0.02)
+        holders = wait_for_lane_lock_holder(lock_path, child.pid)
+        if child.pid not in holders:
+            _kill_group()
+            pytest.fail(
+                f'{lock_path} is held, but /proc/locks does not attribute it '
+                f'to flock(1) child {child.pid} within '
+                f'{_FOREIGN_HOLDER_ATTRIBUTION_SECS}s — so any downstream '
+                f'assertion about "the foreign holder" would be racing '
+                f'/proc/locks settling rather than testing genuine '
+                f'contention; observed holders={holders!r}'
+            )
         yield child
         clean_exit = True
     finally:
