@@ -24,17 +24,16 @@ from __future__ import annotations
 import pathlib
 
 import pytest
-import yaml
 
+from _verify_config_corpus import DF_CONFIG_PATH, load_config_scalar
 from orchestrator.verify_cmd import ChainSegment, split_and_chain_segments
 
 # Loaded from the COMMITTED config rather than hand-copied a third time.
-# ``test_verify_cmd.TestSplitAndChainSegmentsLiveConfigDrift`` already pins
-# this same file against its ``_ROOT_TEST_COMMAND`` corpus constant, so
+# ``test_verify_config_corpus.TestRootScalarsMatchLiveYaml`` already pins
+# this same file against its ``ROOT_TEST_COMMAND`` corpus constant, so
 # reading it here keeps the two suites describing one chain instead of two
 # copies free to drift apart.
-_DF_CONFIG_PATH = pathlib.Path(__file__).resolve().parents[2] / 'dark-factory-orchestrator.yaml'
-_FLEET_TEST_COMMAND = yaml.safe_load(_DF_CONFIG_PATH.read_text(encoding='utf-8'))['test_command']
+_FLEET_TEST_COMMAND = load_config_scalar(DF_CONFIG_PATH, 'test_command')
 
 _SEGMENT_KEYS = {
     'index',
