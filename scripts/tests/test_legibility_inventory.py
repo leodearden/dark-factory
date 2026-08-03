@@ -21,6 +21,8 @@ import gzip
 import importlib.util
 import io
 import json
+import re
+import subprocess
 import zlib
 from collections.abc import Callable
 from datetime import date as dt_date
@@ -31,6 +33,10 @@ import pytest
 
 from legibility import digest, inventory as mod
 from orchestrator import session_registry
+
+# Repo root from scripts/tests/ — the same parents[2] derivation
+# scripts/tests/conftest.py already uses.
+SPAWN_SCRIPT = Path(__file__).resolve().parents[2] / 'skills' / 'spawn' / 'spawn-claude.sh'
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 WORKTREE_CWD = '/home/leo/src/dark-factory/.worktrees/2573'
@@ -224,6 +230,51 @@ def _load_sibling_test_module(name: str):
 
 
 @lru_cache(maxsize=1)
+def _bash_encode_cwd_source() -> str:
+    """Extract spawn-claude.sh's ``_encode_cwd`` function block verbatim.
+
+    spawn-claude.sh is not sourceable — it runs ``set -u`` and an argument-count
+    usage check that exits 2 long before ``_encode_cwd``'s definition, and past
+    that point proceeds straight to launching a terminal. Rather than put a
+    test-only "library mode" branch into a production launcher on the incident
+    path, the four-line pure function is lifted out by an anchored regex and
+    eval'd in a throwaway shell (see :func:`_bash_encode_cwd`).
+
+    The assert on a miss is load-bearing: if the function is ever renamed,
+    moved, or reformatted off this shape, a tolerant ``if m:`` would return
+    nothing and the whole lockstep would pass VACUOUSLY — the exact class of
+    silent coverage loss this guard exists to prevent. A loud extraction
+    failure is the correct outcome.
+    """
+    source = SPAWN_SCRIPT.read_text()
+    match = re.search(r'^_encode_cwd\(\)\s*\{\n(?:.*\n)*?^\}$', source, re.M)
+    assert match is not None, (
+        f'could not extract the _encode_cwd() function block from {SPAWN_SCRIPT}. '
+        'It was renamed, moved, or reformatted off the `_encode_cwd() {` ... `}` '
+        'shape this extraction anchors on — fix the regex here rather than '
+        'letting TestEncoderLockstep silently stop covering the bash copy.'
+    )
+    return match.group(0)
+
+
+def _bash_encode_cwd(cwd: str) -> str:
+    """Run spawn-claude.sh's ``_encode_cwd`` on ``cwd`` and return its raw stdout.
+
+    stdout is returned UNSTRIPPED on purpose: the bash function ends in
+    ``printf '%s'`` (no trailing newline), so an exact ``==`` comparison is
+    valid and keeps a stray-whitespace regression detectable — stripping would
+    mask one.
+    """
+    result = subprocess.run(
+        ['bash', '-c', _bash_encode_cwd_source() + '\n_encode_cwd "$1"', 'bash', cwd],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+@lru_cache(maxsize=1)
 def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
     """(label, callable) for every in-repo PYTHON copy of the cwd encoding.
 
@@ -242,6 +293,7 @@ def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
         ('legibility.inventory.encode_cwd', mod.encode_cwd),
         ('legibility.digest._encode_cwd', digest._encode_cwd),
         ('test_legibility_nightly._encode_cwd', nightly_tests._encode_cwd),
+        ('skills/spawn/spawn-claude.sh:_encode_cwd', _bash_encode_cwd),
     )
 
 
@@ -306,6 +358,15 @@ class TestEncoderLockstep:
                 got = mirror(cwd)
                 assert got == canonical(cwd), f'{label} drifted from canonical: {cwd}'
                 assert got == expected_dir, f'{label} drifted from reality: {cwd}'
+
+    def test_bash_mirror_maps_underscore(self):
+        # Sibling of TestEncodeCwd::test_underscore_maps_to_dash, for the bash
+        # copy. Redundant with the table loop above by construction, but it
+        # makes a bash-specific regression name itself in the failure line
+        # instead of surfacing only as one row of a multi-mirror loop.
+        assert _bash_encode_cwd('/media/leo/data_lv_1/leo/reify-build') == (
+            '-media-leo-data-lv-1-leo-reify-build'
+        )
 
 
 def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'):
