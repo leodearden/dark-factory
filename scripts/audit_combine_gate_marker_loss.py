@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 from typing import NamedTuple
 
 # Tier 1 (tasks.db discovery) ONLY, imported as a flat sibling. This module
@@ -138,3 +139,73 @@ def load_combine_targets(tasks_db_path: str) -> dict[tuple[str, int], CombineTar
     finally:
         conn.close()
     return targets
+
+
+# ---------------------------------------------------------------------------
+# Comparison source (1) — the creating ticket.
+#
+# The curator files every task through a reconciliation ticket, and the
+# ticket's candidate payload is a SUBMIT-TIME SNAPSHOT of the metadata the
+# task was created with. A status='created' row is therefore the closest thing
+# to a pre-combine record of what the task's metadata held.
+# ---------------------------------------------------------------------------
+
+# Ticket status meaning "the curator actually filed this task". The other
+# statuses ('pending', 'combined', 'dropped', ...) never produced the task
+# whose metadata this audit is reconstructing.
+TICKET_STATUS_CREATED = "created"
+
+
+def tickets_db_path(project_root: str) -> Path:
+    """``<root>/data/reconciliation/tickets.db`` — the curator's ticket store.
+
+    NOTE: tickets.db lives in the MAIN checkout, not in a task worktree.
+    """
+    return Path(project_root) / "data" / "reconciliation" / "tickets.db"
+
+
+def load_ticket_expectations(tickets_db_path: str, project_id: str) -> dict[str, dict]:
+    """Load submit-time metadata per task id from *tickets_db_path*.
+
+    Returns ``{str(task_id): submit_metadata_dict}`` built from each created
+    ticket's ``candidate_json['metadata']``.
+
+    THE ``project_id`` PREDICATE IS LOAD-BEARING — DO NOT DROP IT AS
+    REDUNDANT. Measured read-only on the live store: task_id ``'3157'`` has a
+    ``project_id='reify'`` created-row sitting right next to a
+    ``project_id='dark_factory'`` row for the same id. A task_id-only query
+    would silently import ANOTHER PROJECT's submit payload and then report
+    every dark_factory key that payload lacks as LOST — a wall of confident
+    false positives. Bound as a parameter, never string-formatted.
+
+    ``task_id`` is a TEXT column, so results are keyed by ``str(task_id)``;
+    callers joining from tasks.db's INTEGER id must convert. A row is skipped
+    (never raised on) when its ``task_id`` is NULL, its ``candidate_json`` is
+    malformed or decodes to a non-dict, or its ``metadata`` is absent or not a
+    dict — one corrupt ticket cannot abort a sweep.
+
+    Returns ``{}`` rather than raising when the file is absent; the caller
+    records that as a coverage fact, not as a clean result.
+    """
+    if not Path(tickets_db_path).exists():
+        return {}
+
+    expectations: dict[str, dict] = {}
+    conn = sqlite3.connect(f"file:{tickets_db_path}?mode=ro", uri=True)
+    try:
+        cursor = conn.execute(
+            "SELECT task_id, candidate_json FROM tickets "
+            "WHERE project_id = ? AND status = ?",
+            (project_id, TICKET_STATUS_CREATED),
+        )
+        for task_id, candidate_json in cursor:
+            if task_id is None:
+                continue
+            candidate = _decode_metadata(candidate_json)
+            metadata = candidate.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            expectations[str(task_id)] = metadata
+    finally:
+        conn.close()
+    return expectations
