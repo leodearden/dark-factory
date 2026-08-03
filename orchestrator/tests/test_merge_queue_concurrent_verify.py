@@ -24,12 +24,14 @@ This file starts with shared scaffolding only (pre-1).
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import collections
 import contextlib
 import dataclasses
 import logging
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -176,7 +178,205 @@ async def _await_outcome(
 # before the loud _await_outcome failure this task added could ever report. The
 # class mark MUST clear the full 225s budget, not just the pyproject 60s default.
 # Derived, not literal, so the two marks cannot drift apart the way they just did.
-CASCADE_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
+# task 3492: generalized CASCADE_TEST_TIMEOUT -> HEAVY_BARRIER_TEST_TIMEOUT --
+# this same derived ceiling also covers the non-cascade heavy-barrier classes
+# audited by 3492, whose worst per-method budget is 205s
+# (TestCascadeErrorContainment), still comfortably under the 300s value below.
+HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
+
+
+# task 3492: two classes are deliberately left WITHOUT a HEAVY_BARRIER_TEST_TIMEOUT
+# mark, so the omission reads as a decision, not an oversight:
+#   - TestRunInflightVerifyAbortPoll: four test_* methods at 45s each -- 45s
+#     worst-METHOD, under the 60s pyproject ceiling (why per-method, not a
+#     class-wide sum: see _worst_per_method_wait_budget's docstring below).
+#   - TestAwaitOutcomeHelper: 45s nominal (_await_outcome's default), but the
+#     future under test is pre-resolved, so real elapsed time is ~0.
+
+
+# task 3492: known-name table for _worst_per_method_wait_budget below. These
+# are this module's own numeric constants -- referenced directly (not
+# re-derived) so the audit helper can never drift from the values the marks
+# themselves use.
+_KNOWN_WAIT_CONSTANTS: dict[str, float] = {
+    'MERGE_RESULT_TIMEOUT': float(MERGE_RESULT_TIMEOUT),
+    'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
+}
+
+
+def _resolve_wait_value(node: ast.expr | None) -> float:
+    """Resolve a single AST expression to a wait-budget number, or 0.0.
+
+    Conservative by construction: a literal number resolves directly; a
+    name reference resolves ONLY via ``_KNOWN_WAIT_CONSTANTS``; anything
+    else (a local variable, an attribute access, an arithmetic expression,
+    an unknown name) resolves to 0.0. Unknown means ignore, never guess.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        return _KNOWN_WAIT_CONSTANTS.get(node.id, 0.0)
+    return 0.0
+
+
+def _call_wait_budget(call: ast.Call) -> float:
+    """Return the wait-budget contribution of a single ``ast.Call`` node.
+
+    Recognises exactly two call shapes -- ``asyncio.wait_for(..., timeout=N)``
+    (the attribute's value must itself be the ``asyncio`` name, so
+    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match) and
+    ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
+    when no ``timeout=`` kwarg is given). Every other call shape --
+    ``asyncio.sleep``, ``.wait()``, ``.result()``, ``.join()``, a
+    non-``asyncio`` ``.wait_for(...)``, attribute access, arithmetic,
+    unknown names -- contributes 0.0 and is skipped silently (this is a
+    conservative FLOOR over call *shapes*: an unrecognised shape can only
+    under-count, never fabricate a wait; see the plan's floor/superset
+    design decision, and ``_method_wait_budget`` below for the orthogonal
+    over-count risk from control flow).
+    """
+    func = call.func
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == 'wait_for'
+        and isinstance(func.value, ast.Name)
+        and func.value.id == 'asyncio'
+    ):
+        for kw in call.keywords:
+            if kw.arg == 'timeout':
+                return _resolve_wait_value(kw.value)
+        if len(call.args) >= 2:
+            return _resolve_wait_value(call.args[1])
+        return 0.0
+    if isinstance(func, ast.Name) and func.id == '_await_outcome':
+        for kw in call.keywords:
+            if kw.arg == 'timeout':
+                return _resolve_wait_value(kw.value)
+        return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+    return 0.0
+
+
+def _method_wait_budget(fn: ast.AST) -> float:
+    """Sum every recognised wait-call contribution anywhere in *fn*'s body.
+
+    Control-flow-BLIND by construction: ``ast.walk`` visits every call in
+    the subtree regardless of branch, so waits in mutually exclusive
+    ``if``/``else`` arms or ``try``/``except`` handlers are summed
+    together rather than maxed -- the computed total can OVER-count
+    relative to any single real execution path (pinned by
+    ``TestWaitBudgetAuditHelper.test_mutually_exclusive_branches_are_summed_not_maxed``).
+    This is a deliberate, tolerated imprecision, not a design goal: it runs
+    in the opposite direction from ``_call_wait_budget``'s shape-based
+    under-count (an unrecognised call shape contributes 0.0), so the
+    "conservative FLOOR" framing used elsewhere in this module applies to
+    shape recognition only, not to control flow. The combined result is a
+    same-ballpark estimate meant to catch gross under-marking, not a
+    number that is exactly load-bearing.
+    """
+    return sum(
+        _call_wait_budget(node) for node in ast.walk(fn) if isinstance(node, ast.Call)
+    )
+
+
+def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
+    """Statically scan *source* and compute, per top-level ``Test*`` class,
+    the MAX over its ``test_*`` methods of that method's summed sequential
+    real-time wait budget (task 3492's audit engine).
+
+    pytest-timeout applies a class-level ``@pytest.mark.timeout`` mark to
+    EACH test method independently, not to the class total -- so the unit
+    that matters is per-method, not a class-wide sum (see the plan's design
+    decision: summing would false-positive on many-light-methods classes
+    like ``TestRunInflightVerifyAbortPoll`` and could dilute one heavy
+    method below the threshold).
+
+    Must never raise: a crash here would fail the whole suite over an
+    unrelated edit to this file. Unparseable source returns {}.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+
+    budgets: dict[str, float] = {}
+    for node in ast.iter_child_nodes(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name.startswith('Test')):
+            continue
+        method_budgets = [
+            _method_wait_budget(item)
+            for item in node.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name.startswith('test_')
+        ]
+        if method_budgets:
+            budgets[node.name] = max(method_budgets)
+    return budgets
+
+
+# task 3492: the pyproject-configured default per-test timeout ceiling that
+# every heavy-wait class in this module must clear. This is a hand-mirrored
+# copy of `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
+# (currently 60) -- it is still a literal and CAN drift if that setting
+# changes without a matching edit here; there is no automated link between
+# the two.
+PYPROJECT_DEFAULT_TIMEOUT = 60
+
+
+def _timeout_mark_offenders(
+    budgets: dict[str, float],
+    resolve: Callable[[str], object | None],
+) -> list[str]:
+    """Pure offender-accumulation for the timeout-mark coverage guard.
+
+    For each ``class_name -> budget`` pair at or above
+    ``PYPROJECT_DEFAULT_TIMEOUT``, resolve *class_name* via *resolve* and
+    check it carries a ``timeout`` mark whose value clears *budget*.
+    Returns one formatted offender string per failing class; an empty list
+    means every heavy class is adequately marked.
+
+    Extracted as a pure function (independent of ``globals()`` and this
+    module's real classes) so its three failure branches -- unresolvable
+    class name, missing mark, mark value too tight -- are each directly
+    testable with synthetic stubs, rather than only ever exercised by the
+    happy path over this module's own (now fully-marked) classes.
+    """
+    offenders: list[str] = []
+    for class_name, budget in sorted(budgets.items()):
+        if budget < PYPROJECT_DEFAULT_TIMEOUT:
+            continue
+
+        cls = resolve(class_name)
+        if cls is None:
+            offenders.append(
+                f'{class_name}: computed budget {budget}s, but the '
+                f'class could not be resolved from module globals to '
+                f'inspect its marks.'
+            )
+            continue
+
+        mark = next(
+            (m for m in getattr(cls, 'pytestmark', []) if m.name == 'timeout'),
+            None,
+        )
+        if mark is None:
+            offenders.append(
+                f'{class_name}: computed worst-case per-method wait '
+                f'budget is {budget}s (>= the '
+                f'{PYPROJECT_DEFAULT_TIMEOUT}s pyproject default), but '
+                f'the class carries no @pytest.mark.timeout mark at '
+                f'all.'
+            )
+            continue
+
+        mark_value = mark.args[0] if mark.args else None
+        if mark_value is None or mark_value < budget:
+            offenders.append(
+                f'{class_name}: computed worst-case per-method wait '
+                f'budget is {budget}s, but its @pytest.mark.timeout '
+                f'mark is only {mark_value!r} -- too tight to clear '
+                f'it.'
+            )
+    return offenders
 
 
 # ---------------------------------------------------------------------------
@@ -1814,6 +2014,7 @@ class TestFinalizeInflightNonPass:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 60s worst case (30+30) -- exactly AT the 60s pyproject ceiling with zero headroom, plus unbounded worker.stop()/worker_task teardown
 class TestSingleHostSerialByteIdentical:
     """SINGLE-HOST serial byte-identical via the restructured _verifier_loop.
 
@@ -1970,6 +2171,7 @@ class TestSingleHostSerialByteIdentical:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 160s worst case per the automated scan (a control-flow-aware hand count over the mutually-exclusive try/except paths in test_both_verifies_enter_before_either_released would land at 135s; the scan sums both branches -- see _method_wait_budget's branch-summing note)
 class TestOverlapSignal:
     """Two-host overlap: both verifies enter before either is released.
 
@@ -2247,6 +2449,7 @@ class TestLastItemOfBurstFinalizes:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 200s worst case (task 2350 widened this region to 45.0)
 class TestChainInvalidationUnderOverlap:
     """N's verify fails while N+1 is in-flight: N+1 aborted, re-merged, re-verifies done.
 
@@ -2633,6 +2836,7 @@ class TestChainInvalidationUnderOverlap:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 65s worst case
 class TestHaltAndUnavailable:
     """step-21 RED tests: halt aborts all in-flight; RUNNER_UNAVAILABLE quarantine.
 
@@ -3414,7 +3618,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(CASCADE_TEST_TIMEOUT)  # task 3477 amend: see CASCADE_TEST_TIMEOUT -- derived so this cannot drift from TestCascadeFiresRemoteCancel's identical wait profile
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3477 amend: see HEAVY_BARRIER_TEST_TIMEOUT -- derived so this cannot drift from TestCascadeFiresRemoteCancel's identical wait profile
 class TestRunnerUnavailableHeadCascade:
     """RUNNER_UNAVAILABLE on the HEAD triggers the head-failure cascade.
 
@@ -3580,6 +3784,7 @@ class TestRunnerUnavailableHeadCascade:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 90s worst case
 class TestRunInflightVerifyRemoteCancelOnAbort:
     """_run_inflight_verify abort paths fire remote cancel before cancelling verify.
 
@@ -3954,7 +4159,7 @@ class TestStopDrainFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(CASCADE_TEST_TIMEOUT)  # task 3477 amend: see CASCADE_TEST_TIMEOUT -- derived so this cannot drift from TestRunnerUnavailableHeadCascade's identical wait profile (was a bare 180, too tight for the 225s worst case below)
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3477 amend: see HEAVY_BARRIER_TEST_TIMEOUT -- derived so this cannot drift from TestRunnerUnavailableHeadCascade's identical wait profile (was a bare 180, too tight for the 225s worst case below)
 class TestCascadeFiresRemoteCancel:
     """_verifier_loop head-failure cascade fires remote cancel BEFORE task.cancel().
 
@@ -4110,6 +4315,7 @@ class TestCascadeFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 205s worst case (task 2350 widened this region to 45.0)
 class TestCascadeErrorContainment:
     """Per-entry exception in the head-failure cascade MUST NOT kill _verifier_loop.
 
@@ -4556,6 +4762,7 @@ class _FakeEscalationQueue:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 65s worst case, includes a loop.time() + 15.0 deadline-bounded poll loop (~4670-4672) invisible to the automated scan -- a deliberate over-mark the guard alone would not have demanded
 class TestRedispatchSpeculativeConservation:
     """Signal/e2e regression lock (task 2063): a genuinely speculative item
     parked on ``_redispatch`` must stay counted by
@@ -5110,4 +5317,438 @@ class TestAwaitOutcomeHelper:
             f'got {exc_info.value!r}. A real timeout must report AS a '
             f'timeout -- naming the label and the deadline -- not surface '
             f'as a confusing `outcome is None`.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3492 step-1: wait-budget audit helper (source-level AST scan)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitBudgetAuditHelper:
+    """Unit tests for `_worst_per_method_wait_budget`, task 3492's audit
+    engine -- see ITS docstring for the full per-method-vs-class-wide-sum
+    and shape-floor/branch-blind rationale; this class only pins the
+    observable behaviour case by case.
+
+    Every case here is driven from a SYNTHETIC source string, not this
+    module's own source, so these tests are provably non-vacuous and do not
+    shift when this file is later edited.
+    """
+
+    def test_two_sequential_wait_for_calls_sum_within_one_method(self) -> None:
+        """Two sequential `asyncio.wait_for(..., timeout=45.0)` calls in the
+        SAME method sum to 90.0 -- pytest-timeout enforces the whole method
+        body, so sequential waits stack.
+        """
+        source = '''
+class TestTwoSequentialWaits:
+    async def test_two_waits(self):
+        await asyncio.wait_for(x, timeout=45.0)
+        await asyncio.wait_for(y, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestTwoSequentialWaits': 90.0}, (
+            f'Expected two sequential 45.0s waits in one method to sum to '
+            f'90.0, got {budgets!r}.'
+        )
+
+    def test_mutually_exclusive_branches_are_summed_not_maxed(self) -> None:
+        """Two 45.0s waits in opposite arms of an `if`/`else` -- which can
+        never both execute in a single real run -- sum to 90.0, not the
+        45.0 a control-flow-aware count would give.
+
+        This pins a deliberate, tolerated LIMITATION, not a design goal:
+        `_method_wait_budget` walks the whole method body via `ast.walk`
+        with no awareness of branches, so mutually exclusive arms over-count
+        relative to any real execution path (see `_method_wait_budget`'s
+        docstring). It is what makes `TestOverlapSignal`'s computed 160.0s
+        exceed a control-flow-aware hand count of 135.0s for the same
+        method's try/except paths.
+        """
+        source = '''
+class TestBranchesSummed:
+    async def test_branches(self, cond):
+        if cond:
+            await asyncio.wait_for(x, timeout=45.0)
+        else:
+            await asyncio.wait_for(y, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestBranchesSummed': 90.0}, (
+            f'Expected mutually exclusive if/else branches to be SUMMED '
+            f'(90.0), not maxed (45.0) -- this pins the branch-blind '
+            f'limitation documented on _method_wait_budget, not a design '
+            f'goal; got {budgets!r}.'
+        )
+
+    def test_non_asyncio_wait_for_is_not_counted(self) -> None:
+        """A `.wait_for(...)` call on something other than `asyncio` (e.g.
+        `gate.wait_for(x, timeout=999.0)`) contributes 0.0 -- the match is
+        deliberately narrowed to `asyncio.wait_for` specifically, so an
+        unrelated same-named method can't be mistaken for the real thing.
+        """
+        source = '''
+class TestNonAsyncioWaitFor:
+    async def test_it(self, gate):
+        await gate.wait_for(x, timeout=999.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestNonAsyncioWaitFor': 0.0}, (
+            f'Expected a non-asyncio .wait_for(...) call to contribute 0.0, '
+            f'got {budgets!r}.'
+        )
+
+    def test_takes_max_over_methods_not_class_wide_sum(self) -> None:
+        """A class with TWO methods, each with one 45.0 wait, budgets at
+        45.0 -- the MAX over methods, NOT the 90.0 class-wide sum.
+
+        This is the distinction that makes the audit correct: pytest-timeout
+        applies the class mark to each method independently. Summing across
+        methods would misidentify a class like
+        `TestRunInflightVerifyAbortPoll` (four 45s methods, a 180s
+        class-wide sum but only a 45s worst method) as a false-positive
+        breach.
+        """
+        source = '''
+class TestTwoLightMethods:
+    async def test_one(self):
+        await asyncio.wait_for(x, timeout=45.0)
+
+    async def test_two(self):
+        await asyncio.wait_for(y, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestTwoLightMethods': 45.0}, (
+            f'Expected the MAX over methods (45.0), not the class-wide sum '
+            f'(90.0); got {budgets!r}. Summing across methods would '
+            f'misidentify the breaching set the guard is meant to compute.'
+        )
+
+    def test_bare_await_outcome_contributes_hidden_default_budget(self) -> None:
+        """A bare `_await_outcome(req, label='x')` call with no explicit
+        `timeout=` contributes the hidden default, MERGE_RESULT_TIMEOUT
+        (45.0) -- invisible to a naive `timeout=` grep, which is exactly
+        why the guard must special-case this call shape.
+        """
+        source = '''
+class TestBareAwaitOutcome:
+    async def test_bare_default(self):
+        await _await_outcome(req, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestBareAwaitOutcome': 45.0}, (
+            f'Expected a bare _await_outcome() call to contribute the '
+            f'hidden MERGE_RESULT_TIMEOUT default (45.0), got {budgets!r}.'
+        )
+
+    def test_await_outcome_explicit_timeout_overrides_default(self) -> None:
+        """`_await_outcome(req, label='x', timeout=10.0)` contributes its
+        explicit 10.0, not the 45.0 default -- proves the explicit
+        `timeout=` kwarg is read, not just assumed.
+        """
+        source = '''
+class TestExplicitAwaitOutcome:
+    async def test_explicit_timeout(self):
+        await _await_outcome(req, label='x', timeout=10.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestExplicitAwaitOutcome': 10.0}, (
+            f'Expected an explicit timeout=10.0 kwarg to override the '
+            f'hidden default, got {budgets!r}.'
+        )
+
+    def test_dynamic_timeout_value_contributes_zero_and_does_not_raise(self) -> None:
+        """A non-literal/dynamic timeout such as `timeout=some_var`
+        contributes 0.0 and does NOT raise -- the helper is conservative:
+        unknown means ignore, never guess.
+        """
+        source = '''
+class TestDynamicTimeout:
+    async def test_dynamic(self):
+        await asyncio.wait_for(x, timeout=some_var)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestDynamicTimeout': 0.0}, (
+            f'Expected an unresolvable dynamic timeout to contribute 0.0 '
+            f'without raising, got {budgets!r}.'
+        )
+
+    def test_merge_result_timeout_name_resolves_to_45(self) -> None:
+        """`timeout=MERGE_RESULT_TIMEOUT` resolves the name reference to
+        its known numeric value, 45.0.
+        """
+        source = '''
+class TestMergeResultTimeoutName:
+    async def test_it(self):
+        await asyncio.wait_for(x, timeout=MERGE_RESULT_TIMEOUT)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestMergeResultTimeoutName': 45.0}, (
+            f'Expected timeout=MERGE_RESULT_TIMEOUT to resolve to 45.0, '
+            f'got {budgets!r}.'
+        )
+
+    def test_heavy_barrier_test_timeout_name_resolves_to_300(self) -> None:
+        """`timeout=HEAVY_BARRIER_TEST_TIMEOUT` resolves the name reference
+        to its known numeric value, 300.0.
+        """
+        source = '''
+class TestHeavyBarrierTimeoutName:
+    async def test_it(self):
+        await asyncio.wait_for(x, timeout=HEAVY_BARRIER_TEST_TIMEOUT)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestHeavyBarrierTimeoutName': 300.0}, (
+            f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to '
+            f'300.0, got {budgets!r}.'
+        )
+
+    def test_asyncio_sleep_is_outside_the_counted_shape_set(self) -> None:
+        """`asyncio.sleep(999)` contributes 0.0 -- sleeps are deliberately
+        OUT of the counted shape set (the guard is a conservative floor,
+        not a full audit; see the floor/superset design decision).
+        """
+        source = '''
+class TestSleepNotCounted:
+    async def test_sleeps(self):
+        await asyncio.sleep(999)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestSleepNotCounted': 0.0}, (
+            f'Expected asyncio.sleep(...) to contribute 0.0 (not a counted '
+            f'call shape), got {budgets!r}.'
+        )
+
+    def test_non_test_methods_do_not_contribute(self) -> None:
+        """A non-`test_*` method (a private helper or a fixture) contributes
+        nothing -- only real test methods drive the budget.
+        """
+        source = '''
+class TestHelperMethodsIgnored:
+    async def _helper(self):
+        await asyncio.wait_for(x, timeout=999.0)
+
+    @pytest.fixture
+    def some_fixture(self):
+        return object()
+
+    async def test_actual(self):
+        await asyncio.wait_for(y, timeout=5.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestHelperMethodsIgnored': 5.0}, (
+            f'Expected only test_* methods to contribute to the budget '
+            f'(5.0), with the 999.0s wait in a non-test helper ignored; '
+            f'got {budgets!r}.'
+        )
+
+    def test_class_with_no_test_methods_is_zero_or_absent(self) -> None:
+        """A class with no test methods at all budgets 0.0 (or is absent
+        from the result) -- no crash.
+        """
+        source = '''
+class TestNoTestMethods:
+    async def _helper(self):
+        await asyncio.wait_for(x, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets.get('TestNoTestMethods', 0.0) == 0.0, (
+            f'Expected a class with no test_* methods to budget 0.0 (or be '
+            f'absent), got {budgets!r}.'
+        )
+
+    def test_class_with_no_waits_is_zero(self) -> None:
+        """A class whose test methods never wait budgets 0.0 -- no crash."""
+        source = '''
+class TestNoWaits:
+    async def test_nothing(self):
+        x = 1 + 1
+        return x
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets.get('TestNoWaits', 0.0) == 0.0, (
+            f'Expected a class with no waits at all to budget 0.0, got '
+            f'{budgets!r}.'
+        )
+
+    def test_syntactically_odd_but_parseable_input_does_not_raise(self) -> None:
+        """A syntactically odd but still-parseable module -- no `Test*`
+        classes at all, only module-level and conditionally-nested code --
+        does not raise.
+        """
+        source = '''
+x = 1
+def free_function():
+    return 42
+if x:
+    class NotATestClass:
+        def method(self):
+            pass
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {}, (
+            f'Expected a module with no Test* classes to yield an empty '
+            f'result without raising, got {budgets!r}.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3492 amend: cover _timeout_mark_offenders' failure branches directly
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutMarkOffenders:
+    """`_timeout_mark_offenders` is the pure offender-accumulation loop
+    behind `TestTimeoutMarkCoverage`'s guard. Driven here from synthetic
+    stub classes (not this module's own, now fully-marked, classes) so its
+    failure branches -- no mark at all, a mark too tight for the budget,
+    and an unresolvable class name -- are each independently non-vacuous,
+    rather than only ever exercised by the happy path.
+    """
+
+    def test_class_with_no_pytestmark_is_one_offender(self) -> None:
+        """A resolved class with no `timeout` mark at all yields exactly
+        one offender naming the missing mark.
+        """
+
+        class _NoMark:
+            pass
+
+        offenders = _timeout_mark_offenders({'_NoMark': 200.0}, {'_NoMark': _NoMark}.get)
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert '_NoMark' in offenders[0]
+        assert 'no @pytest.mark.timeout mark' in offenders[0]
+
+    def test_mark_too_tight_for_budget_is_one_offender(self) -> None:
+        """A class carrying `@pytest.mark.timeout(60)` against a 200s
+        computed budget yields exactly one offender naming the too-tight
+        value -- this is the exact failure mode task 3477 hit (a mark
+        present but too tight to clear the real wait profile).
+        """
+
+        @pytest.mark.timeout(60)
+        class _TooTight:
+            pass
+
+        offenders = _timeout_mark_offenders({'_TooTight': 200.0}, {'_TooTight': _TooTight}.get)
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert '_TooTight' in offenders[0]
+        assert '60' in offenders[0]
+
+    def test_unresolvable_class_name_is_one_offender(self) -> None:
+        """A budgeted class name that *resolve* cannot look up (e.g. it was
+        renamed or removed after the scan ran) yields exactly one offender
+        rather than raising -- the guard degrades to a loud failure, never
+        a silent skip.
+        """
+        offenders = _timeout_mark_offenders({'DoesNotExist': 200.0}, {}.get)
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert 'DoesNotExist' in offenders[0]
+        assert 'could not be resolved' in offenders[0]
+
+    def test_adequate_mark_yields_no_offenders(self) -> None:
+        """A class whose mark value clears its computed budget yields no
+        offenders -- pins the happy path so it stays non-vacuous too.
+        """
+
+        @pytest.mark.timeout(300)
+        class _Adequate:
+            pass
+
+        offenders = _timeout_mark_offenders({'_Adequate': 200.0}, {'_Adequate': _Adequate}.get)
+
+        assert offenders == [], f'Expected no offenders, got {offenders!r}.'
+
+    def test_budget_below_threshold_is_skipped_even_with_no_mark(self) -> None:
+        """A class computing below `PYPROJECT_DEFAULT_TIMEOUT` is skipped
+        entirely, even carrying no mark at all -- only heavy classes are
+        subject to the guard.
+        """
+
+        class _LightNoMark:
+            pass
+
+        offenders = _timeout_mark_offenders(
+            {'_LightNoMark': PYPROJECT_DEFAULT_TIMEOUT - 1},
+            {'_LightNoMark': _LightNoMark}.get,
+        )
+
+        assert offenders == [], f'Expected no offenders below threshold, got {offenders!r}.'
+
+
+# ---------------------------------------------------------------------------
+# task 3492 step-3: enforced coverage invariant over THIS module's own source
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutMarkCoverage:
+    """Enforced invariant: every class in THIS module whose computed
+    worst-per-method wait budget clears the pyproject default timeout must
+    carry a `@pytest.mark.timeout` mark whose value clears that budget.
+
+    This is what stops the recurrence task 3492 exists to fix: task 2350
+    widened a wait region without adding a mark, task 2376 widened five more
+    sites without a mark, and task 3477 then found its own two marks had
+    drifted too tight for the wait profile they were guarding ("was a bare
+    180, too tight"). Literal values can still drift, but a class going
+    under-marked can no longer land silently -- this guard recomputes the
+    audit from the module's own source on every run.
+
+    The guard is a conservative FLOOR, not the whole audit -- see
+    `_call_wait_budget`'s docstring for exactly which call shapes are
+    counted and why under-demanding (never over-demanding) is the
+    deliberate failure direction.
+    """
+
+    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
+        """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
+        carry a `timeout` mark whose value clears its own computed budget.
+
+        First run (task 3492 step-3, before step-4 added marks) flagged six
+        classes computing >= 60s with no timeout mark at all --
+        TestSingleHostSerialByteIdentical, TestOverlapSignal,
+        TestChainInvalidationUnderOverlap, TestHaltAndUnavailable,
+        TestRunInflightVerifyRemoteCancelOnAbort, TestCascadeErrorContainment.
+        Marks were added for those six (plus TestRedispatchSpeculativeConservation,
+        over-marked on the strength of a wait shape this scan cannot see) in
+        the same change; the two task-3477 cascade classes already passed
+        (HEAVY_BARRIER_TEST_TIMEOUT=300 clears their 225s budget).
+        """
+        source = Path(__file__).read_text()
+        budgets = _worst_per_method_wait_budget(source)
+        offenders = _timeout_mark_offenders(budgets, globals().get)
+
+        assert not offenders, (
+            'The following classes have a worst-case per-method wait '
+            f'budget at or above the pyproject default timeout '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see the '
+            f'[tool.pytest.ini_options].timeout setting in '
+            f'orchestrator/pyproject.toml) but lack an adequate '
+            f'@pytest.mark.timeout mark:\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
+            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
+            'the xdist worker under --max-worker-restart=0, so a '
+            'slow-but-correct run reports as a worker death instead of a '
+            'clean per-test failure. Add '
+            '@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (or another '
+            'value clearing the computed budget) directly above each '
+            'offending class.'
         )
