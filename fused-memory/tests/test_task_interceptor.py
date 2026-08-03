@@ -1083,6 +1083,11 @@ def _record_merged_metadata(taskmaster, existing_raw: str | None) -> dict:
             kwargs.get('append'),
             metadata_present=incoming is not None,
         )
+        # Narrow for _merge_metadata's `incoming: str`. The None case is
+        # already meaningful ABOVE — it is what metadata_present resolves the
+        # mode from — but combine always passes a blob, so reaching here with
+        # None is a regression in the caller, not a shape this helper models.
+        assert incoming is not None, 'combine called update_task without metadata'
         recorded['stored'] = json.loads(
             _merge_metadata(existing_raw, incoming, mode=recorded['mode'])
         )
