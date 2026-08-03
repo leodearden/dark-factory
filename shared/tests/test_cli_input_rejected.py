@@ -19,6 +19,7 @@ merge-verify time.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -616,3 +617,138 @@ class TestInvokeWithCapRetryRetriesCliInputRejectedOnce:
         )
         assert returned.success is False
         assert returned.subtype == 'error_empty_output'
+
+
+class _ScriptedClock:
+    """Stand-in for ``shared.cli_invoke.datetime`` returning scripted stamps.
+
+    Lets the fast-path drives below pin WHICH attempt the ``started_at`` /
+    ``completed_at`` stamps describe, instead of relying on wall-clock
+    resolution to distinguish two invocations microseconds apart.
+    """
+
+    def __init__(self, *stamps: str) -> None:
+        self._stamps = list(stamps)
+        self.issued: list[str] = []
+
+    def now(self, _tz=None):
+        stamp = self._stamps[min(len(self.issued), len(self._stamps) - 1)]
+        self.issued.append(stamp)
+        return SimpleNamespace(isoformat=lambda s=stamp: s)
+
+
+@pytest.mark.asyncio
+class TestInvokeWithCapRetryFastPathRetriesCliInputRejected:
+    """The ``usage_gate is None`` fast path is a SECOND dispatch site — taken
+    by the fused-memory callers that pass no gate (reconciliation, the judge,
+    the curator).  It must carry the same bounded retry, or half the fleet
+    keeps eating the failure silently.
+    """
+
+    async def test_rejection_then_success_retries_once_on_the_fast_path(self):
+        cli = _CountingCli(_rejected(), _succeeded())
+
+        returned = await invoke_with_cap_retry(
+            None,
+            'test[fastpath-reject-then-ok]',
+            invoke_fn=cli,
+            backend='claude',
+            prompt='the original prompt',
+            session_id='sess-original',
+        )
+
+        assert len(cli.calls) == 2, (
+            f'expected exactly one bounded retry (2 calls), got {len(cli.calls)}'
+        )
+        assert returned.success is True
+        assert returned.output == 'the real answer'
+
+    async def test_fast_path_retry_is_fresh_with_a_regenerated_session_id(self):
+        cli = _CountingCli(_rejected(), _succeeded())
+
+        await invoke_with_cap_retry(
+            None,
+            'test[fastpath-fresh]',
+            invoke_fn=cli,
+            backend='claude',
+            prompt='the original prompt',
+            session_id='sess-original',
+        )
+
+        first, retry = cli.calls
+        assert 'resume_session_id' not in retry
+        assert retry['session_id'] != first['session_id']
+        assert retry['prompt'] == 'the original prompt'
+
+    async def test_fast_path_is_bounded_at_two_attempts(self):
+        cli = _CountingCli(_rejected(), _rejected())
+
+        returned = await invoke_with_cap_retry(
+            None,
+            'test[fastpath-reject-twice]',
+            invoke_fn=cli,
+            backend='claude',
+            prompt='the original prompt',
+        )
+
+        assert len(cli.calls) == 2, (
+            f'expected the retry budget to stop at 2 calls, got {len(cli.calls)}'
+        )
+        assert returned.success is False
+        assert returned.subtype == 'error_cli_input_rejected'
+
+    async def test_fast_path_does_not_retry_plain_empty_output(self):
+        cli = _CountingCli(_plain_empty_output(), _succeeded())
+
+        returned = await invoke_with_cap_retry(
+            None,
+            'test[fastpath-plain-empty]',
+            invoke_fn=cli,
+            backend='claude',
+            prompt='the original prompt',
+        )
+
+        assert len(cli.calls) == 1
+        assert returned.subtype == 'error_empty_output'
+
+    async def test_account_name_is_empty_on_the_fast_path(self):
+        """No gate means no account: the stamp must stay '' rather than
+        inheriting anything from the discarded first attempt."""
+        cli = _CountingCli(_rejected(), _succeeded())
+
+        returned = await invoke_with_cap_retry(
+            None,
+            'test[fastpath-account-name]',
+            invoke_fn=cli,
+            backend='claude',
+            prompt='the original prompt',
+        )
+
+        assert returned.account_name == ''
+
+    async def test_cost_stamps_describe_the_attempt_actually_returned(self):
+        """The invocations row must describe the attempt whose result is
+        returned.  Leaving the FIRST attempt's stamps in place would report a
+        ~2s window for a run that actually took the second attempt's wall
+        clock — a silently false cost/latency record."""
+        cli = _CountingCli(_rejected(), _succeeded())
+        clock = _ScriptedClock('t1-start', 't1-done', 't2-start', 't2-done')
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+
+        with patch('shared.cli_invoke.datetime', clock):
+            await invoke_with_cap_retry(
+                None,
+                'test[fastpath-stamps]',
+                invoke_fn=cli,
+                cost_store=cost_store,
+                backend='claude',
+                prompt='the original prompt',
+            )
+
+        assert len(cli.calls) == 2
+        saved = cost_store.save_invocation.await_args.kwargs
+        assert saved['started_at'] == 't2-start', (
+            f'started_at describes the DISCARDED first attempt: {saved["started_at"]!r}'
+        )
+        assert saved['completed_at'] == 't2-done'
