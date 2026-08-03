@@ -1572,10 +1572,17 @@ def default_batch_source(cfg, *, projects_root, now: datetime,
 def _verify_prompt(cluster: dict, *, project_root: str) -> str:
     """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
     cluster against *project_root*'s current main via targeted file reads.
-    Absolute paths only -- this function never sets a subprocess cwd, so a
-    relative path in the model's own tool calls would resolve against
-    whatever directory the CLI process happens to inherit. Asks for an
-    OBSERVATION, never a diagnosis (codebook lesson
+
+    The CLI subprocess this prompt is delivered to runs with its cwd set to
+    *project_root* (``_build_stage_invokes`` binds it). That is load-bearing
+    for a reason that is NOT relative-path resolution: ``claude -p``
+    SANDBOXES tool access to the cwd tree, so a verifier launched from
+    anywhere else has every Read/Bash against this tree permission-denied,
+    with no interactive prompt to approve (proven 2026-08-03). The
+    absolute-paths instruction below is retained as belt-and-braces on top
+    of that scoping, not as a substitute for it.
+
+    Asks for an OBSERVATION, never a diagnosis (codebook lesson
     guards-assert-unverified-diagnoses)."""
     return (
         "You are the periodic-census verifier for the dark-factory "
@@ -1614,7 +1621,16 @@ def _build_default_verify_fn(project_root: str, invoke):
     that cluster rather than crashing the whole census -- a conservative
     fail-closed default for an unverifiable claim. This default never
     reports a "fixed" entry (a stronger claim than a per-cluster verify
-    prompt is designed to elicit)."""
+    prompt is designed to elicit).
+
+    That fail-closed default is correct, and it is also what made the
+    2026-08-03 sandbox gap SILENT: with the CLI subprocess rooted outside
+    the censused tree, every permission-denied verifier read became an
+    ordinary per-cluster rejection, so a whole census mass-rejected without
+    a single error surfacing. What keeps the default honest rather than
+    indiscriminate is ``_build_stage_invokes`` scoping the subprocess cwd to
+    *project_root* -- a rejection then means the claim really could not be
+    verified, not that the verifier could not see the tree."""
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
         for cluster in clusters:
@@ -1782,11 +1798,11 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _build_stage_invokes(cfg):
+def _build_stage_invokes(cfg, *, project_root):
     """Build the three per-stage ``invoke(prompt, model)`` seams, each
     carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``
     (see ``config.Timeouts`` for the rationale — why each stage needs its
-    own budget).
+    own budget) and each scoped to *project_root* as its subprocess cwd.
 
     Returns ``(mining_invoke, verify_invoke, synthesis_invoke)``. Every
     census stage calls its invoke as ``invoke(prompt, model)`` with two
@@ -1795,14 +1811,35 @@ def _build_stage_invokes(cfg):
     ``mining_invoke`` also backs the headroom probe (``run_census`` routes
     both through its single ``invoke`` param).
 
+    *project_root* is bound as ``cwd`` on ALL THREE partials, not on verify
+    alone. VERIFY is where the gap was proven fatal (fleet session
+    census-reify-3386101, 2026-08-03): it is the only stage whose prompt
+    directs the model to read the target tree, and ``claude -p`` sandboxes
+    tool access to its cwd tree, so censusing a project from some other
+    directory permission-denied every verifier read. Scoping only verify
+    would nonetheless leave mining and synthesis silently rooted in
+    whatever directory the operator launched from — an asymmetry with no
+    defensible reason that a later reader would file as a bug. It costs
+    nothing: mining and synthesis are text-in/text-out and take no tool
+    action, so their cwd is unobservable, and binding it makes "the census
+    subprocess runs inside the censused project" a uniform invariant
+    instead of a verify-only patch.
+
     ``coder._invoke_cli`` is looked up here at call time (inside this
     function, invoked from ``main``), never bound at import, so
     monkeypatching ``coder._invoke_cli`` in tests takes effect.
     """
+    cwd = str(project_root)
     return (
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs),
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs),
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs, cwd=cwd,
+        ),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs, cwd=cwd,
+        ),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs, cwd=cwd,
+        ),
     )
 
 
@@ -1917,7 +1954,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    project_root = Path(args.project_root)
+    # Resolved, not used raw: --project-root defaults to "." and is routinely
+    # passed relative. An unresolved relative root would make the stage cwd
+    # binding below vacuous (cwd="." IS the launcher's cwd — exactly the bug
+    # that binding exists to close) and would silently falsify
+    # _verify_prompt's own "ABSOLUTE paths only" contract, since it
+    # interpolates str(project_root) straight into the prompt. One resolve()
+    # at the CLI boundary makes the prompt text, the subprocess cwd and all
+    # four output paths name the same absolute tree.
+    project_root = Path(args.project_root).resolve()
     config_path = (
         Path(args.config) if args.config
         else project_root / "docs" / "legibility" / "legibility.yaml"
@@ -1963,7 +2008,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Each census stage gets its OWN claude-CLI subprocess timeout; see
     # config.Timeouts for the rationale.
-    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(cfg)
+    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
+        cfg, project_root=project_root,
+    )
 
     # One escalate_fn closure shared by BOTH consumers: run_census's
     # headroom-defer path (lines ~800) and main()'s hard-failure catch-all
