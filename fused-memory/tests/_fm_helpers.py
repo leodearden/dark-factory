@@ -671,11 +671,21 @@ def _falkor_port_from_env() -> int:
     already treats as unset.
 
     A non-empty, non-numeric value is an operator error and raises
-    ``RuntimeError`` naming the offending value. conftest.py imports this
-    module on every session, so a bare ``ValueError`` out of ``int()`` would
-    abort the whole run — including the unit lane, which never touches
-    FalkorDB — with a traceback into a shared helper rather than a message
-    anyone can act on.
+    ``RuntimeError`` naming the offending value.
+
+    That raise fires at *import* of this module, and conftest.py imports it on
+    every session — so a malformed FALKOR_PORT aborts the whole run, including
+    the unit lane, which never touches FalkorDB. This is intentional, and is
+    faithful to the behaviour it replaces: each of the six migrated modules
+    already did a bare ``int(os.environ.get('FALKOR_PORT', 6379))`` at its own
+    import, so a malformed value was always fatal. What changes is (a) the
+    message — actionable text naming the offending value, rather than a
+    ``ValueError`` traceback into a shared helper — and (b) the blast radius,
+    which widens from the six FalkorDB modules to every fused-memory module.
+    Deferring the raise into ``_falkor_available()`` would narrow (b), at the
+    cost of letting a typo'd port read as "FalkorDB not reachable" and silently
+    skip the live lane rather than reporting the typo. Failing loudly is the
+    better trade.
     """
     raw = os.environ.get('FALKOR_PORT', '').strip()
     if not raw:

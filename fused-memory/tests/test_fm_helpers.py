@@ -628,31 +628,26 @@ class TestFalkorHelpers:
         with pytest.raises(RuntimeError, match=r"FALKOR_PORT.*'notaport'"):
             _falkor_port_from_env()
 
-    def test_falkor_constants_are_derived_from_env(self):
-        """The module constants are derived through the helpers, not hardcoded.
+    def test_falkor_constants_have_the_types_consumers_require(self):
+        """The module constants carry the types ``FalkorDB(...)`` requires.
 
-        Deliberately takes no monkeypatch: the constants were computed from the
-        ambient environment at import time, so ``setenv`` here would prove
-        nothing. The ``isinstance`` pair holds under any environment and
-        catches the real hazard (a str port silently breaking
-        ``FalkorDB(port=...)``); the equalities pin that the constants flow
-        through these helpers — strong under a configured environment, a smoke
-        check under the default one. No assertion here may pin a literal
-        default, which would couple this lane to the operator's environment.
+        Scoped deliberately to the types, which is the real hazard: ``os.environ``
+        yields str, and a str port silently breaks ``FalkorDB(port=...)``. This
+        holds under any environment and pins no literal default, which would
+        couple this lane to the operator's environment.
+
+        It does NOT pin that the constants are *derived* from the environment.
+        That cannot be asserted in-process without an ``importlib.reload`` of a
+        module the whole session already holds references into (it would hand
+        earlier-imported tests stale dataclass identities), and a subprocess
+        import costs a measured ~8.6s here. The derivation functions themselves
+        are covered directly by the tests above; what is untested is only the
+        two assignment lines that call them.
         """
-        from _fm_helpers import (
-            FALKOR_HOST,
-            FALKOR_PORT,
-            _falkor_host_from_env,
-            _falkor_port_from_env,
-        )
+        from _fm_helpers import FALKOR_HOST, FALKOR_PORT
 
         assert isinstance(FALKOR_HOST, str)
         assert isinstance(FALKOR_PORT, int)
-        # Operand order is ruff SIM300's (it reads an UPPER_CASE name as the
-        # literal-like side); the assertion is the same either way.
-        assert _falkor_host_from_env() == FALKOR_HOST
-        assert _falkor_port_from_env() == FALKOR_PORT
 
     def test_falkor_available_true_when_client_ok(self, monkeypatch):
         """_falkor_available() returns True when construct, query, and close all succeed."""
