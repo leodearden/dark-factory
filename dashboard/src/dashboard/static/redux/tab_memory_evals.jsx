@@ -321,10 +321,15 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
   const trend = m.trend || { labels: [], values: [] };
   const Chart = chartForKind(m.kind);
   const gaps = trendGaps(trend.values);
+  // An EMPTY series is not a drawable series: both Sparkline and StepSpark
+  // return null for a zero-length array, so without this count a metric with
+  // no runs renders a blank 26px box.  `trendGaps([])` is 0, so the gap check
+  // alone cannot tell the two apart.
+  const points = (trend.values || []).length;
   // A series with a hole cannot be drawn honestly by charts.jsx (see
   // trendGaps).  Equality, not an ordering comparison: nothing here re-derives
   // anything from a threshold.
-  const plottable = Chart && gaps === 0;
+  const plottable = Chart && gaps === 0 && points > 0;
   const labels = trend.labels || [];
   const span = labels.length
     ? `${labels[0]} → ${labels[labels.length - 1]}`
@@ -379,31 +384,58 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
       <td className="num">{dash(m.denominator)}</td>
       <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{dash(m.direction)}</td>
       <td style={{ width: 160 }}>
-        {/* Two DISTINCTLY worded suppression states, both reusing the
-            "no chart, value only" shape chartForKind already establishes:
-            an unknown kind is a rendering gap the payload files an
-            `unknown_kind` issue for, whereas a hole is normal, fully-explained
-            missing data.  Either way the row still shows value, current_value,
-            n, denominator, direction and the verdict badge — the operator
-            loses a 160px sparkline, never the signal. */}
+        {/* THREE DISTINCTLY worded suppression states, all reusing the
+            "no chart, value only" shape chartForKind already establishes.
+            They assert different things and must not be collapsed:
+
+              * unknown kind — a RENDERING gap; the payload passes the value
+                through verbatim and files an `unknown_kind` issue for it.
+              * holed series — normal, fully-explained MISSING DATA: some runs
+                produced no sample, and the count says how many.
+              * no runs — the metric simply has NOT BEEN MEASURED yet. Folding
+                this into the gap message would print "0 of 0 runs produced no
+                sample", a nonsense sentence that reads as a bug.
+
+            `!Chart` stays first: an unrenderable kind is the more actionable
+            fact than an empty series.  In every case the row still shows
+            value, current_value, n, denominator, direction and the verdict
+            badge — the operator loses a 160px sparkline, never the signal. */}
         {plottable
           ? (
-            <div style={{ height: 26 }} title={span}>
+            <div style={{ height: 26 }} title={span} data-testid="memory-eval-trend-chart">
               {/* values passed through verbatim — never filtered or compacted */}
               <Chart values={trend.values} color={MEC.accent} />
             </div>
           )
           : !Chart
             ? (
-              <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+              <span
+                className="mono"
+                style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                data-testid="memory-eval-trend-no-kind"
+              >
                 no chart for kind {String(m.kind)}
               </span>
             )
-            : (
-              <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-                no chart — {gaps} of {labels.length} runs produced no sample
-              </span>
-            )}
+            : points === 0
+              ? (
+                <span
+                  className="mono"
+                  style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                  data-testid="memory-eval-trend-no-runs"
+                >
+                  no runs yet — nothing to chart
+                </span>
+              )
+              : (
+                <span
+                  className="mono"
+                  style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                  data-testid="memory-eval-trend-gaps"
+                >
+                  no chart — {gaps} of {labels.length} runs produced no sample
+                </span>
+              )}
         <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
           {trend.labels ? trend.labels.length : 0} pts
           {gaps ? ` · ${gaps} gap(s) — no chart drawn` : ''}
