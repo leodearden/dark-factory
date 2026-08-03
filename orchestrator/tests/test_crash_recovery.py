@@ -2255,6 +2255,55 @@ class TestSessionResumeStorm:
         await _drive_session_slot(harness, 'x1', self._stale_session('uuid-x1'))
 
 
+@pytest.mark.asyncio
+class TestMarkInProgressDoneRecoveryStateCleanup:
+    """_mark_in_progress_done must drop ALL THREE parallel recovery stashes for
+    the task it terminates, not just two of them (task 3256).
+
+    Why this matters now: ``_recovered_session_config_dirs`` was left behind
+    while ``_recovered_plans`` / ``_recovered_sessions`` were popped. BEFORE the
+    'reseeded' split that orphan was at worst a harmless mis-corroboration that
+    still emitted a LOUD fallback. AFTER it, a stale stash pointing at a
+    long-deleted path classifies as ``reason='reseeded'`` and is SILENTLY
+    suppressed — the leak turns from benign into a silent-degradation path,
+    against the repo's loud-over-silent / no-silent-fail-soft invariants. So
+    closing it is a correctness PRECONDITION for the downgrade being sound.
+    """
+
+    async def test_mark_in_progress_done_clears_recovered_session_config_dir(
+        self, harness: Harness, tmp_path: Path
+    ):
+        tid = '9256'
+        harness._recovered_plans[tid] = _make_plan(3, 5, tid)
+        harness._recovered_sessions[tid] = {
+            'session_id': 'uuid-leak', 'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(), 'resume_count': 0,
+        }
+        harness._recovered_session_config_dirs[tid] = str(
+            tmp_path / 'long-deleted' / 'claude-config-x'
+        )
+
+        harness.scheduler.mark_done = AsyncMock()
+        harness.git_ops.release_lane_for_terminal_task = AsyncMock()
+        # Resolve to a path that does NOT exist, so the cleanup_worktree branch
+        # is skipped and this stays a pure recovery-state assertion.
+        harness._resolve_task_worktree = MagicMock(return_value=tmp_path / 'nope')
+
+        marked = await harness._mark_in_progress_done(
+            tid, sha='deadbeef', note='test-leak', reason='found-on-main',
+        )
+
+        assert marked is True
+        harness.scheduler.mark_done.assert_awaited_once()
+        assert tid not in harness._recovered_plans
+        assert tid not in harness._recovered_sessions
+        assert tid not in harness._recovered_session_config_dirs, (
+            'the config-dir stash must be dropped in lockstep with its session '
+            "— a surviving orphan would later classify as 'reseeded' and be "
+            'silently suppressed instead of surfacing'
+        )
+
+
 class TestCrashRecoveryPromptNote:
     """γ L0-dismissal note (task 2774): adding the escalation auto-dismissal
     warning to the shared crash-recovery resume prompt must NOT flip
