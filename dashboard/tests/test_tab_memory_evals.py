@@ -674,6 +674,46 @@ def test_index_html_registers_tab_memory_evals_load_order(
     )
 
 
+def test_index_html_cache_buster_bumped_for_the_memory_eval_ui_fixes(
+    index_html_body: str,
+) -> None:
+    """The cache-buster must be bumped, uniformly, for this task's .jsx edits.
+
+    Two of the three fixes in task 3470 are pure edits to .jsx bundles that an
+    already-open dashboard has ALREADY cached — tab_memory_evals.jsx (per-eval
+    provenance key, empty-trend state) and tab_escalations.jsx (focus-miss and
+    focus-pending feedback). Neither adds a route, a template or any other
+    server-side change that would force the browser to refetch. Without a bump
+    an open dashboard keeps running the buggy bundle indefinitely: the operator
+    sees every provenance <details> pop open on the next 3s poll, a blank 26px
+    box where an empty trend should name itself, and a dead cross-tab link,
+    while the fixed source sits on disk unread.
+
+    Bumping is therefore part of the fix, not a cosmetic afterthought, so it is
+    pinned by a test like every prior bump was.
+    """
+    versions = set(
+        re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)
+    )
+    # Uniformity first: a PARTIAL bump is the real failure mode here. It would
+    # refetch some bundles and serve others from cache, mixing old and new
+    # module code in one page — strictly worse than not bumping at all.
+    assert len(versions) == 1, (
+        f'index.html has mixed /static/redux/?v= cache-buster versions: '
+        f'{sorted(versions)} — every /static/redux/* asset must carry the '
+        'SAME version, the styles.css <link> included, not just the two .jsx '
+        'files this task edits.'
+    )
+    v = int(next(iter(versions)))
+    assert v >= 42, (
+        f'index.html cache-buster version is {v}, expected >= 42 so task '
+        "3470's tab_memory_evals.jsx and tab_escalations.jsx fixes actually "
+        'reach already-open browsers. This floor supersedes the two it '
+        'subsumes: >= 41 (test_index_html.py) and >= 38 (the memory-evals '
+        'section landing in task 3216).'
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-5 tests: tab_memory_evals.jsx is served and renders eval cards + trends
 # ---------------------------------------------------------------------------
