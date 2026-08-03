@@ -1610,6 +1610,135 @@ def test_limits_provenance_rendered(
         )
 
 
+def test_limits_provenance_open_state_is_per_eval(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """The provenance <details> open state must be PER EVAL and read once at mount.
+
+    The defect this pins, in two halves:
+
+    (1) A single module-global key.  `ME_PROV_OPEN_KEY = 'df.memevals.prov'`
+        was one string shared by every eval card, so expanding one card's
+        provenance wrote '1' and the next re-render expanded ALL of them.  The
+        open state of a <details> is per-disclosure UI state; keying it on the
+        section rather than on the eval makes one operator's click look like a
+        rendering bug across every other card.
+
+    (2) The attribute was a CALL: `<details open={readProvOpen()} ...>`.  A
+        function call in a JSX attribute re-runs on every render — here a
+        synchronous `localStorage.getItem` per eval card per 3s poll tick — and
+        makes the DOM's own open state unrecoverable, since the next poll
+        overwrites whatever the operator just toggled with the stored value.
+        The fix is React state seeded from storage exactly once at mount.
+
+    Every identifier below is DERIVED from the source, never pinned by
+    spelling: renaming the state local, the helpers, or the hook alias is not a
+    test failure.  What must hold is the structure.
+    """
+    code = tab_memory_evals_jsx_code
+
+    prov_body = _extract_function_body(code, 'LimitsProvenance')
+    assert prov_body, 'could not extract the LimitsProvenance body.'
+
+    # (a) the `open=` attribute is a bare identifier, not a call.
+    open_attr = re.search(r'<details\s[^>]*open=\{(\w+)\}', prov_body)
+    assert open_attr is not None, (
+        'the provenance <details> must take its open state from a bare '
+        'identifier (`open={someLocal}`). Not found — see (b): it must be '
+        'React state seeded from localStorage at mount.'
+    )
+    open_local = open_attr.group(1)
+
+    # ...and the NEGATIVE that is the actual defect: no call in the attribute.
+    call_attr = re.search(r'<details\s[^>]*open=\{\s*\w+\s*\(', code)
+    assert call_attr is None, (
+        f'the provenance <details> reads its open state from a function call '
+        f'in the attribute: {call_attr.group(0)!r}. That is a synchronous '
+        'localStorage read on EVERY render — once per eval card per 3s poll '
+        'tick — and it clobbers the operator\'s toggle on the next poll. Seed '
+        'React state from storage once at mount instead.'
+    )
+
+    # (b) that identifier is React useState, seeded by the read helper.
+    #     Any useState alias is accepted (the file uses ME-prefixed aliases:
+    #     MESpark / MEStep / MEC / MEDF), so the assertion is on the
+    #     destructuring SHAPE plus the initializer, not on the hook's spelling.
+    state_decl = re.search(
+        r'const\s*\[\s*' + re.escape(open_local) + r'\s*,\s*(\w+)\s*\]\s*=\s*(\w+)\(([\s\S]{0,200}?)\);',
+        prov_body,
+    )
+    assert state_decl is not None, (
+        f'`{open_local}` reaches the <details> `open=` attribute but is not '
+        f'declared as React state (`const [{open_local}, setX] = useState(...)`). '
+        'Holding the open state in the component is what makes it per-card '
+        'rather than per-section.'
+    )
+    initializer = state_decl.group(3)
+    read_helpers = [
+        m.group(1)
+        for m in re.finditer(r'function\s+(\w+)\s*\([^)]*\)\s*\{[\s\S]{0,300}?localStorage\.getItem\(', code)
+    ]
+    assert read_helpers, (
+        'no function in tab_memory_evals.jsx reads localStorage — the '
+        'provenance open state must still be PERSISTED across reloads.'
+    )
+    assert any(re.search(r'\b' + re.escape(h) + r'\s*\(', initializer) for h in read_helpers), (
+        f'the state initializer {initializer.strip()!r} does not call the '
+        f'localStorage read helper (one of {read_helpers}). The stored open '
+        'state must seed the component exactly once at mount.'
+    )
+
+    # (c) HOOK ORDER: the state declaration must precede the `if (!lim)` early
+    #     return LimitsProvenance already has for a null limits artifact. A
+    #     hook after a conditional return is a Rules-of-Hooks violation that
+    #     blanks the card at runtime the first time an eval has no limits.
+    lim_local = re.search(r'\b(\w+)\s*=\s*ev\.limits\b', prov_body)
+    assert lim_local is not None, (
+        'LimitsProvenance must read `ev.limits` into a local.'
+    )
+    guard = re.search(
+        r'if\s*\(\s*!\s*' + re.escape(lim_local.group(1)) + r'\s*\)', prov_body
+    )
+    assert guard is not None, (
+        'LimitsProvenance must keep its `if (!lim)` early-return guard for a '
+        'null limits artifact.'
+    )
+    assert state_decl.start() < guard.start(), (
+        'the provenance open-state hook is declared AFTER the `if (!lim)` '
+        'early return. That is a conditional hook (Rules of Hooks): the first '
+        'eval without a limits artifact changes the hook count and React '
+        'blanks the card. Move the hook above the guard.'
+    )
+
+    # (d) the persisted key is derived from the EVAL IDENTITY, so the key
+    #     expression reaching localStorage varies per card.
+    assert re.search(r'\bev\.eval_id\b', prov_body), (
+        'LimitsProvenance never reads `ev.eval_id`, so its persisted open-state '
+        'key cannot vary per eval — one card\'s toggle would expand every other '
+        'card on the next poll-driven re-render.'
+    )
+
+    # (e) the read and write helpers take the key as a PARAMETER rather than
+    #     closing over one module constant. This is what makes a single global
+    #     key structurally unrepresentable, not merely absent today.
+    for call in ('getItem', 'setItem'):
+        sites = list(re.finditer(
+            r'function\s+(\w+)\s*\(([^)]*)\)\s*\{[\s\S]{0,300}?localStorage\.'
+            + call + r'\(\s*([\w.]+)',
+            code,
+        ))
+        assert sites, f'no `localStorage.{call}(` call site found in tab_memory_evals.jsx.'
+        for site in sites:
+            fn_name, params, first_arg = site.group(1), site.group(2), site.group(3)
+            param_names = [p.strip() for p in params.split(',') if p.strip()]
+            assert first_arg in param_names, (
+                f'`{fn_name}` passes {first_arg!r} to localStorage.{call}() but '
+                f'its parameters are {param_names}. The storage key must be a '
+                'PARAMETER, so a single module-global key shared by every eval '
+                'card is unrepresentable rather than merely not-currently-written.'
+            )
+
+
 # ---------------------------------------------------------------------------
 # step-13 test: staleness wording, empty states, issues notice
 # ---------------------------------------------------------------------------
