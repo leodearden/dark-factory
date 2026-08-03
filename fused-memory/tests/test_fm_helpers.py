@@ -581,6 +581,68 @@ class TestFalkorHelpers:
         assert FALKOR_PORT == 6379
         assert isinstance(FALKOR_PORT, int)
 
+    def test_falkor_available_true_when_client_ok(self, monkeypatch):
+        """_falkor_available() returns True when construct, query, and close all succeed."""
+        from _fm_helpers import _falkor_available
+
+        fake_graph = MagicMock()
+        fake_graph.query.return_value = None
+        fake_client = MagicMock()
+        fake_client.select_graph.return_value = fake_graph
+        fake_client.close.return_value = None
+        monkeypatch.setattr('falkordb.FalkorDB', MagicMock(return_value=fake_client))
+
+        assert _falkor_available() is True
+        fake_client.close.assert_called_once()
+
+    def test_falkor_available_false_when_query_raises(self, monkeypatch):
+        """_falkor_available() returns False (never raises) when the probe query raises."""
+        from _fm_helpers import _falkor_available
+
+        fake_graph = MagicMock()
+        fake_graph.query.side_effect = Exception('boom')
+        fake_client = MagicMock()
+        fake_client.select_graph.return_value = fake_graph
+        monkeypatch.setattr('falkordb.FalkorDB', MagicMock(return_value=fake_client))
+
+        assert _falkor_available() is False
+        # The fork wraps close() in contextlib.suppress inside a `finally`, so a
+        # probe against a half-dead server must still not leak the connection.
+        fake_client.close.assert_called_once()
+
+    def test_falkor_available_false_when_construct_raises(self, monkeypatch):
+        """_falkor_available() returns False (never raises) when FalkorDB(...) itself raises."""
+        from _fm_helpers import _falkor_available
+
+        def _boom(*args, **kwargs):
+            raise Exception('connection refused')
+
+        monkeypatch.setattr('falkordb.FalkorDB', _boom)
+
+        assert _falkor_available() is False
+
+    def test_falkor_available_probe_wiring(self, monkeypatch):
+        """_falkor_available() probes with the same host/port/timeout and query the forks used.
+
+        Pins the behaviour-preserving contract: a bounded ~2s connect against
+        FALKOR_HOST/FALKOR_PORT, then ``select_graph('_probe').query('RETURN 1')``.
+        """
+        from _fm_helpers import FALKOR_HOST, FALKOR_PORT, _falkor_available
+
+        fake_graph = MagicMock()
+        fake_client = MagicMock()
+        fake_client.select_graph.return_value = fake_graph
+        fake_ctor = MagicMock(return_value=fake_client)
+        monkeypatch.setattr('falkordb.FalkorDB', fake_ctor)
+
+        assert _falkor_available() is True
+
+        fake_ctor.assert_called_once_with(
+            host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2
+        )
+        fake_client.select_graph.assert_called_once_with('_probe')
+        fake_graph.query.assert_called_once_with('RETURN 1')
+
 
 # ---------------------------------------------------------------------------
 # Tests for the shared poll_until() helper (task 2377)
