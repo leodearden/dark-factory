@@ -166,10 +166,23 @@ def _split_pytest_args(rest: list[str]) -> tuple[tuple[str, ...], tuple[str, ...
 
 # Unquoted tokens that mean *raw* is doing shell control flow beyond a plain
 # left-to-right `&&` chain. `split_chain_tail` refuses to carry a tail across
-# any of them: a `||` alternative, a `;` sequence, a `|` pipe or a `( ... )`
-# subshell all make "everything after segment 0" something other than "further
-# independent commands that would have run anyway".
-_NON_AND_CHAIN_TOKENS = frozenset({'||', ';', '|', '(', ')'})
+# any of them.
+#
+# The rule, rather than a re-typed member list: EVERY chain operator except
+# `&&`, plus the two paren tokens. `&&` is the sole exclusion because a plain
+# left-to-right `&&` chain is the one shape whose tail is "further independent
+# commands that would have run anyway" — every other operator makes the tail
+# conditional on the head (`||`), merely sequenced after it (`;`), or fed by it
+# (`|`), and a `( ... )` subshell groups it into a single unit that cannot be
+# split at all. Deriving this keeps it from silently diverging when a new
+# operator joins `_CHAIN_OPERATOR_TOKENS`: a delimiter recognised there but
+# missing here would have its tail carried across control flow it was never
+# safe to cross. `frozenset` arithmetic returns a `frozenset`, so the
+# token-equality membership test below is unaffected.
+#
+# `_has_shell_grouping_or_substitution` is the character-level companion to
+# this token-equality check — see its docstring for what equality cannot see.
+_NON_AND_CHAIN_TOKENS = (_CHAIN_OPERATOR_TOKENS - {'&&'}) | {'(', ')'}
 
 
 def _has_shell_grouping_or_substitution(raw: str) -> bool:

@@ -6824,6 +6824,19 @@ async def run_main_tip_sweep(
 # always-on.
 _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
 
+#: Generous per-test timeout (seconds) injected into the main-tip-sweep
+#: CONFIRM gate's isolated re-run command via ``_with_pytest_timeout_str``.
+#: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` /
+#: ``_SWEEP_PREFILTER_TIMEOUT_SECS``: the serial recovery's ``-o addopts=``
+#: clears pyproject ``addopts`` but NOT the
+#: ``[tool.pytest.ini_options] timeout=60`` default, so without this
+#: explicit override a still-loaded host can starve the isolated confirm
+#: run into a false "still fails" verdict — and unlike the merge gate
+#: (which only holds a merge), a false verdict HERE files a red-main L1.
+#: Kept as a SEPARATE constant from the pre-filter's and the merge gate's
+#: so the three are retuned on their own signals.
+_SWEEP_CONFIRM_TIMEOUT_SECS: int = 300
+
 
 async def _run_isolated_confirm_group(
     worktree: Path,
@@ -6884,9 +6897,12 @@ def _group_node_ids_by_subproject(
     *worktree*), sync, never raises on ordinary input. Extracted from
     ``confirm_main_tip_failure_is_real`` so the main-tip-sweep isolated
     pre-filter reuses it rather than the tree gaining a THIRD copy of this
-    block (task 3095; the merge-path copy in
-    ``confirm_merge_verify_flake_suppressible`` takes list-shaped
-    module_configs and is deliberately left alone — filed as a follow-up).
+    block (task 3095). All THREE call sites now share this one implementation
+    — ``confirm_main_tip_failure_is_real``,
+    ``_sweep_failure_reproduces_in_isolation``, and the merge gate
+    ``confirm_merge_verify_flake_suppressible`` (task 3290, which folded in
+    the last inline copy; it passes ``{mc.prefix: mc for mc in
+    module_configs}`` built from its list-shaped parameter).
 
     For each node-id, the file component (``node_id.split('::', 1)[0]``) is
     probed against EVERY discovered subproject — not just the first match —
@@ -7096,9 +7112,18 @@ async def confirm_main_tip_failure_is_real(
     esc-main-sweep-ea2bd3c95e33-2 and the 2026-07-09 park_stop/symlink-loop
     incidents. This function is the harness's confirm-before-alarm gate: it
     extracts the named failing pytest node-ids from *failing_result*, and
-    re-runs JUST those tests, in ISOLATION (serial, addopts cleared — the
-    exact task-2045 recovery), in a FRESH probe worktree pinned at
-    *main_sha* — never the sweep's own contended worktree.
+    re-runs JUST those tests, in ISOLATION (scoped + forced-serial + addopts
+    cleared — the exact task-2045 recovery — plus an explicit generous
+    ``--timeout``), in a FRESH probe worktree pinned at *main_sha* — never
+    the sweep's own contended worktree.
+
+    The ``--timeout`` (``_SWEEP_CONFIRM_TIMEOUT_SECS``, task 3290) is not
+    cosmetic: ``-o addopts=`` clears pyproject's ``addopts`` but NOT its
+    ``[tool.pytest.ini_options] timeout=60`` default, so without the
+    override a still-loaded host could starve this confirmation into a
+    false "still fails" verdict — which here means filing a red-main L1
+    escalation for a flake, the exact false positive this gate exists to
+    prevent.
 
     Returns:
         ``False`` (suppress the alarm) ONLY when every named failing test
@@ -7218,8 +7243,11 @@ async def confirm_main_tip_failure_is_real(
         # re-run. ALL groups must confirm green to suppress.
         for prefix, group_node_ids in groups.items():
             mc = module_configs[prefix]
-            scoped_cmd = _serial_pytest_str(
-                _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+            scoped_cmd = _with_pytest_timeout_str(
+                _serial_pytest_str(
+                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                ),
+                _SWEEP_CONFIRM_TIMEOUT_SECS,
             )
             scoped_mc = replace(
                 mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
@@ -7308,10 +7336,15 @@ async def confirm_merge_verify_flake_suppressible(
     infra-sentinel re-run category (``INFRA_TRANSIENT_CATEGORIES`` — never
     trusted as confirmation).
 
-    Node-id -> subproject mapping mirrors ``confirm_main_tip_failure_is_real``
-    but over the GIVEN *module_configs* + *worktree* (the merge tree already on
-    disk), never re-discovered. Empty *module_configs* / files-not-on-disk
-    (unit-test fakes) naturally map nothing -> ``None``, which keeps existing
+    Node-id -> subproject mapping DELEGATES to ``_group_node_ids_by_subproject``
+    over ``{mc.prefix: mc for mc in module_configs}`` — the same shared helper
+    ``confirm_main_tip_failure_is_real`` and the sweep pre-filter use (task
+    3290 retired this call site's inline copy). The list -> dict conversion is
+    order-preserving on a prefix-deduped list, so candidate iteration and
+    first-wins ambiguity resolution are unchanged. The mapping runs over the
+    GIVEN *module_configs* + *worktree* (the merge tree already on disk), never
+    re-discovered. Empty *module_configs* / files-not-on-disk (unit-test fakes)
+    naturally map nothing -> ``None``, which keeps existing
     ``LocalRunner.run_merge_verify`` tests byte-identical.
     """
     try:
@@ -7320,44 +7353,39 @@ async def confirm_merge_verify_flake_suppressible(
             return None
 
         # Map each node-id to its owning subproject over the given
-        # module_configs + the on-disk merge worktree. Any unmapped node-id
-        # fails CLOSED to red (no guessing which subproject a node-id belongs
-        # to). Mirrors confirm_main_tip_failure_is_real's existence mapping:
-        # collect EVERY candidate subproject (not just the first) so a bare
-        # relative path that happens to exist under more than one given
-        # subproject is WARN-flagged rather than silently mis-attributed to
-        # whichever prefix iterates first — which would run the isolated
-        # confirm re-run against the wrong subproject's tests.
+        # module_configs + the on-disk merge worktree, via the SHARED helper
+        # (see its docstring for the probe rules and the ambiguity WARNING).
+        # mc_by_prefix is the single source for both the helper argument and
+        # the per-group lookup below.
         mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
-        groups: dict[str, list[str]] = {}
-        for node_id in node_ids:
-            file_part = node_id.split('::', 1)[0]
-            candidates: list[tuple[str, str]] = []
-            for mc in module_configs:
-                prefix = mc.prefix
-                if (worktree / prefix / file_part).exists():
-                    candidates.append((prefix, f'{prefix}/{node_id}'))
-                elif file_part.startswith(f'{prefix}/') and (worktree / file_part).exists():
-                    candidates.append((prefix, node_id))
-            if not candidates:
-                logger.info(
-                    'confirm_merge_verify_flake_suppressible: node-id %r did '
-                    'not map to any given subproject in %s — unconfirmable, '
-                    'not suppressing',
-                    node_id, worktree,
-                )
-                return None
-            if len(candidates) > 1:
-                logger.warning(
-                    'confirm_merge_verify_flake_suppressible: node-id %r matched '
-                    '%d given subprojects (%s) in %s — using %r; a relative path '
-                    'shared across subprojects can mis-attribute the isolated '
-                    're-run to the wrong ModuleConfig',
-                    node_id, len(candidates), [c[0] for c in candidates],
-                    worktree, candidates[0][0],
-                )
-            matched_prefix, matched_node_id = candidates[0]
-            groups.setdefault(matched_prefix, []).append(matched_node_id)
+        groups = _group_node_ids_by_subproject(
+            worktree, mc_by_prefix, node_ids,
+            log_label='confirm_merge_verify_flake_suppressible',
+        )
+        # `not groups`, NOT `is None`: both sentinels must fail CLOSED. Falling
+        # into the groups.items() loop with an empty dict would exit having run
+        # ZERO isolated re-runs and then `return node_ids` — a full suppression
+        # verdict on zero evidence, letting a genuinely red merge land. Mirrors
+        # the same defensive guard in _sweep_failure_reproduces_in_isolation.
+        if not groups:
+            # Name the offending node-ids HERE so this ONE merge-lane line
+            # answers both "which tests failed to map?" and "what did the gate
+            # decide?" without correlating a second line: the shared helper's
+            # own INFO names the first unmappable node-id but only knows the
+            # neutral 'unconfirmable', while the verdict vocabulary ('not
+            # suppressing') is the caller's alone. Rendering `groups` also
+            # separates the reachable None case from the defensive-only {}.
+            # The preview is bounded — a mass failure can extract hundreds of
+            # node-ids, and a log line is not a report.
+            shown = node_ids[:10]
+            extra = len(node_ids) - len(shown)
+            logger.info(
+                'confirm_merge_verify_flake_suppressible: node-id -> subproject '
+                'mapping yielded nothing usable (%r) for %s%s in %s — '
+                'unconfirmable, not suppressing',
+                groups, shown, f' (+{extra} more)' if extra else '', worktree,
+            )
+            return None
 
         # Each subproject group gets its own scoped + forced-serial +
         # generous-timeout isolated re-run in the SAME merge worktree. ALL

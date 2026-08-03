@@ -442,9 +442,15 @@ def _build_escalation_arguments(cfg: LegibilityConfig, summary: str, detail: str
 def _default_poster(url: str, envelope: dict) -> None:
     """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
 
-    ``httpx`` is imported lazily since it is not a ``scripts/`` dependency
-    -- mirrors ``census_trigger.default_status_fetcher``. Raises on any
-    network/HTTP failure; :func:`post_escalation` wraps this best-effort.
+    ``httpx`` is imported lazily so that importing this module -- for its
+    unit-tested pure core -- never needs it, and so the tests can substitute
+    a stub for the real POST. It is NOT lazy for availability: httpx is a
+    direct dependency of ``shared`` (``shared/pyproject.toml``,
+    ``httpx>=0.27``, task 2965), and the systemd unit runs this script under
+    ``uv run --frozen --project shared``, so it is always importable in
+    production. Mirrors ``census_trigger.default_status_fetcher``. Raises on
+    any network/HTTP failure; :func:`post_escalation` wraps this
+    best-effort.
     """
     import httpx
 

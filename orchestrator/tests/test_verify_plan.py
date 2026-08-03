@@ -21,7 +21,13 @@ import logging
 from pathlib import Path
 
 import pytest
-import yaml
+from _verify_config_corpus import (
+    FM_LINT_COMMAND,
+    MODULE_LINT_COMMANDS,
+    ROOT_LINT_COMMAND,
+    ROOT_TEST_COMMAND,
+    ROOT_TYPE_CHECK_COMMAND,
+)
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -46,82 +52,11 @@ from orchestrator.verify_plan import (
     reverse_dependent_test_targets,
 )
 
-# ---------------------------------------------------------------------------
-# Real config command strings, verbatim from the repo's orchestrator configs
-# (verified byte-identical to the live YAML). Every subproject's lint_command
-# chains a `python3 fused-memory/scripts/check_*.py <dir>` sibling checker, so
-# these are the corpus that decides whether the pre-merge scoper preserves a
-# trailing clause or truncates at the keyword.
-# ---------------------------------------------------------------------------
-
-# fused-memory/orchestrator.yaml:11 — the only 3-segment chain (two checkers)
-_FM_LINT_COMMAND = (
-    'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
-    ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
-)
-
-# cockpit/dashboard/escalation/orchestrator/sampler/shared orchestrator.yaml —
-# each the same 2-segment shape, differing only in the module name.
-_MODULE_LINT_COMMANDS = {
-    module: (
-        f'uv run --project {module} --directory {module} ruff check src/ tests/'
-        f' && python3 fused-memory/scripts/check_bare_magicmock_config.py {module}/tests'
-    )
-    for module in ('cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared')
-}
-
-# The committed repo-root config, loaded by the drift guard in
-# ``TestRootTestCommandLiveConfigDrift``. ``parents[2]`` mirrors
-# ``conftest.REPO_ROOT`` and ``tests/scripts/test_fallback_verify_config.py``'s
-# ``DF_CONFIG_PATH``.
-_DF_CONFIG_PATH = Path(__file__).resolve().parents[2] / 'dark-factory-orchestrator.yaml'
-
-# FROZEN ILLUSTRATIVE SNAPSHOT, not a live mirror —
-# dark-factory-orchestrator.yaml:lint_command (a key name, not a line number
-# — see _ROOT_TEST_COMMAND below for why). Known stale, deliberately frozen:
-# re-syncing this one is not a literal-only edit — it would invalidate the
-# exact-output golden in test_root_lint_chain_scopes_ruff_and_keeps_the_checker.
-# Only _ROOT_TEST_COMMAND is guarded against the committed yaml
-# (TestRootTestCommandLiveConfigDrift below); TestFrozenRootCommandsKeepTheirScopingShape
-# below pins that this one's structural head hasn't moved. Live drift and
-# re-sync tracked by ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19 (agent-followup-3495).
-_ROOT_LINT_COMMAND = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
-    ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-)
-
-# FROZEN ILLUSTRATIVE SNAPSHOT, not a live mirror —
-# dark-factory-orchestrator.yaml:type_check_command (a key name, not a line
-# number — see _ROOT_TEST_COMMAND below for why). Known stale, deliberately
-# frozen: re-syncing this one is not a literal-only edit — it would turn the
-# ``(_ROOT_TYPE_CHECK_COMMAND, 'pyright', 4, logging.DEBUG)`` case in
-# TestDroppedChainClausesAreLogged._DROP_CASES into a different count. Only
-# _ROOT_TEST_COMMAND is guarded against the committed yaml
-# (TestRootTestCommandLiveConfigDrift below); TestFrozenRootCommandsKeepTheirScopingShape
-# below pins that this one's structural head hasn't moved. Live drift and
-# re-sync tracked by ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19 (agent-followup-3495).
-_ROOT_TYPE_CHECK_COMMAND = (
-    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
-    ' && cd ../dashboard && npx pyright'
-)
-
-# dark-factory-orchestrator.yaml:test_command (a key name, not a line number
-# — line-number labels drift as the yaml's comment block grows, which is
-# exactly how this constant's old ``:41`` label went stale). Kept honest by
-# TestRootTestCommandLiveConfigDrift below, which re-derives the live value
-# on every run rather than restating it here.
-_ROOT_TEST_COMMAND = (
-    'cd shared && uv run pytest tests/ --timeout=300'
-    ' && cd ../escalation && uv run pytest tests/ --timeout=300'
-    ' && cd ../orchestrator && uv run pytest tests/ --timeout=300'
-    ' && cd ../fused-memory && uv run pytest tests/ --timeout=300'
-    ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
-    ' && cd ../sampler && uv run pytest tests/ --timeout=300'
-    ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
-)
+# The real config command strings this suite exercises live in
+# `_verify_config_corpus.py` (one definition site, shared with test_verify_cmd.py
+# and test_verify_scope_kappa.py); `test_verify_config_corpus.py` checks them
+# against the live YAML — the executable form of the "verified byte-identical"
+# claim this comment block used to make in prose.
 
 # Task 3218: not a config in this repo (yet), but the shape the pytest slot
 # must never tail-preserve. Mirrors test_verify_cmd.py's pair — the sibling
@@ -1178,11 +1113,11 @@ class TestDeriveVerifyPlanMergeBreadth:
 # pairings, which exercise the keyword-absent and keyword-in-a-later-segment
 # rejections.
 _REAL_CONFIG_COMMANDS: list[tuple[str, str]] = [
-    *((f'{module}-lint', cmd) for module, cmd in _MODULE_LINT_COMMANDS.items()),
-    ('fm-lint', _FM_LINT_COMMAND),
-    ('root-lint', _ROOT_LINT_COMMAND),
-    ('root-type-check', _ROOT_TYPE_CHECK_COMMAND),
-    ('root-test', _ROOT_TEST_COMMAND),
+    *((f'{module}-lint', cmd) for module, cmd in MODULE_LINT_COMMANDS.items()),
+    ('fm-lint', FM_LINT_COMMAND),
+    ('root-lint', ROOT_LINT_COMMAND),
+    ('root-type-check', ROOT_TYPE_CHECK_COMMAND),
+    ('root-test', ROOT_TEST_COMMAND),
     ('ruff-trailing-value-flag', 'ruff check src/ --select E'),
     ('opaque-mypy', 'mypy src/'),
     ('no-op-true', 'true'),
@@ -1233,7 +1168,7 @@ class TestScoperTrailingClausePreservation:
         byte-identically, still pointed at the whole ``fused-memory/tests``
         directory they assert an invariant over.
         """
-        scoped = verify._scope_to_keyword(_FM_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run --project fused-memory ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
@@ -1245,15 +1180,16 @@ class TestScoperTrailingClausePreservation:
             '&& python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests',
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
-            assert checker in _FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
+            assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
     def test_root_lint_chain_scopes_ruff_and_keeps_the_checker(self):
-        """dark-factory-orchestrator.yaml:lint_command — the fallback path's own command."""
-        scoped = verify._scope_to_keyword(_ROOT_LINT_COMMAND, 'ruff check', self._FILES)
+        """dark-factory-orchestrator.yaml::lint_command — the fallback path's own command."""
+        scoped = verify._scope_to_keyword(ROOT_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
             ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+            ' sampler/tests cockpit/tests'
         )
 
     def test_trailing_value_flag_still_truncates_at_the_keyword(self):
@@ -1276,32 +1212,33 @@ class TestScoperTrailingClausePreservation:
     def test_root_type_check_fan_out_still_truncates(self):
         """HAZARD GUARD: a cwd-sequenced same-tool fan-out must NOT keep its tail.
 
-        ``dark-factory-orchestrator.yaml:type_check_command`` is ``cd
-        fused-memory && npx pyright && cd ../orchestrator && npx pyright &&
-        cd ../dashboard && npx pyright``. Preserving that tail would (a) run
-        pyright fully UNSCOPED over two more subprojects, defeating scoping
-        entirely, and (b) break correctness — scoping applies ``strip_cwd``, which removes
-        the leading ``cd fused-memory``, so a surviving ``cd ../orchestrator``
-        would resolve relative to the worktree ROOT and escape the repo.
+        ``dark-factory-orchestrator.yaml::type_check_command`` is a ``cd <dir>
+        && npx pyright`` sequence over every subproject; its live text is
+        ``ROOT_TYPE_CHECK_COMMAND`` (deliberately not restated here — a
+        hand-copy in prose is exactly the drift ``test_verify_config_corpus.py``
+        exists to prevent, and this docstring's old ``:51`` line-number label
+        is how the previous copy rotted). Preserving that tail would (a) run
+        pyright fully UNSCOPED over every remaining subproject, defeating
+        scoping entirely, and (b) break correctness — scoping applies
+        ``strip_cwd``, which removes the leading ``cd fused-memory``, so a
+        surviving ``cd ../orchestrator`` would resolve relative to the
+        worktree ROOT and escape the repo.
         """
-        scoped = verify._scope_to_keyword(_ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
+        scoped = verify._scope_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
         assert scoped == 'npx pyright fused-memory/tests/test_harness.py'
         assert 'cd ../orchestrator' not in scoped
         assert 'cd ../dashboard' not in scoped
 
     def test_root_test_fan_out_still_truncates(self):
-        """Same hazard for ``dark-factory-orchestrator.yaml:test_command``'s fan-out.
+        """Same hazard for ``dark-factory-orchestrator.yaml::test_command``'s fan-out.
 
-        Two counts of the SAME chain appear in this module, and they measure
-        different things: the 16 top-level ``&&`` clauses (see
-        ``TestDroppedChainClausesAreLogged``'s ``_DROP_CASES`` comment) fold,
-        via ``split_and_chain_segments``, to 8 cwd-sequenced pytest segments
-        (see test_verify_cmd.py's ``TestSplitAndChainSegmentsLiveConfigDrift``).
-        Scoping to one touched file retains exactly 1 of those 8 segments and
-        drops the other 14 top-level clauses — the ``dropped=14`` entry this
-        module's ``_DROP_CASES`` pins.
+        Labelled by yaml KEY, not line number: the old ``:41`` label pointed at
+        a line the key has long since moved off (it is line 72 today) — the
+        drift that motivated task 3495. ``ROOT_TEST_COMMAND``'s exact text is
+        pinned against the live yaml by ``test_verify_config_corpus.py``, so
+        this docstring names the key and leaves the value to the gate.
         """
-        scoped = verify._scope_to_keyword(_ROOT_TEST_COMMAND, 'pytest', self._FILES)
+        scoped = verify._scope_to_keyword(ROOT_TEST_COMMAND, 'pytest', self._FILES)
         assert scoped == 'uv run pytest fused-memory/tests/test_harness.py'
         assert 'cd ../escalation' not in scoped
         assert 'cockpit' not in scoped
@@ -1426,7 +1363,7 @@ class TestTailPreservationAllowlist:
 
     def test_lint_slot_still_preserves_its_sibling_checker(self):
         """Non-regression: the allowlisted lint keyword keeps task 3061's behaviour."""
-        scoped = verify._scope_to_keyword(_FM_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped is not None
         assert (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
@@ -1505,8 +1442,8 @@ class TestDroppedChainClausesAreLogged:
     # entirely, which is exactly what let it emit at INFO claiming a dropped
     # sibling check when every clause it drops is a pytest fan-out.
     _DROP_CASES = [
-        (_ROOT_TYPE_CHECK_COMMAND, 'pyright', 4, logging.DEBUG),
-        (_ROOT_TEST_COMMAND, 'pytest', 14, logging.DEBUG),
+        (ROOT_TYPE_CHECK_COMMAND, 'pyright', 12, logging.DEBUG),
+        (ROOT_TEST_COMMAND, 'pytest', 14, logging.DEBUG),
         (_SIBLING_CHECKER_TEST_COMMAND, 'pytest', 1, logging.INFO),
         (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest', 1, logging.INFO),
         (_SIBLING_CHECKER_TYPE_CHECK_COMMAND, 'pyright', 1, logging.INFO),
@@ -1583,7 +1520,7 @@ class TestDroppedChainClausesAreLogged:
     @pytest.mark.parametrize(
         ('raw', 'keyword'),
         [
-            (_FM_LINT_COMMAND, 'ruff check'),
+            (FM_LINT_COMMAND, 'ruff check'),
             ('ruff check src/ --select E', 'ruff check'),
             ('mypy src/ && python3 x.py', 'ruff check'),
             ('true && python3 x.py', 'pytest'),
@@ -1633,11 +1570,11 @@ class TestDroppedChainClausesAreLogged:
     @pytest.mark.parametrize(
         ('raw', 'keyword'),
         [
-            (_ROOT_TYPE_CHECK_COMMAND, 'pyright'),
-            (_ROOT_TEST_COMMAND, 'pytest'),
+            (ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (ROOT_TEST_COMMAND, 'pytest'),
             (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
             (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
-            (_FM_LINT_COMMAND, 'ruff check'),
+            (FM_LINT_COMMAND, 'ruff check'),
             ('ruff check src/ --select E', 'ruff check'),
             ('mypy src/', 'ruff check'),
             ('true', 'pytest'),
@@ -1732,7 +1669,7 @@ class TestReprojectStrChainTail:
 
     @pytest.mark.parametrize(
         'raw',
-        [_ROOT_TYPE_CHECK_COMMAND, _ROOT_TEST_COMMAND],
+        [ROOT_TYPE_CHECK_COMMAND, ROOT_TEST_COMMAND],
         ids=['root-type-check-cd-fan-out', 'root-test-subshell-fan-out'],
     )
     def test_gate_reject_cases_still_no_op(self, raw):
@@ -1767,23 +1704,23 @@ class TestReprojectStrChainTail:
         — i.e. ``fused-memory/fused-memory/scripts/...`` -> exit 2 "can't open
         file" -> a spurious RED verify on a clean tree.
         """
-        result = verify._reproject_str(_FM_LINT_COMMAND, verify._FALLBACK_UV_PROJECT)
-        assert result == _FM_LINT_COMMAND
+        result = verify._reproject_str(FM_LINT_COMMAND, verify._FALLBACK_UV_PROJECT)
+        assert result == FM_LINT_COMMAND
         assert 'fused-memory/fused-memory' not in (result or '')
 
     @pytest.mark.parametrize(
         'raw',
         [
-            _FM_LINT_COMMAND,
-            *_MODULE_LINT_COMMANDS.values(),
-            _ROOT_LINT_COMMAND,
-            _ROOT_TYPE_CHECK_COMMAND,
-            _ROOT_TEST_COMMAND,
+            FM_LINT_COMMAND,
+            *MODULE_LINT_COMMANDS.values(),
+            ROOT_LINT_COMMAND,
+            ROOT_TYPE_CHECK_COMMAND,
+            ROOT_TEST_COMMAND,
             'uv run --directory sub pyright src/ && python3 tools/check.py d',
         ],
         ids=[
             'fused-memory-lint',
-            *(f'{module}-lint' for module in _MODULE_LINT_COMMANDS),
+            *(f'{module}-lint' for module in MODULE_LINT_COMMANDS),
             'root-lint',
             'root-type-check-cd-fan-out',
             'root-test-subshell-fan-out',
@@ -2147,7 +2084,7 @@ class TestReverseDependentTestTargets:
 # PlannedRun.scoped_targets: the D3 plan record's scoping provenance (task 3219)
 # ---------------------------------------------------------------------------
 
-# The single-clause counterpart of _MODULE_LINT_COMMANDS' chained shape — the
+# The single-clause counterpart of MODULE_LINT_COMMANDS' chained shape — the
 # UNIFORMITY control for test_unchained_lint_records_the_same_scoped_targets.
 # Nothing in the live configs looks like this today (every subproject chains a
 # sibling checker), which is exactly why the chained path's record loss went
@@ -2170,14 +2107,14 @@ _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
     # The live 2-segment chained lint + the root's cd-chained pyright/pytest.
     ('real-chained', ModuleConfig(
         prefix='orchestrator',
-        lint_command=_MODULE_LINT_COMMANDS['orchestrator'],
-        type_check_command=_ROOT_TYPE_CHECK_COMMAND,
-        test_command=_ROOT_TEST_COMMAND,
+        lint_command=MODULE_LINT_COMMANDS['orchestrator'],
+        type_check_command=ROOT_TYPE_CHECK_COMMAND,
+        test_command=ROOT_TEST_COMMAND,
     )),
     # The only 3-segment chain in the live configs (two sibling checkers).
     ('fm-three-segment-lint', ModuleConfig(
         prefix='orchestrator',
-        lint_command=_FM_LINT_COMMAND,
+        lint_command=FM_LINT_COMMAND,
         type_check_command='npx pyright',
         test_command='uv run pytest tests/ --timeout=300',
     )),
@@ -2185,7 +2122,7 @@ _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
     # (cmd.targets-populated) control the pre-3219 fixtures were all built from.
     ('root-lint-bare-tools', ModuleConfig(
         prefix='orchestrator',
-        lint_command=_ROOT_LINT_COMMAND,
+        lint_command=ROOT_LINT_COMMAND,
         type_check_command='pyright',
         test_command='pytest',
     )),
@@ -2220,9 +2157,9 @@ _FULL_BREADTH_CONFIG = OrchestratorConfig(
 _BARE_FALLBACK_CONFIG = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
 _REAL_SUITE_FALLBACK_CONFIG = OrchestratorConfig(
     project_root=Path('/fake'),
-    lint_command=_ROOT_LINT_COMMAND,
-    type_check_command=_ROOT_TYPE_CHECK_COMMAND,
-    test_command=_ROOT_TEST_COMMAND,
+    lint_command=ROOT_LINT_COMMAND,
+    type_check_command=ROOT_TYPE_CHECK_COMMAND,
+    test_command=ROOT_TEST_COMMAND,
 )
 
 # The branches derive_verify_plan can take, split by whether a ModuleConfig is
@@ -2299,7 +2236,7 @@ class TestPlanRecordScopedTargets:
         two are the actual deliverable: the D3 record can now answer "which
         files was this scoped to?".
         """
-        mc = ModuleConfig(prefix='fused-memory', lint_command=_FM_LINT_COMMAND)
+        mc = ModuleConfig(prefix='fused-memory', lint_command=FM_LINT_COMMAND)
         plan = derive_verify_plan([_FM_TEST_FILE], [mc], None, fake_worktree_reader)
         run = _run_for(plan, 'fused-memory', 'lint:')
         assert run is not None
@@ -2356,7 +2293,7 @@ class TestPlanRecordScopedTargets:
         test_file = 'orchestrator/tests/test_x.py'
         mc = ModuleConfig(
             prefix='orchestrator',
-            type_check_command=_MODULE_LINT_COMMANDS['orchestrator'].replace(
+            type_check_command=MODULE_LINT_COMMANDS['orchestrator'].replace(
                 'ruff check', 'npx pyright',
             ),
             test_command='uv run pytest tests/ --timeout=300',
@@ -2532,85 +2469,3 @@ class TestPlanRecordScopedTargets:
         """
         plan = derive_verify_plan(files, [], config, fake_worktree_reader, role=role)
         _assert_scoped_targets_invariant(plan, files, f'{branch_name}/{diff_name}')
-
-
-class TestRootTestCommandLiveConfigDrift:
-    """``_ROOT_TEST_COMMAND`` must keep matching the COMMITTED yaml.
-
-    A sibling of ``test_verify_cmd.py``'s
-    ``TestSplitAndChainSegmentsLiveConfigDrift`` (task 3338, commit
-    8999ad8c93). The constant and the guard are duplicated here rather than
-    imported from that module or hoisted into a shared conftest helper —
-    that is a scope call for task 3495, not an architecture verdict: this
-    suite's own conftest.py module docstring already documents avoiding
-    plain (non-fixture) names shared across test modules via conftest.py
-    itself, to dodge ``sys.modules['conftest']`` collisions with sibling
-    subprojects' own conftests under this repo's ``--import-mode=importlib``
-    addopts (pyproject.toml) — see conftest.py's own ``_orch_helpers.py``
-    workaround for that exact problem. The safer shared home would be a new,
-    uniquely-named module (e.g. ``tests/_root_config.py``), and creating or
-    editing either that or conftest.py is a file outside the two this task
-    holds locks for (this module and ``test_verify_cmd.py``) — out of scope
-    for a documentation-accuracy pass. Filed as a follow-up:
-    agent-followup-3495-conftest-hoist (ticket tkt_0RS0KSXR1H74KTQBXBTDECJ1EM).
-
-    Given each module keeps its own hand-copy today, a guard only protects
-    the copy living in its own module — demonstrated, not hypothetical: this
-    module's ``_ROOT_TEST_COMMAND`` silently drifted out of sync with the
-    live yaml (missing the ``scripts/tests/`` target ``test_command``
-    gained), while ``test_verify_cmd.py``'s identical constant was re-synced
-    the moment its own guard went red. Leaning on that sibling guard instead
-    of adding this one would leave this module's copy unprotected again.
-    """
-
-    @staticmethod
-    def _live_test_command() -> str:
-        return yaml.safe_load(_DF_CONFIG_PATH.read_text(encoding='utf-8'))['test_command']
-
-    def test_corpus_constant_still_matches_the_committed_yaml(self):
-        assert self._live_test_command() == _ROOT_TEST_COMMAND, (
-            'dark-factory-orchestrator.yaml:test_command has drifted from '
-            '_ROOT_TEST_COMMAND. Re-copy the constant, then re-check that the '
-            "assertions it feeds still describe the live chain: the dropped=14 "
-            "'root-test-fan-out' case in TestDroppedChainClausesAreLogged."
-            '_DROP_CASES, and the truncation golden in '
-            'test_root_test_fan_out_still_truncates.'
-        )
-
-
-class TestFrozenRootCommandsKeepTheirScopingShape:
-    """Cheap structural pin for the two FROZEN root command snapshots.
-
-    ``_ROOT_LINT_COMMAND`` / ``_ROOT_TYPE_CHECK_COMMAND`` are deliberately
-    NOT kept byte-equal to the live yaml (see the FROZEN ILLUSTRATIVE
-    SNAPSHOT comments above them): a full re-sync is deferred to ticket
-    tkt_0RS0C6DZXK29SRSRSZ08CQ4R19 because it invalidates exact-output
-    goldens elsewhere in this module. Deferred is not the same as unguarded:
-    a GROWING target list (the live lint_command gaining ``sampler
-    cockpit``) is the expected, already-tolerated drift, but a change to the
-    command's STRUCTURAL HEAD — which tool runs first, in which cwd — would
-    silently invalidate test_root_lint_chain_scopes_ruff_and_keeps_the_checker
-    and test_root_type_check_fan_out_still_truncates regardless of the
-    deferred re-sync. This pin catches that narrower, cheaper-to-check case
-    without committing to the full literal re-sync.
-    """
-
-    def test_live_lint_command_still_starts_with_the_frozen_prefix(self):
-        live = yaml.safe_load(_DF_CONFIG_PATH.read_text(encoding='utf-8'))['lint_command']
-        assert live.startswith('uv run ruff check '), (
-            "dark-factory-orchestrator.yaml:lint_command's structural head "
-            'has changed shape, not just grown its target list — re-derive '
-            'test_root_lint_chain_scopes_ruff_and_keeps_the_checker and bump '
-            'ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19, not just '
-            '_ROOT_LINT_COMMAND.'
-        )
-
-    def test_live_type_check_command_still_starts_with_the_frozen_prefix(self):
-        live = yaml.safe_load(_DF_CONFIG_PATH.read_text(encoding='utf-8'))['type_check_command']
-        assert live.startswith('cd fused-memory && npx pyright'), (
-            "dark-factory-orchestrator.yaml:type_check_command's structural "
-            'head has changed shape, not just added pyright segments — '
-            're-derive test_root_type_check_fan_out_still_truncates and bump '
-            'ticket tkt_0RS0C6DZXK29SRSRSZ08CQ4R19, not just '
-            '_ROOT_TYPE_CHECK_COMMAND.'
-        )
