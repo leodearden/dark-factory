@@ -3166,6 +3166,23 @@ class TaskKnowledgeSync(BaseStage):
         class is now rejected pre-write, server-side, by ``ReconWritePolicy``
         (task 2224), so post-hoc detection is redundant.
 
+        ``report.stats['tasks_created']`` (task 3046) is also normalized here,
+        plus repaired — UPWARD ONLY — against ``report.stats['task_created_records']``,
+        the action-shaped ground truth the '## Task-Creation Accounting' prompt
+        section mandates Stage 2 append to at the moment each ``resolve_ticket``
+        call confirms a creation. ``submit_task``/``resolve_ticket`` are not
+        journaled, so unlike the flag counters above, ``tasks_created`` has no
+        write-journal-derived ground truth to fall back on; a self-reported
+        undercount (e.g. a task filed mid-cycle via the Proactive Task Sample or
+        Cross-Project Routing, as in run 507bc25b) would otherwise stand
+        uncorrected. The deduped valid-record count is always published as
+        ``report.stats['task_created_records_valid']``; when it exceeds the
+        self-reported ``tasks_created``, the pre-repair value is stashed under
+        ``report.stats['tasks_created_reported']``, ``tasks_created`` is
+        overwritten, and a WARNING is logged. Never clamped downward — task 2230
+        (W5-mu) deliberately removed symmetric clamping of Stage 2's
+        self-reported counters from this method.
+
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
                 Mutated in place.
@@ -3197,6 +3214,31 @@ class TaskKnowledgeSync(BaseStage):
         # value.
         report.stats.setdefault('stage1_analytical_findings_processed', 0)
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
+
+        # ── tasks_created accounting repair (task 3046) ─────────────────────
+        # tasks_created is a purely SELF-REPORTED counter: submit_task/resolve_ticket
+        # are not journaled (TaskInterceptor._journal_around covers only
+        # set_task_status/update_task/remove_tasks/add_dependency/remove_dependency),
+        # so derive_stage_stats cannot recompute it and stats_verifier leaves it
+        # untouched (not in _COMPUTED_STAT_KEYS).  task_created_records is the
+        # action-shaped ground truth the prompt now mandates — mirroring
+        # flag_deleted_records — so an increment missed on a mid-cycle
+        # proactive/cross-project filing is recovered here instead of lost
+        # (run 507bc25b reported tasks_created=0 while filing task 3045).
+        report.stats.setdefault('tasks_created', 0)
+        observed = _count_valid_task_created_records(report.stats.get('task_created_records'))
+        report.stats['task_created_records_valid'] = observed
+        reported = report.stats.get('tasks_created')
+        reported_int = reported if isinstance(reported, int) and not isinstance(reported, bool) else 0
+        if observed > reported_int:
+            report.stats['tasks_created_reported'] = reported
+            report.stats['tasks_created'] = observed
+            logger.warning(
+                'reconciliation.stage2_tasks_created_undercount: run_id=%s project_id=%s '
+                'self-reported tasks_created=%r but %d confirmed task_created_records were '
+                'emitted — repairing upward to %d.',
+                run_id, self.project_id, reported, observed, observed,
+            )
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
