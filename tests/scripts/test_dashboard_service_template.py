@@ -37,19 +37,20 @@ HARDCODED_EXPECTED_ENV_LINE = (
     "/home/leo/src/dark-factory"
 )
 
-# Task 3503 made this directive load-bearing: dashboard/src/dashboard/config.py
-# DashboardConfig.project_root's default_factory is Path.cwd() (no longer a
-# hardcoded literal), and config.py's comment above that field argues
-# production behaviour is unchanged ONLY because both service files pin
-# WorkingDirectory= to the repo root and neither sets DASHBOARD_PROJECT_ROOT —
-# so cwd resolves to exactly what the old literal returned. Dropping
-# WorkingDirectory= would silently relocate every derived dashboard DB path
-# (burndown.db, metrics.db, runs.db, escalations_dir, memory_evals_dir,
-# load_samples_db) to whatever cwd systemd happens to give the unit, with
-# nothing else here catching it: check_dashboard_unit_parity.py treats
-# WorkingDirectory as presence-only by design (it compares committed-vs-
-# installed, where the directive's value can legitimately diverge across
-# hosts), so it does not guard the template/hardcoded pair asserted below.
+# WorkingDirectory= is load-bearing on its own terms: ExecStart runs
+# `uv run --project dashboard python -m uvicorn dashboard.app:app`, and
+# `--project dashboard` is a RELATIVE path resolved against the unit's
+# process cwd. systemd sets that cwd only from WorkingDirectory= (it does not
+# inherit an interactive shell's), so dropping or repointing this directive
+# makes uv resolve the wrong project directory, or fail outright. Both files
+# also pin an ABSOLUTE path, which systemd requires: an unsubstituted
+# __REPO_ROOT__ sentinel trips a fatal "WorkingDirectory= path is not
+# absolute" error, corroborated in this file's
+# test_systemd_analyze_verify_reports_no_ignored_directives docstring (point
+# 3, below). check_dashboard_unit_parity.py treats WorkingDirectory as
+# presence-only by design (it compares committed-vs-installed, where the
+# directive's value can legitimately diverge across hosts), so it does not
+# guard the template/hardcoded pair asserted below.
 TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE = "WorkingDirectory=__REPO_ROOT__"
 
 HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE = (
@@ -135,44 +136,40 @@ def test_hardcoded_service_file_sets_known_project_roots() -> None:
 def test_template_sets_working_directory() -> None:
     """scripts/dashboard.service.template must pin WorkingDirectory= to the repo root sentinel.
 
-    Task 3503 made this directive load-bearing (see the comment on
-    TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above): dashboard config's
-    project_root now defaults to Path.cwd(), which only reproduces the old
-    hardcoded-literal behaviour because this directive fixes systemd's cwd
-    for the unit to the repo root. Losing it would silently relocate every
-    derived dashboard DB path with no other test catching the drift.
+    See the comment on TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above: this
+    directive is load-bearing because ExecStart's `--project dashboard` is a
+    relative path resolved against the cwd systemd assigns the unit, and that
+    cwd comes only from WorkingDirectory=.
     """
     content = TEMPLATE.read_text(encoding="utf-8")
     assert TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE in content, (
         f"Expected line not found in {TEMPLATE}:\n"
         f"  {TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE!r}\n"
-        "WorkingDirectory=__REPO_ROOT__ is load-bearing as of task 3503: "
-        "dashboard/src/dashboard/config.py's project_root default_factory is "
-        "Path.cwd(), which relies on systemd's cwd for this unit being the "
-        "repo root. Removing or repointing this directive would silently "
-        "relocate every derived dashboard DB path."
+        "WorkingDirectory=__REPO_ROOT__ is load-bearing: ExecStart's "
+        "`--project dashboard` is a relative path resolved against the "
+        "unit's process cwd, and systemd sets that cwd only from "
+        "WorkingDirectory=. Removing or repointing this directive makes uv "
+        "resolve the wrong project directory, or fail outright."
     )
 
 
 def test_hardcoded_service_file_sets_working_directory() -> None:
     """dashboard/dark-factory-dashboard.service must pin WorkingDirectory= to the literal repo root.
 
-    Task 3503 made this directive load-bearing (see the comment on
-    HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE above): dashboard config's
-    project_root now defaults to Path.cwd(), which only reproduces the old
-    hardcoded-literal behaviour because this directive fixes systemd's cwd
-    for the unit to the repo root. Losing it would silently relocate every
-    derived dashboard DB path with no other test catching the drift.
+    See the comment on HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE above: this
+    directive is load-bearing because ExecStart's `--project dashboard` is a
+    relative path resolved against the cwd systemd assigns the unit, and that
+    cwd comes only from WorkingDirectory=.
     """
     content = HARDCODED.read_text(encoding="utf-8")
     assert HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE in content, (
         f"Expected line not found in {HARDCODED}:\n"
         f"  {HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE!r}\n"
-        "WorkingDirectory=/home/leo/src/dark-factory is load-bearing as of "
-        "task 3503: dashboard/src/dashboard/config.py's project_root "
-        "default_factory is Path.cwd(), which relies on systemd's cwd for "
-        "this unit being the repo root. Removing or repointing this "
-        "directive would silently relocate every derived dashboard DB path. "
+        "WorkingDirectory=/home/leo/src/dark-factory is load-bearing: "
+        "ExecStart's `--project dashboard` is a relative path resolved "
+        "against the unit's process cwd, and systemd sets that cwd only "
+        "from WorkingDirectory=. Removing or repointing this directive "
+        "makes uv resolve the wrong project directory, or fail outright. "
         "check_dashboard_unit_parity.py treats WorkingDirectory as presence-"
         "only by design (committed-vs-installed comparison), so it does not "
         "guard this literal value."
