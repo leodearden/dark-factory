@@ -992,6 +992,50 @@ class TestVerifyFailureIsPreexistingBaselineDiffFork:
         baseline_mock.assert_not_awaited()
         legacy_probe_mock.assert_awaited_once()
 
+    def test_baseline_diff_fork_never_reaches_the_isolated_flake_confirm_gate(
+        self, tmp_path: Path,
+    ) -> None:
+        """(reviewer_comprehensive finding 6, task 3597 amendment) The
+        isolated-rerun confirm gate (_main_probe_failure_is_isolated_flake)
+        is scoped to the signature-comparison path only — the task-mu
+        baseline-diff fork above must return BEFORE the gate is ever
+        reached. Pins this by patching verify.run_verification (the gate's
+        isolated-rerun engine) and asserting it is never awaited when a
+        baseline is available and the branch is wholly preexisting, so a
+        future refactor that moves the gate above this fork (or makes the
+        fork fall through) cannot silently start paying for isolated
+        re-runs on the merge_verify_breadth='full' path without a test
+        failing here."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', failing_test_ids=['X'],
+        )
+        baseline_mock = AsyncMock(return_value=frozenset({'X', 'Z'}))
+        isolated_rerun_mock = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch.object(verify_module, 'main_baseline_failing_ids', new=baseline_mock),
+            patch.object(verify_module, 'run_verification', isolated_rerun_mock),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], failing_result, mock_git_ops,
+                )
+            )
+
+        assert result == (True, MAIN_SHA), result
+        baseline_mock.assert_awaited_once()
+        isolated_rerun_mock.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # task 3597: _main_probe_failure_is_isolated_flake — main-probe confirm gate
@@ -1337,6 +1381,184 @@ class TestMainProbeIsolatedFlakeConfirmGate:
 
         assert result is None, f'Expected None (never raises), got {result!r}'
 
+    # -- amendment: reviewer_comprehensive finding 1 (co-occurring lint/type
+    # break precondition) ----------------------------------------------------
+
+    def test_returns_none_when_main_result_has_lint_output(self, tmp_path: Path) -> None:
+        """A genuine, co-occurring lint break on main (main_result.lint_output
+        non-empty) alongside an otherwise-recoverable test node-id -> None,
+        and run_verification is NEVER awaited. The gate may only downgrade a
+        PURELY test-leg failure — downgrading here would silently absolve a
+        real lint break on main by re-running just the flaky tests."""
+        from orchestrator import verify as verify_module
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            )
+        ]
+
+        co_occurring_lint_break = VerifyResult(
+            passed=False,
+            test_output=LOAD_FLAKE_MAIN_RESULT.test_output,
+            lint_output='foo.py:1:1: E999 SyntaxError: invalid syntax',
+            type_output='',
+            summary='Failures: tests failed, lint issues',
+            cause_hint=f'FAILED {PROBE_NODE_ID}',
+            category='test_failure',
+        )
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with patch.object(verify_module, 'run_verification', rv):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, module_configs, co_occurring_lint_break,
+                )
+            )
+
+        assert result is None, (
+            f'Expected None: a co-occurring lint break on main must not be '
+            f'masked by a green test-only isolated re-run; got {result!r}'
+        )
+        rv.assert_not_awaited()
+
+    def test_returns_none_when_main_result_has_type_output(self, tmp_path: Path) -> None:
+        """Same as above for a co-occurring type-check break
+        (main_result.type_output non-empty)."""
+        from orchestrator import verify as verify_module
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            )
+        ]
+
+        co_occurring_type_break = VerifyResult(
+            passed=False,
+            test_output=LOAD_FLAKE_MAIN_RESULT.test_output,
+            lint_output='',
+            type_output='error TS2769: foo.tsx:12',
+            summary='Failures: tests failed, type errors',
+            cause_hint=f'FAILED {PROBE_NODE_ID}',
+            category='test_failure',
+        )
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        with patch.object(verify_module, 'run_verification', rv):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, module_configs, co_occurring_type_break,
+                )
+            )
+
+        assert result is None, (
+            f'Expected None: a co-occurring type-check break on main must not '
+            f'be masked by a green test-only isolated re-run; got {result!r}'
+        )
+        rv.assert_not_awaited()
+
+    # -- amendment: reviewer_comprehensive finding 6 (multi-group coverage) --
+
+    def test_second_group_still_failing_returns_none_after_first_group_confirms(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two subproject groups: the FIRST group's isolated re-run confirms
+        green but the SECOND group's still fails -> overall None (fail-safe).
+        Exercises the per-group loop's `return None` firing on a LATER
+        iteration, not just the only (first) one — a partial confirmation
+        must never leak into a downgrade."""
+        from orchestrator import verify as verify_module
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+        other_node_id = 'tests/test_other_thing.py::test_other'
+        _write_probe_layout(probe_worktree, {
+            'other/tests/test_other_thing.py': 'def test_other():\n    pass\n',
+        })
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            ),
+            ModuleConfig(
+                prefix='other',
+                test_command='uv run --project other --directory other pytest tests/ -q',
+            ),
+        ]
+
+        two_group_main_result = VerifyResult(
+            passed=False,
+            test_output=f'FAILED {PROBE_NODE_ID}\nFAILED {other_node_id}\n',
+            lint_output='',
+            type_output='',
+            summary='test_failure',
+            cause_hint=f'FAILED {PROBE_NODE_ID}',
+            category='test_failure',
+        )
+
+        def _fake_run_verification(worktree, config, module_config, **kwargs):
+            if other_node_id in module_config.test_command:
+                return VerifyResult(
+                    passed=False,
+                    test_output=f'FAILED {other_node_id}\n',
+                    lint_output='',
+                    type_output='',
+                    summary='test_failure',
+                    cause_hint=f'FAILED {other_node_id}',
+                    category='test_failure',
+                )
+            return PASSING_RESULT
+
+        rv = AsyncMock(side_effect=_fake_run_verification)
+
+        with patch.object(verify_module, 'run_verification', rv):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, module_configs, two_group_main_result,
+                )
+            )
+
+        assert result is None, (
+            f'Expected None: the second group still fails in isolation even '
+            f'though the first group confirmed green; got {result!r}'
+        )
+        called_commands = [c.args[2].test_command for c in rv.await_args_list]
+        assert any(PROBE_NODE_ID in cmd for cmd in called_commands), (
+            f'Expected the first (orchestrator) group to have been attempted '
+            f'too, not short-circuited; got {called_commands!r}'
+        )
+        assert any(other_node_id in cmd for cmd in called_commands), (
+            f'Expected the second (other) group to have been attempted; '
+            f'got {called_commands!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 3597: verify_failure_is_preexisting_on_main — end-to-end confirm-gate
@@ -1467,6 +1689,18 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
             assert record['node_ids'] == [PROBE_NODE_ID], record
             assert record['suppressed_via'] == 'main_probe_isolated_rerun', record
 
+            # (reviewer_comprehensive finding 4) repeat-count observability:
+            # a positive int is recorded (>=1). NOTE: not asserted == 1 —
+            # verify._MAIN_PROBE_DOWNGRADE_REPEAT_COUNTS is a process-global
+            # with no per-test reset fixture (unlike _PROBE_CACHE /
+            # _BASELINE_FAILING_IDS_CACHE, see conftest.py's
+            # _clear_probe_cache and its "adding new verify.py
+            # process-globals" maintainer note — out of this task's locked
+            # scope, filed as a follow-up), so a prior xdist-worker-shared
+            # run of this same test could have already bumped it.
+            assert isinstance(record['repeat_count'], int) and record['repeat_count'] >= 1, record
+            first_repeat_count = record['repeat_count']
+
             # (e) a WARNING naming the downgrade
             warned = any(
                 MAIN_SHA[:8] in _fmt_log(call) or PROBE_NODE_ID in _fmt_log(call)
@@ -1489,6 +1723,15 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
             assert scoped_probe_mock.await_count == 2, (
                 f'A second identical call must re-probe (no cache entry from '
                 f'the downgrade); got {scoped_probe_mock.await_count} probe calls'
+            )
+
+            # (reviewer_comprehensive finding 4) the repeat counter advances
+            # on the second downgrade of the SAME signature, making the
+            # re-probe amplification observable rather than silent.
+            second_new_records = verify_module._suppressed_flake_records[pre_run_registry_len + 1:]
+            assert len(second_new_records) == 1, second_new_records
+            assert second_new_records[0]['repeat_count'] == first_repeat_count + 1, (
+                second_new_records[0]
             )
 
     # -- step-7: LEAF SIGNAL direction 2 (genuine red main) + envelope ------
