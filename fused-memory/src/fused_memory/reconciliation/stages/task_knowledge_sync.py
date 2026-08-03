@@ -288,7 +288,10 @@ async def _acknowledge_resolved_stage1_markers(
 _TASK_CREATED_SUCCESS_STATUSES: frozenset[str] = frozenset({'created', 'combined'})
 
 
-def _count_valid_task_created_records(records: object) -> int:
+def _count_valid_task_created_records(
+    records: object,
+    default_project_id: str | None = None,
+) -> int:
     """Return the deduped count of confirmed task creations in *records* (task 3046).
 
     *records* is ``report.stats['task_created_records']`` — the action-shaped
@@ -297,15 +300,34 @@ def _count_valid_task_created_records(records: object) -> int:
     creation, modeled directly on ``flag_deleted_records``. A record counts
     only when its ``status`` (case/whitespace-insensitive) is ``created`` or
     ``combined`` AND it carries a non-empty ``task_id``; ``failed`` is NEVER
-    counted regardless of whether a ``task_id`` is present, mirroring the
-    '## Verifying Task Operations' confirmation rule so the prompt and this
-    helper cannot drift on what counts.
+    counted regardless of whether a ``task_id`` is present.
+
+    This is the ``resolve_ticket``-confirmed SUBSET of the '## Verifying Task
+    Operations' confirmation rule, not the whole of it: that section also lets
+    an agent count a creation via a ``get_task`` fallback when
+    ``resolve_ticket``'s ``status`` is neither ``created``/``combined``/
+    ``failed`` but a ``task_id`` is present and a follow-up ``get_task`` call
+    verifies it. That fallback path has no dedicated ``task_created_records``
+    status value and is intentionally NOT counted here — it still
+    contributes to the agent's own self-reported ``tasks_created``, and this
+    helper's result is only ever used to raise that self-report, never lower
+    it, so a ``get_task``-verified creation is never double-counted and never
+    suppressed by this helper (task-3046 amendment: '## Verifying Task
+    Operations' intentionally covers a strictly larger set of countable
+    creations than this Python subset does — the two are not claimed to be
+    equivalent).
 
     Deduplication is keyed on ``(project_id, str(task_id))``, NOT on
     ``task_id`` alone: Cross-Project Routing means the same numeric id can
     legitimately be filed under two different projects in the same cycle
     (Taskmaster ids are per-project), and that is two distinct tasks, not a
-    duplicate report of one.
+    duplicate report of one. ``project_id`` is normalised the same way as
+    ``task_id`` — ``str(...).strip()`` — so ``' dark_factory'`` and
+    ``'dark_factory'`` collapse to one key instead of inflating the count
+    (task-3046 amendment). A record with no ``project_id`` (or one that is
+    blank after stripping) falls back to *default_project_id* — typically
+    the caller's own ``self.project_id`` — so an omitted field cannot
+    masquerade as a second, distinct cross-project filing of the same task.
 
     Best-effort and non-raising throughout, mirroring
     ``_acknowledge_resolved_stage1_markers`` above: *records* must be a
@@ -335,12 +357,52 @@ def _count_valid_task_created_records(records: object) -> int:
             if not task_id_str:
                 continue
             project_id = record.get('project_id')
-            project_id_str = str(project_id) if project_id is not None else None
+            if project_id is None:
+                project_id_str = default_project_id
+            else:
+                project_id_str = str(project_id).strip() or default_project_id
         except Exception:
             continue
         seen.add((project_id_str, task_id_str))
 
     return len(seen)
+
+
+def _coerce_tasks_created_count(value: object) -> int:
+    """Best-effort int coercion for a self-reported ``tasks_created`` value (task 3046).
+
+    Stage 2 self-reports ``tasks_created`` as free-form LLM JSON, so it can
+    plausibly arrive as a clean ``int``, a numeric ``str`` (``"3"``), or a
+    ``float`` (``3.0``) instead. This coerces all three to ``int``. A
+    ``bool`` is explicitly rejected — never trusted as a count, even though
+    ``isinstance(True, int)`` holds in Python — and anything that fails
+    coercion (``None``, a non-numeric string, a list, ...) falls back to
+    ``0``, exactly like an absent value.
+
+    Without this, a non-``int`` self-report would collapse to ``0`` under a
+    bare ``isinstance(x, int)`` check, and a smaller record-derived
+    ``observed`` count could then look like an UNDERCOUNT and overwrite a
+    legitimately larger self-report — a silent downward move the
+    upward-only repair is explicitly designed never to make (task 2230 /
+    W5-mu).
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        try:
+            return int(stripped)
+        except ValueError:
+            pass
+        try:
+            return int(float(stripped))
+        except ValueError:
+            return 0
+    return 0
 
 
 def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
@@ -3175,13 +3237,23 @@ class TaskKnowledgeSync(BaseStage):
         write-journal-derived ground truth to fall back on; a self-reported
         undercount (e.g. a task filed mid-cycle via the Proactive Task Sample or
         Cross-Project Routing, as in run 507bc25b) would otherwise stand
-        uncorrected. The deduped valid-record count is always published as
-        ``report.stats['task_created_records_valid']``; when it exceeds the
-        self-reported ``tasks_created``, the pre-repair value is stashed under
-        ``report.stats['tasks_created_reported']``, ``tasks_created`` is
-        overwritten, and a WARNING is logged. Never clamped downward — task 2230
-        (W5-mu) deliberately removed symmetric clamping of Stage 2's
-        self-reported counters from this method.
+        uncorrected. The self-reported value is coerced to ``int`` via
+        :func:`_coerce_tasks_created_count` (a numeric-``str``/``float`` self-report
+        normalizes in place; a ``bool`` or anything else uncoercible normalizes to
+        ``0``) *before* comparison, so a legitimately larger non-``int`` self-report
+        (e.g. ``"3"``) can never look like an undercount and get overwritten
+        downward — the coerced value is always what ends up in
+        ``report.stats['tasks_created']``, so normalization is real even when no
+        repair fires. The deduped valid-record count (project-scoped via
+        :func:`_count_valid_task_created_records`'s ``default_project_id``, so a
+        record with an omitted ``project_id`` collapses onto this stage's own
+        ``self.project_id`` rather than masquerading as a second cross-project
+        filing) is always published as ``report.stats['task_created_records_valid']``;
+        when it exceeds the coerced self-reported ``tasks_created``, the pre-repair
+        raw value is stashed under ``report.stats['tasks_created_reported']``,
+        ``tasks_created`` is overwritten, and a WARNING is logged. Never clamped
+        downward — task 2230 (W5-mu) deliberately removed symmetric clamping of
+        Stage 2's self-reported counters from this method.
 
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
@@ -3226,10 +3298,20 @@ class TaskKnowledgeSync(BaseStage):
         # proactive/cross-project filing is recovered here instead of lost
         # (run 507bc25b reported tasks_created=0 while filing task 3045).
         report.stats.setdefault('tasks_created', 0)
-        observed = _count_valid_task_created_records(report.stats.get('task_created_records'))
+        observed = _count_valid_task_created_records(
+            report.stats.get('task_created_records'),
+            default_project_id=self.project_id,
+        )
         report.stats['task_created_records_valid'] = observed
         reported = report.stats.get('tasks_created')
-        reported_int = reported if isinstance(reported, int) and not isinstance(reported, bool) else 0
+        # Coerce before comparing (task-3046 amendment): a non-int self-report
+        # (e.g. "3" or 3.0) must not collapse to 0 and look like an undercount
+        # relative to `observed` — that would silently move a legitimately
+        # larger self-report DOWN, which the upward-only contract forbids.
+        # The coerced value is written back unconditionally so the "normalize"
+        # half of this block is real even when no repair fires.
+        reported_int = _coerce_tasks_created_count(reported)
+        report.stats['tasks_created'] = reported_int
         if observed > reported_int:
             report.stats['tasks_created_reported'] = reported
             report.stats['tasks_created'] = observed
