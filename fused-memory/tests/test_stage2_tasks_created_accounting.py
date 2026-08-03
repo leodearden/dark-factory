@@ -256,3 +256,226 @@ class TestCountValidTaskCreatedRecords:
             {'task_id': '3045', 'status': 'combined', 'project_id': 'dark_factory'},
         ]
         assert _count_valid_task_created_records(records) == 1
+
+
+# ── Task-3046 step-5: TaskKnowledgeSync._apply_post_flight_guards repair ────
+
+
+def _mock_deps() -> dict:
+    """Kwargs for constructing a TaskKnowledgeSync with mocked deps (task 3046).
+
+    Replicates the ~12-line construction from
+    ``tests/test_stages.py::stage2_guard_mock_deps`` (10083-10098) rather than
+    cross-importing that module-private fixture — the same choice
+    ``test_recon_gate_closure_guidance.py::_make_consolidator`` documents and
+    makes for ``MemoryConsolidator``.
+    """
+    config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+    write_journal_mock = MagicMock()
+    write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
+    journal_mock = MagicMock()
+    journal_mock.write_journal = write_journal_mock
+    journal_mock.record_run_session = AsyncMock()
+    journal_mock.clear_run_session = AsyncMock()
+    return {
+        'memory_service': AsyncMock(),
+        'taskmaster': AsyncMock(),
+        'journal': journal_mock,
+        'config': config,
+        'scope': ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
+    }
+
+
+def _make_stage() -> TaskKnowledgeSync:
+    return TaskKnowledgeSync(StageId.task_knowledge_sync, **_mock_deps())
+
+
+def _make_report(stats: dict) -> StageReport:
+    now = datetime.now(tz=UTC)
+    return StageReport(
+        stage=StageId.task_knowledge_sync,
+        started_at=now,
+        completed_at=now,
+        stats=stats,
+    )
+
+
+_REPAIR_LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+
+class TestPostFlightTasksCreatedRepair:
+    """TaskKnowledgeSync._apply_post_flight_guards' tasks_created repair (task 3046).
+
+    Exercises the post-flight guard directly (not via ``stage.run()``): with
+    ``flag_deleted_records`` absent from stats,
+    ``_acknowledge_resolved_stage1_markers`` short-circuits to 0 without
+    touching the mocked memory service, isolating these assertions to the
+    tasks_created normalization + upward-only repair added by step-6.
+    """
+
+    @pytest.mark.asyncio
+    async def test_normalization_on_empty_stats(self):
+        """No counter, no records: both new keys default to 0, no repair key."""
+        stage = _make_stage()
+        report = _make_report({})
+
+        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+
+        assert report.stats['tasks_created'] == 0
+        assert report.stats['task_created_records_valid'] == 0
+        assert 'tasks_created_reported' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_run_507bc25b_regression_undercount_is_repaired(self, caplog):
+        """The exact run-507bc25b shape: tasks_created=0 self-reported while
+        one task_created_records entry confirms task 3045 was filed via the
+        proactive-sample surface — repaired upward to 1."""
+        stage = _make_stage()
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': [
+                {
+                    'action': 'task_created',
+                    'task_id': '3045',
+                    'status': 'created',
+                    'project_id': 'dark_factory',
+                    'source_path': 'proactive_sample',
+                },
+            ],
+        })
+
+        with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
+            await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+
+        assert report.stats['tasks_created'] == 1
+        assert report.stats['tasks_created_reported'] == 0
+        assert report.stats['task_created_records_valid'] == 1
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'tasks_created=0' in message
+        assert 'to 1' in message
+
+    @pytest.mark.asyncio
+    async def test_missing_counter_key_derives_from_records(self):
+        """tasks_created absent entirely; two distinct confirmed records ⇒ 2."""
+        stage = _make_stage()
+        report = _make_report({
+            'task_created_records': [
+                {
+                    'action': 'task_created',
+                    'task_id': '3045',
+                    'status': 'created',
+                    'project_id': 'dark_factory',
+                },
+                {
+                    'action': 'task_created',
+                    'task_id': '3046',
+                    'status': 'created',
+                    'project_id': 'dark_factory',
+                },
+            ],
+        })
+
+        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+
+        assert report.stats['tasks_created'] == 2
+        assert report.stats['tasks_created_reported'] == 0
+        assert report.stats['task_created_records_valid'] == 2
+
+    @pytest.mark.asyncio
+    async def test_agreement_leaves_counter_untouched_no_repair_key(self, caplog):
+        """Self-report already matches the record-derived count: no repair,
+        no spurious tasks_created_reported key, no WARNING."""
+        stage = _make_stage()
+        report = _make_report({
+            'tasks_created': 2,
+            'task_created_records': [
+                {
+                    'action': 'task_created',
+                    'task_id': '3045',
+                    'status': 'created',
+                    'project_id': 'dark_factory',
+                },
+                {
+                    'action': 'task_created',
+                    'task_id': '3046',
+                    'status': 'created',
+                    'project_id': 'dark_factory',
+                },
+            ],
+        })
+
+        with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
+            await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+
+        assert report.stats['tasks_created'] == 2
+        assert 'tasks_created_reported' not in report.stats
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    async def test_no_downward_clamp_on_over_report(self, caplog):
+        """Mirrors test_stages.py::TestPostFlightGuardsNoFlagCounterClamp
+        (task 2230): an over-reported tasks_created survives untouched even
+        though ground truth is lower. task_created_records_valid still
+        publishes the lower count so the divergence stays observable, and no
+        WARNING fires (this guard warns only on an UNDER-count repair)."""
+        stage = _make_stage()
+        report = _make_report({
+            'tasks_created': 3,
+            'task_created_records': [
+                {
+                    'action': 'task_created',
+                    'task_id': '3045',
+                    'status': 'created',
+                    'project_id': 'dark_factory',
+                },
+            ],
+        })
+
+        with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
+            await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+
+        assert report.stats['tasks_created'] == 3
+        assert report.stats['task_created_records_valid'] == 1
+        assert 'tasks_created_reported' not in report.stats
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    async def test_non_list_records_are_inert(self):
+        stage = _make_stage()
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': 'not-a-list',
+        })
+
+        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+
+        assert report.stats['tasks_created'] == 0
+        assert report.stats['task_created_records_valid'] == 0
+        assert 'tasks_created_reported' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_non_dict_and_failed_status_entries_are_inert(self):
+        stage = _make_stage()
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': [
+                None,
+                'x',
+                ['a'],
+                {
+                    'action': 'task_created',
+                    'task_id': '3045',
+                    'status': 'failed',
+                    'project_id': 'dark_factory',
+                },
+            ],
+        })
+
+        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+
+        assert report.stats['tasks_created'] == 0
+        assert report.stats['task_created_records_valid'] == 0
+        assert 'tasks_created_reported' not in report.stats
