@@ -375,6 +375,38 @@ class TestComputePatchCanonicalAndSupersedes:
         )
         assert 'canonical' not in decision.patch
 
+    def test_a_member_that_is_already_canonical_is_reported(self):
+        """Never demoting is not a licence to say nothing.
+
+        A member carrying ``canonical: true`` while the cluster's canonical
+        is someone else is the one shape that can turn a topic stamp into a
+        SECOND canonical for ``(project_id, topic)`` — the rule ``merge_plans``
+        claims to uphold.  Silence here would make the outcome depend on which
+        id sorted first.
+        """
+        decision = _mod.compute_patch(
+            {'canonical': True},
+            target_topic='docs-prd-landing',
+            make_canonical=False,
+        )
+        assert 'stray_canonical_on_member' in decision.dispositions
+        assert 'canonical' not in decision.patch, (
+            f'reporting must not become demotion: {decision.patch}'
+        )
+
+    @pytest.mark.parametrize('existing', [{}, {'canonical': False}], ids=['absent', 'false'])
+    def test_a_member_that_is_not_canonical_is_not_reported(self, existing: dict):
+        """The overwhelmingly common case stays quiet.
+
+        ``canonical: False`` is an explicit "not the canonical", so it is no
+        more a stray than an absent key is — pinned so the ``is True`` test
+        cannot be loosened to a truthiness check that fires on every member.
+        """
+        decision = _mod.compute_patch(
+            existing, target_topic='docs-prd-landing', make_canonical=False
+        )
+        assert 'stray_canonical_on_member' not in decision.dispositions
+
     # -- supersedes: PRD D2, normalize only where it is honest --------------
 
     def test_scalar_uuid_supersedes_is_folded_to_a_list(self):
@@ -1578,6 +1610,130 @@ class TestStampOne:
         assert result['outcome'] == 'conflicting_existing_topic'
         assert result['existing_topic'] == 'a-different-topic'
 
+    # -- the stray canonical: refuse, so the verdict is order-independent ----
+
+    @pytest.mark.asyncio
+    async def test_a_member_that_is_already_canonical_is_refused(self):
+        """Stamping the topic here is what would MANUFACTURE a second canonical.
+
+        ``canonical`` is scoped by ``topic``, so a stray canonical carrying no
+        topic yet is invisible to the ``{'topic': T, 'canonical': True}``
+        probe — the guard below cannot catch this one.  Refusing the whole
+        write is what keeps the corpus from acquiring a violation the sweep
+        itself created.
+        """
+        service = _service(record=_record(canonical=True))
+        result = await _mod.stamp_one(service, _target(make_canonical=False), apply=True)
+
+        service.update_memory.assert_not_awaited()
+        assert result['outcome'] == 'stray_canonical_on_member'
+        assert result['patch'] == {}
+        assert result['outcome'] in _mod.ERROR_OUTCOMES, (
+            'a manufactured uniqueness violation must not exit 0'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_stray_canonical_verdict_does_not_depend_on_sort_order(self):
+        """The reviewer's sequence, run BOTH ways round.
+
+        ``merge_plans`` orders targets by raw UUID, so before this guard the
+        same corpus produced either a silent double-canonical or a loud
+        ``canonical_uniqueness_blocked`` depending purely on which id sorted
+        first.  Here the designated canonical X and the stray member M are
+        stamped in each order against one shared store; both orders must
+        produce the same two verdicts and leave exactly one canonical.
+        """
+        stray, chosen = M1, M2
+
+        async def _verdicts(order: tuple[str, ...]) -> dict:
+            store = {stray: {'canonical': True}, chosen: {}}
+            service = AsyncMock()
+            service.get_memory_by_id.side_effect = lambda *, project_id, memory_id: (
+                {'id': memory_id, 'content': 'a fact', 'metadata': dict(store[memory_id])}
+            )
+            service.count_memories_by_metadata.side_effect = lambda project_id, filters: sum(
+                1 for md in store.values()
+                if md.get('topic') == filters['topic'] and md.get('canonical') is True
+            )
+            service.get_memories_by_metadata.side_effect = lambda p, f, limit=1000: [
+                {'id': i} for i, md in store.items()
+                if md.get('topic') == f.get('topic') and md.get('canonical') is True
+            ][:limit]
+            service.update_memory.side_effect = lambda **kw: (
+                store[kw['memory_id']].update(kw['metadata_patch']) or {'status': 'updated'}
+            )
+            out = {}
+            for memory_id in order:
+                result = await _mod.stamp_one(
+                    service,
+                    _target(memory_id=memory_id, make_canonical=memory_id == chosen),
+                    apply=True,
+                )
+                out[memory_id] = result['outcome']
+            out['_canonicals'] = sum(
+                1 for md in store.values()
+                if md.get('topic') == 'topic-one' and md.get('canonical') is True
+            )
+            return out
+
+        stray_first = await _verdicts((stray, chosen))
+        chosen_first = await _verdicts((chosen, stray))
+
+        assert stray_first == chosen_first, (
+            f'same corpus, opposite reports: {stray_first} vs {chosen_first}'
+        )
+        assert stray_first[stray] == 'stray_canonical_on_member'
+        assert stray_first[chosen] == 'stamped'
+        assert stray_first['_canonicals'] == 1
+
+    # -- every await is guarded: a flaky backend must not eat the report -----
+
+    @pytest.mark.asyncio
+    async def test_a_raising_read_becomes_a_stamp_error_not_a_traceback(self):
+        """``get_memory_by_id`` PROPAGATES a Qdrant read timeout, by contract.
+
+        Unguarded, one transient hiccup mid-``--apply`` unwinds out of
+        ``main``'s ``asyncio.run`` before either artifact is written — leaving
+        a partly-stamped corpus and no record of what landed.
+        """
+        service = _service()
+        service.get_memory_by_id.side_effect = TimeoutError('qdrant read timed out')
+
+        result = await _mod.stamp_one(service, _target(), apply=True)
+
+        service.update_memory.assert_not_awaited()
+        assert result['outcome'] == 'stamp_error'
+        assert 'TimeoutError' in result['error']
+        assert result['memory_id'] == M1, 'the row must still identify its record'
+        assert result['outcome'] in _mod.ERROR_OUTCOMES
+
+    @pytest.mark.asyncio
+    async def test_a_raising_write_becomes_a_stamp_error_not_a_traceback(self):
+        """Same guard on the write, where a partial sweep is already underway."""
+        service = _service(record=_record())
+        service.update_memory.side_effect = ConnectionError('qdrant went away')
+
+        result = await _mod.stamp_one(service, _target(), apply=True)
+
+        assert result['outcome'] == 'stamp_error'
+        assert 'ConnectionError' in result['error']
+        assert result['patch'] == {'topic': 'topic-one'}, (
+            'the row must still say what the failed write would have written'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_normalization_carries_the_legacy_spelling_it_replaced(self):
+        """The one moment the old value is knowable is before the rewrite.
+
+        ``run`` needs it to count the records that share the legacy spelling
+        and are NOT in this id-bounded sweep.
+        """
+        service = _service(record=_record(topic='topic_one'))
+        result = await _mod.stamp_one(service, _target(), apply=True)
+
+        assert 'topic_normalized' in result['dispositions']
+        assert result['existing_topic'] == 'topic_one'
+
 
 # ===========================================================================
 # run — the three sources, end to end
@@ -1602,6 +1758,10 @@ EXPECTED_BUCKETS = frozenset({
     'member_not_a_uuid',
     'cluster_without_canonical',
     'out_of_scope_project',
+    'stray_canonical_on_member',
+    'stamp_error',
+    'canonical_scroll_truncated',
+    'legacy_topic_spelling_remains',
 })
 
 PROSE_SUPERSEDES = (

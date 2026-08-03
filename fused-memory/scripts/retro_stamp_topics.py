@@ -87,6 +87,7 @@ from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 
 __all__ = [
     'CALIBRATION_FIXTURE_PATH',
+    'CANONICAL_SCROLL_LIMIT',
     'CLUSTER_MEMBER_KEYS',
     'DF_CURATOR_GATE_CLUSTERS',
     'DEFAULT_JSON_OUT',
@@ -294,7 +295,11 @@ def compute_patch(
         target_topic: The slug this cluster resolved to.  Already validated
             by the planner that produced it.
         make_canonical: Whether this record is its cluster's undisputed
-            canonical.  Never demotes: ``False`` emits nothing.
+            canonical.  Never demotes: ``False`` writes nothing.  It does
+            *report* a record that is already ``canonical: true``
+            (``stray_canonical_on_member``), because stamping the cluster's
+            topic onto one is what would create a second canonical for that
+            topic.
 
     Returns:
         A :class:`PatchDecision`; ``patch`` may be empty.
@@ -327,6 +332,19 @@ def compute_patch(
         else:
             patch['canonical'] = True
             dispositions.append('canonical_stamped')
+    elif existing_metadata.get('canonical') is True:
+        # A member that is ALREADY canonical, in a cluster whose canonical is
+        # someone else (or is plural/undecided). Silence here would defeat the
+        # <=1-canonical-per-(project_id, topic) guarantee `merge_plans` claims
+        # to uphold: `topic` is what SCOPES canonical uniqueness, so stamping
+        # it on an untopiced stray canonical is the very act that manufactures
+        # the second canonical — and `stamp_one`'s probe cannot see it coming,
+        # because it counts only records that already carry the topic. Which
+        # of the two the probe catches would then depend on nothing but the
+        # UUID sort order `merge_plans` happens to emit. Reporting it (and, in
+        # `stamp_one`, refusing the write) makes the verdict a property of the
+        # corpus rather than of iteration order.
+        dispositions.append('stray_canonical_on_member')
 
     # supersedes (PRD D2): fold scalar -> list, but ONLY when every member
     # would still be a resolvable id afterwards. `normalize_supersedes`
@@ -540,6 +558,13 @@ def plan_calibration_clusters(
     fallback and mint a slugified UUID as a topic — so a cluster with no
     registry entry is skipped rather than stamped.
 
+    A cluster with NO ``canonical`` row yields ``cluster_without_canonical``
+    and a topic-only plan; one with SEVERAL yields ``canonical_plural``, and
+    every competing id is demoted to an ordinary member so all get the topic
+    and none gets ``canonical`` — the same rule the DF manifest applies to
+    gates 3036 and 3092.  Neither is resolved here, because picking would
+    both risk the wrong record and erase the evidence anything was in doubt.
+
     Pure: no I/O (the caller loads both fixtures), no mutation of *rows*.
 
     Args:
@@ -582,7 +607,16 @@ def plan_calibration_clusters(
             continue
         project_id = getattr(entry, 'project_id', None) or 'reify'
 
-        canonical_id: str | None = None
+        # Every canonical-labeled id is collected, not just the first. A
+        # second one is a real disagreement in the fixture, and this module
+        # reports ambiguity rather than resolving it everywhere else
+        # (`canonical_disagreement`, `canonical_plural`, `topic_underivable`);
+        # keeping only the first would make the extra row vanish from the
+        # artifact entirely — neither stamped nor skipped. Latent today (the
+        # committed fixture has exactly one canonical per cluster) but the
+        # fixture is expected to grow under ζ/3130, and nothing else pins the
+        # one-canonical-per-cluster property.
+        canonical_ids: dict[str, None] = {}
         members: dict[str, None] = {}
         for row in group:
             label = row.get('label')
@@ -602,12 +636,28 @@ def plan_calibration_clusters(
                 })
                 continue
             if label == _CANONICAL_LABEL:
-                if canonical_id is None:
-                    canonical_id = memory_id
+                canonical_ids.setdefault(memory_id, None)
                 continue
             members.setdefault(memory_id, None)
 
-        if canonical_id is None:
+        canonical_plural = len(canonical_ids) > 1
+        if canonical_plural:
+            # Same rule the DF manifest applies to gates 3036 and 3092: every
+            # id still gets the topic, none gets `canonical`. Both competing
+            # ids are named so an auditor can settle it.
+            skips.append({
+                'reason': 'canonical_plural',
+                'cluster_id': cluster_id,
+                'topic': topic,
+                'canonical_memory_ids': sorted(canonical_ids),
+            })
+            for canonical_id_ in canonical_ids:
+                members.setdefault(canonical_id_, None)
+            canonical_id: str | None = None
+        else:
+            canonical_id = next(iter(canonical_ids), None)
+
+        if canonical_id is None and not canonical_plural:
             # Not a blocker: the members are still a real cluster and still
             # benefit from a topic. What the sweep must not do is PICK one.
             skips.append({
@@ -623,6 +673,7 @@ def plan_calibration_clusters(
             canonical_memory_id=canonical_id,
             member_memory_ids=tuple(members),
             source='calibration_registry_join',
+            canonical_plural=canonical_plural,
             provenance={
                 'cluster_id': cluster_id,
                 'gate_ids': (getattr(entry, 'provenance', None) or {}).get('gate_ids'),
@@ -759,7 +810,14 @@ DF_CURATOR_GATE_CLUSTERS: tuple[GateCluster, ...] = (
         ),
         note=(
             'the gate resolved to SEVERAL package/precondition-tagged canonical '
-            'entries, so no single record may be stamped canonical'
+            'entries, so no single record may be stamped canonical. '
+            "COUNT RECONCILED: the title says 7 and metadata.memory_ids "
+            'enumerates 8 because an 8th near-duplicate '
+            '(4a74ed20, written 2026-07-25) surfaced during /unblock of task '
+            '2920 and was appended by Stage 2 recon (run 77967a4c, '
+            '2026-07-26) without retitling the gate; the description records '
+            'the addition. All 8 are stamped — the 7 the title counts plus '
+            'that late arrival'
         ),
     ),
     # 3063 [cancelled] "Human gate: confirm task 3053 cancellation was
@@ -1063,6 +1121,8 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
     'canonical_uniqueness_blocked',
     'canonical_probe_failed',
     'conflicting_existing_topic',
+    'stray_canonical_on_member',
+    'stamp_error',
 })
 
 
@@ -1100,6 +1160,16 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
     and "a duplicate exists" are different facts an operator must be able to
     tell apart.
 
+    EVERY await is guarded, for the same reason.  ``get_memory_by_id``
+    documents that a Qdrant read timeout PROPAGATES rather than collapsing to
+    ``None``, and ``run`` has no per-target guard of its own — so one
+    transient backend hiccup partway through an ``--apply`` sweep would unwind
+    out of ``main``'s ``asyncio.run`` before either artifact is written,
+    leaving a partially-stamped corpus with no record of what landed.  That is
+    the single failure mode this artifact-centric design exists to prevent:
+    a re-run is only free if you can see what the last one did.  A failed
+    target becomes one ``stamp_error`` row and the sweep carries on.
+
     Args:
         memory_service: Anything with the four ``MemoryService`` coroutines
             used below.  Injected rather than constructed so the tests never
@@ -1123,9 +1193,18 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
         'make_canonical': target.make_canonical,
     }
 
-    record = await memory_service.get_memory_by_id(
-        project_id=target.project_id, memory_id=target.memory_id,
-    )
+    try:
+        record = await memory_service.get_memory_by_id(
+            project_id=target.project_id, memory_id=target.memory_id,
+        )
+    except Exception as exc:
+        return {
+            **base,
+            'outcome': 'stamp_error',
+            'patch': {},
+            'dispositions': (),
+            'error': f'{type(exc).__name__}: {exc}',
+        }
     if record is None:
         return {**base, 'outcome': 'memory_not_found', 'patch': {}, 'dispositions': ()}
 
@@ -1134,6 +1213,12 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
         metadata, target_topic=target.topic, make_canonical=target.make_canonical,
     )
     result = {**base, 'patch': dict(decision.patch), 'dispositions': decision.dispositions}
+    # The legacy spelling rides along on a normalization, so `run` can probe
+    # for the records that share it and are NOT in this id-bounded sweep.
+    # Recovering it afterwards would mean a second read of a record that has
+    # by then been rewritten — the one moment it is knowable is here.
+    if 'topic_normalized' in decision.dispositions:
+        result['existing_topic'] = metadata.get('topic')
 
     # An existing topic that is neither ours nor a legacy spelling of ours
     # means the plan put this record in the wrong cluster. Refuse the WHOLE
@@ -1143,6 +1228,22 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
         return {
             **result,
             'outcome': 'conflicting_existing_topic',
+            'existing_topic': metadata.get('topic'),
+            'patch': {},
+        }
+
+    # A member that already carries `canonical: true` while this cluster's
+    # canonical is someone else, plural, or undecided. Refuse the WHOLE write
+    # for the same reason as above: `topic` is what scopes canonical
+    # uniqueness, so stamping it here is precisely the act that would create
+    # the second canonical — and the probe below would not catch it, since a
+    # stray canonical with no topic yet is invisible to a `{'topic': T,
+    # 'canonical': True}` count. Refusing makes the verdict a fact about the
+    # corpus instead of an artefact of which id sorted first.
+    if 'stray_canonical_on_member' in decision.dispositions:
+        return {
+            **result,
+            'outcome': 'stray_canonical_on_member',
             'existing_topic': metadata.get('topic'),
             'patch': {},
         }
@@ -1185,14 +1286,21 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
     if not apply:
         return {**result, 'outcome': 'would_stamp'}
 
-    response = await memory_service.update_memory(
-        memory_id=target.memory_id,
-        project_id=target.project_id,
-        metadata_patch=dict(decision.patch),
-        metadata_mode='merge',
-        reason=WRITE_REASON,
-        _source=WRITE_SOURCE,
-    )
+    try:
+        response = await memory_service.update_memory(
+            memory_id=target.memory_id,
+            project_id=target.project_id,
+            metadata_patch=dict(decision.patch),
+            metadata_mode='merge',
+            reason=WRITE_REASON,
+            _source=WRITE_SOURCE,
+        )
+    except Exception as exc:
+        return {
+            **result,
+            'outcome': 'stamp_error',
+            'error': f'{type(exc).__name__}: {exc}',
+        }
     # `update_memory` reports a not-found by RETURNING a structured envelope
     # rather than raising, so a caller that only guarded against exceptions
     # would score a refused write as a stamp.
@@ -1216,6 +1324,19 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
 #: cover a sixth of source (1).
 DEFAULT_PROJECTS: tuple[str, ...] = ('dark_factory', 'reify')
 
+#: The page size for source (1)'s scroll, passed EXPLICITLY so the cap is a
+#: number this module owns and can compare against.
+#:
+#: ``MemoryService.get_memories_by_metadata`` returns a bare list and defaults
+#: to 1000 — the ``truncated``/``total`` self-disclosure exists only on the MCP
+#: wrapper, not on the service method this script calls.  So an implicit
+#: default would let a canonical population above the cap be covered as a
+#: silent prefix while ``record_count`` and ``bounded: True`` read as complete
+#: coverage: exactly the silent cap the ``SKIP_BUCKETS`` pre-seeding exists to
+#: refuse.  Six canonicals exist today, so this is forward-looking — which is
+#: the only time it can be added honestly.
+CANONICAL_SCROLL_LIMIT = 1000
+
 #: Every bucket the report carries, PRE-SEEDED TO EMPTY.  Seeding is the
 #: point: an absent bucket reads as "nothing was skipped", which is a
 #: different claim from "we looked and found nothing".  A hole in coverage
@@ -1234,11 +1355,16 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'canonical_plural',
     # from stamp_one
     'conflicting_existing_topic',
+    'stray_canonical_on_member',
     'canonical_uniqueness_blocked',
     'canonical_probe_failed',
     'memory_not_found',
     'update_failed',
+    'stamp_error',
     'supersedes_not_normalizable',
+    # from run, after the stamping loop
+    'canonical_scroll_truncated',
+    'legacy_topic_spelling_remains',
 )
 
 #: What each source IS, in the artifact rather than only in this docstring.
@@ -1261,6 +1387,72 @@ SOURCE_DESCRIPTIONS: dict[str, str] = {
         'manifest, transcribed from the seven PRD-D11 curator gates'
     ),
 }
+
+
+async def _probe_legacy_topic_residue(
+    memory_service, results: list[dict], skips: dict[str, list[dict]],
+) -> None:
+    """Count records still carrying a legacy spelling this sweep normalized.
+
+    One ``count_memories_by_metadata`` per distinct ``(project_id, legacy
+    spelling)`` — bounded by the number of topics actually normalized, which
+    is at most the target count and in practice a handful.
+
+    The arithmetic is what makes the number mean one thing in both modes.  In
+    a dry run this sweep's own targets still carry the legacy value and so are
+    included in the count, so the rehearsed ones are subtracted; in an apply
+    run the ones that landed no longer carry it and the count already excludes
+    them, while a target whose write FAILED still carries it — and is genuine
+    residue, correctly left in.
+
+    A probe that raises is filed in the same bucket carrying its error and no
+    count: unknown residue is not zero residue, and a bucket entry is how this
+    module says so.  Mutates *skips* in place; returns nothing.
+    """
+    pending: dict[tuple[str, str], dict] = {}
+    for result in results:
+        if 'topic_normalized' not in (result.get('dispositions') or ()):
+            continue
+        legacy = result.get('existing_topic')
+        if not isinstance(legacy, str) or not legacy:
+            continue
+        entry = pending.setdefault(
+            (result['project_id'], legacy), {'topic': result['topic'], 'rehearsed': 0},
+        )
+        if result.get('outcome') == 'would_stamp':
+            entry['rehearsed'] += 1
+
+    bucket = skips.setdefault('legacy_topic_spelling_remains', [])
+    for (project_id, legacy), entry in sorted(pending.items()):
+        try:
+            count = int(await memory_service.count_memories_by_metadata(
+                project_id, {'topic': legacy},
+            ))
+        except Exception as exc:
+            bucket.append({
+                'reason': 'legacy_topic_spelling_remains',
+                'project_id': project_id,
+                'legacy_topic': legacy,
+                'topic': entry['topic'],
+                'error': f'{type(exc).__name__}: {exc}',
+                'note': 'residue UNKNOWN — the probe failed, which is not the same as zero',
+            })
+            continue
+        residue = max(0, count - entry['rehearsed'])
+        if residue:
+            bucket.append({
+                'reason': 'legacy_topic_spelling_remains',
+                'project_id': project_id,
+                'legacy_topic': legacy,
+                'topic': entry['topic'],
+                'residue_count': residue,
+                'note': (
+                    'records outside this id-bounded sweep still carry the '
+                    'legacy spelling, so the claim is split across two topic '
+                    'values — normalize them before flipping '
+                    'memory_metadata.enforce'
+                ),
+            })
 
 
 async def run(
@@ -1317,11 +1509,31 @@ async def run(
     # --- source (1): the live canonical scroll, per project ----------------
     canonical_plans: list[ClusterPlan] = []
     scrolled_records = 0
+    scroll_truncated = False
     for project_id in projects:
         records = await memory_service.get_memories_by_metadata(
-            project_id, {'canonical': True},
+            project_id, {'canonical': True}, limit=CANONICAL_SCROLL_LIMIT,
         )
         scrolled_records += len(records)
+        # A full page is indistinguishable from a truncated one at this seam
+        # (no `total` comes back), so a full page is REPORTED as possibly
+        # short rather than assumed complete. Over-reporting at exactly the
+        # cap is the safe direction: the cost is one bucket entry an operator
+        # can dismiss, against a coverage hole nobody would ever see.
+        if len(records) >= CANONICAL_SCROLL_LIMIT:
+            scroll_truncated = True
+            _record_skips([{
+                'reason': 'canonical_scroll_truncated',
+                'project_id': project_id,
+                'value': CANONICAL_SCROLL_LIMIT,
+                'note': (
+                    "source (1)'s scroll came back exactly at the limit, so "
+                    'the canonical population may extend past it and this run '
+                    'covered only a prefix — re-run with a raised '
+                    'CANONICAL_SCROLL_LIMIT before reading source (1) as '
+                    'complete'
+                ),
+            }])
         plans, source_skips = plan_canonical_clusters(records, project_id=project_id)
         canonical_plans.extend(plans)
         _record_skips(source_skips)
@@ -1385,6 +1597,21 @@ async def run(
                 'topic': result['topic'],
             })
 
+    # --- what normalization could NOT reach -------------------------------
+    # Normalizing a legacy snake_case spelling is only an improvement if the
+    # WHOLE population moves. This sweep is id-bounded by design, so it
+    # rewrites only the enumerated members of a cluster; any record sharing
+    # the legacy value without appearing in one of the three sources keeps it,
+    # and the claim ends up filed under two exact-match topic values — worse
+    # for `get_memories_by_metadata({'topic': T})` retrieval than the uniform
+    # legacy state was. Measurably reachable: the leaf-β census shows
+    # `merge_request_bare_task_id_branch_arg` at 4 records in one project.
+    #
+    # One bounded count per (project, legacy spelling) turns an invisible
+    # split namespace into a report line the `memory_metadata.enforce` flip
+    # can actually be decided against.
+    await _probe_legacy_topic_residue(memory_service, results, skips)
+
     return {
         'apply': apply,
         # The safety claim, stated where the artifact's reader can check it.
@@ -1394,6 +1621,10 @@ async def run(
             'canonical_scroll': {
                 'description': SOURCE_DESCRIPTIONS['canonical_scroll'],
                 'record_count': scrolled_records,
+                # Stated beside the count, because `record_count` alone cannot
+                # tell a complete scroll from a truncated one.
+                'limit': CANONICAL_SCROLL_LIMIT,
+                'truncated': scroll_truncated,
                 'plan_count': len(canonical_plans),
             },
             'calibration_registry_join': {
@@ -1446,7 +1677,7 @@ _SKIP_DETAIL_KEYS: tuple[str, ...] = (
     'gate_task_id', 'cluster_id', 'project_id', 'memory_id', 'topic',
     'topics', 'canonical_memory_ids', 'incumbent_id', 'raw_topic', 'key',
     'value', 'error', 'error_type', 'detail', 'note', 'existing_topic',
-    'row_count',
+    'legacy_topic', 'residue_count', 'row_count',
 )
 
 
@@ -1490,6 +1721,13 @@ def render_markdown(report: dict) -> str:
         (
             '**Scope:** bounded — every target is addressed by memory id from '
             'an enumerated source below, never by a corpus scroll.'
+        ),
+        (
+            '**Consequence:** because it is id-bounded, a legacy topic '
+            'spelling is normalized only on the members enumerated here. Any '
+            'record sharing that spelling from outside the three sources '
+            'keeps it — see the `legacy_topic_spelling_remains` bucket, which '
+            'counts exactly that residue.'
         ),
         '',
         '## Sources',
