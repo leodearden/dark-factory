@@ -700,3 +700,124 @@ def audit_project(project_root: str, project_id: str) -> ProjectAudit:
             manifest_parse_failures=len(parse_failures),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Reporting.
+#
+# Both caveats are SINGLE module-level constants rather than inline prose, so
+# the tests pin the constant and an editor improving the wording changes one
+# place instead of drifting two copies apart.
+# ---------------------------------------------------------------------------
+
+_FIDELITY_CAVEAT = (
+    "  FIDELITY: findings are TICKET-EVIDENCED, not certain. The creating "
+    "ticket is a SUBMIT-TIME snapshot, so it cannot see a key legitimately "
+    "added between submit and combine; only key LOSS is claimed, never value "
+    "drift. Measured agreement over 400 never-combined dark_factory tasks: "
+    "367/368 on task_kind and 368/368 on source, the single task_kind "
+    "mismatch (task 3295) proving the field IS mutable post-creation. "
+    "Manifest-sourced rows rest on the capability sidecar instead, and are "
+    "labelled source=manifest."
+)
+
+_COVERAGE_CAVEAT = (
+    "  COVERAGE (the findings above are an OBSERVABLE SUBSET, not the full "
+    "damaged population - a combine target with no comparison source is "
+    "UNKNOWN, neither clean nor damaged):"
+)
+
+
+def _format_finding_line(finding: Finding) -> str:
+    """One finding, in the precedent's ``key=value`` style."""
+    return (
+        f"  task_id={finding.task_id} tag={finding.tag} "
+        f"status={finding.status} key={finding.key} "
+        f"severity={finding.severity} source={finding.expected_source}"
+    )
+
+
+def _format_coverage(coverage: AuditCoverage) -> list[str]:
+    """Render the always-printed coverage block.
+
+    Never omitted and never abbreviated when there are no findings: the whole
+    point is that the finding list is an observable subset, and a reader must
+    be told the size of the unobservable remainder.
+    """
+    return [
+        _COVERAGE_CAVEAT,
+        f"    combine targets scanned:            {coverage.total_combine_targets}",
+        f"    with a creating ticket:             {coverage.targets_with_ticket}",
+        f"    with a capability manifest:         {coverage.targets_with_manifest}",
+        f"    with NO comparison source:          {coverage.targets_without_comparison_source}",
+        f"    manifests that failed to parse:     {coverage.manifest_parse_failures}",
+    ]
+
+
+def _format_section(label: str, findings: list[Finding]) -> list[str]:
+    lines = [f"  -- {label} ({len(findings)}) --"]
+    for finding in findings:
+        lines.append(_format_finding_line(finding))
+        lines.append(f"      reason: {finding.reason}")
+    return lines
+
+
+def format_report(audits: list[ProjectAudit]) -> str:
+    """Render *audits* as a grouped, human-readable report.
+
+    LIVE findings render BEFORE terminal ones: those are the rows an operator
+    can still act on. Terminal findings are printed IN FULL regardless — they
+    are suppressed from the exit code, never from the report.
+
+    Both the FIDELITY and COVERAGE blocks are emitted for every project,
+    INCLUDING projects with zero findings.
+
+    Pure: returns the text and never prints. ``main()`` does the single print.
+    """
+    lines: list[str] = []
+    total_live = 0
+    total_terminal = 0
+    for audit in audits:
+        lines.append(f"{audit.project_root} (project_id={audit.project_id}):")
+
+        live = [f for f in audit.findings if not f.terminal]
+        terminal = [f for f in audit.findings if f.terminal]
+        total_live += len(live)
+        total_terminal += len(terminal)
+
+        lines.extend(_format_section("live findings", live))
+        lines.extend(_format_section("terminal findings (reported, but not "
+                                     "counted toward the exit code)", terminal))
+        lines.append(_FIDELITY_CAVEAT)
+        lines.extend(_format_coverage(audit.coverage))
+
+    lines.append(
+        f"{total_live + total_terminal} finding(s) across {len(audits)} "
+        f"project(s): {total_live} live, {total_terminal} terminal"
+    )
+    return "\n".join(lines)
+
+
+def format_json(audits: list[ProjectAudit]) -> str:
+    """Render *audits* as a JSON OBJECT carrying findings AND coverage.
+
+    An object rather than a bare array so the coverage counts and the fidelity
+    caveat travel with the findings — a consumer that received only an array
+    could not tell a clean project from an unobservable one.
+
+    Pure: returns the text and never prints.
+    """
+    return json.dumps(
+        {
+            "fidelity": _FIDELITY_CAVEAT,
+            "projects": [
+                {
+                    "project_root": audit.project_root,
+                    "project_id": audit.project_id,
+                    "coverage": audit.coverage._asdict(),
+                    "findings": [f._asdict() for f in audit.findings],
+                }
+                for audit in audits
+            ],
+        }
+    )

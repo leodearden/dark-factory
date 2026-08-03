@@ -1007,7 +1007,8 @@ def test_fidelity_caveat_states_the_submit_time_bound_and_measured_agreement():
     assert "367/368" in _FIDELITY_CAVEAT      # task_kind agreement
     assert "368/368" in _FIDELITY_CAVEAT      # source agreement
     assert "3295" in _FIDELITY_CAVEAT         # the mismatch proving mutability
-    assert "ticket-evidenced" in _FIDELITY_CAVEAT
+    # Case-insensitive: the constant SHOUTS the label on purpose.
+    assert "ticket-evidenced" in _FIDELITY_CAVEAT.lower()
 
 
 def test_coverage_caveat_names_the_uncoverable_population():
