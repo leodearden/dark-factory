@@ -278,10 +278,38 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
         # silently short-circuits every reap test that does not override it.
         # A test needing a real queue passes escalations_dir= at its own call
         # site; '' also matches every one of the ~300 real on-disk records.
+        # Pinned by test_make_decision_defaults_to_the_unset_queue_sentinel.
         'escalations_dir': '',
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
+
+
+def test_make_decision_defaults_to_the_unset_queue_sentinel() -> None:
+    """_make_decision must default escalations_dir to the '' unset sentinel.
+
+    escalations_dir is the ONLY DecisionRecord field that is a guard input to
+    the reaper's axis-2 queue check (``_run_reap_decisions._status``). Giving
+    this SHARED fixture a non-empty default makes every _make_decision()-built
+    decision carry a queue FOREIGN to the tmp_path-rooted queue a reap test
+    invokes the reaper with, so _status short-circuits to None before
+    read_escalation_status ever runs -- silently collapsing every
+    reap-decisions test that does not override the field into a vacuous
+    ``assert state == OPEN`` that passes no matter what it claims to pin.
+
+    That is not hypothetical: it cost three live regression tests at once
+    (task 3528, caught in review), all of them covering the very function
+    this field guards -- ..._leaves_pending_escalation_open,
+    ..._scopes_to_project and ..._fail_soft_on_bad_escalations_dir each kept
+    passing with its premise inverted.
+
+    A test that needs a real queue must pass ``escalations_dir=`` explicitly
+    at its own call site rather than changing this default. The '' sentinel
+    also matches every one of the ~300 real on-disk records, so the bare
+    fixture reproduces the common production shape and exercises the full
+    code path.
+    """
+    assert _make_decision().escalations_dir == ''
 
 
 def test_decision_state_enum_values() -> None:
