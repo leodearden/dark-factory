@@ -279,34 +279,65 @@ class TestDefaultFixturePaths:
         assert mod.DEFAULT_DISTRACTOR_SLAB_PATH == DISTRACTOR_SLAB_PATH
         assert mod.DEFAULT_ALPHA_FIXTURE_PATH == ALPHA_FIXTURE_PATH
         assert mod.DEFAULT_REGISTRY_PATH == REGISTRY_PATH
+        # Committed, not merely named: a default pointing at a path nobody
+        # ever added would only surface on a live run.
+        assert all(
+            path.exists() for path in (
+                ARM_CLAIMS_PATH, QUERY_SET_PATH, DISTRACTOR_SLAB_PATH,
+                ALPHA_FIXTURE_PATH, REGISTRY_PATH,
+            )
+        )
 
-    def test_paths_are_derived_from___file___not_baked_in(self):
+    def test_paths_are_derived_from___file___not_baked_in(self, tmp_path):
         """The lesson test_calibrate_write_triage.py:1267 pins.
 
         A path resolved at AUTHOR time breaks the moment the script runs from
-        another checkout. Every default must therefore be a child of the
-        package root the module derived from its own ``__file__`` — which is
-        exactly what a baked-in literal from this worktree would not be.
-        """
-        mod = _mod()
+        another checkout.  Asserting `is_relative_to(package_root)` on the
+        module as loaded from THIS worktree could not tell the two apart: a
+        hardcoded
+        `/home/leo/src/dark-factory/.worktrees/3199/fused-memory/tests/
+        fixtures/e2_arm_claims.jsonl` is absolute, is under this package root,
+        and exists, so it would satisfy every such assertion.
 
-        # `ModuleType.__file__` is `str | None` (namespace/builtin modules have
-        # none). `_mod()` loads via `spec_from_file_location`, so it is always
-        # set here — assert rather than assume, since a None would otherwise
-        # turn this path-derivation check into a TypeError far from its cause.
-        module_file = mod.__file__
-        assert module_file is not None
-        package_root = Path(module_file).resolve().parent.parent
-        for default in (
-            mod.DEFAULT_ARM_CLAIMS_PATH,
-            mod.DEFAULT_QUERY_SET_PATH,
-            mod.DEFAULT_DISTRACTOR_SLAB_PATH,
-            mod.DEFAULT_ALPHA_FIXTURE_PATH,
-            mod.DEFAULT_REGISTRY_PATH,
-        ):
+        So relocate the script — copy it to a package root somewhere else
+        entirely and import THAT — and require the defaults to follow it.
+        Only a `__file__`-derived path can.
+        """
+        import importlib.util  # noqa: PLC0415
+        import shutil  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        (tmp_path / 'scripts').mkdir()
+        relocated = tmp_path / 'scripts' / SCRIPT_PATH.name
+        shutil.copy2(SCRIPT_PATH, relocated)
+
+        name = 'relocated_bake_off_storage_shape'
+        spec = importlib.util.spec_from_file_location(name, relocated)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module  # @dataclass looks itself up here
+        try:
+            spec.loader.exec_module(module)
+            defaults = (
+                module.DEFAULT_ARM_CLAIMS_PATH,
+                module.DEFAULT_QUERY_SET_PATH,
+                module.DEFAULT_DISTRACTOR_SLAB_PATH,
+                module.DEFAULT_ALPHA_FIXTURE_PATH,
+                module.DEFAULT_REGISTRY_PATH,
+            )
+        finally:
+            sys.modules.pop(name, None)
+
+        for default in defaults:
             assert default.is_absolute()
-            assert default.is_relative_to(package_root)
-            assert default.exists()
+            assert default.is_relative_to(tmp_path), (
+                f'{default} did not follow the script to {tmp_path} — it is '
+                f'baked in, so the script only works from the checkout it '
+                f'was authored in'
+            )
+        # Nothing was copied alongside it, so a default that "exists" here
+        # would mean it is pointing back at the original tree.
+        assert not any(default.exists() for default in defaults)
 
 
 # ===========================================================================
@@ -914,6 +945,102 @@ class TestGroupedReadPassThrough:
 
         assert [r.record_id for r in grouped] == ['child-a']
         assert grouped[0].content == 'ORPHAN'
+
+
+class TestSuppressionImmunityIsRealInEveryLiveArm:
+    """Every V2 test below hands `contested_ids=` in literally, so all of them
+    stay green if the LIVE path derives an empty set.
+
+    The live path is `_index_arm` -> `contested_record_ids`, which reads the
+    flag through `load_arm_claims`' ``record.get('contested', False)``.  A
+    fixture field rename, or a regression in either function, would turn
+    suppression-immunity silently OFF in every run — arm (b)'s numbers would
+    shift, the artifact gate eta depends on would not say so, and this file
+    would still pass.  That is the silent-fail-soft the repo's design
+    invariants forbid, so the derivation is asserted against the fixture ON
+    DISK rather than against the loader that reads it.
+    """
+
+    @staticmethod
+    def _raw_claims() -> list[dict]:
+        return [
+            json.loads(line)
+            for line in ARM_CLAIMS_PATH.read_text(encoding='utf-8').splitlines()
+            if line.strip()
+        ]
+
+    def test_the_committed_fixture_still_carries_contested_claims(self):
+        """Read from the JSONL, not through the loader whose flag-reading is
+        exactly what could regress."""
+        contested = [row for row in self._raw_claims() if row.get('contested')]
+
+        assert contested, (
+            'no row in e2_arm_claims.jsonl is flagged contested, so every '
+            'live arm measures suppression-immunity over an empty set'
+        )
+
+    def test_every_arm_derives_a_non_empty_contested_set(self):
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+        raw_contested = {
+            row['claim_id'] for row in self._raw_claims() if row.get('contested')
+        }
+
+        for shape in mod.ARM_SHAPES:
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+
+            assert seeded.contested_ids, (
+                f'{shape}: the seeded arm carries no contested record, so the '
+                f'grouped read is free to fold every child away'
+            )
+            # Sound: nothing is marked contested that the fixture on disk does
+            # not flag...
+            for record_id in seeded.contested_ids:
+                realized = set(seeded.records_by_id[record_id].claim_ids)
+                assert realized & raw_contested, (
+                    f'{shape}/{record_id} is treated as contested but '
+                    f'realizes none of the fixture-flagged claims {realized}'
+                )
+            # ...and complete: every contested claim this arm realizes is
+            # covered, so none can be quietly folded.
+            for record in records:
+                if raw_contested & set(record.claim_ids):
+                    assert record.record_id in seeded.contested_ids, (
+                        f'{shape}/{record.record_id} realizes a contested '
+                        f'claim but is not immune to suppression'
+                    )
+
+    def test_every_cluster_keeps_a_canonical_record_in_every_arm(self):
+        """`canonical_record_ids` feeds the discoverability column the same
+        way, and an empty map would read as "no canonical to discover" rather
+        than as a broken derivation."""
+        mod = _mod()
+        clusters = mod.load_calibration_clusters()
+        claims = mod.load_arm_claims()
+        topics = mod.load_registry_topics()
+        raw_canonical = {
+            row['cluster_id']: row['claim_id']
+            for row in self._raw_claims() if row.get('canonical')
+        }
+        assert raw_canonical, 'the fixture flags no canonical claim at all'
+
+        for shape in mod.ARM_SHAPES:
+            records = mod.materialize_arm(shape, clusters, claims, topics, [])
+            seeded = mod._index_arm(shape, 'p', 'c', records, claims)
+
+            for cluster_id, claim_id in raw_canonical.items():
+                record_id = seeded.canonical_by_cluster.get(cluster_id)
+                assert record_id is not None, (
+                    f'{shape}/{cluster_id}: no canonical record, so this '
+                    f'cluster reads as undiscoverable by construction'
+                )
+                assert claim_id in seeded.records_by_id[record_id].claim_ids, (
+                    f'{shape}/{cluster_id}: canonical points at {record_id}, '
+                    f'which does not realize the fixture-canonical {claim_id}'
+                )
 
 
 class TestGroupedReadNeverSuppressesContested:
@@ -1782,6 +1909,60 @@ def _top5(*scores, category='procedural_knowledge'):
     return [
         _scored(f's{i}', score, category=category) for i, score in enumerate(scores)
     ]
+
+
+class TestTheCharProxyNameIsTrueOfItsArithmetic:
+    """`CHAR_PROXY_ESTIMATOR_NAME` is printed into the operator-facing
+    artifact as a factual claim about how its token numbers were produced.
+
+    Nothing asserted the arithmetic behind it: the only comparison
+    (`TestResolveTokenEstimator`) does `encode(...) == character_proxy_tokens(...)`
+    where, on a venv without tiktoken, `encode` IS `character_proxy_tokens` —
+    compared to itself.  An implementation returning `len(text)` or
+    `len(text) // 8` satisfies every monotonicity/zero/determinism test in
+    this file, and the report would then misname its own numbers by a factor
+    of four.
+    """
+
+    def test_it_really_is_four_characters_per_token(self):
+        mod = _mod()
+
+        # The boundary, not just a large sample: `// 8` and `len(text)` both
+        # break here, and so does an off-by-one divisor.
+        assert mod.character_proxy_tokens('x' * 4) == 1
+        assert mod.character_proxy_tokens('x' * 3) == 0
+        assert mod.character_proxy_tokens('x' * 7) == 1
+        assert mod.character_proxy_tokens('x' * 8) == 2
+        assert mod.character_proxy_tokens('x' * 40) == 10
+
+    def test_the_name_states_the_divisor_the_arithmetic_uses(self):
+        """The name is what an operator reads the numbers through, so tie the
+        two together rather than pinning the string on its own."""
+        import re  # noqa: PLC0415
+
+        mod = _mod()
+        name = mod.CHAR_PROXY_ESTIMATOR_NAME
+        stated = re.search(r'(\d+)-chars-per-token', name)
+        assert stated is not None, f'{name!r} states no chars-per-token'
+        chars_per_token = int(stated.group(1))
+
+        for length in (0, 1, 4, 9, 40, 401):
+            assert mod.character_proxy_tokens('x' * length) == (
+                length // chars_per_token
+            ), f'{name} is not what the estimator does at length {length}'
+
+    def test_it_delegates_to_the_repos_one_chars_per_token_helper(self):
+        """INV-5: a second literal `// 4` here could drift from
+        `context_assembler.estimate_tokens` with no test noticing.  Asserted
+        by VALUE — introspecting the function object would only restate the
+        import."""
+        from fused_memory.reconciliation.context_assembler import (  # noqa: PLC0415
+            estimate_tokens,
+        )
+
+        mod = _mod()
+        for text in ('', 'x', 'x' * 40, 'mixed English/JSON {"a": 1}' * 7):
+            assert mod.character_proxy_tokens(text) == estimate_tokens(text)
 
 
 class TestGuardAdequacyPartOneCandidatePresent:

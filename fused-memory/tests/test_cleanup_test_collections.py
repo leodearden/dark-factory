@@ -238,7 +238,12 @@ class TestStaysIdempotent:
         mod = _mod()
         _install_fake_qdrant(monkeypatch, [], unreachable=True)
 
-        assert mod.main() is None
+        # No `main() is None`: it is declared `-> None` with no `return
+        # <value>` on any path, so that would imply a return-value contract
+        # the script does not have.  Returning at all IS the assertion — a
+        # cron job that raised on an unreachable Qdrant would page someone.
+        mod.main()
+
         assert 'unreachable' in capsys.readouterr().err.lower()
 
     def test_it_returns_cleanly_when_qdrant_client_is_not_installed(
@@ -249,7 +254,8 @@ class TestStaysIdempotent:
         mod = _mod()
         monkeypatch.setitem(sys.modules, 'qdrant_client', None)
 
-        assert mod.main() is None
+        mod.main()  # returning at all is the assertion; see the sibling above
+
         assert 'not installed' in capsys.readouterr().err.lower()
 
     def test_a_second_sweep_over_a_clean_world_deletes_nothing(
@@ -277,16 +283,36 @@ class TestReportingIsQuietWhenThereIsNothingToSay:
 
         assert capsys.readouterr().out == ''
 
-    def test_it_reports_a_count_when_it_deleted_something(self, monkeypatch, capsys):
+    def test_it_reports_the_number_it_actually_deleted(self, monkeypatch, capsys):
+        """`'2' in out` would pass on any stdout containing the character —
+        a collection name with a 2 in it (`_test_e2_bakeoff_` has one), a
+        future `took 2.3s` line, a uuid fragment — so a wrong count would
+        very likely still pass.  Two runs of DIFFERENT sizes, each required
+        to report its own number and not the other's, cannot.
+
+        Suffixes are letters only and the sizes are 3 and 7 so no digit can
+        arrive incidentally from a name.
+        """
+        import re  # noqa: PLC0415
+
         mod = _mod()
-        _install_fake_qdrant(
-            monkeypatch,
-            [f'{mod.PREFIX}a', f'{mod.E2_BAKEOFF_PREFIX}_b', *LIVE_COLLECTIONS],
-        )
+        letters = 'abcdefghijk'
+        reported = {}
+        for size in (3, 7):
+            stale = [f'{mod.PREFIX}{c}' for c in letters[:size - 1]]
+            stale.append(f'{mod.E2_BAKEOFF_PREFIX}z')
+            clients = _install_fake_qdrant(
+                monkeypatch, [*stale, *LIVE_COLLECTIONS],
+            )
 
-        mod.main()
+            mod.main()
 
-        assert '2' in capsys.readouterr().out
+            out = capsys.readouterr().out
+            assert sum(len(client.deleted) for client in clients) == size
+            reported[size] = {int(tok) for tok in re.findall(r'\d+', out)}
+
+        assert 3 in reported[3] and 7 not in reported[3], reported[3]
+        assert 7 in reported[7] and 3 not in reported[7], reported[7]
 
 
 @pytest.mark.parametrize('suffix', ['main', 'gw0', 'gw11'])
