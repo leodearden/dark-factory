@@ -5889,6 +5889,10 @@ class Harness:
         worktree_path = self._resolve_task_worktree(tid)
         self._recovered_plans.pop(tid, None)
         self._recovered_sessions.pop(tid, None)
+        # The config dir must be dropped in lockstep with its session (task
+        # 3256): a stale stash paired with a later adoption would classify as
+        # 'reseeded' and be silently suppressed instead of surfacing.
+        self._recovered_session_config_dirs.pop(tid, None)
         if worktree_path.exists():
             try:
                 await self.git_ops.cleanup_worktree(worktree_path, tid)
