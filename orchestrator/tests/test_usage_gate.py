@@ -219,8 +219,16 @@ class TestGateLifecycle:
             gate._accounts[0].capped = False
             gate._open.set()
 
-        asyncio.create_task(uncap_after_delay())
-        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        # Bind to a name (and await it below): a task with no strong
+        # reference can be garbage-collected mid-execution (see the asyncio
+        # docs on create_task), and awaiting it in `finally` reaps it
+        # deterministically instead of leaking a pending task into the loop
+        # if the assertions below fail first.
+        uncap_task = asyncio.create_task(uncap_after_delay())
+        try:
+            token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        finally:
+            await uncap_task
         assert token is not None
         assert token.token == 'token-a'
 
