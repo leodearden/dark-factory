@@ -1678,6 +1678,187 @@ class TestRuffFormatNotAnEnforcedGateCluster:
         assert cluster.min_phrase_hits == 2
         assert '3342' in cluster.hint
 
+    @staticmethod
+    def _cluster():
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        return next(c for c in clusters if c.topic_id == 'ruff-format-not-an-enforced-gate')
+
+    def test_matches_representative_near_duplicate_note(self):
+        note = (
+            'In dark-factory, `ruff format` is NOT an enforced gate -- only '
+            '`ruff check` and pyright gate commits, so pre-existing format '
+            'drift on main is normal.'
+        )
+        result = find_matching_topic_cluster(note, [self._cluster()])
+        assert result is not None
+        assert result[0].topic_id == 'ruff-format-not-an-enforced-gate'
+
+    @pytest.mark.parametrize(
+        'excerpt',
+        [
+            pytest.param(
+                'In fused-memory, `ruff format` is configured in pyproject.toml '
+                'but is NOT a clean/enforced gate across the existing codebase',
+                id='210be257-fused-memory-2026-07-09',
+            ),
+            pytest.param(
+                'Amendment/cleanup agents should NOT run `ruff format` on touched '
+                'files in this codebase — it rewrites large unrelated regions. '
+                'Verify with `ruff check` (lint) only',
+                id='e8c5eb3f-orchestrator-merge-types-2026-07-12',
+            ),
+            pytest.param(
+                'In dark-factory, `ruff format` is NOT a quality gate — the '
+                'declared gates in each orchestrator.yaml are `ruff check` '
+                '(lint_command), `npx pyright` (type_check_command) and pytest '
+                '(test_command).',
+                id='c565afd0-general-dark-factory-2026-08-01',
+            ),
+        ],
+    )
+    def test_matches_the_preferences_and_norms_entries_that_grew_the_cluster(self, excerpt):
+        """The three preferences_and_norms entries of gate 3342's corpus match.
+
+        This is task 3435's core claim made executable: these are the writes
+        that grew the cluster UNCAUGHT, because the write-time guard only
+        consults this cluster list for explicit ``category='procedural_knowledge'``
+        writes. Each excerpt is a contiguous verbatim span of the stored
+        content, so the literal-substring convention stays auditable.
+
+        NOTE: soft-blocking a ``preferences_and_norms`` write additionally
+        requires companion task 3430's category generalization at the CALL
+        SITE (``server/tools.py``). What is pinned here is the CLUSTER's
+        matching power, which is this task's scope and is entirely
+        category-independent -- ``find_matching_topic_cluster`` takes content
+        and clusters, never a category.
+        """
+        result = find_matching_topic_cluster(excerpt, [self._cluster()])
+        assert result is not None, f'preferences_and_norms excerpt must match: {excerpt!r}'
+        assert result[0].topic_id == 'ruff-format-not-an-enforced-gate'
+
+    @pytest.mark.parametrize(
+        'excerpt',
+        [
+            pytest.param(
+                'The actual enforced gate is `ruff check` (lint), which passes '
+                "cleanly. Don't try to \"fix\" this by running ruff format "
+                'wholesale — it creates unrelated diff noise.',
+                id='f1e41082-fused-memory-2026-07-04',
+            ),
+            pytest.param(
+                'In dark-factory, `ruff format` is NOT an enforced gate — many '
+                'committed files are not format-clean (e.g. '
+                'tests/scripts/test_dashboard_service_template.py on main had '
+                'implicit-concat and comprehension hunks ruff would rewrite). '
+                'Only `ruff check` and pyright gate commits.',
+                id='4ab1c78f-general-dark-factory-2026-07-31',
+            ),
+            pytest.param(
+                'In dark-factory the enforced lint gate is `ruff check` only — '
+                '`ruff format` is NOT gated.',
+                id='d72c66dc-shared-orchestrator-yaml-2026-07-31',
+            ),
+            pytest.param(
+                'The enforced lint gate per CONTRIBUTING.md (lines ~137, ~160) '
+                'is `ruff check <touched packages>`, not `ruff format`.',
+                id='a598dc3c-shared-tests-2026-08-01',
+            ),
+            pytest.param(
+                'hooks/project-checks (the main-branch-only pre-commit gate) '
+                'invokes `ruff check` but never `ruff format --check`',
+                id='87a4982d-hooks-project-checks-2026-07-16',
+            ),
+            pytest.param(
+                "orchestrator's real lint/format gate — hooks/project-checks, "
+                'which hooks/pre-commit only runs when branch==main — is `ruff '
+                'check --quiet` plus `uv run pyright` per pyright-configured '
+                'package; it never invokes `ruff format` or `ruff format '
+                '--check` anywhere.',
+                id='69bd6ae5-orchestrator-2026-07-31',
+            ),
+        ],
+    )
+    def test_matches_the_procedural_knowledge_entries_in_the_gate_cluster(self, excerpt):
+        """Representative procedural_knowledge entries from gate 3342's corpus.
+
+        These are the 11-entry majority the guard ALREADY covers today, so
+        seeding this cluster bites immediately rather than waiting on task
+        3430. Excerpts are contiguous verbatim spans of the stored content.
+
+        Coverage spread is deliberate: 4ab1c78f is the 4-hit maximum
+        ('ruff format' + 'ruff check' + 'enforced gate' + 'format-clean'),
+        d72c66dc / a598dc3c carry 'enforced lint gate', and 87a4982d /
+        69bd6ae5 sit exactly AT the threshold on the 'ruff format' +
+        'ruff check' anchor pair alone.
+        """
+        result = find_matching_topic_cluster(excerpt, [self._cluster()])
+        assert result is not None, f'procedural_knowledge excerpt must match: {excerpt!r}'
+        assert result[0].topic_id == 'ruff-format-not-an-enforced-gate'
+
+    @pytest.mark.parametrize(
+        'note',
+        [
+            pytest.param(
+                'ruff check flagged B008 mutable default argument in the new '
+                'module; fix it before committing.',
+                id='lint-only-note-1-hit',
+            ),
+            pytest.param(
+                'The pre-commit hook runs pyright only for packages with staged '
+                '.py changes.',
+                id='pyright-hook-note-0-hits',
+            ),
+            pytest.param(
+                'I ran ruff format on the file I created so my added lines are '
+                'clean.',
+                id='format-only-note-1-hit',
+            ),
+        ],
+    )
+    def test_does_not_match_unrelated_lint_or_format_notes(self, note):
+        # Each note reaches at most 1 distinct hit -- below min_phrase_hits --
+        # so an ordinary lint, hook or format observation must NOT be
+        # soft-blocked and mis-routed to gate 3342.
+        assert find_matching_topic_cluster(note, [self._cluster()]) is None
+
+    def test_no_seeded_phrase_nests_inside_another(self):
+        """The invariant that keeps ``min_phrase_hits=2`` meaningful.
+
+        If one phrase were a substring of another (the concrete temptation
+        being to add 'ruff format --check' alongside bare 'ruff format'), a
+        SINGLE occurrence would score two DISTINCT hits and satisfy the
+        threshold on its own -- defeating the field's stated purpose
+        ("Default 2 so a single incidental keyword never triggers a false
+        block"). This is the regression guard against a future well-meaning
+        addition re-introducing that.
+        """
+        phrases = [p.lower() for p in self._cluster().phrases]
+        for outer in phrases:
+            for inner in phrases:
+                if outer is not inner:
+                    assert inner not in outer, (
+                        f'{inner!r} nests inside {outer!r} -- one occurrence would '
+                        f'score two distinct hits and defeat min_phrase_hits'
+                    )
+
+    def test_full_default_cluster_list_resolves_here_not_an_earlier_cluster(self):
+        # This cluster is seeded LAST, and find_matching_topic_cluster returns
+        # the FIRST qualifying cluster, so it can only catch what the five
+        # earlier clusters miss -- it can never shadow them. The converse was
+        # measured, not assumed: all 14 entries of gate 3342's
+        # mem0_entries_to_adjudicate corpus score 0 distinct hits against every
+        # one of the five earlier clusters, so a ruff note falls through
+        # cleanly to here rather than being swallowed upstream.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'In dark-factory, `ruff format` is NOT an enforced gate -- only '
+            '`ruff check` and pyright gate commits, so pre-existing format '
+            'drift on main is normal.'
+        )
+        result = find_matching_topic_cluster(note, clusters)
+        assert result is not None
+        assert result[0].topic_id == 'ruff-format-not-an-enforced-gate'
+
 
 class TestWriteTriageConfig:
     """The write-triage band thresholds (task 3130, PRD leaf alpha).
