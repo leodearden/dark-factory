@@ -1366,20 +1366,46 @@ async def invoke_with_cap_retry(
         # silently clobbered.
         invoke_kwargs.setdefault('backend', backend)
 
-    # Fast path: no usage gate → single invocation, no cap retry.
+    # Fast path: no usage gate → no cap retry (there is no account pool to fail
+    # over to), but the pre-turn-rejection retry below still applies: it is not
+    # an account failure, and this path is taken by the gate-less fused-memory
+    # callers (reconciliation, judge, curator) that would otherwise keep eating
+    # the failure silently.  Bounded by the SAME
+    # _should_retry_cli_input_rejected policy the gated loop uses, so the
+    # ceiling can never drift between the two dispatch sites.
+    #
     # NOTE: if `resume_session_id` was set by the caller (crash-recovery path),
     # this fast path will attempt the resume but cannot fall back to a fresh
-    # invocation on failure — the non-cap-hit resume→fresh-fallback branch in
-    # the while-loop below only runs when usage_gate is provided.  In practice
-    # the orchestrator always supplies a gate, but callers without one should be
-    # aware that a failed resume returns the failure result directly.
+    # invocation on a general failure — the non-cap-hit resume→fresh-fallback
+    # branch in the while-loop below only runs when usage_gate is provided.  In
+    # practice the orchestrator always supplies a gate, but callers without one
+    # should be aware that a failed resume returns the failure result directly.
+    # A pre-turn REJECTION is the one exception, and it is not really an
+    # exception to that rule: the CLI exited before contacting the API, so
+    # there is no session to preserve and _reset_for_fresh_retry's switch to a
+    # fresh invocation discards nothing.
     if not usage_gate:
-        started_at = datetime.now(UTC).isoformat()
-        result = await invoke(
-            **invoke_kwargs,
-            config_dir=config_dir.path if config_dir else None,
-        )
-        completed_at = datetime.now(UTC).isoformat()
+        while True:
+            started_at = datetime.now(UTC).isoformat()
+            result = await invoke(
+                **invoke_kwargs,
+                config_dir=config_dir.path if config_dir else None,
+            )
+            completed_at = datetime.now(UTC).isoformat()
+            # Re-stamped per attempt (above), so started_at/completed_at always
+            # describe the attempt actually RETURNED — leaving the discarded
+            # attempt's stamps in place would write a silently false window
+            # into the cost_store invocations row.
+            if not _should_retry_cli_input_rejected(result, cli_input_rejected_retries):
+                break
+            cli_input_rejected_retries += 1
+            logger.warning(
+                f'{label}: CLI rejected the invocation before any model turn '
+                f'(no prompt reached the CLI) — retrying fresh '
+                f'({cli_input_rejected_retries}/{_MAX_CLI_INPUT_REJECTED_RETRIES}). '
+                f'Cause: {_cli_input_rejection_cause(result.stderr)}',
+            )
+            _reset_for_fresh_retry(invoke_kwargs, original_prompt)
     else:
         # Derive this invocation's cap scope once (PRD task β, write half of
         # boundary B1): the invoked model when it is a scoped-cap model, else
