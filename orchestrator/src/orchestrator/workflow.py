@@ -277,6 +277,36 @@ _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
 # caught at the constant definition rather than silently diverging across assertions.
 _ORPHAN_HALT_NO_QUEUE_TOKENS: tuple[str, ...] = ('orphan halt', 'unhalt_merge_queue')
 
+# Architect failure kinds eligible for ONE transient-glitch retry in ``_plan``
+# (task 3143; the 2026-07-28 ~16:31Z incident cluster, where a turns=0 /
+# $0.00 / no-plan.json architect failure terminally blocked a planning task).
+# Both kinds mean the run did NO work and billed NOTHING, so a retry cannot
+# double-bill and is the only thing standing between a sub-second transport
+# glitch and a terminally-blocked task.
+#
+# Deliberately EXCLUDED, because a second Opus dispatch buys nothing:
+# - TIMED_OUT: burned the full wall clock; the next attempt would too.
+# - MAX_TURNS: the run saturated its budget doing real work.
+# - API_ERROR: provider-side; the scheduler's transient requeue lane owns the
+#   pacing, and retrying here just multiplies load on a degraded provider.
+# - MODEL_NOT_FOUND: deterministic — the model does not exist for this account.
+_ARCHITECT_TRANSIENT_RETRY_KINDS: frozenset[AgentFailureKind] = frozenset({
+    AgentFailureKind.EMPTY_OUTPUT,
+    AgentFailureKind.CLI_INPUT_REJECTED,
+})
+
+
+def _is_transient_architect_glitch(result: AgentResult, *, plan_on_disk: bool) -> bool:
+    """Return True when an architect run shows the anomalous-premature-exit shape.
+
+    Few turns, negligible cost, and nothing written to disk: the run cannot
+    have done real planning work, so a single retry is cheap and plausibly
+    productive.  The SINGLE definition of that signature — evaluated on both
+    the ``success=True`` anomalous-exit path and the ``success=False``
+    zero-work-failure path — so the two can never drift apart on the numbers.
+    """
+    return result.turns <= 2 and result.cost_usd < 0.20 and not plan_on_disk
+
 
 def _is_gating_escalation(e: Escalation) -> bool:
     """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
@@ -4452,6 +4482,45 @@ class TaskWorkflow:
                             )
                         self.plan = salvaged
                         break  # fall through to validation / provenance / lock
+
+                    # Transient-glitch retry on the FAILURE path (task 3143).
+                    # The same anomalous-premature-exit signature the success
+                    # path below has always retried — few turns, negligible
+                    # cost, nothing on disk — but reached via success=False.
+                    # Ranked BELOW salvage (a finalized plan always wins) and
+                    # ABOVE the terminal _mark_blocked, which stays the
+                    # fall-through for the second occurrence and for every
+                    # non-transient kind: this strictly ADDS one retry and
+                    # removes no terminal path.
+                    #
+                    # A turns=0 / $0.00 failure did no work, so the retry
+                    # cannot double-bill — and it is the only thing standing
+                    # between a sub-second transport glitch and a terminally
+                    # blocked planning task (2026-07-28 ~16:31Z).
+                    #
+                    # bool(salvaged) is the honest analogue of the success
+                    # path's `not self.plan`: `salvaged` is already
+                    # self.artifacts.read_plan(), which returns {} (never None)
+                    # when plan.json is absent, so re-reading here would only
+                    # risk the two branches disagreeing.
+                    if (
+                        attempt == 0
+                        and cls.kind in _ARCHITECT_TRANSIENT_RETRY_KINDS
+                        and _is_transient_architect_glitch(
+                            result, plan_on_disk=bool(salvaged)
+                        )
+                    ):
+                        logger.warning(
+                            f'Task {self.task_id}: architect failed with a '
+                            f'zero-work transient glitch ({cls.kind.value}: '
+                            f'{cls.summary}) — turns={result.turns}, '
+                            f'cost=${result.cost_usd:.2f}, '
+                            f'duration={result.duration_ms}ms, '
+                            f'output_len={len(result.output)} '
+                            f'— retrying once'
+                        )
+                        continue
+
                     logger.error(
                         'Task %s: architect failed (%s): %s',
                         self.task_id, cls.kind.value, cls.summary,
@@ -4463,12 +4532,11 @@ class TaskWorkflow:
 
                 # Detect anomalous premature exit: succeeded but suspiciously
                 # few turns and low cost — likely a transient CLI issue.
+                # Shares _is_transient_architect_glitch with the failure-path
+                # retry above so there is exactly one copy of the numbers.
                 self.plan = self.artifacts.read_plan()
-                if (
-                    attempt == 0
-                    and result.turns <= 2
-                    and result.cost_usd < 0.20
-                    and not self.plan
+                if attempt == 0 and _is_transient_architect_glitch(
+                    result, plan_on_disk=bool(self.plan)
                 ):
                     logger.warning(
                         f'Task {self.task_id}: architect completed anomalously '
