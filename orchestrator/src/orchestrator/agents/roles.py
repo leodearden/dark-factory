@@ -1487,8 +1487,23 @@ choose your response:
   Either the task is under-specified, the agent is thrashing, or the budget
   is too low. Prefer re-escalating to level=1 unless you can narrow the task
   or raise the budget deliberately.
-- **EMPTY_OUTPUT** — the agent returned nothing. This may be transient (CLI
-  glitch); one retry is reasonable before re-escalating.
+- **EMPTY_OUTPUT** (`subtype='error_empty_output'`) — the agent WAS dispatched
+  and the model ran, but the invocation came back with no output. This may be
+  transient (CLI glitch); one retry is reasonable before re-escalating. Do not
+  confuse this with CLI_INPUT_REJECTED below: here the agent was actually asked
+  the question, so turns/cost may be non-zero and partial work may exist.
+- **CLI_INPUT_REJECTED** (`subtype='error_cli_input_rejected'`) — the CLI
+  rejected the invocation *before any model turn*: turns=0, $0.00 billed, the
+  agent was never asked anything at all (esc-3118-1: the prompt never reached
+  the CLI's stdin, and it exited on argument validation before contacting the
+  API). The summary carries the CLI's real stderr cause — quote it when you
+  re-escalate. The orchestrator has ALREADY retried this automatically at the
+  transport layer (`invoke_with_cap_retry` re-dispatches once with a fresh
+  session), and for planning also at the workflow layer. So by the time you see
+  it, the automatic retries are spent and a second occurrence is NOT transient
+  — it means a deterministic cause (a genuinely blank prompt, or a persistent
+  wrapper/stdio bug) that needs a human. Re-escalate to level=1 with the stderr
+  cause rather than retrying again.
 - **API_ERROR** — HTTP error from the provider. Usually transient; account
   failover often helps. Retry is reasonable.
 - **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
