@@ -276,17 +276,27 @@ def _bash_encode_cwd(cwd: str) -> str:
 
 @lru_cache(maxsize=1)
 def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
-    """(label, callable) for every in-repo PYTHON copy of the cwd encoding.
+    """(label, callable) for every in-repo copy of the cwd encoding.
 
-    Cached, and resolved ONCE per session rather than per assertion row:
-    naming the nightly mirror requires exec'ing that whole test module, which
-    is not written to be executed repeatedly, and an uncached call inside the
-    ``REAL_ENCODED_DIR_PAIRS`` loop re-exec'd it once per row (growing with
-    the table). Any future module-scope side effect there now costs one
-    execution, not N.
+    Not only the Python ones: a copy in another language enters through a
+    bridge that presents it as a plain ``Callable[[str], str]``, so the
+    lockstep assertions need no special case for it. ``spawn-claude.sh``'s
+    bash copy is the first such entry (see :func:`_bash_encode_cwd`).
 
-    See :class:`TestEncoderLockstep`'s SCOPE note for the copies deliberately
-    NOT listed here.
+    Cached, and resolved ONCE per session rather than per assertion row, for
+    two reasons that now compound: naming the nightly mirror requires exec'ing
+    that whole test module, which is not written to be executed repeatedly,
+    and the bash bridge reads and regex-scans spawn-claude.sh. An uncached
+    call inside the ``REAL_ENCODED_DIR_PAIRS`` loop paid both once per row
+    (growing with the table). Any future module-scope side effect there now
+    costs one execution, not N. Note the caching is of the mirror REGISTRY and
+    of the extracted bash SOURCE, never of an encoding result — every
+    assertion row still calls each encoder for real.
+
+    As of task 3464 no in-repo copy is deliberately omitted. If you add one,
+    add it here; if you add one that cannot be pinned to the canonical, say so
+    in :class:`TestEncoderLockstep`'s SCOPE note rather than leaving it
+    unlisted, which would let that docstring imply coverage it lacks.
     """
     nightly_tests = _load_sibling_test_module('test_legibility_nightly')
     return (
@@ -300,11 +310,12 @@ def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
 class TestEncoderLockstep:
     """Every in-repo copy of the cwd encoding must agree with the canonical (task 3272).
 
-    The rule is duplicated four times across the repo, and in 3272 ALL FOUR
-    copies were found to be missing the same character (``_`` -> ``-``) at
-    once. The old ``inventory.encode_cwd`` docstring asserted the mirrors were
-    "kept in lockstep with the canonical implementation" — a claim nothing
-    checked, and which was false in fact.
+    The rule is duplicated five times across the repo (four Python, one bash),
+    and EVERY ONE was found to be missing the same character (``_`` -> ``-``)
+    at once — the four Python copies in task 3272, the bash copy in task 3464.
+    The old ``inventory.encode_cwd`` docstring asserted the mirrors were "kept
+    in lockstep with the canonical implementation" — a claim nothing checked,
+    and which was false in fact.
 
     This class replaces that aspiration with an enforced invariant. Each
     mirror is asserted equal to BOTH:
@@ -322,30 +333,42 @@ class TestEncoderLockstep:
     off a real ``~/.claude/projects`` tree can detect an encoder that is
     self-consistently wrong.
 
-    SCOPE — what this does NOT cover. TWO copies of the rule sit outside
-    this guard, and as of task 3272 both are still on the old two-character
-    (``/`` + ``.``) rule. Neither is in 3272's file scope, so neither was
-    changed here:
+    Every in-repo copy is now inside this guard — the two that task 3272 had
+    to leave outside it were closed by task 3464:
 
-      - ``skills/spawn/spawn-claude.sh``'s ``_encode_cwd`` (bash) — no
-        Python test can import it. Filed as a follow-up.
-      - ``tests/scripts/test_spawn_claude.py``'s inline
-        ``str(tmp_path).replace("/", "-").replace(".", "-")``. This one IS
-        Python and IS importable, but it is deliberately pinned to the BASH
-        copy rather than to the canonical: it names the dir a fake ``claude``
-        creates so that spawn-claude.sh's own started-evidence probe (which
-        computes the lookup key with its ``_encode_cwd``) finds it. Listing
-        it among the mirrors would therefore assert the wrong thing. It must
-        instead move in the SAME commit as the bash fix — pytest ``tmp_path``
-        names routinely contain underscores, so the moment bash starts
-        collapsing ``_`` the fixture's dir name and the probe's lookup key
-        stop agreeing and that test fails.
+      - ``skills/spawn/spawn-claude.sh``'s ``_encode_cwd`` (bash) is covered
+        via :func:`_bash_encode_cwd`, a subprocess bridge: the function block
+        is lifted out of the script with an anchored regex and eval'd in a
+        throwaway shell, then registered as an ordinary :func:`_mirrors`
+        entry. 3272 left it out for want of a mechanism (no Python test can
+        import bash), not for want of will. The extraction ASSERTS on a miss,
+        so renaming or reformatting the function fails loudly instead of
+        silently dropping coverage and letting this class pass vacuously.
+      - ``tests/scripts/test_spawn_claude.py``'s fixture is no longer a copy
+        of the rule at all: it now CALLS ``session_registry.encode_cwd``, so
+        it is pinned to the canonical by construction and needs no entry
+        here. (It could never have been listed as a mirror anyway — it names
+        the dir a fake ``claude`` creates for spawn-claude.sh's own probe to
+        find, so it was pinned to the BASH copy, and while bash was wrong,
+        asserting it equal to the canonical would have asserted the wrong
+        thing. Both moved in one commit, as this note previously required.)
 
-    Adding a Python mirror here is only ever the DEFAULT place to put a copy
-    of this rule — if you add one elsewhere, add it to :func:`_mirrors` too,
-    and if you add one that is pinned to something OTHER than the canonical
-    (another language, or a fixture mirroring a not-yet-fixed copy), say so
-    in this list rather than letting this docstring imply coverage it lacks.
+    SCOPE — what this still does NOT cover. This class verifies encoder
+    AGREEMENT and nothing more. That spawn-claude.sh's ``_started_evidence``
+    (or any other caller) USES the encoded value correctly — as a lookup key
+    against a directory that exists, at the right moment — is outside it;
+    ``test_spawn_claude.py``'s ``test_transcript_appearance_suppresses_flag``
+    is what exercises that end to end. Nor does it extend the rule's
+    validated domain: the pairs below are complete only over the punctuation
+    actually observed (``- . / _``), per ``session_registry.encode_cwd``.
+
+    Best of all is not to add a copy: prefer CALLING
+    ``session_registry.encode_cwd``, as the spawn test's fixture now does.
+    Where a copy is genuinely unavoidable, add it to :func:`_mirrors` — being
+    in another language is no longer an exemption, since a bridge can present
+    it as a plain callable. Only if a copy truly cannot be pinned to the
+    canonical, say so in the SCOPE note above rather than leaving it silently
+    unlisted and letting this docstring imply coverage it lacks.
     """
 
     def test_every_mirror_agrees_with_canonical_and_with_reality(self):

@@ -1361,8 +1361,8 @@ class TestRenderDigest:
         assert meta['cwd'] == _DIGEST_CWD
         assert meta['date'] == '2026-07-11'
         assert meta['agent_class'] == 'interactive'
-        # No transcript path given -> encoded_dir falls back to the
-        # cwd.replace('/','-').replace('.','-') mirror encoding.
+        # No transcript path given -> encoded_dir falls back to the mirror of
+        # session_registry.encode_cwd (every '/', '.' and '_' maps to '-').
         assert meta['encoded_dir'] == '-home-leo-src-dark-factory'
 
     def test_encoded_dir_prefers_transcript_path_parent_dir_name(self, tmp_path):
