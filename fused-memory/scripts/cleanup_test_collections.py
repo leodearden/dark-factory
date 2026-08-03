@@ -53,13 +53,25 @@ def main() -> None:
 
     try:
         client = QdrantClient(url=QDRANT_URL, timeout=5)
-        collections = client.get_collections().collections
     except Exception as exc:
         print(f'Qdrant unreachable ({exc}), skipping', file=sys.stderr)
         return
 
+    # From here a client object EXISTS, so every exit path has to run through
+    # the `finally` below.  The listing therefore lives inside it rather than
+    # beside the construct: a Qdrant that accepts the TCP connection and then
+    # times out (or 500s) on `get_collections` is the realistic unattended-cron
+    # failure, and pairing the two in one earlier `try` returned from that
+    # branch with the connection still open — bypassing the very `finally`
+    # that exists to close it.
     deleted = 0
     try:
+        try:
+            collections = client.get_collections().collections
+        except Exception as exc:
+            print(f'Qdrant unreachable ({exc}), skipping', file=sys.stderr)
+            return
+
         for col in collections:
             if not col.name.startswith(PREFIXES):
                 continue

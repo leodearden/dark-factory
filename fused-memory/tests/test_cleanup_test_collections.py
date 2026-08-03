@@ -225,17 +225,37 @@ class TestSweep:
         assert sorted(clients[0].deleted) == sorted(rest)
         assert doomed in capsys.readouterr().err
 
-    def test_the_client_is_closed_even_when_a_delete_failed(
+    def test_the_client_is_closed_when_the_collection_listing_fails(
         self, monkeypatch, capsys,
     ):
+        """Constructed, THEN the listing raises — the realistic cron failure.
+
+        A Qdrant that accepts the TCP connection and then times out or 500s on
+        `get_collections` leaves a live client object behind, so this is the
+        one path where a leak is possible at all: an unreachable Qdrant raises
+        in `QdrantClient.__init__` and never produces a client to leak.
+
+        A delete-failure variant of this test would assert nothing — the
+        per-collection `except` swallows that, so the close after the loop was
+        always reached and the assertion passes with or without the `finally`.
+        """
         mod = _mod()
-        doomed = f'{mod.PREFIX}locked'
-        clients = _install_fake_qdrant(monkeypatch, [doomed], fail_on=[doomed])
+        clients = _install_fake_qdrant(monkeypatch, [f'{mod.PREFIX}a'])
 
-        mod.main()
+        def _explode(self):
+            raise RuntimeError('timed out listing collections')
 
+        monkeypatch.setattr(
+            sys.modules['qdrant_client'].QdrantClient,
+            'get_collections',
+            _explode,
+        )
+
+        mod.main()  # a cron job, so still a clean return
+
+        assert len(clients) == 1, 'no client was constructed, so nothing could leak'
         assert clients[0].closed is True
-        capsys.readouterr()
+        assert 'unreachable' in capsys.readouterr().err.lower()
 
 
 class TestStaysIdempotent:
