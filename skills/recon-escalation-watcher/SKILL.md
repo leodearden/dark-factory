@@ -278,6 +278,20 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   (`<queue-dir>/.watcher-exclude-recon`) so the watcher's next (re)start
   skips it — not `--exclude-id`, which does not scale at this queue's size
   (see "Re-arming over deliberately-pending items" above).
+  **Also stamp the record itself** via
+  `mcp__escalation__stamp_triage(escalation_id, triage_note="PARK: <one-line
+  rationale>")` (registered on the 8103 server,
+  `escalation/src/escalation/server.py:1120`). This is metadata-only — it
+  never touches `status`, `level`, or `updated_at`, so it cannot re-arm the
+  re-file rule (`has_open_l1` filters `status=='pending'` only,
+  `escalation/src/escalation/queue.py:489-504`) — but it turns the record's
+  `triaged_at` from "never looked at" into "deliberately parked", which is
+  what that field should mean now that PARK is a sanctioned default
+  disposition rather than a gap, and it makes dashboard/analytics
+  triage-coverage metrics for this queue meaningful (decided under task
+  3526; ratified this stamp specifically for the two aging categories below
+  — do not read it as a blanket rule for every other Priority-3 "leave
+  pending" case in this skill).
   **Why park, not resolve:** recon files a fresh gate-backlog escalation for
   a task only when `has_open_l1(task_id,
   category='reconciliation_stale_gate_backlog')` is false
@@ -317,8 +331,10 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   Same aging/park shape as `reconciliation_stale_gate_backlog` above —
   **default: PARK**, file a cockpit DecisionRecord, append its esc-id to
   the exclude file on the watcher's next start (not `--exclude-id` — see
-  that row above for why); see that row above too for the mechanism and
-  churn evidence, not repeated here. **Asymmetry to know:**
+  that row above for why), **and stamp_triage it the same way** (see the
+  gate-backlog row above for the call, the safety argument, and why it
+  matters); see that row above too for the mechanism and churn evidence,
+  not repeated here. **Asymmetry to know:**
   this path dedups on an *un-categorized* `has_open_l1(task_id)` inside
   `maybe_escalate_stalled_tasks` (same module, line 385), so an open
   `reconciliation_stale_gate_backlog` L1 on
