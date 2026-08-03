@@ -280,7 +280,8 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   (see "Re-arming over deliberately-pending items" above).
   **Also stamp the record itself — once, on first park; skip re-stamping on
   repeat cycles.** `stamp_triage` unconditionally overwrites `triaged_at` to
-  now on every call (`escalation/src/escalation/queue.py:949-958,977`), and
+  now on every call (`escalation/src/escalation/queue.py:949-958`, set at
+  line 977), and
   the "Drain-side shortcut" note below already has you re-affirming PARK on
   this same record every cycle `get_pending_escalations()` returns it — so
   the same restraint applies to the MCP call itself: skip it when
