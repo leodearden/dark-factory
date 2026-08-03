@@ -219,8 +219,18 @@ class TestGateLifecycle:
             gate._accounts[0].capped = False
             gate._open.set()
 
-        asyncio.create_task(uncap_after_delay())
-        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        # Bind so the finally below can reap it deterministically.
+        uncap_task = asyncio.create_task(uncap_after_delay())
+        try:
+            # Generous timeout: this asserts on the outcome (gate unblocks,
+            # leases token-a), not wall-clock timing, since the loop can be
+            # starved under xdist load — but stays well under the 60s
+            # global pytest-timeout, whose thread method kills the worker.
+            token = await asyncio.wait_for(gate.before_invoke(), timeout=5)
+        finally:
+            # return_exceptions=True: don't let driver cleanup mask a
+            # genuine TimeoutError raised above.
+            await asyncio.gather(uncap_task, return_exceptions=True)
         assert token is not None
         assert token.token == 'token-a'
 
