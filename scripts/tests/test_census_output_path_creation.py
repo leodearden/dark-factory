@@ -184,3 +184,31 @@ def test_run_census_deferred_at_headroom_creates_no_output_dirs(tmp_path):
     assert outcome.status == "deferred"
     assert not (tmp_path / "plans").exists()
     assert not (tmp_path / "docs" / "legibility").exists()
+
+
+def test_advance_census_state_creates_its_own_parent_dir(tmp_path):
+    """The writer-side half of the guarantee, unit-tested directly.
+
+    ``run_census``'s ``_ensure_output_parents`` buys FAIL-FAST but covers
+    only that function's own four paths. ``advance_census_state`` is
+    census-state.json's SOLE writer and is callable from anywhere, so it
+    creates its own parent too (mirroring trickle_state's atomic writer) —
+    otherwise ``tempfile.mkstemp(dir=<missing>)`` raises the very
+    FileNotFoundError this task exists to remove, for any future caller
+    that does not route through run_census.
+    """
+    state_path = tmp_path / "docs" / "legibility" / "census-state.json"
+    assert not state_path.parent.exists()
+
+    mod.advance_census_state(
+        state_path,
+        now_iso="2026-08-03T00:00:00+00:00",
+        report_path="plans/confusion-census-2026-08-03.md",
+        done_count=7,
+    )
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "last_census_at": "2026-08-03T00:00:00+00:00",
+        "last_census_report": "plans/confusion-census-2026-08-03.md",
+        "last_census_done_count": 7,
+    }

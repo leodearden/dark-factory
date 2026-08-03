@@ -628,6 +628,16 @@ def advance_census_state(
         "last_census_done_count": done_count,
     }
     directory = os.path.dirname(os.fspath(path)) or "."
+    # WRITER-SIDE parent creation, mirroring trickle_state.py's atomic
+    # writer -- deliberately belt-and-braces with run_census's own
+    # _ensure_output_parents, which serves a different purpose. That call
+    # buys FAIL-FAST (an un-creatable output path must cost nothing rather
+    # than a whole ~$100 mining run) and only covers run_census's four
+    # paths; this line makes the guarantee hold for EVERY caller of this
+    # function, present and future, so nobody can reintroduce the
+    # FileNotFoundError that mkstemp(dir=<missing>) raises just by writing
+    # census state from somewhere new. Idempotent, so the two do not fight.
+    os.makedirs(directory, exist_ok=True)
     fd, tmp_file = tempfile.mkstemp(prefix=".census-state-", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1174,6 +1184,13 @@ def run_census(
     #     pointing elsewhere trips the codebook/state pair identically.
     #     dark-factory's own plans/ + docs/legibility/ are the ONLY reason
     #     none of this was ever hit before.
+    #     This "one place" argument is honest only for run_census's OWN four
+    #     paths, so it is not the whole guard: advance_census_state also
+    #     creates its parent writer-side (mirroring trickle_state), which
+    #     covers every OTHER caller too. codebook.dump has no such
+    #     writer-side guard yet -- codebook.py sits outside this task's lock
+    #     scope -- so nightly.py's codebook.dump call remains exposed to the
+    #     same FileNotFoundError. Follow-up, not fixed here.
     # (3) AFTER THE GATE. Sitting below the headroom-defer return rather than
     #     at the top of run_census keeps the DEFER branch side-effect-free --
     #     a deferred census creates no empty directories in the target
