@@ -51,6 +51,7 @@ from audit_combine_gate_marker_loss import (
     format_report,
     load_combine_targets,
     load_ticket_expectations,
+    resolve_project_id,
     tickets_db_path,
 )
 
@@ -1104,3 +1105,105 @@ def test_formatters_are_pure_and_print_nothing(capsys):
     assert isinstance(format_report([_audit()]), str)
     assert isinstance(format_json([_audit()]), str)
     assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# resolve_project_id + the project-id mismatch guard.
+#
+# THIS IS TRAP (a) INVERTED, and the most dangerous failure mode this detector
+# has. project_id is derived heuristically from the directory name. A WRONG
+# derivation matches zero ticket rows, which makes every combine target look
+# totally wiped and produces a catastrophic wall of confident false positives
+# that an operator would read as a real incident. Failing loudly instead is
+# the no-silent-fail-soft rule in docs/legibility/design-invariants.md.
+# ---------------------------------------------------------------------------
+
+def test_resolve_project_id_derives_from_the_directory_name(tmp_path):
+    """dark-factory -> dark_factory: '-' maps to '_'."""
+    assert resolve_project_id("/home/leo/src/dark-factory") == "dark_factory"
+    assert resolve_project_id("/x/y/reify") == "reify"
+    assert resolve_project_id("/x/y/a-b-c") == "a_b_c"
+
+
+def test_resolve_project_id_override_wins(tmp_path):
+    assert resolve_project_id("/home/leo/src/dark-factory", override="reify") == "reify"
+
+
+def test_audit_project_flags_a_project_id_matching_zero_of_many(tmp_path, make_tasks_db):
+    """The guard fires: the resolved id matches NOTHING in a tickets.db that
+    plainly holds created-rows for other project_ids."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 1, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[
+            {"project_id": "reify", "task_id": 1, "metadata": {"source": "prd"}},
+            {"project_id": "other_project", "task_id": 2, "metadata": {"source": "prd"}},
+        ],
+    )
+
+    audit = audit_project(str(root), "dark_factory")
+
+    assert audit.project_id_mismatch is not None
+    # Names the resolved id AND the ids actually present, so an operator can
+    # see the misconfiguration rather than guessing at a wall of findings.
+    assert "dark_factory" in audit.project_id_mismatch
+    assert "reify" in audit.project_id_mismatch
+    assert "other_project" in audit.project_id_mismatch
+
+
+def test_audit_project_guard_is_inert_when_the_id_matches(tmp_path, make_tasks_db):
+    """A correct id, even alongside other projects' rows, never fires."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 1, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[
+            {"project_id": "reify", "task_id": 1, "metadata": {"source": "prd"}},
+            {"project_id": "dark_factory", "task_id": 1, "metadata": {"source": "prd"}},
+        ],
+    )
+
+    assert audit_project(str(root), "dark_factory").project_id_mismatch is None
+
+
+def test_audit_project_guard_is_inert_when_tickets_db_is_absent(tmp_path, make_tasks_db):
+    """An absent tickets.db is honest 'no comparison source', NOT a
+    misconfiguration — firing here would cry wolf on every fresh project."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 1, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+    )
+
+    audit = audit_project(str(root), "dark_factory")
+
+    assert audit.project_id_mismatch is None
+    assert audit.coverage.targets_without_comparison_source == 1
+
+
+def test_audit_project_guard_is_inert_on_a_genuinely_empty_tickets_db(
+        tmp_path, make_tasks_db):
+    """A tickets.db with no created-rows at all is likewise honest emptiness."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 1, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "reify", "task_id": 1, "status": "pending",
+                  "metadata": {"source": "prd"}}],
+    )
+
+    assert audit_project(str(root), "dark_factory").project_id_mismatch is None
+
+
+def test_audit_project_mismatch_reaches_the_report_and_the_json(tmp_path, make_tasks_db):
+    """The signal must reach the CALLER so main() can exit non-zero rather
+    than printing a clean-looking wall of findings."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 1, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "reify", "task_id": 1, "metadata": {"source": "prd"}}],
+    )
+
+    audit = audit_project(str(root), "dark_factory")
+
+    assert "dark_factory" in format_report([audit])
+    assert audit.project_id_mismatch in format_report([audit])
+    payload = json.loads(format_json([audit]))
+    assert payload["projects"][0]["project_id_mismatch"] == audit.project_id_mismatch
