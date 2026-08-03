@@ -746,13 +746,14 @@ def _drain_async_mock_coroutines():
 def make_steward(tmp_path: Path):
     """Build a minimal ``TaskSteward`` on a fixture-OWNED, ``tmp_path``-rooted worktree.
 
-    Merges the two near-identical ``_make_steward`` copies that used to live in
-    ``test_suggestion_triage.py`` and ``test_workflow_state_machine_boundary.py``
-    (task 3461).  It is NOT yet the suite's only steward factory: ``test_steward.py``
-    keeps its own richer fixture graph (``worktree`` / ``mock_config`` / ``mock_queue``
-    / ``mock_mcp`` / ``mock_briefing`` / ``_build_steward`` / ``steward``) and
-    ``test_out_of_band_routing.py`` has a third, ``_build_steward``.  Folding those in
-    was out of 3461's scope — if you are here to add a fourth, extend this one instead.
+    This is the suite's ONLY steward factory.  Task 3461 merged the two
+    near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
+    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
+    that remained — ``test_out_of_band_routing.py``'s ``_steward_config`` /
+    ``_build_steward``, and ``test_steward.py``'s five-fixture graph (whose
+    ``worktree`` / ``mock_config`` / ``mock_queue`` / ``mock_mcp`` /
+    ``mock_briefing`` names survive there as one-line views onto this factory's
+    build).  If you are here to add another, EXTEND this one instead.
 
     Lives in conftest.py — rather than ``_orch_helpers.py``, which is scoped to
     non-fixture helpers — because it must close over ``tmp_path`` to own the
@@ -773,8 +774,20 @@ def make_steward(tmp_path: Path):
     ``worktree=tmp_path`` would put that sibling outside the directory pytest's
     retention policy reclaims.
 
-    Config defaults applied (union of what both former factories set; a caller
-    overrides any of them via ``config_overrides``, applied last):
+    Optional keyword arguments, all defaulting to the common case:
+      - ``worktree`` — a caller-owned path (must be strictly below ``tmp_path``;
+        omit it and let the fixture own the directory)
+      - ``config_overrides`` — a dict applied LAST, so it wins over every default
+        below (``test_steward.py``'s ``steward_max_attempts=1`` rides this channel)
+      - ``task`` — the task dict; ``task_id`` is derived from ``task['id']`` so
+        the two can never disagree
+      - ``event_store`` / ``cost_store`` — forwarded verbatim
+      - ``escalation_queue`` — substitutes a caller-built queue (e.g. a real
+        filesystem-backed ``EscalationQueue``) for the mock one; when supplied,
+        no mock queue is built and the caller's own ``queue_dir`` is left alone
+
+    Config defaults applied (union of what all four former factories set; a
+    caller overrides any of them via ``config_overrides``, applied last):
       - ``project_root`` = ``tmp_path / 'project'`` (created)
       - ``steward_lifetime_budget`` = 12.0, ``steward_max_attempts`` = 3
       - ``steward_max_timeouts_per_escalation`` = 3,
@@ -782,21 +795,19 @@ def make_steward(tmp_path: Path):
       - ``suggestion_triage_threshold`` = 10
       - triage + steward ``models`` / ``budgets`` / ``max_turns`` / ``effort`` / ``backends``
       - ``escalation.host`` / ``escalation.port``
+      - ``timeouts.steward`` / ``steward_completion_timeout`` — the
+        spawn/completion-timeout path
+      - ``fused_memory.url`` / ``fused_memory.project_id``
+      - ``stamp_stock_routing_config(config)`` — real ``routing.*`` containers, so
+        anything NOT patching the invoke seam reaches the real ``resolve_route``
+        (which does membership/dict ops a bare ``MagicMock`` cannot satisfy)
 
-    KNOWN GAPS — the defaults are the union of the *two* retired factories only,
-    so relative to ``test_steward.py``'s ``mock_config`` these are still unset and
-    will surface as a bare ``MagicMock`` (and then a confusing ``TypeError``)
-    rather than a clear missing-default message:
-      - ``stamp_stock_routing_config(config)`` — needed by anything reaching
-        ``resolve_route`` (it does real membership/dict ops on ``config.routing.*``);
-        already exported from ``_orch_helpers.py``
-      - ``config.timeouts.steward`` and ``config.steward_completion_timeout`` —
-        the spawn/completion-timeout path
-      - ``config.fused_memory.*``
-      - ``escalation_queue.queue_dir`` — read at ``steward.py`` in the spawn argv
-    All five migrated call sites patch the invoke seam, so none of them reach these
-    today.  If yours does, EXTEND this fixture (and this list) rather than debugging
-    the MagicMock.
+    Collaborator defaults: the mock queue's ``queue_dir`` is derived from the
+    fixture-owned worktree (``<worktree.parent>/<worktree.name>-escalations``,
+    created) so it is unique per build and inside the sandbox — ``steward.py``
+    reads it into the escalation-watcher argv, making it real mutable state.
+    ``mcp.url``, both briefing prompt builders (as ``AsyncMock``s), and a
+    ``.task/`` seeded with ``metadata.json`` + ``plan.json`` round out the union.
 
     The config mock is ``spec_set``'d against ``OrchestratorConfig`` so a typo'd
     field name raises ``AttributeError`` on both read and write.

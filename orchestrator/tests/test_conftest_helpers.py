@@ -30,12 +30,14 @@ and are NOT already covered by other tests:
    ``overrides_db_path`` so ``OverrideStore.from_config(config)`` can call
    ``.parent.mkdir()`` and ``sqlite3.connect(str(...))`` without crashing.
 
-6. **``make_steward`` owns its worktree** — the shared steward factory must
-   root every worktree it builds strictly *below* the test's ``tmp_path``,
-   whether the caller supplies one or not, so pytest's retention policy
-   reclaims both the worktree and the ``.task-meta`` sibling the steward
-   derives from it, and two default builds in one test must not collide.
-   See ``TestMakeStewardFixture``.
+6. **``make_steward`` owns its worktree** — the shared steward factory (as of
+   task 3514, the suite's *only* one) must root every worktree it builds
+   strictly *below* the test's ``tmp_path``, whether the caller supplies one or
+   not, so pytest's retention policy reclaims both the worktree and the
+   ``.task-meta`` sibling the steward derives from it, and two default builds in
+   one test must not collide.  Its pass-through kwargs and the config /
+   collaborator defaults the folded-in factories depended on are pinned here
+   too.  See ``TestMakeStewardFixture``.
 
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
 are deliberately omitted — they would just duplicate literals from
@@ -315,29 +317,34 @@ def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
 class TestMakeStewardFixture:
     """Contract tests for the ``make_steward`` conftest fixture-factory.
 
-    ``make_steward`` merges the two near-identical ``_make_steward`` copies that
-    used to live in ``test_suggestion_triage.py`` and
-    ``test_workflow_state_machine_boundary.py`` (task 3461).  It is not the only
-    steward factory in the suite — ``test_steward.py`` and
-    ``test_out_of_band_routing.py`` still carry their own; see the fixture
-    docstring in ``conftest.py``.
+    ``make_steward`` is the suite's ONLY steward factory.  Task 3461 merged the
+    two near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
+    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
+    that remained (``test_out_of_band_routing.py``'s, and ``test_steward.py``'s
+    five-fixture graph, whose fixture names survive there as views onto a single
+    build).  See the fixture docstring in ``conftest.py``.
 
     Because it closes over ``tmp_path`` it can *own* the worktree directory
     rather than merely documenting a convention, which is what these tests pin:
 
     - the default worktree is fixture-owned, created, and distinct per call, so
-      repeated default builds cannot share ``.task/`` or the ``.task-meta``
-      sibling that holds ``verdicts/triage.json``;
+      repeated default builds cannot share ``.task/``, the ``.task-meta`` sibling
+      that holds ``verdicts/triage.json``, or the derived escalation ``queue_dir``;
     - a caller-supplied worktree is rejected unless it is strictly below
       ``tmp_path``, checked *before* any ``mkdir``;
     - ``config_overrides`` is applied last (the row-9 ``steward_max_attempts=1``
-      divergence rides on this channel — it is the only field the two former
-      factories genuinely disagreed on).
+      divergence rides on this channel — it is the only field the four former
+      factories genuinely disagreed on);
+    - the ``task`` / ``event_store`` / ``cost_store`` / ``escalation_queue``
+      kwargs pass through, and the config + collaborator defaults the folded-in
+      factories set locally are real values rather than child ``MagicMock``s.
 
     Per this module's exclusion policy (see the module docstring), the scalar
     config defaults and the collaborators' canned return values are NOT asserted
     here: those literals live 20 lines away in ``conftest.py``, and the real
-    regression detector for them is the migrated call sites themselves.
+    regression detector for them is the migrated call sites themselves.  The
+    defaults tests below therefore assert *types* and *containment*, never the
+    literals.
     """
 
     def test_default_worktree_is_created_under_tmp_path(self, make_steward, tmp_path):
