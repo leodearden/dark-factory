@@ -314,6 +314,20 @@ NON_CAP_CLI_ERROR_MARKERS = [
     'permission denied',
 ]
 
+# The CLI rejected the invocation because no prompt ever reached it
+# (esc-3118-1, 2026-07-28 ~16:31Z).  The claude backend is 100%
+# stdin-dependent — ``build_claude_argv`` emits no positional prompt and no
+# ``-`` stdin marker — so when the prompt never lands on the child's stdin the
+# CLI exits on ARGUMENT VALIDATION, *before contacting the API*.  A cap message
+# therefore can never coexist with this text.  Matched case-insensitively.
+# Shared with
+# ``shared.cli_invoke.is_cli_invocation_rejected``, which imports this table
+# lazily (this module imports cli_invoke at module top, so the reverse must
+# stay function-local).
+CLI_INPUT_REQUIRED_MARKERS = [
+    'input must be provided either through stdin or as a prompt argument',
+]
+
 # Substrings (case-insensitive) indicating the requested model does not
 # exist / is not available (task beta, plans/adaptive-model-routing-prd.md).
 # Checked as a fallback when no structured api_error_status==404 is present

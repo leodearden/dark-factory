@@ -547,6 +547,59 @@ def is_timed_out_with_progress(result: AgentResult) -> bool:
     return result.timed_out and (result.transcript_turns or 0) > 0
 
 
+def _stderr_has_cli_input_required(stderr: str) -> bool:
+    """Case-insensitive scan of *stderr* for the CLI's input-required error.
+
+    The single place the marker table is consulted, shared by
+    ``is_cli_invocation_rejected`` (which takes an ``AgentResult``) and
+    ``_parse_claude_output`` (which only has a ``_SubprocessResult``), so the
+    subtype and the predicate can never disagree about what the marker is.
+    """
+    if not stderr:
+        return False
+    # Lazy (function-local) import — see the identical note in
+    # classify_agent_failure: invocation_outcome imports cli_invoke at module
+    # top, so a module-top import here would create a circular import.
+    from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
+
+    stderr_lower = stderr.lower()
+    return any(marker in stderr_lower for marker in CLI_INPUT_REQUIRED_MARKERS)
+
+
+def is_cli_invocation_rejected(result: AgentResult) -> bool:
+    """Return True when the CLI rejected the invocation BEFORE any model turn.
+
+    The signature is a pre-first-turn *transport* rejection: ``success=False``,
+    ``timed_out=False``, ``turns == 0``, ``cost_usd == 0.0``, and a stderr
+    carrying one of ``CLI_INPUT_REQUIRED_MARKERS``.  The agent was never asked
+    anything — nothing was billed and no work was done — so the run is a free
+    retry candidate rather than an agent failure.
+
+    Observed payload (esc-3118-1, 2026-07-28 ~16:31Z)::
+
+        Warning: no stdin data received in 3s, proceeding without it. ...
+        Error: Input must be provided either through stdin or as a prompt
+        argument when using --print
+
+    with ``turns=0``, ``cost_usd=0.0``, ``duration_ms=17331``,
+    ``timed_out=False``, and empty stdout.
+
+    Deliberately contrasted with ``is_zero_output_timeout``: that predicate is
+    keyed to the TIMEOUT family (it returns False immediately unless
+    ``result.timed_out``), so it always misses this failure — which is exactly
+    why no timeout-keyed consumer (the resume wedge guard, the workflow
+    circuit breaker) ever caught the observed incident.  A killed run is not a
+    pre-turn rejection: when ``timed_out`` is set the timeout predicates stay
+    authoritative and this one returns False even if the marker text is
+    present on stderr.
+    """
+    if result.success or result.timed_out:
+        return False
+    if result.turns != 0 or result.cost_usd != 0.0:
+        return False
+    return _stderr_has_cli_input_required(result.stderr)
+
+
 def is_server_error_status(status: int | None) -> TypeGuard[int]:
     """Return True when *status* is a server-side HTTP error (5xx).
 
@@ -2054,9 +2107,20 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         # done" for a productive run (reify-4827). Mirrors
         # is_timed_out_with_progress's condition inline since that predicate
         # takes an AgentResult, not this _SubprocessResult.
+        #
+        # Third arm (task 3143 / esc-3118-1): a NOT-timed-out fast exit whose
+        # stderr carries the CLI's input-required error is a pre-turn
+        # invocation REJECTION — the prompt never reached the child's stdin, so
+        # the CLI exited on argument validation before contacting the API.
+        # Extends the same argument: conflating a rejection ("we never asked
+        # the agent anything") with an empty output ("we asked and got
+        # nothing") fabricates a false narrative and makes the fixed summary
+        # 'agent returned empty output' actively misdescribe the cause.
         empty_output_subtype = (
             'error_timeout_killed_with_progress'
             if result.timed_out and (result.transcript_turns or 0) > 0
+            else 'error_cli_input_rejected'
+            if not result.timed_out and _stderr_has_cli_input_required(result.stderr)
             else 'error_empty_output'
         )
         return AgentResult(
