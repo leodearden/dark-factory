@@ -566,6 +566,37 @@ def _stderr_has_cli_input_required(stderr: str) -> bool:
     return any(marker in stderr_lower for marker in CLI_INPUT_REQUIRED_MARKERS)
 
 
+def _cli_input_rejection_cause(stderr: str) -> str:
+    """Extract the operator-facing CAUSE line for a pre-turn CLI rejection.
+
+    The CLI's own stderr is the ONLY evidence of what actually happened, so
+    this returns REAL OBSERVED TEXT or an explicit absence marker — never an
+    invented explanation.  Preference order:
+
+    1. the first stderr line carrying one of ``CLI_INPUT_REQUIRED_MARKERS``
+       (the CLI's verbatim argument-validation error);
+    2. the LAST non-empty stderr line (defensive: a caller stamped the subtype
+       by hand, or the CLI's wording drifted off the marker table — either way
+       the tail is the closest thing to a real cause we observed);
+    3. ``'<no stderr captured>'`` when stderr is empty — an explicit statement
+       that nothing was observed, which is the honest degradation.  Fabricating
+       a plausible-sounding cause here would be exactly the laundering this
+       task exists to remove.
+    """
+    # Lazy (function-local) import — see _stderr_has_cli_input_required.
+    from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
+
+    lines = [line.strip() for line in (stderr or '').splitlines()]
+    non_empty = [line for line in lines if line]
+    for line in non_empty:
+        line_lower = line.lower()
+        if any(marker in line_lower for marker in CLI_INPUT_REQUIRED_MARKERS):
+            return line
+    if non_empty:
+        return non_empty[-1]
+    return '<no stderr captured>'
+
+
 def is_cli_invocation_rejected(result: AgentResult) -> bool:
     """Return True when the CLI rejected the invocation BEFORE any model turn.
 
@@ -644,6 +675,7 @@ class AgentFailureKind(enum.StrEnum):
     ENDED_AWAITING_BACKGROUND = 'ended_awaiting_background'
     MAX_TURNS = 'max_turns'
     EMPTY_OUTPUT = 'empty_output'
+    CLI_INPUT_REJECTED = 'cli_input_rejected'
     API_ERROR = 'api_error'
     MODEL_NOT_FOUND = 'model_not_found'
     TIMED_OUT = 'timed_out'
@@ -729,12 +761,23 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
        NON-5xx statuses ever reach here (a 5xx is claimed above), so this
        rule now covers 4xx/429 exclusively — its verdict for those is
        unchanged.
-    8. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
+    8. ``result.subtype == 'error_cli_input_rejected'`` →
+       ``CLI_INPUT_REJECTED`` (task 3143 / esc-3118-1): the CLI rejected the
+       invocation on ARGUMENT VALIDATION before any model turn, because no
+       prompt ever reached it.  Placed immediately ABOVE rule 9 because a
+       rejection is a strict, MORE SPECIFIC subset of "empty stdout": both
+       arrive with empty output, but only this one means the agent was never
+       asked anything.  Ranked below it, the generic rule would claim every
+       such run first and launder a transport rejection into the transient
+       agent-failure bucket, replacing the only evidence there is (the CLI's
+       own stderr line) with the fixed, actively-wrong string 'agent returned
+       empty output'.  The summary embeds that stderr line verbatim.
+    9. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
        (may be transient).
-    9. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
+    10. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
        subtype looked like an error but a valid structured output was
        recovered; callers usually treat as success).
-    10. otherwise → ``UNKNOWN``.
+    11. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
     duration_ms, timed_out, transcript_turns, api_error_status, output
@@ -872,6 +915,25 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         return AgentFailureClass(
             kind=AgentFailureKind.API_ERROR,
             summary=f'agent API error: HTTP {result.api_error_status}',
+            diagnostic_detail=diagnostic_detail,
+        )
+    # Pre-turn CLI rejection — ranked immediately ABOVE the generic
+    # empty-output rule below.  A rejection is a strict subset of "empty
+    # stdout" (both land here with no output), so ordering these the other way
+    # round would have the generic rule claim every rejection first — exactly
+    # the laundering task 3143 exists to remove: 'agent returned empty output'
+    # asserts we asked the agent something and got nothing back, when in fact
+    # the prompt never reached the CLI and no model turn ever ran.  The cause
+    # is carried through verbatim from stderr (the only evidence there is)
+    # rather than replaced by a fixed string.
+    if result.subtype == 'error_cli_input_rejected':
+        cause = _cli_input_rejection_cause(result.stderr)
+        return AgentFailureClass(
+            kind=AgentFailureKind.CLI_INPUT_REJECTED,
+            summary=(
+                'CLI rejected the invocation before any model turn '
+                f'(no prompt reached the CLI): {cause}'
+            ),
             diagnostic_detail=diagnostic_detail,
         )
     if result.subtype == 'error_empty_output':
