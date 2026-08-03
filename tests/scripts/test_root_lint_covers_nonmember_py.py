@@ -256,22 +256,38 @@ def test_root_lint_command_targets_every_root_level_and_skills_py() -> None:
     The root ``lint_command`` is the ONLY available lever for the two repo-root
     files: ``_discover_module_configs`` explicitly SKIPS a root-level config
     (``prefix == '.'``), so ``conftest.py`` / ``df_pytest_isolation.py`` can
-    never belong to a module config.
+    never belong to a module config. That makes it the only lever for
+    DECLARING them as lint targets — not for getting them linted on change.
 
-    WHY THE WIDENING IS LOAD-BEARING, NOT COSMETIC. This command runs on the
-    module-config-less path (``verify._build_fallback_config``). There,
-    ``verify._scope_to_keyword`` NARROWS the ruff head to the touched
-    ``.py`` files — so a ``conftest.py``-only diff is already ruff'd. The gap is
-    the VERBATIM (unscoped) form, which runs when a touched file classifies
-    STRUCTURAL or under FULL_SUITE. ``conftest.py`` is itself a STRUCTURAL
-    trigger, so a diff touching it runs the chain verbatim and, before this
-    task, never checked ``conftest.py``. A docs-only / zero-``.py`` diff hits
-    the same verbatim path.
+    WHAT THE WIDENING ACTUALLY BUYS (AND WHAT IT DOES NOT). It buys DRIFT
+    DETECTION on the merge-lane global gate: the VERBATIM (unscoped) form of
+    the command is reached only through ``verify.run_verification`` with
+    ``module_config is None`` (its "Global fallback" branch, which assigns
+    ``lint_cmd = config.lint_command`` untouched) — a merge-lane verify of a
+    zero-``.py`` docs/yaml-only diff, or a ``force_workspace`` train /
+    ``merge_verify_workspace`` run. So these paths are linted on diffs that do
+    NOT touch them.
+
+    It does NOT lint them on diffs that DO. On the module-config-less path
+    (``verify._build_fallback_config``) the lint leg is narrowed
+    UNCONDITIONALLY whenever the diff holds any ``.py`` file — there is no
+    widen-to-verbatim branch on the LINT slot anywhere (D2, STRUCTURAL ->
+    unscoped, widens PYRIGHT only; D1, CONFTEST/TEST_DATA -> FULL_SUITE, widens
+    PYTEST only). And a diff touching these files alongside subproject files
+    resolves a non-empty ``module_configs``, none of whose prefixes owns a
+    repo-root path, so this command is not invoked at all.
 
     WHAT THIS GUARD DOES NOT PROVE. It parses the CONFIG COMMAND STRING, so it
     is not evidence that runtime routing actually reaches that command — the
     same disclaimer ``TestFleetLintCoversEveryWorkspaceMember`` makes about its
-    own ``KNOWN_FLEET_MEMBERS`` floor. And it deliberately does not cover
+    own ``KNOWN_FLEET_MEMBERS`` floor. Sharper than that: because narrowing
+    DISCARDS the head targets rather than supplementing them
+    (``verify._scope_to_keyword`` truncates the head at the keyword, then
+    ``verify_cmd.scope_to`` replaces ``targets`` wholesale with the touched
+    files), a passing assertion here is evidence about the VERBATIM /
+    merge-lane form ONLY. It is NOT evidence that these files get linted when
+    they change. The residual gap is recorded in the config's SCOPE HONESTY
+    block and carried by a follow-up ticket. And it deliberately does not cover
     ``scripts/**`` or ``tests/scripts/**``, which carry their own module
     configs and their own declared lint commands (tasks 3445 and 3350).
 

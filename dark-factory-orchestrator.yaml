@@ -139,18 +139,64 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # no matter what orchestrator.yaml is added where. Widening this head is
 # therefore mandatory for them; once made, it covers `skills` through the same
 # lever at zero routing risk (see the WHY NOT skills/orchestrator.yaml block
-# below).
+# below). Note precisely what "only lever" means: it is the only lever for
+# DECLARING them as lint targets, NOT for getting them linted when they
+# change — see SCOPE HONESTY below.
 #
-# SCOPE HONESTY — what this widening does and does not buy. This command runs
-# on the module-config-less path (verify._build_fallback_config). There,
-# verify._scope_to_keyword NARROWS the ruff head to the touched .py
-# files, so a conftest.py-only diff was already ruff'd before this change. The
-# widening bites on the VERBATIM (unscoped) form, which is what runs when a
-# touched file classifies STRUCTURAL — conftest.py is itself such a trigger —
-# or on a docs-only / zero-.py diff. It does NOT run inside
-# run_full_verification's gather, which iterates module_configs.values() only;
-# recorded here rather than left invisible, and carried by the follow-up cited
-# in the block below.
+# SCOPE HONESTY — what this widening does and does not buy. Measured, not
+# assumed; an earlier draft of this block overclaimed and was corrected.
+#
+# WHAT IT BUYS: DRIFT DETECTION on the merge-lane global gate. The VERBATIM
+# (unscoped) form of this command is reached only through
+# verify.run_verification with module_config is None — its "Global fallback"
+# branch, which assigns lint_cmd = config.lint_command untouched. Live
+# triggers: a MERGE-LANE verify of a diff with zero .py/.rs files and no
+# module config (docs/yaml/markdown-only — via the INV-1 escalation or the
+# manifest-drift / verify-pipeline-guard override), and force_workspace train
+# / merge_verify_workspace runs. For role='task' a zero-source diff returns a
+# trivial pass before reaching it. So these paths are linted on diffs that do
+# NOT touch them.
+#
+# WHAT IT DOES NOT BUY: it does NOT lint them on diffs that DO touch them.
+# Three independent reasons, each sufficient on its own:
+#   1. On the module-config-less path (verify._build_fallback_config) the lint
+#      leg is narrowed UNCONDITIONALLY whenever the diff holds any .py file,
+#      and on that path the head targets are DISCARDED, not supplemented:
+#      verify._scope_to_keyword truncates the head at the keyword (retaining
+#      only up to and including `ruff check`), so all positional targets are
+#      dropped before parsing, and verify_cmd.scope_to then REPLACES targets
+#      wholesale with the touched files. Adding names to the ruff head is a
+#      strict no-op on EVERY narrowed run. (The `&& python3
+#      check_bare_magicmock_config.py` tail IS preserved — 'ruff check' is in
+#      verify_cmd._TAIL_PRESERVING_KEYWORDS — which is exactly why the guard's
+#      chain-SHAPE assertion is load-bearing.)
+#   2. There is no widen-to-verbatim branch on the LINT slot anywhere. D2
+#      (STRUCTURAL -> unscoped) widens PYRIGHT only; D1 (CONFTEST/TEST_DATA ->
+#      FULL_SUITE) widens PYTEST only. Neither _build_fallback_config nor
+#      verify_plan._derive_module_runs branches lint on file kind at all.
+#   3. A diff that touches these files alongside subproject files resolves a
+#      NON-EMPTY module_configs, where each module lints only its own src/ and
+#      tests/ — no registered prefix owns a repo-root path — so this command is
+#      never invoked at all. Same under merge_verify_breadth: "full", whose
+#      expansion iterates module_configs.values().
+#
+# A superseded draft of this block claimed conftest.py is itself a STRUCTURAL
+# trigger that forces the verbatim form. It is not: verify_plan.classify_file
+# tests the conftest.py basename and returns FileKind.CONFTEST BEFORE the
+# Protocol/TypedDict content check that produces STRUCTURAL, and FileKind's own
+# docstring states that a Protocol/TypedDict defined inside a conftest.py is
+# never STRUCTURAL. Recorded rather than silently deleted, because the claim
+# was load-bearing in the original rationale.
+#
+# RESIDUAL GAP, stated plainly rather than left invisible: because
+# _discover_module_configs skips prefix == '.', NO lever available today lints
+# conftest.py / df_pytest_isolation.py on the diffs that change them. Filed as
+# follow-up ticket tkt_0RS0K2EAS12A8A3G0JXMAVYD0P (a curator ticket from task
+# 3485, not yet a task id). The widening is KEPT regardless: drift detection on
+# the merge gate is real, every target exists, the command runs rc=0, and it
+# costs nothing. And the 2 SIM105 fixes in the preceding commit stand on their
+# own merits independent of which gate observes them — they are real findings
+# removed from the tree.
 #
 # Guarded by tests/scripts/test_root_lint_covers_nonmember_py.py.
 # Production code is cited BY SYMBOL throughout this block and never by
