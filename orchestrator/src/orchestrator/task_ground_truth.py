@@ -128,12 +128,10 @@ class EscalationRef:
     from a non-pinning one (spec ``docs/task-escalation-state-spec.md`` S6/E7),
     which is why ``severity`` is carried here rather than re-read downstream.
 
-    ``severity=''`` means "unknown" (the queue row carried no severity);
-    ``escalation.pins.classify_pins`` fails that safe to PINNING rather than
-    raising.  ``filing_claimant_run_id`` carries the FILING incarnation's
-    identity in ``shared.task_claimant.compose_claimant_run_id`` format
-    (``{run_id}/{session_id}/pid={owner_pid}``); ``None`` means unknown, which
-    the classifier likewise fails safe to pinning.
+    ``severity=''`` and ``filing_claimant_run_id=None`` both mean "unknown".
+    Their semantics and the fail-safe rule are documented once, on
+    ``escalation.pins.classify_pins`` (normative source: spec S6) — this
+    docstring deliberately does not restate them.
 
     Both new fields are DEFAULTED so every existing construction site keeps
     working untouched.
@@ -152,12 +150,23 @@ class TruthReport:
 
     Frozen — a point-in-time snapshot, not a live view; callers re-derive
     via :meth:`TaskGroundTruth.derive_truth` for a fresh report.
+
+    KNOWN GAP on ``open_escalations`` (task 3533 -> beta/3535): its ``[]`` is
+    currently AMBIGUOUS — "the store was read and holds no open escalations"
+    and "no escalation store was bound, so no read was possible" are
+    indistinguishable (see :meth:`TaskGroundTruth._resolve_open_escalations`).
+    That is exactly the collapse ``escalation.pins.classify_pins(records=None)
+    -> store_unavailable`` exists to make impossible, so this field has no way
+    to reach that third state yet.  Task beta (3535) widens it; until then a
+    consumer must NOT read ``open_escalations == []`` as proof that the task
+    carries no open escalation.
     """
 
     db_status: str
     live_claimant: Claimant | None
     branch_state: BranchState
     worktree_present: bool
+    # ``[]`` is ambiguous — see the KNOWN GAP note in the class docstring.
     open_escalations: list[EscalationRef]
     deploy_phase: DeployPhase | None
 

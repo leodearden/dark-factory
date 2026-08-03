@@ -972,14 +972,9 @@ class TestEscalationGrantedFiles:
 class TestFilingClaimantRunId:
     """Escalation carries the FILING incarnation's claimant identity (task 3533).
 
-    ``filing_claimant_run_id`` records which orchestrator incarnation filed the
-    record, in ``shared.task_claimant.compose_claimant_run_id`` format
-    (``{run_id}/{session_id}/pid={owner_pid}``).  ``escalation.pins`` compares it
-    against the currently-live incarnation's identity so an L0 whose FILING
-    incarnation is dead can be told apart from a genuinely-live handoff — a newer
-    live incarnation never keeps a prior incarnation's unconsumed L0 alive
-    (spec ``docs/task-escalation-state-spec.md`` S6).  ``None`` means "filing
-    identity unknown", which the classifier fails safe to pinning.
+    These tests pin the FIELD's storage/round-trip behaviour only.  What the
+    identity MEANS, and the fail-safe rule applied to it, are documented once
+    on ``escalation.pins.classify_pins`` and exercised in tests/test_pins.py.
     """
 
     #: Real ``compose_claimant_run_id`` output shape.

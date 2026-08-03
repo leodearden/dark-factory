@@ -20,10 +20,11 @@ Structured-evidence field (default-empty; task 2558):
 Filing-identity field (default-None; task 3533):
   filing_claimant_run_id:
               the FILING incarnation's claimant id in
-              `shared.task_claimant.compose_claimant_run_id` format
-              (`{run_id}/{session_id}/pid={owner_pid}`); None = unknown.
-              Consumed by `escalation.pins` to tell a dead-filer L0 apart
-              from a live handoff (spec docs/task-escalation-state-spec.md S6)
+              `shared.task_claimant.compose_claimant_run_id` format;
+              None = unknown.  Semantics and the fail-safe rule are stated
+              once on `escalation.pins.classify_pins` (normative source:
+              spec docs/task-escalation-state-spec.md S6) — do not restate
+              them here.
 """
 
 from __future__ import annotations
@@ -165,24 +166,15 @@ class Escalation:
     # legacy JSON without this key deserialises to [] via the from_dict
     # __dataclass_fields__ filter below — no migration required.
     granted_files: list[str] = field(default_factory=list)
-    # The FILING incarnation's claimant identity (task 3533), in
-    # `shared.task_claimant.compose_claimant_run_id` format —
-    # `{run_id}/{session_id}/pid={owner_pid}`.  Stored verbatim and compared as
-    # an exact string; never parsed (a differing `pid=` suffix is a DIFFERENT
-    # incarnation).  `escalation.pins` compares it against the currently-live
-    # incarnation's identity so an L0 whose filing incarnation is dead can be
-    # told apart from a genuinely-live handoff — a newer live incarnation never
-    # keeps a prior incarnation's unconsumed L0 alive (spec
-    # docs/task-escalation-state-spec.md S6).
-    # None means "filing identity unknown" — legacy records, and every producer
-    # not yet stamping it — which `escalation.pins` treats as FAIL-SAFE TO
-    # PINNING (it may only convert an L0 when it can PROVE the filer is dead).
-    # Zero migration, same pattern as members / evidence / train_state / the
-    # triage quad / granted_files above: legacy JSON without this key
-    # deserialises to None via the from_dict __dataclass_fields__ filter below,
-    # and to_dict's asdict() serialises it automatically.  queue.submit /
-    # submit_resolved / _atomic_write / resolve / park / stamp_triage need NO
-    # change — they are field-agnostic passthroughs or RMW-on-hydrated-record.
+    # The FILING incarnation's claimant identity (task 3533) — semantics are
+    # documented once on `escalation.pins.classify_pins` (see the module
+    # docstring's field summary above). Zero migration, same pattern as
+    # members / evidence / train_state / the triage quad / granted_files
+    # above: legacy JSON without this key deserialises to None via the
+    # from_dict __dataclass_fields__ filter below, to_dict's asdict()
+    # serialises it automatically, and queue.submit / submit_resolved /
+    # _atomic_write / resolve / park / stamp_triage need NO change (they are
+    # field-agnostic passthroughs or RMW-on-hydrated-record).
     filing_claimant_run_id: str | None = None
 
     def to_dict(self) -> dict:
