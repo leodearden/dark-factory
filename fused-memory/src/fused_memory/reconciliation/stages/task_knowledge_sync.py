@@ -70,6 +70,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
     SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
     SNAPSHOT_PRUNED_STAT_KEY,
+    SNAPSHOT_WRITTEN_STAT_KEY,
     TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
     build_task_count_snapshot_content,
@@ -2962,7 +2963,7 @@ class TaskKnowledgeSync(BaseStage):
                 self.memory, self.project_id, run_window_start,
             )
         if task_count_snapshot_written is not None:
-            report.stats['task_count_snapshot_written'] = (
+            report.stats[SNAPSHOT_WRITTEN_STAT_KEY] = (
                 1 if task_count_snapshot_written else 0
             )
 
