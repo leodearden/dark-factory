@@ -278,6 +278,14 @@ def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
     return budgets
 
 
+# task 3492: the pyproject-configured default per-test timeout ceiling that
+# every heavy-wait class in this module must clear. See
+# orchestrator/pyproject.toml:99 (`timeout = 60`) -- not a bare literal, so
+# this cannot drift from the real pytest-timeout configuration it guards
+# against.
+PYPROJECT_DEFAULT_TIMEOUT = 60
+
+
 # ---------------------------------------------------------------------------
 # (d) OrchestratorConfig builders: single-host vs two-host
 # ---------------------------------------------------------------------------
@@ -5458,4 +5466,98 @@ if x:
         assert budgets == {}, (
             f'Expected a module with no Test* classes to yield an empty '
             f'result without raising, got {budgets!r}.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3492 step-3: enforced coverage invariant over THIS module's own source
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutMarkCoverage:
+    """Enforced invariant: every class in THIS module whose computed
+    worst-per-method wait budget clears the pyproject default timeout must
+    carry a `@pytest.mark.timeout` mark whose value clears that budget.
+
+    This is what stops the recurrence task 3492 exists to fix: task 2350
+    widened a wait region without adding a mark, task 2376 widened five more
+    sites without a mark, and task 3477 then found its own two marks had
+    drifted too tight for the wait profile they were guarding ("was a bare
+    180, too tight"). Literal values can still drift, but a class going
+    under-marked can no longer land silently -- this guard recomputes the
+    audit from the module's own source on every run.
+
+    The guard is a conservative FLOOR, not the whole audit: it only sees
+    `asyncio.wait_for(...)` and `_await_outcome(...)` call shapes, so it can
+    under-demand (a class the manual audit marks anyway, on the strength of
+    a wait shape the scan cannot see, is tolerated) but must never
+    over-demand a mark value the applied mark does not clear.
+    """
+
+    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
+        """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
+        carry a `timeout` mark whose value clears its own computed budget.
+
+        RED (task 3492 step-3): six classes compute >= 60s and carry no
+        timeout mark at all -- TestSingleHostSerialByteIdentical,
+        TestOverlapSignal, TestChainInvalidationUnderOverlap,
+        TestHaltAndUnavailable, TestRunInflightVerifyRemoteCancelOnAbort,
+        TestCascadeErrorContainment. The two task-3477 cascade classes
+        already pass (HEAVY_BARRIER_TEST_TIMEOUT=300 clears their 225s
+        budget).
+        """
+        source = Path(__file__).read_text()
+        budgets = _worst_per_method_wait_budget(source)
+
+        offenders: list[str] = []
+        for class_name, budget in sorted(budgets.items()):
+            if budget < PYPROJECT_DEFAULT_TIMEOUT:
+                continue
+
+            cls = globals().get(class_name)
+            if cls is None:
+                offenders.append(
+                    f'{class_name}: computed budget {budget}s, but the '
+                    f'class could not be resolved from module globals to '
+                    f'inspect its marks.'
+                )
+                continue
+
+            mark = next(
+                (m for m in getattr(cls, 'pytestmark', []) if m.name == 'timeout'),
+                None,
+            )
+            if mark is None:
+                offenders.append(
+                    f'{class_name}: computed worst-case per-method wait '
+                    f'budget is {budget}s (>= the '
+                    f'{PYPROJECT_DEFAULT_TIMEOUT}s pyproject default), but '
+                    f'the class carries no @pytest.mark.timeout mark at '
+                    f'all.'
+                )
+                continue
+
+            mark_value = mark.args[0] if mark.args else None
+            if mark_value is None or mark_value < budget:
+                offenders.append(
+                    f'{class_name}: computed worst-case per-method wait '
+                    f'budget is {budget}s, but its @pytest.mark.timeout '
+                    f'mark is only {mark_value!r} -- too tight to clear '
+                    f'it.'
+                )
+
+        assert not offenders, (
+            'The following classes have a worst-case per-method wait '
+            f'budget at or above the pyproject default timeout '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see '
+            f'orchestrator/pyproject.toml:99) but lack an adequate '
+            f'@pytest.mark.timeout mark:\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
+            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
+            'the xdist worker under --max-worker-restart=0, so a '
+            'slow-but-correct run reports as a worker death instead of a '
+            'clean per-test failure. Add '
+            '@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (or another '
+            'value clearing the computed budget) directly above each '
+            'offending class.'
         )
