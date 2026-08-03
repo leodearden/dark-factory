@@ -683,6 +683,17 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     and it lands in infra_hold + escalate_to_human instead of the debugger
     — a human sees it, nothing is silently greened.
 
+    The opposite-direction case — an UNLISTED co-occurring load flake that
+    defeats this veto (esc-3514-2 / task 3514: any FAILED line naming a
+    test absent from ``_KNOWN_LOAD_FLAKE_NODEID_RES`` forces ``False``,
+    classifying the whole failure as TEST_FAILURE) — is deliberately NOT
+    fixed by broadening the allow-list; it is instead caught DOWNSTREAM by
+    ``verify_failure_is_preexisting_on_main``'s isolated-re-run confirm
+    gate (``_main_probe_failure_is_isolated_flake``, task 3597), which
+    re-runs the named node-ids in isolation before trusting a preexisting-
+    main-break verdict. Read the two guards as one design: this one stays
+    narrow by choice, that one catches what it declines to cover.
+
     Returns ``False`` for falsy *output* or when the crash signature itself
     is absent.
     """
