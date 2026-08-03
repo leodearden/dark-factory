@@ -155,18 +155,19 @@ const PARITY_REFINEMENT = {
   // than toward the healthy label.  This is the last render step and must not
   // quietly undo that.
   //
-  // `base` is 'no verdict' here only because the value is outside the badge
-  // vocabulary, so the label says which of the two it is.  Borrowing
-  // `badge muted` would report a PRESENT-but-unreadable verdict as an ABSENT
-  // one — the same substitution the absent-verdict guard prevents, running the
-  // other way.  `unjudged` is the genuinely-absent case and correctly stays in
-  // PARITY_PLAIN, muted.
+  // The condition itself is named by the BASE, which reads 'unreadable
+  // verdict' for a value that is present but outside the vocabulary (see
+  // verdictBadge below).  So these two suffixes carry only what PARITY adds —
+  // the linkage — exactly as the alarm pair does.  Naming the condition in
+  // both halves would render "unreadable verdict · unrecognised verdict",
+  // asserting one fact twice and reading as two.
   //
-  // Wording follows `unmatchedReasonText`'s `unrecognised reason: ...`, so the
-  // file has ONE way of saying "the producer emitted a value this UI does not
-  // recognise".
-  'unknown_verdict':        { suffix: 'unrecognised verdict', cls: 'badge bad' },
-  'unknown_verdict_open':   { suffix: 'unrecognised verdict · escalation open', cls: 'badge bad' },
+  // Borrowing `badge muted` here would report a PRESENT-but-unreadable verdict
+  // as an ABSENT one — the same substitution the absent-verdict guard
+  // prevents, running the other way.  `unjudged` is the genuinely-absent case
+  // and correctly stays in PARITY_PLAIN, muted, reading 'no verdict'.
+  'unknown_verdict':        { suffix: 'no escalation',   cls: 'badge bad' },
+  'unknown_verdict_open':   { suffix: 'escalation open', cls: 'badge bad' },
 };
 // Reserved for states where the verdict badge already says everything there is
 // to say: nothing is filed, and the verdict names itself.
@@ -203,10 +204,10 @@ function verdictBadge(metric) {
   // `base` rather than replacing it is what makes that unrepresentable here,
   // for every one of the nine refined states at once.
   //
-  // Absent is absent: a null/unrecognised verdict labels itself, and is NEVER
-  // defaulted to no_alarm (mirrors memory_evals._verdict_class(), which buckets
-  // an absent value to `unjudged` and an unrecognised one to
-  // `unknown_verdict`).
+  // Absent is absent and unreadable is unreadable: neither is EVER defaulted
+  // to no_alarm, and the two carry DIFFERENT labels — mirroring
+  // memory_evals._verdict_class(), which buckets an absent value to `unjudged`
+  // and a present-but-out-of-vocabulary one to `unknown_verdict`.
   let base = 'no verdict';
   let cls = 'badge muted';
   if (verdict === 'alarm') {
@@ -221,6 +222,20 @@ function verdictBadge(metric) {
   } else if (verdict === 'insufficient_data') {
     base = 'insufficient_data';
     cls = 'badge muted';
+  } else if (verdict !== null && verdict !== undefined) {
+    // Present, but outside the closed vocabulary — the bucket
+    // memory_evals._verdict_class() calls `unknown_verdict`.  'no verdict' is
+    // reserved for the genuinely ABSENT case: saying it here would assert the
+    // verdict is MISSING, and the operator reads the rendered string, not this
+    // comment.  `badge bad` rather than muted so the row fails toward
+    // "something is wrong here" on the base alone, before any parity
+    // refinement — the producer files a named `unknown_verdict` issue for
+    // exactly this value and the last render step must not undo it.  Wording
+    // follows `unmatchedReasonText`'s `unrecognised reason: ...`, so the file
+    // has ONE register for "the producer emitted a value this UI does not
+    // recognise".
+    base = 'unreadable verdict';
+    cls = 'badge bad';
   }
 
   // Parity states that carry information the verdict alone does not.  Each
@@ -232,9 +247,27 @@ function verdictBadge(metric) {
   // One lookup and one composition site.  A state listed in PARITY_PLAIN is not
   // absent from the table by accident; it is declared there as having nothing
   // to add to the verdict badge.
-  const refinement = PARITY_REFINEMENT[parity];
+  // `hasOwnProperty` rather than a bare `PARITY_REFINEMENT[parity]`: the table
+  // is a plain object literal, so a bare lookup resolves through
+  // Object.prototype and a payload carrying parity 'constructor' / 'toString'
+  // / 'valueOf' / 'hasOwnProperty' would find a truthy INHERITED member,
+  // rendering `cls: undefined` and a label ending in '· undefined'.
+  const own = Object.prototype.hasOwnProperty.call(PARITY_REFINEMENT, parity);
+  const refinement = own ? PARITY_REFINEMENT[parity] : null;
   if (refinement) {
     return { cls: refinement.cls, label: base + ' · ' + refinement.suffix };
+  }
+
+  // A non-empty parity in NEITHER declaration is a state this copy of the file
+  // has never been told about — the producer added one and an already-open
+  // browser is still holding a cached bundle.  It is MARKED, not passed
+  // through: rendering it as the bare verdict badge is indistinguishable from
+  // a state that declined refinement, i.e. the unknown fails toward the
+  // healthy label — the same substitution the unknown-verdict pair above
+  // exists to prevent, one level up.  PARITY_PLAIN is what makes "considered
+  // and declined" distinguishable from "never heard of it" at all.
+  if (parity && PARITY_PLAIN.indexOf(parity) === -1) {
+    return { cls: 'badge bad', label: base + ' · unrecognised parity' };
   }
   return { cls: cls, label: base };
 }

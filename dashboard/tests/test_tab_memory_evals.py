@@ -213,6 +213,111 @@ def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helper: the JSX's two parity declarations, parsed once
+# ---------------------------------------------------------------------------
+
+
+# One `'state': { ... }` entry of PARITY_REFINEMENT.  Declared once and shared:
+# it is the non-trivial invariant three tests depend on, and three verbatim
+# copies would have to be fixed three times.
+_PARITY_ENTRY_RE = r'[\'"]?(\w+)[\'"]?\s*:\s*\{([^{}]*)\}'
+
+
+def _parity_tables(code: str) -> tuple[dict[str, str], set[str]]:
+    """Parse tab_memory_evals.jsx's parity vocabulary into ``(entries, declined)``.
+
+    ``entries`` maps a refined parity state to the raw body of its
+    ``{ suffix, cls }`` object; ``declined`` is the set of states listed in
+    ``PARITY_PLAIN``.  Both declarations must exist and be non-empty, and every
+    ``PARITY_REFINEMENT`` value must be a ``{ suffix, cls }`` pair — those are
+    preconditions of every caller, so they are asserted HERE with one canonical
+    message rather than re-stated per test.
+
+    The shape check runs against the top-level keys of the literal, not against
+    what the entry regex happened to match: an entry written with a non-object
+    value would otherwise be silently absent from ``entries`` and get reported
+    by the vocabulary test as an *unhandled state*, sending the reader to look
+    for a missing declaration that is right there.
+    """
+    refinement = _extract_const_object(code, 'PARITY_REFINEMENT')
+    assert refinement, (
+        'tab_memory_evals.jsx must declare `const PARITY_REFINEMENT = {...}` at '
+        'module scope in CODE (not in a comment). It is the one place the file '
+        'says which parity states change the badge, and what these tests '
+        'compare against memory_evals.PARITY_STATES.'
+    )
+    plain = _extract_const_object(code, 'PARITY_PLAIN', open_char='[')
+    assert plain, (
+        'tab_memory_evals.jsx must declare `const PARITY_PLAIN = [...]` at '
+        'module scope — the EXPLICIT opt-out list. Without it, a state that is '
+        'merely unhandled is indistinguishable from one deliberately left to '
+        'the plain verdict badge, and these tests cannot tell a considered '
+        'decision from an oversight.'
+    )
+
+    # Keys are quoted in the source (they are producer vocabulary strings, not
+    # JS identifiers), but the quotes are tolerated rather than required here:
+    # the presence grep in `test_verdict_badges_driven_by_persisted_verdict` is
+    # what enforces the quoted form, and it says so clearly. Requiring them
+    # here too would report a dropped quote as "the table holds no entries".
+    entries = dict(re.findall(_PARITY_ENTRY_RE, refinement))
+    declined = set(re.findall(r"'([^']*)'", plain))
+
+    # Top-level keys, found by deleting the one level of nesting the literal
+    # has (the `{ suffix, cls }` values) and reading what keys remain.
+    declared = set(
+        re.findall(r'[\'"]?(\w+)[\'"]?\s*:', re.sub(r'\{[^{}]*\}', '', refinement[1:-1]))
+    )
+    malformed = declared - set(entries)
+    assert malformed == set(), (
+        f'PARITY_REFINEMENT entr(ies) {sorted(malformed)} do not hold a '
+        '`{ suffix, cls }` object literal. Storing a whole label (or anything '
+        'else) would let a parity branch report a state the payload never '
+        'asserted — `_parity()` derives most states from (verdict class, '
+        'linked?), so the verdict must survive into the label.'
+    )
+    for key, value in entries.items():
+        keys = set(re.findall(r'(\w+)\s*:', value))
+        assert keys == {'suffix', 'cls'}, (
+            f"PARITY_REFINEMENT['{key}'] must be a {{ suffix, cls }} pair, got "
+            f'keys {sorted(keys)}. A `suffix` is composed onto the '
+            'verdict-derived base and a `cls` selects an existing badge class; '
+            'anything else is not consumed by verdictBadge at all.'
+        )
+
+    assert entries, 'PARITY_REFINEMENT is declared but holds no entries.'
+    assert declined, 'PARITY_PLAIN is declared but holds no states.'
+    return entries, declined
+
+
+def _return_label_exprs(badge_body: str) -> list[str]:
+    """Every `label:` expression in ``verdictBadge``'s ``return { ... }`` sites.
+
+    Each is captured to the END of its return object rather than to the first
+    comma: a label expression that legitimately contains one (a function call,
+    a string with a comma in it) would otherwise be silently truncated and the
+    assertions below would then hold — or fail — for the wrong reason.
+    """
+    exprs: list[str] = []
+    for m in re.finditer(r'return\s*\{', badge_body):
+        start = m.end() - 1
+        depth = 0
+        obj = ''
+        for i in range(start, len(badge_body)):
+            if badge_body[i] == '{':
+                depth += 1
+            elif badge_body[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    obj = badge_body[start + 1 : i]
+                    break
+        label = re.search(r'\blabel\s*:\s*', obj)
+        if label:
+            exprs.append(obj[label.end() :].strip().rstrip(',').strip())
+    return exprs
+
+
+# ---------------------------------------------------------------------------
 # Load-order helpers (copied from test_index_html.py / test_tab_escalations.py)
 # ---------------------------------------------------------------------------
 
@@ -732,33 +837,13 @@ def test_parity_vocabulary_fully_covered(tab_memory_evals_jsx_code: str) -> None
 
     code = tab_memory_evals_jsx_code
 
-    refinement = _extract_const_object(code, 'PARITY_REFINEMENT')
-    assert refinement, (
-        'tab_memory_evals.jsx must declare `const PARITY_REFINEMENT = {...}` at '
-        'module scope in CODE (not in a comment). It is the one place the file '
-        'says which parity states change the badge, and what this test compares '
-        'against memory_evals.PARITY_STATES.'
-    )
-    plain = _extract_const_object(code, 'PARITY_PLAIN', open_char='[')
-    assert plain, (
-        'tab_memory_evals.jsx must declare `const PARITY_PLAIN = [...]` at '
-        'module scope — the EXPLICIT opt-out list. Without it, a state that is '
-        'merely unhandled is indistinguishable from one deliberately left to '
-        'the plain verdict badge, and this test cannot tell a considered '
-        'decision from an oversight.'
-    )
-
-    # Keys are quoted in the source (they are producer vocabulary strings, not
-    # JS identifiers), but the quotes are tolerated rather than required here:
-    # the presence grep in `test_verdict_badges_driven_by_persisted_verdict` is
-    # what enforces the quoted form, and it says so clearly. Requiring them
-    # here too would report a dropped quote as "the table holds no entries".
-    entries = re.findall(r'[\'"]?(\w+)[\'"]?\s*:\s*\{([^{}]*)\}', refinement)
-    handled = {key for key, _ in entries}
-    declined = set(re.findall(r"'([^']*)'", plain))
-
-    assert handled, 'PARITY_REFINEMENT is declared but holds no entries.'
-    assert declined, 'PARITY_PLAIN is declared but holds no states.'
+    # `_parity_tables` also asserts both declarations exist and that every
+    # table value is a `{ suffix, cls }` pair — the composition invariant in
+    # its structural form: table values are SUFFIXES, never whole labels, so
+    # there is no expression in this file capable of returning a label that
+    # discards the verdict-derived base.
+    entries, declined = _parity_tables(code)
+    handled = set(entries)
 
     overlap = handled & declined
     assert overlap == set(), (
@@ -785,26 +870,16 @@ def test_parity_vocabulary_fully_covered(tab_memory_evals_jsx_code: str) -> None
         'spelling if the producer renamed the state.'
     )
 
-    # The composition invariant, in its structural form: table values are
-    # SUFFIXES, never whole labels, so there is no expression in this file
-    # capable of returning a label that discards the verdict-derived base.
-    for key, value in entries:
-        keys = set(re.findall(r'(\w+)\s*:', value))
-        assert keys == {'suffix', 'cls'}, (
-            f"PARITY_REFINEMENT['{key}'] must be a {{ suffix, cls }} pair, got "
-            f'keys {sorted(keys)}. Storing a whole label would let a parity '
-            'branch report a state the payload never asserted — `_parity()` '
-            'derives most states from (verdict class, linked?), so the verdict '
-            'must survive into the label.'
-        )
-
     badge_body = _extract_function_body(code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
-    labels = re.findall(r'label\s*:\s*([^,}\n]+)', badge_body)
+    labels = _return_label_exprs(badge_body)
     assert labels, 'verdictBadge returns no `label`.'
     for expr in labels:
-        assert expr.strip().startswith('base'), (
-            f'verdictBadge returns the label {expr.strip()!r}, which does not '
+        # `base\b`, not `startswith('base')`: the latter also accepts an
+        # unrelated identifier such as `baseline` or `baseLabel`, so it would
+        # not actually pin composition onto the verdict-derived `base`.
+        assert re.match(r'base\b', expr), (
+            f'verdictBadge returns the label {expr!r}, which does not '
             'begin with the verdict-derived `base`. Every returned label must '
             'compose onto it: a fixed label reports a state the payload never '
             'asserted. `_parity()` is a three-case lookup over (verdict class, '
@@ -846,14 +921,7 @@ def test_every_open_parity_state_shows_the_escalation_affordance(
         'replaced the suffix before deleting this guard.'
     )
 
-    refinement = _extract_const_object(code, 'PARITY_REFINEMENT')
-    plain = _extract_const_object(code, 'PARITY_PLAIN', open_char='[')
-    assert refinement and plain, (
-        'PARITY_REFINEMENT / PARITY_PLAIN must both be declared (see '
-        'test_parity_vocabulary_fully_covered).'
-    )
-    entries = dict(re.findall(r'[\'"]?(\w+)[\'"]?\s*:\s*\{([^{}]*)\}', refinement))
-    declined = set(re.findall(r"'([^']*)'", plain))
+    entries, declined = _parity_tables(code)
 
     for state in sorted(open_states):
         assert state not in declined, (
@@ -879,23 +947,41 @@ def test_every_open_parity_state_shows_the_escalation_affordance(
             'still live — and must say so in the same words, so the operator '
             'reads one marker rather than learning six.'
         )
+        # Severity follows the VERDICT, not the linkage — but never DOWN to
+        # healthy. Without this, flipping the four warn-level `_open` entries
+        # to 'badge ok' keeps the whole suite green while colouring a row that
+        # has a live open escalation the same green as one with nothing filed.
+        cls = re.search(r"cls\s*:\s*'([^']*)'", entries[state])
+        assert cls, f"PARITY_REFINEMENT['{state}'] has no `cls` string."
+        assert cls.group(1) != 'badge ok', (
+            f"PARITY_REFINEMENT['{state}'] renders 'badge ok'. An escalation is "
+            'OPEN on that row, so the badge may not be the healthy one: colour '
+            'is the first thing scanned and a green row is not looked at '
+            'twice, which would bury the very fact the suffix was added to '
+            'disclose. Severity may follow the verdict down to warn, never to '
+            'healthy.'
+        )
 
 
 def test_unknown_verdict_is_visibly_unrenderable(
     tab_memory_evals_jsx_code: str,
 ) -> None:
-    """An unrecognised verdict must not borrow the healthy or the neutral badge.
+    """An unrecognised verdict must read as broken — not as absent, not as fine.
 
     Server-side this is a NAMED issue kind: the reader files an
     `unknown_verdict` issue naming the eval, metric and offending value,
     precisely so a value outside the closed vocabulary fails toward "something
-    is wrong here".  Letting it fall through to the muted `no verdict` badge
-    both undoes that and asserts something false — there IS a verdict, it is
-    just unreadable, and the two are different facts about the row.
+    is wrong here".  This is the last render step and must not quietly undo it.
 
-    Contrast `unjudged`, which correctly stays plain and muted: nothing judged
-    that metric at all, so 'no verdict' is exactly true.  The distinction is
-    the point — these must not render alike.
+    Two substitutions are refused, because an operator reads the rendered badge
+    and nothing else:
+
+    * the CLASS may borrow neither the healthy badge nor the neutral
+      not-measured one — the row is broken, not fine and not unmeasured;
+    * the LABEL may not say the verdict is MISSING.  It is present, just
+      unreadable, and the two are different facts.  Contrast `unjudged`, which
+      correctly stays plain and muted reading 'no verdict': nothing judged that
+      metric at all, so there that label is exactly true.
 
     Asserted over RENDERED OUTPUT (badge class and the label the operator
     reads), not over comment prose.
@@ -911,23 +997,17 @@ def test_unknown_verdict_is_visibly_unrenderable(
         'before deleting this guard.'
     )
 
-    refinement = _extract_const_object(code, 'PARITY_REFINEMENT')
-    plain = _extract_const_object(code, 'PARITY_PLAIN', open_char='[')
-    assert refinement and plain, (
-        'PARITY_REFINEMENT / PARITY_PLAIN must both be declared (see '
-        'test_parity_vocabulary_fully_covered).'
-    )
-    entries = dict(re.findall(r'[\'"]?(\w+)[\'"]?\s*:\s*\{([^{}]*)\}', refinement))
-    declined = set(re.findall(r"'([^']*)'", plain))
+    entries, declined = _parity_tables(code)
 
     for state in sorted(unknown):
         assert state not in declined, (
             f"'{state}' is in PARITY_PLAIN, so it renders as the plain verdict "
-            "badge — 'no verdict', muted. That reports a present-but-unreadable "
-            'verdict as an ABSENT one, which is the same substitution the '
-            'absent-verdict guard exists to prevent, running the other way. '
-            'The producer files a named `unknown_verdict` issue for this; the '
-            'last render step must not quietly undo it.'
+            'badge — muted, with nothing marking the row as broken. That '
+            'reports a present-but-unreadable verdict as an unremarkable one, '
+            'which is the same substitution the absent-verdict guard exists to '
+            'prevent, running the other way. The producer files a named '
+            '`unknown_verdict` issue for this; the last render step must not '
+            'quietly undo it.'
         )
         assert state in entries, (
             f"'{state}' has no PARITY_REFINEMENT entry, so it renders through "
@@ -941,15 +1021,96 @@ def test_unknown_verdict_is_visibly_unrenderable(
             'one: the value is present and outside the vocabulary, so the row '
             'is broken, not fine and not unmeasured.'
         )
-        suffix = re.search(r"suffix\s*:\s*'([^']*)'", entries[state])
-        assert suffix, f"PARITY_REFINEMENT['{state}'] has no `suffix` string."
-        assert re.search(r'unrecognis|unknown', suffix.group(1), re.IGNORECASE), (
-            f"PARITY_REFINEMENT['{state}'] renders the suffix "
-            f'{suffix.group(1)!r}, which never names the condition. The '
-            "operator sees a badge that says the metric's verdict is something "
-            'other than what it is; the label must say the verdict was not '
-            'recognised, so the row reads as broken rather than as a '
-            'warn-level parity note.'
+    # The condition is named by the BASE, not by a parity suffix. `base` is the
+    # verdict-derived half of every label, so it is the only half that can say
+    # what happened to the VERDICT; a suffix appended to 'no verdict' cannot
+    # un-say it, and the composed label would then assert both halves of the
+    # distinction at once ("no verdict · unrecognised verdict" — absent in the
+    # first clause, present-but-unreadable in the second).
+    badge_body = _extract_function_body(code, 'verdictBadge')
+    assert badge_body, 'could not extract the verdictBadge body.'
+    assigned = re.findall(r"\bbase\s*=\s*'([^']*)'", badge_body)
+    assert assigned, 'verdictBadge assigns no literal `base` label.'
+    absent = assigned[0]  # the seed, in force until a verdict is recognised
+    unreadable = [v for v in assigned if re.search(r'unread|unrecognis|unknown', v, re.I)]
+    assert unreadable, (
+        'verdictBadge never assigns a `base` label naming an UNREADABLE '
+        f'verdict — the literals it can render are {sorted(set(assigned))}. A '
+        'verdict that is present but outside the closed vocabulary reaches '
+        f'parity {sorted(unknown)}, and the operator must be able to see that '
+        'from the label: memory_evals._verdict_class() buckets an absent value '
+        'to `unjudged` and a present-but-out-of-vocabulary one to '
+        '`unknown_verdict` precisely because they are different facts.'
+    )
+    assert absent not in unreadable, (
+        f'verdictBadge seeds `base` to {absent!r} and uses that same label for '
+        'an unreadable verdict, so the two states the producer distinguishes '
+        'render identically. Seed the genuinely-ABSENT label and overwrite it '
+        'on a present-but-unrecognised value.'
+    )
+
+
+def test_unrecognised_parity_is_marked_not_passed_through(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """A parity value in NEITHER declaration must render as visibly unknown.
+
+    Two ways the badge can be wrong about a parity string it has never been
+    told about, and the file refuses both:
+
+    * an INHERITED member.  `PARITY_REFINEMENT` is a plain object literal, so a
+      bare `PARITY_REFINEMENT[parity]` resolves through `Object.prototype`: a
+      payload carrying parity 'constructor' / 'toString' / 'valueOf' /
+      'hasOwnProperty' finds a truthy inherited function and the row renders
+      `cls: undefined` with a label ending '· undefined'.  The lookup must be
+      own-property guarded.
+    * a genuinely NEW state — the producer added one and an already-open
+      browser is still holding a cached copy of this file (the case the
+      cache-buster bump exists for, and which it cannot make impossible).
+      Passing it through to the plain verdict badge renders it identically to a
+      state that DECLINED refinement: the unknown fails toward the healthy
+      label, which is what the unknown-verdict pair exists to prevent one level
+      up.  `PARITY_PLAIN` is what makes "considered and declined" and "never
+      heard of it" distinguishable at all, so the fall-through must consult it.
+    """
+    code = tab_memory_evals_jsx_code
+    badge_body = _extract_function_body(code, 'verdictBadge')
+    assert badge_body, 'could not extract the verdictBadge body.'
+
+    assert 'hasOwnProperty' in badge_body, (
+        'verdictBadge reads PARITY_REFINEMENT with an unguarded bracket '
+        'lookup. That resolves through Object.prototype, so a parity of '
+        "'constructor' or 'toString' returns a truthy INHERITED member and the "
+        "badge renders `cls: undefined`. Guard it with "
+        '`Object.prototype.hasOwnProperty.call(PARITY_REFINEMENT, parity)`.'
+    )
+    assert 'PARITY_PLAIN' in badge_body, (
+        'verdictBadge never consults PARITY_PLAIN, so it cannot tell a state '
+        'that deliberately declined refinement from one it has never heard of '
+        '— both take the same fall-through and render the same badge. The '
+        'opt-out list has to be READ for it to mean anything at render time.'
+    )
+
+    marked = [
+        obj
+        for obj in re.findall(r'return\s*\{([^{}]*)\}', badge_body)
+        if re.search(r'unrecognis|unknown', obj, re.IGNORECASE)
+    ]
+    assert marked, (
+        'verdictBadge has no return that marks an unrecognised parity. A '
+        'parity in neither PARITY_REFINEMENT nor PARITY_PLAIN is a state this '
+        'copy of the file has never been told about; rendering it as the bare '
+        'verdict badge tells the operator the row is ordinary, which is the '
+        'one thing not known about it.'
+    )
+    for obj in marked:
+        cls = re.search(r"cls\s*:\s*'([^']*)'", obj)
+        assert cls, 'the unrecognised-parity return sets no literal `cls`.'
+        assert cls.group(1) not in ('badge ok', 'badge muted'), (
+            f'the unrecognised-parity return renders {cls.group(1)!r}. An '
+            'unknown state may borrow neither the healthy badge nor the '
+            'neutral not-measured one — both assert something about the row '
+            'that this bundle has no basis for.'
         )
 
 
