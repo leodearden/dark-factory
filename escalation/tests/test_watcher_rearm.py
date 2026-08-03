@@ -213,6 +213,50 @@ def test_explicit_level_still_filters(tmp_path):
     )
 
 
+def test_level_less_default_exclude_file_suppresses(tmp_path):
+    """Structural mirror of test_exclude_file_ownership_suppresses, for the
+    level-less mode: with no --level the wrapper's OWNED default exclude
+    path must be <queue_dir>/.watcher-rearm-exclude -- the levelled
+    '-l<level>' suffix DROPPED, not left dangling as a bare '-l'.
+
+    Like its sibling, suppression can only happen if the wrapper actually
+    WIRES that path into the watcher invocation, so this proves far more
+    than a --check output assertion could. The name stays a dotfile that
+    does not end in '.json', which is what keeps it invisible to both the
+    watcher's own esc-*.json glob (watcher.py:85) and the dashboard's
+    broader *.json recon glob (dashboard/.../escalations.py:89)."""
+    queue_dir = tmp_path / 'queue'
+    queue_dir.mkdir()
+    esc = _write_pending(queue_dir, 'esc-54-1', task_id='54', level=0)
+
+    default_exclude_file = queue_dir / '.watcher-rearm-exclude'
+    default_exclude_file.write_text(f'{esc.id}\n')
+
+    result = _run(
+        '--queue-dir', str(queue_dir), '--timeout', '1',
+        env=_live_env(REPO_ROOT),
+    )
+
+    assert result.returncode == 124, (
+        f'Expected exit 124 (pending item suppressed via the wrapper-owned '
+        f'level-less exclude-file); got {result.returncode}\n'
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert 'WATCHER_REARM_OUTCOME: CEILING exit=124' in result.stderr, (
+        f'Expected the CEILING outcome line on stderr; got {result.stderr!r}'
+    )
+    assert 'esc-' not in result.stdout, (
+        f'Expected no escalation JSON on stdout; got {result.stdout!r}'
+    )
+
+    check = _run('--check', '--queue-dir', str(queue_dir), env=_live_env(REPO_ROOT))
+    resolved = check.stdout.split('exclude-file=')[-1].strip()
+    assert resolved == str(default_exclude_file), (
+        f'Expected the level-less --check to resolve exclude-file to '
+        f'{str(default_exclude_file)!r} (no trailing "-l"); got {resolved!r}'
+    )
+
+
 def test_exclude_file_ownership_suppresses(tmp_path):
     """A pending escalation whose id is already listed in the wrapper's
     OWNED default exclude-file (<queue_dir>/.watcher-rearm-exclude-l<level>)
