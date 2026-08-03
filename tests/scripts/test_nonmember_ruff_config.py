@@ -34,28 +34,34 @@ Test (b) then pins the DECLARED config so a reader can see the intended values
 and a member cannot silently diverge from them.
 
 BOTH HALVES SWEEP, THEY DO NOT ENUMERATE. The probed paths and the forbidden
-shadowing configs are DERIVED by walking the repo and subtracting the workspace
-members declared in ``[tool.uv.workspace].members``, never listed by hand. A
-hand-maintained list is the same failure mode this table closes one level up: it
-covers today's two gated directories and lets the NEXT non-member directory —
-or a nested ``scripts/legibility/ruff.toml``, which would silently re-scope
-roughly half of what ``ruff check scripts/`` covers — re-open the gap without
-anything going red. The two gated directories are separately asserted to be
-PRESENT in the derived set, so a pruning bug cannot shrink coverage silently.
+shadowing configs are DERIVED from ``git ls-files --cached --others
+--exclude-standard``, minus the workspace members declared in
+``[tool.uv.workspace].members``, never listed by hand. A hand-maintained list is
+the same failure mode this table closes one level up: it covers today's two
+gated directories and lets the NEXT non-member directory — or a nested
+``scripts/legibility/ruff.toml``, which would silently re-scope roughly half of
+what ``ruff check scripts/`` covers — re-open the gap without anything going
+red. The two gated directories are separately asserted to be PRESENT in the
+derived set, so a pruning bug cannot shrink coverage silently.
 
-THE DERIVATION ITSELF IS GUARDED, because a sweep is only as good as its
-containment. This file's first draft walked the filesystem and pruned by
-directory NAME, which held in a task worktree and collapsed anywhere else:
-measured with that walk, this worktree yielded 6 probe paths and 0 shadows,
-while the canonical ``project_root`` clone every operator is told to make
-yielded 2356 probe paths and 369 shadows — foreign checkouts
-(``.eval-worktrees`` 218, ``.worktrees-orphaned`` 104, ``.claude`` 41) plus the
-``graphiti`` and ``mem0`` submodules (4 + 2), each carrying its own
-``[tool.ruff]`` and so failing parity against the baseline. Because that
-contamination is invisible from inside a worktree, the containment of
-``_nonmember_probe_paths`` and ``_shadowing_configs`` is pinned against a
-SYNTHETIC repo built per-test rather than against the ambient checkout — an
-ambient bound would have been born green here and proved nothing.
+GIT'S VIEW, NOT THE FILESYSTEM'S — because a sweep is only as good as its
+containment, and containment is what makes the derived set identical in a task
+worktree and in the ``--recurse-submodules`` clone SETUP.md tells every operator
+to make. This file's first draft walked the filesystem and pruned by directory
+NAME, which held in a worktree and collapsed anywhere else: measured with that
+walk, this worktree yielded 6 probe paths and 0 shadows, while the canonical
+``project_root`` clone yielded 2356 probe paths and 369 shadows — foreign
+checkouts (``.eval-worktrees`` 218, ``.worktrees-orphaned`` 104, ``.claude``
+41) plus the ``graphiti`` and ``mem0`` submodules (4 + 2), each carrying its own
+``[tool.ruff]`` and so failing parity against the baseline, and each ``ruff``
+subprocess costing ~0.164 s inside a directory whose ``test_command`` is a merge
+gate under ``merge_verify_breadth: "full"``. Under the git derivation both
+checkouts yield the SAME 6 probe paths and zero shadows. See ``_git_ls_files``
+for why each flag is load-bearing. Because that contamination is invisible from
+inside a worktree, the containment of ``_nonmember_probe_paths`` and
+``_shadowing_configs`` is additionally pinned against a SYNTHETIC repo built
+per-test rather than against the ambient checkout — an ambient bound would have
+been born green here and proved nothing.
 
 WHAT TEST (b) COMPARES, AND WHY THE ROOT TABLE MAY DECLARE NOTHING ELSE. Only
 ``[tool.ruff].line-length`` and ``[tool.ruff.lint].{select,ignore}`` are held
@@ -113,9 +119,9 @@ print(sys, os, X, Y)
 PROBE_BASENAME = '_ruff_probe.py'
 
 # The two GATED non-member directories this task exists for. These are a FLOOR,
-# not the coverage list: the probed set is derived by walking the repo (see
-# _nonmember_probe_paths), and these two are asserted to be in it so a pruning
-# bug or a moved directory cannot quietly shrink the guard to nothing.
+# not the coverage list: the probed set is derived from git's view of the repo
+# (see _nonmember_probe_paths), and these two are asserted to be in it so a
+# pruning bug or a moved directory cannot quietly shrink the guard to nothing.
 GATED_NONMEMBER_DIRS = ('scripts', 'tests/scripts')
 
 # A live workspace member, used as the BASELINE. Parity is asserted against what
@@ -144,64 +150,147 @@ _SHADOWING_FILENAMES = ('pyproject.toml', 'ruff.toml', '.ruff.toml')
 _ROOT_COMPARED_KEYS = frozenset({'line-length', 'lint'})
 _ROOT_COMPARED_LINT_KEYS = frozenset({'select', 'ignore'})
 
-# Never walked: VCS metadata, virtualenvs, caches, build output, and nested task
-# worktrees (each is a full checkout of this repo, so descending into one would
-# rediscover every member pyproject.toml under a non-member prefix).
-_PRUNED_DIR_NAMES = frozenset({
-    '.git', '.hg', '.mypy_cache', '.pytest_cache', '.ruff_cache', '.task',
-    '.tox', '.venv', '.worktrees', '__pycache__', 'build', 'dist',
-    'node_modules', 'venv',
-})
+
+def _root_pyproject(root: pathlib.Path = REPO_ROOT) -> dict:
+    return tomllib.loads((root / 'pyproject.toml').read_text())
 
 
-def _root_pyproject() -> dict:
-    return tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text())
-
-
-def _member_roots() -> set[pathlib.Path]:
+def _member_roots(root: pathlib.Path = REPO_ROOT) -> set[pathlib.Path]:
     """Directories owned by a workspace member, read from the root declaration.
 
     Members are globbed rather than string-matched because uv permits patterns
     (``packages/*``); ``Path.glob`` handles a literal name identically.
     """
-    members = _root_pyproject()['tool']['uv']['workspace']['members']
+    members = _root_pyproject(root)['tool']['uv']['workspace']['members']
     roots: set[pathlib.Path] = set()
     for pattern in members:
-        roots.update(path for path in REPO_ROOT.glob(pattern) if path.is_dir())
+        roots.update(path for path in root.glob(pattern) if path.is_dir())
     return roots
 
 
-def _nonmember_dirs() -> list[pathlib.Path]:
-    """Every directory the repo-root [tool.ruff] table governs.
+def _git(cwd: pathlib.Path, *args: str) -> str:
+    """Run git in *cwd* with a scrubbed environment, FAILING loudly on non-zero.
 
-    The whole repo minus the member subtrees minus _PRUNED_DIR_NAMES. Derived,
-    never enumerated: a hand-written list covers today's directories and lets the
-    next one re-open the gap silently.
+    ``GIT_*`` is stripped from the environment because pytest can run under a
+    hook or wrapper that exports ``GIT_DIR`` / ``GIT_INDEX_FILE`` — this repo's
+    own pre-commit hook does — and either would silently redirect these calls at
+    a different index than the tree being asked about. Identity and signing are
+    pinned inline so nothing depends on the ambient user's git config (they are
+    inert for the read-only ``ls-files`` call and load-bearing for the synthetic
+    fixture's commits).
+
+    A missing git, or a non-zero exit, raises ``AssertionError`` — it never
+    skips. Same stance, and the same reason, as the module docstring gives for
+    ruff: a guard that skips itself away is a green check that never ran.
     """
-    member_roots = _member_roots()
-    found: list[pathlib.Path] = []
-    stack = [REPO_ROOT]
-    while stack:
-        directory = stack.pop()
-        found.append(directory)
-        for child in sorted(directory.iterdir()):
-            if child.is_symlink() or not child.is_dir():
-                continue
-            if child.name in _PRUNED_DIR_NAMES or child.name.endswith('.egg-info'):
-                continue
-            if child in member_roots:
-                continue
-            stack.append(child)
-    return found
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    command = [
+        'git',
+        '-c', 'user.email=ruff-config-guard@example.invalid',
+        '-c', 'user.name=ruff config guard',
+        '-c', 'commit.gpgsign=false',
+        '-c', 'init.defaultBranch=main',
+        *args,
+    ]
+    try:
+        proc = subprocess.run(
+            command, cwd=cwd, capture_output=True, text=True, env=env, check=False,
+        )
+    except OSError as exc:  # pragma: no cover - only on a broken env
+        raise AssertionError(
+            f'Could not execute `git {" ".join(args)}` in {cwd}: {exc!r}. This guard derives '
+            'the swept set from git rather than from a filesystem walk, and deliberately FAILS '
+            'rather than skipping when git is unavailable.'
+        ) from exc
+    assert proc.returncode == 0, (
+        f'`git {" ".join(args)}` failed in {cwd} with rc={proc.returncode}.\n'
+        f'stdout: {proc.stdout!r}\nstderr: {proc.stderr!r}'
+    )
+    return proc.stdout
 
 
-def _nonmember_probe_paths() -> list[str]:
+def _git_ls_files(root: pathlib.Path, *pathspecs: str) -> list[str]:
+    """Repo-relative paths git considers part of the repository at *root*.
+
+    ``--cached --others --exclude-standard`` is the whole containment argument,
+    and each half is load-bearing:
+
+    * ``--cached`` alone would miss a NEWLY CREATED, not-yet-committed
+      ``scripts/legibility/ruff.toml`` — the live-shadow case the sweep exists
+      for — so ``--others`` is added to catch it.
+    * ``--exclude-standard`` then drops everything gitignored, which is how the
+      foreign checkouts vanish: ``.worktrees/``, ``.worktrees-orphaned/``,
+      ``.eval-worktrees/`` and ``.claude/worktrees/`` are all ignored at the repo
+      root. Verified to add nothing spurious — with and without ``--others`` the
+      tracked ``.py`` count and the shadow list are identical in both checkouts.
+    * Submodules need no handling at all: ``graphiti`` and ``mem0`` are single
+      mode-160000 gitlink entries, so a ``'*.py'`` pathspec matches nothing
+      inside them and no ``.gitmodules`` parsing is required.
+    * A nested checkout likewise needs none: git reports a directory holding a
+      VALID ``.git`` as one untracked directory entry and never descends into it.
+
+    ``-z`` rather than git's default output, so a path containing a space or a
+    quote is not silently mangled by C-style quoting.
+    """
+    return [
+        entry
+        for entry in _git(root, 'ls-files', '--cached', '--others', '--exclude-standard',
+                          '-z', '--', *pathspecs).split('\0')
+        if entry
+    ]
+
+
+def _nonmember_directories(root: pathlib.Path = REPO_ROOT) -> set[str]:
+    """Repo-relative directories holding Python that the root table governs.
+
+    Git's view of the repo minus the workspace members. Derived, never
+    enumerated: a hand-written list covers today's directories and lets the next
+    one re-open the gap silently — and a hand-written PRUNE list, which is what
+    this helper used to carry, silently over-collects instead (2356 probe paths
+    in the canonical clone against 6 here; see the module docstring).
+    """
+    members = sorted(path.relative_to(root).as_posix() for path in _member_roots(root))
+    directories = set()
+    for entry in _git_ls_files(root, '*.py'):
+        if any(entry == member or entry.startswith(f'{member}/') for member in members):
+            continue
+        directories.add(pathlib.PurePosixPath(entry).parent.as_posix())
+    return directories
+
+
+def _nonmember_probe_paths(root: pathlib.Path = REPO_ROOT) -> list[str]:
     """One probe path per non-member directory that actually holds Python."""
     return sorted(
-        str((directory / PROBE_BASENAME).relative_to(REPO_ROOT))
-        for directory in _nonmember_dirs()
-        if any(directory.glob('*.py'))
+        PROBE_BASENAME if directory == '.' else f'{directory}/{PROBE_BASENAME}'
+        for directory in _nonmember_directories(root)
     )
+
+
+def _shadowing_configs(root: pathlib.Path = REPO_ROOT) -> list[str]:
+    """Every non-member config file that would shadow the repo-root table.
+
+    SWEPT, not enumerated: at any depth, so e.g. a ``scripts/legibility/ruff.toml``
+    — which would silently re-scope roughly half of what ``ruff check scripts/``
+    covers — is caught. The repo-root ``pyproject.toml`` is exempt because it IS
+    the table under test; a root ``ruff.toml``/``.ruff.toml`` is NOT, because ruff
+    prefers those over a ``pyproject.toml`` in the SAME directory and one there
+    would replace the very table this file pins.
+    """
+    members = sorted(path.relative_to(root).as_posix() for path in _member_roots(root))
+    entries = _git_ls_files(root, *(f'*{filename}' for filename in _SHADOWING_FILENAMES))
+    found = []
+    for entry in entries:
+        # git pathspec `*` spans directory separators, which is what makes the
+        # sweep depth-independent — but it also makes `*ruff.toml` match e.g.
+        # `myruff.toml`, so the basename is re-checked against the real list.
+        if pathlib.PurePosixPath(entry).name not in _SHADOWING_FILENAMES:
+            continue
+        if any(entry == member or entry.startswith(f'{member}/') for member in members):
+            continue
+        if entry == 'pyproject.toml':
+            continue
+        found.append(entry)
+    return sorted(found)
 
 
 def _resolved_rule_codes(probe_path: str) -> set[str]:
@@ -267,9 +356,10 @@ def test_nonmember_dirs_resolve_the_member_ruff_rule_set() -> None:
             f'{gated}/ carries a directory-wide lint_command ({gated}/orchestrator.yaml) but '
             f'was not discovered by _nonmember_probe_paths(), which found {probe_paths}. '
             'Either the directory moved (update GATED_NONMEMBER_DIRS and its orchestrator.yaml '
-            'together), it no longer holds any .py file, or _PRUNED_DIR_NAMES / the member '
+            'together), it no longer holds any .py file, or the git derivation / the member '
             'subtraction is over-pruning — in which case this guard is checking less than it '
-            'reads as checking.'
+            'reads as checking. Note the derived set is what git reports, so a .py file that '
+            'is gitignored is deliberately absent: no lint_command would see it either.'
         )
 
     for probe_path in probe_paths:
@@ -316,43 +406,6 @@ _FIXTURE_EXPECTED_PROBES = frozenset({PROBE_BASENAME, f'tooling/{PROBE_BASENAME}
 
 # Prefixes that must contribute NOTHING, each asserted separately below.
 _FIXTURE_FOREIGN_PREFIXES = ('vendored/', 'nested/', '.eval-worktrees/')
-
-
-def _git(cwd: pathlib.Path, *args: str) -> str:
-    """Run git in *cwd* with a scrubbed environment, FAILING loudly on non-zero.
-
-    ``GIT_*`` is stripped because pytest may run under a hook or wrapper that
-    exports ``GIT_DIR`` / ``GIT_INDEX_FILE``, which would silently redirect these
-    calls at the surrounding dark-factory checkout instead of the fixture.
-    Identity and signing are pinned inline so the fixture does not depend on the
-    ambient user's git config, and commits use ``--no-verify`` so this repo's own
-    hooks never run against a throwaway tree.
-    """
-    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-    proc = subprocess.run(
-        [
-            'git',
-            '-c', 'user.email=fixture@example.invalid',
-            '-c', 'user.name=ruff config fixture',
-            '-c', 'commit.gpgsign=false',
-            '-c', 'init.defaultBranch=main',
-            *args,
-        ],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
-    assert proc.returncode == 0, (
-        f'`git {" ".join(args)}` failed in {cwd} with rc={proc.returncode}.\n'
-        f'stdout: {proc.stdout!r}\nstderr: {proc.stderr!r}\n'
-        'This is a FIXTURE CONSTRUCTION failure, not the contract under test. This guard '
-        'deliberately FAILS rather than skipping when git is unavailable or refuses, for the '
-        'same reason the module docstring gives for ruff: a guard that skips itself away is a '
-        'green check that never ran.'
-    )
-    return proc.stdout
 
 
 def _write(root: pathlib.Path, relative: str, text: str) -> None:
@@ -550,22 +603,9 @@ def test_root_ruff_config_matches_every_workspace_member() -> None:
         'were vacuous. Either the members lost their tables or the member list is wrong.'
     )
 
-    # SWEPT, not enumerated: every non-member directory, at any depth. A
-    # hand-listed set would miss e.g. scripts/legibility/ruff.toml, which
-    # silently re-scopes roughly half of what `ruff check scripts/` covers.
-    shadows = []
-    for directory in _nonmember_dirs():
-        for filename in _SHADOWING_FILENAMES:
-            candidate = directory / filename
-            if not candidate.is_file():
-                continue
-            # The repo-root pyproject.toml IS the table under test. A root
-            # ruff.toml/.ruff.toml is NOT exempt: ruff prefers those over a
-            # pyproject.toml in the SAME directory, so one there would replace
-            # the very table the assertions above pin.
-            if directory == REPO_ROOT and filename == 'pyproject.toml':
-                continue
-            shadows.append(str(candidate.relative_to(REPO_ROOT)))
+    # SWEPT, not enumerated: every non-member directory, at any depth. See
+    # _shadowing_configs for what is swept and what is deliberately exempt.
+    shadows = _shadowing_configs()
 
     assert not shadows, (
         f'{sorted(shadows)} SHADOW the repo-root [tool.ruff] table — ruff takes the NEAREST '
