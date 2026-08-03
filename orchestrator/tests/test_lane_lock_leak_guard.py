@@ -39,6 +39,7 @@ import contextlib
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -189,7 +190,9 @@ def foreign_lane_lock_holder(lock_path: Path) -> Iterator[subprocess.Popen]:
                     f'be vacuous'
                 )
             time.sleep(0.02)
-        holders = wait_for_lane_lock_holder(lock_path, child.pid)
+        holders = wait_for_lane_lock_holder(
+            lock_path, child.pid, timeout=_FOREIGN_HOLDER_ATTRIBUTION_SECS,
+        )
         if child.pid not in holders:
             _kill_group()
             pytest.fail(
@@ -511,7 +514,7 @@ def test_foreign_holder_fixture_survives_a_transient_empty_holder_read(
             return []
         return real_reader(path)
 
-    monkeypatch.setattr('test_lane_lock_leak_guard.lane_lock_holder_pids', _flaky)
+    monkeypatch.setattr(sys.modules[__name__], 'lane_lock_holder_pids', _flaky)
 
     lock_path = lane_lock_path(tmp_path / 'lane')
     with foreign_lane_lock_holder(lock_path) as child:
@@ -778,7 +781,9 @@ class TestSelfOwnedLaneLockLeak:
             # unparseable row all yield the same []).  A one-shot read here
             # landed on exactly that empty snapshot under 16-worker xdist
             # load, producing the observed `assert 658016 in []`.
-            holders = wait_for_lane_lock_holder(lock_path, child.pid)
+            holders = wait_for_lane_lock_holder(
+                lock_path, child.pid, timeout=_FOREIGN_HOLDER_ATTRIBUTION_SECS,
+            )
             assert os.getpid() not in holders, (
                 'staging error: this process must NOT hold the lock, or the '
                 'negative below would be vacuous'
