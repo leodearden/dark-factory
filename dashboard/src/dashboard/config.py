@@ -250,7 +250,24 @@ class DashboardConfig:
 
     @classmethod
     def from_env(cls) -> DashboardConfig:
-        """Create config with DASHBOARD_-prefixed env var overrides."""
+        """Create config with DASHBOARD_-prefixed env var overrides.
+
+        When ``DASHBOARD_PROJECT_ROOT`` is unset, the cwd-derived fallback root
+        (see the ``project_root`` field) is logged at INFO so the resolved root
+        is observable in the journal instead of being an invisible default —
+        every database path the dashboard opens hangs off it.
+
+        INFO and not WARNING, deliberately: the canonical deployment relies on
+        the cwd path BY DESIGN — the systemd units pin ``WorkingDirectory`` on
+        purpose — so a WARNING would be crying wolf on the supported
+        configuration, unlike the ``_discover_escalation_urls`` WARNINGs in this
+        same module, which flag genuinely degraded states.  INFO still surfaces
+        the root in ``journalctl`` at uvicorn's default log level.
+
+        ``from_env()`` is called once per process (app.py's ``lifespan``,
+        ``__main__.py``), so this is one line per process lifetime — never per
+        request.
+        """
         kwargs: dict = {}
         if (host := os.environ.get('DASHBOARD_HOST')) is not None:
             kwargs['host'] = host
@@ -258,6 +275,12 @@ class DashboardConfig:
             kwargs['port'] = int(port)
         if (root := os.environ.get('DASHBOARD_PROJECT_ROOT')) is not None:
             kwargs['project_root'] = Path(root)
+        else:
+            logger.info(
+                'DASHBOARD_PROJECT_ROOT unset — using cwd-derived project_root %s '
+                '(all database paths are derived from it)',
+                Path.cwd().resolve(),
+            )
         if (urls := os.environ.get('DASHBOARD_FUSED_MEMORY_URLS')) is not None:
             kwargs['fused_memory_urls'] = [u.strip() for u in urls.split(',') if u.strip()]
         if (roots := os.environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS')) is not None:
