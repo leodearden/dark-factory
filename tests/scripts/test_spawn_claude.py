@@ -1549,6 +1549,93 @@ def test_spawn_run_budget_clamps_to_spawn_run_cap(
     assert _SPAWN_RUN_CAP_SECS + _READINESS_WAIT_CAP_SECS < 300
 
 
+def _capture_spawn_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, **kwargs
+) -> float:
+    """Invoke _run_spawn with subprocess.run monkeypatched to a no-op stub
+    that records the `timeout` kwarg it was handed, so the load-scaling
+    policy is pinned as runtime behaviour (the actual argument
+    subprocess.run receives) without ever launching a real subprocess or
+    sleeping.
+    """
+    captured: dict[str, float] = {}
+
+    def _fake_run(argv, **kw):
+        captured["timeout"] = kw["timeout"]
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    _run_spawn({}, tmp_path, **kwargs)
+    return captured["timeout"]
+
+
+def test_run_spawn_scales_its_timeout_under_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A fixed wall-clock bound races a host-load-dependent startup chain --
+    observed as test_genuine_launcher_failure_yields_127[xterm] timing out
+    at a fixed 15s under merge-verify contention. The default `timeout=30`
+    _run_spawn hands to subprocess.run must itself be load-adaptive, not a
+    fixed 30, so every one of the ~20 call sites on the bare default is
+    covered by a single fix.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    timeout = _capture_spawn_timeout(monkeypatch, tmp_path)
+    assert timeout == _spawn_run_budget(30) == 90
+
+
+def test_run_spawn_explicit_timeout_is_a_scaled_base_not_a_fixed_pin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An explicit `timeout=` argument is treated as a BASE routed through
+    _spawn_run_budget, not a ceiling -- so a caller that dialed down its
+    bound (e.g. the old timeout=15 at the reported flake site) still gets
+    load protection instead of racing the same fixed pin under contention.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    timeout = _capture_spawn_timeout(monkeypatch, tmp_path, timeout=20)
+    assert timeout == _spawn_run_budget(20) == 60
+
+
+def test_run_spawn_idle_host_timeout_is_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The no-regression guarantee for every existing call site: on an idle
+    host (load-per-core < 1), both the default and an explicit timeout
+    reach subprocess.run completely unchanged. Passes both before and
+    after step-4 -- intentionally; this is the no-regression guard, not a
+    RED test.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _capture_spawn_timeout(monkeypatch, tmp_path) == 30
+    assert _capture_spawn_timeout(monkeypatch, tmp_path, timeout=10) == 10
+
+
+def test_run_spawn_scale_timeout_false_forwards_base_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """scale_timeout=False is the documented opt-out that preserves task
+    3486's audited decision for the load-INSENSITIVE 126/no-emulator sites
+    (rc==126 is decided by an immediate availability-guard failure; load-
+    scaling would only make a genuine regression take longer to report).
+    Pinned as a contract here rather than left as an undocumented
+    convention, so a future edit to _run_spawn cannot silently drop it.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    timeout = _capture_spawn_timeout(
+        monkeypatch, tmp_path, scale_timeout=False, timeout=10
+    )
+    assert timeout == 10
+
+
 # ===========================================================================
 # Task 3451: _set_started_grace -- shared started-grace policy for the
 # "must NOT be flagged failed-to-start" test family
