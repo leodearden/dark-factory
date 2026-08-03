@@ -284,6 +284,65 @@ async def _acknowledge_resolved_stage1_markers(
         return 0
 
 
+#: resolve_ticket statuses that constitute a confirmed task creation (task 3046).
+_TASK_CREATED_SUCCESS_STATUSES: frozenset[str] = frozenset({'created', 'combined'})
+
+
+def _count_valid_task_created_records(records: object) -> int:
+    """Return the deduped count of confirmed task creations in *records* (task 3046).
+
+    *records* is ``report.stats['task_created_records']`` — the action-shaped
+    ground truth the '## Task-Creation Accounting' prompt section mandates
+    Stage 2 append to at the moment each ``resolve_ticket`` call confirms a
+    creation, modeled directly on ``flag_deleted_records``. A record counts
+    only when its ``status`` (case/whitespace-insensitive) is ``created`` or
+    ``combined`` AND it carries a non-empty ``task_id``; ``failed`` is NEVER
+    counted regardless of whether a ``task_id`` is present, mirroring the
+    '## Verifying Task Operations' confirmation rule so the prompt and this
+    helper cannot drift on what counts.
+
+    Deduplication is keyed on ``(project_id, str(task_id))``, NOT on
+    ``task_id`` alone: Cross-Project Routing means the same numeric id can
+    legitimately be filed under two different projects in the same cycle
+    (Taskmaster ids are per-project), and that is two distinct tasks, not a
+    duplicate report of one.
+
+    Best-effort and non-raising throughout, mirroring
+    ``_acknowledge_resolved_stage1_markers`` above: *records* must be a
+    non-empty ``list`` or this returns ``0``; non-``dict`` entries and
+    entries that raise while being inspected are silently skipped rather
+    than aborting the count — a malformed record degrades to "not counted",
+    never to an exception that would corrupt an otherwise-good stage report.
+    """
+    if not isinstance(records, list) or not records:
+        return 0
+
+    seen: set[tuple[str | None, str]] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        try:
+            status = record.get('status')
+            if (
+                not isinstance(status, str)
+                or status.strip().lower() not in _TASK_CREATED_SUCCESS_STATUSES
+            ):
+                continue
+            task_id = record.get('task_id')
+            if task_id is None:
+                continue
+            task_id_str = str(task_id).strip()
+            if not task_id_str:
+                continue
+            project_id = record.get('project_id')
+            project_id_str = str(project_id) if project_id is not None else None
+        except Exception:
+            continue
+        seen.add((project_id_str, task_id_str))
+
+    return len(seen)
+
+
 def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
     """Return True iff *created_at* falls within the current run window.
 
