@@ -70,25 +70,18 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # --directory, so cwd stays at the worktree root and scripts/ resolves.
 #
 # RULE SET (resolved by task 3457; this block previously recorded the gap).
-# --project shared selects the ENVIRONMENT ruff runs from; it does NOT make
-# shared's ruff config apply to files outside shared/. ruff resolves config
-# hierarchically per file, SKIPPING a pyproject.toml with no [tool.ruff]
-# section — so while the repo root declared none, files under scripts/ were
-# checked against ruff's BUILT-IN defaults (E401/E402/E7xx/E9 + F) rather than
-# the members' set, and this gate passed against a rule set nobody chose.
+# Note --project shared above selects the ENVIRONMENT ruff runs from; it does
+# NOT make shared's ruff config apply to files outside shared/. That is why this
+# gate ran ruff's built-in defaults until the repo-root pyproject.toml declared
+# a [tool.ruff] table, and why the command VALUE below is unchanged by 3457 —
+# only the rule set it resolves changed. Widening surfaced 125 findings here,
+# all FIXED in the same branch as the config change, never excluded.
 #
-# The repo-root pyproject.toml NOW declares [tool.ruff], so files under scripts/
-# resolve select = ["E","F","UP","B","SIM","I"], ignore = ["E501"],
-# line-length = 100 — byte-identical to every workspace member's. Widening
-# surfaced 125 findings here (150 across scripts/ + tests/scripts/), all FIXED
-# in the same branch as the config change, never excluded.
-#
-# The full rationale — why a root table and not a scripts/pyproject.toml, the
-# per-rule measurement, the un-gated residue — lives in the [tool.ruff] comment
-# block in the repo-root pyproject.toml. Read it there rather than duplicating
-# it here, so the two cannot drift apart.
-# tests/scripts/ is in the identical position and resolves the identical set;
-# tests/scripts/test_nonmember_ruff_config.py holds both directories to it.
+# The resolved values, the mechanism, the per-rule measurement and the un-gated
+# residue are stated ONCE, in the [tool.ruff] comment block in the repo-root
+# pyproject.toml, and held there by tests/scripts/test_nonmember_ruff_config.py.
+# Read them there; do not restate them here, or the two will drift and only one
+# copy is guarded.
 lint_command: "uv run --project shared ruff check scripts/"
 
 # TYPE IS DELIBERATELY NOT DECLARED YET — the gap is measured, not overlooked
