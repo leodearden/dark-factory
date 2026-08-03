@@ -37,6 +37,25 @@ HARDCODED_EXPECTED_ENV_LINE = (
     "/home/leo/src/dark-factory"
 )
 
+# Task 3503 made this directive load-bearing: dashboard/src/dashboard/config.py
+# DashboardConfig.project_root's default_factory is Path.cwd() (no longer a
+# hardcoded literal), and config.py's comment above that field argues
+# production behaviour is unchanged ONLY because both service files pin
+# WorkingDirectory= to the repo root and neither sets DASHBOARD_PROJECT_ROOT —
+# so cwd resolves to exactly what the old literal returned. Dropping
+# WorkingDirectory= would silently relocate every derived dashboard DB path
+# (burndown.db, metrics.db, runs.db, escalations_dir, memory_evals_dir,
+# load_samples_db) to whatever cwd systemd happens to give the unit, with
+# nothing else here catching it: check_dashboard_unit_parity.py treats
+# WorkingDirectory as presence-only by design (it compares committed-vs-
+# installed, where the directive's value can legitimately diverge across
+# hosts), so it does not guard the template/hardcoded pair asserted below.
+TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE = "WorkingDirectory=__REPO_ROOT__"
+
+HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE = (
+    "WorkingDirectory=/home/leo/src/dark-factory"
+)
+
 # These are the literal paths baked into the committed hardcoded service file;
 # the render test verifies the template expands to exactly those values.
 # setup-host.sh computes REPO_ROOT and UV_PATH at runtime (from $(dirname $0)/..
@@ -110,6 +129,53 @@ def test_hardcoded_service_file_sets_known_project_roots() -> None:
     assert HARDCODED_EXPECTED_ENV_LINE in content, (
         f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
         "Add it to the [Service] section after the ExecStart block."
+    )
+
+
+def test_template_sets_working_directory() -> None:
+    """scripts/dashboard.service.template must pin WorkingDirectory= to the repo root sentinel.
+
+    Task 3503 made this directive load-bearing (see the comment on
+    TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above): dashboard config's
+    project_root now defaults to Path.cwd(), which only reproduces the old
+    hardcoded-literal behaviour because this directive fixes systemd's cwd
+    for the unit to the repo root. Losing it would silently relocate every
+    derived dashboard DB path with no other test catching the drift.
+    """
+    content = TEMPLATE.read_text(encoding="utf-8")
+    assert TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE in content, (
+        f"Expected line not found in {TEMPLATE}:\n"
+        f"  {TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE!r}\n"
+        "WorkingDirectory=__REPO_ROOT__ is load-bearing as of task 3503: "
+        "dashboard/src/dashboard/config.py's project_root default_factory is "
+        "Path.cwd(), which relies on systemd's cwd for this unit being the "
+        "repo root. Removing or repointing this directive would silently "
+        "relocate every derived dashboard DB path."
+    )
+
+
+def test_hardcoded_service_file_sets_working_directory() -> None:
+    """dashboard/dark-factory-dashboard.service must pin WorkingDirectory= to the literal repo root.
+
+    Task 3503 made this directive load-bearing (see the comment on
+    HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE above): dashboard config's
+    project_root now defaults to Path.cwd(), which only reproduces the old
+    hardcoded-literal behaviour because this directive fixes systemd's cwd
+    for the unit to the repo root. Losing it would silently relocate every
+    derived dashboard DB path with no other test catching the drift.
+    """
+    content = HARDCODED.read_text(encoding="utf-8")
+    assert HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE in content, (
+        f"Expected line not found in {HARDCODED}:\n"
+        f"  {HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE!r}\n"
+        "WorkingDirectory=/home/leo/src/dark-factory is load-bearing as of "
+        "task 3503: dashboard/src/dashboard/config.py's project_root "
+        "default_factory is Path.cwd(), which relies on systemd's cwd for "
+        "this unit being the repo root. Removing or repointing this "
+        "directive would silently relocate every derived dashboard DB path. "
+        "check_dashboard_unit_parity.py treats WorkingDirectory as presence-"
+        "only by design (committed-vs-installed comparison), so it does not "
+        "guard this literal value."
     )
 
 
