@@ -304,11 +304,12 @@ def test_multiselect_select_none_keeps_real_selection(shell_jsx_body):
 
 def test_index_html_cache_buster_bumped(index_html_body):
     """Every /static/redux/* asset in index.html must carry a ?v= cache-buster
-    that is equal and >= 19.
+    that is >= 19.
 
-    The current value is 18.  Any change to styles.css, shell.jsx,
-    tab_scheduler.jsx, or app.jsx requires bumping the version so browsers
-    reload the changed assets.
+    FLOOR only: whether the versions are UNIFORM is asserted once,
+    canonically, in test_index_html.py — do not restate that claim here.
+    Any change to styles.css, shell.jsx, tab_scheduler.jsx, or app.jsx
+    requires bumping the version so browsers reload the changed assets.
 
     Asserts:
     - All ?v= values found on /static/redux/* paths are integers >= 19
