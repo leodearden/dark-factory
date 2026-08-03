@@ -2025,11 +2025,76 @@ class TestSessionResumeStorm:
         }
 
     @staticmethod
+    def _fresh_session(sid: str) -> dict:
+        """A session that passes freshness + cap, so its only failing leg is
+        transcript corroboration (used to drive the 'reseeded' arm).
+        """
+        return {
+            'session_id': sid,
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+
+    @staticmethod
     def _queue() -> MagicMock:
         q = MagicMock()
         q.has_open_l1 = MagicMock(return_value=False)
         q.make_id = MagicMock(return_value='sr-storm')
         return q
+
+    async def test_reseeded_fallbacks_never_file_l1(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Reseed-explained fallbacks are EXPECTED and must never trip the
+        storm escape, however many of them arrive (task 3256).
+
+        threshold=1 makes the very first genuine fallback fire, so a zero
+        submit count across three reseeded dispatches proves they do not feed
+        the streak at all. The telemetry channel must SURVIVE the downgrade:
+        this is noise suppression of the ESCALATION, not of the event.
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
+        harness._escalation_queue = self._queue()
+
+        for i in range(3):
+            await _drive_session_slot(
+                harness, f'rs{i}', self._fresh_session(f'uuid-rs{i}'),
+                config_dir=tmp_path / f'gone{i}' / 'claude-config-x',
+            )
+
+        assert harness._escalation_queue.submit.call_count == 0
+        assert harness._session_resume_fallback_streak == 0
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 3
+        for et, kwargs in emits:
+            assert et == EventType.session_resume_fallback
+            assert kwargs['data']['reason'] == 'reseeded'
+
+    async def test_genuine_failures_still_file_l1_across_reseeded(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A reseeded fallback neither counts toward NOR resets the genuine
+        streak — the same semantics as ``capped`` (task 3256).
+
+        Interleaving reseeds between ``threshold`` stale fallbacks must still
+        file exactly one L1: a drip of by-design reseeds cannot mask a genuine
+        systematic failure hiding between them.
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+
+        for i in range(3):
+            await _drive_session_slot(harness, f'g{i}', self._stale_session(f'uuid-g{i}'))
+            await _drive_session_slot(
+                harness, f'ir{i}', self._fresh_session(f'uuid-ir{i}'),
+                config_dir=tmp_path / f'gone{i}' / 'claude-config-x',
+            )
+
+        assert harness._escalation_queue.submit.call_count == 1
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+        assert 'resume' in esc.summary.lower()
 
     async def test_streak_files_one_l1_at_threshold(self, harness: Harness):
         harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
