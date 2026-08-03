@@ -304,6 +304,17 @@ def _is_transient_architect_glitch(result: AgentResult, *, plan_on_disk: bool) -
     productive.  The SINGLE definition of that signature — evaluated on both
     the ``success=True`` anomalous-exit path and the ``success=False``
     zero-work-failure path — so the two can never drift apart on the numbers.
+
+    NOTE the numbers only testify on the SUCCESS path, where ``turns`` and
+    ``cost_usd`` are parsed from the CLI's JSON.  On the failure arms this
+    predicate serves (``error_empty_output`` / ``error_cli_input_rejected``)
+    that JSON is never parsed, so both are 0 by construction and the numeric
+    clauses are vacuous.  The failure call site therefore ANDs in the
+    transcript-authoritative ``not result.transcript_turns`` clause, which is
+    the only signal there that distinguishes "nothing ran" from "a productive
+    run was killed from outside".  That clause is kept at the call site rather
+    than folded in here precisely because it is NOT a no-op on the success
+    path.
     """
     return result.turns <= 2 and result.cost_usd < 0.20 and not plan_on_disk
 
@@ -4493,10 +4504,32 @@ class TaskWorkflow:
                     # non-transient kind: this strictly ADDS one retry and
                     # removes no terminal path.
                     #
-                    # A turns=0 / $0.00 failure did no work, so the retry
-                    # cannot double-bill — and it is the only thing standing
-                    # between a sub-second transport glitch and a terminally
-                    # blocked planning task (2026-07-28 ~16:31Z).
+                    # TRANSCRIPT-AUTHORITATIVE extra clause, failure path only.
+                    # On the error_empty_output / error_cli_input_rejected
+                    # arms the CLI's JSON is never parsed, so result.turns and
+                    # result.cost_usd are 0 BY CONSTRUCTION — the numeric
+                    # clauses inside _is_transient_architect_glitch are
+                    # therefore vacuous here and cannot testify that no work
+                    # was done.  The transcript can: an architect SIGKILLed
+                    # from outside (OOM killer, not our watchdog, so
+                    # timed_out=False) after 40 productive turns arrives with
+                    # exactly this shape but transcript_turns>0, and retrying
+                    # it DOES double-bill a full Opus architect run.  Same
+                    # signal steward._is_empty_output already consults via
+                    # is_timed_out_with_progress.
+                    #
+                    # Deliberately NOT folded into
+                    # _is_transient_architect_glitch: on the success path turns
+                    # and cost are real, parsed numbers that already bound the
+                    # work done, and transcript_turns there tracks those turns
+                    # — so the clause would suppress genuine
+                    # anomalous-premature-exit retries rather than being the
+                    # no-op it is here.
+                    #
+                    # A zero-turn, $0.00, zero-transcript failure did no work,
+                    # so the retry cannot double-bill — and it is the only
+                    # thing standing between a sub-second transport glitch and
+                    # a terminally blocked planning task (2026-07-28 ~16:31Z).
                     #
                     # bool(salvaged) is the honest analogue of the success
                     # path's `not self.plan`: `salvaged` is already
@@ -4506,6 +4539,7 @@ class TaskWorkflow:
                     if (
                         attempt == 0
                         and cls.kind in _ARCHITECT_TRANSIENT_RETRY_KINDS
+                        and not (result.transcript_turns or 0)
                         and _is_transient_architect_glitch(
                             result, plan_on_disk=bool(salvaged)
                         )
@@ -4516,6 +4550,7 @@ class TaskWorkflow:
                             f'{cls.summary}) — turns={result.turns}, '
                             f'cost=${result.cost_usd:.2f}, '
                             f'duration={result.duration_ms}ms, '
+                            f'transcript_turns={result.transcript_turns}, '
                             f'output_len={len(result.output)} '
                             f'— retrying once'
                         )

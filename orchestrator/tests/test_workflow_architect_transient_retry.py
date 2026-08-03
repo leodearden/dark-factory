@@ -239,9 +239,8 @@ class TestTransientRetryIsBounded:
 
 @pytest.mark.asyncio
 class TestNonTransientKindsStayTerminal:
-    """NARROWNESS (passes today, must keep passing): a failure that either
-    burned the full wall clock or is deterministic buys NO second Opus
-    dispatch."""
+    """NARROWNESS: a failure that either burned the full wall clock, did real
+    observable work, or is deterministic buys NO second Opus dispatch."""
 
     @pytest.mark.parametrize(
         'result',
@@ -273,6 +272,33 @@ class TestNonTransientKindsStayTerminal:
                     turns=0, cost_usd=0.0, duration_ms=600_000, timed_out=True,
                 ),
                 id='timed_out',
+            ),
+            pytest.param(
+                # An architect SIGKILLed from OUTSIDE (OOM killer, not our
+                # watchdog -- so timed_out stays False) after 43 productive
+                # turns.  The CLI's JSON is never parsed on this arm, so turns
+                # and cost_usd are 0 BY CONSTRUCTION and the numeric clauses of
+                # _is_transient_architect_glitch are vacuous: without the
+                # transcript-authoritative clause this classifies EMPTY_OUTPUT,
+                # passes the predicate, and buys a full second Opus architect
+                # dispatch that DOES double-bill.
+                AgentResult(
+                    success=False, output='', subtype='error_empty_output',
+                    turns=0, cost_usd=0.0, duration_ms=900_000,
+                    timed_out=False, transcript_turns=43,
+                ),
+                id='externally_killed_after_productive_turns',
+            ),
+            pytest.param(
+                # Same shape on the rejection arm: a stamped subtype cannot
+                # override observed transcript progress.
+                AgentResult(
+                    success=False, output='',
+                    subtype='error_cli_input_rejected',
+                    turns=0, cost_usd=0.0, duration_ms=900_000,
+                    timed_out=False, transcript_turns=7,
+                ),
+                id='rejection_subtype_with_transcript_progress',
             ),
         ],
     )
