@@ -251,6 +251,119 @@ def lane_is_free(lock_path: Path) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# `wait_for_lane_lock_holder` — the bounded-poll idiom already used above
+# (:147-161, :167-174), factored out and given a name so the fixture's own
+# attribution gate (step-4) and the flaky test's staging read (step-7) can
+# share ONE settle bound instead of each hand-rolling — or, as the flaky
+# assertion did, omitting — one.
+#
+# Pinned here in isolation against an INJECTED fake reader, so these cases are
+# deterministic and touch no real lock; the real-lock fixture behaviour is
+# pinned separately, further below, by
+# `test_foreign_holder_fixture_survives_a_transient_empty_holder_read`.
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForLaneLockHolder:
+    """Unit-pins for the shared bounded-poll helper, `wait_for_lane_lock_holder`."""
+
+    def test_polls_rather_than_reading_once(self):
+        """A pid that only appears on the 3rd read must still be found.
+
+        This is the exact shape of the observed flake: a single read (today's
+        one-shot ``lane_lock_holder_pids`` call) can land on an empty snapshot
+        even though the pid is about to be attributed. The helper must return
+        the SNAPSHOT IN WHICH THE PID APPEARED, not a filtered or synthesised
+        list — callers assert on the whole list (e.g. the negative check that
+        ``os.getpid()`` is NOT among the holders).
+        """
+        readings = [[], [], [999, 4242]]
+        calls: list[Path] = []
+
+        def _reader(path: Path) -> list[int]:
+            calls.append(path)
+            return readings[len(calls) - 1]
+
+        result = wait_for_lane_lock_holder(
+            Path('/irrelevant'), 4242, timeout=1.0, interval=0.001, read_holders=_reader,
+        )
+
+        assert result == [999, 4242], (
+            f'must return the snapshot the pid actually appeared in, not a '
+            f'filtered/synthesised list; got {result!r}'
+        )
+        assert len(calls) == 3, (
+            f'must poll rather than trust a single read — the observed flake '
+            f'is exactly a one-shot read landing on an empty snapshot; the '
+            f'reader was called {len(calls)} time(s)'
+        )
+
+    def test_bounded_and_honest_on_timeout(self):
+        """A pid that never appears must return the LAST snapshot, not hang or raise.
+
+        Mirrors ``wait_until``'s deliberate return-don't-raise contract: the
+        caller's own ``assert pid in holders`` then reports the real
+        kernel-observed list — precisely the diagnostic (``assert 658016 in
+        []``) that identified this flake in the first place. A helper that
+        raised would replace that evidence with an internal traceback instead.
+        """
+        def _reader(_path: Path) -> list[int]:
+            return [7]
+
+        timeout = 0.1
+        start = time.monotonic()
+        result = wait_for_lane_lock_holder(
+            Path('/irrelevant'), 999, timeout=timeout, interval=0.01, read_holders=_reader,
+        )
+        elapsed = time.monotonic() - start
+
+        assert result == [7], (
+            f'must return the last observed snapshot on timeout so the '
+            f'caller\'s own assertion reports what the kernel actually said; '
+            f'got {result!r}'
+        )
+        assert elapsed >= timeout, (
+            f'must not return before the bound elapses; elapsed={elapsed!r}'
+        )
+        assert elapsed < timeout + 1.0, (
+            f'must not overrun the bound by more than a comfortable slack '
+            f'margin; elapsed={elapsed!r}'
+        )
+
+    def test_no_cost_on_the_happy_path(self):
+        """A pid already attributed on the FIRST read must cost exactly one read.
+
+        The fixture and staging-read call sites this helper is wired into
+        (steps 4 and 7) are on the happy path almost always — attribution is
+        normally already settled by the time anyone asks. This pins that the
+        added safety net is free in that case, so none of this fixture's five
+        consumers pays for a race they do not have.
+        """
+        calls: list[Path] = []
+
+        def _reader(path: Path) -> list[int]:
+            calls.append(path)
+            return [4242]
+
+        interval = 1.0  # deliberately large: any sleep at all would show up below
+        start = time.monotonic()
+        result = wait_for_lane_lock_holder(
+            Path('/irrelevant'), 4242, timeout=5.0, interval=interval, read_holders=_reader,
+        )
+        elapsed = time.monotonic() - start
+
+        assert result == [4242]
+        assert len(calls) == 1, (
+            f'attribution was already settled on the first read — must not '
+            f'poll again; reader was called {len(calls)} time(s)'
+        )
+        assert elapsed < interval / 2, (
+            f'must not sleep at all when the pid is already attributed; '
+            f'elapsed={elapsed!r}'
+        )
+
+
 def test_scaffold_helpers_are_importable(tmp_path: Path):
     """Smoke pin: the shared helpers exist and the foreign holder really holds.
 
