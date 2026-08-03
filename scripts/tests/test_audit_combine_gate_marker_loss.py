@@ -409,7 +409,8 @@ _MANUAL_CHECK = {"kind": "manual", "reason": "needs a human eye"}
 
 
 def _capability(name: str, check: dict | None) -> dict:
-    cap = {"name": name, "binding": "capability->producer (wired)", "verdict": "PASS"}
+    cap: dict[str, object] = {
+        "name": name, "binding": "capability->producer (wired)", "verdict": "PASS"}
     if check is not None:
         cap["delivered_check"] = check
     return cap
@@ -988,12 +989,20 @@ def _audit(findings=(), coverage=None, root="/tmp/proj", project_id="dark_factor
     )
 
 
-def _finding(**kw):
-    base = dict(tag="master", task_id=1, status="pending", key="source",
-                severity=SEVERITY_INFORMATIONAL, expected_source=SOURCE_TICKET,
-                terminal=False, reason="because")
-    base.update(kw)
-    return Finding(**base)
+def _finding(
+    *,
+    tag: str = "master",
+    task_id: int = 1,
+    status: str = "pending",
+    key: str = "source",
+    severity: str = SEVERITY_INFORMATIONAL,
+    expected_source: str = SOURCE_TICKET,
+    terminal: bool = False,
+    reason: str = "because",
+) -> Finding:
+    return Finding(tag=tag, task_id=task_id, status=status, key=key,
+                   severity=severity, expected_source=expected_source,
+                   terminal=terminal, reason=reason)
 
 
 def test_format_report_always_emits_both_caveats_even_with_zero_findings():
@@ -1205,10 +1214,12 @@ def test_audit_project_mismatch_reaches_the_report_and_the_json(tmp_path, make_t
 
     audit = audit_project(str(root), "dark_factory")
 
+    mismatch = audit.project_id_mismatch
+    assert mismatch is not None
     assert "dark_factory" in format_report([audit])
-    assert audit.project_id_mismatch in format_report([audit])
+    assert mismatch in format_report([audit])
     payload = json.loads(format_json([audit]))
-    assert payload["projects"][0]["project_id_mismatch"] == audit.project_id_mismatch
+    assert payload["projects"][0]["project_id_mismatch"] == mismatch
 
 
 # ---------------------------------------------------------------------------
