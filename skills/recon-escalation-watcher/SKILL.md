@@ -278,20 +278,54 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   (`<queue-dir>/.watcher-exclude-recon`) so the watcher's next (re)start
   skips it — not `--exclude-id`, which does not scale at this queue's size
   (see "Re-arming over deliberately-pending items" above).
-  **Also stamp the record itself** via
-  `mcp__escalation__stamp_triage(escalation_id, triage_note="PARK: <one-line
-  rationale>")` (registered on the 8103 server,
-  `escalation/src/escalation/server.py:1120`). This is metadata-only — it
-  never touches `status`, `level`, or `updated_at`, so it cannot re-arm the
-  re-file rule (`has_open_l1` filters `status=='pending'` only,
-  `escalation/src/escalation/queue.py:489-504`) — but it turns the record's
-  `triaged_at` from "never looked at" into "deliberately parked", which is
-  what that field should mean now that PARK is a sanctioned default
-  disposition rather than a gap, and it makes dashboard/analytics
-  triage-coverage metrics for this queue meaningful (decided under task
-  3526; ratified this stamp specifically for the two aging categories below
-  — do not read it as a blanket rule for every other Priority-3 "leave
-  pending" case in this skill).
+  **Also stamp the record itself — once, on first park; skip re-stamping on
+  repeat cycles.** `stamp_triage` unconditionally overwrites `triaged_at` to
+  now on every call (`escalation/src/escalation/queue.py:949-958,977`), and
+  the "Drain-side shortcut" note below already has you re-affirming PARK on
+  this same record every cycle `get_pending_escalations()` returns it — so
+  the same restraint applies to the MCP call itself: skip it when
+  `triaged_at` is already set and the record is unchanged since (`updated_at`
+  is `None`, or not newer than `triaged_at` — never order `None` against a
+  timestamp string directly). Re-stamping on every pass would overwrite the
+  "first parked at" time each rotation and destroy the aging signal the
+  stamp exists to create. This reuses, verbatim, the sibling skill's
+  freshness rule — `skills/escalation-watcher-auto/SKILL.md`, "Triage-ack
+  freshness contract".
+
+  On first park, use a predicate+probe note, not a bare conclusion — same
+  convention as that freshness contract, and for the same reason (a
+  conclusion-only note is untrusted prose the next rotation can't check;
+  that section documents real churn — esc-2584, two refuted cycles, five
+  separate `resolve_issue` calls — caused by skipping this):
+  ```
+  mcp__escalation__stamp_triage(
+    escalation_id,
+    triage_note="PARK: task-650 status==blocked, gate_escalated_at=2026-06-20T..."
+                 " | probe: get_task 650 -> status=blocked | decision: <cockpit --id>",
+  )
+  ```
+  (registered on the 8103 server, `escalation/src/escalation/server.py:1120`).
+  This is metadata-only: `stamp_triage` touches none of the fields
+  `has_open_l1` reads (`status`, `level`, and optionally `category`;
+  `escalation/src/escalation/queue.py:489-504`), so a stamped record still
+  counts as an open L1 and the re-file rule stays suppressed. It turns the
+  record's `triaged_at` from "never looked at" into "deliberately parked" —
+  a durable rotation-to-rotation handoff note plus a machine-readable marker
+  in the record JSON, which is what that field should mean now that PARK is
+  a sanctioned default disposition rather than a gap (decided under task
+  3526; ratified specifically for the two aging categories below — do not
+  read it as a blanket rule for every other Priority-3 "leave pending" case
+  in this skill). **Not an analytics dependency today:** dashboard
+  `triage_segments`
+  (`dashboard/src/dashboard/data/escalation_analytics.py:381-390`) is fed
+  only from `config.escalations_dir` / `known_project_roots`
+  (`dashboard/src/dashboard/app.py`'s `_analytics_project_dirs`), never from
+  `reconciliation_escalations_dir` — this queue isn't in that pipeline at
+  all — and even if it were, `triage_segments` samples only terminal
+  `resolved`/`dismissed` records, so a PARKed record, which stays `pending`
+  by this very playbook's design, could never contribute a sample either
+  way. Wiring the recon queue into dashboard analytics is unfiled follow-up
+  work, not something this stamp does on its own.
   **Why park, not resolve:** recon files a fresh gate-backlog escalation for
   a task only when `has_open_l1(task_id,
   category='reconciliation_stale_gate_backlog')` is false
@@ -332,9 +366,10 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   **default: PARK**, file a cockpit DecisionRecord, append its esc-id to
   the exclude file on the watcher's next start (not `--exclude-id` — see
   that row above for why), **and stamp_triage it the same way** (see the
-  gate-backlog row above for the call, the safety argument, and why it
-  matters); see that row above too for the mechanism and churn evidence,
-  not repeated here. **Asymmetry to know:**
+  gate-backlog row above for the call, the once-on-first-park cadence, the
+  predicate+probe note shape, the safety argument, and why it matters); see
+  that row above too for the mechanism and churn evidence, not repeated
+  here. **Asymmetry to know:**
   this path dedups on an *un-categorized* `has_open_l1(task_id)` inside
   `maybe_escalate_stalled_tasks` (same module, line 385), so an open
   `reconciliation_stale_gate_backlog` L1 on
