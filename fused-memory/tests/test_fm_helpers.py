@@ -549,6 +549,40 @@ class TestQdrantHelpers:
 
 
 # ---------------------------------------------------------------------------
+# Tests for shared FalkorDB test scaffolding (task 3502)
+# ---------------------------------------------------------------------------
+# De-duplicates the _falkor_available()/FALKOR_HOST/FALKOR_PORT/skip-marker
+# scaffolding that was forked, byte-identical modulo docstring, in six
+# live-FalkorDB test modules: test_list_indices_integration.py,
+# test_falkor_fulltext_integration.py, test_merge_entities.py,
+# test_startup_identity_scan.py, test_reassign_edge.py and
+# test_refresh_entity_summary.py. No real FalkorDB is used here —
+# falkordb.FalkorDB is monkeypatched throughout, so this suite runs in the
+# default `-m 'not integration'` lane.
+
+class TestFalkorHelpers:
+    """Unit tests for FALKOR_HOST/FALKOR_PORT, _falkor_available(), falkor_skipif()."""
+
+    def test_falkor_host_constant(self):
+        """FALKOR_HOST matches the local-FalkorDB default all six forks used."""
+        from _fm_helpers import FALKOR_HOST
+
+        assert FALKOR_HOST == 'localhost'
+
+    def test_falkor_port_constant_is_int(self):
+        """FALKOR_PORT is the default 6379 *as an int*, not the raw env string.
+
+        Every fork wrote ``int(os.environ.get('FALKOR_PORT', '6379'))``; the
+        int() coercion is the load-bearing part, since a str port silently
+        breaks ``FalkorDB(port=...)``.
+        """
+        from _fm_helpers import FALKOR_PORT
+
+        assert FALKOR_PORT == 6379
+        assert isinstance(FALKOR_PORT, int)
+
+
+# ---------------------------------------------------------------------------
 # Tests for the shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
 # Converts fixed "sleep(N) then assert background work is done" sites (fragile
