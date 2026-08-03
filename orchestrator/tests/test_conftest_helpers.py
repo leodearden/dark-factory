@@ -573,3 +573,67 @@ class TestMakeStewardFixture:
         assert steward.task_id == '42', (
             f'the default task_id must not move, got {steward.task_id!r}'
         )
+
+    # --- config defaults: the KNOWN GAPS conftest used to list (task 3514) ---
+
+    def test_routing_config_is_resolvable_not_magicmock(self, make_steward):
+        """``config.routing.*`` carries real containers, i.e. ``stamp_stock_routing_config`` ran.
+
+        Not cosmetic: the folded-in ``test_out_of_band_routing.py`` tests that do
+        NOT patch the invoke seam reach the real ``resolve_route``, which does
+        membership and dict ops (``candidate not in ...allowed_models``,
+        ``...per_model_daily_ceiling_usd.get(...)``, ``for rule in ...rules``)
+        that a bare child ``MagicMock`` satisfies falsely and then fails on
+        deeper.  The stock *values* are ``_orch_helpers.py``'s literals and are
+        deliberately not restated here — only that real containers arrived.
+        """
+        routing = make_steward().config.routing
+
+        assert isinstance(routing.allowed_models, list), (
+            f'expected routing.allowed_models to be a real list, got '
+            f'{type(routing.allowed_models).__name__!r} — stamp_stock_routing_config did not run'
+        )
+        assert isinstance(routing.ladder, list), (
+            f'expected routing.ladder to be a real list, got {type(routing.ladder).__name__!r}'
+        )
+        assert isinstance(routing.per_model_daily_ceiling_usd, dict), (
+            f'expected routing.per_model_daily_ceiling_usd to be a real dict, got '
+            f'{type(routing.per_model_daily_ceiling_usd).__name__!r}'
+        )
+        assert isinstance(routing.rules, list), (
+            f'expected routing.rules to be a real list, got {type(routing.rules).__name__!r}'
+        )
+
+    def test_timeout_config_defaults_are_real_floats(self, make_steward):
+        """The spawn/completion timeouts are real numbers, not child ``MagicMock``s.
+
+        The steward compares these against elapsed wall-clock; a ``MagicMock``
+        silently satisfies the comparison operator and yields a confusing
+        ``TypeError`` (or a wrong branch) far from the missing default.
+        """
+        config = make_steward().config
+
+        assert isinstance(config.timeouts.steward, float), (
+            f'expected timeouts.steward to be a real float, got '
+            f'{type(config.timeouts.steward).__name__!r}'
+        )
+        assert isinstance(config.steward_completion_timeout, float), (
+            f'expected steward_completion_timeout to be a real float, got '
+            f'{type(config.steward_completion_timeout).__name__!r}'
+        )
+
+    def test_fused_memory_config_defaults_are_real_strings(self, make_steward):
+        """``config.fused_memory.url`` / ``.project_id`` are real strings.
+
+        They are interpolated into the MCP config the steward hands its agent, so
+        a ``MagicMock`` here reaches JSON serialization before it fails.
+        """
+        fused_memory = make_steward().config.fused_memory
+
+        assert isinstance(fused_memory.url, str), (
+            f'expected fused_memory.url to be a real str, got {type(fused_memory.url).__name__!r}'
+        )
+        assert isinstance(fused_memory.project_id, str), (
+            f'expected fused_memory.project_id to be a real str, got '
+            f'{type(fused_memory.project_id).__name__!r}'
+        )
