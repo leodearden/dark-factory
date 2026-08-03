@@ -49,26 +49,39 @@ CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
 )
 
 
-# Verbatim real-CLI capacity messages, each with recorded provenance.  Used by
-# test_capacity_skip.py's drift guard, which asserts that the skip helper and
-# the PRODUCTION detector (invocation_outcome.classify_invocation) agree these
-# are cap messages.  Add an entry only with a transcript to cite.
-REAL_CLI_CAP_MESSAGES: tuple[str, ...] = (
+# Verbatim real-CLI capacity messages, each with recorded provenance.  This is
+# the SINGLE source for these strings — test modules derive their corpora from
+# it rather than restating the text (a second hand-maintained copy of a
+# verbatim transcript is the same drift trap this module exists to close).
+# Used by test_capacity_skip.py's drift guard, which asserts that the skip
+# helper and the PRODUCTION detector (invocation_outcome.classify_invocation)
+# agree these are cap messages.  Add an entry only with a transcript to cite.
+#
+# Split by the outcome production assigns each message, because CapHit and
+# NearCap are NOT interchangeable there: usage_gate routes CapHit to
+# ``_handle_cap_detected`` (CAPPED phase, cap-retry / account failover) and
+# NearCap to ``_handle_near_cap_warning``, which is annotation-only.  The split
+# lets the drift guard assert the exact variant, so a regression that downgrades
+# a genuine cap-hit to a near-cap warning — silently disabling cap-retry — goes
+# red instead of passing a loose isinstance check.  The skip helper itself does
+# not distinguish them (it skips on either), so it consumes the union below.
+
+# Messages production classifies as a confirmed cap hit.
+REAL_CLI_CAP_HIT_MESSAGES: tuple[str, ...] = (
     # Observed 2026-08-01, claude CLI 2.1.220, task 3454, during the
     # cross-account resume probe: account B answered the resumed turn with
     # this and no model turn ever ran.  Recorded verbatim in the measurement
     # comment at ``shared/src/shared/cli_invoke.py`` L1435.  This is the ONLY
     # entry observed as a transcript first-hand.
     "You've hit your weekly limit · resets Aug 5, 11am",
-    # The four cap-hit / near-cap messages that motivated the marker list.
-    # Their original provenance pointer read "shared.usage_gate inline
-    # comments, lines 64-75"; task 2129 moved those string tables to
-    # ``shared.invocation_outcome`` (CAP_HIT_PREFIXES / CAP_CONFIRM_KEYWORDS /
-    # NEAR_CAP_PREFIXES), so do not go chasing them in usage_gate.py.
+    # The cap-hit messages that motivated the marker list.  Their original
+    # provenance pointer read "shared.usage_gate inline comments, lines 64-75";
+    # task 2129 moved those string tables to ``shared.invocation_outcome``
+    # (CAP_HIT_PREFIXES / CAP_CONFIRM_KEYWORDS / NEAR_CAP_PREFIXES), so do not
+    # go chasing them in usage_gate.py.
     "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
     "You've used all available credits. Upgrade your plan for more capacity.",
     "You're out of extra usage for this billing period. Your plan resets in 2h.",
-    "You're close to reaching your usage limit. Your plan resets in 1h.",
     # DELIBERATELY ABSENT: the session-limit and 5-hour variants.  The
     # 2026-08-01 observation described a session limit only in prose (see
     # cli_invoke.py L1445), never verbatim.  Inventing a plausible
@@ -76,6 +89,16 @@ REAL_CLI_CAP_MESSAGES: tuple[str, ...] = (
     # one place a future engineer will read as ground truth — would put a
     # fabricated transcript in the record.  Those variants are covered
     # structurally by the markers instead.
+)
+
+# Messages production classifies as approaching, but not yet at, the cap.
+REAL_CLI_NEAR_CAP_MESSAGES: tuple[str, ...] = (
+    "You're close to reaching your usage limit. Your plan resets in 1h.",
+)
+
+# The union — what the skip helper sees, since it skips on either variant.
+REAL_CLI_CAP_MESSAGES: tuple[str, ...] = (
+    REAL_CLI_CAP_HIT_MESSAGES + REAL_CLI_NEAR_CAP_MESSAGES
 )
 
 
@@ -115,5 +138,11 @@ def result_looks_like_capacity_failure(result: AgentResult) -> bool:
 
     Inspects both ``result.output`` and ``result.stderr`` — a cap message can
     arrive on either stream depending on how the CLI failed.
+
+    **Must remain a pure delegation.** This is a calling convention, not a
+    second policy: everything it decides is decided by
+    ``looks_like_capacity_failure``. Growing independent matching logic here
+    re-creates the two-implementations-that-can-disagree bug this module was
+    extracted to kill, one level down.
     """
     return looks_like_capacity_failure(f'{result.output}\n{result.stderr}')
