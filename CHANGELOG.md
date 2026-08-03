@@ -10,36 +10,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
-#### MCP write tools now reject leaked tool-call XML (task 3083)
+#### Leaked tool-call XML: root cause, and the tooling to sweep the corpus (task 3083)
 
-`submit_task`, `update_task`, `add_memory`, and `add_episode` now **reject** a
-call whose text fields carry a leaked serialized tool-call XML fragment,
-returning `error_type = 'ToolCallXmlLeakError'` **before anything is
-persisted**. Scanned fields: `title`, `description`, `prompt`, and `details`
-for the task tools; `content` for the memory tools. Each field is scanned
-independently, so a match cannot straddle two clean fields.
+**This task ships no write-time guard.** Live rejection at the MCP write
+boundary is delivered by `fused_memory/server/markup_tripwire.py` (task 3141 —
+see "MCP writes carrying raw envelope markup are now REJECTED" below), which is
+deliberately the only place in the package that enumerates the markup literals.
+An earlier revision of this task added a second, parallel guard; it was retired
+before merge as a duplicate enumeration of that invariant. If you need to write
+content that legitimately quotes a fragment, the override is 3141's
+`metadata={'allow_mcp_markup': True}` and the rejection is
+`error_type = 'McpEnvelopeMarkupWriteRejected'`.
 
-**Why this is a behaviour change and not just a validation tweak.** These
-fragments never originate in this repo — there is no XML parser anywhere in
-`fused-memory/src/`. They are evidence that the harness's tool-call parser
-terminated a string argument early at a literal closing tag inside that
-argument's value, which also **silently swallows the sibling arguments that
-followed**. A leaked fragment in `description` means `priority` may never have
-reached the MCP boundary at all, in which case
-`sqlite_task_backend.py`'s `priority or 'medium'` substituted a plausible
-wrong value with no log. The rejection message says so explicitly: that
-sentence is what converts an invisible wrong-value failure into a visible one.
+**What this task establishes: the fragments do not originate in this repo.**
+There is no XML parser anywhere in `fused-memory/src/`. They are evidence that
+the *harness's* tool-call parser terminated a string argument early at a literal
+closing tag inside that argument's value, which also **silently swallows the
+sibling arguments that followed**. A leaked fragment in `description` means
+`priority` may never have reached the MCP boundary at all, in which case
+`sqlite_task_backend.py`'s `priority or 'medium'` substituted a plausible wrong
+value with no log. That sibling-argument loss is the part of the failure that is
+otherwise invisible — a corrupted record looks merely untidy, not wrong.
 
-The guard **rejects rather than sanitizes** — silently stripping the fragment
-would be a second silent mutation of user content layered on the first. It runs
-at the top of the write prologue, ahead of `inject_execution_class` /
-`inject_operational_routing`, so routing is never derived from already-truncated
-text.
+**Added:** `fused_memory/utils/toolcall_xml_leak.py`, the shared detector for
+*already-stored* content, now the single implementation behind the corpus sweep,
+`scan_memory_content`, the redaction path, and `scripts/scan_task_toolcall_leaks.py`
+(which previously carried its own inline copy of the pattern).
 
-**Opt-out:** `metadata={'allow_toolcall_xml': True}`, mirroring the existing
-`allow_near_duplicate` convention. Required for any write that legitimately
-quotes the fragment — task 3083's own description, and
-`docs/mcp-toolcall-xml-leak.md`, would otherwise be unfileable.
+It is calibrated in the **opposite** direction from 3141's tripwire, on purpose:
+the tripwire over-reports to maximise recall at write time, where a false
+positive costs one retry; this detector under-reports to stay precise, because
+it runs over already-stored content where a false positive would silently
+rewrite something a user wrote. That asymmetry is why both exist, and why this
+one must not adopt the tripwire's pattern list.
 
 **Also added:** `scan_memory_content` (read-only literal substring scan over
 Qdrant payload text — semantic `search` provably cannot find these),
