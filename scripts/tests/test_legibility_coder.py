@@ -567,6 +567,24 @@ def _write_fake_claude_capturing(bin_dir, *, argv_file, stdin_file, stdout_path)
     p.chmod(0o755)
 
 
+def _write_fake_claude_recording_cwd(bin_dir, *, cwd_file, stdout_path):
+    """Fake `claude` binary: records the directory it was RUN IN to
+    *cwd_file*, then echoes the contents of *stdout_path* and exits 0.
+
+    Separate from _write_fake_claude_capturing so the cwd tests assert the
+    one thing they are about; `pwd` is the honest probe here because the
+    working directory is a property of the spawned process, not of anything
+    _invoke_cli could report about itself."""
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f'pwd > "{cwd_file}"\n'
+        f'cat > /dev/null\n'
+        f'cat "{stdout_path}"\n'
+    )
+    p.chmod(0o755)
+
+
 def _write_fake_claude_failing(bin_dir, *, exit_code=1, stderr_text="simulated failure"):
     p = bin_dir / "claude"
     p.write_text(
@@ -641,6 +659,55 @@ def test_invoke_cli_timeout_raises_invocation_error(tmp_path):
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=0.2,
         )
+
+
+def _cwd_probe(tmp_path, monkeypatch):
+    """Set up the two-sibling-directory fixture the cwd tests share:
+    chdir into `launcher/`, and return (target_dir, cwd_file, claude_bin)
+    for a fake `claude` that records where it ran."""
+    bin_dir = tmp_path / "bin"
+    launcher = tmp_path / "launcher"
+    target = tmp_path / "target"
+    for d in (bin_dir, launcher, target):
+        d.mkdir()
+
+    cwd_file = tmp_path / "cwd.txt"
+    stdout_path = tmp_path / "stdout.txt"
+    stdout_path.write_text('{"matches": [], "candidates": []}')
+    _write_fake_claude_recording_cwd(bin_dir, cwd_file=cwd_file, stdout_path=stdout_path)
+
+    monkeypatch.chdir(launcher)
+    return launcher, target, cwd_file, str(bin_dir / "claude")
+
+
+def test_invoke_cli_runs_in_given_cwd(tmp_path, monkeypatch):
+    """A caller can scope the headless CLI subprocess to a directory other
+    than the launcher's — the knob census needs to verify a project that is
+    not the one it was launched from."""
+    launcher, target, cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
+
+    mod._invoke_cli(
+        "prompt text", "haiku", claude_bin=claude_bin, timeout=10, cwd=str(target),
+    )
+
+    # .resolve() on both sides: a symlinked tmp dir (/tmp -> /private/tmp on
+    # non-Linux hosts) must not make this flaky.
+    recorded = Path(cwd_file.read_text().strip()).resolve()
+    assert recorded == target.resolve()
+    assert recorded != launcher.resolve()
+
+
+def test_invoke_cli_without_cwd_inherits_the_launcher_cwd(tmp_path, monkeypatch):
+    """The new parameter's default is EXACTLY today's behavior, so the
+    existing callers (code_digest, the trickle, nightly) are provably
+    unchanged by its introduction."""
+    launcher, target, cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
+
+    mod._invoke_cli("prompt text", "haiku", claude_bin=claude_bin, timeout=10)
+
+    recorded = Path(cwd_file.read_text().strip()).resolve()
+    assert recorded == launcher.resolve()
+    assert recorded != target.resolve()
 
 
 # ---------------------------------------------------------------------------
