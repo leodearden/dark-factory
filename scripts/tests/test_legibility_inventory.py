@@ -264,12 +264,27 @@ def _bash_encode_cwd(cwd: str) -> str:
     ``printf '%s'`` (no trailing newline), so an exact ``==`` comparison is
     valid and keeps a stray-whitespace regression detectable — stripping would
     mask one.
+
+    Every guard in this bridge is deliberately loud-on-failure, and the two
+    below close the only paths that were not. ``timeout`` is not optional
+    belt-and-braces: an unavailable or wedged ``bash`` with no deadline HANGS
+    the suite instead of failing it, which would be the single silent
+    degradation in an otherwise fail-loud mechanism. And the returncode is
+    checked explicitly rather than with ``check=True``, because
+    ``CalledProcessError``'s default message does not include captured stderr —
+    a bash-level syntax error introduced while editing ``_encode_cwd`` would
+    surface as a bare "returned non-zero exit status 2" with the actual
+    diagnostic hidden in an unprinted attribute.
     """
     result = subprocess.run(
         ['bash', '-c', _bash_encode_cwd_source() + '\n_encode_cwd "$1"', 'bash', cwd],
         capture_output=True,
         text=True,
-        check=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, (
+        f'bash _encode_cwd exited {result.returncode} for cwd {cwd!r}. '
+        f'stderr: {result.stderr!r}'
     )
     return result.stdout
 
@@ -381,15 +396,6 @@ class TestEncoderLockstep:
                 got = mirror(cwd)
                 assert got == canonical(cwd), f'{label} drifted from canonical: {cwd}'
                 assert got == expected_dir, f'{label} drifted from reality: {cwd}'
-
-    def test_bash_mirror_maps_underscore(self):
-        # Sibling of TestEncodeCwd::test_underscore_maps_to_dash, for the bash
-        # copy. Redundant with the table loop above by construction, but it
-        # makes a bash-specific regression name itself in the failure line
-        # instead of surfacing only as one row of a multi-mirror loop.
-        assert _bash_encode_cwd('/media/leo/data_lv_1/leo/reify-build') == (
-            '-media-leo-data-lv-1-leo-reify-build'
-        )
 
 
 def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'):
