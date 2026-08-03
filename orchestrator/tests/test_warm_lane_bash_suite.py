@@ -23,8 +23,18 @@ reify's originals on the strength of this suite being green:
   ``N`` at or above a per-suite floor — the same strictly-stronger predicate
   reify's own runner (``tests/infra/run_all_ambient_isolation_lib.sh``) applies.
   Exit-status-only would be the weak link in κ's chain: a block that skips or
-  short-circuits still exits 0 while its share of the 837 asserts never runs.
+  short-circuits still exits 0 while its share of the 865 asserts never runs.
   See ``ASSERT_FLOORS``.
+
+These items no longer run in the default ``orchestrator`` suite.  Task 3349
+took PRD §11 q4's documented escape: they are deselected via
+``orchestrator/pyproject.toml``'s ``addopts`` (``-m 'not warm_lane_bash'``) and
+re-selected post-merge by the ``warm-lane-bash`` ``LaneCommand`` in
+``dark-factory-orchestrator.yaml``.  So a reader who runs ``pytest tests/`` and
+sees nothing from this module is looking at a relocation, NOT a dropped port —
+select them on demand with ``-m warm_lane_bash``.  The two config edits are
+coupled, and ``test_warm_lane_bash_bucket_placement.py`` is the guard that
+keeps them that way.
 
 See ``orchestrator/tests/warm-lane/README.md`` for provenance, the enumerated
 deltas from the reify sources, and the measured wall-clock per test.
@@ -114,11 +124,20 @@ SCRIPT_COVERAGE = {
 #: durable lane record and added 28 asserts (Block S + Block A's A10), so the
 #: floor moved 170 → 198.  It moved because the count was RE-MEASURED, not to
 #: make a red run green.
+#:
+#: Dark-factory task 3292 then wired ``warm-lane-gc.sh``'s PROTECT_GLOB default
+#: to ``lib_lane_state.sh``'s ``lane_protect_glob`` (deleting the hand-mirrored
+#: literal) and added Block X's 16 asserts, so the floor moved 198 → 214 — again
+#: RE-MEASURED against the suite, not raised to absorb a red.  Block X carries no
+#: skip guard, so 214 is both its floor and its measured count on any host that
+#: satisfies ``REQUIRED_HOST_TOOLS``: X-degrade reaches the bridge's degrade
+#: branch by RELOCATING a copy of gc.sh (its resolved repo root then carries no
+#: dark-factory checkout), which needs no python3 and no network.
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 62,
     'test_warm_lane_degenerate_ref.sh': 70,
     'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 198,  # 170 + 28 (Block S 23 + A10 3 + S9b/S10b)
+    'test_warm_lane_gc.sh': 214,  # 198 + 16 (Block X: X-band 7 + X-degrade 9)
     'test_warm_lane_gc_sweep.sh': 86,
     'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
@@ -153,10 +172,15 @@ _RESULTS_RE = re.compile(r'^Results: (\d+) passed, (\d+) failed$', re.MULTILINE)
 #: re-measurement, never to make a red run green, and the arithmetic above is
 #: recorded so the next mover can check it rather than re-derive it.  The cost
 #: is bounded and one-sided — a genuinely hung suite now reports in 15 minutes
-#: instead of 5.  If the fleet-load figure keeps climbing, the sanctioned next
-#: lever is NOT another bump but the README's documented escape:
-#: ``git.offline_lane_commands``, which runs the ``warm_lane_bash`` bucket
-#: post-merge, off the verify hot path.
+#: instead of 5.
+#:
+#: That next lever HAS NOW BEEN PULLED.  Task 3349 took the README's documented
+#: escape and moved this bucket onto ``git.offline_lane_commands``, post-merge
+#: and off the verify hot path (PRD §11 q4, re-decided 2026-08-01, on a
+#: re-measured 289.58s at loadavg 128.72 on 32 cores — 6.2x the 47s module
+#: baseline).  The 900/960 pair is RETAINED UNCHANGED and still governs this
+#: bucket wherever it runs, the offline lane included; a further bump remains
+#: the wrong answer.
 SUBPROC_TIMEOUT = 900
 
 #: Host tools reify's originals hard-require with no skip guards.
@@ -404,7 +428,7 @@ def test_bash_suite_passes(name: str) -> None:
     """Each ported bash suite must be green by reify's own greenness predicate.
 
     ``exit 0`` AND a ``Results: N passed, 0 failed`` line AND ``N`` at or above
-    ``ASSERT_FLOORS[name]``.  Exit status alone cannot distinguish "all 837
+    ``ASSERT_FLOORS[name]``.  Exit status alone cannot distinguish "all 865
     asserts ran and passed" from "a block skipped and the rest passed", and leaf
     κ deletes reify's originals on the strength of this item being green.
     """

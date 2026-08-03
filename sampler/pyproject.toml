@@ -20,7 +20,9 @@ dark-factory-shared = { workspace = true }
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "../shared/src"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+extraPaths = ["src", "../shared/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 venvPath = ".."

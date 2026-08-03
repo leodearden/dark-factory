@@ -66,6 +66,39 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Traceability pointer to the report that produced the two thresholds
     # above; reloaded alongside them so config never names a stale run.
     'write_triage.calibration_report_path',
+    # Per-category cutoffs (task 3357), same green tier and same live-read
+    # path as the pooled t_high above. _iter_leaves yields the dict WHOLE, so
+    # the map reloads as ONE atomic leaf (same treatment as the
+    # procedural_knowledge_topic_guard_clusters list): a half-applied set of
+    # per-category cutoffs can never gate an audit_duplicate_memories sweep.
+    # Replaced wholesale rather than merged, so a category the latest run
+    # stopped deriving a cutoff for does not keep a stale one.
+    'write_triage.t_high_by_category',
+    # In-place update_memory authorization (task 3088). Read live per tool call
+    # by resolve_mem0_update_enabled (server/mem0_update_authz.py) off the
+    # shared memory_service.config.mem0_update object -- the resolver captures
+    # nothing at import or construction, so an in-place reload flips the tool
+    # off on the very next call. This is the one leaf that MUST be green-tier:
+    # it is what an operator flips to stop an in-flight silent-rewrite
+    # incident, and a restart-only kill switch is no kill switch.
+    'mem0_update.enabled',
+    # Read live per tool call by resolve_mem0_update_allowed_prefixes, same
+    # live-read path as the kill switch above. The two lists are registered
+    # SEPARATELY because they gate different arms: widening the metadata bar
+    # alone is the supported way to admit an interactive curator-gate tagging
+    # flow on a running server WITHOUT granting content-amend authority.
+    'mem0_update.content_amend_allowed_agent_prefixes',
+    'mem0_update.metadata_patch_allowed_agent_prefixes',
+    # Storm-alarm knobs, read live off the shared config by
+    # MemoryService.update_memory and passed INTO StormCounter.record() on every
+    # call. That per-call argument is the non-obvious part: the shared
+    # StormCounter (server/storm_counter.py) deliberately does NOT capture
+    # threshold/window in __init__, because a value captured at construction
+    # cannot observe an in-place mutation (see this module's reload-safety
+    # rule) -- which would make these two leaves restart-only while sitting in
+    # this allowlist as if they were green-tier.
+    'mem0_update.storm_threshold',
+    'mem0_update.storm_window_seconds',
 })
 
 

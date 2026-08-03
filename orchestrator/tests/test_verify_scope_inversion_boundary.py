@@ -1131,9 +1131,11 @@ def _row8_assert_legacy_scoped_shape(executed_mc: ModuleConfig) -> None:
     pytest must be SKIPPED (``None``): a source-only diff has no
     collectable test file to file-scope, and the R3 task-role pytest floor
     (``TestRow2TaskRoleSignal`` above) is gated to ``role == 'task'`` only
-    (``verify_plan._derive_module_runs``'s ``elif role == 'task':`` branch)
-    — ``role == 'merge'`` always falls through to the legacy ``else:``
-    SKIPPED arm, unchanged by λ (R4). lint/pyright, in contrast, stay
+    (``verify_plan._derive_module_runs``'s ``elif role == 'task' and
+    production_trigger is not None:`` branch — moved ABOVE the
+    collectable-tests branch by task 3294, still role-gated, so this row's
+    outcome is unchanged) — ``role == 'merge'`` always falls through to the
+    legacy ``else:`` SKIPPED arm, unchanged by λ (R4). lint/pyright, in contrast, stay
     FILE_SCOPED and non-``None``: D1/D2 file-scoping never forked on role
     or ``merge_verify_breadth`` to begin with, so R4 has nothing to roll
     back there.
@@ -1296,12 +1298,16 @@ class TestRow9FallbackNarrowingNeverWholeRepoChain:
 # ---------------------------------------------------------------------------
 
 
-# modA's touched file is a collectable TEST file — pytest is FILE_SCOPED to
-# it at BOTH roles (the collectable-tests branch of
-# verify_plan._derive_module_runs never forks on role). modB's touched file
-# is a plain SOURCE file with no collectable test alongside it, which DOES
-# fork by role: FULL_SUITE at role='task' (the R3 owning-module pytest
-# floor) vs SKIPPED at role='merge' (R4 — the legacy shape).
+# modA's touched file is a collectable TEST file and NOTHING ELSE under that
+# prefix — no SOURCE/STRUCTURAL file — so pytest is FILE_SCOPED to it at BOTH
+# roles. (Narrow claim, deliberately: since task 3294 the collectable-tests
+# branch is reached only when no production file was touched under the same
+# prefix, because the role='task' floor now sits ABOVE it. A modA diff that
+# ALSO touched a production file would fork by role, which is not the shape
+# this row exercises.) modB's touched file is a plain SOURCE file with no
+# collectable test alongside it, which DOES fork by role: FULL_SUITE at
+# role='task' (the R3 owning-module pytest floor) vs SKIPPED at role='merge'
+# (R4 — the legacy shape).
 ROW10_MODA_TEST_PATH: str = 'moda/tests/test_thing.py'
 ROW10_MODA_TEST_CONTENT: str = 'def test_thing():\n    pass\n'
 ROW10_MODB_SOURCE_PATH: str = 'modb/helpers.py'

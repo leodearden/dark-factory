@@ -35,7 +35,7 @@
 #                          DIR (/home/leo/src/warm-lanes/worktrees), NOT the XFS mount
 #                          point (/home/leo/src/warm-lanes).
 #                          Derives: WORKTREES_DIR=$MOUNT (lanes live directly under it),
-#                                   BASE_TARGET=$(dirname "$MOUNT")/base/target
+#                                   BASE_TARGET=<parent of $MOUNT>/base/target
 #                                   (the XFS-sibling base dir, one level up from
 #                                   the worktrees-dir).
 #                          The two scripts consume the shared value differently:
@@ -56,17 +56,21 @@
 #   --main-ref REF         Git ref for "main" branch (default: main).
 #   --lane-glob GLOB       Glob matching pool-lane entries (default: _lane-*,_spec-*).
 #                          Matched entries are reset via α, not removed.
-#   --protect-glob GLOB    Glob matching entries to never touch (default:
-#                          _merge-*,_mainprobe-*,_mainsweep-*,_solo-*,
-#                          _substrate-gate-*,_offline-deep,_iact-*). Matched
-#                          entries are skipped entirely. This is the full set
-#                          of orchestrator-managed non-pool worktree kinds
-#                          dark-factory mints directly under the warm-lane
-#                          mount (git_ops.py ephemeral_worktree /
-#                          PROTECTED_PREFIXES); none of them may ever be
-#                          orphan-removed by Pass 2 — e.g. _mainprobe-*/
-#                          _mainsweep-* must survive while a background
-#                          integrity sweep is live (task 5221).
+#   --protect-glob GLOB    Glob matching entries to never touch. Matched entries
+#                          are skipped entirely. The DEFAULT is the full set of
+#                          orchestrator-managed non-pool worktree kinds
+#                          dark-factory mints directly under the warm-lane mount,
+#                          RENDERED from the registry (git_ops.py
+#                          PROTECTED_PREFIXES) via lib_lane_state.sh's
+#                          lane_protect_glob, minus the pool bands this sweep
+#                          owns; none of those kinds may ever be orphan-removed
+#                          by Pass 2 — e.g. _mainprobe-*/_mainsweep-* must
+#                          survive while a background integrity sweep is live
+#                          (task 5221). Run `lane_protect_glob _lane- _spec-` to
+#                          see the effective set for this deployment; it honours
+#                          REIFY_WARM_LANE_IACT_PREFIX. A failed render warns and
+#                          degrades to lib_lane_state.sh's static backstop, never
+#                          to an empty glob (task 3292).
 #   --extra-protect-glob GLOB
 #                          Additive protect glob (opt-in): ADDS to (never
 #                          replaces) the --protect-glob set above, comma-joined,
@@ -110,7 +114,9 @@
 #   REIFY_WARM_LANE_GC_BASE_TARGET      — default --base-target
 #   REIFY_WARM_LANE_GC_MAIN_REF         — default --main-ref (default: main)
 #   REIFY_WARM_LANE_GC_LANE_GLOB        — default --lane-glob
-#   REIFY_WARM_LANE_GC_PROTECT_GLOB     — default --protect-glob
+#   REIFY_WARM_LANE_GC_PROTECT_GLOB     — default --protect-glob. Any non-empty
+#                                         value also SHORT-CIRCUITS the registry
+#                                         render before it runs (task 3292).
 #   REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB — default --extra-protect-glob (any
 #                                         non-empty value = on); off by default
 #   REIFY_WARM_LANE_GC_SEED_SCRIPT      — default --seed-script
@@ -124,7 +130,7 @@
 #       THIS script (gc.sh): --mount = the WORKTREES DIR.  The value is assigned to
 #         WORKTREES_DIR directly, and BASE_TARGET is derived from its PARENT:
 #           WORKTREES_DIR  = <--mount value>
-#           BASE_TARGET    = $(dirname <--mount value>)/base/target
+#           BASE_TARGET    = <parent of the --mount value>/base/target
 #         On the real host: --mount = /home/leo/src/warm-lanes/worktrees, so
 #           WORKTREES_DIR = /home/leo/src/warm-lanes/worktrees
 #           BASE_TARGET   = /home/leo/src/warm-lanes/base/target
@@ -269,7 +275,17 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# dirname by PARAMETER EXPANSION, not a fork: a PATH without dirname yields an
+# EMPTY substitution, `cd ""` succeeds as a no-op, and SCRIPT_DIR silently becomes
+# the CALLER'S CWD. See README.md "Delta 7".
+_src="${BASH_SOURCE[0]}"
+_dir='.'
+case "$_src" in
+    */*) _dir="${_src%/*}"
+         [ -n "$_dir" ] || _dir='/' ;;
+esac
+SCRIPT_DIR="$(cd "$_dir" && pwd)"
+unset _src _dir
 
 # Shared live-reference /proc scanner (live_ref_present). Fail LOUDLY if it is
 # missing: a silently-absent liveness guard is precisely the failure mode task
@@ -331,13 +347,12 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
   Optional options:
     --main-ref REF        Git ref for 'main' (default: main).
     --lane-glob GLOB      Glob for pool-lane entries (default: _lane-*,_spec-*).
-    --protect-glob GLOB   Glob for protected entries (default:
-                          _merge-*,_mainprobe-*,_mainsweep-*,_solo-*,
-                          _substrate-gate-*,_offline-deep,_iact-*) — the full
-                          set of orchestrator-managed non-pool worktree kinds,
-                          which must never be orphan-removed (e.g. ephemeral
-                          verify/sweep worktrees while a background integrity
-                          sweep is live).
+    --protect-glob GLOB   Glob for protected entries. Default: the full set of
+                          orchestrator-managed non-pool worktree kinds, rendered
+                          from the registry (see lane_protect_glob in
+                          lib_lane_state.sh), which must never be orphan-removed
+                          (e.g. ephemeral verify/sweep worktrees while a
+                          background integrity sweep is live).
     --extra-protect-glob GLOB
                           Additive protect glob: ADDS to (never replaces) the
                           --protect-glob set, so a caller protects extra entries
@@ -437,9 +452,35 @@ fi
 # ── apply --mount derivation (before required-options validation) ──────────────
 # --mount sets WORKTREES_DIR and BASE_TARGET when not already set by explicit flags.
 # Explicit --worktrees-dir / --base-target always override the derived values.
+#
+# The parent of $MOUNT comes from PARAMETER EXPANSION, not a `dirname` fork —
+# see README.md "Delta 7". This is the same trim-then-`%/*` shape as
+# lib_lane_state.sh L141-146, and the guards are load-bearing, because the
+# derived VALUE must stay exactly what the header comments above document:
+#   - the `%/` trim: dirname "/a/b/wt/" is "/a/b", but a bare "${MOUNT%/*}"
+#     would give "/a/b/wt" — a trailing slash on --mount is plausible operator
+#     input, and this is the one edge where the naive form silently misderives.
+#   - BOTH empty-result guards: "${MOUNT%/}" is empty for MOUNT=/ and
+#     "${_mnt_trimmed%/*}" is empty for MOUNT=/worktrees; dirname answers "/"
+#     in both cases, so each needs its own `|| ...='/'`.
+#   - the `*/*` case: for a slashless relative MOUNT=worktrees, dirname gives
+#     "." where "${MOUNT%/*}" leaves it unchanged.
+# Verified equal to `dirname` over /worktrees, worktrees, /a/b/wt, /a/b/wt/, /,
+# ., ./x and the real host value. Not equal for MULTIPLE trailing slashes
+# (--mount /a/b//), which the single `%/` trim leaves at /a/b — stated rather
+# than papered over; it matches lib_lane_state.sh's existing behaviour and
+# --mount is documented above as a directory path.
 if [ -n "$MOUNT" ]; then
     [ -n "$WORKTREES_DIR" ] || WORKTREES_DIR="$MOUNT"
-    [ -n "$BASE_TARGET"   ] || BASE_TARGET="$(dirname "$MOUNT")/base/target"
+    _mnt_trimmed="${MOUNT%/}"
+    [ -n "$_mnt_trimmed" ] || _mnt_trimmed='/'
+    _mnt_parent='.'
+    case "$_mnt_trimmed" in
+        */*) _mnt_parent="${_mnt_trimmed%/*}"
+             [ -n "$_mnt_parent" ] || _mnt_parent='/' ;;
+    esac
+    [ -n "$BASE_TARGET" ] || BASE_TARGET="$_mnt_parent/base/target"
+    unset _mnt_trimmed _mnt_parent
 fi
 
 # ── validate required options ──────────────────────────────────────────────────
@@ -458,17 +499,52 @@ fi
 
 # ── apply defaults for optional globs and seed-script ─────────────────────────
 [ -n "$LANE_GLOB" ]    || LANE_GLOB="_lane-*,_spec-*"
-# This list mirrors dark-factory's PROTECTED_PREFIXES worktree-kind inventory
-# (git_ops.py) — every orchestrator-managed non-pool worktree kind minted
-# directly under the warm-lane mount. Keeping the full set here means Pass 2
+# The default protect set is RENDERED from dark-factory's PROTECTED_PREFIXES
+# registry (git_ops.py) through lib_lane_state.sh's lane_protect_glob — every
+# orchestrator-managed non-pool worktree kind minted directly under the warm-lane
+# mount, MINUS the pool bands this sweep owns. Having the full set means Pass 2
 # (destructive orphan removal) can only ever target genuine pool lanes
 # (_lane-*/_spec-*, handled by Pass 1's reset instead) and genuine cold
 # non-underscore orphans (e.g. legacy task-*) — never a live managed worktree
 # such as an ephemeral _mainsweep-*/_mainprobe-* verify sweep (task 5221).
-# _merge-* MUST stay first/present: it is _merge-verify's ONLY gc protection
-# (dark-factory's .merge_verify.lock is a different path gc never inspects),
-# so this list only ever grows, never narrows an existing prefix.
-[ -n "$PROTECT_GLOB" ] || PROTECT_GLOB="_merge-*,_mainprobe-*,_mainsweep-*,_solo-*,_substrate-gate-*,_offline-deep,_iact-*"
+#
+# It is NOT restated here in prose. This used to be a hand-copied literal
+# carrying a comment that asked for a cross-repo hand-sync; that request is now
+# retired, because the duplication it was managing is gone. Re-stating the
+# rendered contents in this comment would just re-create the same INV-5 mirror
+# one layer up, with the same silent failure mode: a band added to
+# PROTECTED_PREFIXES that nobody mirrors becomes a live managed worktree the
+# reaper happily removes. To see the effective set, run
+# `lane_protect_glob _lane- _spec-` (task 3292).
+#
+# `_lane- _spec-` are the bands THIS sweep owns, and must never come back as
+# protected: protecting them would make gc skip every lane in both passes, so a
+# python3 outage would FREEZE reclaim rather than degrade it — and a frozen
+# reclaim is what accreted the pool to the 2026-07-10 ENOSPC outage. See
+# PROTECT_GLOB_OWNED_POOL_BANDS in git_ops.py.
+#
+# The interactive band is honoured per-deployment via REIFY_WARM_LANE_IACT_PREFIX
+# (dark-factory's `git.iact_prefix` is config, not a constant — a deployment that
+# renamed it had the old literal protecting a band it never mints while omitting
+# the band it does, the dangerous direction). Pinned by Block X-band.
+#
+# The `||` is load-bearing, not stylistic: this script runs `set -euo pipefail`,
+# and lane_protect_glob fails LOUD (one [warn] naming the failing stage, EMPTY
+# stdout, non-zero) precisely so a failed render can never read as "nothing is
+# protected". Without the fallback the non-zero return would abort a
+# timer-driven reclaim sweep; with it, a failed render costs one visible [warn]
+# line and degrades to the machine-checked static backstop
+# (LANE_PROTECT_GLOB_FALLBACK, gated by
+# orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift) —
+# never an empty glob. Pinned by Block X-degrade.
+#
+# An explicit --protect-glob / REIFY_WARM_LANE_GC_PROTECT_GLOB still wins, and
+# short-circuits the bridge before it runs: the render costs one interpreter
+# start per INVOCATION (not per lane), so a caller that already knows its set
+# never pays for one.
+[ -n "$PROTECT_GLOB" ] || \
+    PROTECT_GLOB="$(lane_protect_glob _lane- _spec-)" || \
+    PROTECT_GLOB="$LANE_PROTECT_GLOB_FALLBACK"
 # Extra additive protect glob (task 5378): --extra-protect-glob /
 # REIFY_WARM_LANE_GC_EXTRA_PROTECT_GLOB ADDS to (never replaces) the effective
 # protect set — comma-joined onto whatever PROTECT_GLOB resolved to above
@@ -518,7 +594,7 @@ _is_git_worktree() {
 _is_reclaimable() {
     local dir="$1"
     local name
-    name="$(basename "$dir")"
+    name="${dir##*/}"
 
     # (a) dirty tracked changes
     local dirty
@@ -593,7 +669,10 @@ _do_reclaim() {
         # Strip trailing slash
         entry="${entry%/}"
         [ -d "$entry" ] || continue
-        name="$(basename "$entry")"
+        # Leaf by parameter expansion (README.md "Delta 7"): an EMPTY $name here
+        # matches NEITHER glob below, so a protected _merge-*/_iact-* entry would
+        # fall through to orphan_candidates.
+        name="${entry##*/}"
 
         # Skip protected entries entirely — count them as preserved in the summary
         # (they are not reclaimed, which is the user-visible meaning of "preserved").
@@ -619,7 +698,7 @@ _do_reclaim() {
     # ── Pass 1: reset reclaimable lanes ───────────────────────────────────────
     local lane
     for lane in "${lane_candidates[@]+${lane_candidates[@]}}"; do
-        name="$(basename "$lane")"
+        name="${lane##*/}"
         local lane_lock="${WORKTREES_DIR}/${name}.lock"
 
         # Acquire the lane lock NON-BLOCKING in the PARENT shell so the same
@@ -825,7 +904,7 @@ _do_reclaim() {
     # ── Pass 2: remove reclaimable orphans ────────────────────────────────────
     local orphan
     for orphan in "${orphan_candidates[@]+${orphan_candidates[@]}}"; do
-        name="$(basename "$orphan")"
+        name="${orphan##*/}"
         local orphan_lock="${WORKTREES_DIR}/${name}.lock"
 
         # Same single-acquisition pattern as Pass 1: non-blocking exclusive

@@ -29,6 +29,7 @@ function endpointsFor(win) {
     '/api/v2/dashboard/scheduler':                    ['SCHEDULER'],
     '/api/v2/dashboard/escalations':                  ['ESCALATIONS'],
     '/api/v2/dashboard/escalation-analytics':         ['ESCALATION_ANALYTICS'],
+    '/api/v2/dashboard/memory-evals':                 ['MEMORY_EVALS'],
   };
 }
 
@@ -123,6 +124,28 @@ window.DF_DATA = {
     offline_projects: [],
     paused: false,
     paused_projects: [],
+  },
+  // MEMORY_EVALS is an object (not a captured top-level array), so it is NOT
+  // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
+  // tab_memory_evals.jsx reads through DF_DATA.MEMORY_EVALS per render.
+  //
+  // This seed mirrors redux_api.shape_memory_evals' default body exactly:
+  // root_present false with empty lists is the server's OWN healthy
+  // no-artifacts shape, so the pre-fetch render and a real empty response are
+  // indistinguishable and no component has to branch on which it got.  No
+  // illustrative rows — an invented eval would be synthetic data.
+  //
+  // Deliberately no per-endpoint poll interval: the shared 3s tick plus the
+  // route's 60s server-side TTL single-flight cache (PRD DD4) already bounds
+  // the daily-cadence artifact file scan.
+  MEMORY_EVALS: {
+    generated_at: null,
+    root_present: false,
+    storm_escape: null,
+    evals: [],
+    issues: [],
+    issue_count: 0,
+    unmatched_escalations: [],
   },
 };
 
@@ -331,14 +354,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   startPolling();
 }
 
-// Named DF_DATA_LOADER_API (not the graph_layout.js boilerplate's plain
-// `API`): every redux/*.js file is loaded as a separate classic
-// (non-module) <script> tag on the same page (index.html), and top-level
-// `const` bindings in classic scripts share one global lexical scope across
-// ALL of them — a second top-level `const API` here would collide with
-// graph_layout.js's, throwing "Identifier 'API' has already been declared"
-// and aborting this entire script (see runtime_format.js:44-51's identical
-// note/precedent).
+// Module-unique export const, never a bare `API` — see the
+// shared-classic-script-scope note in graph_layout.js's header, enforced by
+// dashboard/tests/js/classic_script_scope.test.mjs.
 const DF_DATA_LOADER_API = {
   endpointsFor,
   applyKey,

@@ -978,3 +978,59 @@ def shape_scheduler(
             'paused_projects': list(paused_projects),
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# MEMORY_EVALS
+# ---------------------------------------------------------------------------
+
+
+def shape_memory_evals(
+    *,
+    generated_at: str | None = None,
+    root_present: bool = False,
+    storm_escape: dict | None = None,
+    evals: list[dict] | None = None,
+    issues: list[dict] | None = None,
+    issue_count: int = 0,
+    unmatched_escalations: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Return ``{MEMORY_EVALS: {generated_at, root_present, storm_escape, evals, issues, issue_count, unmatched_escalations}}``.
+
+    Pure, I/O-free — mirrors ``shape_curator`` / ``shape_scheduler`` style.
+    The route calls this with ``**build_memory_evals(...)``; all disk access
+    lives in that builder (which the route runs off the event loop), so nothing
+    here reads.
+
+    **These field names are the contract.**  ``docs/prds/memory-eval-dashboard.md``
+    open question 4 assigns the payload vocabulary to this shape fn plus
+    ``dashboard/tests/test_memory_evals_data.py``; the React section consumes
+    exactly these names.  The parameters are spelled out rather than swallowed
+    by ``**_``: a new builder key must be threaded through here deliberately,
+    and until it is, the mismatch is a loud ``TypeError`` rather than a field
+    that silently never reaches the UI.
+
+    ``storm_escape`` is the run-scoped, program-wide escape block — one banner
+    source, carried beside the eval rows rather than only inside them, so the
+    UI never has to elect a row to read it from and it survives a root with
+    zero eval dirs.
+
+    Shallow-copies top-level containers only (``list(evals)``); the inner eval
+    /issue /escalation dicts stay aliased to the builder's objects, which is
+    benign because the builder constructs them fresh per call.  Defaults are
+    fresh literals per call, never a shared module-level constant, so one
+    response can never mutate another's.  A default-shaped body is structurally
+    identical to a real one — same keys, ``root_present=False`` — so the UI
+    never has to branch on which it got.
+    """
+    return {
+        'MEMORY_EVALS': {
+            'generated_at': generated_at,
+            'root_present': root_present,
+            'storm_escape': dict(storm_escape) if storm_escape else None,
+            'evals': list(evals) if evals else [],
+            'issues': list(issues) if issues else [],
+            'issue_count': issue_count,
+            'unmatched_escalations': list(unmatched_escalations) if unmatched_escalations else [],
+        }
+    }

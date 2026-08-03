@@ -30,6 +30,7 @@ import json
 
 import pytest
 
+from orchestrator import verify_classify
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES, FailureCategory
 from orchestrator.verify_cmd import ToolKind
 
@@ -1491,3 +1492,198 @@ class TestSummarizeChecksThreadsToolIdentity:
         )
         assert not passed
         assert category == FailureCategory.FLOCK_ERROR
+
+
+# ---------------------------------------------------------------------------
+# step-3367: mis-resolved pyright interpreter (esc-3359-1)
+# ---------------------------------------------------------------------------
+
+
+def _unresolved_import_lines(*modules: str, path: str = 'src/fused_memory/server.py') -> str:
+    """Render *modules* in pyright's REAL unresolved-import line shape.
+
+    Captured verbatim during the task-3367 reproduction, e.g.::
+
+        /repo/src/fused_memory/server.py:12:8 - error: Import "pytest" could
+        not be resolved (reportMissingImports)
+    """
+    return '\n'.join(
+        f'  /repo/{path}:{i + 8}:8 - error: Import "{mod}" could not be '
+        f'resolved (reportMissingImports)'
+        for i, mod in enumerate(modules)
+    )
+
+
+# The observed false-red: the baseline sentinel `pytest` is unresolved
+# alongside many other workspace third-party packages, because the resolved
+# interpreter is not this worktree's .venv at all.
+PHANTOM_MISSING_IMPORTS = _unresolved_import_lines(
+    'pytest', 'pydantic', 'aiosqlite', 'openai', 'qdrant_client'
+)
+
+
+class TestInterpreterMissingWorkspacePackages:
+    """Pins ``is_interpreter_missing_workspace_packages`` — task 3367 / esc-3359-1.
+
+    The predicate recognises an interpreter holding NONE of the workspace's
+    third-party packages (pyright resolved an ambient env rather than this
+    worktree's ``.venv``), and must NOT fire on a genuine missing-dependency
+    regression — a false positive would excuse a real branch defect as
+    environmental and let it through the merge gate as an infra hold.
+    """
+
+    def test_sentinel_plus_many_distinct_modules_is_environmental(self) -> None:
+        """The observed shape: `pytest` unresolved alongside >=5 distinct modules."""
+        assert verify_classify.is_interpreter_missing_workspace_packages(
+            PHANTOM_MISSING_IMPORTS
+        )
+
+    def test_dotted_submodules_collapse_to_their_top_level_module(self) -> None:
+        """Submodules of ONE package must not inflate the distinct count alone.
+
+        Both blocks below carry the sentinel. The first names five distinct
+        top-level packages via dotted paths and must fire; the second names
+        five dotted paths that all belong to two top-level packages and must
+        not.
+        """
+        five_distinct_tops = _unresolved_import_lines(
+            'pytest',
+            'graphiti_core.nodes',
+            'qdrant_client.models',
+            'pydantic.fields',
+            'openai.types',
+        )
+        assert verify_classify.is_interpreter_missing_workspace_packages(
+            five_distinct_tops
+        )
+
+        two_distinct_tops = _unresolved_import_lines(
+            'pytest',
+            'qdrant_client.models',
+            'qdrant_client.http',
+            'qdrant_client.http.models',
+            'qdrant_client.conversions',
+        )
+        assert not verify_classify.is_interpreter_missing_workspace_packages(
+            two_distinct_tops
+        )
+
+    def test_single_genuine_missing_dependency_is_not_environmental(self) -> None:
+        """A real branch defect must stay RED, never be excused as environmental."""
+        assert not verify_classify.is_interpreter_missing_workspace_packages(
+            _unresolved_import_lines('brand_new_lib')
+        )
+
+    def test_many_distinct_modules_without_the_sentinel_is_not_environmental(self) -> None:
+        """The sentinel is what separates "wrong interpreter" from "wrong dep set".
+
+        A branch that legitimately dropped several dependencies loses those
+        imports but never loses ``pytest`` — every workspace member declares
+        it as a dev dependency, so a healthy env ALWAYS resolves it.
+        """
+        assert not verify_classify.is_interpreter_missing_workspace_packages(
+            _unresolved_import_lines(
+                'pydantic', 'aiosqlite', 'openai', 'qdrant_client', 'graphiti_core'
+            )
+        )
+
+    def test_empty_output_is_not_environmental(self) -> None:
+        assert not verify_classify.is_interpreter_missing_workspace_packages('')
+
+    def test_other_pyright_rules_are_not_environmental(self) -> None:
+        """Only reportMissingImports counts — other pyright rules are branch defects."""
+        other_rules = (
+            '  /repo/src/a.py:3:9 - error: Argument of type "int" cannot be '
+            'assigned to parameter "x" (reportArgumentType)\n'
+            '  /repo/src/b.py:4:9 - error: Cannot access attribute "foo" for '
+            'class "Bar" (reportAttributeAccessIssue)\n'
+            '  /repo/src/c.py:5:9 - error: "baz" is not a known attribute of '
+            'module "qux" (reportAttributeAccessIssue)\n'
+            '  /repo/src/d.py:6:9 - error: Expression of type "None" is '
+            'incompatible (reportAssignmentType)\n'
+            '  /repo/src/e.py:7:9 - error: No overloads for "get" match '
+            '(reportCallIssue)\n'
+        )
+        assert not verify_classify.is_interpreter_missing_workspace_packages(other_rules)
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'Traceback (most recent call last):\n  File "t.py", line 1\nImportError: x\n',
+            'src/a.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n',
+            'error: could not compile `foo` (lib) due to 1 previous error\n',
+            '\x00\x01 not even text — Import " could not be resolved (\n',
+        ],
+    )
+    def test_arbitrary_non_pyright_text_returns_false_without_raising(
+        self, text: str
+    ) -> None:
+        """Exception-safe on any input — a classifier must never raise."""
+        assert verify_classify.is_interpreter_missing_workspace_packages(text) is False
+
+
+class TestInterpreterMisresolutionClassifiesEnvTransient:
+    """The mis-resolved-interpreter signature classifies ENV_TRANSIENT, tool-blind.
+
+    Task 3367 / esc-3359-1. Before this, the fleet chain
+    ``cd fused-memory && npx pyright && ...`` parsed to ``ToolKind.OPAQUE``
+    (``verify_cmd._parse_chain`` — multi-segment, neither pytest nor cargo), so
+    ``classify_failure`` dispatched to ``_classify_opaque``, whose ladder fell
+    through to ``UNKNOWN_TEST_FAILURE`` — i.e. the host's mis-resolved
+    interpreter read as a BRANCH DEFECT, burning a merge cycle and a steward
+    escalation on a docs-only diff.
+    """
+
+    def test_opaque_fleet_chain_signature_is_env_transient(self) -> None:
+        """OPAQUE is the case that actually matters — the fleet chain's ToolKind."""
+        assert (
+            verify_classify.classify_failure(ToolKind.OPAQUE, 1, PHANTOM_MISSING_IMPORTS, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    def test_pyright_tool_kind_signature_is_env_transient(self) -> None:
+        """The per-module `uv run --project X pyright` commands too.
+
+        Proves the detection lives in the tool-blind guard (guard 3, which runs
+        BEFORE per-tool dispatch), not in one tool's table.
+        """
+        assert (
+            verify_classify.classify_failure(ToolKind.PYRIGHT, 1, PHANTOM_MISSING_IMPORTS, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_rc_zero_still_passes_with_the_phantom_text_present(
+        self, tool: ToolKind
+    ) -> None:
+        """Guard 1 precedence is unchanged: rc==0 is PASSED regardless of output."""
+        assert (
+            verify_classify.classify_failure(tool, 0, PHANTOM_MISSING_IMPORTS, False)
+            == FailureCategory.PASSED
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_timed_out_still_wins_over_the_phantom_text(self, tool: ToolKind) -> None:
+        """Guard 2 precedence is unchanged: the wall-clock limit is the root cause."""
+        assert (
+            verify_classify.classify_failure(tool, 1, PHANTOM_MISSING_IMPORTS, True)
+            == FailureCategory.INFRA_TIMEOUT
+        )
+
+    def test_single_genuine_missing_import_is_not_excused_as_environmental(self) -> None:
+        """A real branch defect keeps its pre-existing category, never ENV_TRANSIENT."""
+        genuine = _unresolved_import_lines('brand_new_lib')
+        assert (
+            verify_classify.classify_failure(ToolKind.OPAQUE, 1, genuine, False)
+            != FailureCategory.ENV_TRANSIENT
+        )
+
+    def test_env_transient_is_infra_transient_at_the_merge_lane(self) -> None:
+        """Documents the merge-lane consequence this classification buys.
+
+        ``merge_queue``'s ``INFRA_TRANSIENT_CATEGORIES`` branch turns this into a
+        loud infra_issue hold that never blames the branch — the exact outcome
+        that would have saved esc-3359-1's merge cycle. No new FailureCategory
+        member is introduced; ENV_TRANSIENT already carries precisely this policy.
+        """
+        assert FailureCategory.ENV_TRANSIENT in INFRA_TRANSIENT_CATEGORIES

@@ -2279,6 +2279,34 @@ class ReconciliationHarness:
             await self._drain_judge_tasks()
             await self._stop_escalation_server()
 
+    def auto_resume_pending(self, project_id: str) -> bool:
+        """True iff a currently-halted ``project_id`` will auto-resume on the
+        next loop tick: this deployment enabled ``auto_unhalt_after_cooldown``
+        AND the judge's halt cooldown has expired.
+
+        The single source of truth for that rule. :meth:`_project_loop` calls
+        it to decide auto-resume-after-cooldown (task 2920 deliverable c), and
+        the ``trigger_reconciliation`` MCP tool calls the SAME method to decide
+        whether forwarding a manual trigger is honest — a trigger is only ever
+        consumed by a cycle that actually runs (task 3050).
+
+        Keeping one predicate is the point: re-deriving the rule at the MCP
+        boundary would let the tool keep answering ``trigger_requested: True``
+        the moment this rule gained a condition (a usage gate, a drain flag, a
+        grace check), silently reintroducing exactly the class of lie task 3050
+        exists to remove.
+
+        Returns False when no judge is wired, and for a project that is not
+        halted (:meth:`Judge.cooldown_expired` is False for an unhalted
+        project) — so this answers "pending auto-resume", never "healthy".
+        """
+        if self.judge is None:
+            return False
+        return bool(
+            self.config.auto_unhalt_after_cooldown
+            and self.judge.cooldown_expired(project_id)
+        )
+
     async def _project_loop(self, project_id: str) -> None:
         """Independent reconciliation loop for a single project."""
         logger.info(f'Project reconciliation loop started for {project_id}')
@@ -2305,10 +2333,9 @@ class ReconciliationHarness:
 
                 # Halt check
                 if self.judge and self.judge.is_halted(project_id):
-                    if (
-                        self.config.auto_unhalt_after_cooldown
-                        and self.judge.cooldown_expired(project_id)
-                    ):
+                    # One predicate, shared with trigger_reconciliation — see
+                    # auto_resume_pending's docstring.
+                    if self.auto_resume_pending(project_id):
                         # Auto-resume-after-cooldown (task 2920 deliverable c):
                         # the halt cooldown has expired and this deployment opted
                         # in, so unhalt (which seeds the normal post-unhalt grace
@@ -3297,10 +3324,15 @@ class ReconciliationHarness:
     ) -> None:
         """Escalate a sustained task_count_snapshot write-cadence gap.
 
-        Reads *run*'s Stage-2 freshness stat (``task_count_snapshot_written``,
-        already computed by ``TaskKnowledgeSync.run()``'s post-flight check);
-        only a CONFIRMED current miss (``False`` — not a fresh write and not an
-        inconclusive/unknown check) is eligible to escalate.  The prior
+        Reads *run*'s Stage-2 freshness stat
+        (``task_count_snapshot_mem0_written``, already computed by
+        ``TaskKnowledgeSync.run()``'s post-flight check); only a CONFIRMED
+        current miss (``False`` — not a fresh write and not an
+        inconclusive/unknown check) is eligible to escalate.  Journal rows
+        persisted before the task-3045 rename carry the old
+        ``task_count_snapshot_written`` spelling and are still honored, via
+        ``extract_snapshot_written``'s legacy-key fallback — without it the
+        streak below would stop dead at the first pre-rename row.  The prior
         consecutive-miss streak is recomputed each call from
         ``journal.get_recent_runs`` — mirroring ``_finding_persistence_count``'s
         journal-recompute pattern — rather than a stored counter, so it

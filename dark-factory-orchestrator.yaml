@@ -38,7 +38,38 @@ max_concurrent_tasks: 24
 # NOTE: any pytest segment added to this chain in the future must also carry
 # --timeout>60 — enforced by
 # tests/scripts/test_fallback_verify_config.py::test_fallback_verify_raises_per_test_timeout.
-test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ --timeout=300"
+# task 3384: this segment also runs ``scripts/tests/`` together with
+# ``tests/scripts/`` above — a near-homograph but DIFFERENT directory (~30
+# modules testing scripts/legibility/*, scripts/*.py census / trickle /
+# codebook / worktree-lifecycle tooling, e.g. test_census_trigger.py and
+# test_legibility_census.py). Neither the 5 subprojects' own tests/ dirs nor
+# tests/scripts/ itself ever collect scripts/tests/ (it is not a workspace
+# member and sits outside every subproject prefix), so it is folded into the
+# same ``--project shared`` pytest invocation (scripts/tests/ imports no
+# first-party package, and shared is the member declaring pytest;
+# collection across the two directories' few shared basenames is safe
+# because the root pyproject.toml sets addopts = "--import-mode=importlib"
+# and neither directory has an __init__.py). Measured green standalone:
+# 1184 passed in ~113s (lowest of local runs) — see the fleet-chain budget
+# accounting below for how this feeds verify_command_timeout_secs; the
+# combined-directories figure is recorded in project memory for task 3460
+# rather than duplicated here.
+#
+# DEFENCE-IN-DEPTH ONLY: this whole chain is built by
+# ``_build_fallback_config``, which ``run_scoped_verification``
+# (orchestrator/verify.py) reaches only past its ``if module_configs:``
+# check — i.e. only when NO module config is discovered at all.
+# ``_discover_module_configs`` DOES register a ``scripts`` module config,
+# and ``derive_modules`` -> ``OrchestratorConfig.for_module``'s
+# longest-prefix walk resolves every scripts/** path
+# (scripts/legibility/digest.py, scripts/census_trigger.py,
+# scripts/tests/test_codebook.py, ...) to prefix ``scripts`` — so a
+# scripts/** diff routes to scripts/orchestrator.yaml's own test_command
+# instead, and this segment never executes for it. The real, still-open
+# gate is scripts/orchestrator.yaml's test_command, which targets only
+# tests/scripts/ under FULL_SUITE / merge-role merge_verify_breadth="full";
+# task 3460 owns closing that gap there — do not re-close it here.
+test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
 # this to a single touched file for root-level changes) emits a bare ``ruff
@@ -47,29 +78,309 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # bare-MagicMock config gate — whole-repo scope on this rare module_config-less
 # fallback path (per-module orchestrator.yaml lint_commands carry the per-package
 # scope; also runs in merge-queue verify; see hooks/project-checks).
-lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
-type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
+# task 3397: the ``ruff check`` leg now covers all 7 [tool.uv.workspace].members
+# (added sampler and cockpit — cockpit is on main now), closing the gap where a
+# docs-only or cross-cutting diff (zero .py files touched -> verify._build_
+# fallback_config returns None -> this chain runs verbatim, no per-subproject
+# rescoping) left them never ruff-checked at the gating layer. Enforced by
+# tests/scripts/test_fallback_verify_config.py::TestFleetLintCoversEveryWorkspaceMember.
+# Preserve the existing chain SHAPE when editing either leg — the leading
+# ``uv run ruff check ...`` head plus the ``&& python3 ...`` tail:
+# verify._reproject_str relies on split_chain_tail(cmd, 'uv run') carrying the
+# tail through verbatim; adding target names to the head does not disturb it,
+# restructuring the chain would.
+# The ``check_bare_magicmock_config.py`` tail leg now also covers all 7
+# members' tests/ dirs, for the same reason and via the same workspace-member
+# set as the ruff leg above — a future member is therefore caught by
+# TestFleetLintCoversEveryWorkspaceMember.
+# test_every_present_workspace_member_tests_dir_is_magicmock_checked rather
+# than silently escaping this gate.
+#
+# NON-MEMBER TARGETS ADDED DELIBERATELY (task 3485).
+#
+# `conftest.py`, `df_pytest_isolation.py` and `skills` are NOT workspace
+# members; they are named here because before this task they were linted by
+# NOTHING, on checks reporting green. This command targeted only the 7
+# [tool.uv.workspace].members; scripts/orchestrator.yaml targets scripts/;
+# tests/scripts/orchestrator.yaml targets tests/scripts/. Nothing covered
+# these three paths — the same vacuous-gate class tasks 3350 and 3445 closed
+# for tests/scripts/ and scripts/. `skills` is written bare, matching the
+# existing targets' style; ruff traverses the directory.
+#
+# MEASUREMENT: at base main 1f83dbed15, `uv run --project shared ruff check
+# --select E,F,UP,B,SIM,I --ignore E501 --line-length 100 conftest.py
+# df_pytest_isolation.py skills/` returned exactly 2 findings, both SIM105
+# (`try`/`except ImportError`/`pass`) in conftest.py at lines 40 and 45;
+# df_pytest_isolation.py 0, skills/ 0. Both were FIXED — by hand, with
+# contextlib.suppress, in the commit immediately preceding this one — rather
+# than the command being weakened with an exclude or a narrowed target (task
+# 3350's precedent). Fix-and-declare stays atomic: at no point does a declared
+# target carry a finding. That matters because verify.run_full_verification
+# asyncio-gathers over ALL module_configs.values(), not just those a diff
+# touches, and this file sets merge_verify_breadth: "full" — so a red
+# lint_command here blocks every merge, review checkpoint and main-tip sweep
+# repo-wide, on branches with no defect.
+#
+# RULE-SET / LANDING-ORDER NOTE. The measurement above passes the members'
+# rule set as EXPLICIT --select flags because task 3457's root [tool.ruff]
+# table is NOT on main at this base (verified two ways: 5a286fcc36 is not an
+# ancestor of HEAD, and `ruff check --show-settings conftest.py` enables only
+# E401/E402/E7xx/E9/F). So TODAY this command checks these three paths under
+# ruff's BUILT-IN defaults, and widens automatically to E,F,UP,B,SIM,I the
+# moment 3457 lands. Both states are green, deliberately: the fix was measured
+# under the WIDE set, and the built-in defaults are a strict SUBSET of it, so
+# 3457 landing cannot retroactively red-wall main. Do not "simplify" the guard
+# to read the resolved config — that would make it silently weaker today and
+# change meaning later.
+#
+# WHY THE ROOT COMMAND IS THE ONLY LEVER FOR THE TWO ROOT FILES.
+# _discover_module_configs SKIPS a root-level config (prefix == '.'), so
+# conftest.py and df_pytest_isolation.py can never belong to a module config,
+# no matter what orchestrator.yaml is added where. Widening this head is
+# therefore mandatory for them; once made, it covers `skills` through the same
+# lever at zero routing risk (see the WHY NOT skills/orchestrator.yaml block
+# below). Note precisely what "only lever" means: it is the only lever for
+# DECLARING them as lint targets, NOT for getting them linted when they
+# change — see SCOPE HONESTY below.
+#
+# SCOPE HONESTY — what this widening does and does not buy. Measured, not
+# assumed; an earlier draft of this block overclaimed and was corrected.
+#
+# WHAT IT BUYS: DRIFT DETECTION on the merge-lane global gate. The VERBATIM
+# (unscoped) form of this command is reached only through
+# verify.run_verification with module_config is None — its "Global fallback"
+# branch, which assigns lint_cmd = config.lint_command untouched. Live
+# triggers: a MERGE-LANE verify of a diff with zero .py/.rs files and no
+# module config (docs/yaml/markdown-only — via the INV-1 escalation or the
+# manifest-drift / verify-pipeline-guard override), and force_workspace train
+# / merge_verify_workspace runs. For role='task' a zero-source diff returns a
+# trivial pass before reaching it. So these paths are linted on diffs that do
+# NOT touch them.
+#
+# WHAT IT DOES NOT BUY: it does NOT lint them on diffs that DO touch them.
+# Three independent reasons, each sufficient on its own:
+#   1. On the module-config-less path (verify._build_fallback_config) the lint
+#      leg is narrowed UNCONDITIONALLY whenever the diff holds any .py file,
+#      and on that path the head targets are DISCARDED, not supplemented:
+#      verify._scope_to_keyword truncates the head at the keyword (retaining
+#      only up to and including `ruff check`), so all positional targets are
+#      dropped before parsing, and verify_cmd.scope_to then REPLACES targets
+#      wholesale with the touched files. Adding names to the ruff head is a
+#      strict no-op on EVERY narrowed run. (The `&& python3
+#      check_bare_magicmock_config.py` tail IS preserved — 'ruff check' is in
+#      verify_cmd._TAIL_PRESERVING_KEYWORDS — which is exactly why the guard's
+#      chain-SHAPE assertion is load-bearing.)
+#   2. There is no widen-to-verbatim branch on the LINT slot anywhere. D2
+#      (STRUCTURAL -> unscoped) widens PYRIGHT only; D1 (CONFTEST/TEST_DATA ->
+#      FULL_SUITE) widens PYTEST only. Neither _build_fallback_config nor
+#      verify_plan._derive_module_runs branches lint on file kind at all.
+#   3. A diff that touches these files alongside subproject files resolves a
+#      NON-EMPTY module_configs, where each module lints only its own src/ and
+#      tests/ — no registered prefix owns a repo-root path — so this command is
+#      never invoked at all. Same under merge_verify_breadth: "full", whose
+#      expansion iterates module_configs.values().
+#
+# A superseded draft of this block claimed conftest.py is itself a STRUCTURAL
+# trigger that forces the verbatim form. It is not: verify_plan.classify_file
+# tests the conftest.py basename and returns FileKind.CONFTEST BEFORE the
+# Protocol/TypedDict content check that produces STRUCTURAL, and FileKind's own
+# docstring states that a Protocol/TypedDict defined inside a conftest.py is
+# never STRUCTURAL. Recorded rather than silently deleted, because the claim
+# was load-bearing in the original rationale.
+#
+# RESIDUAL GAP, stated plainly rather than left invisible: because
+# _discover_module_configs skips prefix == '.', NO lever available today lints
+# conftest.py / df_pytest_isolation.py on the diffs that change them. Filed as
+# follow-up ticket tkt_0RS0K2EAS12A8A3G0JXMAVYD0P (a curator ticket from task
+# 3485, not yet a task id). The widening is KEPT regardless: drift detection on
+# the merge gate is real, every target exists, the command runs rc=0, and it
+# costs nothing. And the 2 SIM105 fixes in the preceding commit stand on their
+# own merits independent of which gate observes them — they are real findings
+# removed from the tree.
+#
+# Guarded by tests/scripts/test_root_lint_covers_nonmember_py.py.
+# Production code is cited BY SYMBOL throughout this block and never by
+# file:line — task 3445's explicit correction of the convention task 3350
+# established, after every line pin copied forward had already rotted at HEAD.
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
+#
+# WHY NOT skills/orchestrator.yaml (task 3485).
+#
+# Task 3485 was explicitly asked to choose between extending the ruff head
+# above and registering a module config for skills/. It chose the head. The
+# rationale is recorded here because the alternative is the obvious-looking
+# "better" fix and would otherwise be re-proposed on every read.
+#
+# FEASIBLE, BUT NOT SUFFICIENT. _discover_module_configs registers a module
+# iff the directory directly contains an `orchestrator.yaml` carrying at least
+# one overridable field, and it SKIPS prefix == '.'. A skills/orchestrator.yaml
+# (prefix `skills`, depth 1) is well inside the effective lock_depth of 4 — the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml ships
+# lock_depth: 4, layered over the pydantic Field default of 2 — so it would in
+# fact be discovered. But it could never cover conftest.py or
+# df_pytest_isolation.py, which sit at the repo ROOT and are excluded by that
+# same prefix == '.' skip. Widening the head above is therefore REQUIRED
+# regardless; once made, it covers `skills` through the same lever with no
+# routing change at all.
+#
+# WHAT REGISTERING ONE WOULD BUY: a strictly stronger gate. A module config
+# participates in run_full_verification's asyncio.gather over
+# module_configs.values(); this root command does not (see SCOPE HONESTY
+# above).
+#
+# WHAT IT WOULD COST: a TEST-routing change, and a new vacuous gate. Today a
+# skills/-only diff matches no module config, so run_scoped_verification falls
+# through to _build_fallback_config and runs the whole fleet test chain.
+# Registering a module config makes module_configs non-empty, and a config
+# with no test_command yields a ScopeKind.SKIPPED PlannedRun that
+# _run_or_skip_timed turns into a CheckRun.skipped — VACUOUSLY PASSING at
+# rc=0. That closes one vacuous gate by opening another, which is precisely
+# the failure class tasks 3350, 3445 and 3485 exist to prevent. Declaring an
+# honest test_command instead is a separate design question: skills/ has no
+# tests/ directory of its own, and pointing it at tests/scripts/ would
+# replicate the byte-identical duplicate-run cost tests/scripts/
+# orchestrator.yaml already documents about itself.
+#
+# CONCLUSION: widen the root command here; leave skills/orchestrator.yaml to a
+# follow-up that can settle the test-routing question on its own merits. Filed
+# from task 3485 as [tkt_0RS0CK3MYE2HG5H7TDMGQP24QB] — a curator TICKET id,
+# not a task id: the curator runs asynchronously and decides create/combine/
+# drop, so the resulting task number is not knowable at this commit. That
+# follow-up cannot subsume the widening above; do not "consolidate" by
+# removing the non-member targets from the ruff head.
+# The bare ``npx pyright`` spelling is DELIBERATE and safe (task 3367 /
+# esc-3359-1): every ``cd`` target below pins pyright's own interpreter via
+# ``[tool.pyright] venvPath = ".."`` / ``venv = ".venv"`` in its pyproject.toml,
+# resolved relative to that file's directory — so each clause always type-checks
+# against THIS worktree's own .venv, never an ambient VIRTUAL_ENV/PATH one
+# (verify._target_subprocess_env strips both) and never another tree's.
+# Enforced by tests/scripts/test_fallback_verify_config.py::
+# TestRootTypeCheckCommandPyrightInterpreterPinned, which walks these clauses.
+# Do NOT "fix" this by rewriting the clauses to ``uv run --project <sub> pyright``:
+# ``uv run --project`` SYNCS that member's environment, and every member of this
+# uv workspace shares ONE root .venv — that would add a second concurrent
+# shared-venv mutator racing the TEST leg's own ``cd X && uv run pytest`` fanout,
+# reintroducing the mutation class tasks 2045/2048 exist to paper over. The
+# pyproject pin is static config: zero mutation, zero concurrency.
+# task 3397: extended from 3 to all 7 [tool.uv.workspace].members (fused-memory,
+# orchestrator, dashboard, shared, escalation, sampler, cockpit), closing the
+# gap where a docs-only or cross-cutting diff (zero .py files touched ->
+# verify._build_fallback_config returns None -> this chain runs verbatim with
+# no per-subproject rescoping) left 4 of 7 members never type-checked at the
+# gating layer — the same defect class tasks 2361/2368 closed for test_command.
+# cockpit gets a HARD ``cd ../cockpit`` here, deliberately NOT test_command's
+# ``( [ -d cockpit ] || exit 0; cd cockpit && ... )`` presence-guard idiom:
+# cockpit is on main now (unlike when that idiom was written for test_command),
+# and more importantly a subshell clause is unparseable to
+# verify._cd_clause_target, which requires an exact two-token ``cd <dir>``.
+# Splitting a guarded subshell on ``&&`` yields a >2-token first half, which
+# silently STALLS cwd tracking at the previous member for BOTH
+# verify._scope_fallback_tool_to_subproject (task 3022) and
+# TestRootTypeCheckCommandPyrightInterpreterPinned (task 3367) — mis-attributing
+# the trailing ``npx pyright`` clause to the wrong directory. Every clause in
+# this chain must therefore stay a bare ``cd <dir>`` or a bare ``npx pyright``;
+# enforced by tests/scripts/test_fallback_verify_config.py::
+# TestFleetTypeCheckCoversEveryWorkspaceMember, which derives coverage from
+# this same &&-walk (not a substring search), so an unwalkable clause fails
+# loudly as a missing member instead of silently passing.
+# Measured 2026-08-02 in a synced worktree under `env -u VIRTUAL_ENV` (mirrors
+# verify._target_subprocess_env): fused-memory 113s, orchestrator 220s,
+# dashboard 51s, shared 64s, escalation 42s, sampler 11s, cockpit 17s — sum
+# 518s. The full 7-clause chain ran end-to-end in 576s, exit 0, "0 errors" x7,
+# against the 3600s warm / 5400s cold per-command budgets below (6.25x / 9.4x
+# headroom) — see tests/scripts/test_fallback_verify_config.py::
+# MEASURED_FLEET_TYPE_SEGMENT_SECS. A dated snapshot, not a self-maintaining
+# invariant — same honesty as the test_command budget derivation below.
+type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright && cd ../shared && npx pyright && cd ../escalation && npx pyright && cd ../sampler && npx pyright && cd ../cockpit && npx pyright"
 
-# Verification timeouts. The "full warm verify here is ~2 min" premise these were
-# sized against is STALE by an order of magnitude — it predates the monorepo growing
-# to 8 chained suites. Measured on the __fallback__ chain 2026-07-31 (task 3062,
-# esc-3062-3), attempt-2, per-suite completion lines:
-#   shared 2582 passed / 120.21s · escalation 898 / 123.29s
-#   orchestrator 13398 / 1366.23s · fused-memory 8658 / 123.87s
-#   = 1733.6s consumed BEFORE dashboard (1393 tests) even starts, leaving <67s of a
-#   1800s budget for dashboard + sampler + cockpit + tests/scripts (~127s alone).
-# The chain therefore could not fit in 1800s under any load — a structural overrun,
-# not a hang, and it timed out at 1800.66s having already passed 25,536 tests with
-# zero failures. Raised to 3600s warm (orchestrator alone is 76% of the old budget)
-# and 5400s cold, since cold additionally pays uv sync across 6 subprojects.
-# The tight-timeout rationale still holds and is unchanged in KIND — a genuine hang
-# should still surface on the first verify that touches the module, not 8 days later
-# — but the threshold has to exceed the honest cost of the work it gates, or every
-# task touching a slow-suite package false-REDs on the wall clock.
-# NOTE: this buys headroom, it does not fix the trend. orchestrator's suite alone
-# grew to 1366s; if it keeps growing, the answer is scoping verify to the task's
-# declared modules (task 3062's own plan.json-scoped verify runs green in ~127s),
-# not raising this number again.
+# Verification timeouts. verify_command_timeout_secs is a PER-COMMAND budget
+# (skills/orchestrate/references/project-setup.md:150) and the fallback fleet
+# chain above is ONE shell command, so this single ceiling bounds all eight
+# suites together.
+#
+# The "full warm verify here is ~2 min" premise these were originally sized
+# against is STALE by an order of magnitude — it predates the monorepo growing
+# to 9 chained suites. It is deleted rather than softened, because a stale
+# justification is worse than none. MEASURED per-segment durations (task 3062
+# attempt-2, .task/verify/attempt-2.__fallback__.{summary.json,test.log}, run
+# started 2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`, surfaced as
+# escalation esc-3062-3):
+#
+#     shared         120.21   (2582 passed)
+#     escalation     123.29   (898 passed)
+#     orchestrator  1366.23   (13398 passed, zero failures)
+#     fused-memory   123.87   (8658 passed)
+#     tests/scripts  105.00   (lowest of four independent runs, 105-127s)
+#                   -------
+#                   1838.60s   <- five of eight segments; already > the old 1800
+#
+# dashboard, sampler and cockpit are absent because the run timed out at
+# 1800.66s before dashboard even started, so 1838.60 is a hard measured LOWER
+# BOUND, not an estimate. The old 1800s ceiling was provably below it: a healthy
+# run could not clear it, so it surfaced no hangs — it manufactured infra_timeout
+# on the honest green path, after already passing 25,536 tests with zero
+# failures. A structural overrun, not a hang.
+#
+# Raised to 3600s warm / 5400s cold. All eight segments accounted for — the six
+# measured plus the three unmeasured ones estimated rather than silently costed
+# at zero:
+#
+#     measured floor (five segments, above)       1838.60
+#     + scripts/tests (task 3384, lowest of local
+#                   runs, 1184 passed)                ~113
+#     + dashboard  1393 collected @ ~0.137 s/test  ~190
+#     + sampler                                     ~60
+#     + cockpit     321 collected @ ~0.137 s/test   ~44   (conditional: the
+#                   segment is wrapped in `[ -d cockpit ] || exit 0`, so it
+#                   costs 0 on a checkout where cockpit is absent — but it IS
+#                   present here, so budget for it)
+#                                                 -------
+#     honest green path                            ~2246
+#
+# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s; dashboard
+# and cockpit both run serial (no pytest-xdist, per this file's own fanout
+# comment). 3600s leaves ~1.6x headroom over that path, covering the load
+# variance the two same-day orchestrator measurements demonstrate (1157.62s vs
+# 1366.23s, ~18%) plus scripts/tests' own load sensitivity (task 3384 measured
+# it between ~113s idle and, combined with tests/scripts/, up to ~505s wall
+# under contention — see the task-3384 comment above and project memory for
+# the combined-directories figures). Cold gets 5400s because it additionally
+# pays the ~180s `uv sync --all-packages` preprovision plus uv sync across 6
+# subprojects.
+#
+# It also un-starves the `orchestrator` module's OWN verify, which at 1366.23s
+# was consuming 76% of the old per-command ceiling.
+#
+# WHERE "tight timeouts surface hangs" LIVES NOW: on the PER-MODULE budgets —
+# each subproject's own orchestrator.yaml, plus tests/scripts/orchestrator.yaml's
+# 600s — not on starving the whole-fleet fallback chain. The tight-timeout
+# rationale still holds and is unchanged in KIND: a genuine hang should still
+# surface on the first verify that touches the module, not 8 days later at a
+# post-completion full review. But that property cannot hold at the FLEET level,
+# because a ceiling a green run cannot clear surfaces nothing but false
+# infra_timeouts. It holds per-module, where each suite's real cost is known.
+# Guarded by tests/scripts/test_fallback_verify_config.py::
+# test_fallback_verify_budget_clears_the_measured_fleet_chain_floor.
+#
+# BE PRECISE ABOUT WHAT THAT GUARD DOES, because overclaiming it would repeat
+# this comment's own original sin. It asserts the measured floor rather than
+# pinning a value, so it catches anyone LOWERING this budget back below
+# 1838.60s. It does NOT detect suite growth: MEASURED_FLEET_SEGMENT_SECS is a
+# frozen literal table, so if the orchestrator segment doubles tomorrow the
+# table still reads 1366.23, the floor still reads 1838.60, and the guard stays
+# green while the budget is once again provably below the honest green path.
+# Detecting that requires RE-MEASUREMENT — the table has no way to measure
+# itself. So the numbers above are a dated snapshot (2026-07-31), not a
+# self-maintaining invariant: when a verify run's own recorded durations diverge
+# from the table, re-measure and update BOTH the table and this derivation. (A
+# durations-based growth check would need to read a recent run's recorded
+# per-segment times rather than a literal; that is deliberately not built here —
+# the point is that nothing currently performs it, so a human must.)
+#
+# NOTE: this buys headroom, it does not fix the trend. orchestrator's suite
+# alone grew to 1366s; if it keeps growing, the answer is scoping verify to the
+# task's declared modules — which is what tests/scripts/orchestrator.yaml now
+# does for this very fallback path (task 3350) — not raising this number again.
 verify_command_timeout_secs: 3600
 verify_cold_command_timeout_secs: 5400
 
@@ -102,6 +413,39 @@ verify_cold_preprovision_command: "uv sync --all-packages"
 # restarted onto it (2501's code default derives a per-project path itself;
 # invariant I3 preserves this explicit override until then).
 verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
+
+# Dispatch-admission gate (PsiAdmissionConfig; tasks 2327/2328). PROVISIONAL
+# TUNING, Leo 2026-08-03 — applied to BOTH this project and reify so the two
+# heavyweights on this shared 32-core host throttle symmetrically. Green-tier
+# hot-reloadable, so retune via reload_config without a restart.
+#
+# cpu_some_avg10: the shipped default 85.0 has NEVER fired on this host. Measured
+# CPU PSI `some` avg10, two 1 Hz samples: 2026-07-31 (load ~85) min 5.5 / med 46.3
+# / max 68.9; 2026-08-03 (load ~190) min 62.2 / med 66.8 / max 74.1. The
+# distribution SLIDES with load rather than spreading, so every value below 62 is
+# a total gate on a busy day and every value above 69 is dead on a quiet one.
+# Fraction of ticks the gate would hold — 55: 22.2%/100%, 60: 13.9%/100%,
+# 65: 1.9%/68.1%, 70: 0.0%/13.5%, 75: 0%/0%. 70 is the only value inert when
+# quiet yet engaged when busy. NOTE CPU PSI `full` is always 0.00 by kernel
+# definition (something is always runnable) — only `some` is usable for CPU.
+#
+# min_inflight_floor: raised 1 -> 3. The gate defers NEW dispatch while saturated;
+# in-flight drains only as tasks finish, so the floor is "always allow dispatch
+# below N", a safety net rather than a target. It is PER-ORCHESTRATOR, and seven
+# orchestrator services run on this host.
+#
+# mem_some_avg10 (15.0), mem_full_avg10 (3.0) and io_some_avg10 (40.0) LEFT AT
+# DEFAULTS deliberately — mem_full=3.0 is exactly the operator's P1 target
+# expressed as a threshold, and both memory axes are correctly specified as hard
+# trips that should fire only when P1 is actually breached.
+#
+# DURABLE FIX PENDING: task 3590 adds a runqueue-ratio axis, because a fixed
+# CPU-PSI threshold is fragile — the variable tracks load instead of
+# discriminating it (runqueue ratio: 2.4x quiet vs 7.1x busy, ~3x separation
+# where CPU PSI gives ~1.4x).
+psi_admission:
+  cpu_some_avg10: 70.0
+  min_inflight_floor: 3
 
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
@@ -265,6 +609,50 @@ git:
       command: "pytest -m integration"
       cwd: "fused-memory"
       fix_task_priority: "medium"
+    # PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the ported warm-lane bash
+    # bucket moves OFF the verify hot path and onto this lane — the escape
+    # plans/warm-lane-infra-repatriation-prd.md documented for exactly this
+    # case. Two grounds, both recorded in orchestrator/tests/warm-lane/README.md:
+    #   (1) Half the original justification is CONSUMED. q4's first reason was
+    #       that leaf γ changes warm-lane-gc.sh's core predicate and needed this
+    #       coverage on its verify leg. γ IS task 3075 — it has LANDED, with its
+    #       verify green and this coverage in place.
+    #   (2) The surviving cost ground inverted. Measured 289.58s for the 12
+    #       items at loadavg 128.72 (1-min, 32 cores) on 2026-08-01 — 6.2x the
+    #       README's 47s module baseline. A LOAD-QUALIFIED figure, never to be
+    #       quoted as an unloaded one. ``xdist_group('warm_lane_bash')`` pins
+    #       all 12 items to ONE worker by design, so the cost is fully additive
+    #       to the verify critical path and gains nothing from ``-n auto``.
+    #
+    # COUPLING — the two edits below NEVER move independently:
+    #   (a) orchestrator/pyproject.toml addopts  -m 'not warm_lane_bash'
+    #   (b) this entry                           -m warm_lane_bash
+    # Landing (a) without (b) is silent ZERO coverage — the "appearance of
+    # coverage without the fact of it" q4 originally refused, and leaf κ deletes
+    # reify's originals on the strength of this suite being green.
+    # orchestrator/tests/test_warm_lane_bash_bucket_placement.py asserts the
+    # biconditional and is deliberately NOT marked warm_lane_bash, so it keeps
+    # running on the hot path and cannot deselect itself.
+    #
+    # A CLI ``-m`` overrides the pyproject ``-m`` (last wins) — the same
+    # mechanism the qdrant-integration entry above already relies on. The
+    # confirm re-run adds ``-p no:xdist -o addopts=`` (_serial_pytest_str),
+    # which clears addopts but leaves this CLI ``-m`` intact, so the red-path
+    # confirmation still selects exactly this bucket.
+    #
+    # RELOAD ASYMMETRY: offline_lane_commands IS green-tier hot-reloadable
+    # (RELOADABLE_FIELDS, orchestrator/src/orchestrator/config.py) — unlike
+    # offline_lane_enabled above, this entry takes effect via
+    # mcp__escalation__reload_config with NO restart. The paired addopts change
+    # lands with the merge and needs no reload at all.
+    #
+    # fix_task_priority is "high" (vs qdrant's "medium"): leaf κ deletes reify's
+    # originals on this suite's green, so a red here must not sit in a
+    # low-priority queue.
+    - name: warm-lane-bash
+      command: "pytest -m warm_lane_bash"
+      cwd: "orchestrator"
+      fix_task_priority: "high"
 
 # Variable-depth speculative verify placement (task 2359) — ACTIVATE the deep
 # probe (operator decision, 2026-07-19). probe_fraction=0.5: half of second-slot

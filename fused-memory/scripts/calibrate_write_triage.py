@@ -177,6 +177,82 @@ def build_pair_sets(records: list[dict[str, Any]]) -> dict[str, list[dict[str, s
     }
 
 
+def _classify_pair(left: Mapping[str, Any], right: Mapping[str, Any]) -> str:
+    """Name the pair class of one unordered pair — ``build_pair_sets``' rule.
+
+    ``build_pair_sets`` is deliberately left untouched (its three-class
+    return shape is bound by ten-plus tests and its output is the pooled
+    calibration of record, so this task's change stays provably additive).
+    That leaves the rule stated twice, so
+    ``TestPartitionPairsByCategory.test_classification_matches_build_pair_sets_within_a_category``
+    pins the two against each other on the same records: a divergence in
+    what counts as a hard negative fails the suite rather than silently
+    calibrating a category against a different population.
+    """
+    if left['cluster_id'] != right['cluster_id']:
+        return 'unrelated_pairs'
+    if left['label'] in _NEGATIVE_LABELS or right['label'] in _NEGATIVE_LABELS:
+        return 'hard_negative_pairs'
+    return 'true_dup_pairs'
+
+
+def partition_pairs_by_category(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bucket the same three pair classes per Mem0 category.
+
+    A SIBLING of ``build_pair_sets``, not a replacement: the pooled
+    measurement is the current calibration of record and must stay
+    byte-identical, so the per-category evidence is added rather than
+    substituted.
+
+    **Cross-category pairs are excluded, and the exclusion is counted.**
+    ``audit_duplicate_memories.fetch_ann_neighbors`` pushes the querying
+    record's own category into every Qdrant query as a payload filter, so a
+    cross-category ANN pair is structurally impossible rather than merely
+    filtered later. Calibrating a category's cutoff against pairs the
+    consumer can never form would measure the wrong population. The count
+    is emitted as ``cross_category_dropped`` rather than absorbed silently,
+    matching this script's standing rule that every dropped measurement is
+    a reported number.
+
+    A record with a missing or empty ``category`` forms no pair at all: it
+    has no bucket to belong to, and guessing one would invent the very
+    label the calibration is supposed to measure. Those drops are counted
+    the same way.
+
+    Returns ``{'by_category': {category: {<three classes>}},
+    'cross_category_dropped': int}``. Every category present in the input
+    appears in ``by_category`` even when it forms no pairs — omission would
+    read as "not measured" rather than "measured, and empty".
+    """
+    by_category: dict[str, dict[str, list[dict[str, str]]]] = {}
+    for record in records:
+        category = record.get('category')
+        if category:
+            by_category.setdefault(str(category), {
+                'true_dup_pairs': [], 'unrelated_pairs': [], 'hard_negative_pairs': [],
+            })
+
+    cross_category_dropped = 0
+    n = len(records)
+    for i in range(n):
+        left = records[i]
+        left_category = left.get('category')
+        for j in range(i + 1, n):
+            right = records[j]
+            right_category = right.get('category')
+            if not left_category or not right_category or left_category != right_category:
+                cross_category_dropped += 1
+                continue
+            a, b = sorted((str(left['memory_id']), str(right['memory_id'])))
+            by_category[str(left_category)][_classify_pair(left, right)].append(
+                {'a': a, 'b': b},
+            )
+
+    return {'by_category': by_category, 'cross_category_dropped': cross_category_dropped}
+
+
 # ---------------------------------------------------------------------------
 # Similarity + distribution statistics
 # ---------------------------------------------------------------------------
@@ -249,6 +325,31 @@ def summarize_distribution(scores: Sequence[float]) -> dict[str, Any]:
 REASON_EMPTY_CLASS = 'empty_class'
 REASON_NOT_SEPARABLE = 'not_separable'
 REASON_NO_JUDGE_BAND = 'no_judge_band'
+REASON_INSUFFICIENT_PAIRS = 'insufficient_pairs'
+
+MIN_CATEGORY_PAIRS = 20
+"""Pairs a CATEGORY must contribute, per class, to earn a cutoff of its own.
+
+Not a taste threshold — an exceedance bound. Both band edges are fitted to a
+single order statistic of a small sample: ``t_high`` is the smallest duplicate
+strictly above the observed MAXIMUM negative, and ``t_low`` is the duplicate
+p05, which under :func:`_order_statistic`'s nearest-rank rule IS the sample
+minimum for every n <= 20. For n exchangeable draws, a fresh draw falls outside
+the sample's observed extreme with expected probability ``1/(n+1)``. So 20
+pairs pin the expected leak past either fitted edge at <= ~4.8%; at 4 pairs it
+is ~20%, and a cutoff fitted there is a coin-flip dressed as a measurement.
+
+Applied ONLY per category (:func:`derive_bands_per_category`), never to the
+pooled derivation: the pooled band is the calibration of record and clears this
+bar by orders of magnitude, and re-gating it here would be a second policy in
+a function many callers already bind.
+
+A category that fails the bar is not merely un-preferred — it is UNCALIBRATED,
+absent from ``t_high_by_category``, run on the disclosed pooled fallback, and
+fenced out of ``--apply`` deletion by
+``audit_duplicate_memories.restrict_delete_candidates_for_apply``. That fence
+is about STRENGTH of evidence, so a token sample must not buy past it.
+"""
 
 
 def derive_bands(
@@ -392,6 +493,90 @@ def _band_counts(
     }
 
 
+def derive_bands_per_category(
+    scores_by_category_and_class: Mapping[str, Mapping[str, Sequence[float]]],
+    pooled_t_high: float | None,
+    pooled_t_low: float | None,
+    *,
+    min_dup_pairs: int = MIN_CATEGORY_PAIRS,
+    min_negative_pairs: int = MIN_CATEGORY_PAIRS,
+) -> dict[str, dict[str, Any]]:
+    """Derive one band pair per Mem0 category, delegating to ``derive_bands``.
+
+    No second derivation path: each category's cutoff is exactly as
+    evidence-bound as the pooled one, and refuses on the same terms. A
+    category with no negatives (the measured ``preferences_and_norms`` case
+    — all its records in one cluster) yields ``REASON_EMPTY_CLASS``; one
+    whose negatives reach every duplicate yields ``REASON_NOT_SEPARABLE``.
+    Either way the refusal, not a fabricated number, is the finding.
+
+    On TOP of those, and the one rule that is this function's own: a category
+    too THIN to fit a band gets ``REASON_INSUFFICIENT_PAIRS`` even when the
+    arithmetic happened to produce a number. Separability on a handful of
+    pairs is not evidence of separability — see :data:`MIN_CATEGORY_PAIRS`
+    for the exceedance bound that sets the bar, and why a category that fails
+    it must fall back to the pooled cutoff (and its fence) rather than be
+    promoted to full deletion authority on a token sample. The gate applies
+    only to an entry that DERIVED a cutoff, so ``empty_class`` /
+    ``not_separable`` keep naming the more specific reason they already do.
+
+    *min_dup_pairs* / *min_negative_pairs* exist so a test can exercise the
+    delegation on a small hand-built sample; the recorded calibration is
+    produced at the defaults, and lowering them in a real run would put a
+    number into config that :data:`MIN_CATEGORY_PAIRS` says is not evidence.
+
+    Every category present in the input is present in the output, an
+    uncalibrated one INCLUDED with a null ``t_high`` and its reason code.
+    Omitting it would read as "not measured" rather than "measured, and
+    refused" — the ambiguity this calibration exists to remove.
+
+    ``pooled_t_high_negatives_admitted`` counts the category's OWN negatives
+    that the POOLED cutoff would restate deterministically. That count is
+    the direct evidence for or against one cutoff serving every category. It
+    is ``None`` when there is no pooled band to measure against, since ``0``
+    would read as "measured, and safe".
+    """
+    per_category: dict[str, dict[str, Any]] = {}
+    for category, scores_by_class in scores_by_category_and_class.items():
+        scores = {name: list(scores_by_class.get(name) or []) for name in PAIR_CLASSES}
+        negatives = [s for name in NEGATIVE_PAIR_CLASSES for s in scores[name]]
+        t_high, t_low, reason = derive_bands(scores['true_dup'], negatives)
+        if t_high is not None and (
+            len(scores['true_dup']) < min_dup_pairs or len(negatives) < min_negative_pairs
+        ):
+            # A derived number, WITHDRAWN: the sample is too small for either
+            # fitted edge to mean what a cutoff claims. The refusal replaces
+            # any reason derive_bands returned (including no_judge_band) —
+            # there is no band left to qualify.
+            t_high, t_low, reason = None, None, (
+                f'{REASON_INSUFFICIENT_PAIRS}: {len(scores["true_dup"])} duplicate and '
+                f'{len(negatives)} negative pair(s) measured, below the '
+                f'{min_dup_pairs}/{min_negative_pairs} minimum. A fresh pair falls '
+                f'outside a sample this small\'s observed extreme with expected '
+                f'probability 1/(n+1), and both band edges are fitted to exactly '
+                f'that extreme. Refusing a cutoff the sample size cannot support — '
+                f'this category runs on the disclosed pooled fallback instead.'
+            )
+        admitted = (
+            None if pooled_t_high is None
+            else sum(
+                _band_counts(scores[name], pooled_t_high, pooled_t_low)['deterministic']
+                for name in NEGATIVE_PAIR_CLASSES
+            )
+        )
+        per_category[category] = {
+            'distributions': {
+                name: summarize_distribution(values) for name, values in scores.items()
+            },
+            't_high': t_high,
+            't_low': t_low,
+            'reason': reason,
+            'pair_counts': {name: len(values) for name, values in scores.items()},
+            'pooled_t_high_negatives_admitted': admitted,
+        }
+    return per_category
+
+
 def build_report(
     scores_by_class: Mapping[str, Sequence[float]],
     t_high: float | None,
@@ -399,6 +584,7 @@ def build_report(
     reason: str | None,
     recall: dict[str, Any],
     provenance: dict[str, Any],
+    per_category: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON-serializable calibration report.
 
@@ -413,6 +599,14 @@ def build_report(
     refusal, so they are still emitted. The false-positive tally is then
     ``None`` rather than ``0`` — with no deterministic band, ``0`` would
     read as "measured, and safe".
+
+    ``per_category`` (from ``derive_bands_per_category``) is carried
+    verbatim under ``per_category``. It is strictly ADDITIVE: the pooled
+    numbers above are unchanged by its presence, since the pooled t_high
+    remains the calibration of record and this section is the evidence
+    about whether it is warranted per category. It defaults to
+    present-and-empty rather than absent, because an absent key cannot be
+    told apart from an artifact predating the measurement.
     """
     scores = {name: list(scores_by_class.get(name) or []) for name in PAIR_CLASSES}
 
@@ -424,8 +618,12 @@ def build_report(
         else sum(per_band[name]['deterministic'] for name in NEGATIVE_PAIR_CLASSES)
     )
 
+    per_category = dict(per_category or {})
     run_provenance = dict(provenance)
     run_provenance['pair_counts'] = {name: len(values) for name, values in scores.items()}
+    run_provenance['per_category_pair_counts'] = {
+        category: entry['pair_counts'] for category, entry in per_category.items()
+    }
 
     return {
         'chosen_t_high': t_high,
@@ -436,6 +634,7 @@ def build_report(
             name: summarize_distribution(values) for name, values in scores.items()
         },
         'per_band': per_band,
+        'per_category': per_category,
         'recall_at_k': recall,
         'provenance': run_provenance,
     }
@@ -453,6 +652,7 @@ def write_triage_config_block(
     t_high: float | None,
     t_low: float | None,
     report_path: str,
+    t_high_by_category: Mapping[str, float] | None = None,
 ) -> str:
     """Return *yaml_text* with only its ``write_triage:`` block replaced.
 
@@ -461,15 +661,36 @@ def write_triage_config_block(
     would strip config.yaml's extensive explanatory comments, which are
     load-bearing for operators.
 
-    Raises when either threshold is ``None`` — an uncalibrated run must
-    never put a null threshold into config. The input string is never
-    mutated, so a refusal leaves no partial block behind.
+    Raises when either POOLED threshold is ``None`` — an uncalibrated run
+    must never put a null threshold into config, and a per-category map
+    never licenses one. The input string is never mutated, so a refusal
+    leaves no partial block behind.
+
+    ``t_high_by_category`` carries only the categories whose band was
+    actually DERIVED. A category with no derived cutoff is ABSENT from the
+    map, and that is the only spelling of it: emitting it with a null would
+    give "no evidence for this category" two representations that the
+    reader would then have to disambiguate. An empty map omits the key
+    entirely for the same reason. Keys are sorted, so two runs over the
+    same measurement produce the same bytes.
     """
     if t_high is None or t_low is None:
         raise ValueError(
             f'refusing to write an uncalibrated threshold into config '
             f'(t_high={t_high!r}, t_low={t_low!r}). Leave the section absent so '
             'triage fails open to `stored`.',
+        )
+
+    by_category = ''
+    if t_high_by_category:
+        by_category = (
+            '  # Per-category cutoffs, measured the same way over each category\'s\n'
+            '  # OWN pairs. A category ABSENT here has no derived cutoff — see the\n'
+            "  # report's per_category section for the refusal and its reason.\n"
+            '  t_high_by_category:\n'
+        ) + ''.join(
+            f'    {category}: {t_high_by_category[category]}\n'
+            for category in sorted(t_high_by_category)
         )
 
     block = (
@@ -484,6 +705,7 @@ def write_triage_config_block(
         f'  t_high: {t_high}\n'
         f'  t_low: {t_low}\n'
         f'  calibration_report_path: {report_path}\n'
+        f'{by_category}'
     )
 
     lines = yaml_text.splitlines(keepends=True)
@@ -551,6 +773,22 @@ def render_markdown(report: dict[str, Any]) -> str:
     for name in PAIR_CLASSES:
         b = report['per_band'][name]
         lines.append(f'| {name} | {b["deterministic"]} | {b["judge"]} | {b["store"]} |')
+    per_category = report.get('per_category') or {}
+    if per_category:
+        lines += ['', '## Per-category bands', '',
+                  '| category | n true_dup | n negative | t_high | t_low '
+                  '| pooled t_high admits | reason |',
+                  '|---|---|---|---|---|---|---|']
+        for name in sorted(per_category):
+            entry = per_category[name]
+            counts = entry['pair_counts']
+            lines.append(
+                f'| {name} | {counts["true_dup"]} '
+                f'| {counts["unrelated"] + counts["hard_negative"]} '
+                f'| {entry["t_high"]} | {entry["t_low"]} '
+                f'| {entry["pooled_t_high_negatives_admitted"]} '
+                f'| {entry["reason"] or ""} |',
+            )
     lines += ['', '## Candidate-retrieval recall', '',
               '| k | hits | total | recall |', '|---|---|---|---|']
     for row in report['recall_at_k'].get('per_k', []):
@@ -599,6 +837,24 @@ def run_calibration(
     if reason:
         logger.warning('Band derivation returned no complete calibration: %s', reason)
 
+    # Measured a SECOND way out of the SAME `vectors` — no extra embed calls,
+    # so the O(n) embed budget above is unchanged.
+    partition = partition_pairs_by_category(records)
+    scores_by_category_and_class = {
+        category: {
+            name: [
+                cosine_similarity(vectors[p['a']], vectors[p['b']])
+                for p in buckets[f'{name}_pairs']
+            ]
+            for name in PAIR_CLASSES
+        }
+        for category, buckets in partition['by_category'].items()
+    }
+    per_category = derive_bands_per_category(scores_by_category_and_class, t_high, t_low)
+    for category, entry in sorted(per_category.items()):
+        if entry['reason']:
+            logger.warning('Category %s: %s', category, entry['reason'])
+
     max_k = max(ks) if ks else 0
     retrievals = []
     for record in records:
@@ -613,12 +869,23 @@ def run_calibration(
         })
     recall = compute_recall_at_k(retrievals, list(ks))
 
+    per_category_record_counts: dict[str, int] = {}
+    for record in records:
+        category = record.get('category')
+        if category:
+            per_category_record_counts[str(category)] = (
+                per_category_record_counts.get(str(category), 0) + 1
+            )
+
     run_provenance = dict(provenance)
     run_provenance.setdefault('record_count', len(records))
     run_provenance.setdefault('cluster_count', len({r['cluster_id'] for r in records}))
+    run_provenance.setdefault('per_category_record_counts', per_category_record_counts)
+    run_provenance.setdefault('cross_category_dropped', partition['cross_category_dropped'])
     report = build_report(
         scores_by_class=scores_by_class, t_high=t_high, t_low=t_low,
         reason=reason, recall=recall, provenance=run_provenance,
+        per_category=per_category,
     )
 
     report_path = Path(report_path)
@@ -648,10 +915,13 @@ def build_embed_fn(config: Any) -> Any:
     from openai import OpenAI  # noqa: PLC0415
 
     embedder = config.embedder
-    api_key = embedder.providers.get('openai', {}).get('api_key') if isinstance(
-        getattr(embedder, 'providers', None), dict,
-    ) else None
-    client = OpenAI(api_key=api_key) if api_key else OpenAI()
+    openai_provider = embedder.providers.openai
+    api_key = openai_provider.api_key if openai_provider is not None else None
+    client = (
+        OpenAI(api_key=api_key, base_url=openai_provider.api_url)
+        if openai_provider is not None
+        else OpenAI()
+    )
 
     def embed(memory_id: str, content: str) -> list[float]:
         response = client.embeddings.create(model=embedder.model, input=content)
@@ -758,12 +1028,33 @@ async def _run(args: Any) -> int:
         config_path = Path(args.config) if args.config else (
             Path(__file__).parent.parent / 'config' / 'config.yaml'
         )
+        # Only the categories whose band was actually DERIVED. A refused one
+        # is left ABSENT rather than written as a null, so the consumer reads
+        # "uncalibrated for this category" from one unambiguous signal.
+        derived_by_category = {
+            category: entry['t_high']
+            for category, entry in result['report']['per_category'].items()
+            if entry['t_high'] is not None
+        }
+        refused = sorted(
+            set(result['report']['per_category']) - set(derived_by_category),
+        )
+        if refused:
+            logger.warning(
+                'No per-category cutoff derived for %s — left ABSENT from '
+                't_high_by_category; see the report per_category section for '
+                'each refusal reason.', ', '.join(refused),
+            )
         updated = write_triage_config_block(
             config_path.read_text(), result['t_high'], result['t_low'],
             package_relative(args.report_path),
+            t_high_by_category=derived_by_category,
         )
         config_path.write_text(updated)
-        logger.info('Wrote write_triage block to %s', config_path)
+        logger.info(
+            'Wrote write_triage block to %s (per-category cutoffs: %s)',
+            config_path, ', '.join(sorted(derived_by_category)) or 'none',
+        )
         return 0
     finally:
         await memory.close()

@@ -37,8 +37,10 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import census_trigger, codebook, coder, digest, inventory, sampling  # noqa: E402
-from legibility.config import LegibilityConfig, load_config  # noqa: E402
+from legibility import (  # noqa: E402
+    census_trigger, codebook, coder, digest, inventory, sampling, trickle_state,
+)
+from legibility.config import LegibilityConfig, configure_logging, load_config  # noqa: E402
 
 logger = logging.getLogger('legibility.nightly')
 
@@ -168,10 +170,22 @@ drift fails a test instead of silently mis-charging the budget."""
 def select_digest_sessions(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
     *, rendered: dict[tuple, str] | None = None,
-) -> list[sampling.ScoredRecord]:
-    """The budget-bounded, stratified subset of *target_date*'s sessions to
+) -> sampling.SampleResult:
+    """The budget-bounded, stratified sample of *target_date*'s sessions to
     digest -- :func:`select_scored_records` narrowed by
     ``sampling.stratified_sample``.
+
+    Returns the WHOLE :class:`~legibility.sampling.SampleResult` (the
+    selection is ``.selected``), not just the selection. That is deliberate
+    and load-bearing: this function used to end in ``.selected`` and throw
+    the accounting away, so a night that enumerated real signal and then
+    discarded ALL of it on the byte budget (``selected == []`` with
+    ``budget_skipped > 0``) was indistinguishable from a night with nothing
+    to sample -- which is exactly what happened, unobserved, every night
+    from 2026-07-16 to 2026-07-29 (task 2573 computed ``budget_skipped``;
+    task 2581's consumer here dropped it; task 3270 carries it through).
+    There is deliberately NO ``.selected``-only sibling: leaving the lossy
+    accessor available is the mechanism that produced the incident.
 
     The byte budget (``cfg.budgets.max_daily_digest_bytes``) is charged
     against each candidate's ACTUAL rendered digest size, at exactly the
@@ -213,7 +227,7 @@ def select_digest_sessions(
         cost_fn=sampling.digest_byte_cost_fn(
             max_bytes=DEFAULT_MAX_DIGEST_BYTES, rendered=rendered,
         ),
-    ).selected
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -428,9 +442,15 @@ def _build_escalation_arguments(cfg: LegibilityConfig, summary: str, detail: str
 def _default_poster(url: str, envelope: dict) -> None:
     """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
 
-    ``httpx`` is imported lazily since it is not a ``scripts/`` dependency
-    -- mirrors ``census_trigger.default_status_fetcher``. Raises on any
-    network/HTTP failure; :func:`post_escalation` wraps this best-effort.
+    ``httpx`` is imported lazily so that importing this module -- for its
+    unit-tested pure core -- never needs it, and so the tests can substitute
+    a stub for the real POST. It is NOT lazy for availability: httpx is a
+    direct dependency of ``shared`` (``shared/pyproject.toml``,
+    ``httpx>=0.27``, task 2965), and the systemd unit runs this script under
+    ``uv run --frozen --project shared``, so it is always importable in
+    production. Mirrors ``census_trigger.default_status_fetcher``. Raises on
+    any network/HTTP failure; :func:`post_escalation` wraps this
+    best-effort.
     """
     import httpx
 
@@ -605,6 +625,305 @@ class NightlyResult:
     escalated: bool = False
     reason: str | None = None
 
+    budget_suppressed: bool = False
+    """True when this night found real signal and then discarded ALL of it on
+    the digest-byte budget (``not sample.selected and
+    sample.budget_skipped > 0``) -- NOT a no-change night.
+
+    A structured fact rather than a log line to scrape: the two states are
+    otherwise identical in every observable a caller has (``applied == 0``,
+    ``commit_made is False``, ``exit_code == 0``), which is precisely why the
+    live trickle's 14 fully-suppressed nights (2026-07-16..29) went
+    unnoticed. ``exit_code`` deliberately stays 0 -- see
+    :func:`_report_sample_outcome`."""
+
+    barren_escalated: bool = False
+    """True when THIS run crossed the barren-streak threshold and posted the
+    streak escalation (see :func:`_record_trickle_progress`).
+
+    Distinct from both of its neighbours, and deliberately not folded into
+    either. ``escalated`` covers the decision-8 triggers (extractor crash,
+    coder storm, validation failure, commit failure) plus
+    :func:`_report_sample_outcome`'s per-night suppression notice.
+    ``budget_suppressed`` is a PER-NIGHT fact about one run's sampler
+    accounting. This one is about a WINDOW: N consecutive runs that
+    digested nothing despite real signal arriving. Different predicate,
+    different window, different remedy prompt."""
+
+
+def _report_sample_outcome(
+    cfg: LegibilityConfig,
+    sample: sampling.SampleResult,
+    target_date: date,
+    *,
+    poster=None,
+) -> bool:
+    """Report *sample*'s accounting, loudly if the night was totally
+    suppressed. Returns whether an escalation was posted.
+
+    Always emits the operator's grep anchor at INFO -- what was enumerated,
+    what was dropped and why, what the budget bought -- prefixed with the
+    project id and target date, since one journal interleaves every project's
+    timer. Its visibility depends on ``config.configure_logging()`` being
+    called from ``main()``; the two halves are one contract.
+
+    On ``not sample.selected and sample.budget_skipped > 0`` -- which the
+    :class:`~legibility.sampling.SampleResult` conservation invariant makes
+    exactly "candidates existed and were ALL discarded on the byte budget" --
+    it additionally logs ONE WARNING and posts ONE best-effort
+    :func:`post_escalation`, reusing the decision-8
+    ``escalate_info``/``infra_issue``/severity=info envelope unchanged.
+
+    IT NOW REPORTS BOTH BARREN DOORS AT WARNING, BUT ESCALATES ONLY THE
+    BUDGET ONE PER-NIGHT (task 3340). The sibling door -- ``not
+    sample.selected and sample.budget_skipped <= 0 and
+    sample.below_sampling_cut > 0``, i.e. real signal held back by the
+    SAMPLING cut, which never even reached the budget phase -- was
+    entirely unobserved before and now gets a WARNING naming its OWN
+    remedy (``sampling.top_fraction`` / ``sampling.per_stratum_min``,
+    never ``budgets.max_daily_digest_bytes``; ``SampleResult``'s docstring
+    is explicit that conflating the two is wrong). It posts no per-night
+    escalation: escalation for BOTH doors is owned by the edge-triggered
+    barren-STREAK signal in :func:`_record_trickle_progress`, so per-night
+    alarm volume does not rise.
+
+    Two deliberate non-behaviors. It does NOT touch the exit code: a non-zero
+    exit flips ``legibility-trickle@<project>.service`` to ``Result=failed``,
+    so ``check_trickle_liveness.sh`` would fail every night for a timer that
+    is running perfectly -- trading a silent-failure mode for a permanent
+    false alarm, and burning the one signal that currently works. And it does
+    not stop the run: a suppressed night has no reason to skip the census
+    trigger. Partial truncation (``budget_skipped > 0`` with a non-empty
+    selection) stays at INFO too -- that is the budget working as designed,
+    and it is fully visible in the always-on line.
+
+    IT REPEATS EVERY NIGHT, BY DESIGN -- know this before you tune it.
+    Unlike the other decision-8 triggers (extractor crash, coder storm,
+    commit failure), which fire on exceptional events, total suppression is
+    caused by PERSISTENT CONFIG STATE: ``budgets.max_daily_digest_bytes``
+    too small for this project's session sizes. An undersized budget nobody
+    fixes therefore posts one info escalation per project per night, for as
+    long as it stays unfixed, under the same synthetic
+    ``task_id=legibility-trickle-<project_id>``
+    (:func:`_build_escalation_arguments`).
+
+    Repetition was chosen over de-duplicating repeats behind a state file
+    for two reasons. It is self-limiting by construction -- the escalation
+    stops the very first night the budget is raised, and the operator action
+    that stops it is exactly the action that fixes the underlying data loss,
+    so a nightly reminder is proportionate to a project silently digesting
+    NOTHING. And a "only escalate when the previous run was not suppressed"
+    latch has the worse failure mode for this specific incident: whoever
+    misses the single first-night escalation gets silence thereafter, which
+    is the precise pathology (14 indistinguishable nights, 2026-07-16..29)
+    this whole task exists to end. The recurring-alarm-fatigue risk is real
+    and accepted with eyes open; the WARNING line is the per-night signal
+    either way, and the severity stays ``info`` so this never gates
+    anything. If the repeats do become noise before the budget is fixed,
+    latch them here rather than downgrading the WARNING.
+    """
+    summary_line = sampling.format_sample_summary_line(
+        sample, max_bytes=cfg.budgets.max_daily_digest_bytes,
+    )
+    logger.info(
+        'legibility trickle sampler: project=%s date=%s %s',
+        cfg.project_id, target_date.isoformat(), summary_line,
+    )
+
+    if not sample.selected and sample.budget_skipped <= 0 and sample.below_sampling_cut > 0:
+        # The SIBLING barren door, unobserved before task 3340: real,
+        # distinct, non-duplicate signal ranked below its stratum's cut and
+        # never reached the budget phase at all. WARNING only -- no
+        # per-night escalation, because the barren STREAK owns escalation
+        # for this mode (see _record_trickle_progress), so per-night alarm
+        # volume does not rise for a condition that, like suppression,
+        # repeats every night until someone changes config.
+        logger.warning(
+            'legibility trickle night produced nothing: project=%s date=%s %s. '
+            'Real confusion signal WAS found and then held back by the '
+            'SAMPLING CUT (below_sampling_cut=%d, budget_skipped=0) -- this '
+            'is NOT a no-change night, and raising '
+            'budgets.max_daily_digest_bytes will not help: these records '
+            'never competed for budget. Raise sampling.top_fraction or '
+            'sampling.per_stratum_min instead.',
+            cfg.project_id, target_date.isoformat(), summary_line,
+            sample.below_sampling_cut,
+        )
+        return False
+
+    if sample.selected or sample.budget_skipped <= 0:
+        return False
+
+    summary = (
+        f'legibility trickle night totally suppressed by the digest byte budget: '
+        f'{sample.budget_skipped} candidate(s) discarded, 0 selected'
+    )
+    detail = (
+        f'project={cfg.project_id} date={target_date.isoformat()} {summary_line}. '
+        f'Real confusion signal WAS found and then entirely discarded on '
+        f'budgets.max_daily_digest_bytes='
+        f'{cfg.budgets.max_daily_digest_bytes} -- this is NOT a no-change '
+        f'night. Either the budget is too small for this project\'s session '
+        f'sizes or the cost basis is over-charging; raise the budget or '
+        f'investigate the sampler cost basis.'
+    )
+    logger.warning('%s -- %s', summary, detail)
+    return post_escalation(cfg, summary, detail, poster=poster)
+
+
+def _record_trickle_progress(
+    cfg: LegibilityConfig,
+    sample: sampling.SampleResult,
+    target_date: date,
+    result: NightlyResult,
+    *,
+    recorder=None,
+    poster=None,
+    now: datetime | None = None,
+) -> None:
+    """Record WHY this night went the way it did, best-effort.
+
+    Maps *sample*'s six conservation counters plus *result* onto
+    :func:`trickle_state.record_run`, which classifies the run
+    productive/quiet/barren and folds it into the running barren streak
+    that :mod:`check_trickle_progress` reads. This is the write half of
+    the pair; ``check_trickle_liveness.sh`` still answers the separate
+    "did the unit run" question and is untouched.
+
+    CLASSIFICATION USES THE SAMPLER COUNTERS, so a run that crashed AFTER
+    selecting digests still classifies ``productive``. That is deliberate:
+    crashes are already caught loudly by ``check_trickle_liveness.sh``
+    (``Result=failed``) and by the decision-8 escalations, so the progress
+    probe answers the DIFFERENT question "is signal flowing through the
+    pipeline". The recorded ``exit_code`` preserves the crash fact for an
+    operator reading the state file, so nothing is hidden.
+
+    BEST-EFFORT, ALWAYS: the whole call is wrapped in ``try/except`` ->
+    one WARNING, swallowed — mirroring :func:`post_escalation`'s
+    established contract. A state-write failure must never mask or replace
+    the run's own outcome; observability must not become a new failure
+    mode.
+    """
+    record = recorder if recorder is not None else trickle_state.record_run
+    recorded_at = now if now is not None else datetime.now(timezone.utc)
+    try:
+        doc = record(
+            cfg.project_id,
+            target_date=target_date,
+            recorded_at=recorded_at,
+            exit_code=result.exit_code,
+            total_records=sample.total_records,
+            zero_signal_dropped=sample.zero_signal_dropped,
+            dedupe_collapsed=sample.dedupe_collapsed,
+            below_sampling_cut=sample.below_sampling_cut,
+            budget_skipped=sample.budget_skipped,
+            selected_count=len(sample.selected),
+            applied=result.applied,
+            commit_made=result.commit_made,
+            budget_suppressed=result.budget_suppressed,
+        )
+    except Exception as exc:  # noqa: BLE001 — deliberately total
+        logger.warning(
+            'legibility trickle: could not record run state for project=%s '
+            'date=%s (%s: %s); the run itself is unaffected, but the '
+            'progress probe will read a stale streak',
+            cfg.project_id, target_date.isoformat(), type(exc).__name__, exc,
+        )
+        return
+
+    _escalate_barren_streak(cfg, doc, target_date, result, poster=poster)
+
+
+def _escalate_barren_streak(
+    cfg: LegibilityConfig,
+    doc,
+    target_date: date,
+    result: NightlyResult,
+    *,
+    poster=None,
+) -> None:
+    """Post ONE escalation on the run where the barren streak first REACHES
+    :data:`trickle_state.DEFAULT_MAX_BARREN_RUNS`. Best-effort; mutates
+    *result* in place.
+
+    EDGE-TRIGGERED BY EXACT EQUALITY, not ``>=``. That is what makes it
+    fire once per streak and re-arm only after a productive or quiet run
+    resets the counter to 0. Level-triggering would re-fire every night
+    from the threshold on, re-opening task 3270's alarm-fatigue debate;
+    a one-shot latch would instead reproduce the worse failure mode 3270
+    explicitly rejected -- whoever misses the single first escalation gets
+    silence thereafter, which is the precise pathology (14
+    indistinguishable nights) this whole task exists to end. Re-arming
+    after a reset is the middle path, and it is exactly what
+    ``_report_sample_outcome``'s own docstring invited ("If the repeats do
+    become noise before the budget is fixed, latch them here").
+
+    This is a GENUINELY DIFFERENT signal from that per-night notice, not a
+    duplicate of it: different predicate (a window, not one run),
+    different door coverage (BOTH barren doors, not just the budget one),
+    and a different remedy prompt.
+
+    ``result.exit_code`` IS NOT TOUCHED. A non-zero exit flips
+    ``legibility-trickle@<project>.service`` to ``Result=failed``, so
+    ``check_trickle_liveness.sh`` would fail every night for a timer that
+    is running perfectly -- trading a silent-failure mode for a permanent
+    false alarm and burning the one signal that currently works. This is
+    the identical refusal :func:`_report_sample_outcome` already records,
+    for the identical reason.
+    """
+    if not isinstance(doc, dict):
+        return
+    if doc.get('outcome') != trickle_state.OUTCOME_BARREN:
+        return
+    if doc.get('consecutive_barren_runs') != trickle_state.DEFAULT_MAX_BARREN_RUNS:
+        return
+
+    counters = doc.get('counters') or {}
+    budget_skipped = counters.get('budget_skipped') or 0
+    below_sampling_cut = counters.get('below_sampling_cut') or 0
+
+    # DOOR-SPECIFIC remedy. SampleResult's docstring (sampling.py) is
+    # explicit that the two doors have different fixes: raising the byte
+    # budget recovers a budget_skipped record and does nothing whatever for
+    # a below_sampling_cut one. Never conflate them.
+    remedies = []
+    if budget_skipped > 0:
+        remedies.append(
+            'raise budgets.max_daily_digest_bytes (candidates competed for '
+            'budget and were ALL discarded on it)'
+        )
+    if below_sampling_cut > 0:
+        remedies.append(
+            'raise sampling.top_fraction or sampling.per_stratum_min (these '
+            'records ranked below their stratum cut and never competed for '
+            'budget, so a bigger byte budget will not recover them)'
+        )
+    remedy = '; '.join(remedies) or (
+        'inspect the recorded counters: no door counter is set, which should '
+        'be impossible for a barren run'
+    )
+
+    summary = (
+        f'legibility trickle has produced nothing for '
+        f'{trickle_state.DEFAULT_MAX_BARREN_RUNS} consecutive runs'
+    )
+    detail = (
+        f'project={cfg.project_id} date={target_date.isoformat()} '
+        f'outcome=barren consecutive_barren_runs='
+        f'{doc.get("consecutive_barren_runs")} '
+        f'below_sampling_cut={below_sampling_cut} '
+        f'budget_skipped={budget_skipped} '
+        f'last_productive_at={doc.get("last_productive_at")}. '
+        f'Real confusion signal reached the sampling/budget stage on each of '
+        f'those runs and NOTHING was digested -- three consecutive means '
+        f'persistent config state, not a run of bad luck. Remedy: {remedy}. '
+        f'Probe on demand with: check_trickle_progress.py '
+        f'{cfg.project_id} {trickle_state.DEFAULT_MAX_BARREN_RUNS}'
+    )
+    logger.warning('%s -- %s', summary, detail)
+    if post_escalation(cfg, summary, detail, poster=poster):
+        result.barren_escalated = True
+
 
 def run_nightly(
     *,
@@ -617,6 +936,7 @@ def run_nightly(
     status_fetcher=None,
     poster=None,
     committer=None,
+    recorder=None,
 ) -> NightlyResult:
     """Run one full nightly trickle pass for a single project (PRD §5.5).
 
@@ -625,7 +945,17 @@ def run_nightly(
     two is expected to identify it, mirroring the ``nightly.py run`` CLI's
     ``--config``/``--project-id`` pair. *target_date* defaults to
     yesterday UTC; *projects_root* defaults to ``~/.claude/projects``.
-    *now* threads through to :func:`evaluate_census_step`'s clock seam.
+    *now* threads through to :func:`evaluate_census_step`'s clock seam and
+    to the run-state recorder's ``recorded_at``.
+
+    *recorder* (default :func:`trickle_state.record_run`) is the run-state
+    seam, alongside the existing ``invoke``/``status_fetcher``/``poster``/
+    ``committer`` ones. Called exactly once per run from a ``finally``
+    spanning every exit path, so the progress probe
+    (``check_trickle_progress.py``) can tell a barren night from a quiet
+    one — the distinction ``check_trickle_liveness.sh`` structurally
+    cannot make, and the reason 2026-07-16..29 went unnoticed for 14
+    nights.
 
     Happy-path wiring only in this step: inventory+sample -> digest ->
     code -> merge -> docs-only commit (only when the merge actually
@@ -654,133 +984,184 @@ def run_nightly(
     # that render instead of paying for it twice. Rendering is super-linear in
     # signal-item count, so this is roughly a 2x on the job's dominant cost.
     rendered: dict[tuple, str] = {}
-    selected = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
-    digests, extractor_failures = build_digests(selected, rendered=rendered)
+    sample = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
 
-    if extractor_failures:
-        # A digest builder raise is exceptional (build_digests already
-        # isolates per-record failures, so a non-empty extractor_failures
-        # means something crashed outright): fail loud (decision 8) and
-        # never proceed to coder/merge/commit.
-        summary = (
-            f'legibility trickle extractor crashed on {len(extractor_failures)} session(s)'
-        )
-        detail = '; '.join(f'{session}: {reason}' for session, reason in extractor_failures)
-        escalated = post_escalation(cfg, summary, detail, poster=poster)
-        return NightlyResult(
-            exit_code=1,
-            escalated=escalated,
-            reason=summary,
-        )
-
-    codebook_path = Path(cfg.project_root) / _CODEBOOK_RELPATH
-    try:
-        cb = codebook.load(codebook_path)
-    except FileNotFoundError:
-        # First-ever nightly run for a project onboarded without a
-        # pre-seeded codebook: start from an empty v2 document rather than
-        # letting a bare FileNotFoundError escape -- this module's
-        # contract is a clean fail-loud escalation or a graceful default,
-        # never an uncaught traceback. codebook.dump() below (and
-        # _git_commit_docs_only's own never-tracked-path handling) takes
-        # it from there once/if this run's coding actually applies
-        # something.
-        logger.info(
-            'legibility trickle: no codebook at %s yet, starting from an empty v2 document',
-            codebook_path,
-        )
-        cb = {'version': 2, 'entries': [], 'candidates': []}
-
-    run = coder.code_digests(
-        digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
+    # The operator's grep anchor plus the total-suppression signal, emitted on
+    # EVERY run whatever the outcome. Placed BEFORE the digest stage so the
+    # numbers are reported even when a later stage fails loud and returns
+    # early. Its VISIBILITY depends on main()'s config.configure_logging()
+    # call -- the journal's root logger defaults to WARNING, so an INFO line
+    # nobody configured for is an INFO line nobody sees; the two halves are
+    # one contract.
+    budget_suppressed = not sample.selected and sample.budget_skipped > 0
+    suppression_escalated = _report_sample_outcome(
+        cfg, sample, target_date, poster=poster,
     )
 
-    if run.status == 'failure':
-        # >50% of digests failed to code (PRD §5.3/§6.8 storm threshold):
-        # fail loud (decision 8) and skip merge/dump/commit entirely -- the
-        # codebook is left untouched rather than partially applied.
-        summary = f'legibility trickle coder storm: {run.failed}/{run.total} digests failed'
-        detail = '; '.join(f'{session}: {reason}' for session, reason in run.failures)
-        escalated = post_escalation(cfg, summary, detail, poster=poster)
-        return NightlyResult(
-            exit_code=1,
-            coder_status=run.status,
-            escalated=escalated,
-            reason=summary,
+    # ONE recording point for all five return sites AND an unexpected
+    # raise: a single try/finally cannot forget a branch, the way five
+    # separate record calls could. Two load-bearing, non-obvious
+    # subtleties, both deliberate:
+    #
+    # (1) `return result` binds the OBJECT REFERENCE before `finally`
+    #     runs, so _record_trickle_progress mutating `result` in place
+    #     is visible to the caller — that is how the barren-streak
+    #     escalation flag reaches the returned NightlyResult.
+    # (2) The pre-seeded sentinel below is what gets RECORDED when a
+    #     stage raises: exit_code=1, honest about the crash, and its
+    #     counters are still the real sampler numbers because `sample`
+    #     was computed before the try. Recording only on the happy path
+    #     would let the progress probe read a stale streak as healthy
+    #     after repeated crashes.
+    result = NightlyResult(
+        exit_code=1,
+        budget_suppressed=budget_suppressed,
+        escalated=suppression_escalated,
+        reason='legibility trickle run crashed before completing',
+    )
+    try:
+        digests, extractor_failures = build_digests(sample.selected, rendered=rendered)
+
+        if extractor_failures:
+            # A digest builder raise is exceptional (build_digests already
+            # isolates per-record failures, so a non-empty extractor_failures
+            # means something crashed outright): fail loud (decision 8) and
+            # never proceed to coder/merge/commit.
+            summary = (
+                f'legibility trickle extractor crashed on {len(extractor_failures)} session(s)'
+            )
+            detail = '; '.join(f'{session}: {reason}' for session, reason in extractor_failures)
+            escalated = post_escalation(cfg, summary, detail, poster=poster)
+            result = NightlyResult(
+                exit_code=1,
+                escalated=escalated or suppression_escalated,
+                budget_suppressed=budget_suppressed,
+                reason=summary,
+            )
+            return result
+
+        codebook_path = Path(cfg.project_root) / _CODEBOOK_RELPATH
+        try:
+            cb = codebook.load(codebook_path)
+        except FileNotFoundError:
+            # First-ever nightly run for a project onboarded without a
+            # pre-seeded codebook: start from an empty v2 document rather than
+            # letting a bare FileNotFoundError escape -- this module's
+            # contract is a clean fail-loud escalation or a graceful default,
+            # never an uncaught traceback. codebook.dump() below (and
+            # _git_commit_docs_only's own never-tracked-path handling) takes
+            # it from there once/if this run's coding actually applies
+            # something.
+            logger.info(
+                'legibility trickle: no codebook at %s yet, starting from an empty v2 document',
+                codebook_path,
+            )
+            cb = {'version': 2, 'entries': [], 'candidates': []}
+
+        run = coder.code_digests(
+            digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
         )
 
-    applied = 0
-    for record in run.records:
-        cb, stats = codebook.apply_coding_record(cb, record)
-        applied += stats['matched'] + stats['candidates_applied']
+        if run.status == 'failure':
+            # >50% of digests failed to code (PRD §5.3/§6.8 storm threshold):
+            # fail loud (decision 8) and skip merge/dump/commit entirely -- the
+            # codebook is left untouched rather than partially applied.
+            summary = f'legibility trickle coder storm: {run.failed}/{run.total} digests failed'
+            detail = '; '.join(f'{session}: {reason}' for session, reason in run.failures)
+            escalated = post_escalation(cfg, summary, detail, poster=poster)
+            result = NightlyResult(
+                exit_code=1,
+                coder_status=run.status,
+                escalated=escalated or suppression_escalated,
+                budget_suppressed=budget_suppressed,
+                reason=summary,
+            )
+            return result
 
-    validation_errors = codebook.validate(cb)
-    if validation_errors:
-        # A merge that leaves the codebook failing its own validator is
-        # exceptional on par with the other decision-8 triggers (extractor
-        # crash / coder storm / commit failure): silently discarding real
-        # coding work behind a green exit_code=0 would mask every night's
-        # sightings from here on. Fail loud instead -- codebook_path is
-        # left untouched (dump/commit are both skipped).
-        summary = (
-            f'legibility trickle merged codebook failed validation '
-            f'({len(validation_errors)} error(s))'
-        )
-        detail = '; '.join(validation_errors)
-        escalated = post_escalation(cfg, summary, detail, poster=poster)
-        return NightlyResult(
-            exit_code=1,
+        applied = 0
+        for record in run.records:
+            cb, stats = codebook.apply_coding_record(cb, record)
+            applied += stats['matched'] + stats['candidates_applied']
+
+        validation_errors = codebook.validate(cb)
+        if validation_errors:
+            # A merge that leaves the codebook failing its own validator is
+            # exceptional on par with the other decision-8 triggers (extractor
+            # crash / coder storm / commit failure): silently discarding real
+            # coding work behind a green exit_code=0 would mask every night's
+            # sightings from here on. Fail loud instead -- codebook_path is
+            # left untouched (dump/commit are both skipped).
+            summary = (
+                f'legibility trickle merged codebook failed validation '
+                f'({len(validation_errors)} error(s))'
+            )
+            detail = '; '.join(validation_errors)
+            escalated = post_escalation(cfg, summary, detail, poster=poster)
+            result = NightlyResult(
+                exit_code=1,
+                applied=applied,
+                coder_status=run.status,
+                escalated=escalated or suppression_escalated,
+                budget_suppressed=budget_suppressed,
+                reason=summary,
+            )
+            return result
+
+        commit_made = False
+        if applied > 0:
+            codebook.dump(cb, codebook_path)
+            if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
+                message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
+                commit_result = commit_fn(cfg.project_root, [_CODEBOOK_RELPATH], message)
+                if not commit_result.ok:
+                    # The dump already landed in the working tree; only the
+                    # commit itself failed (e.g. a persistent ref-lock after
+                    # exhausted retries). Fail loud (decision 8) -- the
+                    # escalation + non-zero exit is the signal; the uncommitted
+                    # dump is left in place rather than reverted.
+                    summary = 'legibility trickle codebook commit failed'
+                    escalated = post_escalation(cfg, summary, commit_result.stderr, poster=poster)
+                    result = NightlyResult(
+                        exit_code=1,
+                        applied=applied,
+                        coder_status=run.status,
+                        escalated=escalated or suppression_escalated,
+                        budget_suppressed=budget_suppressed,
+                        reason=summary,
+                    )
+                    return result
+                commit_made = True
+
+        if not commit_made:
+            # Covers every case that reaches here without committing: an
+            # empty/dedup-only coding run (applied == 0), or a merge that
+            # applied but produced a byte-identical dump (git status
+            # unchanged) -- both genuine no-change nights, never conflated
+            # with a coding failure (PRD §6.7). A merged-but-invalid codebook
+            # is NOT a no-change night -- it fails loud above instead, before
+            # reaching here.
+            logger.info(
+                'legibility trickle: no-change night: nothing committed (applied=%d)', applied,
+            )
+
+        census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
+
+        result = NightlyResult(
+            exit_code=0,
+            commit_made=commit_made,
             applied=applied,
             coder_status=run.status,
-            escalated=escalated,
-            reason=summary,
+            census_line=census_line,
+            census_fire=census_fire,
+            escalated=suppression_escalated,
+            budget_suppressed=budget_suppressed,
         )
-
-    commit_made = False
-    if applied > 0:
-        codebook.dump(cb, codebook_path)
-        if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
-            message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
-            commit_result = commit_fn(cfg.project_root, [_CODEBOOK_RELPATH], message)
-            if not commit_result.ok:
-                # The dump already landed in the working tree; only the
-                # commit itself failed (e.g. a persistent ref-lock after
-                # exhausted retries). Fail loud (decision 8) -- the
-                # escalation + non-zero exit is the signal; the uncommitted
-                # dump is left in place rather than reverted.
-                summary = 'legibility trickle codebook commit failed'
-                escalated = post_escalation(cfg, summary, commit_result.stderr, poster=poster)
-                return NightlyResult(
-                    exit_code=1,
-                    applied=applied,
-                    coder_status=run.status,
-                    escalated=escalated,
-                    reason=summary,
-                )
-            commit_made = True
-
-    if not commit_made:
-        # Covers every case that reaches here without committing: an
-        # empty/dedup-only coding run (applied == 0), or a merge that
-        # applied but produced a byte-identical dump (git status
-        # unchanged) -- both genuine no-change nights, never conflated
-        # with a coding failure (PRD §6.7). A merged-but-invalid codebook
-        # is NOT a no-change night -- it fails loud above instead, before
-        # reaching here.
-        logger.info(
-            'legibility trickle: no-change night: nothing committed (applied=%d)', applied,
+        return result
+    finally:
+        _record_trickle_progress(
+            cfg, sample, target_date, result,
+            recorder=recorder, poster=poster, now=now,
         )
-
-    census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
-
-    return NightlyResult(
-        exit_code=0,
-        commit_made=commit_made,
-        applied=applied,
-        coder_status=run.status,
-        census_line=census_line,
-        census_fire=census_fire,
-    )
 
 
 def _parse_date(value: str) -> date:
@@ -807,7 +1188,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     ``legibility.yaml`` path (via :func:`resolve_config_path`) and return
     0, or print an error to stderr and return 1 if no project matches --
     this is what ``install-trickle-timer.sh`` shells out to.
+
+    Configures logging FIRST, before arg parsing, so the summary line and
+    every other INFO line this module emits is actually visible in the
+    journal (see :func:`legibility.config.configure_logging` — without it
+    root sits at WARNING under the systemd ExecStart and they are all
+    dropped). Doing it here rather than at import keeps pytest/caplog and
+    any library importer untouched.
     """
+    configure_logging()
+
     parser = argparse.ArgumentParser(
         prog='nightly.py', description='Legibility nightly trickle pipeline (PRD task ε).',
     )

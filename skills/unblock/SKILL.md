@@ -315,31 +315,143 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
    - `status: "done"` or `status: "already_merged"` → **terminal success.** Thread the merge commit SHA:
      - Normal `done`: SHA is in `result["commit"]`.
-     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive from `git log main --oneline | head -5` or fall back to `done_provenance={"note": "merge already present on main"}`.
+     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same exact-subject search the canonical check uses — `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` — or, if that comes back empty, fall back to `done_provenance={"note": "merge already present on main"}`. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
 
      Go directly to step 8.
 
+   - `status: "superseded"` → **this submission was absorbed into a coalesced train, or replaced
+     by a generation-advance resubmission, before the bounded wait returned.** Absorption
+     resolves the waiting future directly (`MergeOutcome('superseded', superseded_by=train_id)`,
+     `orchestrator/src/orchestrator/merge_queue.py:12703`) and `merge_request` returns that status
+     verbatim (`escalation/server.py:1733`), so with `wait_secs=100` this is the *ordinary*
+     absorption outcome, not an exotic one. It is always submission-scoped here — it is your own
+     call's response, so none of the unscoped-handle staleness guard applies — so go straight to
+     the *Polled terminal failures* `superseded` bullet below and follow `result["superseded_by"]`
+     exactly as the `request_id` arm does. **Never resubmit and never direct-merge**: the
+     successor is already in flight and either would race it. In particular do **not** reach for
+     the orchestrator-down direct-merge rule below — the orchestrator is up, it just coalesced you.
+
    - `status: "queued"` or `status: "attached"` → **durable intent confirmed** — the request is enqueued; proceed to poll:
      ```
-     request_id = result["request_id"]
+     if result["status"] == "queued":
+         poll_by = "request_id"
+         poll_kwargs = {"request_id": result["request_id"]}
+     else:  # "attached" — pick the handle the response discloses (task 3148); a
+            # missing poll_by (pre-3148 server) degrades to request_id, today's behaviour
+         poll_by = result.get("poll_by", "request_id")
+         if poll_by == "request_id":
+             poll_kwargs = {"request_id": result["request_id"]}
+         elif poll_by == "task_id":
+             poll_kwargs = {"task_id": result["inflight_task_id"]}
+         else:  # "branch" (pollable == False): neither handle known, another merger
+                # owns the worktree; the returned request_id was never enqueued, so a
+                # first-tick unknown here is NOT the "server lost its record" case below —
+                # keep polling by branch and confirm via git merge-base --is-ancestor
+                # (see *Polled terminal failures*) before concluding anything
+             poll_kwargs = {"branch": "task/<TASK_ID>"}
+
+     # unknown is terminal only when the polled id was actually enqueued — on the branch arm
+     # nothing was, so unknown is that arm's live state until the git-authority tier resolves it.
+     # superseded means this request was superseded by another one — either absorbed into a
+     # coalesced train, or replaced by a generation-advance resubmission (see *Polled terminal
+     # failures* below; the two need different remediation). It stays terminal on every arm
+     # (dropping it here would resurrect the spin-forever bug this tuple exists to fix), but it
+     # is submission-scoped ONLY on the request_id arm — on branch/task_id it is subject to the
+     # same UNSCOPED-HANDLE STALENESS GUARD as every other non-done terminal below.
+     terminal = ("done", "conflict", "blocked", "abandoned", "superseded") if poll_by == "branch" \
+         else ("done", "conflict", "blocked", "abandoned", "unknown", "superseded")
+     # 20-min hard ceiling on BOTH unscoped arms (branch and task_id): each can reject a
+     # terminal `done` (see accept_terminal), and a durable tier re-serves the same stale
+     # record every tick, so without a floor the loop would spin forever. request_id is
+     # submission-scoped, never rejects, and keeps its unbounded wait.
+     deadline = None if poll_by == "request_id" else now() + 1200
+     timed_out = False
      poll_interval = 15  # seconds; ramp up to 60 s
+
+     # UNSCOPED-HANDLE STALENESS GUARD (applies to the `branch` AND `task_id` arms).
+     # Neither key is tied to *this* submission once the live-snapshot tier stops serving
+     # it (e.g. a mid-flight orchestrator restart): the durable tiers resolve both to the
+     # most-recent *finalized* record for that key — retention ring `get_by_branch` /
+     # `get_by_task` → event store `latest_merge_finalized(branch=...)` /
+     # `latest_merge_finalized(task_id=...)` (escalation/server.py:2244-2287) — and the
+     # event store survives restarts. Branches AND task_ids are both reused verbatim
+     # across resubmissions (this skill's own retry loop is "fix in worktree, resubmit"
+     # on the same `task/<TASK_ID>`), so a previous round's done/conflict/blocked/
+     # abandoned record can satisfy the terminal test on the very FIRST tick, before this
+     # attempt has done anything. Only git ancestry proves that *this* attempt landed.
+     def accept_terminal(poll):
+         if poll_by == "request_id":
+             return True          # request_id names exactly this in-flight entry — always submission-scoped
+         # branch and task_id arms: both unscoped, both gated identically.
+         if poll["state"] == "done":
+             if poll.get("kind") == "found_on_main":
+                 # Tier-3.5 git-authority response — a LIVE probe of main, reached only
+                 # because the durable tiers MISSED. Structurally cannot be a stale
+                 # prior-round record, so it is not what this guard defends against.
+                 # Accept it directly: re-gating it on ancestry is what deadlocks a
+                 # merged-and-cleaned-up branch (see the rc=128 case below).
+                 return True
+             # Durable-tier `done` (retention ring / event store: no `kind`, no
+             # `merge_sha`) — this is the stale-record case. Confirm with git.
+             return branch_on_main()   # canonical check below; not-landed → keep polling
+         return True              # remaining non-done terminals (conflict/blocked/abandoned/
+                                   # unknown/superseded): exit the loop, but treat as UNCONFIRMED.
+                                   # For superseded specifically, do not spin here re-polling this
+                                   # same key hoping for done — for a coalesce-absorbed member it
+                                   # structurally never arrives (see *Polled terminal failures*
+                                   # below for the real resolution: ancestry + landing signals,
+                                   # not more polling).
+
      loop:
          sleep(poll_interval)
-         poll = mcp__escalation__merge_status(request_id=request_id)
-         if poll["state"] in ("done", "conflict", "blocked", "abandoned", "unknown"):
-             break  # any terminal (or restart/unknown) state
+         poll = mcp__escalation__merge_status(**poll_kwargs)
+         if poll["state"] in terminal and accept_terminal(poll):
+             break
+         if deadline is not None and now() >= deadline:
+             timed_out = True
+             break
          eta = poll.get("eta_seconds") or poll_interval * 2  # eta_seconds may be None
          poll_interval = min(max(eta, 15), 60)
      ```
-     After the loop exits, dispatch on `poll["state"]`:
-     - `"done"` → `merge_status` returns **no merge SHA** (`poll["outcome"]` is the raw state string `"done"`, not a commit hash). Re-derive the merge commit from git:
-       ```
-       git log main --oneline | head -5
-       ```
-       Thread the first commit SHA into `done_provenance={"commit": "<sha>"}`. If no single commit is recoverable, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
-     - `"conflict"`, `"blocked"`, `"abandoned"`, or `"unknown"` → see *Polled terminal failures* below.
 
-   *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — and cancellation are covered below.)*
+     <a id="branch-on-main"></a>**The canonical ancestry check (`branch_on_main`) — three outcomes, not two.** Every "is it on main?" confirmation in this skill means *this* check. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the single most common post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py:7538-7574`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
+     ```bash
+     git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
+     # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
+     # nothing on rc=0 OR rc=1, and the `rc=$?` assignment itself exits 0, so
+     # without it the tool reports exit 0 and identical empty output for "on
+     # main" and "NOT on main" -- silence you would have to guess at. Echoing
+     # the numeric rc is NOT the two-outcome `&& echo` idiom banned above: it
+     # prints on every path and keeps all three outcomes distinguishable. Do
+     # not "tidy" it away.
+     # rc=0   → landed. Accept as done/found_on_main.
+     # rc=1   → genuinely not on main. Keep polling / resubmit, per the arm.
+     # rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the
+     #          normal state AFTER a successful merge + cleanup — it is NOT "not on
+     #          main". Search main for THIS branch's merge commit (see below):
+     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
+         --max-count=1 --format=%H
+     #          Non-empty output → that SHA IS the true merge commit; landed.
+     #          Empty output    → not landed (branch never existed, or never merged).
+     ```
+     **The rc=128 search must be the exact-subject one above — never an unfiltered `git log main --merges | head -5`.** An unfiltered listing takes no task argument, so on any repo with merge history it always prints something; "a hit" would be unconditionally true, "no hit" unreachable, and every rc=128 — *including a typo'd branch name, the wrong worktree, or a branch that was never pushed*, which all exit 128 too — would be recorded as landed with some unrelated task's merge SHA. The server's `done_provenance` backstop is only `git merge-base --is-ancestor <sha> main`, which any recent merge on main passes, so nothing downstream would catch it.
+
+     This is the shape the in-repo authority uses — `GitOps.find_merge_marker` (`orchestrator/src/orchestrator/git_ops.py:7862-7905`), the same function `merge_status`'s git-authority tier calls on the deleted-branch path. `--fixed-strings` against the exact subject from `_merge_subject(branch, main_branch)` (`git_ops.py:1874`, canonical form `Merge <full-branch> into <main-branch>`) is what makes it substring-safe: `Merge task/1 into main` cannot match inside `Merge task/10 into main`, because the `0` falls where the pattern has a space. Do **not** substitute a bare `--grep="task/<TASK_ID>"` — that is BRE, unrestricted to merge commits, matches any commit merely *mentioning* the task, and re-opens the `task/1`/`task/10` collision. If a project overrides `git.branch_prefix` (default `task/`) or `git.main_branch`, build the subject from `_merge_subject` rather than hardcoding.
+
+     `branch_on_main()` above returns True for rc=0 and for a *non-empty* rc=128 marker search, False for rc=1 or an empty rc=128 search.
+
+     After the loop exits:
+     - `timed_out` (either unscoped arm's 20-minute deadline reached without an accepted terminal state — i.e. the only `done` on offer never became an ancestor of main) → do NOT resubmit and do NOT direct-merge; run the [canonical ancestry check](#branch-on-main) one final time — **including its rc=128 merge-marker search**, since a branch deleted by a successful merge is the likeliest reason you got here — and stop-and-report to the human only if that too comes back not-landed, per *Polled terminal failures*'s `unknown` bullet below.
+     - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread it as `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}` — **not** a bare `commit`. `merge_sha` is not always the merge commit: on the live-branch resolution path it's the *branch tip* SHA, a distinct commit from the actual merge commit for a `--no-ff` merge; only the deleted-branch path's `merge_sha` is the true merge-commit SHA (`_found_on_main_response`'s docstring, `escalation/server.py:2290-2305`). **Otherwise** — including on either unscoped arm (`poll_by` `"branch"` or `"task_id"`), where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the true merge commit from git:
+       ```bash
+       git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
+           --max-count=1 --format=%H
+       ```
+       Thread that SHA into `done_provenance={"commit": "<sha>"}`. **Do not fall back to eyeballing `git log main --oneline | head -5`** — it is not scoped to this task, so any SHA you pick from it is likely an unrelated task's merge, and the server's only provenance backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main and would not catch it. If the search comes back empty, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
+     - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same reused branch/task_id rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
+     - `poll["state"] == "superseded"` → **on the `request_id` arm** (always submission-scoped) follow the train/successor directly. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) this is UNCONFIRMED** per the staleness guard above — with a further wrinkle for a coalesce-absorbed member, where that arm's `superseded` can be permanent rather than merely stale. See *Polled terminal failures* below for the full follow-the-train procedure and why ancestry plus the two landing signals there, not re-polling this same handle, is the real resolution.
+
+   *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — plus the `superseded` absorption edge above, and cancellation, are covered below.)*
 
 8. `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha>"})`
    - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note above). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
@@ -364,25 +476,190 @@ The merge procedure is iterative — don't assume one pass will be enough:
 - `poll["state"] == "conflict"`, `poll["state"] == "blocked"`, or `poll["state"] == "abandoned"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7. (For `abandoned`, also verify the cancellation was not intentional before resubmitting.)
 - `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → `merge_status` now self-resolves a landed merge via its git-authority tier and returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` when the branch is provably on main. If `merge_status` still returns `unknown`, confirm deterministically:
   ```bash
-  git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
-  # exit 0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
+  git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
+  # The trailing `echo` is REQUIRED -- see the [canonical ancestry
+  # check](#branch-on-main) above for why: without it, "on main" and "NOT on
+  # main" print identical empty output and exit 0, indistinguishable.
+  # rc=0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
   #   commit=<landing sha: git log --format=%H -1 main>
   #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
-  # exit 1 (not on main) AND queue healthy: loop back to step 7 (resubmit).
+  # rc=128 (branch ref gone — already cleaned up after a successful merge): do NOT read
+  #   this as "not on main". Run the exact-subject merge-marker search from the canonical
+  #   check above:
+  #     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
+  #         --max-count=1 --format=%H
+  #   Non-empty → proceed to step 8 with that SHA as kind='found_on_main'.
+  #   Empty     → not landed. (Do NOT substitute an unfiltered `git log main --merges`:
+  #                it takes no task argument and would report "landed" for every rc=128.)
+  # rc=1 (genuinely not on main) AND queue healthy: loop back to step 7 (resubmit).
   ```
-  **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed.
+  **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same [canonical ancestry check](#branch-on-main) once more (rc=128 marker search included) and STOP and report to the human only if it still comes back not-landed, rather than resubmitting.
+
+- `poll["state"] == "superseded"` → this request was superseded by another one. Two distinct
+  mechanisms produce that state, and they need different remediation — check `superseded_by`'s
+  shape below to tell them apart. **On the `request_id` arm** (always submission-scoped) follow
+  the successor directly. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`)** this is
+  UNCONFIRMED per the staleness guard above — but for a **coalesce-train absorption, that arm's
+  `superseded` is permanent by construction, not merely stale: it will never itself turn
+  `done`.** Nothing overwrites it — the absorbed member's own `merge_finalized` record is
+  written under its own branch/task keys at absorption time
+  (`orchestrator/src/orchestrator/merge_queue.py:4353-4354, 4373-4377`), the train instead lands
+  under a brand-new `GroupMergeRequest` that bypasses `enqueue_merge_request` via direct queue
+  surgery (`orchestrator/src/orchestrator/merge_queue.py:12685-12696`), and `mark_member_done`
+  (`orchestrator/src/orchestrator/harness.py:1011`) flips scheduler status without writing a
+  merge record. Because the durable tiers keep serving that stale hit, Tier 3.5's git-authority
+  probe — gated behind a durable-tier *miss* (`escalation/server.py:2407-2420`) — never runs to
+  correct it. So for a coalesce absorption, treat the canonical ancestry check plus the two
+  landing signals below as the **primary** confirmation, not a post-timeout fallback; reserve
+  resuming branch-handle polling for the derail/re-drive case below, where the orchestrator
+  itself re-lands or re-dispatches the member. (A generation-advance `mr-*` successor is
+  simpler: it is enqueued the normal way,
+  `orchestrator/src/orchestrator/merge_queue.py:4289`, so branch/task_id polling does eventually
+  reflect its outcome there — see its dispatch below.) Once you are following a successor,
+  **never resubmit and never direct-merge, on any arm**, while it is still unresolved — it may
+  already be in flight and either would race it. `superseded_by` names one of two shapes:
+
+  - **`mr-*` id** (generation-advance path — a plain resubmission of *this same task* at a newer
+    generation; not a train, nothing absorbed, nothing to re-drive). A real request id. Poll it:
+    ```
+    mcp__escalation__merge_status(request_id="<superseded_by value>")
+    ```
+    with the same 15 s→60 s backoff. This successor is not your own submission, so bound the
+    poll with its own 20-minute wall-clock ceiling rather than waiting unbounded. While it is
+    still unresolved the never-resubmit rule above holds — do not act on a non-terminal poll.
+    Once it reaches a terminal state, dispatch on that outcome:
+    - `done` → landed. This successor merges the same single branch (no tip/train distinction),
+      so the standard polled-done procedure applies directly: thread `merge_sha` if present,
+      else re-derive via the exact-subject marker search for `task/<TASK_ID>` above.
+    - `conflict` or `blocked` → the successor has now failed on its own terms, and nothing
+      auto-retries it — `_redrive_coalesce_members` is gated on
+      `isinstance(req, GroupMergeRequest)` and the train id starting with `coalesce-`
+      (`orchestrator/src/orchestrator/merge_queue.py:12914, 12928`), neither of which holds for
+      a generation-advance successor. Fix in the worktree, rebase on main, and resubmit — the
+      standard *Polled terminal failures* remediation, loop back to step 7. (Both states are
+      reachable here: this successor is an ordinary solo merge through `classify_and_merge`,
+      which returns `conflict` (`merge_queue.py:5746`) and which `_map_terminal_state` passes
+      through unchanged (`escalation/server.py:2194-2195`). The conflict→`blocked` collapse
+      (`merge_queue.py:6339, 6357`) is inside `_do_train_merge` — train path only.)
+    - `abandoned` → stop and report to the human. Do not resubmit; the resubmission may have
+      been cancelled deliberately.
+    - `superseded` → the successor was itself superseded (a further generation advance, or
+      absorption into a train). Re-read its `superseded_by` and re-enter this bullet from the
+      top against that value; the 20-minute ceiling is shared across the whole chain.
+    - `unknown` → the successor's record is gone (orchestrator restarted, or the retention ring
+      expired). This is terminal on the `request_id` arm from the **very first tick** — it does
+      not wait for the 20-minute ceiling. Do **not** fall through to *Polled terminal failures*'
+      plain `unknown` rule: that ends in "loop back to step 7 (resubmit)", and the successor may
+      still be in flight, which is the double-merge race this bullet exists to forbid. Go
+      straight to the branch-handle fallback below.
+  - **`coalesce-*` id** (coalesce-train path) — this names the *train*, not a request. It
+    resolves through none of `merge_status`'s tiers (no retention-ring alias is ever recorded
+    for a train id, no event-store finalized row is keyed on one, and Tier 3.5's git-authority
+    probe is skipped when only `request_id` is passed) — polling it by `request_id` returns an
+    honest `state: "unknown"` that will never resolve to anything else. Do not poll it by
+    `request_id`.
+
+  For the `coalesce-*` case, or an `mr-*` poll that returns `unknown` on **any** tick (including
+  the first) or is still unresolved at its 20-minute ceiling: **do not fall through to step 7's
+  plain `unknown` rule** — that rule resubmits, which is exactly the race this bullet exists to
+  forbid. Instead stop polling by `request_id` and fall back to the `branch` handle plus the
+  [canonical ancestry check](#branch-on-main) — rc=128 exact-subject merge-marker search
+  included:
+  ```
+  mcp__escalation__merge_status(branch="task/<TASK_ID>")
+  ```
+  If still in flight, keep polling the branch handle with the same backoff, **under the
+  [resumed-poll terminal set](#resumed-poll) below**. Never resubmit and never direct-merge.
+
+  <a id="resumed-poll"></a>**Resumed-poll terminal set.** Wherever this section sends you to
+  branch-handle polling with a `superseded` hit already in hand — after an rc=1 ancestry read
+  (the case below), or because its `superseded_by` was unpollable or never resolved — drop
+  `superseded` from the terminal set for that resumed loop. The branch handle will otherwise
+  re-serve the identical record on tick 1, `accept_terminal` accepts it unconditionally, and you
+  bounce straight back into the bullet you came from — a ping-pong that burns the entire
+  20-minute budget without ever observing a `merge_status` state change. Use:
+  ```
+  terminal_resumed = ("done", "conflict", "blocked", "abandoned")
+  # plus: a `superseded` whose `superseded_by` DIFFERS from the one you just disregarded —
+  #       that is a genuinely new absorption; re-enter the superseded bullet against it.
+  # An identical `superseded`/`superseded_by` pair is the stale record: keep polling.
+  ```
+  **`merge_status` will never itself change for a coalesce-absorbed member** — nothing overwrites
+  its `superseded` record (see above) — so `terminal_resumed` alone can starve forever even after
+  the real merge lands. On every tick, alongside the `merge_status` check, also re-run the
+  [canonical ancestry check](#branch-on-main): break the instant it — or, once it reaches
+  rc=128-with-empty-marker, either landing signal below — reports landed. Only stop-and-report
+  once ancestry (and, where reached, both signals) is still not-landed when `terminal_resumed`'s
+  20-minute ceiling arrives; that final check is what "if it never lands" means below. This does
+  **not** contradict `accept_terminal`'s "do not spin here re-polling this same key": that rule
+  governs the *first* loop, where exiting on `superseded` is exactly what gets you to the
+  ancestry check. This governs the *resumed* loop, which is driven by that check, not by
+  `merge_status`'s frozen state.
+
+  **Here an empty rc=128 marker search does NOT mean "not landed."** A coalesce train stacks its
+  members linearly and merges only the **tip** branch into main (`tip_branch=tip_req.branch`,
+  `orchestrator/src/orchestrator/merge_queue.py:12673`), so a non-tip absorbed member gets its
+  commits onto main with **no `Merge task/<TASK_ID> into main` marker of its own** — and its branch
+  is still deleted by cleanup, because it genuinely *is* an ancestor of main. rc=128-with-empty-marker
+  is thus the *expected* reading for a non-tip member, which is precisely the caller this bullet
+  serves; taking it as "not landed" would report a successful merge to the human as a failure and
+  leave the task un-flipped. So:
+  - Ancestry `rc=0` is authoritative — landed — while the ref still exists.
+  - Ancestry `rc=1` (the branch ref **exists** and its commits are genuinely not on main) means
+    only "not landed **yet**" — right after absorption the train (or successor) is typically
+    still in flight, so this round's commits have legitimately not reached main. It is **not**
+    evidence that the `superseded` hit is a stale prior-round record, and it is not a reason to
+    give up: disregard the raw `superseded`/`superseded_by` value as an action signal (do not
+    try to poll or follow it) and resume branch-handle polling **under the
+    [resumed-poll terminal set](#resumed-poll)**, which re-derives the real answer from ancestry
+    itself on every tick rather than from this frozen record. Stop-and-report only if rc=1 still
+    holds at that loop's 20-minute ceiling. Never resubmit here.
+  - **Only under rc=128-with-empty-marker**, do not conclude anything yet — and only here are
+    signals (a) and (b) consultable at all. There are exactly **two** affirmative landing
+    signals, and only these two:
+    **(a)** the **tip's** merge marker on main — `git log main --fixed-strings
+    --grep="Merge task/<TIP_ID> into main" --max-count=1 --format=%H` (with a
+    `coalesce-<TIP_ID>-<hex>` id the tip id is readable straight off it); and
+    **(b)** **this task's own scheduler status** having been flipped to `done`, which the
+    orchestrator does for every absorbed member once the train lands (`mark_member_done`,
+    `orchestrator/src/orchestrator/harness.py:1011`).
+  - Under rc=128-with-empty-marker only, either one saying landed → the merge succeeded; proceed
+    to step 8 with the train's advanced SHA as `done_provenance={"kind": "found_on_main",
+    "commit": "<sha>", "note": "absorbed into train <train_id>"}`. If the task is already `done`,
+    the flip happened for you — no write needed.
+  - **`get_merge_queue()` no longer showing the train is NOT a landing signal.** It means only
+    "stop waiting on the train," and is equally consistent with a **derail**: on any non-`done`
+    train outcome the orchestrator re-pends the still-unlanded members for solo re-merge
+    (`_redrive_coalesce_members`, `orchestrator/src/orchestrator/merge_queue.py:12264`), which
+    also removes the train from the queue with nothing of yours on main. On queue-absence with
+    neither (a) nor (b), the correct action is to **resume polling the `branch` handle** to the
+    20-minute ceiling **under the [resumed-poll terminal set](#resumed-poll)** — the
+    orchestrator's re-drive lands it — never to flip the task.
+
+  Stop-and-report to the human in exactly two cases: under rc=128-with-empty-marker once both
+  signal (a) and signal (b) come back not-landed, or under rc=1 once the branch-handle polling
+  above has reached its ceiling. An rc=1 ancestry result is never overridden by signal (a),
+  signal (b), or queue-absence — signals (a)/(b) are consultable **only** under
+  rc=128-with-empty-marker.
 
 *Abandonment (`merge_cancel`):*
 
 To abandon a submitted merge (e.g. the task needs redesign after submission):
 ```
-mcp__escalation__merge_cancel(request_id=request_id)
+mcp__escalation__merge_cancel(request_id=result["request_id"])
 ```
-Cancel using the `request_id` you received — for both `queued` and `attached` responses this is already the in-flight entry's id (`attached` responses set `req_id_override=dispatch.inflight_request_id`). If `merge_cancel` returns `{state: "unknown"}`, the entry has no live waiter in this server instance (restarted or finalized) — poll `mcp__escalation__merge_status(request_id)` first (it now self-resolves via the git-authority tier and returns `state: "done"` / `kind: "found_on_main"` / `merge_sha` when the branch is provably on main). If `merge_status` still returns `unknown`, confirm deterministically:
+Whether the `request_id` you received cancels the in-flight entry depends on how you got it: for `queued`, and for `attached` with `poll_by == "request_id"`, it already is the in-flight entry's id (`attached` responses with a known `inflight_request_id` set `req_id_override=dispatch.inflight_request_id`) and cancel works as described above. For `attached` with `poll_by` `"task_id"` or `"branch"`, the id you received names your own coalesced submission, not the in-flight entry — treat the cancel as best-effort (`cancelled: false` / `state: "unknown"` is the expected outcome, not evidence of a lost record). Re-check the real state by the handle `poll_by` names (`merge_status(task_id=...)` or `merge_status(branch="task/<TASK_ID>")`) before deciding whether the merge still needs abandoning.
+
+If `merge_cancel` returns `{state: "unknown"}` on the `request_id` handle (or after the re-check above still leaves it unresolved), the entry has no live waiter in this server instance (restarted or finalized) — poll `mcp__escalation__merge_status(request_id)` first (it now self-resolves via the git-authority tier and returns `state: "done"` / `kind: "found_on_main"` / `merge_sha` when the branch is provably on main). If `merge_status` still returns `unknown`, confirm deterministically:
 ```bash
-git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
-# exit 0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
-# exit 1 (not on main): the merge did not land; decide whether to resubmit or discard
+git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
+# The trailing `echo` is REQUIRED -- see the [canonical ancestry
+# check](#branch-on-main) above for why: without it, "on main" and "NOT on
+# main" print identical empty output and exit 0, indistinguishable.
+# rc=0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
+# rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —
+#   run the merge-marker search from the canonical check above before concluding anything
+# rc=1 (not on main): the merge did not land; decide whether to resubmit or discard
 ```
 Never fall back to direct merge in response to `unknown` — `unknown` means the server lost its record, not that the merge failed.
 

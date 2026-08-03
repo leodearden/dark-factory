@@ -935,6 +935,316 @@ class TestSamplesDownsampling:
 
 
 # ---------------------------------------------------------------------------
+# archives_present — the payload's own "did this scan reach the archive?" signal
+# ---------------------------------------------------------------------------
+
+_ANALYTICS_KEYS = {'generated_at', 'parse_failures', 'regime_markers', 'per_project',
+                   'archives_present', 'archives_reached'}
+
+
+class TestArchivesPresent:
+    """Did every configured project's escalation archive actually exist?
+
+    The COMPLETENESS diagnostic: ``all()`` over the configured roots.  It
+    answers "was this scan whole?", which is an operator's question — the
+    cache's question ("did this scan reach anything at all?") is answered by
+    ``archives_reached`` next door, and the two are deliberately not the same
+    field.  Nothing else in the payload can answer either one:
+    ``iter_all_escalation_paths`` returns silently on a missing dir and
+    ``Path.glob`` swallows ``PermissionError``, so an absent archive, an
+    unreadable one and a genuinely empty one are otherwise byte-identical —
+    zero filings, zero parse failures, same shape.
+
+    Deliberately NOT derived from ``parse_failures``.  That counts unparseable
+    RECORDS and is a permanent property of a corrupt file, so a cache keyed on
+    it would be defeated forever by one bad record sitting in front of the
+    expensive walk.  The two fields answer different questions, and the last
+    test here pins that they stay independent in both directions.
+    """
+
+    def test_a_present_archive_reports_true(self, tmp_path):
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['archives_present'] is True
+
+    def test_an_absent_archive_reports_false(self, tmp_path):
+        """The dir was never created — the walk had nothing to reach.
+
+        Indistinguishable from an empty archive in every other field, which is
+        exactly why this key has to exist.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        never_created = tmp_path / 'nope' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', never_created, runs_db)], now=now)
+
+        assert result['archives_present'] is False
+        # The rest of the payload is unchanged: still a well-formed, empty,
+        # NON-erroring entry.  This signal reports on the scan, it does not
+        # degrade the answer.
+        assert result['parse_failures'] == 0
+        assert len(result['per_project']) == 1
+        assert result['per_project'][0]['project'] == 'dark_factory'
+
+    def test_one_absent_project_of_two_reports_false(self, tmp_path):
+        """It is ``all()``, not ``any()`` — this field reports COMPLETENESS.
+
+        A multi-project payload where one root's archive is missing is a
+        partial scan, and this field says so.  It does NOT follow that a
+        partial scan is uncacheable: see ``TestArchivesReached``, which pins
+        the cache predicate onto ``any()`` precisely because the ordinary
+        production config is permanently partial.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        present = tmp_path / 'primary' / 'data' / 'escalations'
+        present.mkdir(parents=True)
+        absent = tmp_path / 'secondary' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics(
+            [('primary', present, runs_db), ('secondary', absent, runs_db)], now=now,
+        )
+
+        assert result['archives_present'] is False
+        assert [p['project'] for p in result['per_project']] == ['primary', 'secondary']
+
+    def test_the_existing_contract_keys_are_untouched(self, tmp_path):
+        """Additive: the four Seam-2 keys keep their names, values and shapes."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert set(result) == _ANALYTICS_KEYS
+        assert result['generated_at'] == now.isoformat()
+        assert isinstance(result['regime_markers'], list)
+        entry = result['per_project'][0]
+        assert {'project', 'origin', 'lifespan', 'workflow'} <= set(entry)
+
+    def test_a_corrupt_record_does_not_flip_archives_present(self, tmp_path):
+        """The two signals are independent, and this is the load-bearing case.
+
+        ``build_golden_archive`` plants one non-JSON file, so ``parse_failures``
+        is >= 1 permanently.  If ``archives_present`` tracked it, the route's
+        cache would be permanently defeated by a single corrupt record — the
+        exact failure the reviewer's suggestion was NOT asking for.  The
+        archive dir exists and was walked; that a record inside it is garbage
+        is a different fact, reported by a different field.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['parse_failures'] >= 1
+        assert result['archives_present'] is True
+
+
+# ---------------------------------------------------------------------------
+# archives_reached — the payload's "did this scan reach ANY archive?" signal
+# ---------------------------------------------------------------------------
+
+
+class TestArchivesReached:
+    """Did the scan reach AT LEAST ONE configured archive?
+
+    ``archives_present`` (``all``) and ``archives_reached`` (``any``) answer
+    two different questions, and conflating them is what this class exists to
+    prevent.  ``all`` is the completeness DIAGNOSTIC an operator reads; ``any``
+    is the CACHE predicate, and only ``any`` is sound for that job.
+
+    Measured on this machine, 2026-08-01, against the installed unit's own
+    root list (``systemctl --user cat dark-factory-dashboard`` ->
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS``, 9 roots): 2 roots
+    (``/home/leo/src/autotrade``, ``/home/leo/mission-control``) have no
+    ``data/escalations`` dir at all, while the other 7 hold ~9.1k ``esc-*.json``
+    records between them (dark_factory 3278, reify 5561, autopilot-video 69,
+    +4 smaller).  So in the CURRENT production config ``all`` is permanently
+    False and ``any`` is True.  Keying the cache on ``all`` means the 60s TTL
+    never stores anything and every 3s poll (``POLL_INTERVAL_MS``,
+    static/redux/data.js) re-runs the whole multi-second walk — i.e. ``all``
+    reports "this scan was free to redo" at exactly the moment it was most
+    expensive.  A root that has simply never escalated must not delete the
+    cache in front of the other seven.
+
+    The remaining question — is ``any`` too lax? — is answered by what the
+    predicate is FOR: a build that walked nothing is genuinely free to redo
+    (one ``is_dir`` stat per project, all of them negative), and pinning it
+    would keep the tab reporting an empty archive for a full TTL window after
+    the volume mounts.  A build that walked something paid for that walk, and
+    the cache is what stops it being paid again three seconds later.
+    """
+
+    def test_a_present_archive_reports_true(self, tmp_path):
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['archives_reached'] is True
+
+    def test_an_absent_archive_reports_false(self, tmp_path):
+        """Nothing was walked, so nothing is worth pinning — both signals agree."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        never_created = tmp_path / 'nope' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', never_created, runs_db)], now=now)
+
+        assert result['archives_reached'] is False
+        assert result['archives_present'] is False
+
+    def test_one_absent_project_of_two_is_reached_but_not_present(self, tmp_path):
+        """THE case, and the whole reason this field exists.
+
+        This is the shape of the installed 9-root config (2 archive-less roots,
+        7 holding ~9.1k records — see the class docstring).  The scan reached
+        an archive and paid the full walk for it, so the payload MUST be
+        cacheable; it did not reach every archive, so the diagnostic must still
+        say the picture is partial.  One field cannot be both.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        present = tmp_path / 'primary' / 'data' / 'escalations'
+        present.mkdir(parents=True)
+        absent = tmp_path / 'secondary' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics(
+            [('primary', present, runs_db), ('secondary', absent, runs_db)], now=now,
+        )
+
+        assert result['archives_reached'] is True
+        assert result['archives_present'] is False
+        assert [p['project'] for p in result['per_project']] == ['primary', 'secondary']
+
+    def test_two_absent_projects_report_false_on_both_signals(self, tmp_path):
+        """Reached nothing AND complete-of-nothing: the one case that agrees."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        runs_db = _make_runs_db(tmp_path, [])
+        first = tmp_path / 'primary' / 'data' / 'escalations'
+        second = tmp_path / 'secondary' / 'data' / 'escalations'
+
+        result = build_escalation_analytics(
+            [('primary', first, runs_db), ('secondary', second, runs_db)], now=now,
+        )
+
+        assert result['archives_reached'] is False
+        assert result['archives_present'] is False
+
+    def test_no_configured_projects_reports_not_reached(self, tmp_path):
+        """The degenerate case, pinned deliberately rather than left to fall out.
+
+        ``any([])`` is False and ``all([])`` is True, so an empty config is the
+        one shape where the two signals INVERT: nothing was reached, yet
+        everything configured was present.  Reached-nothing is the correct
+        answer for the cache — there is no walk to protect — and writing it
+        down here means a later refactor that flips either default trips a
+        test instead of silently pinning an empty payload.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        result = build_escalation_analytics([], now=golden_now())
+
+        assert result['archives_reached'] is False
+        assert result['archives_present'] is True
+        assert result['per_project'] == []
+
+    def test_a_corrupt_record_does_not_flip_archives_reached(self, tmp_path):
+        """Twin of the ``archives_present`` case: the three signals stay independent.
+
+        ``build_golden_archive`` plants one non-JSON file, so ``parse_failures``
+        is >= 1 permanently.  If the cache predicate tracked it, a single
+        corrupt record would defeat the cache forever in front of the very
+        walk it protects.  The archive was reached; that a record inside it is
+        garbage is a different fact, reported by a different field.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['parse_failures'] >= 1
+        assert result['archives_reached'] is True
+
+
+class TestArchiveScanSucceeded:
+    """The exported cache predicate, unit-tested away from the route.
+
+    Mirrors ``memory_evals.root_scan_succeeded``: a NAMED function rather than
+    a lambda in the route, so the rule is testable in isolation and its
+    rationale has somewhere to live that a route docstring is not.
+    """
+
+    def test_a_reached_archive_is_cacheable(self):
+        from dashboard.data.escalation_analytics import archive_scan_succeeded
+
+        assert archive_scan_succeeded({'archives_reached': True}) is True
+
+    def test_a_partial_scan_is_cacheable(self):
+        """The behaviour change, stated as a unit fact.
+
+        Reached some, missed some — the walk was paid for, so it is cached.
+        ``archives_present: False`` rides along as the diagnostic and has no
+        say in the cacheability decision.
+        """
+        from dashboard.data.escalation_analytics import archive_scan_succeeded
+
+        payload = {'archives_reached': True, 'archives_present': False}
+
+        assert archive_scan_succeeded(payload) is True
+
+    def test_an_unreached_archive_is_not_cacheable(self):
+        from dashboard.data.escalation_analytics import archive_scan_succeeded
+
+        assert archive_scan_succeeded({'archives_reached': False}) is False
+
+    def test_a_payload_without_the_key_is_not_cacheable(self):
+        """Reads through ``.get`` because it runs in the cache WRITE path.
+
+        A partially-built or older-shaped payload must degrade to "don't
+        cache" — a raise here surfaces as a 500 on a 3s dashboard poll.
+        """
+        from dashboard.data.escalation_analytics import archive_scan_succeeded
+
+        assert archive_scan_succeeded({'parse_failures': 0}) is False
+        assert archive_scan_succeeded({}) is False
+
+
+# ---------------------------------------------------------------------------
 # step-16: row 7 — perf: cold ~10k-record build_escalation_analytics() < 5s
 # ---------------------------------------------------------------------------
 

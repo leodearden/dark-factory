@@ -160,10 +160,12 @@ def _assistant_text(record: dict[str, Any]) -> str:
     content = _message_content(record)
     if not isinstance(content, list):
         return ''
+    # Walrus-bound so the isinstance narrowing reaches the element expression;
+    # see the note in digest.py's _first_text_block. Filtering is unchanged.
     parts = [
-        block.get('text') for block in content
+        block_text for block in content
         if isinstance(block, dict) and block.get('type') == 'text'
-        and isinstance(block.get('text'), str)
+        and isinstance(block_text := block.get('text'), str)
     ]
     return '\n'.join(parts).lower()
 
@@ -306,7 +308,7 @@ STRATA: tuple[str, ...] = (
 _WORKTREE_DIR_MARKERS: tuple[str, ...] = (
     '--worktrees-', '--claude-worktrees-',
     # reify's warm-lane and build-worktree encoded-dir shapes (task 2612):
-    # encode_cwd (inventory.py) maps both '/' and '.' to '-', so
+    # encode_cwd (inventory.py) maps '/', '.' and '_' all to '-', so
     # /home/leo/src/reify/.warm-lanes/worktrees/<id> and
     # .../reify/build-worktrees/<id> never produce the double-dash
     # '--worktrees-'/'--claude-worktrees-' form above.
@@ -348,9 +350,9 @@ def _first_user_turn_text(record: dict[str, Any] | None) -> str:
         return content
     if isinstance(content, list):
         parts = [
-            block.get('text') for block in content
+            block_text for block in content
             if isinstance(block, dict) and block.get('type') == 'text'
-            and isinstance(block.get('text'), str)
+            and isinstance(block_text := block.get('text'), str)
         ]
         return '\n'.join(parts)
     return ''
@@ -617,17 +619,48 @@ def digest_byte_cost_fn(
 class SampleResult:
     """The result of :func:`stratified_sample`: the selection plus accounting.
 
-    ``zero_signal_dropped`` and ``dedupe_collapsed`` count records that
-    never got a chance to compete for budget — no signal at all, or a
-    near-duplicate shape collapsed by :func:`dedupe_shapes` — while
-    ``budget_skipped`` counts records that DID survive to the candidate
-    stage but were cut solely because the byte budget ran out (a
-    reserved-floor group skipped whole, or a leftover candidate excluded by
-    the greedy fill's halt). Surfacing all three lets an operator reading
+    Every record handed to :func:`stratified_sample` leaves by exactly ONE
+    of five doors, and each door has its own counter:
+
+    - ``zero_signal_dropped`` — no confusion signal at all.
+    - ``dedupe_collapsed`` — a near-duplicate shape collapsed by
+      :func:`dedupe_shapes`.
+    - ``below_sampling_cut`` — real, distinct signal that ranked below its
+      stratum's ``top_fraction``/``per_stratum_min`` cut, so it never
+      competed for budget.
+    - ``budget_skipped`` — reached the candidate stage and DID compete, but
+      was cut solely because the byte budget ran out (a reserved-floor group
+      skipped whole, or a leftover candidate excluded by the greedy fill's
+      halt).
+    - ``selected`` — digested.
+
+    Separating those doors is the whole point: it lets an operator reading
     :func:`main`'s summary tell "there was nothing to sample" apart from
     "the budget cut off real signal" (reviewer_comprehensive/observability,
-    task 2573 amendment pass #2) — the previous summary reported the first
-    two but left budget-driven truncation invisible.
+    task 2573 amendment pass #2) apart from "the sampling cut held real
+    signal back" — three states that otherwise look identical from outside.
+    The last two have DIFFERENT remedies and must never be conflated:
+    raising ``budgets.max_daily_digest_bytes`` recovers a ``budget_skipped``
+    record and does nothing whatever for a ``below_sampling_cut`` one, which
+    needs ``sampling.top_fraction``/``per_stratum_min`` raised instead.
+
+    CONSERVATION INVARIANT (the full identity, pinned as a test in
+    ``test_legibility_sampling.TestSampleResultAccounting``)::
+
+        total_records == zero_signal_dropped + dedupe_collapsed
+                         + below_sampling_cut + budget_skipped
+                         + len(selected)
+
+    Nothing falls through unaccounted, so the operator line always balances
+    and "why did only 3 of 17 sessions get digested?" is answerable from the
+    line alone. Its load-bearing corollary is that every record reaching the
+    CANDIDATE stage ends in exactly one of ``selected`` or
+    ``budget_skipped`` — which is what makes ``not selected and
+    budget_skipped > 0`` mean exactly "candidates existed and were ALL
+    discarded on the byte budget", the total-suppression predicate
+    ``nightly._report_sample_outcome`` escalates on, and the reason a
+    budget-suppressed night is no longer indistinguishable from a genuine
+    no-change night (task 3270).
     """
 
     selected: list[ScoredRecord]
@@ -648,6 +681,42 @@ class SampleResult:
 
     dedupe_collapsed: int = 0
     budget_skipped: int = 0
+
+    below_sampling_cut: int = 0
+    """Records that survived the zero-signal and dedupe filters but ranked
+    below their stratum's candidate cut, so they never reached the budget
+    phase at all.
+
+    The cut is ``max(ceil(top_fraction * stratum_size), per_stratum_min)``
+    (see :func:`stratified_sample` step 4): at the stock
+    ``top_fraction=0.12`` a stratum of 17 distinct real-signal records
+    yields 3 candidates and 14 of these. Those 14 landed in NO bucket
+    before task 3270's amendment pass, so the summary line simply did not
+    balance and an operator could reasonably read the gap as a second,
+    undiagnosed suppression mode.
+
+    Deliberately NOT folded into ``budget_skipped``: these records lost to
+    the SAMPLING policy, not to the byte budget, and the two have different
+    fixes (see the class docstring). Defaulted so hand-built
+    ``SampleResult``s in tests stay valid."""
+
+    total_records: int = 0
+    """How many records were HANDED TO :func:`stratified_sample` — the
+    denominator every other count in this dataclass is a slice of.
+
+    Both production callers build exactly ONE ``ScoredRecord`` per
+    ``inventory.enumerate_sessions`` hit (:func:`main`'s scoring loop and
+    ``nightly.select_scored_records``), so this is 1:1 with the sessions
+    enumerated for the target date — which is why the operator summary line
+    may label it ``enumerated=``. It is the number of INPUTS, not of
+    survivors and not of candidates: ``total_records - zero_signal_dropped
+    - dedupe_collapsed`` is what survived the two pre-budget FILTERS, and
+    the stratum sampling cut then narrows those survivors further, so what
+    actually reached the candidate stage is that quantity minus
+    ``below_sampling_cut`` (equivalently: ``len(selected) +
+    budget_skipped``). See the full conservation identity above. Defaulted
+    so the existing all-keyword construction sites, and hand-built
+    ``SampleResult``s in tests, stay valid."""
 
 
 def stratified_sample(
@@ -715,10 +784,13 @@ def stratified_sample(
     candidate that would exceed the budget (a strict greedy halt, not a
     skip-ahead bin-pack). The final selection is returned in
     score-descending order. ``dedupe_collapsed`` (records collapsed away by
-    :func:`dedupe_shapes` in step 3) and ``budget_skipped`` (candidates
-    excluded solely by the byte cap in steps 5-6) are accumulated
-    alongside the selection for :func:`main`'s summary — see
-    :class:`SampleResult`.
+    :func:`dedupe_shapes` in step 3), ``below_sampling_cut`` (survivors the
+    step-4 cut left out, which therefore never compete for budget at all)
+    and ``budget_skipped`` (candidates excluded solely by the byte cap in
+    steps 5-6) are accumulated
+    alongside the selection for :func:`main`'s summary — as is
+    ``total_records`` (``len(records)``, one per enumerated session in both
+    production callers) — see :class:`SampleResult`.
     """
     top_fraction = config.sampling.top_fraction
     per_stratum_min = config.sampling.per_stratum_min
@@ -747,6 +819,7 @@ def stratified_sample(
 
     zero_signal_dropped = 0
     dedupe_collapsed = 0
+    below_sampling_cut = 0
     reserved_groups: list[list[ScoredRecord]] = []
     leftover: list[ScoredRecord] = []
 
@@ -765,6 +838,11 @@ def stratified_sample(
             len(survivors),
         )
         candidates = survivors[:candidate_count]
+        # Survivors the cut left out. Counted rather than dropped on the
+        # floor: they are real, distinct signal, and an operator asking why
+        # only 3 of 17 sessions were digested has to be able to read the
+        # answer off the summary line (see SampleResult.below_sampling_cut).
+        below_sampling_cut += len(survivors) - candidate_count
 
         reserve_count = min(per_stratum_min, len(candidates))
         if reserve_count:
@@ -804,6 +882,8 @@ def stratified_sample(
         bytes_used=bytes_used,
         dedupe_collapsed=dedupe_collapsed,
         budget_skipped=budget_skipped,
+        below_sampling_cut=below_sampling_cut,
+        total_records=len(records),
     )
 
 
@@ -828,6 +908,46 @@ def render_manifest(selected: Sequence[ScoredRecord]) -> str:
         for record in selected
     ]
     return '\n'.join(lines)
+
+
+def format_sample_summary_line(result: SampleResult, *, max_bytes: int) -> str:
+    """Render *result*'s accounting as ONE greppable ``key=value`` line.
+
+    The single source for both operator-facing surfaces: :func:`main`'s
+    stderr summary block appends it, and ``nightly.run_nightly`` logs it at
+    INFO on EVERY run. One formatter rather than two field lists, so the
+    diagnostic an operator runs by hand and the line the systemd timer
+    writes to the journal can never disagree about what the budget was
+    spent on (INV-5 no-lockstep-duplication) — the drift that let a
+    totally-budget-suppressed night read exactly like a genuine no-change
+    night for 14 nights (2026-07-16..29, task 3270).
+
+    Emits no prefix and no trailing newline: callers own both (nightly
+    prefixes the project id and target date, since one journal interleaves
+    every project's timer). Every field is on one line because that is what
+    an operator's ``journalctl ... | grep`` has to return as a single unit;
+    the per-stratum breakdown deliberately stays in :func:`main`'s
+    multi-line block, where it does not have to fit.
+
+    ``enumerated`` is :attr:`SampleResult.total_records` — one per
+    enumerated session in both production callers.
+
+    The drop fields are emitted in PIPELINE order and, by
+    :class:`SampleResult`'s conservation invariant, they BALANCE:
+    ``enumerated`` equals the four drop counts plus ``selected``. That is
+    load-bearing for the operator reading it — an unaccounted remainder
+    would read as a second, undiagnosed suppression mode — so a new drop
+    bucket added to the sampler must be added here too.
+    """
+    return (
+        f'enumerated={result.total_records} '
+        f'zero_signal_dropped={result.zero_signal_dropped} '
+        f'dedupe_collapsed={result.dedupe_collapsed} '
+        f'below_sampling_cut={result.below_sampling_cut} '
+        f'budget_skipped={result.budget_skipped} '
+        f'selected={len(result.selected)} '
+        f'bytes_used={result.bytes_used}/{max_bytes}'
+    )
 
 
 def _find_first_user_turn(path: Path) -> dict[str, Any] | None:
@@ -914,15 +1034,33 @@ def main(argv: Sequence[str]) -> int:
     print(render_manifest(result.selected))
 
     summary = ['=== legibility sampler summary ===', '']
-    summary.append(f'sessions enumerated: {len(sessions)}')
+    # result.total_records rather than len(sessions): the same number (one
+    # ScoredRecord per enumerated session, just above), sourced from the
+    # object the greppable line below is also formatted from, so the
+    # human block and the one-liner cannot drift apart.
+    summary.append(f'sessions enumerated: {result.total_records}')
     summary.append(f'zero-signal dropped: {result.zero_signal_dropped}')
     summary.append(f'near-duplicate clones collapsed: {result.dedupe_collapsed}')
+    # Named for its REMEDY, not just its cause: unlike the budget-skipped
+    # line below, no amount of extra byte budget recovers these — the
+    # stratum sampling cut is what held them back.
+    summary.append(
+        f'below the stratum sampling cut (raise sampling.top_fraction / '
+        f'per_stratum_min to recover): {result.below_sampling_cut}'
+    )
     for stratum in sorted(result.per_stratum_counts):
         summary.append(f'  {stratum}: {result.per_stratum_counts[stratum]} selected')
     summary.append(
         f'digest bytes used: {result.bytes_used} / {cfg.budgets.max_daily_digest_bytes}'
     )
     summary.append(f'budget-skipped candidates (would exceed cap): {result.budget_skipped}')
+    # The same greppable one-liner ``nightly.run_nightly`` logs to the
+    # journal, from the same formatter — so this hand-run diagnostic and the
+    # timer's nightly line can never report different numbers (INV-5).
+    summary.append('')
+    summary.append(
+        format_sample_summary_line(result, max_bytes=cfg.budgets.max_daily_digest_bytes)
+    )
     print('\n'.join(summary), file=sys.stderr)
 
     return 0

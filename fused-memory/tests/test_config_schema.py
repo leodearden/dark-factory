@@ -18,6 +18,7 @@ from fused_memory.config.schema import (
     FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
+    Mem0UpdateConfig,
     PathScopeAdjudicatorConfig,
     ProceduralTopicCluster,
     QueueConfig,
@@ -30,6 +31,15 @@ from fused_memory.config.schema import (
 )
 from fused_memory.server.near_duplicate_guard import find_matching_topic_cluster
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
+
+# Imported from the LEAF, not from memory_metadata: this test module asserts
+# the config side's behaviour, and pulling the registry here would drag in
+# mem0 and mask the very import-lightness the extraction bought (task 3198).
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    TOPIC_SLUG_RE,
+    is_valid_topic_slug,
+)
 
 
 class _DummySettings(BaseSettings):
@@ -696,6 +706,114 @@ class TestReconciliationConfigBulkResetGuardFields:
         assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 120.5
 
 
+class TestMem0UpdateConfig:
+    """Authorization + storm knobs for the in-place update_memory tool (task 3088).
+
+    Shape follows the sibling storm-knob precedent below
+    (TestReconciliationConfigStormKnobs) — the in-repo evidence that storm
+    thresholds belong in config rather than in module constants.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig: recon Stage 1 is this gate's first sanctioned caller,
+    not its owner, so it starts where ReconciliationConfig's own ownership note
+    points instead of requiring a later migration.
+    """
+
+    # --- fail-safe defaults ---
+
+    def test_default_enabled_is_true(self):
+        """A named kill switch, defaulting ON — the tool ships usable."""
+        assert Mem0UpdateConfig().enabled is True
+
+    def test_default_content_amend_allowlist_is_recon_stage(self):
+        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == ['recon-stage-']
+
+    def test_default_metadata_patch_allowlist_is_recon_stage(self):
+        assert Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes == ['recon-stage-']
+
+    def test_default_storm_threshold_is_20(self):
+        assert Mem0UpdateConfig().storm_threshold == 20
+
+    def test_default_storm_window_is_3600(self):
+        assert Mem0UpdateConfig().storm_window_seconds == 3600.0
+
+    # --- the two bars are independently configurable ---
+
+    def test_prefix_lists_are_separate_objects(self):
+        """A shared default_factory list would couple the two bars the decision
+        doc deliberately decoupled — widening the metadata-patch bar must not
+        also grant content-amend authority."""
+        cfg = Mem0UpdateConfig()
+        assert cfg.content_amend_allowed_agent_prefixes is not \
+            cfg.metadata_patch_allowed_agent_prefixes
+        cfg.metadata_patch_allowed_agent_prefixes.append('curator-')
+        assert cfg.content_amend_allowed_agent_prefixes == ['recon-stage-'], (
+            'widening one list must not mutate the other, got '
+            f'{cfg.content_amend_allowed_agent_prefixes!r}'
+        )
+
+    def test_separate_instances_do_not_share_lists(self):
+        a, b = Mem0UpdateConfig(), Mem0UpdateConfig()
+        a.content_amend_allowed_agent_prefixes.append('x-')
+        assert b.content_amend_allowed_agent_prefixes == ['recon-stage-']
+
+    # --- overrides accepted ---
+
+    def test_overrides_accepted(self):
+        cfg = Mem0UpdateConfig(
+            enabled=False,
+            content_amend_allowed_agent_prefixes=[],
+            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'curator-'],
+            storm_threshold=5,
+            storm_window_seconds=600.0,
+        )
+        assert cfg.enabled is False
+        assert cfg.content_amend_allowed_agent_prefixes == []
+        assert cfg.metadata_patch_allowed_agent_prefixes == ['recon-stage-', 'curator-']
+        assert cfg.storm_threshold == 5
+        assert cfg.storm_window_seconds == 600.0
+
+    # --- validation bounds ---
+
+    def test_storm_threshold_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_threshold=0)
+
+    def test_storm_threshold_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_threshold=-1)
+
+    def test_storm_window_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_window_seconds=0)
+
+    def test_storm_window_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_window_seconds=-1.0)
+
+    # --- wired onto FusedMemoryConfig as a top-level section ---
+
+    def test_top_level_field_with_default_factory(self):
+        """An unconfigured deployment still gets the narrow allowlists."""
+        cfg = FusedMemoryConfig()
+        assert isinstance(cfg.mem0_update, Mem0UpdateConfig)
+        assert cfg.mem0_update.enabled is True
+        assert cfg.mem0_update.content_amend_allowed_agent_prefixes == ['recon-stage-']
+
+    def test_field_is_bare_submodel_not_optional(self):
+        """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
+        per-leaf paths — an `X | None` submodel is compared whole and lands as a
+        single restart_required entry (esc-2718-1)."""
+        annotation = FusedMemoryConfig.model_fields['mem0_update'].annotation
+        assert annotation is Mem0UpdateConfig, (
+            f'expected a bare Mem0UpdateConfig annotation, got {annotation!r}'
+        )
+
+    def test_two_configs_do_not_share_the_submodel(self):
+        a, b = FusedMemoryConfig(), FusedMemoryConfig()
+        assert a.mem0_update is not b.mem0_update
+
+
 class TestReconciliationConfigStormKnobs:
     """Tests for the dead_owner_shielded suppression-storm knobs (task 1755 / PRD β).
 
@@ -1256,6 +1374,119 @@ class TestProceduralTopicClusterModel:
             ProceduralTopicCluster(topic_id='t', phrases=['a', 'b'], min_phrase_hits=0)
 
 
+class TestProceduralTopicClusterTopicIdSlug:
+    """``topic_id`` shares ONE namespace with ``metadata.topic`` (PRD D4, task 3198).
+
+    Before leaf ε, ``topic_id`` was a bare ``str``: an operator could seed a
+    snake_case cluster id that could never equal any validated
+    ``metadata.topic``, so 3135's auto-seed invariant
+    (``cluster.topic_id == canonical.metadata.topic``) was unenforceable and
+    the guard would silently match nothing. The validator makes that a
+    config-LOAD failure instead.
+    """
+
+    @pytest.mark.parametrize(
+        ('bad_id', 'why'),
+        [
+            ('bad_slug', 'snake_case — the shape 98 of 352 live topics have'),
+            ('Bad-Slug', 'uppercase'),
+            ('bad topic-slug', 'embedded space'),
+            ('-lead', 'leading separator'),
+            ('', 'empty'),
+            ('a' * (TOPIC_SLUG_MAX_LEN + 1), 'over the length cap'),
+        ],
+    )
+    def test_rejects_non_slug_topic_id(self, bad_id, why):
+        with pytest.raises(ValidationError) as excinfo:
+            ProceduralTopicCluster(topic_id=bad_id, phrases=['a', 'b'])
+        message = str(excinfo.value)
+        assert repr(bad_id) in message, f'must quote the offending value ({why})'
+        assert TOPIC_SLUG_RE.pattern in message, 'must name the slug rule'
+        assert 'fused_memory.topic_slug' in message, 'must name the rule/home so it is findable'
+
+    def test_over_length_id_is_rejected_by_length_not_by_the_regex(self):
+        """Pins that the validator applies the CAP, not merely the pattern.
+
+        The regex accepts an over-long run of ``a``s, so without this the
+        over-length case above would pass for the wrong reason and deleting
+        the length clause would go unnoticed.
+        """
+        over = 'a' * (TOPIC_SLUG_MAX_LEN + 1)
+        assert TOPIC_SLUG_RE.match(over), 'the regex alone must NOT reject it'
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(topic_id=over, phrases=['a', 'b'])
+
+    @pytest.mark.parametrize('good_id', ['some-topic', 't', 'x1-2y'])
+    def test_accepts_conforming_topic_id(self, good_id):
+        """Positive control: the shapes the pre-existing tests already use.
+
+        ``'some-topic'`` and ``'t'`` are the exact ids
+        ``TestProceduralTopicClusterModel`` constructs, so this proves the
+        new validator adds a rejection without regressing any existing case.
+        """
+        assert ProceduralTopicCluster(topic_id=good_id, phrases=['a', 'b']).topic_id == good_id
+
+    def test_default_seeded_clusters_all_survive_the_validator(self):
+        """The shipped default config must still LOAD (PRD §10's hard requirement).
+
+        Constructed via ``ReconciliationConfig()`` rather than by copying
+        the ids, so a future seed that breaks the rule fails here rather
+        than at an operator's config load.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert len(clusters) >= 5
+        for cluster in clusters:
+            assert is_valid_topic_slug(cluster.topic_id)
+
+    def test_snake_case_cluster_id_in_yaml_fails_at_config_load(self, tmp_path, monkeypatch):
+        """Operator-facing: the failure lands at LOAD, not silently at match time.
+
+        This is the whole point of validating on the config side. A
+        snake_case ``topic_id`` can never equal a validated
+        ``metadata.topic``, so without this the guard would load cleanly and
+        then match nothing forever — a silent no-op, the failure mode
+        ``extra='forbid'`` is already on this model to prevent.
+        """
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(
+            yaml.dump(
+                {
+                    'reconciliation': {
+                        'procedural_knowledge_topic_guard_clusters': [
+                            {'topic_id': 'eval_worktree_plan_tools_missing', 'phrases': ['a', 'b']},
+                        ],
+                    },
+                },
+            ),
+        )
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+        with pytest.raises(ValidationError) as excinfo:
+            FusedMemoryConfig()
+        assert 'eval_worktree_plan_tools_missing' in str(excinfo.value)
+
+    def test_conforming_cluster_id_in_yaml_loads(self, tmp_path, monkeypatch):
+        """Positive control for the loader path itself.
+
+        Without it, the failure above could be caused by an unrelated YAML
+        or env-var problem rather than by the slug rule.
+        """
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(
+            yaml.dump(
+                {
+                    'reconciliation': {
+                        'procedural_knowledge_topic_guard_clusters': [
+                            {'topic_id': 'eval-worktree-plan-tools-missing', 'phrases': ['a', 'b']},
+                        ],
+                    },
+                },
+            ),
+        )
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+        clusters = FusedMemoryConfig().reconciliation.procedural_knowledge_topic_guard_clusters
+        assert [c.topic_id for c in clusters] == ['eval-worktree-plan-tools-missing']
+
+
 class TestProceduralTopicGuardClustersDefault:
     """ReconciliationConfig seeds all known topic-guard clusters by default.
 
@@ -1495,3 +1726,270 @@ class TestWriteTriageConfig:
         assert isinstance(annotation, type) and issubclass(annotation, WriteTriageConfig), (
             f'write_triage must be annotated as a bare submodel, got {annotation!r}'
         )
+
+    # -- per-category cutoffs (task 3357) -----------------------------------
+
+    def test_t_high_by_category_defaults_to_none(self):
+        """None means NO category is calibrated — the same fail-open posture.
+
+        Asserted on the schema class for the same reason as the pooled
+        fields above: FusedMemoryConfig() loads config.yaml, which by design
+        carries a calibration run's output.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig().t_high_by_category is None
+
+    def test_the_root_wiring_introduces_no_per_category_default(self):
+        factory = FusedMemoryConfig.model_fields['write_triage'].default_factory
+        assert factory is not None
+        assert factory().t_high_by_category is None  # type: ignore[call-arg]
+
+    def test_accepts_a_measured_mapping(self):
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        # Synthetic, full-precision: pins that a derived cutoff's precision
+        # survives the field without being mistakable for a measured value.
+        mapping = {'procedural_knowledge': 0.1234567890123456}
+        assert WriteTriageConfig(t_high_by_category=mapping).t_high_by_category == mapping
+
+    @pytest.mark.parametrize('value', [0.0, 1.0])
+    def test_accepts_a_per_category_cutoff_at_the_cosine_unit_bounds(self, value):
+        """Both bounds are INCLUSIVE, exactly as the pooled sibling's are.
+
+        A cosine of 1.0 is a legitimately measurable cutoff (identical
+        embeddings), and 0.0 is a measured number too. Tightening the check
+        to a strict inequality would reject a real calibration output while
+        passing every other test in this class.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig(
+            t_high_by_category={'procedural_knowledge': value},
+        ).t_high_by_category == {'procedural_knowledge': value}
+
+    def test_an_empty_mapping_is_accepted_and_means_no_category_calibrated(self):
+        """Distinct from None only in provenance, identical in effect.
+
+        A calibration run that derived nothing may still write an empty map;
+        rejecting it would force the writer to choose between two spellings
+        of the same measured outcome.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig(t_high_by_category={}).t_high_by_category == {}
+
+    @pytest.mark.parametrize('value', [-0.1, 1.1, 42.0])
+    def test_rejects_a_per_category_cutoff_outside_the_cosine_unit_range(self, value):
+        """A bad cutoff must fail at LOAD, not silently gate deletions.
+
+        This map is read by audit_duplicate_memories --apply. A cutoff of
+        42.0 would match nothing and a negative one would match everything;
+        either way the failure would surface as deleted (or undeleted)
+        memories rather than as a config error.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
+
+    def test_the_rejection_names_the_offending_category(self):
+        """Which category is bad IS the actionable half of the error.
+
+        The map is written per category by the calibration script; an error
+        that only said "a cutoff is out of range" would leave an operator
+        diffing three numbers to find the one that failed.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteTriageConfig(t_high_by_category={
+                'procedural_knowledge': 0.9, 'observations_and_summaries': 42.0,
+            })
+
+        message = str(excinfo.value)
+        assert 'observations_and_summaries' in message
+        assert '42.0' in message, 'the offending VALUE is evidence for the refusal'
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_a_bool_map_value_is_coerced_exactly_as_the_pooled_sibling_is(self, value):
+        """Measured, not assumed — and the consumer never sees a bool.
+
+        `audit_duplicate_memories._calibrated_float` deliberately refuses a
+        bool, so what matters here is that a YAML `true` cannot reach it AS a
+        bool: pydantic resolves it to a float at load, identically for the map
+        and for the pooled t_high beside it. Demanding stricter parsing for
+        one than the other would be an inconsistency invented here.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        coerced = WriteTriageConfig(
+            t_high_by_category={'procedural_knowledge': value},
+        ).t_high_by_category
+        assert coerced is not None
+        assert coerced['procedural_knowledge'] == float(value)
+        assert not isinstance(coerced['procedural_knowledge'], bool)
+        assert coerced['procedural_knowledge'] == WriteTriageConfig(
+            t_high=value,  # pyright: ignore[reportArgumentType]
+        ).t_high
+
+    @pytest.mark.parametrize('value', [None, [0.9], 'abc', {'x': 1}])
+    def test_rejects_a_non_numeric_per_category_cutoff(self, value):
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
+
+    def test_a_numeric_string_is_coerced_exactly_as_the_pooled_sibling_coerces_it(self):
+        """Measured, not assumed: both fields take pydantic's lax float path.
+
+        The real input is a YAML numeric scalar written by the calibration
+        script, and demanding stricter parsing for the map than for the
+        pooled t_high beside it would be an inconsistency invented here
+        rather than one the config actually has.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        # The numeric strings are deliberately off-type: the declared fields are
+        # float / dict[str, float], and what this asserts is precisely that
+        # pydantic coerces the YAML-scalar spelling the same way for both.
+        assert WriteTriageConfig(t_high='0.9').t_high == 0.9  # pyright: ignore[reportArgumentType]
+        assert WriteTriageConfig(
+            t_high_by_category={'procedural_knowledge': '0.9'},  # pyright: ignore[reportArgumentType]
+        ).t_high_by_category == {'procedural_knowledge': 0.9}
+
+    def test_one_bad_entry_rejects_the_whole_map(self):
+        """No partial acceptance: a half-applied set of cutoffs must not gate a sweep."""
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(t_high_by_category={
+                'procedural_knowledge': 0.88, 'observations_and_summaries': 9.0,
+            })
+
+
+class TestMemoryMetadataConfig:
+    """`memory_metadata` — the Mem0 metadata write-boundary section (task 3195, leaf β).
+
+    A direct sibling of ``TaskMetadataConfig``: same top-level placement, same
+    warn-by-default posture, same RED-TIER/restart-only wording on the enforce
+    flags. PRD D3 names that precedent explicitly ("census first, tiers later"),
+    so this section follows it rather than inventing a second shape.
+    """
+
+    def _cls(self):
+        from fused_memory.config.schema import MemoryMetadataConfig  # noqa: PLC0415
+
+        return MemoryMetadataConfig
+
+    def test_section_is_top_level_not_nested(self):
+        """Top-level, NOT under ``taskmaster``/``reconciliation``.
+
+        It governs a vocabulary shared beyond any one backend (the registry
+        lives in ``fused_memory.memory_metadata`` and leaf ι's prompt tests
+        import it), exactly the rationale ``TaskMetadataConfig`` records for
+        its own placement.
+        """
+        from fused_memory.config.schema import (  # noqa: PLC0415
+            MemoryMetadataConfig,
+            ReconciliationConfig,
+            TaskmasterConfig,
+        )
+
+        assert 'memory_metadata' in FusedMemoryConfig.model_fields
+        annotation = FusedMemoryConfig.model_fields['memory_metadata'].annotation
+        assert isinstance(annotation, type) and issubclass(annotation, MemoryMetadataConfig)
+        assert 'memory_metadata' not in TaskmasterConfig.model_fields
+        assert 'memory_metadata' not in ReconciliationConfig.model_fields
+
+    def test_defaults_are_warn_mode(self):
+        """Both enforce flags default OFF.
+
+        This is the census-refuted-premise safety default, not timidity: leaf
+        α measured 242 of 329 live `kind` values as singletons, so a day-one
+        strict reject would turn every newly invented kind into a hard
+        memory-write failure on the live fleet.
+        """
+        cfg = FusedMemoryConfig().memory_metadata
+        assert cfg.enforce is False
+        assert cfg.enforce_kind_registry is False
+        assert cfg.unknown_key_storm_threshold == 50
+        assert cfg.unknown_key_storm_window_seconds == 300
+
+    def test_extra_keys_are_forbidden(self):
+        """A mistyped leaf must fail LOUD at config load/reload.
+
+        With ``extra='ignore'`` an operator who typed ``enforce_kind_regsitry``
+        would get a silently-ignored key and believe enforcement was on — the
+        no-silent-fail-soft invariant applied to the config surface.
+        """
+        assert self._cls().model_config.get('extra') == 'forbid'
+        with pytest.raises(ValidationError):
+            # Splatted rather than written as a literal keyword: the typo is
+            # the POINT of the test, and pyright rejects a misspelled keyword
+            # statically, which would fail the type gate before the runtime
+            # assertion could ever run.
+            self._cls()(**{'enfroce': True})
+
+    @pytest.mark.parametrize('bad', [0, -1, -50])
+    def test_storm_threshold_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            self._cls()(unknown_key_storm_threshold=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1, -300])
+    def test_storm_window_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            self._cls()(unknown_key_storm_window_seconds=bad)
+
+    def test_round_trips_from_a_config_dict(self):
+        # `model_validate` rather than a splatted `__init__`: this is how a
+        # loaded config.yaml actually reaches the model, and a splat makes
+        # pyright widen every sibling field's type to the dict's value type,
+        # producing a type error per section of FusedMemoryConfig.
+        cfg = FusedMemoryConfig.model_validate(
+            {'memory_metadata': {'enforce': True, 'enforce_kind_registry': True}}
+        )
+        assert cfg.memory_metadata.enforce is True
+        assert cfg.memory_metadata.enforce_kind_registry is True
+
+    @pytest.mark.parametrize('field', ['enforce', 'enforce_kind_registry'])
+    def test_enforce_flags_are_restart_only(self, field):
+        """RED TIER, asserted behaviourally rather than as a doc blurb.
+
+        The operator-facing promise is not that some `description=` string
+        contains the letters "restart" — it is that `reload_config` REPORTS
+        this leaf as ``restart_required`` and does not silently no-op it.
+        That is a property of the reload allowlist and of `diff_config`, so
+        this pins both: the section has no hot-reloadable leaf, and a real
+        diff over a flipped flag buckets red, not green.
+
+        The step-11 ``description=`` strings are retained as operator
+        documentation; they are simply no longer test-pinned. Prose is
+        reviewed by humans and enforced by neither pyright nor pytest, and a
+        substring check over it fails open anyway (``'restarting is not
+        required'`` would have passed the check this replaces).
+        """
+        from fused_memory.config.reload import (  # noqa: PLC0415
+            RELOADABLE_FIELDS,
+            diff_config,
+        )
+
+        # 1. No leaf of this section is hot-reloadable. An added-and-
+        #    unreviewed allowlist entry fails here, loudly.
+        assert not any(f.startswith('memory_metadata.') for f in RELOADABLE_FIELDS)
+
+        # 2. Observable bucketing through the real diff path, mirroring the
+        #    red-tier precedent `TestDiffConfig.
+        #    test_non_allowlisted_leaf_lands_in_restart_required`.
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = getattr(live.memory_metadata, field)
+        # `object.__setattr__` is the established idiom in test_config_reload:
+        # it bypasses the validation/assignment wrapper so the diff sees a raw
+        # differing leaf.
+        object.__setattr__(fresh.memory_metadata, field, not old)
+
+        d = diff_config(live, fresh)
+
+        assert d.restart_required[f'memory_metadata.{field}'] == {'old': old, 'new': not old}
+        assert f'memory_metadata.{field}' not in d.applied_candidates

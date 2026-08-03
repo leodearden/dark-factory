@@ -254,7 +254,7 @@ Labels are PRD-local; task IDs assigned at decompose.
 > this endpoint) and needs its own row — do not silently widen α to chase it.
 
 | **ε** | `/healthz`: whole-handler deadline, deliverable budget | `dashboard/src/dashboard/app.py`, `dashboard/tests/` | — | With a DB made unresponsive, `/healthz` returns **503 `degraded` within its stated budget (< 5s)** instead of hanging (measured today: 50.6s); `conn.execute` is covered by the deadline, not just `fetchone` |
-| **ζ** | write_journal growth alarm (no pruning) | `fused-memory/`, `dashboard/` | α | When `write_journal.db` exceeds the configured size/growth threshold, a loud WARNING **and** an escalation appear naming the measured size (today 6.5 GB / 16.3M rows, ~50 MB/day) |
+| **ζ** | write_journal growth alarm (no pruning) | `fused-memory/`, `dashboard/` | α | When `write_journal.db` exceeds the configured size/growth threshold, a loud WARNING **and** an escalation appear naming the measured size (today 6.6 GB / 16.7M rows; **~221 MB/day trailing-7d** — see the growth-rate correction below, *not* the ~50 MB/day lifetime mean this row originally quoted) |
 | **η** | Dashboard unit-file parity check (in-repo vs installed) | `scripts/`, `dashboard/tests/` | γ, δ | Script exits non-zero and names the drifting directive when the installed unit differs from the repo copy (today: `DASHBOARD_KNOWN_PROJECT_ROOTS` = 9 roots installed vs 1 in repo) |
 | **θ** | Fix `No [object Object] tasks` empty state | `dashboard/static/redux/tabs.jsx` | — | With all three orchestrator filters off, the table reads a plain-English empty state; the string `[object Object]` appears nowhere in rendered output |
 
@@ -263,6 +263,32 @@ Labels are PRD-local; task IDs assigned at decompose.
 α, β, γ, δ, ε, ζ, η. It is the batch's terminal gate: it re-arms the timer
 only after the preconditions it already enumerates are met, and carries the
 `disable --now` fallback if they will not be.
+
+**Follow-on: α's residual is now owned (added 2026-08-02).** Task 3304's
+amended details flagged — deliberately without filing — that the index
+leaves `get_operations_breakdown` unimproved on an endpoint polled every
+3s, and handed that residual to this PRD's owner. It is now task **3519**,
+wired as a prerequisite of **3289** (whose acceptance includes the
+`memory-graphs < 2s` check, previously unreachable).
+
+The "**remains `SCAN` by design**" wording in row α's correction is
+accurate only for the *unhinted* query. Re-measured on the live DB
+2026-08-02 (24h window; all variants return identical results, 19 groups):
+
+| Variant | Plan | Time |
+|---|---|---|
+| baseline, as shipped | `SCAN idx_wo_operation` | 22.01s |
+| `INDEXED BY idx_wo_created` | `SEARCH idx_wo_created` | **0.64s** |
+| subquery pre-filter, **no** hint | `SCAN` — SQLite flattens it | 18.12s |
+| subquery **+** hint inside | `SEARCH idx_wo_created` | 0.49s |
+| rowid pre-filter, no hint | `SCAN` + scalar subquery | 2.63s |
+
+So the planner will not choose the date index unaided — consistent with the
+architect's post-`ANALYZE` and covering-index findings — but an explicit
+`INDEXED BY` hint takes the query from 22.01s to 0.64s (34×). Note this
+**refutes** the "restructure to pre-filter on a `created_at` subquery"
+option floated in esc-3304-2: SQLite flattens that subquery straight back
+to the same plan. The hint is load-bearing; 3519 adopts it.
 
 **G7 walk (docs/legibility/design-invariants.md).** No unwaived hits.
 γ is the direct remedy for the INV-4 violation that caused the incident (a
@@ -304,10 +330,114 @@ no new contract, no fail-soft path.
    `.py`. State persistence across oneshot ticks and the `escalation submit`
    call argue for Python (`scripts/orchestrator-watchdog.py` precedent).
    **Suggested resolution:** Python. Decide in γ.
-3. **Exact ζ thresholds.** Absolute size vs growth-rate. **Suggested
+3. ~~**Exact ζ thresholds.** Absolute size vs growth-rate. **Suggested
    resolution:** both — absolute (e.g. 10 GB) and a daily-delta ceiling
-   anchored on the measured ~50 MB/day. Decide in ζ.
-4. **Whether η should also assert the two unit copies' `Environment=` values
-   agree**, given the installed copy legitimately carries 9 project roots.
-   **Suggested resolution:** check *directive presence and shape*, not
-   values, and allow an explicit documented divergence list. Decide in η.
+   anchored on the measured ~50 MB/day. Decide in ζ.~~
+   **CORRECTED 2026-08-02 — the suggested anchor was wrong and would have
+   self-defeated.** The ~50 MB/day figure was a **lifetime mean**
+   (total size ÷ 114 days) for a series that is strongly **accelerating**.
+   Measured trailing-7d on the live DB: **~221 MB/day** (3.9×), with the
+   preceding weeks at 402,700 / 336,900 / 137,700 rows/day (d7-14 /
+   d14-21 / d21-28) against 520,700 rows/day in the trailing week. A
+   daily-delta ceiling anchored on ~50 MB/day would have been **in breach
+   the moment the alarm deployed** — a threshold derived from a bad
+   baseline is worse than none, because it fires immediately and then gets
+   disabled. Task **3311**'s planner caught this independently
+   (esc-3311-2 / esc-3311-3) and re-anchored on measured figures:
+   **10 GiB absolute / 300 MiB/day**. At the measured rate the absolute
+   ceiling is expected ~10-13 days after deploy — **by design**, since the
+   alarm exists to trigger the follow-on retention decision.
+   *Generalisation for future PRDs: state the measurement **window**
+   beside any rate, and never anchor a threshold on a lifetime mean
+   without first checking the trend.*
+4. ~~**Whether η should also assert the two unit copies' `Environment=` values
+   agree**, given the installed copy legitimately carries 9 project roots.~~
+   **RESOLVED in η (task 3312).** Presence-and-shape everywhere would have
+   been too weak to deliver the check's actual purpose — an installed
+   `TimeoutStopSec=90` against a committed `15`, or a stale
+   `--timeout-graceful-shutdown`, is *present but wrong*. So directives are
+   split by CLASS instead, in `scripts/check_dashboard_unit_parity.py`:
+
+   - **Value-compared** — host-INVARIANT literals carrying no paths (`Type`,
+     `Restart`, `RestartSec`, `RestartMaxDelaySec`, `TimeoutStopSec`,
+     `TimeoutStartSec`, `StandardOutput`/`Error`, `OnBootSec`,
+     `OnUnitActiveSec`, `WantedBy`). Comparison is symmetric: a directive
+     added only to the installed copy is drift too.
+   - **Presence-only** — directives embedding host paths (`ExecStart`,
+     `WorkingDirectory`, `Documentation`), which cannot be value-compared
+     without firing on every machine that is not this one.
+   - **ExecStart flags** — the uvicorn flags γ added are extracted from the
+     backslash-continuation-joined logical `ExecStart` of both copies and
+     compared individually, so the `uv` path and repo root are ignored while
+     a stale `--timeout-keep-alive` is not. This is what makes "the unit
+     change reached the running system" a checkable claim for γ and δ.
+   - **`Environment=`** — compared by variable-NAME set (a dropped variable
+     is always drift), with values compared only for names off a documented
+     `DIVERGENCE_ALLOWLIST`. One entry today: `DASHBOARD_KNOWN_PROJECT_ROOTS`,
+     carrying the committed unit's own justification verbatim. Allowlisting
+     is scoped to a variable NAME, not to `Environment=` as a whole, so
+     blessing the nine-root value does not also bless the variable
+     disappearing. Lines are split with `shlex`, so systemd's
+     several-assignments-per-line and quoted spellings parse the way systemd
+     reads them — reformatting a line must not invent drift.
+   - **Override mechanisms** — comparing directives only proves something if
+     the installed unit *file* is what takes effect. A drop-in
+     (`<unit>.d/*.conf`, what `systemctl --user edit` writes) is merged over
+     the unit at load time, and an `EnvironmentFile=` pulls values from a
+     file off the tree; either lets every compared directive match while the
+     running configuration differs. Drop-ins are detected in the installed
+     dir and reported as `[override]`; `EnvironmentFile=` is registered
+     per-unit and fires when one copy declares it and the other does not.
+
+   Expected VALUES are read from the committed unit at run time; only the KEY
+   registry and the allowlist are curated. A hardcoded literal list would be
+   a third site that must agree with the other two, and would silently defeat
+   the purpose — a stale literal keeps passing against the OLD value on both
+   sides while the repo edit again fails to reach the running system. The key
+   registry is guarded against rot by tests asserting every listed key is
+   really declared in the committed unit.
+
+   Exit contract, matching `check_fused_memory_unit_parity.py` so
+   `setup-host.sh` can branch on it: **0** parity / **1** drift *or
+   unverifiable* / **2** installed unit absent, with 1 DOMINATING 2 so an
+   unrelated uninstalled unit cannot mask an actionable finding. Exit 1 also
+   covers a vanished committed unit and a drop-in override — both mean the
+   gate could not make its claim, which is the opposite of the benign "not
+   installed here" that 2 denotes. The three are worded apart in the report
+   (`[drift]` / `[vanished]` / `[override]`) because they send the operator
+   to different places, and `setup-host.sh`'s warn line says "drift or
+   unverifiable" rather than collapsing them back to "DRIFT". No `--fix`:
+   re-running the installer is the propagation path, and a `--fix` could
+   silently re-arm a watchdog timer someone deliberately left disarmed.
+
+   **Where it is wired, and which caller is the real gate.** `setup-host.sh`
+   calls it TWICE, and only the first can observe anything:
+
+   - **Section 8, BEFORE the install — the real gate.** The install
+     unconditionally re-renders `dark-factory-dashboard.service` and `cp`s
+     both watchdog units, so it ERASES the drift a moment later. Checking
+     only afterwards would have made the report a tautology: it could
+     report a failed copy, but never the case the checker was built around
+     ("the installed watchdog is still the pre-incident inline-shell copy"),
+     because by then it isn't. Running first buys the RECORD of what was
+     silently stale before setup fixed it.
+   - **Verification section, AFTER the install — a sanity check.** A
+     mismatch here does not mean the host drifted; it means the install did
+     not take (failed write, template no longer rendering to the committed
+     unit, or a drop-in that survives reinstallation because `setup-host.sh`
+     does not touch `<unit>.d/`).
+
+   Both are warn-only; neither aborts the install. NOT YET WIRED: a caller
+   that observes drift on a cadence rather than only when an operator runs
+   the installer — the watchdog tick, a periodic timer, or a pre-merge hook.
+   That is the placement with the most value and it is deliberately left for
+   a follow-up, since every candidate site is outside task 3312's locks.
+
+   **Drift this surfaces on the host at landing time:** the installed
+   `dark-factory-dashboard-watchdog.service` is still the pre-incident
+   inline-shell copy — no `TimeoutStartSec`, no journal routing — so the
+   checker exits 1 until task 3289 installs the post-δ units. That is the
+   intended signal, not a defect: it is exactly the silent-propagation
+   failure this check was built to expose. The deliberate 9-vs-1
+   `DASHBOARD_KNOWN_PROJECT_ROOTS` divergence correctly stays silent, and
+   the uvicorn flags compare clean.

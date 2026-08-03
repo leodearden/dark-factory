@@ -52,7 +52,7 @@ mcp__escalation__merge_request(
   worktree="<path to worktree>",
   description="<brief description of what's being merged>",
   wait_secs=100,
-  verified_green=True
+  verified_green=<True|False>  # decide per the verified_green rule below — do not default to True
 )
 ```
 
@@ -62,7 +62,7 @@ Parameters:
 - `worktree` — absolute path to the task's worktree (e.g., `/home/leo/src/dark-factory/.worktrees/42/`)
 - `description` — optional context for logs
 - `wait_secs=100` — **always pass this explicitly.** The value 100 equals the server's maximum bounded wait (`_MAX_WAIT_SECS`), so fast/idle-queue merges return their terminal outcome in the same call. The call always returns within ≤100 s.
-- `verified_green` — pass `True` **only** when the verification suite (tests, lint, type-check from step 1 "Prepare your branch") actually ran and passed on this branch, on top of its own base; omit it (or pass `False`) if you skipped verification, or it failed and you're submitting anyway for an unrelated reason (e.g. resubmitting after a `conflict`/`blocked` fix-up you haven't re-verified). This vouches to the merge queue that the branch was seen green pre-merge — it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`. Since `/do` lands its branches through this skill, honoring this rule here also covers `/do` submissions.
+- `verified_green` — a **per-submission decision, not a default.** Pass `True` **only** when the verification suite (tests, lint, type-check from step 1 "Prepare your branch") actually ran and passed on this branch, on top of its own base; omit it (or pass `False`) if you skipped verification, or it failed and you're submitting anyway for an unrelated reason (e.g. resubmitting after a `conflict`/`blocked` fix-up you haven't re-verified). This vouches to the merge queue that the branch was seen green pre-merge — it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`. Since `/do` lands its branches through this skill, honoring this rule here also covers `/do` submissions. `/unblock`'s step 6 D2 is this same rule, with an added D1/D2 split for its rebase/re-verify loop — an agent holding both skills is applying one rule, not two.
   - **Caution — not retractable:** the classifier's green fact is *any-prior-green, keyed by task ID* — once `verified_green=True` has been emitted for a task ID, omitting it (or passing `False`) on a **later** resubmission for that same task ID does not undo the earlier green. If you resubmit after an unverified fix-up (e.g. a quick conflict resolution you didn't re-run the suite on), a genuine `BRANCH_BUG` in that fix-up can still be misattributed to `INTEGRATION_SKEW` on a later merge failure, because the classifier only sees "this task ID was green once," not which commit. When in doubt, re-run verification before resubmitting rather than relying on an earlier `True`.
 
 The call returns with **either** a **terminal** status **or** a **non-terminal** status:
@@ -72,15 +72,30 @@ The call returns with **either** a **terminal** status **or** a **non-terminal**
   - `superseded` means your request was absorbed into a coalesced train before it could be individually processed. The response includes `superseded_by: "<train_request_id>"`. Re-poll the train request immediately (step 4 / follow-the-train protocol below).
 
 - **Non-terminal** (`queued`, `attached`): the submission succeeded as **durable intent** — the merge worker has accepted the request and will process it. This is **not a failure**. The `request_id` in the response identifies your submission. Proceed to "Poll for completion" below.
-  - `attached` means your submission was coalesced with an already-in-flight request for the same branch; you share that request's `request_id`.
+  - `attached` means your submission was coalesced with an already-in-flight request for the same branch. Whether you share that in-flight entry's `request_id` depends on the response's own disclosure — see "Poll for completion" below, which branches on the `poll_by` field the response carries alongside `source`, `inflight_request_id`, `inflight_task_id`, and `pollable`.
 
 ### Poll for completion
 
-Call `merge_status(request_id)` on a backoff schedule until the state is terminal:
+**Pick the poll handle from the submit response's `poll_by` field** (present on `attached` responses since task 3148; a `queued` response has no in-flight entry to disclose, so it's always polled by its own `request_id`). Read it defensively — `result.get("poll_by", "request_id")` — so a response from a server predating this field degrades to today's behaviour instead of raising:
 
-```
-mcp__escalation__merge_status(request_id="<request_id from submit>")
-```
+- `poll_by == "request_id"` (or absent) — the returned `request_id` IS the handle:
+  ```
+  mcp__escalation__merge_status(request_id="<request_id from submit>")
+  ```
+- `poll_by == "task_id"` — no in-flight `request_id` is known; the returned `request_id` is your *own* submitting call's id, not a handle. Poll the in-flight task instead:
+  ```
+  mcp__escalation__merge_status(task_id="<inflight_task_id from submit>")
+  ```
+  **Terminal states on this arm are UNCONFIRMED too, for the same reason as the `branch` arm below.** A task-keyed poll is submission-scoped only while the live-snapshot tier is still serving it; once that stops (e.g. a mid-flight orchestrator restart) the durable tiers resolve it to the most-recent *finalized* record for the task (retention ring `get_by_task` → event store `latest_merge_finalized(task_id=...)`, `escalation/server.py:2244-2287`), and task_ids are reused verbatim across resubmissions exactly like branches. Apply the identical rule: a `done` carrying `kind: "found_on_main"` is already git-authoritative — **accept it directly, do not re-check ancestry**; the ancestry re-check applies only to a `done` served from the durable retention-ring/event-store tiers (no `kind`, no `merge_sha`), which you confirm with the [canonical ancestry check](#canonical-ancestry-check) below. Re-check `get_merge_queue()` before acting on a `conflict`/`blocked`/`abandoned`. Because a rejected `done` would otherwise re-serve forever, this arm shares the `branch` arm's 20-minute ceiling and the same stop-and-report exit.
+- `poll_by == "branch"` (equivalently `pollable == false`) — neither handle is known: a foreign or pre-restart merger owns the worktree, so there's no in-process entry, no retention alias, and no waiter. The returned `request_id` was never enqueued — polling it directly resolves `state: "unknown"`, which here is expected, NOT a lost record. Poll by branch instead, which benefits from `merge_status`'s git-authority tier (self-resolves a landed merge to `state: "done"` / `kind: "found_on_main"`):
+  ```
+  mcp__escalation__merge_status(branch="task/<TASK_ID>")
+  ```
+  **Terminal states on this arm are UNCONFIRMED.** A branch-keyed poll resolves the most-recent *finalized* record for that branch (retention ring `get_by_branch` → event store `latest_merge_finalized(branch=...)`, `escalation/server.py:2251-2286`) — nothing ties that record to *your* submission, and the event store survives restarts. Task branches are reused verbatim across resubmissions, so a prior round's `done`/`conflict`/`blocked`/`abandoned` can satisfy the terminal test on the very first tick. **Exception — a `done` carrying `kind: "found_on_main"` is NOT subject to this:** that shape comes from the git-authority tier, a live probe of main reached only because the durable tiers missed, so it structurally cannot be a stale prior-round record. Accept it directly. For a `done` served from the durable tiers (no `kind`, no `merge_sha`), confirm with the [canonical ancestry check](#canonical-ancestry-check) below — not-landed means stale, so keep polling. On a `conflict`/`blocked`/`abandoned` from this arm, treat it as possibly predating this submission: re-check `get_merge_queue()` and who owns the worktree before resolving or resubmitting.
+
+  Cross-check `get_merge_queue()` for queue-wide context if useful. On this arm `unknown` is the **live** state, not a first-tick fluke — it persists for as long as the foreign merger is still working, since the git-authority tier can only resolve once the merge is provably on main — by *either* of its two paths: `is_ancestor(tip, main)` while the branch ref still exists, **or** `find_merge_marker` once the ref is gone (the `elif tip is None` deleted-branch path, `escalation/server.py:2448-2459`, which makes no `is_ancestor` call at all). Do NOT read it as a terminal failure or as licence to direct-merge, and do NOT resubmit on it (the `state: "unknown"` resubmit rule below is scoped to the other two arms). **Exception to "same for all three arms" below: this arm and the `task_id` arm are bounded by a 20-minute wall-clock ceiling, starting from your first poll on that arm** (not from the original submit) — matching `skills/unblock/SKILL.md` and `skills/unblock-low-risk/SKILL.md:177-189`. At expiry, in order: (1) run the [canonical ancestry check](#canonical-ancestry-check) one final time; (2) landed (rc=0, or rc=128 with a merge-marker hit) → treat as `done`/`found_on_main` per the `state: "unknown"` handling below; (3) only if it comes back genuinely not-landed → stop and report to the human — never resubmit, never fall back to a direct merge.
+
+Whichever handle you poll, the cadence and state handling below are the same for all three arms:
 
 **Backoff:** start at **15 s**, cap at **60 s**. When the response contains an `eta_seconds` field whose value is a **positive number**, use that value as the sleep duration (capped at 60 s); if `eta_seconds` is absent or `null`, fall back to the 15 s→60 s backoff schedule.
 
@@ -96,15 +111,32 @@ mcp__escalation__merge_status(request_id="<superseded_by value>")
 
 Poll the train request with the same 15 s→60 s backoff until it reaches a terminal state (`done`, `conflict`, `blocked`, `abandoned`). Your absorbed branch lands when the train lands. Handle the train's terminal state per step 4.
 
-**`state: "unknown"`** — the orchestrator restarted and the retention ring no longer holds this request. `merge_status` now self-resolves a landed merge via its git-authority tier: if the branch is provably on `main` it returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` directly. If `merge_status` still returns `unknown`, confirm deterministically:
+**`state: "unknown"`** — for the `request_id`/`task_id` poll arms, this means the orchestrator restarted and the retention ring no longer holds this request (a record that *was* enqueued). `merge_status` now self-resolves a landed merge via its git-authority tier: if the branch is provably on `main` it returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` directly. If `merge_status` still returns `unknown`, confirm deterministically:
+<a id="canonical-ancestry-check"></a>**The canonical ancestry check — three outcomes, not two.** Every "is it on main?" confirmation in this skill means this check. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the normal post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py:7538-7574`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
 ```bash
-git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
-# If exit 0 (on main): treat as done/found_on_main — use done_provenance kind='found_on_main',
-#   commit=<landing sha: git log --format=%H -1 main>
-#   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
-# If exit 1 (not on main) AND queue is healthy: resubmit (go back to step 3).
+git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
+# The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
+# nothing on rc=0 OR rc=1, and the `rc=$?` assignment itself exits 0, so
+# without it the tool reports exit 0 and identical empty output for "on
+# main" and "NOT on main" -- silence you would have to guess at. Echoing the
+# numeric rc is NOT the two-outcome `&& echo` idiom banned above: it prints
+# on every path and keeps all three outcomes distinguishable. Do not "tidy"
+# it away.
+# rc=0   → on main. Treat as done/found_on_main — done_provenance kind='found_on_main',
+#          commit=<landing sha: git log --format=%H -1 main>
+#          (git log gives the merge commit; git merge-base gives the common ancestor, NOT it)
+# rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the normal state
+#          AFTER a successful merge + cleanup — NOT "not on main". Search main for THIS
+#          branch's merge commit, by exact subject:
+git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
+#          Non-empty output → that SHA IS the true merge commit; treat as done/found_on_main.
+#          Empty output    → not landed (branch never existed, or never merged).
+# rc=1   → genuinely not on main. AND queue is healthy: resubmit (go back to step 3).
 ```
-**Never fall back to a direct merge in response to `unknown`** — `unknown` means the server lost its record, NOT that the merge failed. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested.
+**The rc=128 search must be the exact-subject one above — never an unfiltered `git log main --merges | head -5`.** That listing takes no task argument, so on any repo with merge history it always prints something: "a hit" becomes unconditionally true and "no hit" unreachable, and every rc=128 — *including a typo'd branch name, the wrong worktree, or a branch never pushed*, all of which also exit 128 — would be recorded as landed with some unrelated task's merge SHA. The server's `done_provenance` backstop is only `git merge-base --is-ancestor <sha> main`, which any recent merge on main passes, so nothing downstream catches it.
+
+This mirrors the in-repo authority, `GitOps.find_merge_marker` (`orchestrator/src/orchestrator/git_ops.py:7862-7905`) — the same function the git-authority tier calls on the deleted-branch path. `--fixed-strings` against the exact subject from `_merge_subject(branch, main_branch)` (`git_ops.py:1874`, canonical form `Merge <full-branch> into <main-branch>`) is what makes it substring-safe: `Merge task/1 into main` cannot match inside `Merge task/10 into main`, because the `0` falls where the pattern has a space. Do **not** substitute a bare `--grep="task/<TASK_ID>"` — BRE, not restricted to merges, matches any commit merely *mentioning* the task, and re-opens that collision. If a project overrides `git.branch_prefix` (default `task/`) or `git.main_branch`, build the subject from `_merge_subject` rather than hardcoding.
+**Never fall back to a direct merge in response to `unknown`** — `unknown` means the server lost its record, NOT that the merge failed. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; see its 20-minute ceiling above for the bounded exit instead.
 
 ### 4. Handle the outcome
 
@@ -112,7 +144,8 @@ The outcome arrives from either the submit call (terminal at submit time) or the
 
 **`done`** — Merge succeeded. Main has been advanced atomically.
 - Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})`
-  - Use `{"kind": "merged", "commit": "<sha>"}` when this branch's merge commit landed on main (the normal case — the merge tool's return value has the merge SHA). The server backstops with `git merge-base --is-ancestor <sha> main`.
+  - Use `{"kind": "merged", "commit": "<sha>"}` when this branch's merge commit landed on main (the normal case). The server backstops with `git merge-base --is-ancestor <sha> main`.
+  - **Where the SHA comes from depends on which call produced the `done`, and not every source is safe to record as `kind: "merged"`.** A terminal-at-submit-time `merge_request` response carries the true merge SHA in `commit` — safe to use directly. A *polled* `done` does not, unless the response carries `merge_sha` (the git-authority tier's `kind: "found_on_main"` shape) — the durable retention-ring/event-store tiers return only `state`/`request_id`/`generation`/`outcome`/`finished_at` (`escalation/server.py:2404-2420`), and `outcome` is the raw state string `"done"`, not a commit hash. **A `merge_sha` is not necessarily the merge commit**: on the live-branch resolution path (branch still exists, `is_ancestor` hit) it is the *branch tip* SHA — for a `--no-ff` merge, a distinct commit from the actual merge commit — while only the deleted-branch (`find_merge_marker`) path's `merge_sha` is the true merge-commit SHA (`_found_on_main_response`'s docstring, `escalation/server.py:2290-2305`). So: record a bare `merge_sha` as `{"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}`, not `kind: "merged"` — only re-derive and use the actual merge commit if `kind: "merged"` provenance is specifically wanted — and re-derive it with the exact-subject search, `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H`, **not** by eyeballing `git log main --oneline | head -5` (unscoped to this task, so any SHA picked from it is likely an unrelated task's merge, and the server's only backstop — `git merge-base --is-ancestor <sha> main` — passes for every recent commit on main and would not catch it). If the response has neither `commit` nor `merge_sha` — including on the `poll_by == "branch"` arm, where a durable record can resolve `done` with no `merge_sha` — re-derive the merge commit the same way. Never fabricate a SHA; if the search comes back empty, fall back to `{"kind": "found_on_main", "commit": "<landing sha>", "note": "<explanation>"}` with a SHA you've actually verified is on main.
   - Use `{"kind": "found_on_main", "commit": "<landing sha>", "note": "<one-sentence explanation>"}` when the implementation is already on main from a sibling task / prior orchestrator run; the server runs the same git merge-base --is-ancestor backstop as for kind="merged".
 - Clean up worktree and branch:
   ```bash
@@ -170,7 +203,10 @@ The response is `{ cancelled, state, reason }`:
 
 **Important:** `merge_cancel` is the **only** explicit-cancellation path. An MCP client disconnect no longer cancels the merge (durable intent), so an abandoned submission must be cancelled deliberately.
 
-If your submit returned `status: "attached"`, your submission was coalesced with an in-flight entry. Cancel using the `request_id` returned with that `attached` response — it points to the shared in-flight entry.
+If your submit returned `status: "attached"`, whether the returned `request_id` cancels the shared in-flight entry depends on that response's `poll_by`:
+
+- `poll_by == "request_id"` — the returned `request_id` IS the in-flight entry's id; cancel it as shown above.
+- `poll_by == "task_id"` or `poll_by == "branch"` — the returned `request_id` names your own coalesced submission, not the in-flight entry. Treat the cancel as best-effort: `cancelled: false` / `state: "unknown"` is the expected outcome here, not evidence of a problem. On `"branch"` specifically, a foreign or pre-restart merger owns the worktree — reaching the real entry isn't this caller's cancel to make. Re-check the actual state first (`merge_status(task_id=...)` / `merge_status(branch="task/<TASK_ID>")`, which self-resolves a landed merge via the git-authority tier), then the `git merge-base --is-ancestor` confirmation described under `state: "unknown"` above, before deciding anything further.
 
 ### 6. Fallback: direct merge
 
@@ -196,10 +232,11 @@ After a successful direct merge:
 
 | Situation | Action |
 |-----------|--------|
-| Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=True)` — only when verification actually passed — then poll `merge_status` |
+| Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=...)` — `True` only when verification actually passed, `False` otherwise — then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
-| Submit returns `queued` or `attached` | Submission succeeded (durable intent); poll `merge_status(request_id)` with 15 s→60 s backoff |
-| `merge_status` returns `state: "unknown"` | Check `git merge-base --is-ancestor task/<TASK_ID> main` (exit 0 → done/found_on_main; exit 1 + healthy queue → resubmit). Never direct-merge in response to `unknown`. |
+| Submit returns `queued` or `attached` | Durable intent confirmed; poll the handle `poll_by` names (`request_id` for `queued` and the `poll_by=="request_id"` arm; `task_id`/`branch` when `attached` discloses them) with 15 s→60 s backoff |
+| `merge_status` returns `state: "unknown"` | `request_id`/`task_id` arms: run the canonical ancestry check (rc=0 → done/found_on_main; rc=128 → branch ref gone; confirm with the exact-subject search `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` — non-empty = landed, empty = not landed; never an unfiltered `--merges` listing; rc=1 + healthy queue → resubmit). `poll_by == "branch"` arm: `unknown` is that arm's live state — keep polling to the 20-min ceiling, then stop and report, never resubmit. Never direct-merge in response to `unknown`. |
+| Terminal state arrived on an unscoped arm (`poll_by` `"branch"` or `"task_id"`) | Unconfirmed — a branch- or task-keyed poll can match a *prior* round's record on the same reused branch/task_id. A `done` with `kind: "found_on_main"` is git-authoritative — accept directly. Otherwise accept `done` only when the canonical ancestry check says landed (rc=0, or rc=128 with a merge-marker hit); re-check `get_merge_queue()` before acting on a `conflict`/`blocked`/`abandoned`. |
 | Outcome `conflict` | Fix in worktree, resubmit |
 | Outcome `blocked` | Read reason, fix, resubmit |
 | Outcome `done` or `already_merged` | Update task status, clean up |

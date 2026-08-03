@@ -19,6 +19,7 @@ from shared.invocation_outcome import (
     AuthFailed,
     CapHit,
     ModelNotFound,
+    ServerError,
     ZeroOutputWedge,
     classify_invocation,
 )
@@ -142,22 +143,25 @@ class EvalMetrics:
     # ``invocation_error`` records WHAT happened: a stage-prefixed marker for an
     # infra failure observed while producing this cell, e.g.
     # ``"architect:cap_hit: You've hit your session limit · resets 8pm"``,
-    # ``"architect:model_not_found: ..."``, ``"architect:wedge: ..."`` or
-    # ``"judge:api_error: HTTP 429"``. ``None`` means no infra failure was
-    # observed — including for an ordinary content failure (an architect that
-    # ran fine and simply produced a bad/absent plan), which must keep scoring
-    # on content.
+    # ``"architect:model_not_found: ..."``, ``"architect:wedge: ..."``,
+    # ``"architect:server_error: HTTP 529"`` or ``"judge:api_error: HTTP
+    # 429"``. ``None`` means no infra failure was observed — including for an
+    # ordinary content failure (an architect that ran fine and simply
+    # produced a bad/absent plan), which must keep scoring on content.
     #
     # ``cap_tainted`` is the SCORING DECISION derived from it: this cell is not
     # a content measurement at all, so the plan_quality aggregates EXCLUDE it
     # rather than average in a fabricated zero (which would penalise whichever
-    # candidate happened to be scheduled inside a cap window). Scope note: only
-    # the plan_quality surfaces exclude — ``build_composite_report``'s
-    # composite/quality pools and its ``trials`` / ``tests_pass_rate``
-    # denominators deliberately still COUNT a tainted trial, because those pools
-    # measure the implementer-path gates (which a tainted architect cell reports
-    # as an honest failure, not a fabricated score) and dropping trials from the
-    # denominator would silently shrink the sample ``select_survivors`` ranks on.
+    # candidate happened to be scheduled inside a cap window). Scope note
+    # (REVISED by task 3099): the plan_quality surfaces exclude, and so do
+    # ``build_composite_report``'s composite/quality pools for a PLAN-ONLY
+    # trial. Those pools used to COUNT a tainted trial, on the grounds that they
+    # measured the implementer-path gates — which a tainted architect cell
+    # reports as an honest failure, not a fabricated score. That no longer holds
+    # now that a plan-only composite is DERIVED from plan_quality: a fabricated
+    # 0.0 would land in exactly the number ``select_survivors`` ranks on. The
+    # ``trials`` denominator still counts every trial (the sample is never
+    # silently shrunk) and ``plan_quality_cap_excluded`` reports the skips.
     #
     # NAME vs SCOPE (reviewer: design-coherence): the field name is ``cap_``
     # because the campaign that motivated it was a session-cap window, but the
@@ -182,6 +186,46 @@ class EvalMetrics:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def produced_a_plan(metrics: dict[str, Any]) -> bool:
+    """THE plan-production predicate: did this architect actually emit a plan?
+
+    Reads the PERSISTED ``plan_steps`` field above and nothing else. This is the
+    metrics-dict twin of :func:`orchestrator.evals.judge.is_scorable_plan`, which
+    asks the same question of the plan ARTIFACT — the form the report layer can
+    never use, because by report time it holds only a persisted metrics dict.
+    ``run_architect_eval`` derives ``plan_steps`` from the identical
+    ``len(plan.get('steps') or [])``, so the two are equivalent BY CONSTRUCTION
+    (pinned by ``TestProducedAPlan.test_equivalent_to_the_artifact_level_twin``
+    rather than left to coincidence — the drift hazard
+    ``report._has_plan_quality_score`` was written to close).
+
+    **Why not ``plan_quality > 0``** (the rule this replaces everywhere, task
+    3302): the two plan scorers disagreed exactly on a stepless artifact.
+    :func:`judge.score_plan_structure` returns ``0.0`` for one as a deliberate
+    ANTI-FABRICATION guard; the LLM plan judge used to have no such guard and
+    could score the same artifact nonzero (Graphiti episode e2066ec6) — closed
+    at the instrument by task 3303, which gave ``judge_plan_quality`` the same
+    floor. Regardless of which scorer produced it, a nonzero ``plan_quality``
+    is not evidence a plan exists, and a zero one is not evidence it does not
+    — the number is the thing being decided, not the evidence for it.
+
+    **Why not ``outcome == 'done'``** (task 2863 AMENDMENT §1): done-without-a-plan
+    and blocked-with-a-good-plan cells both occur, so the workflow outcome
+    answers a different question.
+
+    Two in-repo surfaces already got this right and this predicate makes the
+    pipeline agree with them rather than contradict them:
+    ``scripts/eval_bootstrap_smoke.sh`` gates its smoke on ``metrics.plan_steps
+    > 0 & outcome == 'done'``, and ``plans/eval-architect-effort-verdict-2026-07-27.md``
+    hand-computed the campaign's ``planRate`` / ``meanPQ_all`` from
+    ``plan_steps > 0`` because the pipeline's own ranking could not be used.
+
+    Pure: no I/O, no mutation. Tolerates a missing key and an explicit ``None``
+    (the empty shape ``len(... or [])`` guards) — both mean "no plan".
+    """
+    return int(metrics.get('plan_steps') or 0) > 0
 
 
 def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:
@@ -252,6 +296,17 @@ def detect_invocation_error(
     It is checked BEFORE the wedge tier so a 429 that also timed out with zero
     turns is reported as the 429 it is, not as a generic wedge.
 
+    ``ServerError`` (HTTP 5xx, including 529 Overloaded) is marked too: the
+    provider refused, so the model never answered and the cell is unmeasurable
+    for the same reason a 429 is. It is attributed ABOVE the wedge tier because
+    a SIGTERM-flushed 5xx on a watchdog-killed CLI is a PROVIDER outage, not a
+    local wedge — the 2026-07-29 incident this tier exists for. This arm also
+    REPAIRS a silent regression: before ``classify_invocation`` grew the
+    ``ServerError`` tier, a timed-out flushed 5xx reached this ladder as a
+    ``ZeroOutputWedge`` and was marked; once that tier was ranked above the
+    wedge upstream, the same case silently fell through to ``None`` until this
+    arm was added.
+
     ``ZeroOutputWedge`` is marked too (reviewer: robustness): a full-timeout
     invocation with zero transcript turns produced no model answer at all, so it
     is unmeasurable for exactly the reason a 429 is, and scoring it 0.0 would
@@ -285,6 +340,14 @@ def detect_invocation_error(
         return None
     if getattr(result, 'api_error_status', None) == 429:
         return 'api_error: HTTP 429'
+    # ServerError sits BELOW the 429 fallback, because a 5xx is never a 429
+    # and 429-body semantics must not move; it sits ABOVE the wedge branch so
+    # this ladder's order tracks classify_invocation's own CapHit/NearCap >
+    # ServerError > ZeroOutputWedge precedence (shared/src/shared/
+    # invocation_outcome.py:398, :523) — a SIGTERM-flushed 5xx on a
+    # watchdog-killed CLI is a provider outage, not a local wedge.
+    if isinstance(outcome, ServerError):
+        return f'server_error: HTTP {outcome.status}'
     if isinstance(outcome, ZeroOutputWedge):
         return 'wedge: zero-output timeout (no transcript turns)'
     return None
@@ -331,14 +394,42 @@ def blend_composite(
     latency_score: float,
     *,
     tests_pass: bool | None,
+    plan_only: bool = False,
+    no_plan: bool = False,
     weights: dict[str, float] = DEFAULT_COMPOSITE_WEIGHTS,
 ) -> float:
     """The C4 efficiency-adjusted ``composite``: *quality* blended with
     normalized cost + latency scores, bounded to ``[0, 1]``.
 
-    Keeps ``compute_composite``'s HARD GATE (decision 11): a failing (or
-    ``None``) *tests_pass* returns ``0.0`` regardless of the efficiency axes, so
-    a cheap+fast WRONG answer can never outrank a correct one.
+    TWO HARD GATES, one per path, resting on ONE argument: a cheap+fast WRONG
+    answer must never outrank a correct one.
+
+    - Keeps ``compute_composite``'s gate (decision 11): a failing (or ``None``)
+      *tests_pass* returns ``0.0`` regardless of the efficiency axes.
+    - **no_plan** (task 3302): the architect produced NO PLAN, so the plan-only
+      path returns ``0.0`` the same way. The asymmetry the earlier docstring got
+      wrong is that the plan-only path bypasses *tests_pass* because "no test
+      signal was collected" is not "the answer was wrong" — but "the architect
+      produced no plan" IS the answer being wrong, and it is the one quality
+      signal a plan-only cell ALWAYS has. It therefore gates exactly the way a
+      failing workflow trial does.
+
+    The bound *no_plan* closes: flooring such a cell's *quality* axis to ``0.0``
+    (the report layer's :func:`_plan_quality_score`) bounds only the 0.6 quality
+    weight. The remaining 0.2 cost + 0.2 latency is still collected, so an
+    ungated no-plan cell caps at ``0.40`` — and a cell that is the sole member of
+    its ``(fixture, 'plan_only')`` group takes the report layer's all-trials
+    fallback baseline, earning ratios of ``1.0`` on both axes and banking the
+    full ``0.40`` for having FAILED. Measured (task 3302 review): a no-plan cell
+    at ``0.40`` outranked a config that produced a real 6-step plan at ``0.26``
+    and survived ``select_survivors(top_k=2)``, while the plan-producing one was
+    cut. Barring the cell from SEEDING its group's floor closes only the
+    intra-group route; this gate closes the cross-group one.
+
+    The gate is UNCONDITIONAL rather than scoped to *plan_only*, so a caller
+    cannot silently bypass it by forgetting the flag. The report layer computes
+    it as ``plan_only and not produced_a_plan(m)``, so it is never ``True`` on
+    the workflow path — where the plan-production question does not exist.
 
     *quality* is the pure :func:`compute_composite` score; *cost_score* and
     *latency_score* are per-fixture NORMALIZED efficiency scores in ``[0, 1]``
@@ -346,8 +437,28 @@ def blend_composite(
     ``report._ratio_score``), supplied by the report layer where the
     cross-config context to normalize exists. PURE and additive: this does not
     touch ``compute_composite``.
+
+    **plan_only** (task 3099) — the cell under test is a PLAN-ONLY run (an
+    architect eval freezes implementer/debugger/reviewer/verify), so no test was
+    ever run and there is no test signal to gate on. The caller then supplies
+    *quality* as the θ-rubric ``plan_quality`` and the ``tests_pass`` hard gate
+    is deliberately bypassed: keeping it would read "no signal collected" as
+    "the answer was wrong" and zero the number that drives survivor selection.
+
+    Under *plan_only* the CALLER — not this function — owns the exclusion of an
+    UNMEASURABLE cell: a cap-tainted trial (no ``plan_quality`` at all) must be
+    dropped from the pool by the report layer, never passed here as a fabricated
+    ``0.0``, which would penalise whichever candidate happened to be scheduled
+    inside a cap window (the task-3118 invariant, one layer up). *no_plan* is
+    owned by the caller for the same reason it owns *tests_pass* and *plan_only*:
+    this function stays PURE over floats + bools and never sees a metrics dict.
     """
-    if not tests_pass:
+    # The two hard gates, as one parallel pair — not one gate plus a special
+    # case. Left: the workflow path's answer was wrong. Right: the plan-only
+    # path's answer was nothing.
+    if not plan_only and not tests_pass:
+        return 0.0
+    if no_plan:
         return 0.0
     blended = (
         weights['quality'] * quality

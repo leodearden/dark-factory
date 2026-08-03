@@ -205,3 +205,134 @@ Recorded rather than silently guessed:
   `bf91bc5c…`**, the `esc-5610` canonical that superseded it within the
   same session. An excluded canonical never takes ownership, so its
   members fall through to the surviving one rather than being orphaned.
+
+---
+
+## `memory_eval_topic_registry.json`
+
+The probed-topic registry for the **E1 retrieval-health** eval
+(`docs/prds/memory-eval-program.md` §5 leaf β, task 3208). Read by
+`fused-memory/scripts/memory_eval_retrieval_probe.py` via
+`load_topic_registry()`; its shape is contract-tested in
+`fused-memory/tests/test_memory_eval_retrieval_probe.py`.
+
+### Purpose
+
+Each entry names a topic, the memory that topic's queries are *expected* to
+return (its **canonical**), several query phrasings, and the substantive
+claims that should come back. The probe issues every phrasing and records
+what the store returned; it emits measurements only and never evaluates a
+limit (D1/G6 — thresholds, grandfather sets and alarms all live in the
+limits evaluator, not here).
+
+### Record schema
+
+Top level is `{"schema_version": 1, "_disclosures": {...}, "entries": [...]}`.
+`_disclosures` is described under "What the registry does **not** cover"
+below. Per entry:
+
+| field | meaning |
+|---|---|
+| `topic` | Stable slug. **This is a persisted key** — the tripwire item key is `t-<topic>`, which the grandfather set stores. Renaming one silently re-releases a grandfathered item. |
+| `project_id` | `dark_factory` or `reify` — which corpus to probe. |
+| `derived_from` | Provenance tag: `curator_gate`, `census_topic`, `topic_guard_cluster`, `briefing_query`, `hand`. Lets a later run tell which entries auto-derivation has taken over from hand-authoring. |
+| `canonical.content_hash` | `content_key()` of the expected entry — sha256 of whitespace-normalised content, `hexdigest()[:16]`. The **primary** matcher. |
+| `canonical.last_known_id` | Fallback matcher. Memory UUIDs rot on re-consolidation (D5), so the probe tries the hash first and discloses which matcher fired. |
+| `canonical.content_prefix` | Human anchor for the report. **Never** used for matching. |
+| `phrasings[]` | `{text, held_out}`. At least three per topic, at least one `held_out`. |
+| `claim_queries[]` | `{query, needles}`. A claim is recalled when **all** needles appear in some returned entry — deliberately weaker than canonical identity, so a consolidation that moved a claim into a different entry does not read as knowledge loss. |
+| `members[]` | Content hashes of entries the curator adjudicated as the same claim. |
+| `supersedes_pairs[]` | `{superseded_hash, successor_hash}`, recorded **offline**. |
+
+Unknown keys on an entry load untouched (the loader is required-strict /
+additive-tolerant), so 3201's widened derivation is an improvement rather
+than a fixture rewrite.
+
+### Why `held_out` exists
+
+A held-out phrasing is authored **fresh** for this eval and was never used to
+write, consolidate or retrieve the entry it probes. Without it, a fix that
+tunes the known phrasings saturates canonical-presence and the metric stops
+discriminating (the Goodhart guard, D5). Three invariants are test-enforced:
+no held-out phrasing may duplicate a tuned phrasing anywhere in the registry,
+none may equal a `_default_topic_guard_clusters()` phrase (those phrases were
+used to *build* the entries they would retrieve), and held-out phrasings are
+unique across topics.
+
+### Why `supersedes_pairs` is recorded, not parsed
+
+The probe never reads `metadata.supersedes`. That parser is
+`normalize_supersedes()` (task 3196), leaf γ/E4's hard dependency, and a
+second one here would be exactly the lockstep duplication INV-5 forbids. The
+relation is therefore recorded at derivation time from committed sources, and
+the runtime metric reduces to "is `index(superseded) < index(successor)` in
+this one result list" — no pointer-shape knowledge at runtime at all.
+
+### Provenance (32 topics)
+
+- **20 `curator_gate`** — one per adjudicated cluster in
+  `write_triage_calibration.jsonl` (17 `esc-55xx`/`56xx` gates). The
+  `canonical`-labelled row is the topic canonical; `duplicate`-labelled rows
+  become `members` and `supersedes_pairs`. Because that fixture commits
+  `content` verbatim, **every hash here is computable offline** — no Qdrant,
+  no embedder, no `OPENAI_API_KEY` — so a reviewer can re-derive and audit any
+  entry.
+- **4 `topic_guard_cluster`** — slugs from
+  `fused_memory/config/schema.py:_default_topic_guard_clusters()`.
+- **4 `census_topic`** — multi-entry topics from
+  `plans/memory-metadata-census-report.json`.
+- **1 `briefing_query`** — `g7-design-invariants`, carrying the four
+  briefing-assembler queries (`briefing.py:978-1013`) as its phrasings. This
+  is the highest-leverage query surface in the system: those four run against
+  every dispatched task's context window.
+- **3 `hand`** — single-entry dark_factory topics.
+
+### What the registry does **not** cover (`_disclosures`)
+
+32 topics is a *selection*. `scripts/memory_eval_retrieval_probe.py
+--derive-registry` emits 74 candidates from the committed offline sources,
+and the census tail it never offered at all is larger still. Every one of
+those narrowings is recorded in the top-level `_disclosures` block and
+rendered into the run report's registry-composition section, because a
+narrowing nobody can see reads downstream as "there was nothing there".
+
+| key | meaning |
+|---|---|
+| `curator_gate_clusters` / `census_topics_emitted` / `topic_guard_clusters` | Candidates derivation produced, per source. |
+| `census_topics_skipped_singleton` | Census topics with `count <= 1`. A one-entry topic answers "is the canonical in the top k" by that entry's mere existence — presence, not retrieval. |
+| `curator_clusters_without_canonical` | Calibration clusters carrying no `canonical`-labelled row, so no entry could be built. |
+| `census_rows_malformed_value` / `census_rows_malformed_count` | Census rows whose `value` / `count` was the wrong shape. Counted **separately** from the singleton skip: a malformed row is a broken census, a singleton is a healthy one — folding them together reports a schema break as a corpus property. |
+| `slug_collisions_dropped` | Candidates whose slug collided with one already emitted. |
+| `derived_candidates_not_carried` | Candidates derivation emitted that this fixture does **not** contain. Mostly census topics whose canonical `content_hash` is unknown offline (derivation leaves it empty) and which no operator has resolved against a live read-only scroll yet. |
+
+Regenerate the derivation half with `--derive-registry` and merge; the flag
+prints and never overwrites, because the hand-authored held-out phrasings
+are the part a machine cannot regenerate.
+
+A `_disclosures` value that is not an integer is a **named load failure**,
+not a silently dropped key — dropping it would erase the record that a
+narrowing happened, which is exactly the state the block exists to prevent.
+
+The `topic_guard_cluster`, `census_topic`, `hand` and `briefing_query`
+canonicals were resolved by a **read-only Qdrant payload scroll** on
+2026-07-30 (no embedder, no writes), because unlike the curator clusters their
+content is not committed anywhere in this repo. Their hashes are therefore
+re-derivable only against a live store; the curator-gate 20 are not.
+
+### Exclusions
+
+- **`architect-plan-revalidation-requeue-lock`** is a
+  `_default_topic_guard_clusters()` slug but is **not** a registry topic: its
+  named canonicals (`6a96a020…`, `974b0adb…`) were not resolvable in the
+  scroll, and inventing a hash that can never match would manufacture a
+  permanent tripwire failure indistinguishable from a real retrieval defect.
+  Four of the five guard slugs are covered.
+- **`distinct` and `pseudo_contradiction` rows are not members.** The curator
+  adjudicated them as separate claims that only *read* as contradictory;
+  folding them in would poison the contamination metric with entries that
+  legitimately answer a different question.
+- **Four curator canonicals no longer resolve by UUID**
+  (`0e954870…`, `168c3a6b…`, `417d86d0…`, `c8ca5f55…`) — they have rotated
+  since the calibration session. They are kept deliberately: their
+  content hashes are still valid, so they exercise the hash-primary /
+  id-fallback matcher on real decay rather than on a synthetic case.

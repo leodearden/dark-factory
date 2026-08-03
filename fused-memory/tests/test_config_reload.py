@@ -407,6 +407,113 @@ class TestReloadConfigTool:
         assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
 
 
+class TestMem0UpdateLeavesAreGreenTier:
+    """All five mem0_update.* leaves must hot-apply (task 3088).
+
+    Modelled on TestWriteTriageLeavesAreGreenTier below — the direct precedent
+    for registering TOP-LEVEL (non-reconciliation.*) leaves. The existing
+    test_reloadable_fields_are_all_real_leaves guards these paths against typos
+    automatically.
+
+    The kill switch is the load-bearing one: mem0_update.enabled is what an
+    operator flips to stop an in-flight rewrite incident, and a restart-only
+    kill switch is no kill switch. The two storm leaves are only genuinely
+    reload-safe because StormCounter takes threshold/window per record() call.
+    """
+
+    PATHS = (
+        'mem0_update.enabled',
+        'mem0_update.content_amend_allowed_agent_prefixes',
+        'mem0_update.metadata_patch_allowed_agent_prefixes',
+        'mem0_update.storm_threshold',
+        'mem0_update.storm_window_seconds',
+    )
+
+    @pytest.mark.parametrize('path', PATHS)
+    def test_leaf_is_allowlisted(self, path):
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+    @pytest.mark.parametrize(
+        ('path', 'new_value'),
+        [
+            ('mem0_update.enabled', False),
+            ('mem0_update.content_amend_allowed_agent_prefixes', []),
+            (
+                'mem0_update.metadata_patch_allowed_agent_prefixes',
+                ['recon-stage-', 'curator-'],
+            ),
+            ('mem0_update.storm_threshold', 5),
+            ('mem0_update.storm_window_seconds', 600.0),
+        ],
+    )
+    def test_changed_leaf_lands_in_applied_candidates(self, path, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        field = path.split('.', 1)[1]
+        old = getattr(live.mem0_update, field)
+        object.__setattr__(fresh.mem0_update, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates, (
+            f'{path} must hot-apply so an operator can retune without a restart'
+        )
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+    def test_kill_switch_flip_is_observed_live_without_a_restart(self):
+        """A reload must be visible to the resolver through the SHARED config
+        object — the precondition config/reload.py's reload-safety rule states
+        before a leaf may be registered at all."""
+        from types import SimpleNamespace
+
+        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
+
+        live = FusedMemoryConfig()
+        svc = SimpleNamespace(config=live)
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='recon-stage-1', content_amend=True, metadata_patch=False,
+        ).allowed is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.mem0_update, 'enabled', False)
+        result = apply_reload(live, fresh)
+
+        assert result['reloaded'] is True, f'reload failed: {result.get("error")!r}'
+        assert 'mem0_update.enabled' in result['applied']
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='recon-stage-1', content_amend=True, metadata_patch=False,
+        ).allowed is False, (
+            'the resolver reads the same shared config object apply_reload '
+            'mutated in place, so the flip takes effect with no restart'
+        )
+
+    def test_widened_metadata_bar_is_observed_live(self):
+        """The operator story: admit a curator-gate metadata patch on a running
+        server WITHOUT granting content-amend authority."""
+        from types import SimpleNamespace
+
+        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
+
+        live = FusedMemoryConfig()
+        svc = SimpleNamespace(config=live)
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(
+            fresh.mem0_update,
+            'metadata_patch_allowed_agent_prefixes',
+            ['recon-stage-', 'curator-'],
+        )
+        apply_reload(live, fresh)
+
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='curator-gate', content_amend=False, metadata_patch=True,
+        ).allowed is True
+        assert resolve_mem0_update_authorization(
+            svc, agent_id='curator-gate', content_amend=True, metadata_patch=False,
+        ).allowed is False, 'widening one bar must not widen the other'
+
+
 class TestWriteTriageLeavesAreGreenTier:
     """The calibration script's config write must be hot-reloadable.
 
@@ -448,3 +555,80 @@ class TestWriteTriageLeavesAreGreenTier:
         )
         assert d.applied_candidates[path] == {'old': old, 'new': new_value}
         assert path not in d.restart_required
+
+
+class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
+    """The per-category cutoff map (task 3357), reloaded as ONE leaf.
+
+    Same green tier as its pooled sibling, and for the same reason: a
+    re-calibration must take effect on a running server. Atomicity is the
+    part that matters here — _iter_leaves yields a container WHOLE (as it
+    already does for reconciliation.procedural_knowledge_topic_guard_clusters),
+    so a half-applied set of per-category cutoffs can never gate a sweep.
+    """
+
+    PATH = 'write_triage.t_high_by_category'
+    # SYNTHETIC, deliberately: a real cutoff copied in here would be one
+    # re-calibration away from equalling the live config's map, at which
+    # point diff_config would report no change and the applied_candidates
+    # lookup below would raise KeyError on a test that is not about that.
+    SYNTHETIC = {'procedural_knowledge': 0.5}
+
+    def test_the_leaf_is_allowlisted(self):
+        assert self.PATH in RELOADABLE_FIELDS, (
+            f'{self.PATH} must be allowlisted so a re-calibration needs no restart'
+        )
+
+    def test_iter_leaves_yields_the_map_as_exactly_one_whole_leaf(self):
+        """Not one leaf per category — the map reloads all-or-nothing."""
+        from fused_memory.config.reload import _iter_leaves  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        object.__setattr__(config.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
+        paths = [path for path, _ in _iter_leaves(config)]
+
+        assert paths.count(self.PATH) == 1, (
+            f'expected exactly one leaf at {self.PATH}, got {paths.count(self.PATH)}'
+        )
+        assert not [p for p in paths if p.startswith(f'{self.PATH}.')], (
+            'the map must not be descended into: a per-category leaf would let '
+            'one cutoff land while another did not'
+        )
+        assert dict(_iter_leaves(config))[self.PATH] == self.SYNTHETIC, (
+            'the leaf value must be the whole mapping'
+        )
+
+    def test_a_changed_map_lands_in_applied_candidates(self):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.write_triage.t_high_by_category
+        assert old != self.SYNTHETIC, (
+            'the fixture must DIFFER from the live map, or diff_config reports '
+            'no change and this test asserts nothing'
+        )
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
+
+        d = diff_config(live, fresh)
+
+        assert d.applied_candidates[self.PATH] == {'old': old, 'new': self.SYNTHETIC}
+        assert self.PATH not in d.restart_required
+
+    def test_apply_reload_replaces_the_map_wholesale(self):
+        """Never merged into the old map.
+
+        A merge would leave a category calibrated after the run that
+        calibrated it stopped deriving a cutoff for it — a stale number
+        outliving its own evidence.
+        """
+        from fused_memory.config.reload import apply_reload  # noqa: PLC0415
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        object.__setattr__(live.write_triage, 't_high_by_category', {
+            'procedural_knowledge': 0.5, 'observations_and_summaries': 0.6,
+        })
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
+
+        apply_reload(live, fresh)
+
+        assert live.write_triage.t_high_by_category == self.SYNTHETIC

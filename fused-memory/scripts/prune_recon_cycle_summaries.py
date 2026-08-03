@@ -20,17 +20,48 @@ invisible to it because they predate the tag:
 
 This script is the one-shot cleanup for both piles.
 
-Delete, not retag
------------------
-Mem0/Qdrant exposes ``delete_memory`` but no in-place payload-update
-primitive on this path — the same constraint documented in
-``scripts/sweep_orphan_flag_markers.py`` (task-1659), where pre-existing
-orphans were deleted rather than re-tagged.  Re-tagging via delete+re-add
-would also change ``created_at`` and lose provenance.  So the effective
-operation here is PRUNE-to-N: keep the ``--keep-recent`` most-recent
-summaries per project x pool, plus any older summary that carries real
-remediation history (see ``carries_remediation_history``), and delete the
-rest.
+Why prune, not retag
+--------------------
+Mem0/Qdrant now exposes an in-place payload-update primitive: task 3088
+shipped ``MemoryService.update_memory`` (``services/memory_service.py``)
+over ``Mem0Backend.set_payload`` (``backends/mem0_client.py``), a
+genuine server-side partial merge — the Qdrant point id, ``created_at``,
+and every unnamed sibling key survive untouched. The old delete+re-add
+objection (retagging changes ``created_at`` and loses provenance) no
+longer applies, so this script's choice to delete rather than retag is no
+longer forced by a missing capability.
+
+Retagging is available here, and it would even work: the missing piece on
+these pre-existing piles is the ``recon_pool`` tag, which is the sole
+visibility gate for task 1942's standing pool-cap enforcement —
+``enforce_summary_pool_cap``'s filter (``reconciliation/summary_pool.py``)
+is ``{'recon_pool': recon_pool, 'kind': _KIND_CYCLE_SUMMARY}`` — the piles
+already carry ``kind='cycle_summary'``, so a backfilled ``recon_pool``
+would hand them straight to that enforcement.
+
+That is exactly why it must not be done as a preservation measure.
+Enforcement's eviction order — ``_sort_key``, nested inside
+``enforce_summary_pool_cap`` (``reconciliation/summary_pool.py``) — is
+``(is_ledger_stamp, has_parseable_created_at, created_at)`` ascending,
+head deleted, against a hardcoded cap of 2 (``STAGE1_CYCLE_SUMMARY_POOL_CAP``
+in ``stages/memory_consolidator.py``). A backfilled pre-existing summary
+carries no ``record_type='ledger_stamp'``, so it sorts ahead of the
+ledger_stamp mirrors on that first key component alone, and ahead of any
+live narrative sibling — same ``is_ledger_stamp=False`` class — on
+``created_at`` alone, since it is always the oldest there; preserving
+``created_at`` (the one thing an in-place patch gets right) makes this
+worse, not better. On the next reconciliation cycle, ``to_delete =
+sorted[: N + M - 2]`` sweeps every backfilled record as soon as two live
+members are present; with fewer than two, the newest backfilled record
+survives that cycle.
+
+So a retag here would convert an explicit, dry-runnable, safety-capped
+one-shot prune into an implicit mass deletion on the next cycle, outside
+operator sight and outside ``--limit-per-project``. Deleting here, now,
+visibly, is the safer operation — PRUNE-to-N: keep the ``--keep-recent``
+most-recent summaries per project x pool, plus any older summary that
+carries real remediation history (see ``carries_remediation_history``),
+and delete the rest.
 
 Two-phase model
 ----------------

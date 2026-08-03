@@ -12,6 +12,13 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.models.scope import Scope
 
+# Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
+# that genuinely has no vector) from "caller passed nothing" (leave the
+# MagicMock attribute unset, so it auto-creates a truthy child mock).  A
+# plain None default would collapse those two cases and make the
+# missing-vector degradation test unable to fail.
+_UNSET = object()
+
 
 @pytest.fixture
 def backend(mock_config):
@@ -230,6 +237,149 @@ class TestMem0BackendScrollByMetadata:
         )
 
 
+class TestMem0BackendScrollByMetadataWithVectors:
+    """scroll_by_metadata can optionally return each point's stored vector.
+
+    Motivation (task 3210): the corpus-health detector generates ANN
+    candidate pairs by querying Qdrant with each record's OWN stored vector,
+    so it needs the vectors to come back on the enumeration pass.  Fetching
+    them here means the detector makes ZERO embedding API calls at runtime
+    and stays in the same metric space Mem0 itself wrote.
+
+    ``with_vectors`` defaults to False so every existing caller
+    (prune_recon_cycle_summaries, sweep_orphan_flag_markers, GC pool
+    enumeration, ...) keeps today's payload-only contract and pays no extra
+    bandwidth for vectors it does not read.
+
+    Mocked AsyncQdrantClient throughout — no live Qdrant, so these stay in
+    the unit lane alongside the sibling scroll_by_metadata tests above.
+    """
+
+    def _make_mock_point(
+        self,
+        point_id: str,
+        created_at: str | None,
+        extra_meta: dict | None = None,
+        vector=_UNSET,
+    ):
+        """Qdrant Record/ScoredPoint double, optionally carrying a vector.
+
+        ``vector`` defaults to the _UNSET sentinel meaning "leave the
+        attribute unset", which on a MagicMock auto-creates a truthy child
+        mock — exactly the trap the implementation must not fall into when
+        with_vectors=False.  Pass ``vector=None`` to model Qdrant returning a
+        point with no vector, or a list to model a real one.
+        """
+        payload = {}
+        if created_at is not None:
+            payload['created_at'] = created_at
+        if extra_meta:
+            payload.update(extra_meta)
+        point = MagicMock()
+        point.id = point_id
+        point.payload = payload
+        if vector is not _UNSET:
+            point.vector = vector
+        return point
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_no_vectors(self, backend):
+        """Default call forwards with_vectors=False and returns dicts with NO 'vector' key.
+
+        Pins the back-compat contract: today's callers must not start seeing
+        a new key (nor pay to transfer vectors they never asked for).
+        """
+        p1 = self._make_mock_point('id-1', '2026-01-01T00:00:00+00:00', {'category': 'procedural_knowledge'})
+
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([p1], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scroll_by_metadata(
+                scope=Scope(project_id='p'),
+                filters={'category': 'procedural_knowledge'},
+            )
+
+        assert mock_client.scroll.call_args.kwargs.get('with_vectors') is False, (
+            'Default scroll_by_metadata must forward with_vectors=False to client.scroll, got '
+            f'{mock_client.scroll.call_args.kwargs.get("with_vectors")!r}'
+        )
+        assert len(result) == 1
+        assert 'vector' not in result[0], (
+            f"Default mode must not add a 'vector' key; got keys {sorted(result[0])}"
+        )
+        # Existing keys are untouched.
+        assert result[0]['id'] == 'id-1'
+        assert result[0]['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert result[0]['metadata']['category'] == 'procedural_knowledge'
+
+    @pytest.mark.asyncio
+    async def test_with_vectors_true_forwards_and_lifts_vector(self, backend):
+        """with_vectors=True forwards the flag and lifts each point's vector onto the dict."""
+        vec1 = [0.1, 0.2, 0.3]
+        vec2 = [0.4, 0.5, 0.6]
+        p1 = self._make_mock_point(
+            'id-1', '2026-01-01T00:00:00+00:00', {'category': 'procedural_knowledge'}, vector=vec1,
+        )
+        p2 = self._make_mock_point(
+            'id-2', '2026-02-01T00:00:00+00:00', {'category': 'procedural_knowledge'}, vector=vec2,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([p1, p2], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scroll_by_metadata(
+                scope=Scope(project_id='p'),
+                filters={'category': 'procedural_knowledge'},
+                with_vectors=True,
+            )
+
+        assert mock_client.scroll.call_args.kwargs.get('with_vectors') is True, (
+            'with_vectors=True must be forwarded to client.scroll, got '
+            f'{mock_client.scroll.call_args.kwargs.get("with_vectors")!r}'
+        )
+        assert len(result) == 2
+        assert result[0]['vector'] == vec1
+        assert result[1]['vector'] == vec2
+        # Existing keys are unchanged in this mode too.
+        assert result[0]['id'] == 'id-1'
+        assert result[0]['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert result[0]['metadata']['category'] == 'procedural_knowledge'
+        assert result[1]['id'] == 'id-2'
+        assert result[1]['created_at'] == '2026-02-01T00:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_missing_vector_degrades_to_none(self, backend):
+        """A point returned without a vector yields vector=None rather than raising.
+
+        Qdrant can return a point with no vector (e.g. it was never stored, or
+        the collection uses named vectors).  The detector COUNTS these as a
+        ``missing_vector`` disclosure and skips them, so the backend must hand
+        back a clean None instead of exploding mid-enumeration and losing the
+        whole scan.
+        """
+        p_ok = self._make_mock_point('id-ok', '2026-01-01T00:00:00+00:00', vector=[0.1, 0.2])
+        p_missing = self._make_mock_point('id-missing', '2026-02-01T00:00:00+00:00', vector=None)
+
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([p_ok, p_missing], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scroll_by_metadata(
+                scope=Scope(project_id='p'),
+                filters={'category': 'procedural_knowledge'},
+                with_vectors=True,
+            )
+
+        assert len(result) == 2, 'A vector-less point must still be returned, not dropped'
+        assert result[0]['vector'] == [0.1, 0.2]
+        assert result[1]['vector'] is None
+        # The vector-less record keeps its identity so it can be counted/reported.
+        assert result[1]['id'] == 'id-missing'
+        assert result[1]['created_at'] == '2026-02-01T00:00:00+00:00'
+
+
 class TestMem0BackendGetPointById:
     """get_point_by_id fetches a single Qdrant point by id, returning its raw payload.
 
@@ -373,6 +523,180 @@ class TestMem0BackendAddSystemRecord:
         )
         assert result == {'results': [{'id': 'sys-1'}]}, (
             f'add_system_record must return the raw mem0 result dict, got {result!r}'
+        )
+
+
+class TestMem0BackendPayloadPrimitives:
+    """Payload-only writes that never re-embed (task 3088).
+
+    ``Mem0Backend.update`` goes through mem0's ``AsyncMemory.update``, which
+    re-embeds the content, rewrites ``updated_at`` and appends a mem0 history
+    row. For a purely-cosmetic metadata patch (e.g. tagging a survivor with
+    ``topic=``) all three are waste, so the metadata-only arms of
+    ``update_memory`` route straight to Qdrant's payload APIs instead. Named
+    1:1 after the Qdrant primitives they wrap so the decision doc's §5(b)
+    routing table reads directly against the code.
+    """
+
+    UUID = '77a3f6bc-0000-0000-0000-000000000000'
+
+    def _mocks(self, backend):
+        mock_client = AsyncMock()
+        mock_instance = MagicMock()
+        mock_instance.update = AsyncMock()
+        return mock_client, mock_instance
+
+    @pytest.mark.asyncio
+    async def test_set_payload_merges_via_qdrant(self, backend):
+        mock_client, mock_instance = self._mocks(backend)
+        get_instance = AsyncMock(return_value=mock_instance)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                patch.object(backend, '_get_instance', get_instance):
+            await backend.set_payload(
+                self.UUID, {'topic': 'docs-prd-landing'}, Scope(project_id='dark_factory'),
+            )
+
+        assert mock_client.set_payload.await_count == 1
+        kwargs = mock_client.set_payload.call_args.kwargs
+        prefix = backend.config.mem0.collection_prefix
+        assert kwargs.get('collection_name') == f'{prefix}_dark_factory'
+        assert kwargs.get('payload') == {'topic': 'docs-prd-landing'}
+        assert kwargs.get('points') == [self.UUID], (
+            f'the point id must pass through unchanged, got {kwargs.get("points")!r}'
+        )
+        get_instance.assert_not_called()
+        mock_instance.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_payload_removes_named_keys(self, backend):
+        mock_client, mock_instance = self._mocks(backend)
+        get_instance = AsyncMock(return_value=mock_instance)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                patch.object(backend, '_get_instance', get_instance):
+            await backend.delete_payload(
+                self.UUID, ['topic', 'kind'], Scope(project_id='dark_factory'),
+            )
+
+        assert mock_client.delete_payload.await_count == 1
+        kwargs = mock_client.delete_payload.call_args.kwargs
+        prefix = backend.config.mem0.collection_prefix
+        assert kwargs.get('collection_name') == f'{prefix}_dark_factory'
+        assert kwargs.get('keys') == ['topic', 'kind']
+        assert kwargs.get('points') == [self.UUID]
+        get_instance.assert_not_called()
+        mock_instance.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_overwrite_payload_replaces_whole_payload(self, backend):
+        mock_client, mock_instance = self._mocks(backend)
+        get_instance = AsyncMock(return_value=mock_instance)
+        full = {'data': 'txt', 'created_at': 'c', 'topic': 'new'}
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                patch.object(backend, '_get_instance', get_instance):
+            await backend.overwrite_payload(
+                self.UUID, full, Scope(project_id='dark_factory'),
+            )
+
+        assert mock_client.overwrite_payload.await_count == 1
+        kwargs = mock_client.overwrite_payload.call_args.kwargs
+        prefix = backend.config.mem0.collection_prefix
+        assert kwargs.get('collection_name') == f'{prefix}_dark_factory'
+        assert kwargs.get('payload') == full
+        assert kwargs.get('points') == [self.UUID]
+        get_instance.assert_not_called()
+        mock_instance.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('method', 'args'),
+        [
+            ('set_payload', ({'topic': 't'},)),
+            ('delete_payload', (['topic'],)),
+            ('overwrite_payload', ({'topic': 't'},)),
+        ],
+    )
+    async def test_timeout_propagates(self, backend, method, args):
+        """A write timeout must PROPAGATE, never be swallowed into a falsy return
+        — the house posture on this file (get_point_by_id), in deliberate
+        contrast to get() which does swallow."""
+        mock_client = AsyncMock()
+        setattr(mock_client, method, AsyncMock(side_effect=TimeoutError))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                pytest.raises(TimeoutError):
+            await getattr(backend, method)(
+                self.UUID, *args, Scope(project_id='dark_factory'),
+            )
+
+
+class TestMem0ManagedMetadataKeys:
+    """The mem0-owned payload-key set, extracted to its single home (task 3088).
+
+    Value-pins the key set mem0's ``AsyncMemory._update_memory`` recomputes or
+    restores (mem0ai 1.0.11, ``mem0/memory/main.py:2461-2481``). Previously this
+    lived privately in ``scripts/tag_cgl_eta_rehome_scope.py``; the in-place
+    ``update_memory`` tool is a second consumer, so per decision doc
+    ``plans/mem0-in-place-update-decision.md`` §6 it moves next to
+    ``Mem0Backend.update``, whose docstring already documents the very
+    constraint it encodes. One definition repo-wide (INV-5).
+    """
+
+    def test_is_frozenset_with_exact_membership(self):
+        from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
+        assert isinstance(MEM0_MANAGED_METADATA_KEYS, frozenset), (
+            f'expected a frozenset, got {type(MEM0_MANAGED_METADATA_KEYS).__name__}'
+        )
+        assert set(MEM0_MANAGED_METADATA_KEYS) == {
+            'data', 'hash', 'created_at', 'updated_at',
+            'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
+        }, f'unexpected membership: {sorted(MEM0_MANAGED_METADATA_KEYS)}'
+
+    def test_split_partitions_managed_from_custom(self):
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        payload = {
+            'data': 'content', 'hash': 'h', 'created_at': 'c', 'updated_at': 'u',
+            'user_id': 'p', 'kind': 'canonical', 'src_project': 'reify', 'topic': 't',
+        }
+        managed, custom = split_managed_metadata(payload)
+        assert managed == {
+            'data': 'content', 'hash': 'h', 'created_at': 'c',
+            'updated_at': 'u', 'user_id': 'p',
+        }, f'unexpected managed subset: {managed!r}'
+        assert custom == {
+            'kind': 'canonical', 'src_project': 'reify', 'topic': 't',
+        }, f'unexpected custom subset: {custom!r}'
+
+    def test_unknown_keys_land_in_custom(self):
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        managed, custom = split_managed_metadata({'wholly_novel_key': 1})
+        assert managed == {}, f'expected no managed keys, got {managed!r}'
+        assert custom == {'wholly_novel_key': 1}, (
+            f'an unknown key must be treated as custom (preserved), got {custom!r}'
+        )
+
+    def test_empty_payload_yields_two_empty_dicts(self):
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        assert split_managed_metadata({}) == ({}, {})
+
+    def test_neither_result_aliases_the_input(self):
+        """Callers mutate the custom subset in place (the merge/delete arms), so
+        neither returned dict may alias the caller's payload."""
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        payload = {'data': 'content', 'kind': 'canonical'}
+        managed, custom = split_managed_metadata(payload)
+        assert managed is not payload and custom is not payload
+        custom['kind'] = 'mutated'
+        managed['data'] = 'mutated'
+        assert payload == {'data': 'content', 'kind': 'canonical'}, (
+            f'mutating a returned subset must not touch the input, got {payload!r}'
         )
 
 

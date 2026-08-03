@@ -489,15 +489,45 @@ def record_path_for_slug(slug: str, root: Path | str | None = None) -> Path:
     return sessions_dir(root) / slug / 'record.json'
 
 
-def transcript_path_for_cwd(cwd: str) -> str:
-    """Best-effort mirror of Claude Code's own ``~/.claude/projects/<enc>`` encoding.
+def encode_cwd(cwd: str) -> str:
+    """Encode *cwd* to Claude Code's own ``~/.claude/projects/<enc>`` dir name.
 
-    Both ``/`` and ``.`` map to ``-`` (confirmed against a real
-    ``~/.claude/projects/`` directory; PRD §3). This is read-only enrichment
-    metadata — never used as a lookup key by this module.
+    THE authoritative statement of the rule; every other copy in this repo
+    is a mirror of this one and is pinned to it by
+    ``scripts/tests/test_legibility_inventory.py``'s ``TestEncoderLockstep``.
+
+    ``/``, ``.`` and ``_`` all map to ``-``. ``-`` passes through unchanged.
+    CASE IS PRESERVED — there is no case-folding step (a live dir named
+    ``-opt-Auto-Claude-resources-backend`` proves it).
+
+    Validated against 738 real (encoded-dir, decoded-cwd) pairs sampled from
+    a live ``~/.claude/projects`` tree, which the rule reproduces exactly.
+    Over that sample the only non-alphanumeric characters appearing in ANY
+    cwd were ``- . / _``, so the rule is complete over the observed domain
+    and UNVERIFIED outside it — a cwd containing some other punctuation
+    character has never been measured, and this function's output for one is
+    a guess. Extend the sample before extending the rule (task 3272).
+
+    Returns the BARE dir name, no ``~/.claude/projects/`` prefix — see
+    :func:`transcript_path_for_cwd` for the display-path form.
     """
-    encoded = cwd.replace('/', '-').replace('.', '-')
-    return f'~/.claude/projects/{encoded}'
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
+
+
+def transcript_path_for_cwd(cwd: str) -> str:
+    """Best-effort mirror of Claude Code's own ``~/.claude/projects/<enc>`` path.
+
+    Delegates the encoding to :func:`encode_cwd` (``/``, ``.`` and ``_`` all
+    map to ``-``; case preserved), which carries the authoritative statement
+    of the rule and the record of what it was measured against — 738 real
+    (encoded-dir, decoded-cwd) pairs from a live ``~/.claude/projects`` tree.
+
+    This is read-only enrichment metadata — never used as a lookup key by
+    this module. Note that OTHER modules do use the encoding as a lookup key
+    (``scripts/legibility/check_transcript_persistence.py``), so its exactness
+    is load-bearing beyond this file.
+    """
+    return f'~/.claude/projects/{encode_cwd(cwd)}'
 
 
 _DECISION_ID_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')

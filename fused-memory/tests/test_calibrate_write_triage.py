@@ -460,6 +460,190 @@ class TestBuildPairSets:
 
 
 # ---------------------------------------------------------------------------
+# Per-category partition
+# ---------------------------------------------------------------------------
+
+def _cat_rec(mid: str, cluster: str, label: str, category: str | None) -> dict:
+    """A minimal record with an explicit category (possibly absent/empty)."""
+    record = _rec(mid, cluster, label)
+    if category is None:
+        record.pop('category')
+    else:
+        record['category'] = category
+    return record
+
+
+class TestPartitionPairsByCategory:
+    """Per-category buckets using build_pair_sets' own classification rule.
+
+    A per-category cutoff has to be measured on the population the consumer
+    can actually form. fetch_ann_neighbors pushes the querying record's own
+    category into the Qdrant query as a payload filter, so a cross-category
+    ANN pair is structurally impossible — including such pairs would
+    calibrate a threshold against pairs it will never be applied to.
+    """
+
+    def test_returns_the_three_classes_per_category(self) -> None:
+        got = _mod().partition_pairs_by_category([
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+        ])
+        assert 'procedural_knowledge' in got['by_category']
+        for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs'):
+            assert key in got['by_category']['procedural_knowledge'], f'missing {key!r}'
+
+    def test_classification_matches_build_pair_sets_within_a_category(self) -> None:
+        """Same rule, applied per bucket — not a second, divergent one."""
+        records = [
+            _cat_rec('c1', 'c1', 'canonical', 'preferences_and_norms'),
+            _cat_rec('d1', 'c1', 'duplicate', 'preferences_and_norms'),
+            _cat_rec('x1', 'c1', 'distinct', 'preferences_and_norms'),
+            _cat_rec('c2', 'c2', 'canonical', 'preferences_and_norms'),
+            _cat_rec('p1', 'c2', 'pseudo_contradiction', 'preferences_and_norms'),
+        ]
+        bucket = _mod().partition_pairs_by_category(records)['by_category'][
+            'preferences_and_norms'
+        ]
+        pooled = _mod().build_pair_sets(records)
+        for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs'):
+            assert _keys(bucket[key]) == _keys(pooled[key]), key
+
+    def test_a_cross_category_pair_lands_in_no_bucket(self) -> None:
+        """fetch_ann_neighbors filters by category, so this pair cannot form."""
+        got = _mod().partition_pairs_by_category([
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('o1', 'c1', 'duplicate', 'observations_and_summaries'),
+        ])
+        for bucket in got['by_category'].values():
+            for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs'):
+                assert _keys(bucket[key]) == set(), (
+                    'a cross-category pair must reach no bucket'
+                )
+        assert got['cross_category_dropped'] == 1, (
+            'the exclusion must be a disclosed number, not invisible attrition'
+        )
+
+    def test_a_mixed_cluster_keeps_only_its_same_category_pairs(self) -> None:
+        """2 of the 20 committed clusters are category-mixed."""
+        got = _mod().partition_pairs_by_category([
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+            _cat_rec('o1', 'c1', 'duplicate', 'observations_and_summaries'),
+        ])
+        assert _keys(got['by_category']['procedural_knowledge']['true_dup_pairs']) == {
+            ('c1', 'd1'),
+        }
+        assert got['cross_category_dropped'] == 2
+        obs = got['by_category']['observations_and_summaries']
+        assert all(len(obs[k]) == 0 for k in obs), 'a lone record forms no pair'
+
+    def test_a_record_with_no_or_empty_category_contributes_no_pairs(self) -> None:
+        for missing in (None, ''):
+            got = _mod().partition_pairs_by_category([
+                _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+                _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+                _cat_rec('u1', 'c1', 'duplicate', missing),
+            ])
+            formed = {
+                tuple(sorted((p['a'], p['b'])))
+                for bucket in got['by_category'].values()
+                for key in bucket for p in bucket[key]
+            }
+            assert formed == {('c1', 'd1')}, f'category={missing!r} formed {formed}'
+            assert got['cross_category_dropped'] == 2
+
+    def test_the_partition_is_total_and_loses_nothing_silently(self) -> None:
+        records = [
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+            _cat_rec('x1', 'c1', 'distinct', 'procedural_knowledge'),
+            _cat_rec('c2', 'c2', 'canonical', 'observations_and_summaries'),
+            _cat_rec('p1', 'c2', 'pseudo_contradiction', 'observations_and_summaries'),
+            _cat_rec('u1', 'c3', 'duplicate', None),
+        ]
+        got = _mod().partition_pairs_by_category(records)
+        bucketed = sum(
+            len(bucket[key])
+            for bucket in got['by_category'].values()
+            for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs')
+        )
+        pooled = sum(len(v) for v in _mod().build_pair_sets(records).values())
+        assert bucketed + got['cross_category_dropped'] == pooled, (
+            'buckets plus disclosed drops must equal the pooled pair total'
+        )
+
+    def test_every_category_present_in_the_input_appears_in_the_output(self) -> None:
+        """Even a single-record category — absence would read as 'not measured'."""
+        got = _mod().partition_pairs_by_category([
+            _cat_rec('c1', 'c1', 'canonical', 'procedural_knowledge'),
+            _cat_rec('d1', 'c1', 'duplicate', 'procedural_knowledge'),
+            _cat_rec('o1', 'o1', 'canonical', 'observations_and_summaries'),
+        ])
+        assert set(got['by_category']) == {
+            'procedural_knowledge', 'observations_and_summaries',
+        }
+
+    def test_empty_input_yields_no_categories_and_no_drops(self) -> None:
+        got = _mod().partition_pairs_by_category([])
+        assert got['by_category'] == {}
+        assert got['cross_category_dropped'] == 0
+
+
+class TestCommittedFixtureIsDerivablePerCategory:
+    """Pin the per-category derivability facts this task turns on.
+
+    Measured from the committed fixture, not assumed. Pinning them makes a
+    future fixture edit force a re-measurement rather than silently
+    invalidating the recorded per-category calibration.
+    """
+
+    EXPECTED = {
+        'procedural_knowledge': (242, 3316, 12),
+        'observations_and_summaries': (4, 45, 6),
+        'preferences_and_norms': (28, 0, 0),
+    }
+
+    def test_measured_pair_counts_per_category(self, records: list[dict]) -> None:
+        got = _mod().partition_pairs_by_category(records)['by_category']
+        assert set(got) == set(self.EXPECTED)
+        for category, (dup, unrelated, hard) in self.EXPECTED.items():
+            bucket = got[category]
+            assert (
+                len(bucket['true_dup_pairs']),
+                len(bucket['unrelated_pairs']),
+                len(bucket['hard_negative_pairs']),
+            ) == (dup, unrelated, hard), category
+
+    def test_preferences_and_norms_has_zero_negatives(self, records: list[dict]) -> None:
+        """All 8 records sit in ONE cluster, so no cutoff is derivable.
+
+        The refusal is itself the calibration finding — this is the fact
+        that makes the task's second acceptance disjunct unreachable.
+        """
+        clusters = {
+            r['cluster_id'] for r in records
+            if r.get('category') == 'preferences_and_norms'
+        }
+        assert len(clusters) == 1
+        bucket = _mod().partition_pairs_by_category(records)['by_category'][
+            'preferences_and_norms'
+        ]
+        assert len(bucket['unrelated_pairs']) == 0
+        assert len(bucket['hard_negative_pairs']) == 0
+
+    def test_cross_category_pairs_are_dropped_and_counted(self, records: list[dict]) -> None:
+        got = _mod().partition_pairs_by_category(records)
+        assert got['cross_category_dropped'] == 1703
+        pooled = sum(len(v) for v in _mod().build_pair_sets(records).values())
+        bucketed = sum(
+            len(bucket[key])
+            for bucket in got['by_category'].values()
+            for key in ('true_dup_pairs', 'unrelated_pairs', 'hard_negative_pairs')
+        )
+        assert bucketed + got['cross_category_dropped'] == pooled
+
+
+# ---------------------------------------------------------------------------
 # cosine_similarity / summarize_distribution
 # ---------------------------------------------------------------------------
 
@@ -661,6 +845,289 @@ class TestDeriveBands:
 
 
 # ---------------------------------------------------------------------------
+# derive_bands_per_category
+# ---------------------------------------------------------------------------
+
+def _classes(dups: list, unrelated: list, hard: list) -> dict:
+    """One category's three measured score samples, in PAIR_CLASSES keys."""
+    return {'true_dup': dups, 'unrelated': unrelated, 'hard_negative': hard}
+
+
+class TestDeriveBandsPerCategory:
+    """Per-category bands: the SAME derivation, applied per bucket.
+
+    Nothing here re-derives a threshold. Each category delegates to
+    derive_bands, so a per-category cutoff is exactly as evidence-bound as
+    the pooled one — and refuses on the same terms.
+
+    Both refusal paths are reachable from the REAL corpus, not hypothetical:
+    preferences_and_norms has zero negative pairs (one cluster), and
+    observations_and_summaries is thin enough that non-separability is a
+    live outcome. The machinery handles both without predicting either.
+    """
+
+    POOLED_T_HIGH = 0.75
+    POOLED_T_LOW = 0.5
+
+    def _derive(
+        self, by_category: dict, pooled_t_high: float | None = POOLED_T_HIGH
+    ) -> dict:
+        # Minimums lowered so these hand-built samples exercise DELEGATION
+        # rather than the sample-size gate; the gate has its own class below,
+        # and the recorded calibration runs at the defaults.
+        return _mod().derive_bands_per_category(
+            by_category, pooled_t_high, self.POOLED_T_LOW,
+            min_dup_pairs=1, min_negative_pairs=1,
+        )
+
+    def test_a_populated_category_yields_exactly_what_derive_bands_yields(self) -> None:
+        """No second derivation path — delegation, so the two cannot drift."""
+        dups, unrelated, hard = [0.5, 0.6, 0.7, 0.8, 0.9], [0.1, 0.2], [0.55]
+        got = self._derive({'procedural_knowledge': _classes(dups, unrelated, hard)})
+        expected = _mod().derive_bands(dups, unrelated + hard)
+        entry = got['procedural_knowledge']
+        assert (entry['t_high'], entry['t_low'], entry['reason']) == expected
+
+    def test_the_negative_class_is_unrelated_plus_hard_negative(self) -> None:
+        """Same pooling of negatives run_calibration already uses."""
+        got = self._derive({'c': _classes([0.5, 0.9], [0.1], [0.95])})
+        assert got['c']['t_high'] is None, (
+            'a hard negative above every duplicate must block derivation; '
+            'ignoring the hard-negative class would fabricate a cutoff'
+        )
+
+    def test_a_category_with_zero_negatives_refuses_with_empty_class(self) -> None:
+        """The measured preferences_and_norms case: one cluster, no negatives.
+
+        No arithmetic produces a cutoff here. The refusal IS the calibration
+        finding, and it must be machine-readable so the consumer can branch.
+        """
+        got = self._derive({'preferences_and_norms': _classes([0.8, 0.9, 0.95], [], [])})
+        entry = got['preferences_and_norms']
+        assert entry['t_high'] is None and entry['t_low'] is None
+        assert entry['reason'].startswith(_mod().REASON_EMPTY_CLASS), entry['reason']
+
+    def test_a_non_separable_category_refuses_with_not_separable(self) -> None:
+        """The reviewer's observations_and_summaries hypothesis, if it fires.
+
+        Formulaic recaps scoring at or above every confirmed duplicate means
+        no measured value separates the classes. Interpolating one would
+        manufacture the very unevidenced cutoff this task exists to remove.
+        """
+        got = self._derive({
+            'observations_and_summaries': _classes([0.80, 0.85], [0.90], [0.88]),
+        })
+        entry = got['observations_and_summaries']
+        assert entry['t_high'] is None
+        assert entry['reason'].startswith(_mod().REASON_NOT_SEPARABLE), entry['reason']
+
+    def test_an_uncalibrated_category_is_present_with_a_null_t_high_never_omitted(
+        self,
+    ) -> None:
+        """Omission would read as 'not measured' rather than 'measured, refused'.
+
+        That ambiguity is exactly what this task exists to remove, so the
+        report keeps every category and distinguishes the two by reason.
+        """
+        got = self._derive({
+            'procedural_knowledge': _classes([0.5, 0.6, 0.7, 0.8, 0.9], [0.1], [0.55]),
+            'preferences_and_norms': _classes([0.8, 0.9], [], []),
+            'observations_and_summaries': _classes([0.4], [0.9], []),
+        })
+        assert set(got) == {
+            'procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries',
+        }
+        assert got['procedural_knowledge']['t_high'] is not None
+        for category, entry in got.items():
+            if entry['t_high'] is None:
+                assert (entry['reason'] or '').strip(), (
+                    f'{category}: a null t_high must never be silent — it carries the '
+                    'reason code that distinguishes "refused" from "not measured"'
+                )
+            if entry['reason']:
+                # derive_bands also reasons on a SUCCESS (REASON_NO_JUDGE_BAND:
+                # a derived t_high with no derivable judge band), so a reason
+                # does not imply refusal — only that a caller can branch on it.
+                assert entry['reason'].split(':')[0] in {
+                    _mod().REASON_EMPTY_CLASS,
+                    _mod().REASON_NOT_SEPARABLE,
+                    _mod().REASON_NO_JUDGE_BAND,
+                    _mod().REASON_INSUFFICIENT_PAIRS,
+                }, f'{category}: unbranchable reason {entry["reason"]!r}'
+
+    def test_every_entry_carries_its_measured_distributions_and_pair_counts(self) -> None:
+        """The evidence that justifies the number — or the refusal."""
+        got = self._derive({'c': _classes([0.5, 0.6, 0.7, 0.8, 0.9], [0.1, 0.2], [0.55])})
+        entry = got['c']
+        assert set(entry['distributions']) == set(_mod().PAIR_CLASSES)
+        assert entry['pair_counts'] == {'true_dup': 5, 'unrelated': 2, 'hard_negative': 1}
+        assert entry['distributions']['true_dup'] == _mod().summarize_distribution(
+            [0.5, 0.6, 0.7, 0.8, 0.9],
+        )
+
+    def test_an_empty_class_reports_n_zero_not_a_measured_zero(self) -> None:
+        got = self._derive({'preferences_and_norms': _classes([0.8, 0.9], [], [])})
+        entry = got['preferences_and_norms']
+        assert entry['pair_counts']['unrelated'] == 0
+        assert entry['distributions']['unrelated']['max'] is None, (
+            'an empty pair class must not report a measured 0.0'
+        )
+
+    # -- the second acceptance disjunct's direct evidence --------------------
+
+    def test_each_entry_counts_its_negatives_admitted_by_the_POOLED_t_high(self) -> None:
+        """Does the pooled cutoff separate THIS category's classes?
+
+        A non-zero count is a measured false-positive rate for the pooled
+        t_high in that category — the direct evidence for (or against) the
+        claim that one cutoff serves all three.
+        """
+        got = self._derive({
+            'observations_and_summaries': _classes([0.6], [0.80, 0.90], [0.99, 0.10]),
+        })
+        assert got['observations_and_summaries']['pooled_t_high_negatives_admitted'] == 3
+
+    def test_negatives_admitted_counts_only_negatives_never_true_duplicates(self) -> None:
+        """A duplicate in the deterministic band is the band working."""
+        got = self._derive({'c': _classes([0.95, 0.96], [0.10], [0.20])})
+        assert got['c']['pooled_t_high_negatives_admitted'] == 0
+
+    def test_a_category_with_no_negatives_admits_none_of_them(self) -> None:
+        got = self._derive({'preferences_and_norms': _classes([0.9], [], [])})
+        assert got['preferences_and_norms']['pooled_t_high_negatives_admitted'] == 0
+
+    def test_an_uncalibrated_pooled_t_high_admits_no_measurement_not_zero(self) -> None:
+        """With no pooled band there is nothing to admit against.
+
+        0 would read as 'measured, and safe' — the same distinction
+        build_report already draws for its false-positive tally.
+        """
+        got = self._derive({'c': _classes([0.9], [0.8], [])}, pooled_t_high=None)
+        assert got['c']['pooled_t_high_negatives_admitted'] is None
+
+    def test_empty_input_yields_no_entries(self) -> None:
+        assert self._derive({}) == {}
+
+
+class TestPerCategoryMinimumSample:
+    """A token sample must not buy a cutoff of its OWN.
+
+    A per-category cutoff is not merely a number: it is what
+    ``restrict_delete_candidates_for_apply`` reads as EVIDENCE, and having one
+    is what lets a category's ANN-only cliques reach an irreversible delete.
+    That fence is about strength of evidence, so a category whose band was fit
+    to a handful of pairs — weaker evidence than the pooled corpus it would
+    displace — must be refused and fall back, not promoted.
+    """
+
+    POOLED_T_HIGH = 0.75
+    POOLED_T_LOW = 0.5
+
+    def _derive(self, by_category: dict, **kwargs) -> dict:
+        return _mod().derive_bands_per_category(
+            by_category, self.POOLED_T_HIGH, self.POOLED_T_LOW, **kwargs,
+        )
+
+    @staticmethod
+    def _separable(n_dup: int, n_neg: int) -> dict:
+        """Perfectly separable classes — only the SAMPLE SIZE is in question."""
+        return _classes(
+            [0.90 + i * 0.001 for i in range(n_dup)],
+            [0.10 + i * 0.001 for i in range(n_neg)],
+            [],
+        )
+
+    def test_a_thin_but_separable_category_is_refused_at_the_default_minimum(self) -> None:
+        """The committed observations_and_summaries shape: 4 duplicate pairs.
+
+        derive_bands alone WOULD return a cutoff here — the classes do not
+        overlap. The refusal is this function's own rule, and without it a
+        4-pair fit inherits full deletion authority.
+        """
+        sample = self._separable(4, 51)
+        assert _mod().derive_bands(
+            sample['true_dup'], sample['unrelated'] + sample['hard_negative'],
+        )[0] is not None, 'sample sanity: the arithmetic alone yields a number'
+
+        entry = self._derive({'observations_and_summaries': sample})[
+            'observations_and_summaries'
+        ]
+
+        assert entry['t_high'] is None and entry['t_low'] is None, (
+            'a band fitted to 4 duplicate pairs is not a measured cutoff'
+        )
+        assert entry['reason'].startswith(_mod().REASON_INSUFFICIENT_PAIRS), entry['reason']
+
+    def test_the_refusal_names_the_measured_counts_that_forced_it(self) -> None:
+        """The counts ARE the evidence for the refusal, so they are recorded."""
+        entry = self._derive({'c': self._separable(4, 51)})['c']
+        detail = entry['reason'].split(':', 1)[1]
+        assert '4' in detail and '51' in detail, detail
+        assert str(_mod().MIN_CATEGORY_PAIRS) in detail, (
+            'the bar the sample failed must be legible next to the sample'
+        )
+
+    def test_a_category_clearing_the_minimum_keeps_its_derived_cutoff(self) -> None:
+        """The gate is a floor, not a ban — procedural_knowledge clears it."""
+        sample = self._separable(_mod().MIN_CATEGORY_PAIRS, _mod().MIN_CATEGORY_PAIRS)
+        entry = self._derive({'procedural_knowledge': sample})['procedural_knowledge']
+        assert entry['t_high'] == _mod().derive_bands(
+            sample['true_dup'], sample['unrelated'],
+        )[0], 'at or above the bar the delegation is unchanged'
+
+    def test_thin_negatives_alone_also_refuse(self) -> None:
+        """t_high is fitted to the observed MAX negative — that max needs a sample."""
+        entry = self._derive({'c': self._separable(200, 3)})['c']
+        assert entry['t_high'] is None
+        assert entry['reason'].startswith(_mod().REASON_INSUFFICIENT_PAIRS), entry['reason']
+
+    def test_the_minimum_is_inclusive_at_exactly_the_bar(self) -> None:
+        n = _mod().MIN_CATEGORY_PAIRS
+        assert self._derive({'c': self._separable(n, n)})['c']['t_high'] is not None
+        assert self._derive({'c': self._separable(n - 1, n)})['c']['t_high'] is None
+        assert self._derive({'c': self._separable(n, n - 1)})['c']['t_high'] is None
+
+    def test_a_more_specific_refusal_is_not_overwritten(self) -> None:
+        """empty_class / not_separable name WHY better than 'too few'.
+
+        preferences_and_norms has 28 duplicate pairs and zero negatives: it is
+        not thin, it is unmeasurable. Reporting the sample size there would
+        suggest a bigger corpus could fix it, which for a single-cluster
+        category is false.
+        """
+        empty = self._derive({'preferences_and_norms': _classes([0.8, 0.9], [], [])})
+        assert empty['preferences_and_norms']['reason'].startswith(
+            _mod().REASON_EMPTY_CLASS,
+        )
+        overlapping = self._derive({'c': _classes([0.80, 0.85], [0.90], [0.88])})
+        assert overlapping['c']['reason'].startswith(_mod().REASON_NOT_SEPARABLE)
+
+    def test_a_refused_category_still_records_its_distributions_and_admissions(
+        self,
+    ) -> None:
+        """Refused for size, not unmeasured — the evidence still lands."""
+        entry = self._derive({'c': self._separable(4, 51)})['c']
+        assert entry['pair_counts'] == {'true_dup': 4, 'unrelated': 51, 'hard_negative': 0}
+        assert entry['distributions']['true_dup']['n'] == 4
+        assert entry['pooled_t_high_negatives_admitted'] == 0, (
+            'the pooled cutoff it now falls back to is still measured against '
+            'its own negatives'
+        )
+
+    def test_the_gate_never_touches_the_pooled_derivation(self) -> None:
+        """derive_bands is bound by the pooled calibration and many callers."""
+        t_high, t_low, reason = _mod().derive_bands([0.9], [0.1])
+        assert t_high == 0.9 and t_low is None
+        assert _mod().REASON_INSUFFICIENT_PAIRS not in (reason or '')
+
+    def test_no_judge_band_does_not_survive_a_size_refusal(self) -> None:
+        """A withdrawn t_high leaves no band for no_judge_band to qualify."""
+        entry = self._derive({'c': _classes([0.9, 0.91], [0.1], [])})['c']
+        assert entry['t_high'] is None and entry['t_low'] is None
+        assert entry['reason'].startswith(_mod().REASON_INSUFFICIENT_PAIRS), entry['reason']
+
+
+# ---------------------------------------------------------------------------
 # compute_recall_at_k
 # ---------------------------------------------------------------------------
 
@@ -794,7 +1261,7 @@ OVERLAP_SCORES = {
 }
 
 
-def _report(scores: dict, t_high, t_low, reason=None, recall=None) -> dict:
+def _report(scores: dict, t_high, t_low, reason=None, recall=None, **kwargs) -> dict:
     return _mod().build_report(
         scores_by_class=scores,
         t_high=t_high,
@@ -802,6 +1269,37 @@ def _report(scores: dict, t_high, t_low, reason=None, recall=None) -> dict:
         reason=reason,
         recall=recall if recall is not None else {'per_k': [], 'canonical_absent': []},
         provenance=dict(_PROVENANCE),
+        **kwargs,
+    )
+
+
+def _per_category(
+    pooled_t_high: float | None = 0.80, pooled_t_low: float | None = 0.70
+) -> dict:
+    """A realistic per-category block: one calibrated, two refused.
+
+    Mirrors the shape the committed fixture actually produces — a category
+    with enough evidence to derive a cutoff, one with zero negatives, and one
+    too thin to separate.
+    """
+    return _mod().derive_bands_per_category(
+        {
+            'procedural_knowledge': {
+                'true_dup': [0.70, 0.80, 0.90], 'unrelated': [0.10], 'hard_negative': [0.55],
+            },
+            'preferences_and_norms': {
+                'true_dup': [0.80, 0.90], 'unrelated': [], 'hard_negative': [],
+            },
+            'observations_and_summaries': {
+                'true_dup': [0.60], 'unrelated': [0.95], 'hard_negative': [],
+            },
+        },
+        pooled_t_high,
+        pooled_t_low,
+        # These fixtures are about report SHAPE, so the sample-size gate is
+        # lowered out of the way; TestPerCategoryMinimumSample owns the gate.
+        min_dup_pairs=1,
+        min_negative_pairs=1,
     )
 
 
@@ -916,6 +1414,209 @@ class TestBuildReport:
         assert json.loads(json.dumps(got)) == got
 
 
+class TestBuildReportPerCategory:
+    """The per-category section is ADDITIVE — the pooled report is untouched.
+
+    The pooled t_high remains the calibration of record; this section is the
+    evidence about whether it is warranted per category. Any drift in the
+    pooled numbers would mean this task changed a measurement it was only
+    supposed to explain, so that is asserted directly.
+    """
+
+    POOLED_KEYS = (
+        'chosen_t_high', 'chosen_t_low', 'reason',
+        'deterministic_band_false_positives', 'distributions', 'per_band',
+        'recall_at_k',
+    )
+
+    def test_carries_a_per_category_section(self) -> None:
+        per_category = _per_category()
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=per_category)
+        assert got['per_category'] == per_category
+
+    # The provenance keys that PREDATE this change. per_category_pair_counts
+    # belongs to the new section, so it is excluded here by construction
+    # rather than by a blanket comparison that would silently absorb it.
+    POOLED_PROVENANCE_KEYS = (*_PROVENANCE, 'pair_counts')
+
+    def test_the_pooled_measurement_is_byte_identical_with_and_without_it(self) -> None:
+        """Additive means additive: same inputs, same pooled numbers."""
+        without = _report(OVERLAP_SCORES, 0.80, 0.70)
+        with_ = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        for key in self.POOLED_KEYS:
+            assert with_[key] == without[key], f'{key} drifted when per_category was added'
+        for key in self.POOLED_PROVENANCE_KEYS:
+            assert with_['provenance'][key] == without['provenance'][key], (
+                f'provenance[{key!r}] drifted'
+            )
+        assert set(without['provenance']) == set(with_['provenance']), (
+            'the two runs must expose the same provenance KEYS — a key that '
+            'appears only when calibrated would make the two shapes diverge'
+        )
+
+    def test_defaults_to_an_empty_section_so_existing_callers_are_unaffected(self) -> None:
+        """Present-and-empty, not missing: 'measured nothing' is still a state."""
+        got = _report(OVERLAP_SCORES, 0.80, 0.70)
+        assert got['per_category'] == {}
+
+    def test_every_category_keeps_its_derived_entry_verbatim(self) -> None:
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        assert set(got['per_category']) == {
+            'procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries',
+        }
+        for category, entry in got['per_category'].items():
+            for key in ('distributions', 't_high', 't_low', 'reason', 'pair_counts',
+                        'pooled_t_high_negatives_admitted'):
+                assert key in entry, f'{category} missing {key!r}'
+
+    def test_an_uncalibrated_category_is_reported_not_dropped(self) -> None:
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        refused = got['per_category']['preferences_and_norms']
+        assert refused['t_high'] is None
+        assert refused['reason'].startswith(_mod().REASON_EMPTY_CLASS)
+
+    def test_an_uncalibrated_POOLED_run_still_emits_the_section(self) -> None:
+        """The pooled refusal does not erase the per-category evidence.
+
+        Those distributions are part of what justifies the pooled refusal.
+        """
+        got = _report(
+            CLEAN_SCORES, None, None, reason='not_separable: ...',
+            per_category=_per_category(pooled_t_high=None, pooled_t_low=None),
+        )
+        assert set(got['per_category']) == {
+            'procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries',
+        }
+        assert got['per_category']['procedural_knowledge'][
+            'pooled_t_high_negatives_admitted'
+        ] is None, 'with no pooled band there is nothing to admit against'
+
+    def test_provenance_records_the_per_category_pair_counts(self) -> None:
+        """Self-describing, exactly as the pooled pair_counts already are."""
+        per_category = _per_category()
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=per_category)
+        assert got['provenance']['per_category_pair_counts'] == {
+            category: entry['pair_counts'] for category, entry in per_category.items()
+        }
+
+    def test_the_report_is_json_serializable_with_the_section(self) -> None:
+        got = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        assert json.loads(json.dumps(got)) == got
+
+
+# ---------------------------------------------------------------------------
+# render_markdown
+# ---------------------------------------------------------------------------
+
+class TestRenderMarkdownPerCategory:
+    """The human-readable form of the finding.
+
+    Assertions are on the numbers and the machine-readable reason codes, not
+    on prose wording — a reader must be able to see, without parsing JSON,
+    which categories are calibrated and what the pooled cutoff would admit
+    in the ones that are not.
+    """
+
+    # Column order of the per-category table, asserted POSITIONALLY: a
+    # substring check would pass on a row that merely contains the digit
+    # somewhere, so deleting a whole column could leave the test green.
+    COLUMNS = ('category', 'n true_dup', 'n negative', 't_high', 't_low',
+               'pooled t_high admits', 'reason')
+
+    @staticmethod
+    def _cells(row: str) -> list[str]:
+        return [c.strip() for c in row.strip().strip('|').split('|')]
+
+    @classmethod
+    def _row_cells(cls, md: str, category: str) -> dict[str, str]:
+        row = next(ln for ln in md.splitlines() if ln.startswith(f'| {category} |'))
+        cells = cls._cells(row)
+        assert len(cells) == len(cls.COLUMNS), (
+            f'row has {len(cells)} cells, header declares {len(cls.COLUMNS)}: {row}'
+        )
+        return dict(zip(cls.COLUMNS, cells, strict=True))
+
+    def _md(self, pooled_t_high=0.80, pooled_t_low=0.70) -> str:
+        return _mod().render_markdown(_report(
+            OVERLAP_SCORES, pooled_t_high, pooled_t_low,
+            per_category=_per_category(pooled_t_high, pooled_t_low),
+        ))
+
+    def test_the_header_declares_the_columns_this_class_binds(self) -> None:
+        """Pins the binding itself: a reordered header must fail here, once."""
+        header = next(ln for ln in self._md().splitlines() if ln.startswith('| category |'))
+        assert self._cells(header) == list(self.COLUMNS)
+
+    def test_emits_one_row_per_category(self) -> None:
+        md = self._md()
+        for category in ('procedural_knowledge', 'preferences_and_norms',
+                         'observations_and_summaries'):
+            assert len([ln for ln in md.splitlines()
+                        if ln.startswith(f'| {category} |')]) == 1, (
+                f'expected exactly one table row for {category}'
+            )
+
+    def test_a_calibrated_row_shows_its_derived_t_high_t_low_and_ns(self) -> None:
+        """Both band edges bound, on a category whose judge band is derivable.
+
+        ``_per_category``'s calibrated row separates perfectly, so its t_low
+        is None — which cannot tell a rendered t_low apart from a rendered
+        t_high. This block is built to have both.
+        """
+        per_category = _mod().derive_bands_per_category(
+            {'procedural_knowledge': _classes([0.60, 0.80, 0.90], [0.10], [0.65])},
+            0.80, 0.70, min_dup_pairs=1, min_negative_pairs=1,
+        )
+        entry = per_category['procedural_knowledge']
+        assert (entry['t_high'], entry['t_low']) == (0.80, 0.60), 'fixture sanity'
+        report = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=per_category)
+        cells = self._row_cells(_mod().render_markdown(report), 'procedural_knowledge')
+
+        assert cells['t_high'] == str(entry['t_high'])
+        assert cells['t_low'] == str(entry['t_low']), (
+            'the judge band is a measured number too — an unbound column can '
+            'silently render the wrong one'
+        )
+        assert cells['n true_dup'] == str(entry['pair_counts']['true_dup'])
+        assert cells['n negative'] == str(
+            entry['pair_counts']['unrelated'] + entry['pair_counts']['hard_negative'],
+        )
+        assert cells['reason'] == '', 'a fully derived row states no refusal'
+
+    def test_a_refused_row_shows_its_reason_code_instead_of_a_number(self) -> None:
+        cells = self._row_cells(self._md(), 'preferences_and_norms')
+        assert cells['reason'].startswith(_mod().REASON_EMPTY_CLASS), (
+            'a refusal must be readable as a refusal, not as a blank cell'
+        )
+        assert cells['t_high'] == 'None' and cells['t_low'] == 'None'
+
+    def test_every_row_shows_what_the_POOLED_cutoff_would_admit(self) -> None:
+        """The evidence for or against one cutoff serving every category."""
+        report = _report(OVERLAP_SCORES, 0.80, 0.70, per_category=_per_category())
+        md = _mod().render_markdown(report)
+        for category, entry in report['per_category'].items():
+            assert self._row_cells(md, category)['pooled t_high admits'] == str(
+                entry['pooled_t_high_negatives_admitted'],
+            ), f'{category}: the pooled cutoff\'s effect on it is unreadable'
+        assert report['per_category']['observations_and_summaries'][
+            'pooled_t_high_negatives_admitted'
+        ] == 1, 'sample sanity: a NON-zero count is what the column must carry'
+
+    def test_a_report_with_no_per_category_section_still_renders(self) -> None:
+        """Older artifacts predate the section; rendering must not crash.
+
+        build_report always sets the key, so the missing-key branch is only
+        reachable by removing it — which is exactly the artifact on disk from
+        before this section existed.
+        """
+        report = _report(CLEAN_SCORES, 0.70, 0.60)
+        assert report.pop('per_category') == {}, 'the key must have been present'
+        md = _mod().render_markdown(report)
+        assert md and 'Per-category bands' not in md, (
+            'no section may be rendered for a report that measured none'
+        )
+
+
 # ---------------------------------------------------------------------------
 # write_triage_config_block
 # ---------------------------------------------------------------------------
@@ -1006,8 +1707,14 @@ def _without_write_triage_block(text: str) -> list[str]:
     return kept
 
 
-def _call(text: str, t_high=0.87, t_low=0.61, path='calibration/r.json') -> str:
-    return _mod().write_triage_config_block(text, t_high, t_low, path)
+def _call(
+    text: str,
+    t_high: float | None = 0.87,
+    t_low: float | None = 0.61,
+    path='calibration/r.json',
+    **kwargs,
+) -> str:
+    return _mod().write_triage_config_block(text, t_high, t_low, path, **kwargs)
 
 
 class TestWriteTriageConfigBlock:
@@ -1132,6 +1839,81 @@ class TestWriteTriageConfigBlockSpanScan:
             't_high': 0.87, 't_low': 0.61, 'calibration_report_path': 'calibration/r.json',
         }
         assert '0.11' not in _call(text), 'the stale body must be gone'
+
+
+class TestWriteTriageConfigBlockPerCategory:
+    """The per-category map, written the same surgical way.
+
+    ABSENT means uncalibrated, and that is the ONLY spelling of it. A
+    category present with a null cutoff would give "no evidence for this
+    category" two representations, and the consumer would have to agree with
+    the writer about which one means what — exactly the ambiguity this task
+    exists to remove.
+    """
+
+    # Deliberately SYNTHETIC, and deliberately full-precision: the first value
+    # carries 16 significant digits so the YAML round-trip is pinned at the
+    # precision a real derived cutoff has, while never being mistakable for
+    # one that was measured.
+    BY_CATEGORY = {
+        'procedural_knowledge': 0.1234567890123456,
+        'observations_and_summaries': 0.91,
+    }
+
+    def test_the_map_parses_back_to_exactly_what_was_measured(self) -> None:
+        parsed = yaml.safe_load(_call(WITH_BLOCK, t_high_by_category=self.BY_CATEGORY))
+        assert parsed['write_triage']['t_high_by_category'] == self.BY_CATEGORY
+
+    def test_the_pooled_values_are_still_written_alongside_it(self) -> None:
+        """The pooled cutoff stays the disclosed fallback, not a casualty."""
+        block = yaml.safe_load(_call(WITH_BLOCK, t_high_by_category=self.BY_CATEGORY))[
+            'write_triage'
+        ]
+        assert block['t_high'] == 0.87
+        assert block['t_low'] == 0.61
+        assert block['calibration_report_path'] == 'calibration/r.json'
+
+    @pytest.mark.parametrize('mapping', [None, {}], ids=['none', 'empty'])
+    def test_no_derived_cutoffs_omits_the_key_entirely(self, mapping) -> None:
+        """Never present-with-null: one spelling of 'uncalibrated'."""
+        out = _call(WITH_BLOCK, t_high_by_category=mapping)
+        assert 't_high_by_category' not in yaml.safe_load(out)['write_triage']
+        assert 't_high_by_category' not in out, (
+            'not even as a commented-out stub — a reader must not have to '
+            'decide whether a null means "measured and refused" or "not run"'
+        )
+
+    def test_the_key_order_is_deterministic(self) -> None:
+        """Two runs over the same measurement must produce the same bytes."""
+        out = _call(WITH_BLOCK, t_high_by_category=self.BY_CATEGORY)
+        emitted = [ln.strip().split(':')[0] for ln in out.splitlines()
+                   if ln.startswith('    ') and ':' in ln]
+        assert emitted == sorted(emitted), f'unsorted per-category keys: {emitted}'
+
+    def test_an_uncalibrated_pooled_run_still_refuses_even_with_a_map(self) -> None:
+        """A per-category cutoff never smuggles a null pooled threshold in."""
+        with pytest.raises(ValueError):
+            _call(WITH_BLOCK, t_high=None, t_high_by_category=self.BY_CATEGORY)
+        with pytest.raises(ValueError):
+            _call(WITH_BLOCK, t_low=None, t_high_by_category=self.BY_CATEGORY)
+
+    def test_the_block_names_the_report_that_produced_the_map(self) -> None:
+        """Same provenance link the pooled numbers already carry."""
+        out = _call(WITH_BLOCK, path='calibration/x.json',
+                    t_high_by_category=self.BY_CATEGORY)
+        header = out.split('t_high_by_category:')[0]
+        assert 'calibration/x.json' in header
+
+    @pytest.mark.parametrize(
+        'text',
+        [WITH_BLOCK_THEN_COLUMN0_HEADER, WITH_BLOCK, WITH_BLOCK_AT_EOF],
+        ids=['column0-header', 'indented-comment', 'at-eof'],
+    )
+    def test_the_surrounding_config_survives_the_nested_map(self, text: str) -> None:
+        """The nested map must not widen what the block replacement eats."""
+        out = _call(text, t_high_by_category=self.BY_CATEGORY)
+        assert _without_write_triage_block(out) == _without_write_triage_block(text)
+        assert yaml.safe_load(out)['write_triage']['t_high_by_category'] == self.BY_CATEGORY
 
 
 # ---------------------------------------------------------------------------
@@ -1264,6 +2046,186 @@ class TestRunCalibration:
         )
 
 
+def _mixed_category_records() -> list[dict]:
+    """Two categories, one of them sharing a cluster with the other.
+
+    The cross-category pair is the one fetch_ann_neighbors can never form.
+    """
+    records = _e2e_records()
+    records.append(_cat_rec('o1', 'c1', 'duplicate', 'observations_and_summaries'))
+    return records
+
+
+def _mixed_embed():
+    vectors = {
+        'c1': [1.0, 0.0], 'd1': [0.99, 0.14],
+        'c2': [0.0, 1.0], 'd2': [0.14, 0.99],
+        'o1': [0.97, 0.24],
+    }
+    calls: list[str] = []
+
+    def embed(mid: str, content: str) -> list[float]:
+        calls.append(mid)
+        return vectors[mid]
+
+    embed.calls = calls  # type: ignore[attr-defined]
+    return embed
+
+
+_WIDE_CLUSTERS = 7
+_WIDE_MEMBERS = 3
+
+
+def _wide_pk_records() -> list[dict]:
+    """A procedural_knowledge corpus wide enough to CLEAR the sample gate.
+
+    7 clusters x 3 members = 21 same-cluster pairs and 189 cross-cluster ones,
+    both past MIN_CATEGORY_PAIRS — so run_calibration's per-category
+    derivation is exercised on a sample the gate actually admits, rather than
+    on one it (correctly) refuses.
+    """
+    return [
+        _cat_rec(f'm{i}_{j}', f'c{i}', 'canonical' if j == 0 else 'duplicate',
+                 'procedural_knowledge')
+        for i in range(_WIDE_CLUSTERS)
+        for j in range(_WIDE_MEMBERS)
+    ]
+
+
+def _wide_pk_embed():
+    """One near-orthogonal direction per cluster, jittered per member.
+
+    Same-cluster cosine ~0.998, cross-cluster ~0.002: separable by a wide
+    margin, so what the test measures is the DERIVATION, not the fixture.
+    """
+    dims = _WIDE_CLUSTERS + _WIDE_MEMBERS
+    vectors = {}
+    for i in range(_WIDE_CLUSTERS):
+        for j in range(_WIDE_MEMBERS):
+            vector = [0.0] * dims
+            vector[i] = 1.0
+            vector[_WIDE_CLUSTERS + j] = 0.05
+            vectors[f'm{i}_{j}'] = vector
+    calls: list[str] = []
+
+    def embed(mid: str, content: str) -> list[float]:
+        calls.append(mid)
+        return vectors[mid]
+
+    embed.calls = calls  # type: ignore[attr-defined]
+    return embed
+
+
+class TestRunCalibrationPerCategory:
+    """End-to-end wiring: the same embeddings, measured a second way.
+
+    The per-category evidence must come out of the SAME single embedding
+    pass — re-embedding per category would multiply a real API bill by the
+    number of categories for no new information.
+    """
+
+    def _run_mixed(self, tmp_path: Path, embed=None):
+        return _run(
+            tmp_path,
+            records=_mixed_category_records(),
+            embed=embed if embed is not None else _mixed_embed(),
+            search=_search_fn(hits={'d1': ['c1'], 'd2': ['c2'], 'o1': ['c1']},
+                              present={'c1', 'c2'}),
+        )
+
+    def test_the_report_carries_a_per_category_entry_for_every_category(
+        self, tmp_path: Path,
+    ) -> None:
+        report = self._run_mixed(tmp_path)['report']
+        assert set(report['per_category']) == {
+            'procedural_knowledge', 'observations_and_summaries',
+        }
+
+    def test_the_embed_budget_is_unchanged_at_one_call_per_record(
+        self, tmp_path: Path,
+    ) -> None:
+        embed = _mixed_embed()
+        records = _mixed_category_records()
+        self._run_mixed(tmp_path, embed=embed)
+        assert sorted(embed.calls) == sorted(r['memory_id'] for r in records), (
+            'per-category measurement must reuse the single embedding pass'
+        )
+
+    def test_a_categorys_cutoff_is_bound_to_that_categorys_own_measurements(
+        self, tmp_path: Path,
+    ) -> None:
+        """Derived from its own pairs — not inherited, not interpolated.
+
+        Asserted against the distributions the report itself records, so a
+        report that does not describe the derivation that produced it fails.
+        Run on the WIDE corpus: a cutoff is only derivable at all once the
+        category clears MIN_CATEGORY_PAIRS.
+        """
+        entry = _run(
+            tmp_path, records=_wide_pk_records(), embed=_wide_pk_embed(),
+            search=_search_fn(hits={}, present=set()),
+        )['report']['per_category']['procedural_knowledge']
+        dup, unrelated = entry['distributions']['true_dup'], entry['distributions']['unrelated']
+        assert dup['n'] == entry['pair_counts']['true_dup']
+        assert dup['n'] >= _mod().MIN_CATEGORY_PAIRS, 'sample sanity: the gate is cleared'
+        assert entry['t_high'] is not None, 'this category is separable in the sample'
+        assert dup['min'] <= entry['t_high'] <= dup['max'], (
+            't_high must be an order statistic of this category\'s duplicate class'
+        )
+        assert entry['t_high'] > unrelated['max'], (
+            't_high must clear this category\'s OWN highest measured negative'
+        )
+
+    def test_run_calibration_applies_the_sample_gate_at_its_default(
+        self, tmp_path: Path,
+    ) -> None:
+        """The same corpus, BELOW the bar: separable, and still refused.
+
+        Pins that the production path uses MIN_CATEGORY_PAIRS rather than the
+        lowered minimum the unit fixtures pass — a per-category cutoff must
+        never reach config on a sample the gate would reject.
+        """
+        entry = self._run_mixed(tmp_path)['report']['per_category'][
+            'procedural_knowledge'
+        ]
+        assert entry['pair_counts']['true_dup'] < _mod().MIN_CATEGORY_PAIRS
+        assert entry['t_high'] is None
+        assert entry['reason'].startswith(_mod().REASON_INSUFFICIENT_PAIRS), entry['reason']
+
+    def test_a_category_with_no_pairs_is_present_and_refused(self, tmp_path: Path) -> None:
+        """A lone record forms no pair — 'not derivable' is still a measurement."""
+        entry = self._run_mixed(tmp_path)['report']['per_category'][
+            'observations_and_summaries'
+        ]
+        assert entry['pair_counts'] == {'true_dup': 0, 'unrelated': 0, 'hard_negative': 0}
+        assert entry['t_high'] is None
+        assert entry['reason'].startswith(_mod().REASON_EMPTY_CLASS)
+
+    def test_provenance_records_the_per_category_record_counts(
+        self, tmp_path: Path,
+    ) -> None:
+        prov = self._run_mixed(tmp_path)['report']['provenance']
+        assert prov['per_category_record_counts'] == {
+            'procedural_knowledge': 4, 'observations_and_summaries': 1,
+        }
+
+    def test_provenance_records_the_cross_category_pairs_dropped(
+        self, tmp_path: Path,
+    ) -> None:
+        """A disclosed number, not invisible attrition."""
+        records = _mixed_category_records()
+        prov = self._run_mixed(tmp_path)['report']['provenance']
+        expected = _mod().partition_pairs_by_category(records)['cross_category_dropped']
+        assert expected == 4, 'sample sanity: o1 pairs with each of the four others'
+        assert prov['cross_category_dropped'] == expected
+
+    def test_the_markdown_carries_the_per_category_table(self, tmp_path: Path) -> None:
+        self._run_mixed(tmp_path)
+        md = (tmp_path / 'report.md').read_text()
+        for category in ('procedural_knowledge', 'observations_and_summaries'):
+            assert f'| {category} |' in md, f'{category} missing from the markdown table'
+
+
 class TestCommittedCalibrationIsTraceable:
     """The committed thresholds must be traceable to the run that produced them.
 
@@ -1339,3 +2301,187 @@ class TestCommittedCalibrationIsTraceable:
         )
         assert block['t_low'] < block['t_high']
         assert report['deterministic_band_false_positives'] == 0
+
+
+class TestCommittedPerCategoryEvidenceIsRecorded:
+    """The per-category evidence must be RECORDED, not merely derivable.
+
+    The machinery added by this task can measure each category
+    separately; that is worth nothing until the measurement is actually
+    run and its outcome committed. These tests read the two tracked
+    artifacts — ``calibration/write_triage_calibration_report.json`` and
+    ``config/config.yaml`` — and pin the end-to-end invariant that a
+    number gating a sweep is a number some run measured.
+
+    The state they exist to make impossible is "used, but not measured":
+    a cutoff applied to a category whose report entry neither derives a
+    value nor records why it could not. Both a derived number and a
+    machine-readable refusal are acceptable answers; silence is not.
+
+    No network, no Qdrant — committed artifacts only.
+    """
+
+    CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
+    REPORT_PATH = (
+        Path(__file__).parent.parent
+        / 'calibration'
+        / 'write_triage_calibration_report.json'
+    )
+
+    # Decorator order is load-bearing — see the sibling class above.
+    @staticmethod
+    @functools.cache
+    def _committed():
+        import yaml  # noqa: PLC0415
+
+        cls = TestCommittedPerCategoryEvidenceIsRecorded
+        block = yaml.safe_load(cls.CONFIG_PATH.read_text()).get('write_triage') or {}
+        assert cls.REPORT_PATH.exists(), f'report missing: {cls.REPORT_PATH}'
+        report = json.loads(cls.REPORT_PATH.read_text())
+        return block, report
+
+    @staticmethod
+    def _refusal_reasons() -> frozenset[str]:
+        """The codes that mean NO cutoff was derived, read from the script.
+
+        Binding to the module's constants means renaming a reason code
+        cannot leave this guard silently accepting a stale spelling.
+
+        REASON_NO_JUDGE_BAND is deliberately NOT here: it accompanies a
+        DERIVED t_high (perfect separation, so no judge band lies below it),
+        so treating it as a refusal would let a null t_high pass while it
+        legitimately reports a successful derivation.
+        """
+        mod = _mod()
+        return frozenset({
+            mod.REASON_EMPTY_CLASS,
+            mod.REASON_NOT_SEPARABLE,
+            mod.REASON_INSUFFICIENT_PAIRS,
+        })
+
+    @staticmethod
+    def _reasons_compatible_with_a_derived_cutoff() -> frozenset[str]:
+        """Codes derive_bands emits ALONGSIDE a number, not instead of one."""
+        return frozenset({_mod().REASON_NO_JUDGE_BAND})
+
+    def test_the_report_covers_every_category_in_the_committed_fixture(
+        self, records: list[dict]
+    ) -> None:
+        _, report = self._committed()
+        fixture_categories = {c for r in records if (c := r.get('category'))}
+        assert fixture_categories == {
+            'procedural_knowledge',
+            'observations_and_summaries',
+            'preferences_and_norms',
+        }, (
+            'the fixture\'s category mix changed — re-run '
+            'scripts/calibrate_write_triage.py before trusting any committed cutoff'
+        )
+        per_category = report.get('per_category')
+        assert isinstance(per_category, dict), (
+            'the committed report has no per_category section, so the cutoff '
+            'gating three categories was measured on an unknown mix of them'
+        )
+        assert fixture_categories <= set(per_category), (
+            f'measured nothing for {sorted(fixture_categories - set(per_category))} — '
+            'a category the corpus contains but the report omits is the exact '
+            '"used but not measured" state this section exists to remove'
+        )
+
+    def test_each_category_is_either_calibrated_or_refused_with_a_reason(self) -> None:
+        _, report = self._committed()
+        per_category = report.get('per_category') or {}
+        assert per_category, 'no per-category measurement is recorded at all'
+        refusals = self._refusal_reasons()
+        for category, entry in per_category.items():
+            t_high = entry.get('t_high')
+            reason = entry.get('reason')
+            if t_high is None:
+                # derive_bands emits `<code>: <measured detail>` — the code is
+                # the machine-readable prefix, the tail carries the counts that
+                # justify it. Split rather than startswith, so a code that
+                # merely shares a prefix cannot pass as a known refusal.
+                code = (reason or '').split(':', 1)[0]
+                assert code in refusals, (
+                    f'{category}: no cutoff and no recognised refusal code '
+                    f'(reason={reason!r}) — "not measured" and "measured, and '
+                    f'refused" must never be indistinguishable'
+                )
+                assert code != reason, (
+                    f'{category}: refusal code {code!r} carries no measured '
+                    f'detail — the counts that force the refusal are the evidence'
+                )
+                assert entry.get('t_low') is None, (
+                    f'{category}: refused a t_high but kept a t_low'
+                )
+            else:
+                assert isinstance(t_high, float) and not isinstance(t_high, bool), (
+                    f'{category}: t_high is {t_high!r}, not a measured float'
+                )
+                assert 0.0 <= t_high <= 1.0, (
+                    f'{category}: t_high {t_high} is outside the cosine range'
+                )
+                # A reason is not automatically a contradiction: derive_bands
+                # emits no_judge_band WITH a derived t_high (perfect
+                # separation). Only a REFUSAL code beside a number is
+                # incoherent — that would mean the artifact says both
+                # "measured this cutoff" and "declined to measure one".
+                code = (reason or '').split(':', 1)[0]
+                assert reason is None or code in (
+                    self._reasons_compatible_with_a_derived_cutoff()
+                ), (
+                    f'{category}: derived t_high={t_high} AND recorded refusal '
+                    f'{reason!r} — a contradictory entry'
+                )
+
+    def test_every_category_records_how_the_pooled_cutoff_treats_its_negatives(
+        self,
+    ) -> None:
+        """The direct evidence for (or against) one cutoff serving all three."""
+        _, report = self._committed()
+        per_category = report.get('per_category') or {}
+        assert per_category, 'no per-category measurement is recorded at all'
+        for category, entry in per_category.items():
+            assert 'pooled_t_high_negatives_admitted' in entry, (
+                f'{category}: the pooled cutoff\'s effect on this category\'s own '
+                f'negatives is unrecorded, so its cross-category validity is '
+                f'asserted rather than measured'
+            )
+            admitted = entry['pooled_t_high_negatives_admitted']
+            assert admitted is None or isinstance(admitted, int), (
+                f'{category}: pooled_t_high_negatives_admitted={admitted!r}'
+            )
+            assert 'pair_counts' in entry, f'{category}: pair counts unrecorded'
+
+    def test_config_restates_only_numbers_the_report_measured(self) -> None:
+        """INV-5, end to end: config never carries a number the report lacks."""
+        block, report = self._committed()
+        by_category = block.get('t_high_by_category')
+        if by_category is None:
+            pytest.fail(
+                'config has no write_triage.t_high_by_category, so every category '
+                'still runs on the pooled cutoff with no record of whether that '
+                'cutoff is evidenced for it'
+            )
+        per_category = report.get('per_category') or {}
+        for category, value in by_category.items():
+            assert category in per_category, (
+                f'config carries a cutoff for {category} that the report never '
+                f'measured — an invented threshold'
+            )
+            assert value == per_category[category]['t_high'], (
+                f'{category}: config says {value}, the report measured '
+                f'{per_category[category]["t_high"]} — a hand-edited threshold'
+            )
+
+    def test_a_refused_category_is_absent_from_config_not_null(self) -> None:
+        block, report = self._committed()
+        by_category = block.get('t_high_by_category') or {}
+        for category, entry in (report.get('per_category') or {}).items():
+            if entry.get('t_high') is not None:
+                continue
+            assert category not in by_category, (
+                f'{category} was refused a cutoff ({entry.get("reason")!r}) yet '
+                f'appears in config as {by_category[category]!r} — "uncalibrated" '
+                f'must have exactly one spelling: absent'
+            )

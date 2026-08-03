@@ -22,37 +22,27 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
+# discover_db_paths is imported from its DEFINING module rather than re-exported
+# through the scanner: the scanner itself never calls it (run_scan_cli resolves it
+# from _task_db_scan's own namespace), so re-exporting it would be a dead import.
+# Same function object either way — these tests exercise an identical callable.
+from _task_db_scan import discover_db_paths
 from scan_provenance_note_log_leaks import (
     NoteLeakMatch,
     detect_log_leak,
-    discover_db_paths,
     format_json,
     format_report,
     scan_db,
 )
 
-# Minimal reproduction of the live tasks table schema (columns + NOT NULL
-# constraints only — see fused-memory's sqlite_task_backend.py _SCHEMA_SQL).
-# `metadata TEXT` is the column that matters here; the precedent scanner
-# deliberately never reads it.
-_TASKS_SCHEMA = """
-CREATE TABLE tasks (
-    tag           TEXT NOT NULL DEFAULT 'master',
-    id            INTEGER NOT NULL,
-    title         TEXT NOT NULL,
-    description   TEXT,
-    details       TEXT,
-    test_strategy TEXT,
-    status        TEXT NOT NULL,
-    metadata      TEXT,
-    updated_at    TEXT NOT NULL,
-    PRIMARY KEY (tag, id)
-);
-"""
+# The tasks-table schema and the fake-db builder live in scripts/tests/
+# conftest.py, behind the `make_tasks_db` fixture (task
+# 3336) — they were previously copied near-identically into all three
+# sweep-script test files.
 
 # ---------------------------------------------------------------------------
 # Genuine-leak fixture: the task-2902 shape, abridged.
@@ -205,53 +195,35 @@ class TestNoteLeakMatch:
 # Fixture-DB helpers
 # ---------------------------------------------------------------------------
 
-def _make_db(tmp_path, rows, name='tasks.db'):
-    """Build a fixture tasks.db. *rows* are (id, metadata_text) pairs."""
-    db_path = tmp_path / name
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(_TASKS_SCHEMA)
-        for task_id, metadata in rows:
-            conn.execute(
-                'INSERT INTO tasks (tag, id, title, status, metadata, updated_at) '
-                "VALUES ('master', ?, ?, 'done', ?, '2026-07-30T00:00:00Z')",
-                (task_id, f'Task {task_id}', metadata),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return str(db_path)
-
-
 def _provenance(kind, **fields):
     return json.dumps({'done_provenance': {'kind': kind, **fields}})
 
 
 # Every row shape scan_db must tolerate. Only task 2902 is a leak.
 _MIXED_ROWS = [
-    (2902, _provenance('deterministic-milestone', note=POLLUTED_NOTE)),
-    (2903, _provenance('deterministic-milestone', note=CLEAN_NOTES[0])),
+    {'id': 2902, 'metadata': _provenance('deterministic-milestone', note=POLLUTED_NOTE)},
+    {'id': 2903, 'metadata': _provenance('deterministic-milestone', note=CLEAN_NOTES[0])},
     # A merged provenance carries a commit but no note at all.
-    (2904, _provenance('merged', commit='43b9439262')),
+    {'id': 2904, 'metadata': _provenance('merged', commit='43b9439262')},
     # Valid JSON object, but no done_provenance key.
-    (2905, json.dumps({'task_kind': 'deterministic'})),
+    {'id': 2905, 'metadata': json.dumps({'task_kind': 'deterministic'})},
     # Valid JSON, but a scalar / an array rather than an object.
-    (2906, json.dumps('deterministic')),
-    (2907, json.dumps([1, 2, 3])),
+    {'id': 2906, 'metadata': json.dumps('deterministic')},
+    {'id': 2907, 'metadata': json.dumps([1, 2, 3])},
     # done_provenance present but not a dict.
-    (2908, json.dumps({'done_provenance': 'deterministic-milestone'})),
+    {'id': 2908, 'metadata': json.dumps({'done_provenance': 'deterministic-milestone'})},
     # Malformed, non-JSON metadata.
-    (2909, '{not valid json'),
+    {'id': 2909, 'metadata': '{not valid json'},
     # NULL metadata.
-    (2910, None),
+    {'id': 2910, 'metadata': None},
 ]
 
 
 class TestScanDb:
     """scan_db reads metadata.done_provenance.note, read-only, tolerantly."""
 
-    def test_finds_exactly_the_polluted_note(self, tmp_path):
-        matches = scan_db(_make_db(tmp_path, _MIXED_ROWS))
+    def test_finds_exactly_the_polluted_note(self, make_tasks_db):
+        matches = scan_db(str(make_tasks_db(_MIXED_ROWS)))
 
         assert len(matches) == 1, matches
         match = matches[0]
@@ -260,21 +232,21 @@ class TestScanDb:
         assert match.provenance_kind == 'deterministic-milestone'
         assert 'fused_memory.backends.graphiti_client' in match.leak_line
 
-    def test_malformed_null_and_absent_rows_are_skipped_without_raising(self, tmp_path):
+    def test_malformed_null_and_absent_rows_are_skipped_without_raising(self, make_tasks_db):
         """A single unparseable blob must not abort the sweep."""
-        rows = [row for row in _MIXED_ROWS if row[0] != 2902]
+        rows = [row for row in _MIXED_ROWS if row['id'] != 2902]
 
-        assert scan_db(_make_db(tmp_path, rows)) == []
+        assert scan_db(str(make_tasks_db(rows))) == []
 
-    def test_clean_db_yields_no_matches(self, tmp_path):
+    def test_clean_db_yields_no_matches(self, make_tasks_db):
         rows = [
-            (index, _provenance('deterministic-milestone', note=note))
+            {'id': index, 'metadata': _provenance('deterministic-milestone', note=note)}
             for index, note in enumerate(CLEAN_NOTES, start=1)
         ]
 
-        assert scan_db(_make_db(tmp_path, rows)) == []
+        assert scan_db(str(make_tasks_db(rows))) == []
 
-    def test_recurrence_in_a_post_fix_note_shape_is_found(self, tmp_path):
+    def test_recurrence_in_a_post_fix_note_shape_is_found(self, make_tasks_db):
         """End-to-end on the shape the guard actually exists to catch.
 
         A note written by the FIXED orchestrator is one line prefixed
@@ -282,12 +254,12 @@ class TestScanDb:
         mid-line, and must still be reported alongside the clean rows.
         """
         rows = [
-            (3001, _provenance('deterministic-milestone', note=PREFIXED_LEAK_NOTE)),
-            (3002, _provenance('deterministic-milestone', note=CLEAN_NOTES[0])),
-            (3003, _provenance('deterministic-milestone', note=CLEAN_NOTES[1])),
+            {'id': 3001, 'metadata': _provenance('deterministic-milestone', note=PREFIXED_LEAK_NOTE)},
+            {'id': 3002, 'metadata': _provenance('deterministic-milestone', note=CLEAN_NOTES[0])},
+            {'id': 3003, 'metadata': _provenance('deterministic-milestone', note=CLEAN_NOTES[1])},
         ]
 
-        matches = scan_db(_make_db(tmp_path, rows))
+        matches = scan_db(str(make_tasks_db(rows)))
 
         assert [m.task_id for m in matches] == [3001], matches
         assert matches[0].leak_line.startswith('2026-07-30'), matches[0]
@@ -295,12 +267,6 @@ class TestScanDb:
 
 class TestDiscoverDbPaths:
     """Same precedence contract as the 2939 precedent scanner."""
-
-    def _touch(self, root):
-        db = root / '.taskmaster' / 'tasks' / 'tasks.db'
-        db.parent.mkdir(parents=True, exist_ok=True)
-        db.write_text('')
-        return str(db)
 
     def test_explicit_dbs_pass_through_existing_only(self, tmp_path):
         existing = tmp_path / 'a.db'
@@ -311,18 +277,18 @@ class TestDiscoverDbPaths:
 
         assert result == [str(existing)]
 
-    def test_project_root_maps_to_taskmaster_tasks_db(self, tmp_path):
+    def test_project_root_maps_to_taskmaster_tasks_db(self, tmp_path, project_root_with_tasks_db):
         root = tmp_path / 'proj'
         root.mkdir()
-        db_file = self._touch(root)
+        db_file = str(project_root_with_tasks_db(root))
 
         assert discover_db_paths(project_roots=[str(root)]) == [db_file]
 
-    def test_parses_dashboard_known_project_roots_env(self, tmp_path):
+    def test_parses_dashboard_known_project_roots_env(self, tmp_path, project_root_with_tasks_db):
         root_a, root_b = tmp_path / 'a', tmp_path / 'b'
         root_a.mkdir()
         root_b.mkdir()
-        db_a, db_b = self._touch(root_a), self._touch(root_b)
+        db_a, db_b = str(project_root_with_tasks_db(root_a)), str(project_root_with_tasks_db(root_b))
 
         # Whitespace padded, with an empty entry (",,") that must be dropped
         # rather than mapped to a bogus db path.
@@ -404,7 +370,7 @@ SCRIPT = Path(__file__).parent.parent / 'scan_provenance_note_log_leaks.py'
 def _run_cli(*args, env=None, timeout=30):
     child_env = {**os.environ, **(env or {})}
     return subprocess.run(
-        ['python3', str(SCRIPT), *args],
+        [sys.executable, str(SCRIPT), *args],
         capture_output=True, text=True, timeout=timeout, env=child_env,
     )
 
@@ -412,16 +378,16 @@ def _run_cli(*args, env=None, timeout=30):
 class TestCli:
     """Exit codes: 0 = clean, 1 = leak found, 2 = no tasks.db resolvable."""
 
-    def test_clean_db_exits_0_with_no_leaks_message(self, tmp_path):
-        db_path = _make_db(tmp_path, [(1, _provenance('merged', commit='abc'))])
+    def test_clean_db_exits_0_with_no_leaks_message(self, make_tasks_db):
+        db_path = str(make_tasks_db([{'id': 1, 'metadata': _provenance('merged', commit='abc')}]))
 
         result = _run_cli('--db', db_path)
 
         assert result.returncode == 0, result.stderr
         assert 'no leaked log lines' in result.stdout
 
-    def test_polluted_db_exits_1_and_names_the_task(self, tmp_path):
-        db_path = _make_db(tmp_path, _MIXED_ROWS)
+    def test_polluted_db_exits_1_and_names_the_task(self, make_tasks_db):
+        db_path = str(make_tasks_db(_MIXED_ROWS))
         before = Path(db_path).read_bytes()
 
         result = _run_cli('--db', db_path)
@@ -431,8 +397,8 @@ class TestCli:
         # Detection-only: the scan must not have touched the file.
         assert Path(db_path).read_bytes() == before
 
-    def test_json_flag_emits_full_untruncated_leak_line(self, tmp_path):
-        db_path = _make_db(tmp_path, _MIXED_ROWS)
+    def test_json_flag_emits_full_untruncated_leak_line(self, make_tasks_db):
+        db_path = str(make_tasks_db(_MIXED_ROWS))
 
         result = _run_cli('--db', db_path, '--json')
 
@@ -453,11 +419,11 @@ class TestCli:
         assert result.returncode == 2
         assert 'no tasks.db resolvable' in result.stderr
 
-    def test_unreadable_db_is_warned_and_skipped_not_fatal(self, tmp_path):
+    def test_unreadable_db_is_warned_and_skipped_not_fatal(self, tmp_path, make_tasks_db):
         """One corrupt file must not abort the sweep over the others."""
         corrupt = tmp_path / 'corrupt.db'
         corrupt.write_text('this is not a sqlite database at all')
-        good = _make_db(tmp_path, _MIXED_ROWS, name='good.db')
+        good = str(make_tasks_db(_MIXED_ROWS, name='good.db'))
 
         result = _run_cli('--db', str(corrupt), '--db', good)
 

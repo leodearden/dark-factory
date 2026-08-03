@@ -208,6 +208,23 @@ class DashboardConfig:
         return self._runtime_data_dir('RECONCILIATION_DATA_DIR', 'reconciliation') / 'escalations'
 
     @property
+    def memory_evals_dir(self) -> Path:
+        """Memory-eval artifact root — ``<project_root>/fused-memory/data/memory-evals``.
+
+        Deliberately a PLAIN property (like ``escalations_dir``), NOT routed
+        through :meth:`_runtime_data_dir`.  The distinction is real, not
+        stylistic: ``QUEUE_DATA_DIR`` / ``RECONCILIATION_DATA_DIR`` relocate the
+        *managed* fused-memory runtime dirs to an XDG-rooted path outside the
+        watched project's tracked tree, and the memory-eval artifacts are not
+        among the things they relocate.  The M1 artifact path is contract-fixed
+        by ``docs/prds/memory-eval-program.md`` §3 and by
+        ``shared.memory_eval_metrics.metrics_artifact_path``; fused-memory
+        writes it relative to the repo.  Honouring a runtime-dir override here
+        would point the dashboard at a directory nothing ever writes.
+        """
+        return self.project_root / 'fused-memory' / 'data' / 'memory-evals'
+
+    @property
     def burndown_db(self) -> Path:
         return self.project_root / 'data' / 'burndown' / 'burndown.db'
 

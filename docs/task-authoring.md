@@ -272,6 +272,45 @@ branch) rather than the false "implementation has not delivered". The
 orchestrator additionally honors an explicitly-set `metadata.cross_repo` for
 the absolute-path-foreign shape it can classify without the registry.
 
+**Merely CITING another project's paths in prose is not a scope error.** A
+task whose description references `orchestrator/src/foo.py` as evidence, as
+a thing to mirror, or as prior art is created normally — the citation never
+blocks anything. It can, however, attract the advisory annotation
+`metadata.possible_scope_mismatch` (plus a non-blocking `scope_violation`
+escalation an operator then has to read), because a prose scan cannot tell
+"modifies X" from "mentions X".
+
+A **declared deliverable** can, so it is what the advisory is attributed on.
+The annotation is suppressed when your declared deliverables attest local
+work — meaning **both** of:
+
+- at least one entry across `metadata.files`, `metadata.files_to_modify` or
+  `metadata.modules` is owned by the project you are filing into, **and**
+- **no** entry across those three keys is owned by a *different* project.
+
+When both hold, the prose citation is treated as incidental and neither the
+annotation nor the escalation fires. **Supplying accurate deliverable
+metadata is therefore the supported way to keep a legitimately
+cross-repo-*referencing* task quiet** — and it is worth doing regardless,
+since the same fields drive scope assignment and the pre-merge delivery
+gate. Declaring only *unowned* paths (`README.md`, `docs/x.md`) does **not**
+count: that is no evidence of local work, so the advisory still fires.
+
+For the residual case — a task that genuinely belongs here but can declare
+no filer-owned deliverable at all — pass `metadata.routing_override_reason`
+(a non-empty string). It is the pre-existing explicit bypass and skips the
+path-scope guards entirely, both the advisory **and** the hard reject, so
+use it only when you are sure the task belongs to the submitting project.
+
+None of this relaxes the rule above. A submission whose **`metadata.files`**
+mix local and foreign entries is still a hard reject — attribution is
+consulted only after that check has already passed, so a locally-owned entry
+can never buy a mixed `files` list past it. A foreign entry that the reject
+never classified (one in `metadata.modules`, or in `metadata.files_to_modify`
+when `metadata.files` is also present and takes precedence) does not reject,
+but it *does* fail the second condition above, so such a submission keeps the
+annotation and the escalation rather than being silently suppressed.
+
 ### 3.3 Delivered-check dependency gate (`metadata.delivered_checks`)
 
 A **local** (same-project) dependency can additionally carry
@@ -434,8 +473,10 @@ open (quiescence guard — no re-dispatch, no churn).
 
 **Runner stamps** (written by `DeterministicRunner`, never
 author-supplied): `before_done_ran_at`, `before_done_verified_at`,
-`gate_escalated_at`, `done_provenance` (`kind='deterministic-deploy'`
-cross-unit; `kind='deterministic-deploy-scheduled'` self-restart).
+`gate_escalated_at`, and `done_provenance` (stamped for all four
+`deterministic-*` kinds — see the requirement table in §2 for
+per-kind semantics; `deterministic-milestone` is stamped on both the
+first-pass check and the post-escalation re-check described in §6).
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks
@@ -697,7 +738,8 @@ capability_manifest, curator_action, curator_justification, combined_at,
 gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, origin_finding_id,
 spawned_from, program, program_stream, stream, cross_repo,
-cross_repo_project
+cross_repo_project, human_curator_gate,
+human_curator_adjudicated_at
 ```
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
@@ -705,6 +747,55 @@ cross_repo_project
 `metadata.files` are all owned by one other registered project (and the
 filer is itself registered), and read by the orchestrator pre-merge
 narrowing gate.
+
+Two unrelated curators appear in this list, and the prefixes keep them
+apart: `curator_action` / `curator_justification` / `combined_at` are
+written by the **automated task curator**'s combine flow (fused-memory
+`task_interceptor`), while the `human_curator_*` keys below belong to a
+**human content curator** adjudicating a deterministic gate.
+
+#### The human-curator-gate contract
+
+`human_curator_gate` + `human_curator_adjudicated_at` mark, and then
+discharge, a deterministic pure gate that only a human's **content
+judgement** can close.
+
+**`metadata.human_curator_gate`** (truthy) on a `task_kind='deterministic'`
+pure gate (`before_done` absent, `always_escalates=true`) declares that the
+gate asks for per-entry human review — not merely a decision. Resolving the
+born-at-L2 `milestone_gate` escalation is **not by itself sufficient** to
+close such a task: closing an escalation record and performing the review
+are different propositions.
+
+The marker belongs on a **pure** gate only. A `before_done` action is a
+machine step that closes the task, which contradicts "only a human's content
+judgement closes this" — a task carrying both takes the act-then-ask path
+with the marker unread, and `DeterministicRunner` logs a warning naming the
+authoring defect on every dispatch. Do not combine them.
+
+**`metadata.human_curator_adjudicated_at`** (ISO-8601 string) is the required
+content-adjudication signal, stamped via `update_task` (with
+`metadata_mode='merge'`) by whoever actually performed the review.
+
+`DeterministicRunner`'s pure-gate resume enforces this as the second rung of
+a two-rung proof ladder — rung one being the archive-inclusive escalation
+record it already required. When the marker is set and the stamp is absent
+or is not a non-empty string, the runner files a born-at-L2
+`curator_adjudication_missing` escalation naming the remediation and leaves
+the task **blocked** rather than driving it to `done`. Both checks fail
+closed: a truthy-but-not-`true` marker still trips the guard, and a
+`bool`/`int`/blank stamp is not accepted as proof. A curator gate that does
+close carries a `done_provenance.note` naming the adjudication stamp
+(truncated if oversized — the note is memory-ingested downstream) and a
+`done_provenance.escalation_id` naming the `milestone_gate` record that
+proved rung one — **not** the `curator_adjudication_missing` re-ask, which
+proves nothing about the gate. So a genuine closure is distinguishable from
+a phantom one in the audit trail.
+
+The originating incident is task 3181, whose gate escalation `esc-3181-1`
+was resolved by the automated `escalation-watcher` — with the resolution's
+own text stating the curator content work was deliberately not executed —
+after which the resume path nonetheless closed the task.
 
 ### Tier-B: canonical keys, not aliases
 

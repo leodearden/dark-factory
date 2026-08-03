@@ -15,9 +15,11 @@ state.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -918,6 +920,75 @@ def test_advance_census_state_done_count_zero_is_written_as_integer_zero(tmp_pat
     assert isinstance(data["last_census_done_count"], int)
 
 
+def test_advance_census_state_writes_none_done_count_as_json_null(tmp_path):
+    """Task 3291: when the done-count could not be OBSERVED, the honest
+    baseline is `null` -- not a fabricated 0 (that is the defect being
+    fixed), not a carried-forward stale value (a quieter guess), and not an
+    omitted key (which would violate the 2579/eta MUST-persist contract).
+    `null` honours that contract literally -- the key is still always
+    present -- while being truthful about the state being unknown."""
+    path = tmp_path / "census-state.json"
+
+    mod.advance_census_state(
+        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
+    )
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "last_census_done_count" in data, "MUST-persist contract: key is never dropped"
+    assert data["last_census_done_count"] is None
+    assert '"last_census_done_count": null' in path.read_text(encoding="utf-8")
+
+
+def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
+    """End-to-end proof that an UNKNOWN baseline disarms condition (b)
+    instead of arming it. A poisoned `0` baseline makes compute_tasks_landed
+    return `current_done - 0` -- every done task ever, ~24x over the 120
+    threshold -- as soon as the get_statuses fetch works (task 3291; see
+    census_trigger's module docstring for the replayed measurements). A
+    `null` baseline instead routes into the existing absent-baseline branch:
+    one WARNING, `None`, no fire."""
+    path = tmp_path / "census-state.json"
+    mod.advance_census_state(
+        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
+    )
+
+    # A null baseline is UNKNOWN, not malformed -- the state file still loads.
+    status, data = census_trigger.load_census_state(path)
+    assert status == "ok"
+    # load_census_state returns tuple[str, dict | None] — the None is real for
+    # the "missing"/"malformed" statuses, so narrow it explicitly rather than
+    # subscripting an Optional.
+    assert data is not None
+    assert data["last_census_done_count"] is None
+
+    with caplog.at_level(logging.WARNING):
+        landed = census_trigger.compute_tasks_landed(
+            state=data,
+            # A perfectly VALID fetcher: the fail-safe here comes from the
+            # unknown baseline, not from any fetch problem.
+            status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
+        )
+
+    assert landed is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+    # ... and with tasks_landed=None, condition (b) cannot fire even when
+    # days_since is well past tasks_landed_min_days. Condition (a)
+    # (max_interval_days) remains the unconditional backstop.
+    config = census_trigger.CensusConfig()
+    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=timezone.utc)
+    decision = census_trigger.evaluate(
+        now=now,
+        last_census_at=now - timedelta(days=config.tasks_landed_min_days + 1),
+        never_censused=False,
+        tasks_landed=None,
+        candidate_first_seens=[],
+        config=config,
+    )
+
+    assert decision.fire is False
+
+
 def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path):
     path = tmp_path / "census-state.json"
 
@@ -930,6 +1001,7 @@ def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path):
 
     status, data = census_trigger.load_census_state(path)
     assert status == "ok"
+    assert data is not None  # tuple[str, dict | None]; None only for missing/malformed
     assert data["last_census_at"] == "2026-07-14T12:00:00+00:00"
     assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
     assert data["last_census_done_count"] == 7
@@ -1014,7 +1086,7 @@ def test_render_report_force_marker_present_when_forced():
 
 
 def test_render_report_is_deterministic_no_clock():
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1081,7 +1153,10 @@ def _capped_mining_result(*, stop_reason, max_batches, batches=2):
 
 
 def _render(**overrides):
-    kwargs = dict(
+    # Annotated for the same reason as _run_census_kwargs: a heterogeneous
+    # dict whose inferred value union would otherwise be re-reported once per
+    # union member per render_report parameter.
+    kwargs: dict[str, Any] = dict(
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1286,8 +1361,15 @@ def test_render_report_flagless_output_is_byte_identical_golden():
 # step-17: RED — run_census() DEFER path (headroom banner)
 # ---------------------------------------------------------------------------
 
-def _run_census_kwargs(tmp_path, **overrides):
-    kwargs = dict(
+def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
+    # The return annotation is load-bearing for the type gate, not decoration.
+    # This dict is deliberately heterogeneous — injected callables, a
+    # LegibilityConfig, Paths, strs, bools, None — so without it pyright infers
+    # the value type as a wide union and then re-reports that union once per
+    # member per use: at each `mod.run_census(**kwargs)` call site (one error
+    # per parameter) and at each `kwargs[...]` attribute access. Measured: this
+    # single annotation cleared 337 of the 350 errors this file carried.
+    kwargs: dict[str, Any] = dict(
         batch_source=None,
         invoke=_make_fake_invoke(default="pong"),
         verify_fn=_poison("verify_fn"),
@@ -1509,6 +1591,104 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert outcome.report_path == str(kwargs["report_path"])
     assert outcome.filed_task_ids == ["task-1"]
     assert outcome.stop_reason == "exhausted"
+
+
+# ---------------------------------------------------------------------------
+# task 3291: run_census() must never persist a FABRICATED done-count baseline.
+#
+# This is the test that would have caught the 2026-07-24 regression on the day
+# it happened. census.py's CLI defaults --project-root to "." and
+# nightly._default_census_launcher launches it with no arguments, so the
+# get_statuses call went out with a relative path; fused-memory rejected it
+# with a {"error", "error_type"} envelope on an isError:false response; and
+# the old `(status.get("statuses") or {})` idiom silently read that as a
+# done-count of 0 and persisted it as a real baseline.
+# ---------------------------------------------------------------------------
+
+def _make_error_envelope_status_fetcher():
+    """Fake `status_fetcher() -> dict` returning fused-memory's tool-error
+    envelope verbatim as observed live against localhost:8002. It is a
+    perfectly well-formed dict -- that is precisely why the old idiom
+    swallowed it -- so nothing short of a shape check can distinguish it
+    from a real status snapshot."""
+    def fake_status_fetcher():
+        return {
+            "error": "project_root must be a non-empty absolute path, got: '.'",
+            "error_type": "ValidationError",
+        }
+
+    return fake_status_fetcher
+
+
+def _make_raising_status_fetcher():
+    def fake_status_fetcher():
+        raise census_trigger.StatusFetchUnavailable("get_statuses unreachable at localhost:8002")
+
+    return fake_status_fetcher
+
+
+@pytest.mark.parametrize(
+    "make_fetcher",
+    [_make_error_envelope_status_fetcher, _make_raising_status_fetcher],
+    ids=["tool-error-envelope", "raising-fetcher"],
+)
+def test_run_census_unobservable_done_count_persists_null_not_zero(
+    tmp_path, caplog, make_fetcher
+):
+    """An unobservable done-count degrades the BASELINE only -- it must not
+    abandon a run whose mining has already been paid for and whose dated
+    report is already on disk.
+
+    Before task 3291 the envelope case silently persisted 0, and the raising
+    case crashed run_census AFTER the report write, leaving the codebook and
+    census state unadvanced."""
+    batch = [
+        _hand_digest("dup-1", "nothing new here"),
+        _hand_digest("novel-verified", "a genuinely new confusion shape"),
+    ]
+    fake_commit = _make_fake_commit()
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[batch],
+        verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=make_fetcher(),
+        commit=fake_commit,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    # --- the census still COMPLETES; only the baseline degrades ---
+    assert outcome.status == "done"
+    assert kwargs["report_path"].exists(), "the paid-for report must survive"
+    assert kwargs["codebook_path"].exists(), "codebook must still be dumped"
+    assert len(fake_commit.calls) == 1, "the run must still commit"
+
+    # --- the baseline is an honest null, NOT a fabricated 0 ---
+    state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
+    assert "last_census_done_count" in state, "MUST-persist contract still holds"
+    assert state["last_census_done_count"] is None
+    assert state["last_census_done_count"] != 0, "a fabricated 0 is the defect being fixed"
+
+    # --- the degradation is LOUD: exactly one warning naming the failure ---
+    fetch_warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "done-count" in r.getMessage()
+    ]
+    assert len(fetch_warnings) == 1, "degrading silently is what caused the incident"
+
+    # --- round-trip: condition (b) is fail-SAFE, not always-armed ---
+    status, data = census_trigger.load_census_state(kwargs["census_state_path"])
+    assert status == "ok"
+    assert census_trigger.compute_tasks_landed(
+        state=data,
+        status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
+    ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2161,6 +2341,7 @@ def test_run_census_dry_run_uses_the_given_path_when_free(tmp_path, caplog):
 
     # no gratuitous renaming: the free path is used verbatim (step-13 contract)
     assert payloads_path.exists()
+    assert outcome.dry_run is not None  # DryRunFiling | None on the outcome
     assert outcome.dry_run.path == str(payloads_path)
     assert list(tmp_path.glob("*-payloads-*.json")) == []
     assert not any("already exists" in r.message for r in caplog.records)
@@ -2274,6 +2455,83 @@ def test_main_without_force_no_fire_noops_with_exit_zero(tmp_path, monkeypatch, 
     out = capsys.readouterr().out
     assert "no-fire" in out.lower(), "an explanatory stdout line naming the no-fire decision"
     assert "max-interval: not yet due" in out
+
+
+# ---------------------------------------------------------------------------
+# step-13: main() must configure logging -- census has the SAME omission as
+# nightly. Nothing under scripts/legibility/ called logging.basicConfig, so
+# root sat at its WARNING default and every INFO line this module emits --
+# notably "census: no codebook at ... yet, starting from an empty v2
+# document" -- was discarded before it reached the journal. Mirrors
+# test_legibility_nightly.py's step-11 trio.
+#
+# The _isolated_root_logging helper below is DUPLICATED verbatim from that
+# file. Its proper home is scripts/tests/conftest.py -- which task 3270 holds
+# no lock on, so the move is deferred to the next review cycle rather than
+# smuggled in. Not a norm, a known wart: keep the two copies in step.
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _isolated_root_logging():
+    """Yield the ROOT logger with its handlers emptied, restoring it after.
+
+    ``config.configure_logging`` goes through ``logging.basicConfig``, which
+    is a NO-OP when root already has handlers -- the very property that makes
+    it safe under pytest -- so its effect is only observable with root
+    cleared first.
+
+    Restoring the level AND the exact handler list is load-bearing here: this
+    file runs ~10 ``caplog.at_level(logging.WARNING)`` blocks (lines 1318,
+    1520, 1650, 1817, 1938, 2018, ...) that leaked root state would silently
+    perturb.
+
+    Keep in step with the copy in test_legibility_nightly.py until one of
+    them moves to conftest.py -- see the section comment above.
+    """
+    root = logging.getLogger()
+    saved_level = root.level
+    saved_handlers = root.handlers[:]
+    root.handlers[:] = []
+    root.setLevel(logging.WARNING)  # the un-configured default this fix exists to beat
+    try:
+        yield root
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monkeypatch):
+    """Driven down the cheap NO-FIRE path -- no LLM, no subprocess, exit 0 --
+    because logging must be configured before the gate, not only on runs that
+    fire."""
+    # The DEFAULT-level case, so the ambient env has to be cleared: this same
+    # change teaches the CLIs to honour LEGIBILITY_LOG_LEVEL, and a developer
+    # debugging the trickle (or a host whose unit env is sourced) exporting
+    # LEGIBILITY_LOG_LEVEL=WARNING would otherwise turn a working fix red.
+    monkeypatch.delenv("LEGIBILITY_LOG_LEVEL", raising=False)
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        return census_trigger.Decision(fire=False, reasons=["max-interval: not yet due"])
+
+    monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
+
+    with _isolated_root_logging() as root:
+        exit_code = mod.main(["--project-root", str(tmp_path)])
+        # Sample inside the block, assert outside, so a failing assertion is
+        # reported by pytest with root logging already restored.
+        effective_level = root.getEffectiveLevel()
+        handler_count = len(root.handlers)
+
+    assert exit_code == 0
+    assert fake_run_census.calls == [], "the NO-FIRE path must stay cheap -- no run_census"
+    assert effective_level <= logging.INFO, (
+        "census.main() must lower root to INFO -- otherwise the empty-codebook line "
+        "and every other census INFO line is dropped before it reaches the journal"
+    )
+    assert handler_count >= 1, "root needs a handler, or INFO records go nowhere"
 
 
 def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
@@ -2588,15 +2846,16 @@ class _FakeHttpxResponse:
         return self._payload
 
 
-def test_post_mcp_tool_call_sends_streamable_http_accept_headers(monkeypatch):
+def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_httpx):
     """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint --
     shared by census.py's submit_task and escalate_info posters via this one
-    function). httpx is imported lazily and is not importable in this test
-    env, so a fake `httpx` module is injected via sys.modules."""
-    import sys
-
+    function). httpx is imported lazily, but it IS importable here -- a
+    direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
+    task 2965) -- so an un-faked call would really hit the network. The
+    shared `install_fake_httpx` fixture substitutes a stub so the outbound
+    request shape is assertable without a live listener on :8002."""
     captured_kwargs = {}
     rpc_response = {
         "jsonrpc": "2.0",
@@ -2604,14 +2863,11 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(monkeypatch):
         "result": {"structuredContent": {"ok": True}},
     }
 
-    fake_httpx = type(sys)("httpx")
-
     def _fake_post(url, **kwargs):
         captured_kwargs.update(kwargs)
         return _FakeHttpxResponse(rpc_response)
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    install_fake_httpx(_fake_post)
 
     result = mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
 

@@ -9,6 +9,10 @@ from fused_memory.reconciliation.prompts import (
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
+from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    SNAPSHOT_PRUNED_STAT_KEY,
+    SNAPSHOT_WRITTEN_STAT_KEY,
+)
 
 STAGE3_SYSTEM_PROMPT = f"""\
 You are an Integrity Check agent operating in sleep mode. Your role is to verify consistency \
@@ -26,9 +30,22 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__get_statuses` — **PRIMARY task enumerator.** Returns \
   `{{'statuses': {{id: status, ...}}}}` — a compact status map (~95% smaller than \
-  get_tasks, ~62 KB vs ~600 KB). Proven safe on projects with 4500+ tasks. **Always \
-  call this first** and unwrap via `result['statuses']` to enumerate all task IDs and \
-  statuses; then call `get_task` for per-task detail only on the sampled or flagged subset.
+  get_tasks, ~62 KB vs ~600 KB). **Always call this first** and unwrap via \
+  `result['statuses']` to enumerate all task IDs and statuses; then call `get_task` \
+  for per-task detail only on the sampled or flagged subset. \
+  **Always paginate:** pass `page_size` and `offset` on every call — \
+  `get_statuses(project_root=..., page_size=1000, offset=0)` — then increment offset \
+  by page_size until `pagination['has_more']` is False, merging the pages into one \
+  status map before enumerating. **Keep `page_size` at or below 2000** — a larger page \
+  can itself exceed the transport limit and be rejected wholesale, which is the exact \
+  failure the loop exists to avoid (the tool does NOT clamp it for you). Do NOT rely \
+  on an un-paginated call: it does not \
+  truncate for you, so on a large project the whole response can exceed the transport \
+  limit and you get back NOTHING at all. If you cannot know the project size in \
+  advance, `auto_paginate=true` is an opt-in one-shot fallback — it returns a FIRST \
+  PAGE plus a `pagination` dict with `auto_paginated: true` and `has_more: true`, \
+  which is NOT the full census, so you must keep paging from there anyway. Prefer the \
+  loop. The ABSENCE of a `pagination` key means the response is complete.
 - `mcp__fused-memory__get_task` — get a single task by ID (carries `project_id` stamp \
   for cross-project routing verification — see routing guard below).
 - `mcp__fused-memory__get_tasks` — **Full-scan fallback only.** Returns the full task \
@@ -101,6 +118,33 @@ at the source keeps Stage 2 load clean.
 
 If you observe a task-count snapshot edge for any of these projects that appears \
 stale or missing, **skip the finding entirely**.
+
+## Snapshot Stats Are Mem0-Only (task-3045)
+
+Stage 2's `{SNAPSHOT_WRITTEN_STAT_KEY}` and `{SNAPSHOT_PRUNED_STAT_KEY}` stats \
+count operations on **Mem0 `observations_and_summaries` records ONLY**. They make \
+no claim whatsoever about Graphiti.
+
+Per Snapshot Discipline, task-count and task-status snapshots are **NEVER** \
+persisted as Graphiti `temporal_facts` edges — for **ANY** project, blocked or \
+not (recurring count churn would cause entity proliferation).
+
+Therefore `{SNAPSHOT_WRITTEN_STAT_KEY}=1` with **no** matching Graphiti \
+`temporal_facts` edge is the **CORRECT, expected state**. Do NOT report it as a \
+rejected write, a missing edge, a memory gap, or any other discrepancy — and do \
+NOT treat it as a stats-vs-reality mismatch when reconciling the Stage 2 report's \
+stats against what you can observe in the stores.
+
+Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
+exception list on this evidence. That contradicts Snapshot Discipline and is the \
+wrong fix.
+
+Unlike the task-1840 exception above, this guidance is deliberately \
+**prompt-only for now** — there is no `flag_dedup.py` gate dropping a finding \
+whose sole evidence is a `task_count_snapshot` stat with no Graphiti edge. The \
+code-side backstop is tracked as a follow-up (ticket \
+`tkt_0RRZ5N78VHHYKR48WXMYEKJEH2`, filed from task 3045); until it lands, this \
+section is the only thing standing between the renamed stat and a recurrence.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 
@@ -263,9 +307,17 @@ and the data is from another project. Include the offending task IDs in your des
 
 Example verification (pseudocode — preferred get_statuses + get_task pattern):
 ```
-# Step 1: enumerate all statuses (compact, safe on large projects)
+# Step 1: enumerate all statuses (compact), paging to completion
 # get_statuses returns {{'statuses': {{id: status, ...}}}} — unwrap the envelope
-statuses = get_statuses(project_root="<this project's root>")['statuses']
+statuses = {{}}
+offset = 0
+while True:
+    page = get_statuses(project_root="<this project's root>",
+                        page_size=1000, offset=offset)
+    statuses.update(page['statuses'])   # unwrap and merge this page
+    if not page.get('pagination', {{}}).get('has_more'):
+        break                           # no pagination key => response complete
+    offset += 1000
 # statuses is now the bare {{id: status, ...}} dict — no project_id stamp here
 
 # Step 2: verify routing by sampling one task via get_task

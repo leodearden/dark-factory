@@ -6,15 +6,20 @@ once the task(s) they reference reach a terminal status (done/cancelled).
 This module adds a small deterministic post-processor: enumerate valid
 edges, cross-reference each referenced task_id's CURRENT status via a direct
 status lookup (taskmaster.get_statuses — NOT semantic search), and
-invalidate any edge whose asserted non-terminal (active/pending/in-progress)
-status now contradicts a terminal task.
+invalidate any edge whose asserted non-terminal (active/pending/blocked/
+in-progress) status now contradicts a terminal task.
 
 Covers:
 - extract_snapshot_edge_task_ids: pure lexical extractor — returns the
   specific task ids a status-snapshot edge asserts as active/pending/
-  in-progress; returns the empty set for text with no such status marker,
-  and for pure count-only snapshots with no specific task-id (the
-  stale-by-design audit trail this sweep must never touch).
+  blocked/in-progress; returns the empty set for text with no such status
+  marker, and for pure count-only snapshots with no specific task-id (the
+  stale-by-design audit trail this sweep must never touch). Includes the
+  task-3042 'blocked' regression class: the closed-class-connective
+  individual form ('Task N is in a blocked status ...'), the status-noun-
+  anchored phrase form for open-class gaps ('Task N is deliberately parked
+  in blocked status ...'), and the precision guards bounding both (no bind
+  inside 'unblocked', no cross-clause/cross-comma gap).
 - flatten_dedup_edges: flattens get_all_valid_edges' dict[entity_uuid,
   list[EdgeDict]] shape and dedups by edge uuid (handles the backend's
   double-attribution of each directed edge under both endpoint entities).
@@ -27,7 +32,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -141,6 +146,438 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         result = extract_snapshot_edge_task_ids('Task 142 landed on the active branch')
         assert result == set()
+
+    def test_blocked_status_individual_form_task_2885_repro(self):
+        """'Task 2885 is in a blocked status due to merge_retry_pending.' -> {2885}.
+
+        Literal fact text from the task-2885 repro (run
+        063f3e99-27f5-4bad-b6e6-d4a6804af09c). TWO separate gaps caused this
+        fact to be invisible to the sweep before task 3042: 'blocked' was
+        absent from the status-marker alternation, AND the preposition +
+        article "in a" sitting between the copula and the marker was not a
+        permitted connective (INDIVIDUAL_SNAPSHOT_RE previously allowed only
+        an optional copula and/or a bare article). Both gaps had to close
+        for this fact to match.
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 2885 is in a blocked status due to merge_retry_pending.'
+        )
+        assert result == {2885}
+
+    def test_blocked_bare_copula_form(self):
+        """'Task 2885 is blocked.' -> {2885}."""
+        assert extract_snapshot_edge_task_ids('Task 2885 is blocked.') == {2885}
+
+    def test_blocked_no_article_form(self):
+        """'Task 2885 is in blocked status.' -> {2885}."""
+        assert extract_snapshot_edge_task_ids('Task 2885 is in blocked status.') == {2885}
+
+    def test_aggregate_blocked_list_form(self):
+        """'Blocked tasks: 142, 148' -> {142, 148}.
+
+        Before task 3042, the gate short-circuit (SNAPSHOT_STATUS_RE not
+        matching 'blocked') suppressed the aggregate list-form path too, even
+        though the aggregate extraction logic itself has nothing to do with
+        the individual-form connective. Widening the gate to admit 'blocked'
+        unlocks this aggregate form for free.
+        """
+        result = extract_snapshot_edge_task_ids('Blocked tasks: 142, 148')
+        assert result == {142, 148}
+
+    def test_count_only_blocked_snapshot_returns_empty(self):
+        """'There are 3 blocked tasks' -> set().
+
+        Count-only snapshots stay out of scope per Snapshot Discipline even
+        with the widened gate — no list introducer, no specific task-id
+        reference. Guard: passes both before and after the task-3042 change.
+        """
+        assert extract_snapshot_edge_task_ids('There are 3 blocked tasks') == set()
+
+    def test_blocked_status_phrase_with_intervening_words_task_2885_repro(self):
+        """'Task 2885 is deliberately parked in blocked status under escalation
+        esc-2885-17 pending human adjudication.' -> {2885}.
+
+        The SECOND literal edge fact from the task-2885 repro. Still set()
+        after task 3042's first change (the widened INDIVIDUAL_SNAPSHOT_RE
+        connective alone) because "deliberately parked" is an open-class gap
+        between the copula and the preposition that the closed-class
+        connective deliberately refuses. The phrase form is admitted only
+        because the marker ('blocked') is immediately followed by the
+        literal noun 'status' — that noun is what makes the span a status
+        assertion rather than an incidental mention.
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 2885 is deliberately parked in blocked status under '
+            'escalation esc-2885-17 pending human adjudication.'
+        )
+        assert result == {2885}
+
+    def test_open_class_gap_without_status_noun_excluded(self):
+        """'Task 142 landed on the blocked branch' -> set().
+
+        An intervening verb with no 'status' noun following the marker must
+        never bind — the task-2613 precision invariant, restated for the
+        'blocked' marker.
+        """
+        result = extract_snapshot_edge_task_ids('Task 142 landed on the blocked branch')
+        assert result == set()
+
+    def test_unblocked_is_not_a_blocked_marker(self):
+        """'Task 9 unblocked the merge queue' -> set().
+
+        \\b prevents the marker from matching inside 'unblocked'.
+        """
+        assert extract_snapshot_edge_task_ids('Task 9 unblocked the merge queue') == set()
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 5 blocked the merge queue',
+            'Task 142 blocked the release',
+            'Task 2885 blocked task 3001 for three days',
+            'Task 9 blocked the merge queue',
+        ],
+    )
+    def test_blocked_as_bare_transitive_verb_excluded(self, fact):
+        """'Task N blocked <object>' -> set().
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). Unlike the adjective-only markers
+        ('active'/'pending'/'in progress'), 'blocked' is also a common
+        transitive past-tense verb. INDIVIDUAL_SNAPSHOT_RE's copula is
+        optional for the adjective arm, so before the split alternation the
+        bare-verb reading bound and every fact below wrongly yielded an id.
+
+        These are permanently-true HISTORICAL facts ('task 5 blocked the
+        merge queue' stays true forever), not status snapshots — the sweep
+        would have retired them the moment task 5/142/2885 went done or
+        cancelled, the over-selection direction the module docstring
+        forbids. Same hazard, and the same copula-only remedy, as task
+        2824's transitive-verb caveat on
+        task_filter.PRESENT_TENSE_COMPLETION_RE.
+
+        Note the last case is the false-positive twin of
+        test_unblocked_is_not_a_blocked_marker: that test only exercises
+        the \\b-protected 'unblocked' spelling, so it never covered the
+        bare-verb 'blocked' reading of the same sentence shape.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 5 blocked these tasks: 142, 148',
+            'Task 5 blocked the merge of tasks [142, 148]',
+            'Task 5 blocked the release for tasks: 142, 148',
+        ],
+    )
+    def test_aggregate_path_not_reachable_by_bare_transitive_verb(self, fact):
+        """'Task 5 blocked <words> tasks: 142, 148' -> set().
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). The aggregate list path used to be anchored to
+        nothing but the whole-fact gate (SNAPSHOT_STATUS_RE), so widening
+        that gate with 'blocked' routed straight around the transitive-verb
+        hardening added to INDIVIDUAL_SNAPSHOT_RE — these facts yielded
+        {142, 148} even though the individual form correctly refused the
+        same bare-verb reading. Each returned set() before 'blocked' joined
+        the gate, so the gate was the only thing holding them back.
+
+        These are permanently-true historical facts; the sweep would have
+        retired them the moment 142 or 148 reached a terminal status.
+        LIST_INTRODUCER_RE now requires the marker immediately before the
+        list noun, so the intervening open-class words ('these', 'the merge
+        of', 'the release for') break adjacency.
+
+        Distinct from test_blocked_as_bare_transitive_verb_excluded, which
+        covers the individual form only — none of its cases carry a list
+        introducer, so it never exercised this path.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Task 2885 is blocked.', {2885}),
+            ('Task 2885 was blocked', {2885}),
+            ('Task 2885 remains blocked', {2885}),
+            ('Task 2885 is a blocked task', {2885}),
+            ('Task 2885 is currently blocked', {2885}),
+            ('Task 2885 is still blocked', {2885}),
+            ('Task 5 is currently active', {5}),
+        ],
+    )
+    def test_blocked_in_copula_form_still_selected(self, fact, expected):
+        """The copula/article forms of 'blocked' must keep matching.
+
+        Pins the recall side of the transitive-verb split: restricting
+        'blocked' to a mandatory copula/article connective must not cost
+        any genuine blocked-status assertion, which is the whole point of
+        task 3042.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    def test_status_phrase_does_not_cross_clause_boundary(self):
+        """'Task 5 is done. Task 9 is in blocked status' -> {9}.
+
+        The bounded gap must not reach across the sentence boundary and drag
+        in task 5's already-terminal snapshot.
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 5 is done. Task 9 is in blocked status'
+        )
+        assert result == {9}
+
+    def test_status_phrase_does_not_cross_comma(self):
+        """'Task 5 landed, work is in blocked status' -> set().
+
+        The comma must be the ONLY thing preventing the match, else this
+        test cannot fail for the reason it names.
+
+        (amendment, reviewer_comprehensive test-quality suggestion, task
+        3042.) The previous fact here — 'Task 5 landed, then 9 shipped in
+        active branch' — returned set() for three reasons unrelated to the
+        comma: bare '9' is not a TASK_REF_RE reference, 'active branch' is
+        not followed by the literal noun 'status' so the phrase form could
+        not fire at all, and the gap from 'Task 5' would need 4+ words. It
+        would still have passed had the gap been changed to absorb commas
+        — dead coverage for the invariant it advertised.
+
+        This fact discriminates: 'landed', 'work', 'is' is exactly 3 gap
+        words followed by ' in blocked status', so it would yield {5} if
+        the gap could absorb the comma, and set() only because it cannot.
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 5 landed, work is in blocked status'
+        )
+        assert result == set()
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 2885 is no longer in blocked status',
+            'Task 2885 was previously in blocked status',
+            'Task 2885 was briefly in blocked status, then merged',
+            'Task 142 is not in blocked status',
+            'Task 5 was never in blocked status',
+            'Task 5 is formerly in pending status',
+        ],
+    )
+    def test_status_phrase_gap_does_not_absorb_negation_or_past_exit(self, fact):
+        """Negated / past-exit phrasings -> set().
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). The phrase form's open-class gap used to
+        absorb 'not'/'no longer'/'previously'/'briefly', which invert the
+        assertion rather than padding it, so all of these yielded an id.
+        Each is a permanently-true HISTORICAL fact — and a
+        blocked->unblocked transition is exactly the event that writes such
+        an edge, the same transition class the task-2885 repro is about, so
+        this is common phrasing here rather than exotic.
+
+        Note the asymmetry this closes: the individual form's closed-class
+        connective already refused the same semantics for free ('Task 2885
+        is no longer blocked' -> set()), because these tokens were never in
+        _ADVERB_ALT. Only the permissive phrase path lost that protection.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    def test_status_phrase_still_matches_non_negated_qualifiers(self):
+        """'Task 5 remains in blocked status' -> {5}.
+
+        The negation guard excludes a specific closed list, not qualifiers
+        generally — an ordinary gap word like 'remains' must still pass, or
+        the guard would have cost recall rather than only precision.
+        """
+        assert extract_snapshot_edge_task_ids('Task 5 remains in blocked status') == {5}
+
+    def test_status_phrase_excludes_following_head_noun(self):
+        """'Task 142 is tracked in the pending status report' -> set().
+
+        Here 'status' modifies the head noun 'report' — it is a pending
+        status REPORT, not a pending task — so the span is not a status
+        assertion about task 142. This is the same 'binds to a noun'
+        failure that got 'in'/'the' reverted from INDIVIDUAL_SNAPSHOT_RE,
+        reaching the phrase form by a different route.
+
+        SNAPSHOT_STATUS_PHRASE_RE's trailing lookahead requires the
+        marker+status span to END its noun phrase (punctuation, end of
+        string, or a preposition/subordinator), which excludes it.
+        'status report' is common phrasing in this repo's memory corpus,
+        so this is not hypothetical. (amendment, reviewer_comprehensive
+        suggestion, task 3042)
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 142 is tracked in the pending status report'
+        )
+        assert result == set()
+
+    def test_status_phrase_gap_internal_subject_is_known_over_selection(self):
+        """'Task 5 depends on work in blocked status' -> {5}.
+
+        DOCUMENTED KNOWN BEHAVIOUR, not an endorsement: the WORK is
+        blocked, not task 5, so this is an over-selection the phrase form
+        does not catch. The gap ('depends on work') contains the real
+        subject of the 'in blocked status' phrase, and distinguishing that
+        requires knowing 'work' is a nominal subject — beyond lexical
+        matching at this altitude.
+
+        Pinned as a test so the residual stays visible rather than being
+        claimed away by a comment (the previous comment asserted the
+        status-noun requirement cost NO precision, which was an
+        overstatement). If a future change fixes this, update the
+        assertion to set() — a failure here is a signal to re-read
+        SNAPSHOT_STATUS_PHRASE_RE's residual notes, not necessarily a
+        regression. (amendment, reviewer_comprehensive suggestion, task
+        3042)
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 5 depends on work in blocked status'
+        )
+        assert result == {5}
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Task 5 blocks task 9 in blocked status', {9}),
+            ('Task 5 supersedes task 9 in pending status', {9}),
+            ('Task 5 unblocks task 9 in in-progress status', {9}),
+            # the 'df N' spelling of a reference was affected identically
+            ('Task 5 supersedes df 9 in pending status', {9}),
+            # ...and the OUTER reference's spelling is irrelevant to the bug
+            ('df 5 blocks task 9 in blocked status', {9}),
+            ('#5 blocks task 9 in blocked status', {9}),
+            # both error directions plus an unrelated individual-form id
+            (
+                'Task 5 blocks task 9 in blocked status and task 11 is pending',
+                {9, 11},
+            ),
+        ],
+    )
+    def test_status_phrase_gap_does_not_absorb_intervening_task_reference(
+        self, fact, expected
+    ):
+        """An intervening task reference must not be swallowed by the gap.
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). SNAPSHOT_STATUS_PHRASE_RE's open-class {0,3}
+        gap could span a whole second task reference, so the 'in <marker>
+        status' phrase bound to the OUTER task rather than the one it
+        actually describes.
+
+        This is strictly worse than an ordinary over-selection, because
+        re.finditer is non-overlapping: the wrong match CONSUMED the inner
+        reference, so the correct id was never extracted either. One match
+        produced both error directions at once — 'Task 5 blocks task 9 in
+        blocked status' yielded {5} where it must yield {9}: over-selection
+        on 5 (a permanently-true historical fact the sweep would retire the
+        moment 5 went terminal) AND silent under-selection on 9 (the edge
+        that genuinely IS a blocked-status snapshot, invisible to the
+        sweep). Every case here yielded the outer id before _GAP_NO_TASK_REF
+        was wired into the gap.
+
+        The last case pins that the fix is local to the phrase path: 'task
+        11 is pending' is still picked up by INDIVIDUAL_SNAPSHOT_RE, so the
+        expected set is {9, 11} and not merely {9}.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Task 5 depends on task 9 in active status', {9}),
+            ('Task 5 blocks #9 in blocked status', {9}),
+        ],
+    )
+    def test_intervening_reference_shapes_that_bounded_the_bug(
+        self, fact, expected
+    ):
+        """The two shapes an intervening reference could NOT be absorbed in.
+
+        Unlike the cases above, these two were already correct before
+        _GAP_NO_TASK_REF existed — they are boundary pins, not regression
+        evidence, and are labelled as such deliberately. They record what
+        bounded the bug, so a future widening reintroduces a failure here
+        rather than silently resurrecting it:
+
+        - a 4+-word gap ('depends', 'on', 'task', '9') exceeds {0,3}, so
+          widening the gap bound would re-open this class;
+        - '#9' cannot be absorbed because the gap's '\\w+' does not match
+          '#', so admitting punctuation into the gap token class would too.
+
+        Both must keep yielding the INNER id.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    def test_task_ref_exclusion_is_word_initial_not_substring(self):
+        """'Task 5 is multitasked in blocked status' -> {5}.
+
+        _GAP_NO_TASK_REF is a per-gap-word lookahead anchored at the START
+        of the gap word, not a substring test: an ordinary open-class word
+        that merely CONTAINS 'task' must still pass, or the guard would have
+        cost recall rather than only precision. Same shape of pin as
+        test_status_phrase_still_matches_non_negated_qualifiers.
+        """
+        assert (
+            extract_snapshot_edge_task_ids('Task 5 is multitasked in blocked status')
+            == {5}
+        )
+
+    def test_plural_list_noun_in_gap_is_a_documented_under_selection(self):
+        """'Task 5 blocks tasks 9 in blocked status' -> set().
+
+        DOCUMENTED KNOWN BEHAVIOUR. _GAP_NO_TASK_REF's '\\w*\\b' tail makes
+        its vocabulary deliberately WIDER than TASK_REF_RE's: 'tasks' is
+        excluded from the gap even though the plural is not itself a
+        reference (TASK_REF_RE's '\\btask\\b' does not match it). So this
+        fact now yields nothing at all rather than the wrong {5} it yielded
+        before.
+
+        That is the fail-safe direction this module prefers throughout —
+        under-selection self-heals next cycle or is caught by Stage 2,
+        whereas over-selection wrongly retires a true fact. Pinned so the
+        trade is visible; narrowing the tail to '\\b' would trade it back.
+        """
+        assert extract_snapshot_edge_task_ids(
+            'Task 5 blocks tasks 9 in blocked status'
+        ) == set()
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 5 is in the active branch',
+            'Task 7 is in the pending merge queue',
+            'Task 5 is in a blocked directory',
+            'Task 5 is the pending review owner',
+            'Task 142 is in the active sprint retrospective',
+        ],
+    )
+    def test_prepositional_noun_phrase_is_not_a_status_assertion(self, fact):
+        """'Task N is in the <marker> <noun>' -> set().
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). An interim revision of this task widened
+        INDIVIDUAL_SNAPSHOT_RE's connective to admit the preposition 'in'
+        and the article 'the' so it could reach the repro fact 'Task 2885
+        is in a blocked status ...'. That made the connective span a full
+        prepositional noun phrase, so the marker bound to a NOUN the task
+        is merely located in (the active BRANCH, the pending merge QUEUE,
+        a blocked DIRECTORY, the pending review OWNER) rather than to the
+        task's own status — every fact below wrongly yielded an id.
+
+        This is the over-selection direction the module docstring forbids:
+        'Task 142 is in the active sprint retrospective' stays true
+        forever, but the sweep would retire it the moment 142 went done.
+        The repro facts are reached instead by SNAPSHOT_STATUS_PHRASE_RE,
+        whose 'in' path requires the literal noun 'status' after the
+        marker — so these must all stay empty while the two
+        task-2885-repro tests above keep passing.
+
+        Distinct from test_open_class_gap_without_status_noun_excluded,
+        which is blocked by the open-class verb 'landed' and never
+        exercises the connective path at all.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
 
 
 # --------------------------------------------------------------------------- #
@@ -306,6 +743,65 @@ class TestSelectStaleStatusSnapshotEdges:
 
         assert result == []
 
+    def test_blocked_snapshot_edge_selected_when_task_done(self):
+        """'Task 2885 is in a blocked status due to merge_retry_pending.' with
+        statuses={'2885': 'done'} -> selected."""
+        edge = {
+            'uuid': 'edge-1',
+            'fact': 'Task 2885 is in a blocked status due to merge_retry_pending.',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'2885': 'done'})
+
+        assert result == [edge]
+
+    def test_blocked_snapshot_edge_not_selected_when_still_blocked(self):
+        """Same fact with statuses={'2885': 'blocked'} -> not selected.
+
+        Pins the invalidate-only-on-positively-terminal semantics: 'blocked'
+        is deliberately NOT a member of INACTIVE_TASK_STATUSES, so a
+        genuinely-still-blocked task can never be selected by this sweep.
+        """
+        edge = {
+            'uuid': 'edge-1',
+            'fact': 'Task 2885 is in a blocked status due to merge_retry_pending.',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'2885': 'blocked'})
+
+        assert result == []
+
+    def test_blocked_snapshot_edge_selected_when_task_cancelled(self):
+        """Same fact with statuses={'2885': 'cancelled'} -> selected."""
+        edge = {
+            'uuid': 'edge-1',
+            'fact': 'Task 2885 is in a blocked status due to merge_retry_pending.',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'2885': 'cancelled'})
+
+        assert result == [edge]
+
+    def test_blocked_status_phrase_edge_selected_when_task_done(self):
+        """The second repro fact ('...deliberately parked in blocked status
+        under escalation esc-2885-17...') with statuses={'2885': 'done'} ->
+        selected."""
+        edge = {
+            'uuid': 'edge-1',
+            'fact': (
+                'Task 2885 is deliberately parked in blocked status under '
+                'escalation esc-2885-17 pending human adjudication.'
+            ),
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'2885': 'done'})
+
+        assert result == [edge]
+
 
 # --------------------------------------------------------------------------- #
 # sweep_stale_status_snapshot_edges — core behavior
@@ -372,6 +868,80 @@ class TestSweepStaleStatusSnapshotEdgesCore:
 
         assert stats == {'scanned': 2, 'candidate_edges': 1, 'invalidated': 1, 'errors': 0}, (
             f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_blocked_status_snapshot_edges_invalidated_end_to_end(self):
+        """Deterministic stand-in for "re-run the sweep to confirm coverage"
+        (task 3042): drives the full enumerate -> extract -> cross-reference
+        -> invalidate path against the two literal task-2885 repro fact
+        texts plus a still-blocked control edge.
+
+        Both repro-fact edges reference task 2885, whose census status has
+        moved to 'done' — both must be invalidated. The control edge
+        references task 3001, whose census status is still 'blocked' (a
+        non-terminal status) — it must be left alone, pinning
+        invalidate-only-on-positively-terminal for the blocked marker
+        end-to-end, not just at the pure-function layer.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        repro_edge_1 = {
+            'uuid': 'edge-2885-a',
+            'fact': 'Task 2885 is in a blocked status due to merge_retry_pending.',
+            'name': '',
+        }
+        repro_edge_2 = {
+            'uuid': 'edge-2885-b',
+            'fact': (
+                'Task 2885 is deliberately parked in blocked status under '
+                'escalation esc-2885-17 pending human adjudication.'
+            ),
+            'name': '',
+        }
+        control_edge = {
+            'uuid': 'edge-3001-control', 'fact': 'Task 3001 is blocked.', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [repro_edge_1, repro_edge_2, control_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2885': 'done', '3001': 'blocked'})
+        now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC)
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            run_id='run-2885', now=now,
+        )
+
+        assert stats == {'scanned': 3, 'candidate_edges': 2, 'invalidated': 2, 'errors': 0}, (
+            f'Expected both blocked-worded task-2885 edges invalidated and the '
+            f'still-blocked control edge left alone, got stats={stats!r}'
+        )
+
+        assert memory_service.update_edge.await_count == 2, (
+            'Expected update_edge awaited exactly twice, for the two repro-fact edges only'
+        )
+        invalidated_uuids = {call.args[0] for call in memory_service.update_edge.await_args_list}
+        assert invalidated_uuids == {'edge-2885-a', 'edge-2885-b'}, (
+            f'Expected only the two task-2885 repro edges invalidated, never the '
+            f'still-blocked control edge, got {invalidated_uuids!r}'
+        )
+        for call in memory_service.update_edge.await_args_list:
+            assert call.kwargs.get('invalid_at') == now, (
+                f'Expected update_edge called with the explicit now= timestamp, got {call!r}'
+            )
+            assert call.kwargs.get('project_id') == 'test_project'
+            assert call.kwargs.get('agent_id') == 'recon-stage-memory_consolidator'
+            assert call.kwargs.get('causation_id') == 'run-2885'
+
+        taskmaster.get_statuses.assert_awaited_once()
+        get_statuses_call = taskmaster.get_statuses.await_args
+        assert get_statuses_call.args[0] == '/tmp/reify'
+        assert '2885' in set(get_statuses_call.kwargs.get('ids', [])), (
+            'Expected get_statuses called with 2885 among the candidate ids — proving the '
+            'blocked-worded ids now reach the cross-reference instead of being dropped by '
+            'the gate'
         )
 
 

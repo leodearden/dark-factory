@@ -76,6 +76,9 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from fused_memory.backends.mem0_client import (
+    MEM0_MANAGED_METADATA_KEYS as _MEM0_MANAGED_METADATA_KEYS,
+)
 from fused_memory.maintenance.project_selection import select_projects
 from fused_memory.maintenance.rehome_scope_tag import (
     CGL_ETA_REHOME_KIND,
@@ -220,22 +223,16 @@ def build_tag_report(
 # ---------------------------------------------------------------------------
 # mem0-owned metadata keys
 # ---------------------------------------------------------------------------
-
-# Keys mem0's AsyncMemory._update_memory (site-packages/mem0/memory/main.py,
-# ~line 2449) never trusts from a forwarded metadata dict: 'data'/'hash'/
-# 'created_at'/'updated_at' are unconditionally recomputed from the update
-# call's own arguments and the existing stored point, and 'user_id'/
-# 'agent_id'/'run_id'/'actor_id'/'role' are restored from the *currently
-# stored* payload (unconditionally for 'actor_id'; whenever absent from what
-# was forwarded for the rest). Forwarding stale copies of these currently
-# works only because mem0 keeps overwriting/re-deriving them -- an implicit
-# coupling to mem0 internals. Stripping them here makes the intent explicit:
-# preserve only this record's CUSTOM provenance keys (kind/src_project/
-# dst_project/src_entity/dst_entity/source_migration/...).
-_MEM0_MANAGED_METADATA_KEYS = frozenset({
-    'data', 'hash', 'created_at', 'updated_at',
-    'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
-})
+#
+# The mem0-managed key set moved to its decided home in
+# fused_memory.backends.mem0_client (PRD D12 / task 3055 §6, extracted by
+# task 3195), where the full rationale lives beside Mem0Backend.update. This
+# script defined it first; task 3195 landed the extraction and task 3088
+# imports rather than re-extracting it, so there is exactly one copy repo-wide
+# (INV-5). The module-local private spelling is retained as an ALIAS to that
+# single object -- never a second copy. The import sits in the module-level
+# import block above; the alias is still an attribute of this module, so
+# `_mod._MEM0_MANAGED_METADATA_KEYS` in the tests keeps resolving.
 
 
 # ---------------------------------------------------------------------------

@@ -67,6 +67,13 @@ What you're trading for that: a bounded first census is a *sample*, not a sweep,
 1. **Read the dated report.** `plans/confusion-census-<date>.md` in the *censused* project's own checkout — open it and read the origin × manifestation matrix (where confusions came from vs. how they showed up) plus the narrative sections. This is the actual deliverable; don't just trust the one-line CLI summary.
 2. **Sanity-check per-stratum coverage counts.** The report should show mining coverage across the strata the sampler drew from — if one stratum has near-zero sightings while others are dense, that's worth a second look (could be a genuinely clean area, could be a sampling gap).
 3. **Confirm `census-state.json` advanced.** Check `docs/legibility/census-state.json` in the censused project — `last_census_at` should now be this run's timestamp and `last_census_report` should point at the new report. This is what makes the *next* census automatic: with a real anchor in place, `census_trigger` can now compute `days_since` and the interval/tasks-landed/novelty-spike conditions become live instead of perpetually "N/A".
+
+   **Also check the baseline.** `last_census_done_count` should be a plausible integer — roughly the *censused project's* current done-task count. Compare it against reality rather than against zero:
+
+   - **An integer that matches the project's done-task count** — correct, nothing to do.
+   - **`0` on a project that demonstrably has done tasks** — wrong, and the run is **not** clean. It means the `get_statuses` call failed and a fabricated baseline was persisted (the 2026-07-24 / 2026-07-31 incident, task 3291). Repair the file with a real readback (same procedure as the anchor-seeding block below) and investigate the fused-memory endpoint. Left in place it makes the tasks-landed delta `current_done - 0` — every done task ever, ~24× the threshold — so that condition fires on every evaluation once its `tasks_landed_min_days` window clears.
+   - **`0` on a project with no done tasks yet** — legitimate. A newly-onboarded project genuinely has a done-count of zero, and the code deliberately keeps that distinguishable from a failed call. Nothing to do.
+   - **`null`** — the count was unobservable at census time (endpoint down, or it answered with something that wasn't a status snapshot). The census itself is fine and its report stands; the tasks-landed condition just fails safe until the next successful census, with `max_interval_days` still the backstop. Worth investigating the endpoint, but not a reason to distrust the run.
 4. **Review the filed remediation tasks.** The run submits tasks through the normal curator path (`submit_fn`) — check the project's task tree for what landed and whether it needs triage/re-prioritization.
 5. **If you ran `--dry-run-filing`: review the payload JSON and file by hand.** This is the only path — the census-state anchor and the codebook have already advanced, so a second run mines a fresh window and files nothing. Work through `plans/confusion-census-<date>-payloads.json` (if you ran the census twice, the second run's payloads are in `…-payloads-2.json`; the first file is never overwritten). Until they're filed, the remediation half of the census is still outstanding.
 
@@ -81,6 +88,8 @@ If a project already had an equivalent manual survey *before* this skill/pipelin
   "last_census_done_count": <done-task count at survey time, from get_statuses>
 }
 ```
+
+`last_census_done_count` is three-valued. Seed it with a real integer from a dated `get_statuses` readback — that is the whole point of seeding, since it is what arms the tasks-landed condition. A real `0` is valid if the project genuinely has no done tasks yet. `null` is the machine-written value for "the count could not be observed at census time"; write it by hand only if you are seeding an anchor and have no way to take a readback, and expect the tasks-landed condition to stay inert until the first successful census.
 
 Precedent: dark_factory itself was seeded this way — commit `0b99cf4ca2` set `last_census_at` from `plans/agent-legibility-survey-2026-07-13.md` (the 2026-07-13 survey, treated as the de-facto first census) with `last_census_done_count: 2321` (a 2026-07-14 done-count readback, intentionally slightly conservative so the tasks-landed condition doesn't over-fire on a stale baseline). Use this path only when a genuinely equivalent survey already exists — it's a substitute for *running* a first census, not a shortcut around wanting one.
 

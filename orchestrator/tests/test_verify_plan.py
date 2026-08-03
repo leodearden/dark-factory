@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,13 @@ from _verify_config_corpus import (
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify_cmd import parse_config_command, render
+from orchestrator.verify_cmd import (
+    ToolKind,
+    parse_config_command,
+    render,
+    with_junitxml,
+    with_pytest_timeout,
+)
 from orchestrator.verify_plan import (
     FileKind,
     PlannedRun,
@@ -50,6 +57,28 @@ from orchestrator.verify_plan import (
 # and test_verify_scope_kappa.py); `test_verify_config_corpus.py` checks them
 # against the live YAML — the executable form of the "verified byte-identical"
 # claim this comment block used to make in prose.
+
+# Task 3218: not a config in this repo (yet), but the shape the pytest slot
+# must never tail-preserve. Mirrors test_verify_cmd.py's pair — the sibling
+# script path is the only difference, and it is what decides which of the two
+# degradations fires before this task lands (see that module's comment).
+_SIBLING_CHECKER_TEST_COMMAND = (
+    'uv run pytest tests/ && python3 scripts/check_pytest_markers.py tests'
+)
+_SIBLING_CHECKER_TEST_COMMAND_UNNAMED = (
+    'uv run pytest tests/ && python3 scripts/check_markers.py tests'
+)
+
+# Task 3218 step-10: the mirror image of the two above — a genuine SIBLING
+# CHECK in a slot that is NOT pytest. The gate rejects it on condition 4 (the
+# `cd` token), the caller retains `'cd x && npx pyright'`, and the single
+# dropped clause does not invoke pyright at an argv head. It is the case that
+# proves the record's level is decided by WHAT WAS DROPPED and not by the
+# keyword: keyed on `keyword == 'pytest'` this reads DEBUG with fan-out prose,
+# when it is the possible-false-GREEN direction the INFO level exists for.
+_SIBLING_CHECKER_TYPE_CHECK_COMMAND = (
+    'cd x && npx pyright && python3 scripts/check_pyright_config.py src'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +564,14 @@ class TestDeriveVerifyPlanTaskRoleFloor:
     instead; role='merge' (and the fallback branch, out of scope here) keep
     the legacy SKIPPED shape (R4 — pinned by the merge+scoped counterparts
     added alongside the migrated goldens in TestDeriveVerifyPlanModulePath).
+
+    Task 3294 widened WHEN the floor fires: it now sits ABOVE the
+    collectable-test branch, so at role='task' ANY touched SOURCE/STRUCTURAL
+    file under the prefix full-suites the owning module — a test-tree-ONLY
+    diff is what keeps FILE_SCOPED selection, not "no test file was touched".
+    The cases in this class are all production-file diffs, so every outcome
+    below is unchanged by 3294; the mixed case it DID change is pinned next
+    door in TestDeriveVerifyPlanTaskRoleFloorMixedDiff.
     """
 
     def test_source_only_diff_full_suites_pytest_at_task_role(self):
@@ -558,9 +595,14 @@ class TestDeriveVerifyPlanTaskRoleFloor:
         assert 'not run' in run.reason.lower()
 
     def test_touched_test_only_diff_stays_file_scoped_at_task_role(self):
-        """(b) A real collectable test file keeps FILE_SCOPED selection — the
-        floor only fires on the pytest else-branch (no touched test file),
-        never overriding the existing collectable-test selection."""
+        """(b) A test-tree-ONLY diff keeps FILE_SCOPED selection.
+
+        The floor is PRODUCTION-triggered, not blanket: it fires whenever a
+        SOURCE/STRUCTURAL file is touched under the prefix, and this diff has
+        none. (Pre-3294 the floor sat below the collectable-test branch and
+        this outcome followed from "a test file was touched" instead — same
+        assertion, different reason. The distinction is what
+        TestDeriveVerifyPlanTaskRoleFloorMixedDiff exists to pin.)"""
         mc = ModuleConfig(
             prefix='shared',
             test_command='uv run --directory shared pytest tests/',
@@ -642,6 +684,233 @@ class TestDeriveVerifyPlanTaskRoleFloor:
         assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
         assert mc.type_check_command is not None
         assert pyright_run.cmd == parse_config_command(mc.type_check_command)
+
+
+# ---------------------------------------------------------------------------
+# derive_verify_plan: the MIXED-diff case the λ floor left open (task 3294)
+# ---------------------------------------------------------------------------
+
+# task 3294: the 3033-shaped MIXED diff — a production file plus a
+# co-committed collectable test file under the SAME module prefix. Pre-3294
+# this hit _derive_module_runs' `elif collectable_tests:` branch (which sat
+# ABOVE the λ floor) and narrowed pytest to just the touched test file, so
+# adding a test to a source-only diff REMOVED coverage. Synthetic paths,
+# matching SOURCE_ONLY_DIFF's invented-path convention.
+MIXED_SOURCE_DIFF: list[str] = [
+    'orchestrator/src/orchestrator/some_module.py',
+    'orchestrator/tests/test_new_thing.py',
+]
+
+# The same shape with the production file being a STRUCTURAL one — the REAL
+# orchestrator/src/orchestrator/workflow.py case, which classify_file returns
+# STRUCTURAL (not SOURCE) for whenever content is read, because it defines
+# `class _McpLike(Protocol)`. A SOURCE-only widening predicate would miss the
+# exact file that motivated this task.
+MIXED_STRUCTURAL_DIFF: list[str] = [
+    STRUCTURAL_DIFF[0],
+    'orchestrator/tests/test_new_thing.py',
+]
+
+
+class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
+    """Task 3294: at role='task', a touched PRODUCTION file full-suites the
+    owning module even when a test file is co-committed.
+
+    λ (task 2589, R3) placed the task-role floor BELOW the collectable-test
+    branch, so it only ever fired when the module's touched files contained no
+    collectable test at all. That made coverage non-monotone in the diff: a
+    source-only diff paid the owning module's full suite, but the SAME diff
+    plus a test file narrowed to that one test file. Task 3033 is the
+    incident — its diff touched orchestrator/src/orchestrator/workflow.py plus
+    tests, the plan file-scoped to 36 items instead of the module's ~13188,
+    and a regression in test_workflow_resume_on_progress.py (a DIFFERENT
+    consumer of workflow.py) was structurally invisible.
+
+    The rule pinned here: ANY touched SOURCE/STRUCTURAL file under the prefix
+    runs the owning module's full test_command at role='task'; only a
+    test-tree-ONLY diff keeps FILE_SCOPED selection (PRD R3). role='merge' is
+    untouched (PRD R4).
+    """
+
+    def test_mixed_source_plus_touched_test_full_suites_at_task_role(self):
+        """(a) SOURCE production file + co-committed collectable test ->
+        FULL_SUITE at role='task'. The co-committed test must NOT narrow the
+        run: the command is the module's verbatim test_command and carries no
+        scoped_targets, so the whole owning package is collected."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert run.scoped_targets == ()
+        # The widened run targets the package, never the touched test file.
+        assert run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' not in run.cmd.targets
+
+    def test_mixed_structural_plus_touched_test_full_suites_at_task_role(self):
+        """(b) The REAL workflow.py case: the production file classifies
+        STRUCTURAL (Protocol-bearing content, read because type_check_command
+        is configured), not SOURCE. It must widen pytest exactly as the SOURCE
+        variant does — the predicate is SOURCE ∪ STRUCTURAL, so pytest breadth
+        never becomes silently type-check-config-dependent. Control: pyright
+        is still FULL_SUITE via the untouched D2 rule."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+            type_check_command=(
+                'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+            ),
+        )
+        plan = derive_verify_plan(
+            MIXED_STRUCTURAL_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+
+        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
+        assert pytest_run.cmd == parse_config_command(mc.test_command)
+        assert pytest_run.scoped_targets == ()
+        assert pytest_run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' not in pytest_run.cmd.targets
+
+        # Control: D2 is role-independent and untouched by this task.
+        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.type_check_command is not None
+        assert pyright_run.cmd == parse_config_command(mc.type_check_command)
+
+    def test_mixed_diff_stays_file_scoped_at_merge_role(self):
+        """(c) PRD R4 rollback golden: the SAME mixed diff at role='merge'
+        (breadth 'scoped') keeps the byte-identical legacy FILE_SCOPED shape.
+        The widening is role='task'-gated and never reaches the merge gate."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='merge',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
+        assert run.scoped_targets == ('orchestrator/tests/test_new_thing.py',)
+
+    def test_touched_test_only_diff_still_file_scoped_at_task_role(self):
+        """(d) The widening is PRODUCTION-triggered, not blanket: a
+        test-tree-ONLY diff at role='task' still file-scopes (PRD R3,
+        "touched-test-only diffs keep file-scoped selection")."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            ['orchestrator/tests/test_new_thing.py', 'orchestrator/tests/test_other.py'],
+            [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.cmd is not None
+        assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
+        assert 'orchestrator/tests/test_other.py' in run.cmd.targets
+
+    # -- WHY the run widened, and how far it did NOT reach -------------------
+
+    def test_mixed_diff_reason_names_the_production_trigger(self):
+        """(e) VerifyResult.plan is the operator-facing record of WHY a scope
+        decision was made, and this codebase already names the trigger in its
+        widening reasons (``pytest: conftest touched ({conftest_trigger})``).
+        The mixed case must do the same: name the production file that
+        triggered the widening, say the co-committed tests did NOT narrow it
+        (otherwise the widened run reads as a scoper bug), and NOT claim the
+        diff was "source-only" — factually false about a diff that touched
+        tests, and the pre-3294 floor's wording.
+
+        Only these are asserted. The role gating is pinned structurally by
+        ``test_mixed_diff_stays_file_scoped_at_merge_role``, and a substring
+        check for a word as common as "task" would discriminate nearly
+        nothing."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert 'orchestrator/src/orchestrator/some_module.py' in run.reason
+        assert 'narrow' in run.reason.lower()
+        assert 'source-only' not in run.reason.lower()
+
+    def test_mixed_diff_in_one_module_never_widens_a_sibling(self):
+        """(f) PRD R1, asserted rather than merely claimed in a reason string:
+        the widening changes each module's own BREADTH, never the SET of
+        modules. Three registered modules, one diff — 'orchestrator' mixed
+        (production + test), 'shared' test-ONLY, 'escalation' untouched.
+
+        This is the case the single-module tests structurally cannot fail on.
+        If the production predicate were computed over the whole
+        *existing_files* list instead of the prefix-filtered ``scoped`` one,
+        'shared' would widen to its full suite off ORCHESTRATOR's production
+        file — and every other test in this class would still pass, because
+        no sibling module is in their plan at all."""
+        mc_orch = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        mc_shared = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        mc_esc = ModuleConfig(
+            prefix='escalation',
+            test_command='uv run --directory escalation pytest tests/',
+            lint_command='uv run --directory escalation ruff check src/',
+        )
+        plan = derive_verify_plan(
+            [*MIXED_SOURCE_DIFF, 'shared/tests/test_sibling.py'],
+            [mc_orch, mc_shared, mc_esc], None, fake_worktree_reader, role='task',
+        )
+
+        # The touched-production module widens...
+        orch_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert orch_run is not None
+        assert orch_run.scope_kind is ScopeKind.FULL_SUITE
+
+        # ...its test-ONLY sibling does not: FILE_SCOPED to its own test file.
+        shared_run = _run_for(plan, 'shared', 'pytest:')
+        assert shared_run is not None
+        assert shared_run.scope_kind is ScopeKind.FILE_SCOPED, (
+            f"'shared' has no touched production file — a mixed diff in "
+            f'orchestrator must not widen it; got {shared_run.reason!r}'
+        )
+        assert shared_run.scoped_targets == ('shared/tests/test_sibling.py',)
+
+        # ...and the untouched module contributes no pytest run at all.
+        assert _run_for(plan, 'escalation', 'pytest:') is None
+        esc_runs = [r for r in plan.runs if r.module_prefix == 'escalation']
+        assert [r.scope_kind for r in esc_runs] == [ScopeKind.SKIPPED]
+        assert esc_runs[0].reason == 'no files under prefix'
 
 
 # ---------------------------------------------------------------------------
@@ -914,12 +1183,13 @@ class TestScoperTrailingClausePreservation:
             assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
     def test_root_lint_chain_scopes_ruff_and_keeps_the_checker(self):
-        """dark-factory-orchestrator.yaml:50 — the fallback path's own command."""
+        """dark-factory-orchestrator.yaml::lint_command — the fallback path's own command."""
         scoped = verify._scope_to_keyword(ROOT_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
             ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+            ' sampler/tests cockpit/tests'
         )
 
     def test_trailing_value_flag_still_truncates_at_the_keyword(self):
@@ -1015,6 +1285,307 @@ class TestScoperTrailingClausePreservation:
 
 # ---------------------------------------------------------------------------
 # verify._reproject_str: &&-chain tail awareness (task 3061)
+# ---------------------------------------------------------------------------
+# Tail-preservation keyword allowlist: the pytest slot stays junit-injectable
+# ---------------------------------------------------------------------------
+
+
+class TestTailPreservationAllowlist:
+    """Both scopers must return a STRUCTURED command for a chained pytest slot.
+
+    Task 3218 part 1. ``split_chain_tail``'s ACCEPT makes
+    ``_scope_prefix_to_keyword`` return ``VerifyCmd(tool=PYTEST, raw=...)``
+    and ``verify._scope_to_keyword`` return a multi-clause string that
+    re-parses the same way. ``with_junitxml`` and ``with_pytest_timeout`` are
+    documented no-ops on ``raw is not None``, so the merge leg's
+    ``--junitxml`` report — which drives
+    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
+    per-test timeout floor — is silently never collected.
+
+    Excluding ``'pytest'`` from the gate's keyword allowlist closes this at
+    all five pytest-slot consumers at once, because both scopers route
+    through that one shared gate.
+    """
+
+    _FILES = ['a/test_x.py']
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_plan_scoper_yields_structured_junit_injectable_pytest(self, raw):
+        """_scope_prefix_to_keyword: raw-retained is the failure mode; assert against it."""
+        scoped = _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
+        assert scoped.tool is ToolKind.PYTEST
+        assert scoped.raw is None, 'a raw-retained pytest cmd silently loses --junitxml'
+
+        injected = with_junitxml(scoped, '/tmp/j.xml')
+        assert injected is not scoped
+        assert '--junitxml /tmp/j.xml' in render(injected)
+
+        timed = with_pytest_timeout(scoped, 300)
+        assert timed is not scoped
+        assert '--timeout 300' in render(timed)
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_string_scoper_yields_structured_junit_injectable_pytest(self, raw):
+        """verify._scope_to_keyword's output must re-parse structured at the injection site.
+
+        The junit injection at ``run_verification`` re-parses the scoped
+        string, so what matters there is the string's PARSE, not the scoper's
+        internal shape.
+        """
+        scoped = verify._scope_to_keyword(raw, 'pytest', self._FILES)
+        assert scoped is not None
+        parsed = parse_config_command(scoped)
+        assert parsed.tool is ToolKind.PYTEST
+        assert parsed.raw is None
+
+        injected = with_junitxml(parsed, '/tmp/j.xml')
+        assert injected is not parsed
+        assert '--junitxml /tmp/j.xml' in render(injected)
+
+    def test_lint_slot_still_preserves_its_sibling_checker(self):
+        """Non-regression: the allowlisted lint keyword keeps task 3061's behaviour."""
+        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
+        assert scoped is not None
+        assert (
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
+            ' fused-memory/tests'
+        ) in scoped
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_lockstep_holds_on_the_rejected_pytest_chains(self, raw):
+        """The two scopers must agree here too — the gate is shared, so this is structural."""
+        assert verify._scope_to_keyword(raw, 'pytest', self._FILES) == render(
+            _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
+        )
+
+
+# ---------------------------------------------------------------------------
+# A gate-rejected multi-clause command must SAY what it dropped
+# ---------------------------------------------------------------------------
+
+
+class TestDroppedChainClausesAreLogged:
+    """Both scopers log the clauses a gate REJECT silently discards (task 3218 2b).
+
+    ``split_chain_tail`` returns ``(raw, '')`` for both "single-segment,
+    nothing to preserve" and "multi-segment, rejected", so today a caller
+    cannot tell them apart and the drop leaves no trace anywhere.
+
+    LEVEL is decided by WHAT WAS DROPPED, not by which slot is running. If any
+    dropped clause re-invokes the tool at an argv-head position the truncation
+    is an intended SAME-TOOL FAN-OUT — DEBUG, not the WARNING used by the
+    reverse-dependency widening's no-op, because both of this repo's root
+    configs hit it on every fallback verify and a WARNING there would be steady
+    noise that trains operators to ignore the record. If NO dropped clause
+    invokes the tool it is a genuine SIBLING CHECK that will now never run —
+    INFO, the possible-false-GREEN direction, as loud as the missing junit
+    report ``verify._with_junitxml_str`` reports at INFO.
+
+    That rule replaces an earlier "the PYTEST slot reads at INFO" one, which
+    conflated which slot is running with what kind of chain got truncated.
+    They come apart in both directions on real configs, and ``_DROP_CASES``
+    now pins both: the root ``test_command`` is a pytest-slot FAN-OUT, and
+    ``_SIBLING_CHECKER_TYPE_CHECK_COMMAND`` is a pyright-slot SIBLING check.
+
+    COUNT is the top-level `&&` segment delta across the retained prefix — see
+    ``test_verify_cmd.py::TestDescribeDroppedClauses`` for why neither the
+    whole-original count nor a re-split of the dropped text is right.
+    """
+
+    _FILES = ['a.py']
+
+    # The two mutually-exclusive explanations the record ends with. Level and
+    # prose must move together, so they are asserted from the same cases.
+    _FAN_OUT_PHRASE = 'an intended same-tool fan-out truncation'
+    _SIBLING_PHRASE = 'a sibling check chained onto this command will NOT run'
+
+    @staticmethod
+    def _records(
+        caplog: pytest.LogCaptureFixture, logger_name: str, level: int | None = None,
+    ) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == logger_name and (level is None or r.levelno == level)
+        ]
+
+    # (raw, keyword, dropped-clause count, expected level)
+    #
+    # The two root configs are the regression cases, and their counts are the
+    # SEGMENT DELTA across the retained prefix (measured, not assumed): the
+    # type-check chain is 6 segments retaining 2, the test chain 16 retaining
+    # 2. Both were over-reported by one when the count was taken over the whole
+    # original. The root `test_command` was additionally absent from this list
+    # entirely, which is exactly what let it emit at INFO claiming a dropped
+    # sibling check when every clause it drops is a pytest fan-out.
+    _DROP_CASES = [
+        (ROOT_TYPE_CHECK_COMMAND, 'pyright', 12, logging.DEBUG),
+        (ROOT_TEST_COMMAND, 'pytest', 14, logging.DEBUG),
+        (_SIBLING_CHECKER_TEST_COMMAND, 'pytest', 1, logging.INFO),
+        (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest', 1, logging.INFO),
+        (_SIBLING_CHECKER_TYPE_CHECK_COMMAND, 'pyright', 1, logging.INFO),
+    ]
+    _DROP_IDS = [
+        'root-type-check-fan-out',
+        'root-test-fan-out',
+        'pytest-named-sibling',
+        'pytest-unnamed-sibling',
+        'pyright-sibling',
+    ]
+
+    @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
+    def test_plan_scoper_logs_the_drop(
+        self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
+    ):
+        """The sibling cases are the record that makes part 1's deliberate
+        truncation non-silent: the gate rejects them, and this is where that
+        says so — at INFO, because a sibling check that never runs is the
+        possible-false-GREEN direction. The two fan-out cases are the live
+        configs, and stay at DEBUG.
+        """
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            result = _scope_prefix_to_keyword(raw, keyword, self._FILES)
+
+        messages = self._records(caplog, 'orchestrator.verify_plan', level)
+        assert len(messages) == 1, f'expected exactly one record, got {messages}'
+        assert keyword in messages[0]
+        # The EXACT rendered phrase, not a bare `str(dropped) in message`: the
+        # message also embeds the whole raw command, so a substring test passes
+        # on a wrong count that happens to appear in it. That looseness is why
+        # the over-count survived review-by-test.
+        assert f'dropped {dropped} trailing' in messages[0]
+        assert result is not None
+        # ...and NOTHING at any other level, so the split is exact.
+        assert self._records(caplog, 'orchestrator.verify_plan') == messages
+
+    @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
+    def test_string_scoper_logs_the_equivalent_record(
+        self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
+    ):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = verify._scope_to_keyword(raw, keyword, self._FILES)
+
+        messages = self._records(caplog, 'orchestrator.verify', level)
+        assert len(messages) == 1, f'expected exactly one record, got {messages}'
+        assert keyword in messages[0]
+        assert f'dropped {dropped} trailing' in messages[0]
+        assert result is not None
+        assert self._records(caplog, 'orchestrator.verify') == messages
+
+    @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
+    def test_wording_matches_the_level(
+        self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
+    ):
+        """Level and prose are two renderings of ONE classification.
+
+        A DEBUG record that says a sibling check will not run is worse than no
+        record: it is the false claim the keyword-keyed branch emitted on this
+        repo's own root ``test_command``, on every fallback verify.
+        """
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            _scope_prefix_to_keyword(raw, keyword, self._FILES)
+
+        messages = self._records(caplog, 'orchestrator.verify_plan', level)
+        assert len(messages) == 1, f'expected exactly one record, got {messages}'
+        if level == logging.DEBUG:
+            assert self._FAN_OUT_PHRASE in messages[0]
+            assert self._SIBLING_PHRASE not in messages[0]
+        else:
+            assert self._SIBLING_PHRASE in messages[0]
+            assert self._FAN_OUT_PHRASE not in messages[0]
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (FM_LINT_COMMAND, 'ruff check'),
+            ('ruff check src/ --select E', 'ruff check'),
+            ('mypy src/ && python3 x.py', 'ruff check'),
+            ('true && python3 x.py', 'pytest'),
+            ('echo pytest && python3 x.py', 'pytest'),
+        ],
+        ids=[
+            'tail-preserved',
+            'single-clause',
+            'multi-clause-keyword-absent',
+            'multi-clause-keyword-absent-opaque',
+            'multi-clause-opaque-prefix',
+        ],
+    )
+    def test_silent_when_nothing_was_dropped(
+        self, raw, keyword, caplog: pytest.LogCaptureFixture,
+    ):
+        """Neither an ACCEPT nor an unchained command may produce a record —
+        and neither may either BAIL-OUT.
+
+        The last three cases are the bail-outs, and they are the point. The
+        gate REJECTS all three (``'ruff check'``/``'pytest'`` is absent from
+        or unparseable in segment 0), so ``has_unpreserved_chain_clauses`` is
+        true for each — but ``_scope_to_keyword`` then returns the command
+        COMPLETELY UNCHANGED via ``idx == -1`` (keyword absent) or via the
+        OPAQUE-prefix guard (``'echo pytest'`` parses OPAQUE), chain and all.
+        Nothing was dropped, so nothing may be reported: a record that does
+        not correspond to a real drop is exactly the "trains operators to
+        ignore it" failure this log exists to avoid. A ``mypy``- or
+        ``true``-based lint/type slot chained with a sibling checker is an
+        ordinary config, so this is reachable in practice.
+        """
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            plan_result = _scope_prefix_to_keyword(raw, keyword, self._FILES)
+        assert self._records(caplog, 'orchestrator.verify_plan') == []
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            string_result = verify._scope_to_keyword(raw, keyword, self._FILES)
+        assert self._records(caplog, 'orchestrator.verify') == []
+
+        # Pin the premise the silence rests on: these really do come back with
+        # every clause intact, so there was genuinely nothing to report.
+        if 'x.py' in raw:
+            assert string_result == raw
+            assert render(plan_result) == raw
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (ROOT_TEST_COMMAND, 'pytest'),
+            (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
+            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
+            (FM_LINT_COMMAND, 'ruff check'),
+            ('ruff check src/ --select E', 'ruff check'),
+            ('mypy src/', 'ruff check'),
+            ('true', 'pytest'),
+            ('mypy src/ && python3 x.py', 'ruff check'),
+            ('true && python3 x.py', 'pytest'),
+            ('echo pytest && python3 x.py', 'pytest'),
+            ('uv run pytest tests/ && python3 scripts/check_markers.py tests', 'uv run'),
+        ],
+        ids=[
+            'root-type-check', 'root-test', 'pytest-named-sibling',
+            'pytest-unnamed-sibling', 'fm-lint', 'single-clause', 'opaque-mypy', 'no-op-true',
+            'multi-clause-keyword-absent', 'multi-clause-keyword-absent-opaque',
+            'multi-clause-opaque-prefix', 'uv-run-keyword-over-a-pytest-clause',
+        ],
+    )
+    def test_logging_is_the_only_observable_change(self, raw, keyword):
+        """Both scopers' returned commands stay byte-identical, and in lockstep."""
+        string_scoped = verify._scope_to_keyword(raw, keyword, self._FILES)
+        plan_scoped = render(_scope_prefix_to_keyword(raw, keyword, self._FILES))
+        assert string_scoped == plan_scoped
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -1635,6 +2206,14 @@ class TestPlanRecordScopedTargets:
     path (_scope_prefix_to_keyword) produces for EVERY subproject — each
     one's lint_command chains a sibling checker. The scoping itself was and
     remains correct; only the machine-readable record was lost.
+
+    The field's contract is "non-empty EXACTLY for FILE_SCOPED", so task
+    3294's widening moved a slot rather than changing the contract: a mixed
+    diff's pytest slot is FULL_SUITE at role='task' and therefore records
+    NOTHING (it narrowed to nothing), while the same slot is still
+    FILE_SCOPED-with-a-record at role='merge'. The parametrised sweep
+    (test_module_path_scoped_targets_nonempty_exactly_for_file_scoped_runs)
+    is what pins the contract itself across both.
     """
 
     def test_chained_lint_records_scoped_targets(self):
@@ -1690,6 +2269,14 @@ class TestPlanRecordScopedTargets:
         pyright records the full touched-.py list (``scoped``); pytest
         records only the collectable tests — the two legitimately DIFFER, so
         one shared field per run, not one per plan, is the right shape.
+
+        Task 3294 migrated the ROLE this is exercised at: at role='task' a
+        mixed diff now widens pytest to FULL_SUITE, and a widened slot
+        records NO scoped_targets (it narrowed to nothing), so the differing
+        pair is pinned at role='merge' — where the legacy FILE_SCOPED shape
+        is preserved byte-identically (PRD R4). The task-role half below
+        pins the complementary record: pyright still narrows, pytest does
+        not, and the widened slot's scoped_targets is empty.
         """
         source_file = 'orchestrator/src/orchestrator/some_module.py'
         test_file = 'orchestrator/tests/test_x.py'
@@ -1700,22 +2287,40 @@ class TestPlanRecordScopedTargets:
             ),
             test_command='uv run pytest tests/ --timeout=300',
         )
-        plan = derive_verify_plan(
-            [source_file, test_file], [mc], None, fake_worktree_reader,
+
+        # -- role='merge': both slots FILE_SCOPED, and their records differ. --
+        merge_plan = derive_verify_plan(
+            [source_file, test_file], [mc], None, fake_worktree_reader, role='merge',
         )
 
-        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
-        assert pyright_run is not None
-        assert pyright_run.scope_kind is ScopeKind.FILE_SCOPED
-        assert set(pyright_run.scoped_targets) == {source_file, test_file}
+        merge_pyright = _run_for(merge_plan, 'orchestrator', 'pyright:')
+        assert merge_pyright is not None
+        assert merge_pyright.scope_kind is ScopeKind.FILE_SCOPED
+        assert set(merge_pyright.scoped_targets) == {source_file, test_file}
 
-        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
-        assert pytest_run is not None
-        assert pytest_run.scope_kind is ScopeKind.FILE_SCOPED
-        assert pytest_run.scoped_targets == (test_file,)
+        merge_pytest = _run_for(merge_plan, 'orchestrator', 'pytest:')
+        assert merge_pytest is not None
+        assert merge_pytest.scope_kind is ScopeKind.FILE_SCOPED
+        assert merge_pytest.scoped_targets == (test_file,)
 
         # The two slots' records legitimately differ — the point of the assertion.
-        assert set(pyright_run.scoped_targets) != set(pytest_run.scoped_targets)
+        assert set(merge_pyright.scoped_targets) != set(merge_pytest.scoped_targets)
+
+        # -- role='task': pyright still narrows; the widened pytest slot
+        # records nothing, because it narrowed to nothing (task 3294). --
+        task_plan = derive_verify_plan(
+            [source_file, test_file], [mc], None, fake_worktree_reader, role='task',
+        )
+
+        task_pyright = _run_for(task_plan, 'orchestrator', 'pyright:')
+        assert task_pyright is not None
+        assert task_pyright.scope_kind is ScopeKind.FILE_SCOPED
+        assert set(task_pyright.scoped_targets) == {source_file, test_file}
+
+        task_pytest = _run_for(task_plan, 'orchestrator', 'pytest:')
+        assert task_pytest is not None
+        assert task_pytest.scope_kind is ScopeKind.FULL_SUITE
+        assert task_pytest.scoped_targets == ()
 
     def test_full_suite_and_skipped_runs_record_no_scoped_targets(self):
         """The negative half of the invariant: empty is CORRECT, and meaningful.

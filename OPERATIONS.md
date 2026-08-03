@@ -294,6 +294,30 @@ session:
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
 | `mcp__fused-memory__get_statuses` | Compact `{id: status}` map — cheap when you only need status, not full records |
+| `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
+| `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
+
+### Is reconciliation halted, or just behind?
+
+A large `reconciliation_backlog` has two causes with **opposite remedies**,
+and they look identical from the number alone — that ambiguity cost two days
+of mis-triage on 2026-07-20.
+
+- Read `reconciliation_halt.halted` from the **same** `get_queue_stats` /
+  `get_status` probe; `halt_reason` and `halted_at` say why and since when.
+- **Halted** → `mcp__fused-memory__unhalt_reconciliation(project_id=...)`.
+- **Not halted** → it's capacity; the backlog is draining too slowly (task 3049).
+
+`trigger_reconciliation` on a halted project now answers `status='halted'`
+(with the reason and remedy) instead of `'requested'` — it used to report
+success while the harness skipped every cycle.
+
+This deployment runs `reconciliation.auto_unhalt_after_cooldown: true`
+(`fused-memory/config/config.yaml`, where the rationale sits next to the
+knob): a halt auto-resumes once its cooldown expires, and the judge re-halts
+if the pipeline is still sick. So a halt you find with an already-expired
+cooldown is about to clear itself on the next ~5s tick — in that one window a
+manual trigger IS consumed, and the tool says so.
 
 ---
 
@@ -441,6 +465,39 @@ from the reload call — not just its top-level `reloaded` flag. A reload
 can report success while individual fields you cared about landed in the
 restart-only bucket. See `plans/config-hot-reload-prd.md` for the
 authoritative allowlist.
+
+**Fused-memory has its own, separate green tier.** Everything above is the
+*orchestrator*'s (`dark-factory-orchestrator.yaml`, applied by
+`mcp__escalation__reload_config`). The fused-memory server keeps a second
+allowlist over `fused-memory/config/config.yaml`, applied by
+`mcp__fused-memory__reload_config` — same tier discipline, different
+process, different file. Do not look for one config's leaves in the
+other's list. Its green tier currently covers several `reconciliation.*`
+leaves (the near-dup/topic-guard knobs and `stale_run_recovery_seconds`),
+`write_triage.*`, and the five in-place-update leaves below — read
+`RELOADABLE_FIELDS` in `fused-memory/src/fused_memory/config/reload.py` as
+the authoritative list rather than treating this enumeration as exhaustive:
+
+- `mem0_update.enabled` — **the kill switch for `update_memory`**, the
+  in-place Mem0 amend tool. Green-tier on purpose: this is what you flip
+  to stop an in-flight silent-rewrite incident, and a restart-only kill
+  switch is no kill switch. Flipping it to `false` denies every caller on
+  the next call, allowlisted or not.
+- `mem0_update.content_amend_allowed_agent_prefixes` and
+  `mem0_update.metadata_patch_allowed_agent_prefixes` — two independently
+  configurable `agent_id`-prefix allowlists, both shipping as
+  `['recon-stage-']`. They are separate because the arms carry different
+  risk: widening **`metadata_patch_allowed_agent_prefixes` alone** is the
+  supported way to admit an interactive curator-gate tagging flow without
+  granting anyone content-amend authority. A mistagged record is cheap to
+  notice and cheap to correct; a silent content rewrite is neither.
+  (`agent_id` is self-reported, so this is a misuse deterrent for
+  cooperating callers, not a security boundary.)
+- `mem0_update.storm_threshold` and `mem0_update.storm_window_seconds` —
+  the content-amend burst alarm (escalates, never blocks; metadata-only
+  calls do not count toward it). Genuinely reload-safe because the shared
+  `StormCounter` takes both values per `record()` call rather than
+  capturing them at construction.
 
 A full restart is expensive by comparison: a graceful stop (SIGTERM, up to
 90s before SIGKILL) cancels in-flight agent tasks and verify suites, then

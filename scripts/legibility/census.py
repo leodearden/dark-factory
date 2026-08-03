@@ -21,11 +21,16 @@ Every LLM / MCP / git side effect in this module is an INJECTED seam
 ``escalate_fn``, ``status_fetcher``, ``commit``, ``batch_source``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
---project shared``) has no MCP client / httpx / live models, so every
-seam is ALWAYS faked in this module's own test suite; the deterministic
-core (duplicate/dup_rate, the mining batch loop + saturation stop, the
-origin x manifestation matrix, census-state advance, codebook lifecycle
-transforms, report rendering) is unit-tested with no network.
+--project shared``) has no MCP client and no live models, so every seam is
+ALWAYS faked in this module's own test suite; the deterministic core
+(duplicate/dup_rate, the mining batch loop + saturation stop, the origin x
+manifestation matrix, census-state advance, codebook lifecycle transforms,
+report rendering) is unit-tested with no network. Note that httpx IS
+available there -- a direct dependency of ``shared``
+(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965) -- so the seams are
+what keep the suite off the network, not an absent HTTP client: an
+un-faked poster would really reach whatever is listening on
+``$FUSED_MEMORY_MCP_URL`` (default localhost:8002).
 
 Model routing (ratified static policy, PRD §5/§12 -- deliberately NOT the
 adaptive ``resolve_route`` ladder): Sonnet for mining + verification,
@@ -569,7 +574,7 @@ def retire_entry(cb: dict, entry_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def advance_census_state(
-    path, *, now_iso: str, report_path: str, done_count: int,
+    path, *, now_iso: str, report_path: str, done_count: int | None,
 ) -> None:
     """Write the §7.5 census-state dict to *path*, atomically.
 
@@ -582,6 +587,34 @@ def advance_census_state(
     absent (census_trigger.py:410-416), and this module is
     census-state.json's SOLE writer, so this is the one place that
     baseline can ever be supplied.
+
+    ``done_count`` is THREE-VALUED (task 3291):
+
+    * a positive int -- a real observed done-count;
+    * ``0`` -- also a real observed done-count, for a project with no done
+      tasks. Unchanged, and still never dropped as falsy;
+    * ``None`` -- the done-count could not be OBSERVED at census time
+      (get_statuses unreachable, or it answered with something that was not
+      a ``{"statuses": mapping}`` envelope). Serialised as JSON ``null``,
+      so the key is still always present and the MUST-persist contract
+      above holds literally. ``compute_tasks_landed`` treats ``null``
+      exactly like an absent key, so condition (b) fails SAFE until the
+      next successful census, with condition (a) (``max_interval_days``)
+      remaining the unconditional backstop.
+
+    Writing a fabricated ``0`` for an unobservable count, or carrying
+    forward the previous file's value, are both FORBIDDEN here. A fabricated
+    0 was written on 2026-07-24 and on 2026-07-31 (task 3291), and it is
+    unsound rather than merely untidy: it turns the delta into
+    ``current_done - 0`` -- every done task ever, ~2872 against a 120
+    threshold. That stayed latent only while the get_statuses fetch was ALSO
+    broken (the same defect zeroed ``current_done``, so the measured pre-fix
+    delta was ``0 - 0``); repairing the fetch alone would have detonated it.
+    See ``census_trigger``'s module docstring for the replayed measurements.
+    A carried-forward stale count is merely a quieter guess, silently
+    under-reporting the next window's delta. ``null`` is the only honest
+    value for an unknown, and it is the caller's job to pass it rather than
+    invent a number.
 
     Uses the same ``tempfile.mkstemp`` + ``os.replace`` atomic-write
     pattern as ``codebook.dump`` (temp file in the same directory as
@@ -1310,8 +1343,32 @@ def run_census(
     # (reviewer_comprehensive finding #4).
     Path(report_path).write_text(report_md, encoding="utf-8")
 
-    status = status_fetcher()
-    done_count = sum(1 for v in (status.get("statuses") or {}).values() if v == "done")
+    # An unobservable done-count degrades ONLY the next window's condition-(b)
+    # baseline -- it must never abandon a run whose mining has already been
+    # paid for and whose dated report is already on disk above. Aborting would
+    # also leave last_census_at unadvanced, so condition (a) would re-fire the
+    # census every single night -- a strictly more over-eager loop than any
+    # this task set out to fix.
+    #
+    # Both the fetch and the extraction are guarded. extract_done_count is what
+    # stops fused-memory's {"error", "error_type"} envelope -- which rides an
+    # isError:false JSON-RPC response and so arrives here looking like a
+    # perfectly good dict -- from being counted as a done-count of 0 and
+    # persisted as a REAL baseline. Such a fabricated 0 arms condition (b)
+    # with a delta of every-done-task-ever the moment the fetch works again
+    # (task 3291; see census_trigger's module docstring for the replayed
+    # measurements). See advance_census_state's docstring for why null, not 0
+    # and not a carried-forward value, is the honest degradation.
+    try:
+        done_count = census_trigger.extract_done_count(status_fetcher())
+    except Exception as exc:  # noqa: BLE001 - a bad baseline must not fail the census
+        done_count = None
+        logger.warning(
+            "census: done-count unobservable (%s) -- persisting a null "
+            "last_census_done_count; the tasks-landed trigger condition will "
+            "fail safe until the next successful census",
+            exc,
+        )
 
     # codebook.dump() and advance_census_state() are adjacent on purpose
     # (reviewer_comprehensive finding #4): nothing else here can raise
@@ -1557,9 +1614,12 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
     """POST one JSON-RPC ``tools/call`` envelope to *url* and unwrap the
     result via ``census_trigger._extract_tool_result`` (reused rather than
     reimplemented -- the same MCP envelope shape applies everywhere in this
-    codebase). ``httpx`` is imported lazily since it is not a ``scripts/``
-    dependency (mirrors ``census_trigger.default_status_fetcher`` /
-    ``nightly._default_poster``)."""
+    codebase). ``httpx`` is imported lazily so importing this module for its
+    unit-tested pure core never needs it, and so the tests can substitute a
+    stub for the real POST -- not for availability, since httpx is a direct
+    dependency of ``shared`` (``httpx>=0.27``, task 2965) and this module
+    runs under ``uv run --project shared``. Mirrors
+    ``census_trigger.default_status_fetcher`` / ``nightly._default_poster``."""
     import httpx
 
     response = httpx.post(
@@ -1748,7 +1808,19 @@ def main(argv: list[str] | None = None) -> int:
     (headroom-preflight) outcome still exits 0, mirroring
     ``census_trigger``'s own CLI contract of reserving a non-zero exit for
     an operator-facing failure, not an expected defer/no-fire outcome.
+
+    Configures logging FIRST, before arg parsing and so before the trigger
+    gate, which is what gets this module's INFO lines (the empty-codebook
+    line, the per-stage progress lines) into the journal on EVERY
+    invocation -- including one that no-ops at the gate. Without it root
+    sits at its WARNING default and they are all silently dropped. Shares
+    ``config.configure_logging`` with ``nightly.main()`` rather than
+    inlining a second ``basicConfig``, so the env var
+    (``LEGIBILITY_LOG_LEVEL``), the default level and the format cannot
+    drift between the two entrypoints (INV-5 no-lockstep-duplication).
     """
+    config.configure_logging()
+
     parser = argparse.ArgumentParser(
         prog="census",
         description="Legibility periodic-census runner "

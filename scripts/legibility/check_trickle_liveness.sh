@@ -10,6 +10,27 @@
 # nothing (see nightly.py's no-change-night gate), so a git-history probe
 # would false-alarm on a healthy-but-quiet timer. ExecMainExitTimestamp /
 # Result / ExecMainStatus are the authoritative last-run signal instead.
+#
+# THIS PROBE ANSWERS "DID THE UNIT RUN" AND NOTHING ELSE -- and it is not
+# meant to answer anything else. It CANNOT distinguish a productive night
+# from a night that produced literally nothing: every night from
+# 2026-07-16 to 2026-07-29 passed this probe while the byte budget
+# discarded every single candidate. That is not a defect here; "did signal
+# flow through the pipeline" is a different question with a different
+# answer source, and it is answered by check_trickle_progress.py, which
+# reads the run state nightly.py records (task 3340). Decision 7 still
+# stands as written: the progress probe reads what the PIPELINE recorded
+# about its own run, never what the repo happens to contain, so a quiet
+# night is recorded as quiet and never alarms.
+#
+# ITS PASS/FAIL SEMANTICS ARE DELIBERATELY UNCHANGED. PRD task kappa
+# (task 2587, args [dark_factory, "72"]) and kappa-prime (task 2615, args
+# [reify, "72"]) are BOTH already status=done with deterministic-milestone
+# provenance resting on exactly these semantics; changing them would
+# retroactively invalidate what that provenance claims, and would silently
+# change when any future binding auto-completes or fires a born-at-L2
+# milestone_check_failed escalation. Do not "fix" this script to also
+# report progress -- add to check_trickle_progress.py instead.
 set -euo pipefail
 
 if [ $# -ne 2 ]; then

@@ -218,7 +218,16 @@ class TestModuleConfigPlanAuthority:
 
     @pytest.mark.asyncio
     async def test_executed_commands_are_driven_by_the_plan(self, tmp_path: Path):
-        """A touched test file + a plain source file under one registered module."""
+        """A touched test file + a plain source file under one registered module.
+
+        Since task 3294 this MIXED shape full-suites pytest at the default
+        role='task' (any touched SOURCE/STRUCTURAL file under the prefix runs
+        the owning module's whole test_command), so this pins the FULL_SUITE
+        arm of the plan→ModuleConfig mapping alongside lint/pyright's
+        FILE_SCOPED arms. The class's contract — executed == planned, with no
+        hand-mirrored decision tree in between — is unchanged; only which arm
+        the pytest slot exercises moved.
+        """
         (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
         (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
         (tmp_path / 'mymod' / 'helpers.py').write_text('def helper():\n    return 1\n')
@@ -261,9 +270,16 @@ class TestModuleConfigPlanAuthority:
         by_tool = {run.cmd.tool: run for run in expected_plan.runs if run.cmd is not None}
 
         pytest_run = by_tool[ToolKind.PYTEST]
-        assert pytest_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        # Task 3294: this MIXED shape (production file + co-committed test)
+        # full-suites pytest at role='task', so this now pins the FULL_SUITE
+        # arm of the plan→ModuleConfig mapping. The expectation is the
+        # VERBATIM configured command, not render(cmd): a FULL_SUITE slot is
+        # rendered by _executed_module_configs_from_plan as `getattr(mc, attr)`,
+        # while render() normalises `--directory` into a leading `cd` — so the
+        # render-based form would fail on a correct mapping.
+        assert pytest_run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
         assert pytest_run.cmd is not None
-        assert executed_mc.test_command == render(pytest_run.cmd)
+        assert executed_mc.test_command == module_configs[0].test_command
 
         ruff_run = by_tool[ToolKind.RUFF]
         assert ruff_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
@@ -1012,6 +1028,7 @@ class TestFallbackPlanAuthorityGoldens:
             f'uv run --project shared ruff check {test_path}'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py '
             'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+            ' sampler/tests cockpit/tests'
         )
         assert 'check_bare_magicmock_config' in (executed[0].lint_command or '')
         # TYPE: a cd-sequenced same-tool fan-out still truncates at the keyword.

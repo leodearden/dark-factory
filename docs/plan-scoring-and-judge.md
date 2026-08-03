@@ -722,6 +722,186 @@ conservative or the insertion point is wrong. Debug before expanding.
 
 ---
 
+## The plan-production predicate (task 3302)
+
+**The rule: `plan_steps > 0`. Never `plan_quality > 0`, never `outcome ==
+'done'`.** Wherever the pipeline or a downstream consumer —
+`select_survivors`, `compute_composite`, `blend_composite`,
+`build_composite_report`, `build_plan_quality_report` — needs to know whether
+an architect actually produced a plan, that is the question it asks, via
+`metrics.produced_a_plan(metrics_dict)`.
+
+**Why not `plan_quality > 0`.** The two plan scorers *disagreed* exactly on a
+stepless artifact. `judge.score_plan_structure` returns `0.0` for one as a
+deliberate anti-fabrication guard (through `judge.is_scorable_plan`, which also
+catches the truthy header-only stub `create_plan` writes); the LLM plan judge
+had no such guard and scored the same artifact confidently. Observed in the
+2026-07-29 corpus cell
+`reify_task_12__architect-opus-high__52c66767.json`: `plan_steps=0` alongside
+`plan_quality=0.31`. That number cannot have come from the floor at all —
+`PLAN_QUALITY_RUBRIC`'s weights sum to `8.0` and the floor returns
+`round(satisfied_weight / 8, 4)`, so its outputs are multiples of `0.125` and
+`0.31` is not one. It came from the ungated judge.
+
+**That disagreement is now closed at the instrument (task 3303)** — see below —
+but the rule stands regardless, and for a reason independent of the fix:
+`plan_quality` is the number being *decided*, so it can never be evidence for
+the decision. Using it as the predicate makes a no-plan cell certify itself.
+Recorded in Graphiti episode `e2066ec6` (edges `23d9c24f` / `8092af24`).
+
+**Why not `outcome == 'done'`.** Done-without-a-plan and blocked-with-a-good-plan
+cells both occur — task 2863 AMENDMENT §1.
+
+**Two failure causes, two treatments, two counts, neither silent:**
+
+| Cause | Treatment | Count |
+|---|---|---|
+| Transport refusal (`cap_tainted`: 429 / auth / model-not-found / wedge) — we never got to ask | **EXCLUDED** from every pool | `plan_quality_cap_excluded` (composite row) / `cap_excluded` (θ table) |
+| No plan produced (`not produced_a_plan`) — we asked, the answer was nothing | **FLOORED** to `0.0` on the quality axis *and* **HARD-GATED** to `composite = 0.0` (`blend_composite(no_plan=True)`), kept in every pool and counted | `plan_quality_no_plan` (composite row) / `no_plan` (θ table) |
+
+A no-plan cell is additionally barred from *setting* its `(fixture,
+'plan_only')` cost/latency baseline, though its real spend still enters the
+row's pools: it is cheap and fast precisely because it failed
+(`plans/eval-architect-effort-verdict-2026-07-27.md` measured $0.5–$3 against a
+real plan's ~$3.7), so seeding the floor with it deflates every candidate that
+succeeded. Barring it from the baseline was *not sufficient on its own*: it
+closes only the intra-group route. Flooring the quality axis bounds just the
+0.6 quality weight, and a no-plan cell that is the sole cell of its `(fixture,
+'plan_only')` group takes the all-trials fallback baseline — earning ratios of
+`1.0` on both efficiency axes and banking the remaining 0.4 as credit for
+having failed. Measured on the pre-fix pipeline: a no-plan cell scored `0.40`,
+outranked a config that produced a real 6-step plan at `0.26`, and survived
+`select_survivors(top_k=2)` while the plan-producing one was cut. Hence the
+composite hard gate — the plan-only analogue of the workflow `tests_pass` gate,
+closing the cross-group route.
+
+**Fixed at all three points.**
+
+| Point | Fix | Task |
+|---|---|---|
+| The **instrument** | `judge_plan_quality` refuses a non-`is_scorable_plan` artifact up front — before a prompt is built, before `invoke_agent` — and returns the floor's own value | 3303 |
+| The **writer** | `run_architect_eval` gates the judge call site on `is_scorable_plan`, so no new incoherent cell is written | 3302 |
+| The **reader** | `report._plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
+
+### The derived reliability surface (task 3379)
+
+Those two counts are collected, but the figure an operator actually compares
+candidates on is the *ratio* over them. Task 3379 derives it — no new
+collection, no new predicate:
+
+```
+plan_rate     = (n_admitted - no_plan) / n_admitted
+cost_per_plan = (spend over ADMITTED plan-only cells) / (n_admitted - no_plan)
+```
+
+| Figure | Composite row key | θ aggregate key | Rendered column |
+|---|---|---|---|
+| `plan_rate` | `plan_rate` (beside `plan_quality_n`, the denominator) | `plan_rate` | `plan_rate` on `format_composite_table` **and** in the `plan_quality by config:` block |
+| `cost_per_plan` | `cost_per_plan` (immediately after `cost_usd`) | — (see below) | `cost_per_plan` on `format_composite_table` |
+
+Both reduce through the shared `report._plan_rate` / `report._cost_per_plan`,
+and `_plan_rate` is called by **both** builders — the `_mean_plan_quality`
+discipline, so the two tables the CLI prints adjacently cannot drift.
+`cost_per_plan` is composite-row-only because `build_plan_quality_report`
+carries no cost data at all; threading some there would create a *second* cost
+surface free to drift from `cost_usd`.
+
+**The denominator rule: the ADMITTED θ pool, never `trials`.** A cap-tainted
+cell leaves *both* the numerator and the denominator. It is a transport refusal
+— we never got to ask — so it is neither a cell that planned nor a cell that
+failed to plan, and counting it would report a candidate as *less reliable* for
+a question a session-cap window stopped it from answering: the
+schedule-attributable penalty tasks 3118 and 3099 spent two rounds removing,
+reintroduced on the surface `select_survivors` ranks on. It also matches the
+campaign this automates —
+`plans/eval-architect-effort-verdict-2026-07-27.md` computes its own `planRate`
+over **19** fixtures, dropping the 3 cap-contaminated ones, not over all 22.
+`plan_quality_n` rides on the row so the ratio is verifiable from the row alone;
+it is the same number the θ table reports as `n`.
+
+**The no-plan cells' real spend stays in the `cost_per_plan` numerator.** That
+asymmetry is the whole figure: you paid for the failed attempt and got nothing,
+which is exactly what "$ per *usable* plan" prices. The verdict doc's own
+arithmetic makes the point — fable read `$3.456`/fixture against the opus-max
+incumbent but `$4.731` per usable plan, i.e. *no cheaper at all*, while failing
+to plan 5× as often. Netting the failed attempts out of the numerator would
+report that illusion rather than remove it. An *unmeasurable* cell's `$0.00` is
+still excluded, for the same reason `_is_unmeasurable` keeps it out of the
+`cost` pool: it is the price of a run that never happened, and letting it in
+would report the cap window as a discount.
+
+**`select_survivors` ranks on `plan_rate` as a TIE-BREAK, below
+`plan_quality`** (axes 5–6 of 7; the name tiebreak falls to 7). Not above:
+a no-plan cell is already paid for twice — floored into `plan_quality` and
+hard-gated in `composite` — so ranking on reliability primarily would charge
+the same failure a third time. Its residual value is real, though: one cell at
+`0.0` beside one at `1.0` yields the *same* mean as two cells at `0.5` while
+the configs differ sharply in reliability, and without this axis that tie falls
+through to the alphabet — the defect the name tiebreak is meant to be a last
+resort against.
+
+**Both figures are `None` (rendered `-`) on an empty pool, never `0.0`.** For
+`plan_rate` the fabrication would be two-sided: a `0.0` slanders a workflow
+config that never ran an architect cell ("it never planned"), a `1.0` flatters
+it ("it always planned"). For `cost_per_plan`, `n_planned == 0` means "we got no
+plan at any price", which must not render as `$0.0000` — nor raise.
+
+**The gap this closes.** The 2026-07-27 operator had to hand-compute `planRate`
+and `$/plan` from the per-cell result JSONs because no report surface exposed
+either, which is precisely why the campaign's headline finding — *what separates
+these candidates is how often they emit a plan at all* — could not be read off
+the pipeline's own ranking table. It can now.
+
+### The anti-fabrication floor applies uniformly (task 3303)
+
+Gating only the writer left the instrument's coherence resting entirely on its
+ONE caller remembering to gate — so a second caller (a backfill/re-scoring
+script, a new eval path, `prompt_opt`, a resume wave) would silently re-open the
+defect above. **The floor therefore applies to whichever scoring path runs, and
+is enforced AT the instrument**, using the same `is_scorable_plan` predicate the
+floor short-circuits on and the runner gates on. Three call sites, one
+predicate: they cannot drift into disagreeing about what a plan is, which is the
+argument `is_scorable_plan`'s own docstring records for the level below.
+
+Three details are load-bearing:
+
+- **The refusal's score is DERIVED**, `score_plan_structure(plan)`, never a
+  hardcoded `0.0`. A literal would be a third independent statement of what an
+  unjudgeable artifact is worth, free to diverge if the floor's semantics ever
+  change. Deriving it is what lets the test assert the identity
+  `verdict.plan_quality == score_plan_structure(plan)` rather than a magic
+  number.
+- **`0.0`, not the `None` sentinel.** `None` means "no judgement available,
+  degrade to the floor" — the parse-failure / transport-refusal signal.  A
+  stepless plan from a healthy architect is a definite content verdict worth
+  `0.0`, so `invocation_error` stays `None` too; conflating the two would
+  collapse the content-failure / infra-failure distinction tasks 3118 and 3302
+  both turn on.
+- **The refusal is logged at WARNING.** Reaching it means a caller did not gate.
+  It cannot double-log through the normal path (the runner's gate
+  short-circuits first), so the record stays rare and means exactly one thing.
+
+The runner-side gate is *not* redundant now: it still owns the taint decision,
+the `task_id × config.name` log line, and the skipped opus call — it simply
+stops being the sole correctness guarantee.
+
+**Known remaining asymmetry, filed as follow-up:** `judge_plan_quality` does
+`float(raw_quality)` with no clamp, while `score_plan_structure` returns
+`round(min(max(score, 0.0), 1.0), 4)`. `PLAN_QUALITY_SCHEMA` declares
+`minimum`/`maximum`, but the `json.loads(result.output)` fallback path bypasses
+schema enforcement, so an out-of-range judge score would persist verbatim. That
+is a *range* invariant rather than the anti-fabrication floor, deliberately left
+out of 3303's scope rather than overlooked.
+
+**Prior art in-repo — this makes the pipeline agree with surfaces that already
+got it right:** `scripts/eval_bootstrap_smoke.sh` gates its smoke on
+`metrics.plan_steps > 0 & outcome == 'done'`, and
+`plans/eval-architect-effort-verdict-2026-07-27.md` hand-computed the campaign's
+`planRate` / `meanPQ_all` ("scores a no-plan cell as 0") from `plan_steps > 0`
+because the pipeline's own ranking could not be used.
+
+---
+
 ## Sharp edges — read these before starting
 
 1. **Cost ceiling at full matrix scale.** Worst case: 5 tasks × 5

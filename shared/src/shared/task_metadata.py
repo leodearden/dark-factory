@@ -529,6 +529,14 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
     key (e.g. a module reloaded/imported twice). Raises ``ValueError`` when a
     *different* model is registered for a key that already has one — this is
     a loud, fail-fast conflict intended to surface at import time.
+
+    Registry keys are OWNED by the module that registers them. Tests must
+    register test-only keys (``<name>_stub``) — never a key a production
+    module registers — or a cross-package pytest co-run pre-registers the real
+    model and the conflict raise below fires spuriously (task 3352).
+    ``shared/tests/test_task_metadata.py`` enforces that convention in its
+    autouse fixture's teardown, which asserts every key a test added ends in
+    ``_stub``.
     """
 
     existing = _SUBMODEL_REGISTRY.get(key)
@@ -696,7 +704,7 @@ class SchemaWarning(BaseModel):
 _WHOLE_METADATA_FIELD = '<metadata>'
 
 
-# Tier-A: the 34 load-bearing conventional metadata keys that real writers
+# Tier-A: the 39 load-bearing conventional metadata keys that real writers
 # (orchestrator, curator, DeterministicRunner, escalation flows) already
 # depend on but that are not (yet) typed TaskMetadata fields. Skipped in
 # parse_metadata's unknown-key scan below so a deliberate, documented
@@ -736,6 +744,9 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         'invariants',
         'optimistic_path',
         'capability_manifest',
+        # AUTOMATED task-curator combine flow (fused_memory.task_interceptor).
+        # Distinct from the HUMAN content curator of the `human_curator_*` keys
+        # below — two unrelated actors, deliberately not sharing a prefix.
         'curator_action',
         'curator_justification',
         'combined_at',
@@ -755,6 +766,20 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # OutcomeKind.plan_files_cross_repo instead of flagging 'files not touched').
         'cross_repo',
         'cross_repo_project',
+        # Human-curator gate contract (task 3341): `human_curator_gate` marks a
+        # pure deterministic gate whose resolution requires human CONTENT
+        # adjudication, not merely a closed escalation record;
+        # `human_curator_adjudicated_at` is the ISO-8601 stamp that proves the
+        # per-entry review happened. Both are read by DeterministicRunner's
+        # pure-gate resume guard, which refuses to drive such a task to done
+        # when the marker is set and the stamp is absent or not a non-empty
+        # string (task 3181 is the incident: an auto-resolved gate escalation
+        # was treated as proof the curator work had been done).  The stamp
+        # carries the `human_curator_` prefix rather than the bare `curator_`
+        # one above precisely so the human content curator is not conflated
+        # with the automated task curator.
+        'human_curator_gate',
+        'human_curator_adjudicated_at',
     }
 )
 

@@ -75,6 +75,14 @@ DISK_GUARD="$WARM_LANE_SCRIPTS_DIR/warm-lane-disk-guard.sh"
 # shellcheck source=tests/infra/test_helpers.sh
 source "$SCRIPT_DIR/test_helpers.sh"
 
+# The SHIPPED lane-state lib, sourced for ONE value: $LANE_PROTECT_GLOB_FALLBACK
+# (see the BRIDGE-COST SEAM comment above run_sweep). Read from the lib rather
+# than written here as a literal for the same reason as in the sibling gc suite:
+# a literal would be a hand-maintained mirror of PROTECTED_PREFIXES sitting
+# outside TestProtectGlobFallbackDrift's gate.
+# shellcheck source=orchestrator/scripts/warm-lane/lib_lane_state.sh
+source "$WARM_LANE_SCRIPTS_DIR/lib_lane_state.sh"
+
 echo "=== scripts/warm-lane-gc-sweep.sh hermetic tests (task 4863) ==="
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -94,10 +102,34 @@ ERR_FILE="$(mktemp /tmp/test-gc-sweep-err-XXXXXX)"
 _TMPDIRS+=("$ERR_FILE")
 
 # ── run_sweep: invoke the sweep script, capture OUT/ERR_OUT/RC ────────────────
+#
+# BRIDGE-COST SEAM (task 3292) — the same seam as the sibling gc suite's
+# run_helper; see the long rationale there (tests/warm-lane/test_warm_lane_gc.sh).
+# Kept as one idiom on purpose so the two files do not drift into two unrelated
+# ones.
+#
+# warm-lane-gc.sh's PROTECT_GLOB default now renders dark-factory's
+# PROTECTED_PREFIXES through a python3 that imports pydantic, once per gc.sh
+# INVOCATION. FOUR cases here drive the REAL gc.sh via --gc-script "$GC_REAL"
+# (G4, G5, and the two U cases) and so would each pay a full render; every other
+# run_sweep either passes a stub --gc-script or exits at the CLI guard, and is
+# unaffected either way. Pinning gc.sh's own already-documented
+# REIFY_WARM_LANE_GC_PROTECT_GLOB short-circuits that render before it runs. The
+# env propagates unchanged through warm-lane-gc-sweep.sh's terminal
+# `exec "$GC_SCRIPT" …` to gc.sh.
+#
+# NO opt-out helper is needed here, unlike the gc suite's
+# run_helper_live_default: NO assert in this file inspects the protect glob. The
+# four real-gc cases are proving the sweep -> gc handoff and the disk-pressure
+# end-to-end path; the stub cases assert gc.sh's ARGV (`reclaim --mount …`),
+# which an environment variable does not appear in. If a future block here does
+# assert what the DEFAULT protects, it must bypass this pin — the gc suite's
+# run_helper_live_default is the pattern to copy.
 run_sweep() {
     local rc=0
     > "$ERR_FILE"
-    OUT="$(bash "$SCRIPT" "$@" 2>"$ERR_FILE")" || rc=$?
+    OUT="$(REIFY_WARM_LANE_GC_PROTECT_GLOB="$LANE_PROTECT_GLOB_FALLBACK" \
+        bash "$SCRIPT" "$@" 2>"$ERR_FILE")" || rc=$?
     ERR_OUT="$(cat "$ERR_FILE")"
     RC=$rc
 }

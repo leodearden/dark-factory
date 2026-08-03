@@ -31,10 +31,58 @@ ExecStart=__UV_PATH__ run --project dashboard \
 # Cost/burndown aggregation roots (comma-separated). Standalone default: this repo only — additional project roots are LOCAL settings, added to the installed unit, not committed here. Keep spaces out of the value; systemd treats unquoted spaces as assignment separators.
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__
 
-# Restart policy: always restart on failure, back off up to 60s
+# Restart policy: always restart on failure, back off up to 60s.
+# RestartSteps is load-bearing here, not decorative. Without it systemd logs
+# "Service has RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." at
+# unit load and discards the cap entirely, so the backoff this comment claims
+# never happens and a crash-looping dashboard retries every 5s forever.
+# With it: backoff 5s -> 60s over 4 steps.
+#
+# Requires systemd >= 254, which introduced BOTH directives. Below that they
+# are unknown keys: systemd logs "Unknown key name ... ignoring." and runs with
+# a flat 5s retry, so this stanza reads correct while doing nothing. That
+# degradation is what tests/scripts/test_dashboard_service_template.py::
+# test_systemd_analyze_verify_reports_no_ignored_directives catches, which is
+# why it matches the warning case-insensitively.
 Restart=on-failure
 RestartSec=5
+RestartSteps=4
 RestartMaxDelaySec=60
+
+# A clean SIGTERM stop exits 143, not 0: `uv run` propagates its child's signal
+# death as 128+15. Without this line systemd's default classification records
+# every graceful stop as "Failed with result exit-code" (status=143) — observed
+# 2026-07-30 22:23:53 BST on this unit after task 3306's bounded-drain change,
+# with six keep-alive clients attached. Left alone it compounds: each routine
+# restart plants a false failure until "failed" means nothing and a real crash
+# reads exactly like a deploy.
+#
+# Numeric, not SIGTERM: `uv run` translates the signal into an exit code before
+# systemd sees it, so the journal reports result=exit-code/status=143 and a
+# signal-name entry would not match what systemd actually observes.
+#
+# The trade: with 143 classified as success, Restart=on-failure no longer
+# re-fires on it. For the restarts that actually happen in practice this costs
+# nothing — both programmatic paths (scripts/restart-dashboard.sh:21,
+# scripts/dashboard-watchdog.py) issue `systemctl --user restart`, an explicit
+# stop for which systemd never consults Restart= at all.
+#
+# The residual case is an out-of-band `kill -TERM`, and there this IS a real
+# loss of supervision, not merely a relocation of it. Previously exit 143 was
+# a failure, Restart=on-failure fired, and the dashboard was back in ~5s. Now
+# the unit stops cleanly and stays inactive until something else notices. That
+# something is dark-factory-dashboard-watchdog.timer, which is slower by an
+# order of magnitude: it probes /api/health every 30s and requires FAIL_STREAK
+# (=3) CONSECUTIVE failures before it restarts anything, so detection is ~90s,
+# not 30s. And that coverage is CONTINGENT — the installed timer is not armed
+# yet (task 3289), so until 3289 lands an out-of-band SIGTERM leaves the
+# dashboard down with nothing watching it at all.
+#
+# Accepted deliberately: nothing in normal operation sends this unit an
+# out-of-band SIGTERM, whereas every routine restart was planting a false
+# failure. Trading a rare slow recovery for an everyday-correct failed state
+# is the right side of that bet, but it is a bet, and 3289 is what settles it.
+SuccessExitStatus=143
 
 TimeoutStopSec=15
 

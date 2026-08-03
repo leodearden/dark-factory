@@ -15,7 +15,9 @@ chains — a ruff/pyright invocation followed by an independent
 anyway — so the scoper accepts them and preserves the tail. The root
 type/test chains are cwd-sequenced same-tool fan-outs (``cd a && npx pyright &&
 cd ../b && npx pyright``), where the tail is *more of the same tool in other
-directories*; the scoper rejects those and keeps today's truncation.
+directories*; the scoper rejects those and keeps today's truncation. A third
+shape, ``SCRIPTS_LINT_COMMAND``, is CHAINLESS — one segment, so there is no
+tail to accept or reject and the gate must leave it alone.
 
 A ``_``-prefixed, uniquely-named sibling module (like ``_orch_helpers.py``,
 ``_merge_queue_harness.py``): ``conftest.py`` inserts ``_TESTS_DIR`` on
@@ -44,6 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 FM_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'orchestrator.yaml'
+SCRIPTS_CONFIG_PATH = REPO_ROOT / 'scripts' / 'orchestrator.yaml'
 
 
 def load_config_scalar(path: Path, key: str) -> str:
@@ -109,10 +112,9 @@ def discover_lint_command_modules() -> set[str]:
     forward half its values from here would collapse the gate's two halves into
     one code path — a discovery bug would then skew both.
 
-    Configs defining only a ``test_command`` (e.g. ``scripts/orchestrator.yaml``)
-    are omitted by construction. Dot-prefixed parents are skipped so ``.venv``,
-    ``.task``, ``.claude`` — and any future dot-dir — stay deterministically out
-    of the result.
+    Configs defining only a ``test_command`` are omitted by construction.
+    Dot-prefixed parents are skipped so ``.venv``, ``.task``, ``.claude`` — and
+    any future dot-dir — stay deterministically out of the result.
 
     ``dark-factory-orchestrator.yaml`` is deliberately out of reach: it sits at
     the repo root rather than under ``*/``, and its scalars are pinned by the
@@ -181,17 +183,29 @@ MODULE_LINT_COMMANDS = {
     for module in ('cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared')
 }
 
+# scripts/orchestrator.yaml::lint_command — the lone CHAINLESS lint command: a
+# single segment, no sibling checker, nothing for the gate to preserve or drop.
+# It gets a dedicated constant rather than a MODULE_LINT_COMMANDS entry because
+# it does not share that dict's 2-segment shape (same reason FM_LINT_COMMAND is
+# separate, in the other direction). Its scoper golden is
+# ``TestSplitChainTail::test_scripts_lint_command_has_no_chain_to_split``.
+SCRIPTS_LINT_COMMAND = 'uv run --project shared ruff check scripts/'
+
 # dark-factory-orchestrator.yaml::lint_command
 ROOT_LINT_COMMAND = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard'
+    'uv run ruff check shared escalation fused-memory orchestrator dashboard sampler'
+    ' cockpit conftest.py df_pytest_isolation.py skills'
     ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
     ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+    ' sampler/tests cockpit/tests'
 )
 
 # dark-factory-orchestrator.yaml::type_check_command
 ROOT_TYPE_CHECK_COMMAND = (
     'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
-    ' && cd ../dashboard && npx pyright'
+    ' && cd ../dashboard && npx pyright && cd ../shared && npx pyright'
+    ' && cd ../escalation && npx pyright && cd ../sampler && npx pyright'
+    ' && cd ../cockpit && npx pyright'
 )
 
 # dark-factory-orchestrator.yaml::test_command
@@ -203,5 +217,5 @@ ROOT_TEST_COMMAND = (
     ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
     ' && cd ../sampler && uv run pytest tests/ --timeout=300'
     ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ --timeout=300'
+    ' && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
 )

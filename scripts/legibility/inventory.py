@@ -8,9 +8,9 @@ many encoded cwd directories: a project's config lists **cwd prefixes**
 (``docs/legibility/legibility.yaml``'s ``cwd_prefixes``), and membership is
 resolved from each session's REAL ``cwd`` (read from a transcript line) via
 path-component semantics, never a raw string-prefix match on the encoded
-dir name — the ``~/.claude/projects`` encoding is lossy (``/`` and ``.``
-both map to ``-``), so a sibling project sharing the same literal prefix
-(e.g. ``dark-factory-cockpit``) would otherwise be over-included.
+dir name — the ``~/.claude/projects`` encoding is lossy (``/``, ``.`` and
+``_`` all map to ``-``), so a sibling project sharing the same literal
+prefix (e.g. ``dark-factory-cockpit``) would otherwise be over-included.
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 §5.2, contract §7.4). Self-contained — does not import task α's
@@ -30,15 +30,29 @@ from typing import Any
 
 
 def encode_cwd(cwd: str) -> str:
-    """Mirror ``session_registry.transcript_path_for_cwd``'s encoding.
+    """Mirror ``session_registry.encode_cwd``'s encoding of Claude Code's dir naming.
 
-    Both ``/`` and ``.`` map to ``-`` — this is the same best-effort
-    mirror of Claude Code's own ``~/.claude/projects/<enc>`` naming, kept
-    in lockstep with the canonical implementation,
-    ``orchestrator.session_registry.transcript_path_for_cwd`` (named, not
-    line-cited, so this docstring doesn't drift as that file evolves).
+    ``/``, ``.`` AND ``_`` all map to ``-``; ``-`` passes through and CASE
+    IS PRESERVED (the encoder does not lowercase). Validated against 738
+    real (encoded-dir, decoded-cwd) pairs sampled from a live
+    ``~/.claude/projects`` tree, over which the only non-alphanumeric
+    characters appearing in any cwd were ``- . / _`` — so the rule is
+    complete over the observed domain, and unverified outside it.
+
+    This is a hand-written mirror of the canonical implementation,
+    ``orchestrator.session_registry.encode_cwd`` (named, not line-cited, so
+    this docstring doesn't drift as that file evolves). It is duplicated
+    rather than imported because this module is deliberately self-contained
+    — its ``__main__`` bootstrap puts only ``scripts/`` on ``sys.path``, so
+    a module-scope orchestrator import would break the standalone nightly
+    invocation. The "kept in lockstep" claim is therefore not left to
+    goodwill: ``scripts/tests/test_legibility_inventory.py``'s
+    ``TestEncoderLockstep`` mechanically asserts this function, the
+    canonical, and every other in-repo copy agree row-for-row with real
+    on-disk dir names. Task 3272 added it after the ``_`` rule was found
+    missing from all four copies at once.
     """
-    return cwd.replace('/', '-').replace('.', '-')
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
 
 
 def iter_project_dirs(projects_root: Path | str, cwd_prefixes: Sequence[str]) -> Iterator[Path]:

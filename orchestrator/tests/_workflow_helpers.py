@@ -195,6 +195,7 @@ class FakeBriefing:
     async def build_architect_prompt(
         self, task: dict, worktree=None, context: str | None = None,
         *, include_prior_proposals: bool = False,
+        committed_work: list[dict] | None = None,
     ) -> str:
         return f'Plan task: {task.get("title", "")}'
 

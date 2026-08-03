@@ -913,17 +913,17 @@ class TestBD1StewardConsultsSharedClassifier:
     step-14.
     """
 
-    async def test_pre_triage_warning_is_single_sourced_from_table(self, caplog):
+    async def test_pre_triage_warning_is_single_sourced_from_table(self, caplog, make_steward):
         import json
         import logging
 
         from shared.cli_invoke import AllAccountsCappedException
-        from test_suggestion_triage import _make_escalation, _make_steward, _make_suggestions
+        from test_suggestion_triage import _make_escalation, _make_suggestions
 
         from orchestrator.unblock_types import BlockClass
         from orchestrator.workflow_types import BlockDisposition, RequeueKind
 
-        steward = _make_steward()
+        steward = make_steward()
         suggestions = _make_suggestions(15)
         escalation = _make_escalation(detail=json.dumps(suggestions))
         cap_exc = AllAccountsCappedException(
