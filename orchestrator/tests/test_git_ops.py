@@ -14260,3 +14260,321 @@ class TestAdvanceMainIndexLockStandoff:
             'still a real, comparable grace downstream; got '
             f'{info.get("grace_seconds", "<unset>")!r}'
         )
+
+    async def test_post_advance_sync_failure_under_a_lock_is_retried(
+        self, git_ops: GitOps,
+    ):
+        """The RESIDUAL TOCTOU window at the post-advance tree sync.
+
+        The pre-snapshot gate is a PROBE, so a foreign `git commit --only`
+        can still grab the index between it and the post-advance
+        `read-tree -u --reset HEAD` — and on the CLEAN-tree path there is no
+        park, hence no mid-park re-probe to catch it.  Left alone that is the
+        exact silent failure the gate exists to prevent: the sync's failure is
+        only LOGGED while the outcome still reports 'advanced', so main lands
+        with a stale project_root tree and the NEXT advance reads the whole
+        old-main->new-main delta as "dirty" WIP.
+
+        Returning 'park_lock_contended' here would be a LIE (update-ref has
+        already run), so the contract is a bounded stand-off and a RETRY of
+        the sync in place.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'sync-retry', 'sync_retry.py',
+        )
+        synced_file = git_ops.project_root / 'sync_retry.py'
+        assert not synced_file.exists(), (
+            'the merge commit is not in project_root\'s tree until the '
+            'post-advance sync runs — that is what this test measures'
+        )
+
+        git_ops.config.merge_park_lock_grace_seconds = 5
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+        read_tree_calls: list[int] = []
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'read-tree', '-u'] and cwd == git_ops.project_root:
+                read_tree_calls.append(1)
+                if len(read_tree_calls) == 1:
+                    # A foreign `git commit --only` grabbed the index in the
+                    # window the gate cannot cover. git 2.43's real signature:
+                    # rc=1 with EMPTY stdout AND stderr.
+                    lock_path.write_text('')
+                    return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        original_state = git_ops._index_lock_state
+        held_observations: list[bool] = []
+
+        async def spy_index_lock_state():
+            present, age = await original_state()
+            held_observations.append(present)
+            # Release once the stand-off has actually observed it held, so the
+            # retry is reached without the test depending on wall-clock.
+            if present:
+                with contextlib.suppress(FileNotFoundError):
+                    lock_path.unlink()
+            return (present, age)
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=mock_run),
+                patch.object(
+                    git_ops, '_index_lock_state',
+                    side_effect=spy_index_lock_state,
+                ),
+            ):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # (1) main landed — this site must NOT claim transient contention.
+        assert result.result == 'advanced', (
+            'update-ref already ran, so the outcome must stay \'advanced\'; '
+            f'got {result.result!r}'
+        )
+
+        # (2) The sync was RETRIED, not merely logged and abandoned.
+        assert len(read_tree_calls) >= 2, (
+            'a read-tree failure with a foreign lock held must be retried '
+            f'after standing off; got {len(read_tree_calls)} call(s)'
+        )
+        assert any(held_observations), (
+            'the retry path must have observed the foreign lock held; got '
+            f'{held_observations!r}'
+        )
+
+        # (3) The tree really is in sync with the new HEAD — the whole point.
+        assert synced_file.exists(), (
+            'project_root\'s working tree must match the advanced HEAD, or '
+            'the NEXT advance reads the delta as dirty WIP'
+        )
+
+    async def test_already_stale_lock_skips_the_standoff(self, git_ops: GitOps):
+        """A crashed-git leftover must not cost the queue the whole grace.
+
+        `_map_advance_failure` declares staleness on the PRE-wait age against
+        `max(grace, _INDEX_LOCK_STALE_FLOOR_S)`.  Once that bar is cleared no
+        amount of waiting can change the verdict, so waiting only burns the
+        full grace in the SERIALIZED merge worker for EVERY queued task until
+        an operator clears the file — a slow-motion version of the stall this
+        gate exists to remove.
+
+        Asserted by PROBE COUNT, not elapsed time: a short-circuit takes the
+        single pre-wait probe and nothing more.
+        """
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        backdated = time.time() - (_INDEX_LOCK_STALE_FLOOR_S + 1000)
+        os.utime(lock_path, (backdated, backdated))
+
+        original_state = git_ops._index_lock_state
+        probes: list[bool] = []
+
+        async def counting_state():
+            present, age = await original_state()
+            probes.append(present)
+            return (present, age)
+
+        try:
+            with patch.object(
+                git_ops, '_index_lock_state', side_effect=counting_state,
+            ):
+                cleared, waited, initial_age = (
+                    await git_ops._await_index_lock_clear(
+                        timeout_s=60.0, context='stale-shortcircuit',
+                    )
+                )
+        finally:
+            lock_path.unlink()
+
+        assert cleared is False
+        assert waited == 0.0, (
+            'an already-stale lock must not be waited on at all; got '
+            f'waited={waited!r}'
+        )
+        assert initial_age > _INDEX_LOCK_STALE_FLOOR_S
+        assert len(probes) == 1, (
+            'the short-circuit must take exactly the pre-wait probe — more '
+            f'probes mean the poll loop ran anyway; got {probes!r}'
+        )
+
+    async def test_a_young_lock_is_still_waited_on(self, git_ops: GitOps):
+        """The stale short-circuit must not over-fire.
+
+        The ordinary docs-direct-commit-on-main window is a YOUNG lock, and
+        that is precisely the case the stand-off exists for — it must still
+        get its full budget.  Contrast the test above.
+        """
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')  # fresh => far below the staleness floor
+
+        original_state = git_ops._index_lock_state
+        probes: list[bool] = []
+
+        async def counting_state():
+            present, age = await original_state()
+            probes.append(present)
+            return (present, age)
+
+        try:
+            with patch.object(
+                git_ops, '_index_lock_state', side_effect=counting_state,
+            ):
+                cleared, _waited, _initial = (
+                    await git_ops._await_index_lock_clear(
+                        timeout_s=1.5, context='young-lock',
+                    )
+                )
+        finally:
+            lock_path.unlink()
+
+        assert cleared is False
+        assert len(probes) >= 2, (
+            'a young lock must be POLLED, not short-circuited — the whole '
+            f'point of the stand-off; got {probes!r}'
+        )
+
+    async def test_index_lock_path_resolves_a_dot_git_FILE_layout(
+        self, git_ops: GitOps,
+    ):
+        """`_index_lock_path`'s fallback branch — the only one that forks.
+
+        A linked worktree (and a submodule) has a `.git` FILE, not a
+        directory, so the `<project_root>/.git/index.lock` fast path is wrong
+        there: the real lock lives in the LINKED git-dir
+        (`<main-git-dir>/worktrees/<name>/index.lock`).  A wrong answer here
+        degrades silently to "no lock detected", i.e. straight back to the
+        halting behaviour this task removes — so the branch that resolves it
+        via `rev-parse --absolute-git-dir` needs its own pin.
+        """
+        worktree_info = await git_ops.create_worktree('dot-git-file-layout')
+        wt_path = worktree_info.path
+        try:
+            assert (wt_path / '.git').is_file(), (
+                'this test requires the .git-FILE layout a linked worktree '
+                'produces; got a directory'
+            )
+
+            linked = GitOps(git_ops.config, wt_path)
+            resolved = await linked._index_lock_path()
+
+            # (1) The fast path was NOT taken — that is the bug being pinned.
+            assert resolved != wt_path / '.git' / 'index.lock', (
+                'a .git FILE is not a directory to hang index.lock off; got '
+                f'{resolved}'
+            )
+            # (2) It is the linked git-dir git itself reports.
+            _, abs_git_dir, _ = await _run(
+                ['git', 'rev-parse', '--absolute-git-dir'], cwd=wt_path,
+            )
+            assert resolved == Path(abs_git_dir.strip()) / 'index.lock'
+            assert 'worktrees' in resolved.parts, (
+                f'expected a linked-worktree git-dir; got {resolved}'
+            )
+            assert resolved.parent.is_dir()
+
+            # (3) End-to-end: a lock written THERE is actually detected.
+            assert await linked._index_lock_state() == (False, 0.0)
+            resolved.write_text('')
+            try:
+                present, age = await linked._index_lock_state()
+                assert present is True, (
+                    'a lock in the linked git-dir must be detected, or the '
+                    'stand-off silently degrades to today\'s halt'
+                )
+                assert age >= 0.0
+            finally:
+                resolved.unlink()
+
+            # (4) Memoised — the git-dir cannot move under a live GitOps.
+            assert await linked._index_lock_path() == resolved
+        finally:
+            await git_ops.cleanup_worktree(wt_path, 'dot-git-file-layout')
+
+    async def test_standoff_deadline_is_monotonic_and_re_announces(
+        self, git_ops: GitOps, caplog,
+    ):
+        """The stand-off's budget is monotonic, and a long wait is LOUD.
+
+        Two behaviours with no wall-clock cost, pinned with a fake clock:
+
+        (a) The deadline keys on `time.monotonic()`, so a wall-clock
+            adjustment mid-wait can neither extend nor truncate the budget.
+            The fake wall clock below jumps an HOUR BACKWARD on every poll;
+            a `time.time()`-keyed deadline would never expire.
+        (b) A wait that outlives `_INDEX_LOCK_WARN_INTERVAL_S` re-announces
+            itself, so a stand-off is never a silent stall.
+        """
+        from orchestrator.git_ops import (
+            _INDEX_LOCK_POLL_INTERVAL_S,
+            _INDEX_LOCK_WARN_INTERVAL_S,
+        )
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        # Warm the git-dir memo BEFORE the clock is faked, so the wait itself
+        # touches nothing but `stat` and the (faked) clock.
+        await git_ops._index_lock_path()
+
+        budget = 3 * _INDEX_LOCK_WARN_INTERVAL_S
+
+        class _FakeClock:
+            """Monotonic under our control; wall clock deliberately hostile."""
+
+            def __init__(self) -> None:
+                self.mono = 1_000.0
+                self.wall = time.time()
+
+            def monotonic(self) -> float:
+                return self.mono
+
+            def time(self) -> float:
+                return self.wall
+
+        clock = _FakeClock()
+
+        async def fake_sleep(secs):
+            clock.mono += max(0.0, secs)
+            clock.wall -= 3600.0  # hostile wall-clock adjustment
+
+        class _FakeAsyncio:
+            def __init__(self, sleep) -> None:
+                self.sleep = sleep
+
+        try:
+            with (
+                caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+                patch('orchestrator.git_ops.time', clock),
+                patch('orchestrator.git_ops.asyncio', _FakeAsyncio(fake_sleep)),
+            ):
+                cleared, waited, _initial = (
+                    await git_ops._await_index_lock_clear(
+                        timeout_s=budget, context='fake-clock',
+                    )
+                )
+        finally:
+            lock_path.unlink()
+
+        # (a) It gave up at its own monotonic deadline, despite the wall clock
+        # running backwards by an hour per poll.
+        assert cleared is False
+        assert waited == pytest.approx(budget, abs=_INDEX_LOCK_POLL_INTERVAL_S), (
+            'the budget must be measured on the MONOTONIC clock; got '
+            f'waited={waited!r} for a {budget}s budget'
+        )
+
+        # (b) The wait re-announced itself rather than stalling silently.
+        still_waiting = [
+            r for r in caplog.records if 'Still waiting' in r.message
+        ]
+        assert len(still_waiting) >= 2, (
+            'a wait spanning several warn intervals must re-announce itself; '
+            f'got {[r.message for r in caplog.records]!r}'
+        )

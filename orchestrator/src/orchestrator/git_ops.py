@@ -212,6 +212,26 @@ MERGE_PARK_REF = 'refs/dark-factory/merge-park'
 _INDEX_LOCK_POLL_INTERVAL_S = 1.0
 _INDEX_LOCK_WARN_INTERVAL_S = 30.0
 
+# Floor (seconds) an index.lock's PRE-wait age must clear before it may be
+# treated as a crashed-git LEFTOVER rather than a live commit.  This repo's
+# documented pre-commit budget (CLAUDE.md instructs `timeout: 300000` for a
+# commit that stages Python), so a lock older than this outlived the longest
+# legitimate hook run.
+#
+# Single source of truth for two collaborating call sites, deliberately
+# defined HERE because the import direction is merge_gates -> git_ops and
+# never the reverse:
+#   * `GitOps._await_index_lock_clear` short-circuits its stand-off once the
+#     pre-wait age clears max(grace, this) — waiting cannot change a verdict
+#     that is already "leftover", it only costs the SERIALIZED merge worker
+#     the whole grace per queued task.
+#   * `merge_gates._map_advance_failure` (which aliases this as
+#     `_STALE_LOCK_FLOOR_S`) uses the SAME bar to decide whether to offer the
+#     destructive `rm -f <lock>` recovery.
+# They must never drift: a short-circuit at a lower bar than the advice bar
+# would skip the wait and then NOT explain why.
+_INDEX_LOCK_STALE_FLOOR_S = 300.0
+
 
 class MergeParkError(Exception):
     """Base class for failures parking pre-advance WIP on MERGE_PARK_REF.
@@ -12836,15 +12856,22 @@ class GitOps:
             # BEFORE the dirty-file snapshot below — not inside the
             # `if dirty_tracked:` park block, for two reasons:
             #
-            #  (i) It covers EVERY project_root index/tree write advance_main
-            #      performs, not just the park: the update-ref and the
-            #      post-advance `read-tree -u --reset HEAD` sync too.  That
+            #  (i) It covers the CLEAN-tree path's post-advance
+            #      `read-tree -u --reset HEAD` sync as well as the park.  That
             #      sync's failure is only LOGGED while the outcome still
             #      reports 'advanced', so on a CLEAN tree (where no park is
             #      attempted at all) a foreign lock would silently land main
             #      with a stale project_root tree — and the NEXT advance
             #      would then read the whole old-main→new-main delta as
             #      "dirty" WIP, cascading into wip_overlap/park damage.
+            #      NOTE this gate is a PROBE, so it narrows but cannot close
+            #      that window: a lock taken AFTER it still reaches the sync.
+            #      The dirty path re-probes mid-park (see the
+            #      `except MergeParkLockContentionError` handler below); the
+            #      sync closes its own residual window with a bounded
+            #      stand-off + retry at the read-tree site itself, because by
+            #      then main has already landed and 'park_lock_contended'
+            #      would be a lie.
             #  (ii) The dirty-file snapshot is now taken AFTER the lock
             #      clears, so it can never record the half-written state of
             #      an in-flight `git commit --only`.  A stale snapshot would
@@ -12878,10 +12905,12 @@ class GitOps:
                 # side channels so _map_advance_failure can name the lock in
                 # the per-task blocked reason.  'dirty_files' is empty on
                 # this path by construction — the snapshot below has not been
-                # taken yet — but the key is kept PRESENT so consumers need
-                # no shape branching.  _last_stash_dirty_files is left
-                # untouched, so the stash_failed escalation text is
-                # unaffected.
+                # taken yet, so no WIP is known to be at risk — and the mapper
+                # renders its "WIP at risk" clause only when the list is
+                # non-empty (the TOCTOU path below, which DOES know the
+                # files).  The key is kept PRESENT so the mapper needs no
+                # shape branching.  _last_stash_dirty_files is left untouched,
+                # so the stash_failed escalation text is unaffected.
                 #
                 # 'age_seconds' and 'initial_age_seconds' differ BY DESIGN and
                 # are not interchangeable.  The former is re-probed here, so
@@ -13132,6 +13161,55 @@ class GitOps:
                 ['git', 'read-tree', '-u', '--reset', 'HEAD'],
                 cwd=self.project_root,
             )
+            if sync_rc != 0:
+                # ── Residual TOCTOU window at the sync ───────────────
+                # advance_main's pre-snapshot gate is a PROBE, so a foreign
+                # `git commit --only` can still grab the index between it and
+                # this sync — and on the CLEAN-tree path there is no park,
+                # hence no mid-park re-probe to catch it.  Left alone, that is
+                # exactly the silent failure the gate exists to prevent: main
+                # LANDS while project_root's tree stays stale, and the NEXT
+                # advance reads the whole old-main→new-main delta as "dirty"
+                # WIP, cascading into wip_overlap/park damage.
+                #
+                # Returning 'park_lock_contended' here would be a LIE —
+                # update-ref has already run, main HAS moved.  So the recovery
+                # is to retry IN PLACE: stand off for the same bounded grace,
+                # then re-run the sync.  Re-probed first so a genuine
+                # (lock-free) read-tree fault is not silently delayed by a
+                # pointless retry; `_await_index_lock_clear` also short-
+                # circuits an already-stale lock, so the worst case is one
+                # grace, not an unbounded stall.
+                held, held_age = await self._index_lock_state()
+                if held:
+                    logger.warning(
+                        'read-tree after advancing main failed while a '
+                        'foreign git index lock is held (age=%.1fs) — '
+                        'standing off and retrying the sync rather than '
+                        'leaving project_root stale. error=%s',
+                        held_age, sync_err,
+                    )
+                    cleared, waited, _pre_age = await self._await_index_lock_clear(
+                        timeout_s=float(
+                            self.config.merge_park_lock_grace_seconds,
+                        ),
+                        context=(
+                            'post-advance tree sync for '
+                            f'{branch or merge_sha[:8]}'
+                        ),
+                    )
+                    if cleared:
+                        sync_rc, _, sync_err = await _run(
+                            ['git', 'read-tree', '-u', '--reset', 'HEAD'],
+                            cwd=self.project_root,
+                        )
+                        if sync_rc == 0:
+                            logger.info(
+                                'read-tree retry succeeded after waiting '
+                                '%.1fs for the foreign index lock to clear — '
+                                'project_root is in sync with the new HEAD.',
+                                waited,
+                            )
             if sync_rc != 0:
                 logger.error(
                     'read-tree failed after advancing main — working tree '
@@ -13508,6 +13586,10 @@ class GitOps:
 
         Uses a MONOTONIC clock for the deadline so a wall-clock adjustment
         mid-wait cannot extend or truncate the budget.
+
+        An ALREADY-STALE lock (pre-wait age past
+        ``max(timeout_s, _INDEX_LOCK_STALE_FLOOR_S)``) short-circuits the wait
+        entirely — see the inline rationale below.
         """
         held, age = await self._index_lock_state()
         if not held:
@@ -13518,6 +13600,33 @@ class GitOps:
         # how this (the only staleness-bearing) measurement used to be lost.
         initial_age = age
         lock_path = await self._index_lock_path()
+
+        # ── Already-stale short-circuit ──────────────────────────────
+        # Do not burn the grace on a lock downstream has already decided is a
+        # crashed-git leftover.  `merge_gates._map_advance_failure` renders
+        # its `rm -f` recovery advice from exactly this pre-wait age against
+        # exactly this threshold (_INDEX_LOCK_STALE_FLOOR_S, which it aliases
+        # as _STALE_LOCK_FLOOR_S), so once the bar is cleared no amount of
+        # waiting can change the verdict — it only costs the SERIALIZED merge
+        # worker the full grace for EVERY queued task until an operator clears
+        # the file, which is a slow-motion version of the stall this gate
+        # exists to remove.  The returned (False, 0.0, initial_age) drives the
+        # identical downstream verdict and advice, minus the dead wall-clock.
+        #
+        # Strictly `>` and keyed on the PRE-wait age, mirroring the mapper: a
+        # young lock (the ordinary docs-direct-commit-on-main window) always
+        # gets its full stand-off, which is the case the wait is FOR.
+        stale_floor = max(max(0.0, timeout_s), _INDEX_LOCK_STALE_FLOOR_S)
+        if initial_age > stale_floor:
+            logger.warning(
+                'Foreign git index lock in project_root is ALREADY %.0fs old '
+                '(past the %.0fs staleness floor) — skipping the stand-off, a '
+                'crashed-git leftover will not clear by waiting. lock=%s '
+                'context=%s',
+                initial_age, stale_floor, lock_path, context,
+            )
+            return (False, 0.0, initial_age)
+
         started = time.monotonic()
         deadline = started + max(0.0, timeout_s)
         # Cap the poll interval so a sub-second timeout_s still yields at

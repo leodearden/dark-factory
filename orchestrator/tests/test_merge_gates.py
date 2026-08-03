@@ -1463,3 +1463,98 @@ class TestMapAdvanceFailureParkLockContended:
             'a side channel with no staleness evidence must not produce '
             f'destructive advice; got {outcome.reason!r}'
         )
+
+    async def test_reason_is_not_miscategorised_as_a_ff_failure(self) -> None:
+        """The reason must not trip workflow.py's merge-failure category
+        heuristic into calling an index-lock stand-off a fast-forward failure.
+
+        `workflow.py`'s blocked path infers the review category with a bare
+        substring test:
+
+            elif 'ff' in reason.lower() or 'advanced' in reason.lower():
+                category = 'merge_ff_failed'
+
+        The original wording ("advance_main stood off: ...") contains 'ff'
+        inside "off", so every park_lock_contended block was filed as
+        `merge_ff_failed` — a category that flows into
+        `_write_merge_failure_review`, the `merge_blocked` event's
+        `data.category`, and the signature-aware L1 dedup key, durably
+        polluting the very observability this task adds.
+
+        Asserted by REPLAYING the heuristic verbatim rather than by pinning
+        prose, so any future reword is checked against the real consumer.
+        (A cleaner fix — an explicit reason-prefix short-circuit in
+        workflow.py, as DROPPED_PLAN_TARGETS/TRANSIENT_INFRA/MAIN_HEALTH_RED
+        already have — needs workflow.py, which is outside this task's lock
+        set; filed as follow-up.)
+        """
+        # Benign fixture strings: the substring test also sees the lock path
+        # and any at-risk filenames, which are runtime values this code
+        # cannot constrain — the CONSTANT prose is what is pinned here.
+        outcome, _halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 300.0,
+            'dirty_files': ['docs/notes.md'],
+        })
+
+        lowered = outcome.reason.lower()
+        assert 'verification failed' not in lowered
+        assert 'ff' not in lowered, (
+            "the reason must not contain the token 'ff' — workflow.py would "
+            f'file it as merge_ff_failed; got {outcome.reason!r}'
+        )
+        assert 'advanced' not in lowered, (
+            "the reason must not contain 'advanced' — workflow.py would file "
+            f'it as merge_ff_failed; got {outcome.reason!r}'
+        )
+
+    async def test_toctou_dirty_files_are_named_in_the_reason(self) -> None:
+        """The side channel's `dirty_files` must reach the operator.
+
+        On the mid-park (TOCTOU) path advance_main already knows which
+        uncommitted tracked files were about to be parked when the foreign
+        lock appeared.  That is the same fact `stash_failed` reports, and it
+        is what tells an operator whether real WIP is implicated — so it must
+        be named rather than collected and dropped.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 2.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 2.0,
+            'grace_seconds': 300.0,
+            'dirty_files': ['CLAUDE.md', 'docs/task-authoring.md'],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'CLAUDE.md' in outcome.reason, (
+            'the dirty tracked files carried on the side channel must be '
+            f'named in the blocked reason; got {outcome.reason!r}'
+        )
+        assert 'docs/task-authoring.md' in outcome.reason
+
+    async def test_empty_dirty_files_adds_no_wip_clause(self) -> None:
+        """The gate path knows of no WIP, so it must claim none.
+
+        `dirty_files` is `[]` by construction there (the dirty snapshot is
+        taken only AFTER the lock clears), and an empty "WIP at risk:" clause
+        would contradict the reason's own "NOTHING in project_root was
+        modified" statement.
+        """
+        outcome, _halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 301.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 1.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        assert 'WIP' not in outcome.reason, (
+            'with no known dirty files the reason must not imply WIP is at '
+            f'risk; got {outcome.reason!r}'
+        )

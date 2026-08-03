@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
 from orchestrator.merge_types import (
     MergeOutcome,
     MergeRequest,
@@ -948,16 +948,40 @@ async def _map_advance_failure(
             f'it with `rm -f {lock_path}`.'
             if stale else ''
         )
+        # WIP-at-risk clause.  Populated ONLY on the mid-park (TOCTOU) path,
+        # where advance_main had already taken the dirty snapshot before the
+        # foreign lock appeared; empty on the pre-snapshot gate path, where
+        # no WIP is known.  Mirrors what `stash_failed` above already reports,
+        # so an operator reading either reason learns the same thing about
+        # which uncommitted work is implicated.
+        at_risk = [str(f) for f in (info.get('dirty_files') or [])]
+        wip_txt = (
+            f' Uncommitted tracked WIP in project_root at the moment of '
+            f'contention: {", ".join(at_risk[:20])}'
+            f'{f" (+{len(at_risk) - 20} more)" if len(at_risk) > 20 else ""}.'
+            if at_risk else ''
+        )
+        # WORDING CONSTRAINT — do not reintroduce the token 'ff' (as in
+        # "stood off") or the word 'advanced' anywhere in this reason.
+        # workflow.py's blocked path infers the merge-failure review category
+        # with a bare substring test
+        # (`'ff' in reason.lower() or 'advanced' in reason.lower()`
+        # -> category 'merge_ff_failed'), which then flows into
+        # `_write_merge_failure_review`, the merge_blocked event's
+        # data.category, and the signature-aware L1 dedup key.  "stood off"
+        # matched it, durably filing every index-lock stand-off as a
+        # fast-forward failure.  Pinned by
+        # test_reason_is_not_miscategorised_as_a_ff_failure.
         return MergeOutcome(
             'blocked',
             reason=(
-                f'advance_main stood off: a foreign git process held '
+                f'advance_main deferred: a foreign git process held '
                 f'{lock_path} for {age_txt} (waited {waited_txt}). The merge '
                 f'did NOT land and NOTHING in project_root was modified. This '
                 f'is the docs-direct-commit-on-main window — a '
                 f'`git commit --only` holding the index lock across its '
                 f'pre-commit hook — which is transient and will be retried on '
-                f're-dispatch.{recovery} (task {task_id})'
+                f're-dispatch.{wip_txt}{recovery} (task {task_id})'
             ),
         )
 
@@ -1797,10 +1821,16 @@ _OVERLAP_GIT_ERROR_SENTINEL = ['<git-error: re-verify required>']
 # commit's index.lock corrupts that in-flight commit, so staleness keys on
 # max(grace, this floor): a lock older than this repo's documented pre-commit
 # budget is the only defensible crashed-leftover signal, INDEPENDENT of how
-# the operator tuned the WAIT.  Kept equal to the GitConfig default (pinned by
-# test_floor_matches_the_documented_pre_commit_budget) rather than imported,
-# because orchestrator.config is a TYPE_CHECKING-only import here.
-_STALE_LOCK_FLOOR_S = 300.0
+# the operator tuned the WAIT.  Equal to the GitConfig default (pinned by
+# test_floor_matches_the_documented_pre_commit_budget); not imported FROM
+# orchestrator.config because that is a TYPE_CHECKING-only import here.
+#
+# Aliased from git_ops rather than re-declared: `_await_index_lock_clear`
+# short-circuits its stand-off on the SAME bar (waiting cannot change a
+# verdict that is already "crashed leftover"), and a drift between the two
+# would mean skipping the wait without then explaining why.  The import
+# direction merge_gates -> git_ops is already established above.
+_STALE_LOCK_FLOOR_S = _INDEX_LOCK_STALE_FLOOR_S
 
 
 async def _rebase_delta_touched_overlap(
