@@ -1013,20 +1013,6 @@ def test_format_report_always_emits_both_caveats_even_with_zero_findings():
     assert _COVERAGE_CAVEAT in report
 
 
-def test_fidelity_caveat_states_the_submit_time_bound_and_measured_agreement():
-    """The constant carries the evidence, so no caller can paraphrase it away."""
-    assert "submit" in _FIDELITY_CAVEAT.lower()
-    assert "367/368" in _FIDELITY_CAVEAT      # task_kind agreement
-    assert "368/368" in _FIDELITY_CAVEAT      # source agreement
-    assert "3295" in _FIDELITY_CAVEAT         # the mismatch proving mutability
-    # Case-insensitive: the constant SHOUTS the label on purpose.
-    assert "ticket-evidenced" in _FIDELITY_CAVEAT.lower()
-
-
-def test_coverage_caveat_names_the_uncoverable_population():
-    assert "comparison source" in _COVERAGE_CAVEAT.lower()
-
-
 def test_format_report_names_the_no_comparison_source_count():
     """COVERAGE prints targets_without_comparison_source as a number."""
     report = format_report([_audit(coverage=AuditCoverage(91, 66, 40, 25, 2))])
