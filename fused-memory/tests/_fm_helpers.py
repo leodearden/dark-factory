@@ -12,6 +12,7 @@ import contextlib
 import functools
 import inspect
 import json
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -632,6 +633,29 @@ def ensure_fresh_collection(
         client.create_collection(
             collection_name=collection_name, vectors_config=vectors_config,
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared FalkorDB test scaffolding (task 3502)
+# ---------------------------------------------------------------------------
+#
+# De-duplicates the _falkor_available()/FALKOR_HOST/FALKOR_PORT/skip-marker
+# scaffolding that was forked — byte-identical modulo docstring — across six
+# live-FalkorDB test modules: test_list_indices_integration.py,
+# test_falkor_fulltext_integration.py, test_merge_entities.py,
+# test_startup_identity_scan.py, test_reassign_edge.py and
+# test_refresh_entity_summary.py. Three of those docstrings literally said
+# "mirrors test_merge_entities.py" / "mirrors test_list_indices_integration.py",
+# so the copy-paste was self-documented.
+#
+# Deliberately placed directly after the Qdrant section above so the two
+# reachability-probe pairs (constants → probe → skipif factory) sit adjacent
+# and read as one convention. tests/test_falkor_probe_routing_guard.py
+# enforces that no test module re-forks this scaffolding.
+# ---------------------------------------------------------------------------
+
+FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
+FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
 
 
 # ---------------------------------------------------------------------------
