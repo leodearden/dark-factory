@@ -322,18 +322,24 @@ def test_index_html_registers_esc_flow_diagram_load_order(index_html_body: str) 
 
 
 def test_index_html_cache_buster_bumped_for_esc_flow(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must still share a single
-    version, and that version must be >= 33 (the uniform bump that
-    accompanies registering the two new esc_flow_* files).
+    """Every /static/redux/* asset must be at or past the floor that
+    accompanies registering the two new esc_flow_* files.
+
+    FLOOR only: whether the versions are UNIFORM is asserted once,
+    canonically, in test_index_html.py. It was replicated byte-identically
+    across five test modules, each with its own stale monotonic floor, so a
+    partial bump failed five tests with five different floors in the
+    message. `min(...)` is the strictly stronger floor claim under mixed
+    versions anyway — the OLDEST asset is the one that serves stale code.
     """
-    versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
-        'bump all of them uniformly to the same value.'
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    v = int(next(iter(versions)))
-    assert v >= 33, (
-        f'index.html cache-buster version is {v}, expected >= 33 (uniform bump for esc_flow_* registration).'
+    assert min(versions) >= 33, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        'expected >= 33 (the floor esc_flow_* registration landed at).'
     )
 
 
