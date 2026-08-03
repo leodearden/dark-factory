@@ -451,6 +451,58 @@ def test_scaffold_helpers_are_importable(tmp_path: Path):
     )
 
 
+def test_foreign_holder_fixture_survives_a_transient_empty_holder_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The fixture's own attribution must survive ONE bad ``/proc/locks`` read.
+
+    Reproduces the observed flake deterministically, against a REAL
+    ``flock(1)`` foreign holder: :func:`lane_lock_holder_pids` is wrapped so
+    it returns an empty snapshot on its FIRST call — exactly the transient
+    ``assert 658016 in []`` observed under 16-worker xdist load — and
+    delegates to the real probe on every later call.
+
+    Today, :func:`foreign_lane_lock_holder` never reads
+    ``lane_lock_holder_pids`` before yielding — its startup gate checks a
+    probe *acquire* instead, and its only read of ``lane_lock_holder_pids``
+    is in TEARDOWN, after the child is already dead.  So the injected empty
+    snapshot is consumed by THIS test's own single read below, and the
+    assertion fails exactly as the reported flake did:
+    ``assert <child.pid> in []``.  Once the fixture itself polls for
+    attribution (step-4), it is the one that absorbs the bad read, and this
+    test's single read lands on a settled, real snapshot instead.
+    """
+    calls: list[Path] = []
+    real_reader = lane_lock_holder_pids
+
+    def _flaky(path: Path) -> list[int]:
+        calls.append(path)
+        if len(calls) == 1:
+            return []
+        return real_reader(path)
+
+    monkeypatch.setattr('test_lane_lock_leak_guard.lane_lock_holder_pids', _flaky)
+
+    lock_path = lane_lock_path(tmp_path / 'lane')
+    with foreign_lane_lock_holder(lock_path) as child:
+        holders = lane_lock_holder_pids(lock_path)  # deliberately a bare single read
+        assert child.pid in holders, (
+            f'the fixture must not yield until the KERNEL names the child as '
+            f'the holder, or every "the foreign holder" assertion downstream '
+            f'is racing /proc/locks settling — even a single transient empty '
+            f'read (exactly what was observed: assert <pid> in []) would '
+            f'defeat it; got holders={holders!r}'
+        )
+
+    assert len(calls) > 1, (
+        f'the fixture must actually have read lane_lock_holder_pids more '
+        f'than once — absorbing the injected empty read, then settling on a '
+        f'real one — or a fixture that merely happened to skip the bad read '
+        f'would pass this test vacuously; reader was called {len(calls)} '
+        f'time(s)'
+    )
+
+
 @pytest.mark.asyncio
 async def test_scaffold_real_git_fixtures_available(real_git_ops):
     """Smoke pin: the imported real-git fixtures resolve in THIS module.
