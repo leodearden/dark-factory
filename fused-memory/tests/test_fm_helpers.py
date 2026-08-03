@@ -642,8 +642,10 @@ class TestFalkorHelpers:
 
         assert isinstance(FALKOR_HOST, str)
         assert isinstance(FALKOR_PORT, int)
-        assert FALKOR_HOST == _falkor_host_from_env()
-        assert FALKOR_PORT == _falkor_port_from_env()
+        # Operand order is ruff SIM300's (it reads an UPPER_CASE name as the
+        # literal-like side); the assertion is the same either way.
+        assert _falkor_host_from_env() == FALKOR_HOST
+        assert _falkor_port_from_env() == FALKOR_PORT
 
     def test_falkor_available_true_when_client_ok(self, monkeypatch):
         """_falkor_available() returns True when construct, query, and close all succeed."""

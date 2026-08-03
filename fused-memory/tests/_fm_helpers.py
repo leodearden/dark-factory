@@ -655,8 +655,40 @@ def ensure_fresh_collection(
 # enforces that no test module re-forks this scaffolding.
 # ---------------------------------------------------------------------------
 
-FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
-FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
+def _falkor_host_from_env() -> str:
+    """Derive the FalkorDB host from FALKOR_HOST, defaulting to localhost.
+
+    Extracted from the bare module-level expression that fed FALKOR_HOST so
+    the derivation — the part actually worth testing — is reachable at call
+    time. As an inline expression it could only be exercised via
+    ``importlib.reload``, so a unit test could pin nothing but the literal
+    default, which coupled the default `-m 'not integration'` lane to the
+    operator's environment: a set FALKOR_HOST turned an unrelated test red.
+    """
+    return os.environ.get('FALKOR_HOST', 'localhost')
+
+
+def _falkor_port_from_env() -> int:
+    """Derive the FalkorDB port from FALKOR_PORT, defaulting to 6379.
+
+    The ``int()`` is load-bearing, not cosmetic: ``os.environ`` yields str, and
+    ``FalkorDB(port='6379')`` fails or misbehaves on a str port. All six forks
+    wrote the coercion for exactly this reason. It is now genuinely pinned by
+    ``test_falkor_port_from_env_coerces_to_int``, which overrides the variable;
+    the previous test asserted only the literal default, so dropping the
+    ``int()`` would have gone unnoticed.
+
+    See ``_falkor_host_from_env`` for why the derivation is a named function
+    rather than an inline expression.
+    """
+    return int(os.environ.get('FALKOR_PORT', '6379'))
+
+
+# Evaluated once at import, exactly as the six forks evaluated their own copies
+# at their own module import — every consumer keeps importing these constants
+# unchanged. Only *where* the expression lives has moved.
+FALKOR_HOST: str = _falkor_host_from_env()
+FALKOR_PORT: int = _falkor_port_from_env()
 
 
 def _falkor_available() -> bool:
