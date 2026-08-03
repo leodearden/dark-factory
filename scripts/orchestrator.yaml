@@ -1,33 +1,104 @@
 # Scripts orchestrator configuration
 #
-# Two different trees are in play here, and the distinction is load-bearing:
-# test_command runs the tests/scripts/ suite (see the note below), while
-# lint_command lints this directory, scripts/. Bash scripts
+# TWO NEAR-HOMOGRAPH TREES are in play here, and telling them apart is
+# load-bearing throughout this file: `tests/scripts/` (at the repo root) and
+# `scripts/tests/` (this directory's own suite). test_command runs BOTH — see
+# the closure record below for why neither can be dropped — while lint_command
+# and type_check_command cover this directory, scripts/. Bash scripts
 # (verify-migration.sh, migrate.sh, etc.) are not linted by either — ruff only
 # reads .py.
 #
-# Pin --project shared: tests/scripts/ lives at the repo root and is not itself a
-# workspace member, so a bare `uv run pytest` resolves against the workspace-ROOT
+# Pin --project shared: NEITHER target directory is a workspace member
+# (tests/scripts/ lives at the repo root; scripts/tests/ is under a non-member
+# directory), so a bare `uv run pytest` resolves against the workspace-ROOT
 # project (dark-factory), which declares no deps and no pytest -> verify dies with
 # "Failed to spawn: pytest" on a freshly-synced venv (e.g. a fresh _merge-* verify
 # worktree). shared is a member that declares pytest, and the scripts tests import
-# no first-party package, so its env suffices. No --directory, so cwd stays at the
-# worktree root and the tests/scripts/ path still resolves. Mirrors the other
-# subprojects' --project <member> convention.
-test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
+# no first-party package, so its env suffices — pre-1 confirmed the
+# `uv run --project shared` environment does collect and run all 40 modules under
+# scripts/tests/. No --directory, so cwd stays at the worktree root and BOTH
+# relative target paths still resolve. Mirrors the other subprojects'
+# --project <member> convention.
+test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300"
 
-# COVERAGE GAP in the command above, recorded rather than left invisible
-# (task 3445, follow-up 3460). This command targets tests/scripts/, but this
-# directory has 40 test modules of its own under scripts/tests/, and NO
-# full-suite command anywhere targets them: the repo-root fleet chain also ends
-# in `pytest tests/scripts/`. FILE_SCOPED pytest does narrow correctly when a
-# scripts/tests/ file is touched (verified: it renders `pytest
-# scripts/tests/<file>.py`), so those tests are not wholly ungated — but under
-# FULL_SUITE and merge-role merge_verify_breadth=full, scripts/tests/ never
-# runs. Note this also corrects tests/scripts/orchestrator.yaml's comment,
-# which asserts "scripts/ has no tests of its own". Distinct from the
-# duplicate-run COST that file already records for the byte-identical
-# test_command; fixing 3460 would resolve both.
+# COVERAGE GAP CLOSED (task 3460, opened and recorded by task 3445). Kept as a
+# closure record rather than deleted, because the reason this is a UNION and
+# not a swap is not recoverable from the command alone.
+#
+# WHAT WAS CLOSED. This command used to target only tests/scripts/, while this
+# directory has 40 test modules of its own under scripts/tests/. All three
+# production paths that reach the FULL_SUITE form ran the wrong tree —
+# measured live through the derive_verify_plan ->
+# verify._executed_module_configs_from_plan bridge before the fix:
+#
+#   * verify_plan._derive_module_runs arm 3, the task-3294 source-only floor,
+#     runs the owning module's test_command VERBATIM for ANY scripts/
+#     production diff. Touching scripts/legibility/census_trigger.py rendered
+#     `pytest tests/scripts/` at scope full_suite, so its own counterpart tests
+#     in scripts/tests/test_census_trigger.py never ran.
+#   * The same function's CONFTEST trigger (arm 1). Touching
+#     scripts/tests/conftest.py — the conftest of the very directory — also
+#     rendered `pytest tests/scripts/`, so the widening bought nothing for the
+#     suite it was widened for.
+#   * verify_plan._derive_full_suite_runs, the merge-role
+#     merge_verify_breadth=full deriver the repo root enables, which never
+#     consults the diff at all.
+#
+# Only the arm-4b FILE_SCOPED path (a touched scripts/tests/test_*.py, which
+# renders `pytest scripts/tests/<file>.py`) narrowed correctly, which is why
+# the gap survived: nothing reported skipped and nothing exited non-zero. The
+# command was present and green; it simply collected the sibling tree. Symbol
+# citations, not file:line, for the reason the LINT block below records.
+#
+# WHY A UNION AND NOT A SWAP to scripts/tests/ alone — which would additionally
+# have resolved the duplicate-run cost, and was rejected for that reason.
+# tests/scripts/ genuinely tests scripts/ PRODUCTION code, not merely config:
+# test_orchestrator_watchdog.py <-> scripts/orchestrator-watchdog.py, plus
+# test_spawn_claude.py, test_check_dashboard_unit_parity.py,
+# test_check_fused_memory_unit_parity.py, test_restart_all_orchestrators.py,
+# test_migrate_metadata_modules_to_files.py, test_repair_wiped_metadata_files.py
+# and test_dashboard_watchdog.py. Because arm 3 runs this command verbatim for
+# every scripts/ production diff, a swap would STOP running those tests for
+# exactly the diffs they cover — trading one coverage gap for another. Coverage
+# must be MONOTONE in the diff, the same principle task 3294 encoded when it
+# moved the floor above the collectable-test branch. The target ORDER and
+# spelling copy the repo-root fleet chain's trailing segment
+# (`pytest tests/scripts/ scripts/tests/`, task 3384 / commit 1eaaf26ab9)
+# verbatim, so the fallback path and this module config cannot drift into two
+# different notions of "the scripts suites". Guarded by
+# tests/scripts/test_scripts_module_config.py::
+# test_scripts_full_suite_pytest_covers_scripts_tests, whose assertion (5) is
+# what rejects a future narrowing back to one directory.
+#
+# MEASURED GREEN BEFORE SWITCHING, on this exact string, two runs at base main
+# b3155c13c7 — non-optional, because verify.run_full_verification
+# asyncio-gathers over ALL module_configs.values() and the repo root sets
+# merge_verify_breadth: "full", so a red command here blocks every merge, review
+# checkpoint and main-tip sweep repo-wide on branches with no defect:
+#
+#   run 1   exit 0   1926 passed, 1 skipped   430.96s pytest / 444.17s wall
+#   run 2   exit 0   1926 passed, 1 skipped   518.61s pytest / 565.37s wall
+#
+# Both figures are recorded rather than only the convenient one: the ~20%
+# run-to-run spread is this oversubscribed host, the same effect
+# tests/scripts/orchestrator.yaml's budget block sizes against.
+#
+# verify_command_timeout_secs stays UNSET here, so this module keeps inheriting
+# the repo-root whole-fleet 3600s ceiling — see the note at the bottom of this
+# file; sizing it remains follow-up 3458's. The risk direction is safe: this
+# command is strictly longer than the one it replaces but the slower measured
+# run is ~6.4x under that ceiling, and guessing a tight budget here could
+# red-wall every merge repo-wide under load, which not setting one cannot.
+#
+# THE DUPLICATE-RUN COST IS NOT RESOLVED BY THIS CHANGE. tests/scripts/ still
+# executes twice per full verify — once from this config and once from the
+# tests/scripts config — for the two structural reasons recorded in
+# tests/scripts/orchestrator.yaml's KNOWN COST block: run_full_verification
+# does not dedupe by command, and workflow._resolve_module_configs dedupes by
+# mc.prefix. That remains task 3383's, whose real fix is a dedupe-by-command
+# guard in run_full_verification — production code of a different class from a
+# yaml command edit. Note 3383's own "BYTE-IDENTICAL test_commands" framing is
+# now stale (these two commands differ); its substance survives unchanged.
 
 # LINT IS DECLARED DELIBERATELY (task 3445).
 #
