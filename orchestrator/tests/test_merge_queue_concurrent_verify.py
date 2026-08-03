@@ -188,9 +188,8 @@ HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
 # task 3492: two classes are deliberately left WITHOUT a HEAVY_BARRIER_TEST_TIMEOUT
 # mark, so the omission reads as a decision, not an oversight:
 #   - TestRunInflightVerifyAbortPoll: four test_* methods at 45s each -- 45s
-#     worst-METHOD, under the 60s pyproject ceiling. A class-wide SUM would
-#     wrongly flag this class at 180s; per-method max is the correct unit
-#     because pytest-timeout applies the mark to each method independently.
+#     worst-METHOD, under the 60s pyproject ceiling (why per-method, not a
+#     class-wide sum: see _worst_per_method_wait_budget's docstring below).
 #   - TestAwaitOutcomeHelper: 45s nominal (_await_outcome's default), but the
 #     future under test is pre-resolved, so real elapsed time is ~0.
 
@@ -5327,24 +5326,14 @@ class TestAwaitOutcomeHelper:
 
 
 class TestWaitBudgetAuditHelper:
-    """`_worst_per_method_wait_budget` statically scans a module's source and
-    computes, per `Test*` class, the MAX over its `test_*` methods of that
-    method's summed sequential real-time wait budget.
-
-    This is the audit engine behind task 3492's guard. pytest-timeout's
-    class-level `@pytest.mark.timeout` mark applies to EACH test method
-    independently, not to the class total, so the unit that matters is
-    per-method, not a class-wide sum (see the plan's design decision: a
-    class-wide sum would both false-positive on many-light-methods classes
-    like `TestRunInflightVerifyAbortPoll` and could dilute one heavy method
-    below the threshold).
+    """Unit tests for `_worst_per_method_wait_budget`, task 3492's audit
+    engine -- see ITS docstring for the full per-method-vs-class-wide-sum
+    and shape-floor/branch-blind rationale; this class only pins the
+    observable behaviour case by case.
 
     Every case here is driven from a SYNTHETIC source string, not this
     module's own source, so these tests are provably non-vacuous and do not
     shift when this file is later edited.
-
-    RED (task 3492 step-1): `_worst_per_method_wait_budget` does not exist
-    yet -- every case below fails on NameError.
     """
 
     def test_two_sequential_wait_for_calls_sum_within_one_method(self) -> None:
@@ -5723,24 +5712,25 @@ class TestTimeoutMarkCoverage:
     under-marked can no longer land silently -- this guard recomputes the
     audit from the module's own source on every run.
 
-    The guard is a conservative FLOOR, not the whole audit: it only sees
-    `asyncio.wait_for(...)` and `_await_outcome(...)` call shapes, so it can
-    under-demand (a class the manual audit marks anyway, on the strength of
-    a wait shape the scan cannot see, is tolerated) but must never
-    over-demand a mark value the applied mark does not clear.
+    The guard is a conservative FLOOR, not the whole audit -- see
+    `_call_wait_budget`'s docstring for exactly which call shapes are
+    counted and why under-demanding (never over-demanding) is the
+    deliberate failure direction.
     """
 
     def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
         """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
         carry a `timeout` mark whose value clears its own computed budget.
 
-        RED (task 3492 step-3): six classes compute >= 60s and carry no
-        timeout mark at all -- TestSingleHostSerialByteIdentical,
-        TestOverlapSignal, TestChainInvalidationUnderOverlap,
-        TestHaltAndUnavailable, TestRunInflightVerifyRemoteCancelOnAbort,
-        TestCascadeErrorContainment. The two task-3477 cascade classes
-        already pass (HEAVY_BARRIER_TEST_TIMEOUT=300 clears their 225s
-        budget).
+        First run (task 3492 step-3, before step-4 added marks) flagged six
+        classes computing >= 60s with no timeout mark at all --
+        TestSingleHostSerialByteIdentical, TestOverlapSignal,
+        TestChainInvalidationUnderOverlap, TestHaltAndUnavailable,
+        TestRunInflightVerifyRemoteCancelOnAbort, TestCascadeErrorContainment.
+        Marks were added for those six (plus TestRedispatchSpeculativeConservation,
+        over-marked on the strength of a wait shape this scan cannot see) in
+        the same change; the two task-3477 cascade classes already passed
+        (HEAVY_BARRIER_TEST_TIMEOUT=300 clears their 225s budget).
         """
         source = Path(__file__).read_text()
         budgets = _worst_per_method_wait_budget(source)
@@ -5749,8 +5739,9 @@ class TestTimeoutMarkCoverage:
         assert not offenders, (
             'The following classes have a worst-case per-method wait '
             f'budget at or above the pyproject default timeout '
-            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see '
-            f'orchestrator/pyproject.toml:99) but lack an adequate '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see the '
+            f'[tool.pytest.ini_options].timeout setting in '
+            f'orchestrator/pyproject.toml) but lack an adequate '
             f'@pytest.mark.timeout mark:\n'
             + '\n'.join(f'  - {offender}' for offender in offenders)
             + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
