@@ -1,6 +1,7 @@
 """Tests for dashboard scaffold: config, app, and fixtures."""
 
 import dataclasses
+import logging
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,57 @@ class TestConfigEnvOverrides:
         cfg = DashboardConfig.from_env()
         assert cfg.reconciliation_db == Path('/tmp/test/data/reconciliation/reconciliation.db')
         assert cfg.worktrees_dir == Path('/tmp/test/.worktrees')
+
+    def test_unset_project_root_logs_the_cwd_fallback_at_info(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """An un-configured root must be observable, not an invisible fallback.
+
+        Scoped to the ``dashboard.config`` logger at INFO so the pre-existing
+        ``_discover_escalation_urls`` WARNINGs in the same module can neither
+        satisfy nor break these assertions.
+        """
+        monkeypatch.delenv('DASHBOARD_PROJECT_ROOT', raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='dashboard.config'):
+            cfg = DashboardConfig.from_env()
+
+        # Filter on INFO level, not merely on "names the root": the pre-existing
+        # _discover_escalation_urls WARNING also names the root, so a
+        # level-agnostic filter would both be satisfied by it and be broken by
+        # it (two matches instead of one).  Requiring exactly one INFO record
+        # therefore pins BOTH that the fallback is logged and that it is logged
+        # at INFO — a future "upgrade" to WARNING yields zero INFO records and
+        # fails here.
+        #
+        # INFO, not WARNING, deliberately: the canonical deployment relies on
+        # the cwd path by design (WorkingDirectory is pinned on purpose), so a
+        # WARNING would cry wolf on the supported configuration.
+        fallback_records = [
+            r
+            for r in caplog.records
+            if r.name == 'dashboard.config'
+            and r.levelno == logging.INFO
+            and str(cfg.project_root) in r.getMessage()
+        ]
+        assert len(fallback_records) == 1, (
+            f'expected exactly one INFO record naming the cwd-derived root '
+            f'{cfg.project_root}, got '
+            f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+
+    def test_set_project_root_logs_no_fallback(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', str(tmp_path))
+
+        with caplog.at_level(logging.INFO, logger='dashboard.config'):
+            DashboardConfig.from_env()
+
+        assert not [
+            r
+            for r in caplog.records
+            if r.name == 'dashboard.config' and r.levelno == logging.INFO
+        ], 'an explicitly-configured root must not emit a fallback record'
 
 
 class TestManagedRuntimeEnvOverrides:
