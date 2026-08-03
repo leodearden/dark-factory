@@ -536,6 +536,56 @@ def test_foreign_holder_fixture_survives_a_transient_empty_holder_read(
     )
 
 
+def test_foreign_holder_fixture_fails_loudly_when_attribution_never_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The attribution gate's FAILURE arm: a kernel that never settles must fail loudly.
+
+    Only the transient-single-bad-read path is pinned above. A regression
+    that inverted the gate's ``if child.pid not in holders:`` condition, or
+    that raised without killing the process group first, would let every
+    downstream "the foreign holder" assertion go back to racing
+    ``/proc/locks`` while this whole suite stayed green — precisely the
+    failure mode task 3598 exists to prevent.
+
+    Patches ``wait_for_lane_lock_holder`` itself — the exact symbol
+    ``foreign_lane_lock_holder``'s attribution gate calls by bare name — to a
+    fake that always reports "no holders", rather than patching the
+    lower-level ``lane_lock_holder_pids``. The latter would ALSO defeat the
+    fixture's teardown poll (which reads the very same function to confirm
+    the killed child has genuinely released the lock), racing this test's own
+    post-block verification against a real SIGKILL under load — precisely
+    the single-shot-read hazard this task exists to fix. Patching the
+    higher-level poll leaves the teardown poll's real, bounded kernel reads
+    untouched, so the verification below is itself race-free.
+    """
+    def _never_attributed(*_args, **_kwargs) -> list[int]:
+        return []
+
+    monkeypatch.setattr(sys.modules[__name__], 'wait_for_lane_lock_holder', _never_attributed)
+
+    lock_path = lane_lock_path(tmp_path / 'lane')
+    with pytest.raises(pytest.fail.Exception, match='does not attribute it'):
+        with foreign_lane_lock_holder(lock_path):
+            pytest.fail(
+                'unreachable: the fixture must fail before yielding when '
+                'attribution never settles'
+            )
+
+    # The gate's side effect: it must kill the foreign holder's process
+    # group before failing, not merely raise and leave it running. A
+    # genuinely killed child releases the flock, so a fresh probe-acquire
+    # now succeeds; a gate that raised without cleaning up would leave the
+    # lock held, and this probe would return None instead.
+    probe = acquire_merge_verify_flock(lock_path, 0.0)
+    assert probe is not None, (
+        'the gate must kill the foreign-holder process group before '
+        'failing — a broken gate that raised without cleaning up would '
+        'leak the held lane lock past this very test'
+    )
+    release_merge_verify_flock(probe)
+
+
 def test_foreign_holder_bounds_clear_measured_spawn_latency():
     """Both foreign-holder bounds must clear a MEASURED worst-case spawn latency.
 
