@@ -277,12 +277,20 @@ class QueueConfig(BaseModel):
     max_attempts: int = Field(default=5)
     retry_base_seconds: float = Field(default=5.0)
     retry_max_delay_seconds: float = Field(default=300.0)
-    # Error-aware retry budget (task 1936): known-transient errors (e.g.
-    # graphiti_core's NodeNotFoundError — a graph-visibility race) get this
-    # longer attempts ceiling instead of max_attempts. Keep this default list
-    # in sync with durable_queue.DEFAULT_TRANSIENT_ERROR_NAMES — drift is
-    # caught by test_config_schema.py::
+    # Error-aware retry budget (task 1936): known-transient errors (e.g. a
+    # connection reset or backend timeout) get this longer attempts ceiling
+    # instead of max_attempts. Keep this default list in sync with
+    # durable_queue.DEFAULT_TRANSIENT_ERROR_NAMES — drift is caught by
+    # test_config_schema.py::
     # TestQueueConfigTransientErrorFields::test_transient_error_names_matches_durable_queue_default.
+    #
+    # 1936's original wording gave "graphiti_core's NodeNotFoundError — a
+    # graph-visibility race" as the example. That premise was refuted by the
+    # esc-3561-3 investigation (2026-08-03) and the example has been replaced
+    # here to stop propagating it. The authoritative caveat, including the
+    # topology assumption that would make it defensible again, lives beside
+    # DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py; task 3585 owns the
+    # removal itself.
     transient_max_attempts: int = Field(default=12)
     transient_error_names: list[str] = Field(default_factory=lambda: [
         'NodeNotFoundError',

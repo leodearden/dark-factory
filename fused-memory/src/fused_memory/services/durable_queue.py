@@ -33,6 +33,30 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # Name-based matching avoids a hard dependency on graphiti_core from this
 # generic SQLite write-queue component. Keep in sync with
 # config.schema.QueueConfig.transient_error_names' default.
+#
+# TOPOLOGY CAVEAT on the not-found entries (task 3585, esc-3561-3).
+# 'NodeNotFoundError' was added here by task 1936 on the hypothesis of a "node
+# -visibility race". Two independent lines of evidence say that premise does
+# not hold as things stand, and they do NOT age the same way:
+#
+#   * Empirical, and topology-independent: across all 28 recorded add_episode
+#     calls there were 304 execution attempts and 0 successes; one was retried
+#     55 times across replays and never converged. A visibility race
+#     converges. 1936's own motivating incident (dead-letter id 8533) was in
+#     fact the self-referential add_episode uuid bug that task 3561 fixes —
+#     not a race at all.
+#
+#   * Topology-dependent, AND THIS HALF EXPIRES: graphiti_core's by-uuid
+#     lookups pass routing_='r', which can land on a lagging follower only on
+#     a CLUSTERED, read-routed backend. We run a single FalkorDB container
+#     with no replicas, and every Graphiti write for a group_id serialises
+#     under MemoryService's per-group identity lock, so that window is
+#     ~nil here.
+#
+# If Graphiti ever moves to a clustered or read-routed backend, the second
+# argument lapses and an extended budget for the not-found family becomes
+# defensible again. Revisit this set at that point — its removal is a
+# judgement about the CURRENT deployment, not a fact settled for all time.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
     'NodeNotFoundError',
     'EdgeNotFoundError',
