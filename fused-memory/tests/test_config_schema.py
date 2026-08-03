@@ -1492,8 +1492,9 @@ class TestProceduralTopicGuardClustersDefault:
 
     Mix of known-contradictory (plan-tools, venv-shadowing, architect
     report_task_already_done main-reachability) and known-recurring
-    (pytest-xdist, architect plan-revalidation after requeue/lock) topics --
-    see the >=5 count and the per-topic-id assertions below.
+    (pytest-xdist, architect plan-revalidation after requeue/lock, `ruff
+    format` not an enforced gate) topics -- see the >=5 count and the
+    per-topic-id assertions below.
     """
 
     def test_default_seeds_non_empty_clusters(self):

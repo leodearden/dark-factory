@@ -581,7 +581,12 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     families: report_task_already_done / main-reachable-commit, registered
     prospectively ahead of still-open gate 3011; and plan-revalidation after
     requeue/lock, gated to already-adjudicated task 2973 (canonical Mem0
-    entries 6a96a020 / 974b0adb).
+    entries 6a96a020 / 974b0adb). The sixth (task 3435) seeds the
+    "``ruff format`` is not an enforced gate; only ``ruff check`` / pyright
+    gate commits" family, registered prospectively ahead of still-blocked
+    gate 3342 -- the first cluster whose corpus spans BOTH
+    ``procedural_knowledge`` and ``preferences_and_norms`` (11 + 3 of its 14
+    entries), which is how it grew uncaught.
     Operator-overridable / tunable via config (green-tier hot-reloadable).
     """
     return [
@@ -722,6 +727,79 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 '974b0adb-ed54-44bd-aa12-aeaeae8b3ea6. Do NOT add another entry '
                 '-- update/consolidate the existing entries, or add context to '
                 'gate task 2973.'
+            ),
+        ),
+        ProceduralTopicCluster(
+            topic_id='ruff-format-not-an-enforced-gate',
+            # Reviewer (robustness, task 3435): phrases are literal substrings
+            # drawn VERBATIM from gate task 3342's
+            # metadata.mem0_entries_to_adjudicate corpus, and all 14 entries
+            # were verified to reach >= 2 distinct hits against this list
+            # (min observed 2, max 4). The two newest preferences_and_norms
+            # entries -- e8c5eb3f (orchestrator/merge_types.py hand-aligned
+            # comments) and c565afd0 (general dark-factory claim) -- sit
+            # exactly AT the threshold on the 'ruff format' + 'ruff check'
+            # anchor pair and nothing else, which is why 'ruff check' cannot
+            # be dropped despite being the most generic of the five.
+            #
+            # NESTING EXCLUSION: 'ruff format --check' / '--diff' / '--write'
+            # are deliberately omitted because each NESTS inside bare
+            # 'ruff format'. The matcher counts DISTINCT phrases present as
+            # plain substrings, so seeding both would let ONE occurrence of
+            # the flag-suffixed form score 2 hits by itself and satisfy
+            # min_phrase_hits alone -- defeating that field's stated purpose
+            # ("Default 2 so a single incidental keyword never triggers a
+            # false block"). Omitting them costs zero coverage: every corpus
+            # entry containing a flag-suffixed form also contains bare
+            # 'ruff format'. This hazard is new to this cluster (the earlier
+            # seeds' phrases barely interact), so a no-phrase-nests-inside-
+            # another invariant test guards it against a well-meaning
+            # re-introduction.
+            #
+            # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
+            # above): 'lint_command', 'pre-existing' and 'quality gate' are
+            # too short/generic and would substring-match unrelated config or
+            # formatting notes. 'not a quality gate' is excluded for a
+            # different, structural reason even though it is a verbatim
+            # literal from c565afd0: it contains no ruff-format-specific
+            # token, so it could pair with 'ruff check' to reach threshold on
+            # a note about a DIFFERENT tool ("mypy is not a quality gate
+            # here; we use ruff check"). Every phrase kept is either
+            # ruff-specific or gate-specific-and-rare.
+            #
+            # ACCEPTED RESIDUAL (mirroring the bare '-n0' note above): a
+            # routine note naming both tools ("I ran ruff check and ruff
+            # format before committing") reaches 2 hits. Accepted, because
+            # the block is SOFT and merely routes the writer to gate 3342,
+            # and because raising min_phrase_hits to 3 is not available -- no
+            # third phrase co-occurs across the corpus, so a 3-hit cluster
+            # would MISS most of the 14 real entries and become exactly the
+            # silent no-op guard this module treats as strictly worse than a
+            # loud one.
+            #
+            # Registered prospectively while gate 3342 is still blocked,
+            # following the task-3013 precedent: the guard is forward-looking
+            # (it only blocks NEW near-dup writes), so seeding now stops the
+            # cluster growing further while the consolidation ruling is
+            # parked. 11 of the 14 entries are procedural_knowledge -- the
+            # category the guard covers today -- so the seed bites
+            # immediately; the preferences_and_norms half activates when
+            # companion task 3430's category generalization lands.
+            phrases=[
+                'ruff format',
+                'ruff check',
+                'enforced gate',
+                'enforced lint gate',
+                'format-clean',
+            ],
+            min_phrase_hits=2,
+            hint=(
+                'Known-recurring topic (`ruff format` is not an enforced gate; '
+                'only `ruff check` / pyright gate commits) gated to human task '
+                '3342, whose ~14-entry cluster spans BOTH procedural_knowledge '
+                'and preferences_and_norms and is still awaiting a consolidation '
+                'ruling. Do NOT add another entry -- update/consolidate the '
+                'existing entries, or add context to gate task 3342.'
             ),
         ),
     ]
