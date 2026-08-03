@@ -86,6 +86,16 @@ def _assert_lifespan_config_is_isolated(basetemp: Path) -> None:
     ):
         assert db_path.is_relative_to(root), f'{label} {db_path} escapes project_root {root}'
 
+    # project_root is not the only root the app opens databases under:
+    # _project_scoped_dbs / _cost_dbs / _performance_resources (app.py) and
+    # data/burndown.py fan out DbPool.get(root / 'data/orchestrator/runs.db')
+    # over every known_project_roots entry too.  Any entry outside pytest's
+    # basetemp is another live WAL database opened by the suite.
+    assert all(r.is_relative_to(basetemp.resolve()) for r in cfg.known_project_roots), (
+        f'known_project_roots escapes pytest basetemp {basetemp}: '
+        f'{cfg.known_project_roots}'
+    )
+
 
 class TestLifespanProjectRootIsolation:
     def test_function_scoped_client_is_isolated(self, client, tmp_path_factory):
@@ -151,3 +161,40 @@ class TestApplyIsolatedEnvNeutralizesAmbientRuntimeDirs:
                     f'{label} {path} is not under the isolated project_root '
                     f'{cfg.project_root}'
                 )
+
+
+class TestApplyIsolatedEnvNeutralizesAmbientKnownRoots:
+    """Redirecting ``project_root`` is not sufficient isolation either.
+
+    ``from_env()`` reads ``DASHBOARD_KNOWN_PROJECT_ROOTS`` into
+    ``known_project_roots``, and ``_project_scoped_dbs`` / ``_cost_dbs`` /
+    ``_performance_resources`` (dashboard/src/dashboard/app.py) plus
+    ``data/burndown.py`` fan out ``DbPool.get(root / 'data/orchestrator/runs.db')``
+    over EVERY entry — so an ambient value read-only-opens live WAL databases in
+    whatever checkouts the operator registered, the same task-3466
+    ``SQLITE_READONLY_RECOVERY`` class as the ``project_root`` path.
+
+    The lifespan assertions above pass vacuously when this var happens to be
+    unset in the running environment (it is, here), so the contract is pinned
+    non-vacuously here with a decoy — mirroring the installed dashboard systemd
+    unit, which does set it.
+    """
+
+    def test_decoy_known_project_roots_do_not_survive(self, tmp_path):
+        from dashboard.config import DashboardConfig
+
+        decoy_a = tmp_path / 'decoy-checkout-a'
+        decoy_b = tmp_path / 'decoy-checkout-b'
+        isolated_root = tmp_path / 'isolated'
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', f'{decoy_a},{decoy_b}')
+
+            apply_isolated_env(mp, isolated_root)
+            cfg = DashboardConfig.from_env()
+
+            assert cfg.known_project_roots == [], (
+                f'known_project_roots followed the ambient decoy env var: '
+                f'{cfg.known_project_roots} — every entry gets a '
+                f"DbPool.get(root / 'data/orchestrator/runs.db')"
+            )
