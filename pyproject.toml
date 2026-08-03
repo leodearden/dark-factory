@@ -44,18 +44,20 @@ venv = ".venv"
 markers = [
     "smoke: live smoke tests requiring a real X11/tmux host (DISPLAY, wmctrl/xdotool/xprop/tmux, python3-tk); deselect: -m 'not smoke'",
     "integration: live tests requiring real external services/credentials (live Claude CLI + OAuth accounts, real Qdrant/OpenAI); deselect: -m 'not integration'",
+    "warm_lane_bash: the ported warm-lane bash bucket in orchestrator/tests/test_warm_lane_bash_suite.py, which shells out to tests/warm-lane/ (task 3073). Deselected from the default suite by orchestrator/pyproject.toml and re-selected post-merge by the `warm-lane-bash` LaneCommand, whose explicit CLI `-m warm_lane_bash` overrides addopts (last wins) and is therefore unaffected by this mirror; deselect: -m 'not warm_lane_bash'",
 ]
 # pytest reads exactly ONE [tool.pytest.ini_options] — the rootdir's inifile —
 # and never merges addopts/markers across pyproject.toml files. So any marker a
 # workspace member deselects must be MIRRORED here, or that member's decision is
 # silently ignored on every root-bound run (`-c pyproject.toml`, a bare `pytest`
 # from the repo root, or any arg set spanning two subprojects) and those tests
-# RUN. Owners today: `smoke` (cockpit), `integration` (shared, fused-memory).
+# RUN. Owners today: `smoke` (cockpit), `integration` (shared, fused-memory),
+# `warm_lane_bash` (orchestrator).
 # Enforced by tests/scripts/test_pytest_workspace_collection.py
 # ::test_root_pyproject_mirrors_member_marker_deselections.
 #
 # ONE combined -m expression, never two -m flags: -m is a single argparse
 # option, so a second one would silently REPLACE the first and drop that
 # deselect.
-addopts = "--import-mode=importlib -m 'not smoke and not integration'"
+addopts = "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'"
 asyncio_mode = "auto"
