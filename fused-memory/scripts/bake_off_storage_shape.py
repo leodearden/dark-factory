@@ -209,6 +209,21 @@ class Query:
     held_out: bool
 
 
+#: Query kinds the fixture encodes, and the order the artifact reports them
+#: in.  Pinned here rather than derived from whatever the loaded fixture
+#: happens to contain: a kind that stopped being generated would silently
+#: vanish from the report instead of showing up as an empty, measured-nothing
+#: row.  ``load_query_set`` validates every record's ``kind`` against this.
+QUERY_KINDS: tuple[str, ...] = ('claim', 'topic_phrasing')
+
+#: The cross-cutting subset reported alongside the kinds.  ``held_out``
+#: phrasings are the ones the E1 registry was NOT derived from, so they are
+#: the only queries that measure generalisation rather than recall of the
+#: derivation input.  It overlaps a kind by construction — it is a SUBSET,
+#: not a third kind — and is labelled that way in the artifact.
+HELD_OUT_SUBSET = 'held_out'
+
+
 @dataclass(frozen=True)
 class Distractor:
     """One contamination-slab entry (pre-4).
@@ -363,7 +378,7 @@ def load_query_set(path: str | Path = DEFAULT_QUERY_SET_PATH) -> list[Query]:
         seen.add(query_id)
         try:
             kind = record['kind']
-            if kind not in ('topic_phrasing', 'claim'):
+            if kind not in QUERY_KINDS:
                 raise FixtureError(f'{path}:{lineno}: unknown query kind {kind!r}')
             queries.append(Query(
                 query_id=query_id,
@@ -1263,6 +1278,22 @@ def tokens_returned(
 #: would measure a more generous guard than the one that is running.
 GUARD_TOP_K = 5
 
+#: The ONLY category production's near-duplicate guard covers.
+#:
+#: ``find_near_duplicate_memory``'s ``category`` parameter defaults to
+#: ``MemoryCategory.procedural_knowledge`` and filters candidates on it
+#: unconditionally (``server/near_duplicate_guard.py:88-95``), and the
+#: pre-check itself only runs on explicit procedural_knowledge writes.  So a
+#: probe of any other category cannot produce ``guard_matched`` under ANY
+#: storage shape, which puts an identical ceiling on every arm's
+#: ``guard_matched_rate`` for a reason that is not about storage shape.
+#:
+#: The STRING, not the enum: this module's pure core must import nothing from
+#: ``fused_memory`` (it is loaded by path, in tests with no package on the
+#: path), and the fixture stores categories as strings anyway.  The value is
+#: pinned against the real enum by a test.
+GUARD_COVERED_CATEGORY = 'procedural_knowledge'
+
 
 @dataclass(frozen=True)
 class ScoredHit:
@@ -1415,12 +1446,16 @@ def select_probing_write(cluster: CalibrationCluster) -> dict[str, Any] | None:
     duplicate-free, and probing them with *something* would manufacture 5
     fake measurements in a 20-row table.
 
-    Note for the report: 3 of the 15 measurable clusters have a probe whose
-    category is not ``procedural_knowledge``, which production's guard does
-    not cover at all (it runs only on explicit procedural_knowledge writes).
-    Those rows are measured the same way and flagged there rather than
-    dropped here — dropping them would hide that the guard's remit is
-    narrower than the corpus.
+    Some measurable clusters have a probe whose category is not
+    :data:`GUARD_COVERED_CATEGORY`, which production's guard does not cover at
+    all (it runs only on explicit procedural_knowledge writes, and
+    ``find_near_duplicate_memory`` filters candidates to that category
+    unconditionally).  Those rows are measured the same way rather than
+    dropped here — dropping them would hide that the guard's remit is narrower
+    than the corpus.  The disclosure is ``guard_adequacy.guard_covered_probes``
+    in the report JSON and the ``(n=covered/probes)`` suffix on the decision
+    table's guard column: without it every arm carries an identical,
+    invisible ceiling on ``guard_matched_rate``.
     """
     duplicates = [m for m in cluster.members if m.get('label') == 'duplicate']
     if not duplicates:
@@ -1712,12 +1747,20 @@ _REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
     # canonical print the best rank, so the two must travel together.
     'discoverability': ('canonical_in_top_5_rate', 'median_canonical_rank',
                         'canonical_found_count', 'canonical_candidates'),
+    # eval-design §5 E2 names claim recall and discoverability as DISTINCT
+    # metrics, and the fixture splits its queries accordingly. Required, not
+    # optional: a pooled-only report cannot tell a shape that wins on claim
+    # queries and loses on topic phrasings from one that ties on both.
+    'by_query_kind': (*QUERY_KINDS, HELD_OUT_SUBSET),
     'tokens_per_query': ('mean', 'estimator'),
     # Both halves, always: the rank-based one and the threshold replay —
     # plus the best score the replay saw, which is what separates "no
-    # candidate cleared the threshold" from "no score ever arrived".
+    # candidate cleared the threshold" from "no score ever arrived" — plus
+    # the covered-probe denominator, without which the replay column carries
+    # an identical, invisible ceiling on every arm.
     'guard_adequacy': ('candidate_present_rate', 'guard_matched_rate',
-                       'threshold_replay', 'threshold', 'max_observed_score'),
+                       'threshold_replay', 'threshold', 'max_observed_score',
+                       'probes', 'guard_covered_probes'),
 }
 
 #: What the artifact must say about how it was produced.  An arbitration
@@ -1906,6 +1949,41 @@ def _rank_cell(discoverability: dict[str, Any]) -> str:
     return f'{median} (n={found}/{candidates})'
 
 
+def _guard_cell(guard: dict[str, Any]) -> str:
+    """The threshold replay, WITH the covered denominator it is ceilinged by.
+
+    Same disclosure as :func:`_rank_cell`, for the same reason.  Production's
+    guard runs only on ``procedural_knowledge`` writes and
+    ``find_near_duplicate_memory`` filters candidates to that category
+    unconditionally, so a probe of any other category can never contribute a
+    match under ANY shape.  The rate is over ALL probes, so its ceiling is
+    ``covered/probes`` — identical across every arm, and invisible without
+    this suffix.  Today no candidate clears the threshold at all, so every
+    arm reads 0.00 and the ceiling is moot; on a rerun where one does, an
+    undisclosed 20% haircut on every arm's guard column is exactly the kind
+    of silent censoring the rank column's denominator exists to prevent.
+    """
+    rate = _cell(guard.get('guard_matched_rate'))
+    covered = guard.get('guard_covered_probes')
+    probes = guard.get('probes')
+    if covered is None or probes is None:
+        return rate
+    return f'{rate} (n={covered}/{probes})'
+
+
+def pin_bullet_prefix(shape: str) -> str:
+    """The stable, machine-findable anchor for a shape's pin bullet.
+
+    The markdown carries several bullet lists (D10's paraphrase exemplars,
+    among others), so a test that located this one by English wording — "a
+    line starting `- ` that mentions the shape AND the word 'pin'" — would
+    break on a REWORDING rather than on a wrong number, which is the opposite
+    of what it is checking.  Renderer and test both go through here, so the
+    bullet's prose is genuinely free to change.
+    """
+    return f'- **`{shape}`** —'
+
+
 #: Rendered for a pin rate that is real but rounds to zero at 2 decimals.
 #:
 #: `0.00` is the load-bearing value in this column: the artifact's own
@@ -1982,6 +2060,15 @@ def render_markdown(report: dict[str, Any]) -> str:
         '',
         'A `—` cell is **no measurement**, not a measured zero.',
         '',
+        '`guard matched (replay)` carries its denominator as `(n=covered/'
+        'probes)`.  Production\'s guard runs only on `procedural_knowledge` '
+        'writes, and `find_near_duplicate_memory` filters its candidates to '
+        'that category unconditionally, so a probe of any other category '
+        'cannot produce a match under ANY shape — a ceiling identical across '
+        'all six arms and unrelated to storage shape.  Without the suffix '
+        'that haircut is invisible in the one column a reader would otherwise '
+        'read as a shape difference.',
+        '',
         '`median canonical rank` carries its denominator as `(n=found/'
         'candidates)`.  The median is over the queries where the canonical '
         'surfaced AT ALL, so without that suffix an arm that almost never '
@@ -2017,7 +2104,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             _rank_cell(measurement['discoverability']),
             _cell(measurement['tokens_per_query']['mean'], precision=1),
             _cell(guard['candidate_present_rate']),
-            _cell(guard['guard_matched_rate']),
+            _guard_cell(guard),
             _pin_cell(measurement['pin']['window_changed_rate']),
         ]) + ' |')
 
@@ -2048,8 +2135,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         rate = on['pin']['window_changed_rate']
         moved = [block for block in pin_blocks if on[block] != off[block]]
         lines.append(
-            f'- **`{shape}`** — the pin changed {_pin_cell(rate)} of the '
-            f'measured windows; '
+            f'{pin_bullet_prefix(shape)} the pin changed {_pin_cell(rate)} of '
+            f'the measured windows; '
             + (
                 f"every metric column is unchanged from `{shape}`."
                 if not moved
@@ -2069,6 +2156,38 @@ def render_markdown(report: dict[str, Any]) -> str:
         'under a shape whose window is already full would have to PROMOTE '
         'rather than append, and that is a design choice for gate η, not a '
         'tuning knob for this experiment.',
+        '',
+        '## By query kind',
+        '',
+        'eval-design §5 E2 names claim recall and canonical/topic '
+        'discoverability as DISTINCT metrics, and the query set is authored '
+        'in two kinds for exactly that reason.  Pooled into one mean, a shape '
+        'that wins on claim queries while losing on topic phrasings is '
+        'indistinguishable from one that ties on both.  `held_out` is a '
+        'SUBSET of `topic_phrasing` — the phrasings the E1 registry was NOT '
+        'derived from, so the only ones that measure generalisation rather '
+        'than recall of the derivation input.',
+        '',
+        '| arm | kind | queries | claim recall@5 | claim recall@10 | '
+        'canonical in top-5 | median canonical rank |',
+        '| --- | --- | --- | --- | --- | --- | --- |',
+    ]
+
+    for arm in ARM_VARIANTS:
+        by_kind = report['arms'][arm]['by_query_kind']
+        for kind in (*QUERY_KINDS, HELD_OUT_SUBSET):
+            subset = by_kind[kind]
+            lines.append('| ' + ' | '.join([
+                arm,
+                kind,
+                str(subset['queries']),
+                _cell(subset['claim_recall']['at_5']),
+                _cell(subset['claim_recall']['at_10']),
+                _cell(subset['discoverability']['canonical_in_top_5_rate']),
+                _rank_cell(subset['discoverability']),
+            ]) + ' |')
+
+    lines += [
         '',
         '## D10 — audit-recall over the labeled fixture',
         '',
@@ -2115,10 +2234,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         '',
         '## Protocol',
         '',
-        f"**Blind authoring**: {protocol['blind_authoring']}.  The arm "
-        f'decomposition and query set were committed BEFORE any metric '
-        f'function existed in this tree; the commits below are the audit '
-        f'trail, and the anti-laziness floor is claim-coverage parity (every '
+        f"**Blind authoring**: {protocol['blind_authoring']}.  The commits "
+        f'below are the audit trail, and the anti-laziness floor is '
+        f'claim-coverage parity (every '
         f'claim id realizable in every arm), deliberately not length parity — '
         f"arm (a)'s long originals versus arm (c)'s short peers differ by "
         f'construction, and that difference IS the tokens/query column.',
@@ -2603,36 +2721,52 @@ async def fetch_arm(
     Guard probes drop the probing write's own record — see
     :data:`GUARD_FETCH_LIMIT`.
 
-    Bounded-concurrent, at the same :data:`SEED_CONCURRENCY` the write side
-    uses and for the same reason: serially this is 236 queries + 15 probes of
-    embed-then-ANN round trips PER ARM, and the read side had no reason to be
-    the only half paying that wall clock.  Determinism is untouched — every
-    ``_search`` is independent, and the results are keyed by ``query_id`` /
-    ``cluster_id`` rather than by arrival order, so what comes back is
-    identical whatever order it arrives in.
+    SERIAL, deliberately, and *concurrency* is accepted only to keep the
+    signature honest about the knob that was tried.
+
+    The obvious efficiency win is to bound-concurrent this the way
+    :func:`seed_arm` does — 236 queries + 15 probes per arm, 753 sequential
+    embed+ANN round trips across the three, every one of them independent and
+    keyed by ``query_id``/``cluster_id`` rather than by arrival order, so
+    concurrency changes nothing about determinism.  It was implemented at
+    ``asyncio.Semaphore(SEED_CONCURRENCY)`` and MEASURED: the live run aborted
+    partway through the second arm with
+
+        MeasurementError: _test_e2_bakeoff_e2_bakeoff_c_peers_main returned no
+        results for a 10-limit query
+
+    Hypothesis for that observation: eight concurrent searches queue behind
+    each other in mem0's client and exceed
+    ``config.queue.backend_read_timeout_seconds``, which
+    ``Mem0Client.search`` SWALLOWS — it logs and returns ``{}``.  The read
+    side is therefore the one place where concurrency converts a latency win
+    into a silently-empty ranking, and this script's whole posture is that an
+    empty ranking must never be published as a measured zero.  The write side
+    keeps its bound because ``add`` propagates its timeout instead of
+    swallowing it.
+
+    Re-derive before re-trying: a smaller bound, or a read timeout raised for
+    the run, would both be defensible — but neither is worth a report that
+    cannot be regenerated.
     """
-    semaphore = asyncio.Semaphore(concurrency)
+    del concurrency  # documented above; the serial path is the measured one
 
-    async def _bounded_search(text: str, *, limit: int) -> list[ScoredHit]:
-        async with semaphore:
-            return await _search(backend, seeded, text, limit=limit)
-
-    async def _query_hits(query: Query) -> tuple[str, list[ScoredHit]]:
-        return query.query_id, await _bounded_search(query.text, limit=limit)
-
-    async def _probe_hits(
-        cluster_id: str, probe: dict[str, Any],
-    ) -> tuple[str, list[ScoredHit]]:
-        own = probe_own_record_ids(seeded, probe['memory_id'])
-        raw = await _bounded_search(
-            probe['content'], limit=guard_fetch_limit(own),
+    fetched_queries: dict[str, list[ScoredHit]] = {}
+    for query in queries:
+        fetched_queries[query.query_id] = await _search(
+            backend, seeded, query.text, limit=limit,
         )
-        return cluster_id, [hit for hit in raw if hit.record.record_id not in own]
 
-    fetched_queries = dict(await _gather_all(_query_hits(q) for q in queries))
-    fetched_probes = dict(
-        await _gather_all(_probe_hits(cid, probe) for cid, probe in probes)
-    )
+    fetched_probes: dict[str, list[ScoredHit]] = {}
+    for cluster_id, probe in probes:
+        own = probe_own_record_ids(seeded, probe['memory_id'])
+        raw = await _search(
+            backend, seeded, probe['content'], limit=guard_fetch_limit(own),
+        )
+        fetched_probes[cluster_id] = [
+            hit for hit in raw if hit.record.record_id not in own
+        ]
+
     return {'queries': fetched_queries, 'probes': fetched_probes}
 
 
@@ -2720,6 +2854,50 @@ def _mean(values: list[float | None]) -> float | None:
     return sum(measured) / len(measured)
 
 
+def _aggregate_queries(rows: list[dict[str, Any]], limit: int) -> dict[str, Any]:
+    """Claim recall + discoverability over one subset of the measured queries.
+
+    Used for the pooled headline AND for each by-kind subset, so a subset can
+    never be computed by a second, subtly different code path than the total.
+
+    ``queries: 0`` is a legitimate result and every metric under it is
+    ``None`` — an empty subset is "not asked", never a measured zero.
+    """
+    canonical_ranks = [
+        row['canonical_rank'] for row in rows if row['canonical_rank'] is not None
+    ]
+    median_rank: float | None = None
+    if canonical_ranks:
+        import statistics  # noqa: PLC0415
+
+        median_rank = float(statistics.median(canonical_ranks))
+    return {
+        'queries': len(rows),
+        'claim_recall': {
+            'at_5': _mean([row['recall_5'] for row in rows]),
+            'at_10': _mean([row['recall_10'] for row in rows]),
+        },
+        'discoverability': {
+            'canonical_in_top_5_rate': _mean([row['canonical_in_5'] for row in rows]),
+            'median_canonical_rank': median_rank,
+            'canonical_found_count': len(canonical_ranks),
+            # Queries that HAD a canonical to look for — the honest
+            # denominator for `canonical_found_count`.  The median rank is a
+            # median over successes only, so without this an arm that almost
+            # never finds the canonical prints the best median in the table.
+            'canonical_candidates': sum(1 for row in rows if row['has_canonical']),
+            # Ranks are censored at the fetch depth, not at the read window.
+            # Stated so a reader knows what "absent entirely" here means —
+            # and taken from the depth THIS run fetched at, never from the
+            # module default: `--limit` is a CLI flag, and an artifact that
+            # printed the constant would understate how far a `--limit 25`
+            # run actually looked. That is the same class of defect as the
+            # censored median this field exists to disclose.
+            'canonical_rank_window': limit,
+        },
+    }
+
+
 def measure_arm(
     seeded: SeededArm,
     fetched: dict[str, dict[str, list[ScoredHit]]],
@@ -2745,16 +2923,16 @@ def measure_arm(
     put anything.  It is ``None`` when the pin is off — the question was never
     asked, and a 0.0 would claim it was asked and answered.
     """
-    recall_5: list[float | None] = []
-    recall_10: list[float | None] = []
-    canonical_in_5: list[float | None] = []
-    canonical_ranks: list[int] = []
-    #: Queries that HAD a canonical to look for — the honest denominator for
-    #: ``canonical_found_count``.  The median rank is a median over successes
-    #: only, so without this an arm that almost never finds the canonical
-    #: prints the best median in the decision table.
-    canonical_candidates = 0
-    token_counts: list[float | None] = []
+    #: One row per query, kept individually rather than accumulated straight
+    #: into means.  eval-design §5 E2 names "claim recall@k" and
+    #: "canonical/topic discoverability" as DISTINCT metrics, and the fixture
+    #: encodes two query kinds plus a held-out phrasing split for exactly that
+    #: reason.  Pooling 236 queries into one mean makes a shape that wins on
+    #: claim queries while losing on topic phrasings indistinguishable from
+    #: one that ties on both — and the held-out subset, which exists to test
+    #: generalisation beyond the phrasings the registry was derived from,
+    #: disappears entirely.  Rows in, subsets out.
+    rows: list[dict[str, Any]] = []
     #: Every read window this arm was measured over, pin-on vs pin-off.  Both
     #: query windows AND the guard probe window: a pin that fires only on a
     #: probe still moves the guard column, and a diagnostic that missed it
@@ -2778,14 +2956,12 @@ def measure_arm(
         top_5 = _window(hits, 5)
         top_10 = _window(hits, 10)
 
-        recall_5.append(claim_recall_at_k(top_5, query.expects_claim_ids, 5))
-        recall_10.append(claim_recall_at_k(top_10, query.expects_claim_ids, 10))
-
+        canonical_in_5: float | None = None
+        canonical_rank: int | None = None
         canonical_id = seeded.canonical_by_cluster.get(query.cluster_id)
         if canonical_id is not None:
-            canonical_candidates += 1
             found = topic_discoverability(top_5, query.topic, canonical_id, 5)
-            canonical_in_5.append(1.0 if found['canonical_in_top_k'] else 0.0)
+            canonical_in_5 = 1.0 if found['canonical_in_top_k'] else 0.0
             # RANK is measured over the deepest window this arm was fetched
             # at, NOT over the k=5 read window the rate is measured over.
             # Scoring the rank inside an already-truncated window censors it
@@ -2796,12 +2972,21 @@ def measure_arm(
                 read_path(seeded, hits, len(hits), pin=pin),
                 query.topic, canonical_id, 5,
             )
-            if deep['canonical_rank'] is not None:
-                canonical_ranks.append(deep['canonical_rank'])
-        else:
-            canonical_in_5.append(None)
+            canonical_rank = deep['canonical_rank']
 
-        token_counts.append(float(tokens_returned(top_10, 10, estimator)['tokens']))
+        rows.append({
+            'kind': query.kind,
+            'held_out': query.held_out,
+            'recall_5': claim_recall_at_k(top_5, query.expects_claim_ids, 5),
+            'recall_10': claim_recall_at_k(top_10, query.expects_claim_ids, 10),
+            # None, not 0.0, when the query had no canonical to look for: the
+            # question was never asked, and a zero would drag the rate down
+            # for a non-observation.
+            'canonical_in_5': canonical_in_5,
+            'canonical_rank': canonical_rank,
+            'has_canonical': canonical_id is not None,
+            'tokens': float(tokens_returned(top_10, 10, estimator)['tokens']),
+        })
 
     candidate_present: list[float | None] = []
     guard_matched: list[float | None] = []
@@ -2811,7 +2996,19 @@ def measure_arm(
     #: against a 0.92 threshold" is a shape finding, "the best candidate
     #: scored 0.00" is a bug report.
     max_observed_score: float | None = None
+    #: Probes production's guard would actually have RUN on.  The pre-check
+    #: fires only on explicit ``procedural_knowledge`` writes, and
+    #: ``find_near_duplicate_memory`` filters its candidates to that category
+    #: unconditionally, so a probe of any other category can never produce
+    #: ``guard_matched`` under ANY storage shape — for a reason that has
+    #: nothing to do with storage shape.  Counted and disclosed rather than
+    #: dropped: dropping would hide that the guard's remit is narrower than
+    #: the corpus, and NOT disclosing would put an identical, invisible
+    #: ceiling on every arm's ``guard_matched_rate``.
+    guard_covered_probes = 0
     for cluster_id, _probe in probes:
+        if _probe.get('category') == GUARD_COVERED_CATEGORY:
+            guard_covered_probes += 1
         probe_hits = fetched['probes'][cluster_id]
         window = _window(probe_hits, GUARD_TOP_K)
         # The SAME slice both times.  `rescore` builds `best_child` by
@@ -2833,11 +3030,14 @@ def measure_arm(
         candidate_present.append(1.0 if verdict['candidate_present'] else 0.0)
         guard_matched.append(1.0 if verdict['guard_matched'] else 0.0)
 
-    median_rank: float | None = None
-    if canonical_ranks:
-        import statistics  # noqa: PLC0415
-
-        median_rank = float(statistics.median(canonical_ranks))
+    pooled = _aggregate_queries(rows, limit)
+    by_query_kind = {
+        kind: _aggregate_queries([r for r in rows if r['kind'] == kind], limit)
+        for kind in QUERY_KINDS
+    }
+    by_query_kind[HELD_OUT_SUBSET] = _aggregate_queries(
+        [r for r in rows if r['held_out']], limit,
+    )
 
     return {
         'pin': {
@@ -2846,23 +3046,17 @@ def measure_arm(
                 _rate(windows_changed, windows_compared) if pin else None
             ),
         },
-        'claim_recall': {'at_5': _mean(recall_5), 'at_10': _mean(recall_10)},
-        'discoverability': {
-            'canonical_in_top_5_rate': _mean(canonical_in_5),
-            'median_canonical_rank': median_rank,
-            'canonical_found_count': len(canonical_ranks),
-            'canonical_candidates': canonical_candidates,
-            # Ranks are censored at the fetch depth, not at the read window.
-            # Stated so a reader knows what "absent entirely" here means —
-            # and taken from the depth THIS run fetched at, never from the
-            # module default: `--limit` is a CLI flag, and an artifact that
-            # printed the constant would understate how far a `--limit 25`
-            # run actually looked. That is the same class of defect as the
-            # censored median this field exists to disclose.
-            'canonical_rank_window': limit,
-        },
+        'claim_recall': pooled['claim_recall'],
+        'discoverability': pooled['discoverability'],
+        # The same two metrics, split the way the fixture and eval-design §5
+        # E2 both say they differ.  Additive: the pooled blocks above are
+        # unchanged, so the headline decision table still reads as before.
+        # `held_out` is a SUBSET of `topic_phrasing`, not a third kind — it
+        # is the phrasings the E1 registry was not derived from, and so the
+        # only ones that measure generalisation.
+        'by_query_kind': by_query_kind,
         'tokens_per_query': {
-            'mean': _mean(token_counts),
+            'mean': _mean([row['tokens'] for row in rows]),
             'estimator': estimator[0],
             'window': 10,
         },
@@ -2876,6 +3070,12 @@ def measure_arm(
             'threshold': guard_threshold,
             'max_observed_score': max_observed_score,
             'probes': len(probes),
+            # The rate's denominator is `probes`, but only these can ever be
+            # nonzero — see the accumulator above.  Reported so the ceiling
+            # is visible in the artifact gate eta reads instead of being an
+            # identical, undisclosed haircut on all six arms.
+            'guard_covered_probes': guard_covered_probes,
+            'guard_covered_category': GUARD_COVERED_CATEGORY,
         },
     }
 

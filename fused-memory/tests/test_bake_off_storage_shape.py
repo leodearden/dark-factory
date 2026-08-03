@@ -2606,6 +2606,20 @@ def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
             'canonical_rank_window': 10,
             'mean_topic_member_count': 3.0,
         },
+        'by_query_kind': {
+            kind: {
+                'queries': 8,
+                'claim_recall': {'at_5': recall5, 'at_10': recall10},
+                'discoverability': {
+                    'canonical_in_top_5_rate': 0.7,
+                    'median_canonical_rank': 2.0,
+                    'canonical_found_count': 6,
+                    'canonical_candidates': 8,
+                    'canonical_rank_window': 10,
+                },
+            }
+            for kind in (*_mod().QUERY_KINDS, _mod().HELD_OUT_SUBSET)
+        },
         'tokens_per_query': {'mean': 412.0, 'estimator': estimator},
         'guard_adequacy': {
             'clusters_measured': 15,
@@ -2614,6 +2628,9 @@ def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
             'threshold_replay': True,
             'threshold': 0.92,
             'max_observed_score': 0.71,
+            'probes': 15,
+            'guard_covered_probes': 12,
+            'guard_covered_category': 'procedural_knowledge',
         },
     }
 
@@ -3583,22 +3600,23 @@ class TestRunBakeOffWiring:
         assert smallest_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
         assert mem0.max_inflight <= mod.SEED_CONCURRENCY
 
-    async def test_fetching_is_concurrent_and_bounded_like_seeding(
+    async def test_fetching_stays_serial_because_a_swallowed_read_timeout_is_silent(
         self, monkeypatch,
     ):
-        """The read side pays the same round-trip tax as the write side.
+        """The read side is the one half that must NOT be made concurrent.
 
-        Serially this is one embed+ANN round trip per query and per probe, per
-        arm — 251 of them at full size, 753 across the three arms — while the
-        write side was deliberately bounded-concurrent for exactly that
-        reason.  Concurrency is safe here because every `_search` is
-        independent and the results are keyed by `query_id`/`cluster_id`, not
-        by arrival order, so nothing about determinism changes.
+        Bounding it at SEED_CONCURRENCY is the obvious efficiency win — 753
+        independent, order-insensitive round trips across the three arms — and
+        it was implemented and measured. The live run aborted partway through
+        the second arm with `MeasurementError: ... returned no results for a
+        10-limit query`. `Mem0Client.search` SWALLOWS its read timeout (logs,
+        returns `{}`), so on the read side concurrency converts a latency win
+        into a silently-empty ranking; `add` propagates its timeout instead,
+        which is why the write side keeps its bound.
 
-        Both halves are asserted: it OVERLAPS at all (a serial fetch never
-        exceeds 1 in flight), and it stays UNDER the same bound seeding uses
-        (an unbounded gather would open every query's embedding request at
-        once, which is the failure the seed bound exists to prevent).
+        Asserted as the OBSERVABLE property — one search in flight at a time —
+        rather than as "no semaphore exists", so a future re-attempt has to
+        confront this test rather than route around it.
         """
         mod = _mod()
         _install_driver_doubles(monkeypatch)
@@ -3607,9 +3625,8 @@ class TestRunBakeOffWiring:
 
         mem0 = _FakeMemoryService.instances[-1].mem0
         per_arm = len(mem0.searches) / len(mod.ARM_SHAPES)
-        assert per_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
-        assert mem0.max_search_inflight > 1
-        assert mem0.max_search_inflight <= mod.SEED_CONCURRENCY
+        assert per_arm > 1  # there is something to overlap, so this can fail
+        assert mem0.max_search_inflight == 1
 
     async def test_a_failed_seed_leaves_no_write_in_flight_past_teardown(
         self, monkeypatch,
@@ -4908,8 +4925,13 @@ class TestCommittedReportMarkdown:
         notice: both sides render through the same function, so the wrong
         value would be written to the committed markdown too.
 
-        Compared as extracted VALUES rather than as a sentence, so rewording
-        the bullet is free — only the number has to agree.
+        Compared as extracted VALUES rather than as a sentence, and the bullet
+        is LOCATED by `pin_bullet_prefix(shape)` — the anchor the renderer
+        itself emits — rather than by English wording.  Selecting on "starts
+        with `- `, names the shape, and contains the word 'pin'" would fail
+        on a reworded bullet with a count mismatch, i.e. break on the one
+        thing this test is supposed to leave free.  Only the number has to
+        agree.
         """
         mod = _mod()
         rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
@@ -4923,8 +4945,7 @@ class TestCommittedReportMarkdown:
         for shape in mod.ARM_SHAPES:
             bullets = [
                 line for line in rendered.splitlines()
-                if line.startswith('- ') and f'`{shape}`' in line
-                and 'pin' in line
+                if line.startswith(mod.pin_bullet_prefix(shape))
             ]
             # Exactly one, so a reworded bullet fails loudly here rather than
             # silently reducing the check below to a no-op.
