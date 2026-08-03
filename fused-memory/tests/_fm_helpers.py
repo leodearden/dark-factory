@@ -14,6 +14,7 @@ import inspect
 import json
 import os
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -713,6 +714,35 @@ def falkor_skipif(reason: str = 'FalkorDB not reachable'):
     currently reports. tests/test_fm_helpers.py pins that property.
     """
     return pytest.mark.skipif(not _falkor_available(), reason=reason)
+
+
+def unique_graph_name(slug: str) -> str:
+    """Return a fresh per-run FalkorDB graph name, ``_test_<slug>_<8 hex>``.
+
+    A new name is minted on every invocation so that concurrent test runs —
+    pytest-xdist ``-n auto``, or a CI matrix pointed at one shared FalkorDB —
+    never select the same graph and wipe each other's fixtures. This rationale
+    was previously a 2-to-3-line comment copy-pasted into each live fixture;
+    it lives here now.
+
+    The caller remains responsible for the surrounding lifecycle: the
+    best-effort delete of a stale graph left by a prior run, and the teardown
+    ``graph.delete()`` / ``client.aclose()`` pair.
+
+    Args:
+        slug: Should embed the owning task id, following the existing
+            convention — ``530_list_indices_integration``,
+            ``3334_falkor_fulltext``, ``2210_startup_scan``,
+            ``3009_reassign_edge``, ``2084_edge_dedup``,
+            ``2207_merge_entities`` — so a graph orphaned by a killed run is
+            traceable back to the test module that created it.
+
+    Returns:
+        The graph name. The 8-hex suffix comes from ``uuid.uuid4()``; the
+        prefix and slug are reproduced verbatim, so migrating a call site to
+        this helper keeps a module inside its existing graph-name namespace.
+    """
+    return f'_test_{slug}_{uuid.uuid4().hex[:8]}'
 
 
 # ---------------------------------------------------------------------------
