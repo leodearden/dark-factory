@@ -995,7 +995,13 @@ def test_focus_handoff_retries_then_reports_a_miss(
 
     # (c) the dep array names the escalations payload local, so the lookup
     #     RETRIES on each 3s poll instead of firing once at mount.
-    esc_local = re.search(r'const\s+(\w+)\s*=\s*DF\.ESCALATIONS', code)
+    #     Derived from inside the COMPONENT body, not the whole file: the
+    #     module-scope seed capture reads `DF.ESCALATIONS` too, and it is a
+    #     different thing — the frozen pre-fetch reference, which correctly
+    #     must NOT appear in the deps.
+    tab_body = _extract_function_body(code, 'EscalationsTab')
+    assert tab_body, 'could not extract the EscalationsTab body.'
+    esc_local = re.search(r'const\s+(\w+)\s*=\s*DF\.ESCALATIONS', tab_body)
     assert esc_local is not None, (
         'EscalationsTab must read `DF.ESCALATIONS` into a local.'
     )

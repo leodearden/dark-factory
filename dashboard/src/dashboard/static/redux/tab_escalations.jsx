@@ -13,6 +13,45 @@ const { ProjectGroup, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const C = window.DF_CHARTS;
 
+// ── Cross-tab focus helpers (module scope) ──
+//
+// The pre-fetch seed, captured by IDENTITY at module-eval time.  data.js seeds
+// ESCALATIONS with zero subsections and `applyKey` replaces the reference
+// wholesale on the first successful poll — ESCALATIONS is deliberately NOT in
+// STABLE_ARRAY_KEYS (data.js:96-105).  Identity is therefore the only signal
+// available: a loaded-but-genuinely-empty queue and the pre-fetch seed are
+// structurally IDENTICAL payloads, so nothing about their contents can tell
+// them apart.
+//
+// The failure direction is chosen on purpose.  An endpoint stuck in data.js's
+// exponential backoff never replaces the seed, so the UI keeps WAITING (and
+// says so) rather than asserting a false "no longer in the queue" — the
+// stronger claim, on evidence that cannot support it.  Listening for
+// `df-data-refresh` instead would produce exactly that false miss: it fires
+// after Promise.all even when the escalations fetch failed.
+//
+// Bounded edge case: a first poll landing before Babel evaluates this file
+// makes the capture a real payload, so the next poll's replacement is what
+// clears the wait — at most one extra 3s tick.
+const ESC_SEED = DF.ESCALATIONS;
+
+// Stable empty payload for the unreachable `DF.ESCALATIONS` falsy case — see
+// the note at its use site in EscalationsTab.
+const ESC_EMPTY = { subsections: [], summary: { by_level: {}, by_status: {} } };
+
+function escalationsLoaded(payload) {
+  return payload !== ESC_SEED;
+}
+
+function findEscalationRow(escalations, id) {
+  for (const sub of (escalations.subsections || [])) {
+    for (const row of (sub.escalations || [])) {
+      if (row.id === id) return row;
+    }
+  }
+  return null;
+}
+
 // ── Local helpers (tabs.jsx-compatible copies; not exported from any namespace) ──
 
 function useOpenSet(ids, defaultOpen = true, storageKey = null) {
@@ -269,7 +308,14 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 // ── EscalationsTab ──
 
 function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
-  const escalations = DF.ESCALATIONS || { subsections: [], summary: { by_level: {}, by_status: {} } };
+  // ESC_EMPTY is hoisted to module scope rather than written inline as
+  // `|| { subsections: [], ... }`. An inline literal would mint a FRESH object
+  // on every render, and `escalations` is now a dependency of the focus effect
+  // (below) — a new identity each render would re-run that effect forever.
+  // data.js's applyKey refuses null/undefined (data.js:153) so this fallback
+  // is unreachable today; hoisting it means a future change that makes it
+  // reachable degrades to a stable empty payload instead of a render loop.
+  const escalations = DF.ESCALATIONS || ESC_EMPTY;
 
   // Filter subsections by project when projectFilter is active.
   // Orchestrator subsections: filter by subsection label (label == project name).
@@ -329,26 +375,32 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   // Selected row for sidebar
   const [selected, setSelected] = uS(null);
 
+  // A focus id that matched no row. Held rather than dropped: the operator
+  // clicked a link and is owed an answer either way.
+  const [focusMiss, setFocusMiss] = uS(null);
+
   // Cross-tab focus handoff (from the memory-eval escalation links in
   // tab_memory_evals.jsx, lifted through app.jsx). Search every subsection for
   // the row and open the existing detail sidebar with it.
   //
-  // The focus is consumed UNCONDITIONALLY — including when no row matches,
-  // which happens when the escalation resolved between the poll that produced
-  // the link and the click. Leaving it set would reopen a stale drawer on every
-  // later visit to this tab; retrying silently would be worse.
+  // The focus is consumed once a DECISION is REACHABLE, never before. Keyed on
+  // `escalations` as well as `focusId`, so while the payload is still the
+  // pre-fetch seed the effect declines to decide and re-runs on each poll —
+  // a cold load, or an endpoint in backoff, no longer silently eats the focus.
+  //
+  // Once the payload is in, both outcomes are reported. A miss is real: the
+  // escalation may have resolved between the poll that produced the link and
+  // the click. It is still CONSUMED on a miss, because leaving it set would
+  // reopen a stale drawer on every later visit to this tab — but it is now
+  // recorded and rendered rather than dropped in silence.
   uE(() => {
     if (!focusId) return;
-    let found = null;
-    for (const sub of (escalations.subsections || [])) {
-      for (const row of (sub.escalations || [])) {
-        if (row.id === focusId) { found = row; break; }
-      }
-      if (found) break;
-    }
-    if (found) setSelected(found);
+    if (!escalationsLoaded(escalations)) return;
+    const found = findEscalationRow(escalations, focusId);
+    if (found) { setSelected(found); setFocusMiss(null); }
+    else { setFocusMiss(focusId); }
     if (onFocusConsumed) onFocusConsumed();
-  }, [focusId]);
+  }, [focusId, escalations]);
 
   // Global summary from top-level data
   const gs = escalations.summary || {};
@@ -358,6 +410,32 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   return (
     <div style={{ position: 'relative' }}>
       <EscalationStatStrip analytics={DF.ESCALATION_ANALYTICS} projectFilter={projectFilter} />
+
+      {/* Cross-tab focus feedback. Two states, not one: a click that lands
+          before the escalations payload does is WAITING, not a miss, and
+          saying "no longer in the queue" while the endpoint is still in
+          backoff would be a false claim. Both name the id, so the operator
+          can see which link they followed. */}
+      {focusId && !escalationsLoaded(escalations) && (
+        <div className="badge" data-testid="esc-focus-pending" style={{ marginBottom: 8 }}>
+          waiting for the escalation queue to load — will open{' '}
+          <span className="mono">{focusId}</span> when it arrives
+        </div>
+      )}
+      {focusMiss && (
+        <div className="badge warn" data-testid="esc-focus-miss" style={{ marginBottom: 8 }}>
+          <span className="mono">{focusMiss}</span> is not in the queue — it was
+          likely resolved between the poll that produced the link and the click
+          <button
+            type="button"
+            className="chip"
+            style={{ marginLeft: 8 }}
+            onClick={() => setFocusMiss(null)}
+          >
+            dismiss
+          </button>
+        </div>
+      )}
 
       {/* Controls header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
