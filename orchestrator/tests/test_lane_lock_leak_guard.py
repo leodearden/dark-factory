@@ -772,12 +772,27 @@ class TestSelfOwnedLaneLockLeak:
         lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
 
         with foreign_lane_lock_holder(lock_path) as child:
-            holders = lane_lock_holder_pids(lock_path)
+            # Polled, not a bare read: lane_lock_holder_pids is fail-safe and
+            # returns [] indistinguishably for "no holder" and "bad procfs
+            # read" (a missing lock file / unreadable /proc/locks / an
+            # unparseable row all yield the same []).  A one-shot read here
+            # landed on exactly that empty snapshot under 16-worker xdist
+            # load, producing the observed `assert 658016 in []`.
+            holders = wait_for_lane_lock_holder(lock_path, child.pid)
             assert os.getpid() not in holders, (
                 'staging error: this process must NOT hold the lock, or the '
                 'negative below would be vacuous'
             )
-            assert child.pid in holders
+            assert child.pid in holders, (
+                f'the kernel-reported holder pid is the discriminator between '
+                f'foreign contention and a self-owned leak, which is why it '
+                f'is polled (bound _FOREIGN_HOLDER_ATTRIBUTION_SECS='
+                f'{_FOREIGN_HOLDER_ATTRIBUTION_SECS}s) rather than weakened; '
+                f'the same pid must also survive into _lane_lock_holder_facts\' '
+                f'raise-time re-read for the str(child.pid) in '
+                f'str(excinfo.value) assertion below to hold; '
+                f'observed holders={holders!r}'
+            )
 
             with pytest.raises(MergeVerifyLeaseContended) as excinfo:
                 await real_git_ops.reset_persistent_merge_worktree(commit_b)
