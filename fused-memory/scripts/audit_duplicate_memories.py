@@ -62,6 +62,10 @@ Task 3357 made that calibration per-category, so the resolution is too, in
 strict priority per swept category:
 
   1. ``--ann-threshold``: an explicit operator number, for every category.
+     It is a RECALL KNOB, not evidence -- it displaces even a category's own
+     measured cutoff, so under it NO category is gated by its own labeled
+     pairs and every one is withheld from ``--apply`` deletion, weaker
+     evidence than the pooled fallback below.
   2. ``config.write_triage.t_high_by_category[category]``: the cutoff
      measured on THAT category's own labeled pairs.
   3. ``config.write_triage.t_high``: the POOLED cutoff, used as a disclosed
@@ -1232,9 +1236,11 @@ def restrict_delete_candidates_for_apply(
     Args:
         groups: The plan's ``near_duplicate_groups`` entries.
         unevidenced_categories: Categories whose ANN cutoff was NOT derived
-            for that category (they ran on the pooled fallback — see
-            ``resolve_ann_threshold``). A group in one of them may not
-            contribute deletions on ANN evidence alone. A
+            for that category — either they ran on the POOLED fallback, or an
+            operator ``--ann-threshold`` displaced every measured cutoff with
+            one recall knob (see ``categories_without_own_cutoff``). Both are
+            numbers measured somewhere other than these pairs, so a group in
+            one of them may not contribute deletions on ANN evidence alone. A
             ``lexical_spanning`` group is unaffected: its evidence never
             depended on the ANN cutoff.
 
@@ -2207,15 +2213,27 @@ def _write_triage_cutoffs(
 def categories_without_own_cutoff(
     memory_service: Any,
     categories: Iterable[str],
+    override: float | None = None,
 ) -> frozenset[str]:
     """Swept categories for which the calibration derived NO cutoff.
 
-    These ran on the pooled fallback (or on an operator override, which is a
-    recall knob, not evidence), so their ANN clusters rest on a number
-    measured on a different population. ``build_sweep_plan`` hands this set
+    These ran on the pooled fallback, or on an operator override — a recall
+    knob, not evidence — so their ANN clusters rest on a number that was not
+    measured on their own labeled pairs. ``build_sweep_plan`` hands this set
     to ``restrict_delete_candidates_for_apply``, which keeps them in the
     REPORT and out of irreversible deletion.
+
+    An *override* is applied uniformly to EVERY category by
+    :func:`resolve_ann_threshold`'s priority-1 branch, displacing even a
+    category's own measured cutoff — so under one, no category is gated by
+    evidence of its own and none may contribute an ANN-only deletion. The
+    override is screened by :func:`_calibrated_float`, not a bare ``is not
+    None``, so this predicate fences on exactly the values the resolver would
+    actually force: the two consumers of :func:`_write_triage_cutoffs` must
+    keep agreeing about what gated the sweep.
     """
+    if _calibrated_float(override) is not None:
+        return frozenset(categories)
     _raw, _pooled, by_category = _write_triage_cutoffs(memory_service)
     return frozenset(
         category for category in categories
@@ -2598,7 +2616,12 @@ async def _run(args: argparse.Namespace) -> int:
             ann_pairs=ann_pairs, ann_scores=ann_scores,
             ann_disclosure=disclosures, ann_threshold=ann_threshold,
             ann_threshold_by_category=ann_thresholds,
-            unevidenced_categories=categories_without_own_cutoff(memory, categories),
+            # Same override that produced ann_thresholds two statements ago:
+            # an operator number gates every category, so it is what makes
+            # them un-evidenced. One value, one story.
+            unevidenced_categories=categories_without_own_cutoff(
+                memory, categories, args.ann_threshold,
+            ),
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
         print(json.dumps(plan, indent=2, default=str))
