@@ -143,7 +143,7 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 #
 # SCOPE HONESTY — what this widening does and does not buy. This command runs
 # on the module-config-less path (verify._build_fallback_config). There,
-# verify_plan._scope_to_keyword NARROWS the ruff head to the touched .py
+# verify._scope_to_keyword NARROWS the ruff head to the touched .py
 # files, so a conftest.py-only diff was already ruff'd before this change. The
 # widening bites on the VERBATIM (unscoped) form, which is what runs when a
 # touched file classifies STRUCTURAL — conftest.py is itself such a trigger —

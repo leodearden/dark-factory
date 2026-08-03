@@ -260,7 +260,7 @@ def test_root_lint_command_targets_every_root_level_and_skills_py() -> None:
 
     WHY THE WIDENING IS LOAD-BEARING, NOT COSMETIC. This command runs on the
     module-config-less path (``verify._build_fallback_config``). There,
-    ``verify_plan._scope_to_keyword`` NARROWS the ruff head to the touched
+    ``verify._scope_to_keyword`` NARROWS the ruff head to the touched
     ``.py`` files — so a ``conftest.py``-only diff is already ruff'd. The gap is
     the VERBATIM (unscoped) form, which runs when a touched file classifies
     STRUCTURAL or under FULL_SUITE. ``conftest.py`` is itself a STRUCTURAL
