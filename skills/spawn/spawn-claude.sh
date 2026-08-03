@@ -409,9 +409,13 @@ finish_failed_to_start() {
 #
 # Do not restate this rule from memory. scripts/tests/test_legibility_inventory.py's
 # TestEncoderLockstep now pins THIS copy to the canonical and to real on-disk
-# dir names, by extracting the function below and running it (task 3464) --
-# keep the `_encode_cwd() {` / `}` framing on their own lines, since that is
-# the shape the extraction anchors on.
+# dir names, by extracting the function below and running it (task 3464). That
+# extraction anchors on exactly two things: the definition must START at column
+# 0 as `_encode_cwd()` -- not indented, and not the `function _encode_cwd`
+# form -- and its body must END at a line that is a bare `}` at column 0.
+# Nothing else is pinned: where this function sits in the file does not matter,
+# and `()` and `{` need not share a line. Break either anchor and the
+# extraction fails loudly rather than quietly stopping covering this copy.
 _encode_cwd() {
   local e="${1//\//-}"
   e="${e//./-}"

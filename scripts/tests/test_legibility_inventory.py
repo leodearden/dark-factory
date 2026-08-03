@@ -240,8 +240,25 @@ def _bash_encode_cwd_source() -> str:
     path, the four-line pure function is lifted out by an anchored regex and
     eval'd in a throwaway shell (see :func:`_bash_encode_cwd`).
 
-    The assert on a miss is load-bearing: if the function is ever renamed,
-    moved, or reformatted off this shape, a tolerant ``if m:`` would return
+    The regex anchors on exactly two properties, and it is worth stating them
+    as MEASURED rather than as remembered — a rule restated from memory in a
+    comment is the mechanism task 3272 traced this whole bug class to:
+
+      - the definition starts at column 0 as ``_encode_cwd()`` — the
+        ``function _encode_cwd`` form does not match, nor does an indented one;
+      - the body ends at a line that is a bare ``}`` at column 0, with no
+        earlier column-0 ``}`` inside it (the match is non-greedy, so an
+        earlier one truncates the extraction).
+
+    Nothing else is required. Verified against this file: ``\\s*`` spans
+    newlines, so ``()`` and ``{`` need NOT share a line (a brace-on-next-line
+    reformat still matches), and ``re.search`` scans the whole script, so the
+    function may be MOVED anywhere in it without breaking extraction. Neither a
+    move nor a brace-style reformat trips the assert below, and this docstring
+    must not claim they do.
+
+    The assert on a miss is load-bearing: if the function is renamed or its
+    definition stops starting at column 0, a tolerant ``if m:`` would return
     nothing and the whole lockstep would pass VACUOUSLY — the exact class of
     silent coverage loss this guard exists to prevent. A loud extraction
     failure is the correct outcome.
@@ -250,9 +267,11 @@ def _bash_encode_cwd_source() -> str:
     match = re.search(r'^_encode_cwd\(\)\s*\{\n(?:.*\n)*?^\}$', source, re.M)
     assert match is not None, (
         f'could not extract the _encode_cwd() function block from {SPAWN_SCRIPT}. '
-        'It was renamed, moved, or reformatted off the `_encode_cwd() {` ... `}` '
-        'shape this extraction anchors on — fix the regex here rather than '
-        'letting TestEncoderLockstep silently stop covering the bash copy.'
+        'Either it was renamed, or its definition no longer starts at column 0 '
+        'as `_encode_cwd()` (the `function _encode_cwd` form does not match), or '
+        'its body no longer ends at a bare column-0 `}`. Fix the regex here '
+        'rather than letting TestEncoderLockstep silently stop covering the '
+        'bash copy.'
     )
     return match.group(0)
 
@@ -357,8 +376,10 @@ class TestEncoderLockstep:
         throwaway shell, then registered as an ordinary :func:`_mirrors`
         entry. 3272 left it out for want of a mechanism (no Python test can
         import bash), not for want of will. The extraction ASSERTS on a miss,
-        so renaming or reformatting the function fails loudly instead of
-        silently dropping coverage and letting this class pass vacuously.
+        so losing the function fails loudly instead of silently dropping
+        coverage and letting this class pass vacuously — see
+        :func:`_bash_encode_cwd_source` for precisely what that extraction does
+        and does not anchor on.
       - ``tests/scripts/test_spawn_claude.py``'s fixture is no longer a copy
         of the rule at all: it now CALLS ``session_registry.encode_cwd``, so
         it is pinned to the canonical by construction and needs no entry
