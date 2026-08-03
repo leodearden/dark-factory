@@ -154,7 +154,12 @@ def test_verify_prompt_and_subprocess_cwd_name_the_same_root(tmp_path, monkeypat
     assert mod.main(["--project-root", str(target), "--force"]) == 0
     fake_run_census.calls[0]["verify_fn"]([{"title": "x"}], model="sonnet")
 
-    assert str(target) in recorded[-1]["prompt"]
+    # Both sides normalized with .resolve(): main() interpolates the
+    # RESOLVED project_root into the prompt, so comparing against an
+    # unresolved str(target) would fail spuriously wherever tmp_path sits
+    # under a symlink (/tmp -> /private/tmp on non-Linux hosts) — the same
+    # flakiness the sibling coder cwd tests guard against.
+    assert str(target.resolve()) in recorded[-1]["prompt"]
     assert Path(recorded[-1]["cwd"]).resolve() == target.resolve()
 
 
@@ -194,3 +199,29 @@ def test_build_stage_invokes_binds_project_root_as_cwd(tmp_path, monkeypatch):
     synth("p", "fable")
 
     assert [r["cwd"] for r in recorded] == [str(tmp_path)] * 3
+
+
+def test_main_rejects_a_project_root_that_is_not_a_directory(tmp_path, monkeypatch, capsys):
+    """A typo'd --project-root must fail LOUDLY at the CLI boundary — exit
+    1, naming the flag — never as a deferral.
+
+    Now that project_root is the stage subprocess cwd, an unguarded bad
+    root reaches subprocess.run as a missing cwd on the FIRST invoke (the
+    headroom probe), and preflight_headroom folds any probe exception into
+    HeadroomResult(ok=False). Without this guard the run would exit 0 with
+    "census deferred: headroom probe invocation failed: ...", wearing the
+    exact costume of a usage-limit defer, on every subsequent invocation.
+    """
+    _launcher, target, _recorded, _fake = _setup_main(tmp_path, monkeypatch)
+    # A real config elsewhere, so config load cannot be what catches this.
+    elsewhere = _write_legibility_yaml(tmp_path / "elsewhere" / "legibility.yaml")
+    missing = target / "typo-not-a-real-root"
+
+    exit_code = mod.main(
+        ["--project-root", str(missing), "--config", str(elsewhere), "--force"]
+    )
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "--project-root" in err
+    assert str(missing) in err

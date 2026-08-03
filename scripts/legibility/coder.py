@@ -291,11 +291,27 @@ def _invoke_cli(
     per cluster (``census._build_default_verify_fn``) that surfaced as a
     silent mass rejection of every cluster rather than an error.
 
-    Raises CoderInvocationError on a non-zero exit or a timeout -- never
-    silently swallowed, never a fabricated empty stdout. The error
-    message carries a stderr tail for diagnosis, plus the resolved cwd, so
-    a future sandbox/permission failure NAMES the directory the process was
-    scoped to instead of leaving it to be inferred.
+    Raises CoderInvocationError on a non-zero exit, a timeout, or a
+    failure to START the process at all -- never silently swallowed, never
+    a fabricated empty stdout. The error message carries a stderr tail for
+    diagnosis, plus the resolved cwd, so a future sandbox/permission
+    failure NAMES the directory the process was scoped to instead of
+    leaving it to be inferred.
+
+    That third case is why the ``OSError`` arm below exists. Passing *cwd*
+    hands ``subprocess.run`` a second thing that can be missing besides the
+    binary: a cwd that does not exist, is not a directory, or is not
+    searchable makes it raise a RAW ``FileNotFoundError`` /
+    ``NotADirectoryError`` / ``PermissionError``, which would escape this
+    function and falsify the contract above. It also lands badly
+    downstream: census's FIRST invoke is the headroom probe, and
+    ``census.preflight_headroom`` folds ANY probe exception into
+    ``HeadroomResult(ok=False)`` (deliberately fail-safe), so an operator
+    typo in ``--project-root`` would read exactly like a usage-limit defer
+    -- exit 0, an INFO escalation, and a census that silently never runs
+    again. Wrapping it here keeps the failure typed; ``census.main`` also
+    rejects a non-directory project_root up front so the loud error names
+    the flag rather than the subprocess.
     """
     resolved_bin = claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"
 
@@ -312,6 +328,16 @@ def _invoke_cli(
         raise CoderInvocationError(
             f"claude CLI timed out after {timeout}s (model={model!r}, "
             f"claude_bin={resolved_bin!r}, cwd={cwd!r})"
+        ) from exc
+    except OSError as exc:
+        # The process never started: a missing/non-executable binary, or a
+        # cwd that is missing / not a directory / not searchable. Both name
+        # themselves in the underlying OSError text, so echo it verbatim
+        # alongside BOTH candidates rather than guessing which one the
+        # kernel objected to.
+        raise CoderInvocationError(
+            f"claude CLI could not be started (model={model!r}, "
+            f"claude_bin={resolved_bin!r}, cwd={cwd!r}): {exc}"
         ) from exc
 
     if proc.returncode != 0:

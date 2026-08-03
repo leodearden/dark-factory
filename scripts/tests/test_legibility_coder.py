@@ -710,6 +710,45 @@ def test_invoke_cli_without_cwd_inherits_the_launcher_cwd(tmp_path, monkeypatch)
     assert recorded != target.resolve()
 
 
+def test_invoke_cli_missing_cwd_raises_invocation_error(tmp_path, monkeypatch):
+    """A cwd that does not exist must fail as a CoderInvocationError, not
+    as a raw FileNotFoundError escaping the documented contract.
+
+    This is not cosmetic typing. census's first invoke is the headroom
+    probe, and preflight_headroom folds ANY probe exception into
+    HeadroomResult(ok=False) — so an unwrapped OSError from a typo'd
+    --project-root would exit 0 as "census deferred", indistinguishable
+    from a usage-limit banner.
+    """
+    _launcher, target, _cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=claude_bin, timeout=10, cwd=str(target / "does-not-exist"),
+        )
+
+    # The message must NAME the directory, so an operator reading the
+    # failure does not have to infer which path was rejected.
+    assert "does-not-exist" in str(excinfo.value)
+
+
+def test_invoke_cli_cwd_that_is_a_file_raises_invocation_error(tmp_path, monkeypatch):
+    """Same contract for the not-a-directory case (NotADirectoryError on
+    Linux), which is a different OSError subclass than the missing-dir
+    one — pinning both keeps the except-arm from being narrowed to
+    FileNotFoundError alone."""
+    _launcher, target, _cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
+    not_a_dir = target / "regular-file.txt"
+    not_a_dir.write_text("i am not a directory", encoding="utf-8")
+
+    with pytest.raises(mod.CoderInvocationError):
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=claude_bin, timeout=10, cwd=str(not_a_dir),
+        )
+
+
 # ---------------------------------------------------------------------------
 # step-17: RED — main(argv) end-to-end, LLM mocked via monkeypatch of
 # mod._invoke_cli (never a real subprocess)

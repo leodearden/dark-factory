@@ -1963,6 +1963,25 @@ def main(argv: list[str] | None = None) -> int:
     # at the CLI boundary makes the prompt text, the subprocess cwd and all
     # four output paths name the same absolute tree.
     project_root = Path(args.project_root).resolve()
+
+    # Rejected LOUDLY here, at the CLI boundary, rather than left to fail
+    # somewhere downstream. Now that project_root is also the stage
+    # subprocess cwd, a typo'd root surfaces on the FIRST invoke -- the
+    # headroom probe -- as a CoderInvocationError, and preflight_headroom
+    # deliberately folds ANY probe exception into HeadroomResult(ok=False).
+    # Without this check `census --project-root /typo --config <real one>`
+    # would exit 0 with "census deferred: headroom probe invocation
+    # failed: ..." plus an INFO escalation: an operator typo wearing the
+    # exact costume of a usage-limit defer, on every subsequent run. A
+    # non-existent root is never a deferral -- it is a bad argument.
+    if not project_root.is_dir():
+        print(
+            f"census: --project-root {args.project_root!r} resolves to "
+            f"{project_root}, which is not an existing directory",
+            file=sys.stderr,
+        )
+        return 1
+
     config_path = (
         Path(args.config) if args.config
         else project_root / "docs" / "legibility" / "legibility.yaml"
