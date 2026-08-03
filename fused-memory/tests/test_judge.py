@@ -1443,6 +1443,54 @@ async def test_call_judge_cli_empty_output_returns_empty_string(mock_journal):
 
 
 @pytest.mark.asyncio
+async def test_call_judge_cli_input_rejected_raises_infra_error(mock_journal):
+    """A pre-turn CLI rejection is INFRA, not a benign empty verdict (task 3143).
+
+    The legacy "empty stdout = valid empty verdict" contract is scoped to a
+    genuine EMPTY_OUTPUT: we asked the judge something and it returned nothing.
+    A rejection means the judge was never asked at all — returning '' there
+    would have _parse_verdict fabricate a benign severity=minor verdict for a
+    review that never happened, exactly the silent degradation this module
+    exists to prevent.  invoke_with_cap_retry has already spent its one
+    automatic retry by the time we get here, so raising is the right escalation.
+    """
+    from unittest.mock import AsyncMock
+
+    from fused_memory.reconciliation.judge import JudgeInfraError
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = make_gate_mock()
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=fake_gate)
+
+    rejected_result = AgentResult(
+        success=False,
+        output='Agent produced no output',
+        subtype='error_cli_input_rejected',
+        stderr=(
+            'Error: Input must be provided either through stdin or as a '
+            'prompt argument when using --print\n'
+        ),
+        session_id='jsess-2',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+        return_value=rejected_result,
+    ):
+        with pytest.raises(JudgeInfraError) as excinfo:
+            await judge._call_judge_cli('Evaluate this run.')
+
+    assert 'Input must be provided' in str(excinfo.value), (
+        f'the raised message must carry the CLI stderr cause, got {excinfo.value!r}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, tmp_path):
     """_call_judge_cli passes cwd all the way through to invoke_claude_agent.
 
