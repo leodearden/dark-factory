@@ -643,6 +643,44 @@ class TestFalkorHelpers:
         fake_client.select_graph.assert_called_once_with('_probe')
         fake_graph.query.assert_called_once_with('RETURN 1')
 
+    def test_falkor_skipif_default_reason(self):
+        """falkor_skipif() returns a skipif marker whose default reason is the forks' string.
+
+        Pinned exactly ('FalkorDB not reachable') — the string all six forks
+        passed — so the skip lines in ``-rs`` output do not silently change
+        wording as a side effect of the consolidation.
+        """
+        from _fm_helpers import falkor_skipif
+
+        m = falkor_skipif()
+
+        assert m.name == 'skipif'
+        assert isinstance(m.kwargs['reason'], str) and m.kwargs['reason']
+        assert m.kwargs['reason'] == 'FalkorDB not reachable'
+
+    def test_falkor_skipif_custom_reason(self):
+        """falkor_skipif(reason=...) propagates a caller-supplied reason string."""
+        from _fm_helpers import falkor_skipif
+
+        assert falkor_skipif(reason='x').kwargs['reason'] == 'x'
+
+    def test_falkor_skipif_condition_tracks_probe(self, monkeypatch):
+        """falkor_skipif()'s condition is `not _falkor_available()`, evaluated at call time.
+
+        The load-bearing property of the whole migration: the factory must
+        resolve _falkor_available through the module global rather than
+        capturing it, so each migrated module's probe still fires at that
+        module's own collection time — exactly as the inline
+        ``not _falkor_available()`` decorator argument did.
+        """
+        import _fm_helpers
+
+        monkeypatch.setattr(_fm_helpers, '_falkor_available', lambda: False)
+        assert _fm_helpers.falkor_skipif().args[0] is True
+
+        monkeypatch.setattr(_fm_helpers, '_falkor_available', lambda: True)
+        assert _fm_helpers.falkor_skipif().args[0] is False
+
 
 # ---------------------------------------------------------------------------
 # Tests for the shared poll_until() helper (task 2377)
