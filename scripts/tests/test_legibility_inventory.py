@@ -19,11 +19,15 @@ from __future__ import annotations
 
 import gzip
 import importlib.util
+import io
 import json
+import zlib
 from collections.abc import Callable
 from datetime import date as dt_date
 from functools import lru_cache
 from pathlib import Path
+
+import pytest
 
 from legibility import digest, inventory as mod
 from orchestrator import session_registry
@@ -67,6 +71,102 @@ REAL_ENCODED_DIR_PAIRS: tuple[tuple[str, str], ...] = (
     ),
     ('/media/leo/data_lv_1/leo/reify-build', '-media-leo-data-lv-1-leo-reify-build'),
 )
+
+
+# ---------------------------------------------------------------------------
+# Corruption scaffolding — a gz payload plus the two damage shapes a
+# fire-and-forget archive writer really produces (a write interrupted by a
+# killed unit, or a file read while it is still being compressed). Kept local
+# to this file rather than hoisted into conftest: scripts/tests/conftest.py is
+# sys.path bootstrap only, and each test module here already carries its own
+# write helpers.
+# ---------------------------------------------------------------------------
+
+def _gz_payload(n_records: int = 200) -> bytes:
+    """Serialize a multi-record JSONL body — the payload the helpers below
+    compress and then damage. Deliberately many padded records so a cut at the
+    halfway mark lands mid-stream rather than inside the 10-byte header."""
+    return ''.join(
+        json.dumps({'type': 'user', 'seq': i, 'pad': 'x' * 200}) + '\n'
+        for i in range(n_records)
+    ).encode('utf-8')
+
+
+def _write_truncated_gz(path: Path) -> Path:
+    """Write the first half of a valid gz stream — the interrupted-write shape.
+
+    Decompression reaches the end of the bytes before the end-of-stream marker
+    and raises ``EOFError``, which is NOT an ``OSError``.
+    """
+    blob = gzip.compress(_gz_payload())
+    path.write_bytes(blob[: len(blob) // 2])
+    return path
+
+
+def _write_corrupt_body_gz(path: Path) -> Path:
+    """Write a gz whose DEFLATE body is damaged, so decompression raises
+    ``zlib.error`` — a THIRD distinct shape, and also not an ``OSError``.
+
+    Where a flipped byte lands decides which failure gzip reports: many flips
+    still decode and only trip the trailing checksum (``gzip.BadGzipFile``,
+    already an ``OSError``), a few truncate the bit stream (``EOFError``), and
+    only a flip that makes the DEFLATE stream itself unparseable raises
+    ``zlib.error``. So this probes for the first flip position that produces
+    that shape rather than assuming any particular byte does. The probe runs
+    against STDLIB ``gzip`` — never the reader under test — so the helper
+    stays valid both before and after the reader normalizes its exceptions.
+    """
+    blob = gzip.compress(_gz_payload())
+    for index in range(10, len(blob)):
+        candidate = bytearray(blob)
+        candidate[index] ^= 0xFF
+        try:
+            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
+        except zlib.error:
+            path.write_bytes(bytes(candidate))
+            return path
+        except Exception:
+            continue  # a different corruption shape — keep probing
+    raise AssertionError('no single-byte flip produced a zlib.error body')
+
+
+_UNDECODABLE_BODY = b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xfe"}\n'
+"""A JSONL body whose SECOND line carries a raw 0xFF — invalid UTF-8.
+
+The first line is well-formed on purpose: a reader that degraded this
+per-LINE rather than per-FILE would be visibly distinguishable here (it
+would yield record 0 and skip record 1) instead of silently passing.
+"""
+
+
+def _write_undecodable_gz(path: Path) -> Path:
+    """Write a STRUCTURALLY VALID gz whose payload is not valid UTF-8.
+
+    The FOURTH shape, and the one the three helpers above structurally CANNOT
+    reach: each damages the gzip container, so a probe that decompresses in
+    BINARY mode (``gzip.GzipFile(...).read()``, as ``_write_corrupt_body_gz``
+    does) can see them. This file decompresses perfectly. The failure happens
+    one layer up — when the reader's ``encoding='utf-8'`` text wrapper meets
+    byte 0xFF and raises ``UnicodeDecodeError``, which is a ``ValueError``
+    subclass and therefore escapes an ``except OSError`` degrade path no
+    matter how the gzip shapes are normalized. A single flipped byte in
+    stored archive data produces exactly this.
+    """
+    path.write_bytes(gzip.compress(_UNDECODABLE_BODY))
+    return path
+
+
+def _write_undecodable_plain(path: Path) -> Path:
+    """The same bad byte in a PLAIN ``.jsonl`` — no gzip layer involved.
+
+    Pins the half of the decode shape that has no gzip analogue at all: both
+    reader branches open under strict ``encoding='utf-8'``, so an
+    uncompressed transcript is equally able to abort a walk. This is why the
+    normalized message says "undecodable transcript bytes" rather than
+    labelling it a gzip-stream failure.
+    """
+    path.write_bytes(_UNDECODABLE_BODY)
+    return path
 
 
 class TestEncodeCwd:
@@ -346,6 +446,196 @@ class TestGzAwareReader:
         corrupt = tmp_path / 'corrupt.jsonl.gz'
         corrupt.write_bytes(b'this is not gzip\n{"cwd": "/x", "timestamp": "2026-07-13T10:00:00Z"}\n')
         assert mod.session_cwd(corrupt) is None
+
+
+class TestPublicIterJsonLines:
+    """``iter_json_lines`` is PUBLIC — the single low-level transcript reader.
+
+    Promoted from ``_iter_json_lines`` for task 3214: the memory-eval retro
+    corpus extractor (``fused-memory/scripts/memory_eval_transcript_corpus.py``)
+    consumes it from a DIFFERENT package, and a cross-package consumer of an
+    underscore name is a standing invitation for the next author to copy the
+    function instead — the outcome the reuse invariant exists to prevent.
+
+    The underscore name is retained as an alias so the existing in-package
+    callers (``sampling.py``, ``check_transcript_persistence.py``) need no edit;
+    these tests pin that they are the SAME object, so the alias cannot silently
+    drift into a second implementation.
+    """
+
+    RECORDS = [
+        {'type': 'user', 'cwd': MAIN_CWD, 'seq': 1},
+        {'type': 'assistant', 'seq': 2},
+    ]
+
+    def _lines(self) -> str:
+        # A blank line and a syntactically-corrupt line interleaved between the
+        # two good records: both are LINE-level degradations a fire-and-forget
+        # writer really produces, and neither may abort the read.
+        return (
+            json.dumps(self.RECORDS[0])
+            + '\n\n'
+            + '{"type": "user", "message": {broken\n'
+            + json.dumps(self.RECORDS[1])
+            + '\n'
+        )
+
+    def test_public_name_exists(self):
+        assert callable(mod.iter_json_lines)
+
+    def test_legacy_private_name_is_the_same_object(self):
+        # Not merely "both work" — the SAME function object, so the three
+        # existing callers keep the exact behaviour the public name is tested
+        # for, and no second copy can appear behind the old name.
+        assert mod._iter_json_lines is mod.iter_json_lines
+
+    def test_plain_jsonl_skips_blank_and_corrupt_lines(self, tmp_path):
+        path = tmp_path / 'session.jsonl'
+        path.write_text(self._lines(), encoding='utf-8')
+        assert list(mod.iter_json_lines(path)) == self.RECORDS
+
+    def test_gz_round_trips_identically(self, tmp_path):
+        gz_path = tmp_path / 'session.jsonl.gz'
+        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
+            f.write(self._lines())
+        assert list(mod.iter_json_lines(gz_path)) == self.RECORDS
+
+    def test_plain_and_gz_yield_the_same_records(self, tmp_path):
+        plain = tmp_path / 'session.jsonl'
+        plain.write_text(self._lines(), encoding='utf-8')
+        gz_path = tmp_path / 'session.jsonl.gz'
+        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
+            f.write(self._lines())
+        assert list(mod.iter_json_lines(plain)) == list(mod.iter_json_lines(gz_path))
+
+    def test_corrupt_gz_raises_oserror(self, tmp_path):
+        # The documented file-level contract the corpus extractor's coverage
+        # accounting depends on: an unreadable FILE raises OSError
+        # (gzip.BadGzipFile subclasses it), so `except OSError` counts one
+        # parse failure — as distinct from the corrupt LINES above, which are
+        # skipped silently and must NOT inflate that count.
+        corrupt = tmp_path / 'corrupt.jsonl.gz'
+        corrupt.write_bytes(b'this is not gzip at all\n')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(corrupt))
+
+
+class TestIterJsonLinesCorruptionShapes:
+    """ALL FOUR corruption shapes must raise ``OSError`` at the FILE level.
+
+    ``test_corrupt_gz_raises_oserror`` above covers only bad MAGIC, which
+    happens to be an ``OSError`` already (``gzip.BadGzipFile``). Measured, the
+    other three shapes are not::
+
+        truncated stream  -> EOFError            ("ended before the end-of-stream marker")
+        corrupt body      -> zlib.error          ("Error -3 while decompressing data")
+        undecodable byte  -> UnicodeDecodeError  ("codec can't decode byte 0xff")
+
+    None derives from ``OSError``, so all escape every consumer's documented
+    ``except OSError`` degrade path — ``sampling.py``,
+    ``check_transcript_persistence.py``, and the cross-package corpus
+    extractor alike — and abort the whole walk with a traceback. All are
+    exactly what a fire-and-forget archive writer produces on a killed unit or
+    a flipped stored byte, and the archive is live fleet runtime state, so
+    none is a theoretical shape.
+
+    The fourth is worth calling out separately, because a fix aimed at the
+    gzip LAYER misses it: the container decompresses cleanly and the fault is
+    at the strict ``encoding='utf-8'`` text wrapper one level up, so it is
+    reachable on a plain ``.jsonl`` too, and being a ``ValueError`` rather
+    than anything gzip raises it survives an
+    ``except (EOFError, zlib.error)`` widening.
+
+    These tests pin the contract the docstring already advertises: one
+    documented degrade path covers every way a FILE can be unreadable.
+    """
+
+    def test_truncated_gz_raises_oserror(self, tmp_path):
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(truncated))
+
+    def test_corrupt_body_gz_raises_oserror(self, tmp_path):
+        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(corrupt))
+
+    def test_the_two_shapes_are_distinguishable_in_the_message(self, tmp_path):
+        # The reason string is what a coverage-reporting caller puts in its
+        # disclosed `examples` list, so an operator must be able to tell a
+        # half-written transcript from a corrupted one without re-reading the
+        # file. Normalizing to a single TYPE must not flatten them to a single
+        # MESSAGE.
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
+
+        with pytest.raises(OSError) as truncated_exc:
+            list(mod.iter_json_lines(truncated))
+        with pytest.raises(OSError) as corrupt_exc:
+            list(mod.iter_json_lines(corrupt))
+
+        assert str(truncated_exc.value) != str(corrupt_exc.value)
+        assert 'end-of-stream' in str(truncated_exc.value)
+        assert 'decompressing' in str(corrupt_exc.value)
+
+    def test_undecodable_gz_raises_oserror(self, tmp_path):
+        # The FOURTH shape. The gz container is intact — the payload simply
+        # is not UTF-8 — so this arrives as UnicodeDecodeError, a ValueError
+        # subclass that no `except (EOFError, zlib.error)` tuple can catch and
+        # no `except OSError` consumer can see. Un-normalized it aborts a
+        # whole-archive walk over one flipped byte, which is the exact class
+        # of failure the three tests above exist to prevent.
+        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(undecodable))
+
+    def test_undecodable_plain_jsonl_raises_oserror(self, tmp_path):
+        # Same byte, no gzip layer: the plain branch opens with the same
+        # strict encoding, so this shape is reachable there too and must
+        # normalize identically.
+        undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(undecodable))
+
+    def test_the_decode_shape_is_distinguishable_from_the_gzip_shapes(self, tmp_path):
+        # Same rule as the two-shape test above, extended: the disclosed
+        # reason must not call an encoding fault a gzip-stream fault, since
+        # that would send an operator to audit the compressor rather than the
+        # bytes. The offending byte stays in the message.
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
+
+        with pytest.raises(OSError) as truncated_exc:
+            list(mod.iter_json_lines(truncated))
+        with pytest.raises(OSError) as undecodable_exc:
+            list(mod.iter_json_lines(undecodable))
+
+        message = str(undecodable_exc.value)
+        assert message != str(truncated_exc.value)
+        assert 'gzip' not in message
+        assert '0xff' in message.lower()
+
+    def test_corrupt_line_in_a_valid_gz_still_degrades_silently(self, tmp_path):
+        # The other half of the split, and the one a too-broad fix would
+        # destroy: a well-formed gz whose LAST line is a half-written record
+        # (the line-level analogue of a truncated file) still yields every
+        # parseable record and still does NOT raise. If the file-level wrap
+        # swallowed the parse loop as well, this read would start raising and
+        # the coverage counters would double-count ordinary trailing debris as
+        # unreadable files.
+        good = [{'type': 'user', 'seq': 1}, {'type': 'assistant', 'seq': 2}]
+        body = (
+            json.dumps(good[0]) + '\n'
+            + '\n'
+            + '{"type": "user", "message": {broken\n'
+            + json.dumps(good[1]) + '\n'
+            + '{"type": "assistant", "message": {"content": "cut mid-writ'
+        )
+        path = tmp_path / 'trailing-partial.jsonl.gz'
+        with gzip.open(path, 'wt', encoding='utf-8') as f:
+            f.write(body)
+
+        assert list(mod.iter_json_lines(path)) == good
 
 
 class TestResolveAgentTranscriptRoots:
