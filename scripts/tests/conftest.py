@@ -205,10 +205,33 @@ def install_fake_httpx(monkeypatch):
 
     Uses ``monkeypatch.setitem`` (never a bare ``sys.modules[...] = ...``) so
     the real module is restored at teardown and cannot leak into later tests.
+
+    The stub exposes only ``post`` — all four consumers use nothing else today.
+    Any OTHER attribute is a loud ``pytest.fail`` rather than an
+    ``AttributeError``, because ``default_status_fetcher`` funnels every
+    ``Exception`` into ``StatusFetchUnavailable``: a future production change
+    reaching for e.g. ``httpx.Timeout`` or ``except httpx.HTTPError`` would
+    otherwise keep its test green off the stub's own miss.  ``pytest.fail``
+    raises a ``BaseException``, which such a handler cannot swallow.  Dunders
+    stay ordinary ``AttributeError``s so import machinery and introspection can
+    still probe the module.
     """
     def _make(post):
         fake = type(sys)('httpx')
         fake.post = post
+
+        def _missing(name: str):
+            if name.startswith('__') and name.endswith('__'):
+                raise AttributeError(name)
+            pytest.fail(
+                f'install_fake_httpx stub has no {name!r}: the code under test now '
+                'reaches for an httpx attribute this fixture does not provide. '
+                'Extend the fixture (scripts/tests/conftest.py) instead of letting '
+                'the miss be swallowed by a production `except Exception` path.',
+                pytrace=False,
+            )
+
+        fake.__getattr__ = _missing  # PEP 562 module-level __getattr__
         monkeypatch.setitem(sys.modules, 'httpx', fake)
         return fake
 
