@@ -22,6 +22,16 @@
 */
 const { Sparkline: MESpark, StepSpark: MEStep, PALETTE: MEC } = window.DF_CHARTS;
 const MEDF = window.DF_DATA;
+// ME-prefixed like the two lines above.  The prefix is a readability
+// convention here, NOT a collision workaround: this file is a
+// `type="text/babel"` .jsx, and Babel-standalone downlevels .jsx top-level
+// bindings so they never join the classic-script shared global lexical scope.
+// That is an observed fact, not an assumption — tabs.jsx, tab_escalations.jsx
+// and tab_escalation_analytics.jsx each already declare their own top-level
+// `const DF` / `useOpenSet` / `usePersistedState` and all render fine.  See the
+// SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs before
+// "fixing" this.
+const { useState: MEuS } = React;
 
 // ── Chart primitive per metric kind (PRD open question 1) ──
 //
@@ -311,11 +321,30 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
   const trend = m.trend || { labels: [], values: [] };
   const Chart = chartForKind(m.kind);
   const gaps = trendGaps(trend.values);
+  // An EMPTY series is not a drawable series: both Sparkline and StepSpark
+  // return null for a zero-length array, so without this count a metric with
+  // no runs renders a blank 26px box.  `trendGaps([])` is 0, so the gap check
+  // alone cannot tell the two apart.
+  //
+  // `points` is the ONE series count in this row — the chart gate, the gap
+  // disclosure and the footer all read it.  Measuring the state from
+  // trend.values and the footer from trend.labels would let a payload where
+  // they disagree render the contradictory pair "no runs yet" next to "N pts",
+  // which is exactly the reads-as-a-bug outcome the no-runs state was added to
+  // prevent, one line further down.
+  const labels = trend.labels || [];
+  const points = (trend.values || []).length;
+  // labels and values are PARALLEL arrays — one entry per run, both built from
+  // the same `runs` list server-side (memory_evals.py:955,993).  A payload
+  // where they disagree cannot be reconciled here: neither length is more
+  // authoritative, the chart would be drawn against a `span` title derived from
+  // the other array, and the gap message would print "1 of 0 runs".  It gets
+  // its own named state rather than a silently-picked winner.
+  const seriesMismatch = labels.length !== points;
   // A series with a hole cannot be drawn honestly by charts.jsx (see
   // trendGaps).  Equality, not an ordering comparison: nothing here re-derives
   // anything from a threshold.
-  const plottable = Chart && gaps === 0;
-  const labels = trend.labels || [];
+  const plottable = Chart && gaps === 0 && points > 0 && !seriesMismatch;
   const span = labels.length
     ? `${labels[0]} → ${labels[labels.length - 1]}`
     : 'no runs';
@@ -369,33 +398,78 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
       <td className="num">{dash(m.denominator)}</td>
       <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{dash(m.direction)}</td>
       <td style={{ width: 160 }}>
-        {/* Two DISTINCTLY worded suppression states, both reusing the
-            "no chart, value only" shape chartForKind already establishes:
-            an unknown kind is a rendering gap the payload files an
-            `unknown_kind` issue for, whereas a hole is normal, fully-explained
-            missing data.  Either way the row still shows value, current_value,
-            n, denominator, direction and the verdict badge — the operator
-            loses a 160px sparkline, never the signal. */}
+        {/* FOUR DISTINCTLY worded suppression states, all reusing the
+            "no chart, value only" shape chartForKind already establishes.
+            They assert different things and must not be collapsed:
+
+              * unknown kind — a RENDERING gap; the payload passes the value
+                through verbatim and files an `unknown_kind` issue for it.
+              * length disagreement — a MALFORMED payload: labels and values are
+                parallel arrays, so nothing else this cell could say about the
+                series would be trustworthy. Named, never silently reconciled
+                by picking one length over the other.
+              * holed series — normal, fully-explained MISSING DATA: some runs
+                produced no sample, and the count says how many.
+              * no runs — the metric simply has NOT BEEN MEASURED yet. Folding
+                this into the gap message would print "0 of 0 runs produced no
+                sample", a nonsense sentence that reads as a bug.
+
+            `!Chart` stays first: an unrenderable kind is the more actionable
+            fact than an empty or malformed series.  In every case the row still
+            shows value, current_value, n, denominator, direction and the
+            verdict badge — the operator loses a 160px sparkline, never the
+            signal. */}
         {plottable
           ? (
-            <div style={{ height: 26 }} title={span}>
+            <div style={{ height: 26 }} title={span} data-testid="memory-eval-trend-chart">
               {/* values passed through verbatim — never filtered or compacted */}
               <Chart values={trend.values} color={MEC.accent} />
             </div>
           )
           : !Chart
             ? (
-              <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+              <span
+                className="mono"
+                style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                data-testid="memory-eval-trend-no-kind"
+              >
                 no chart for kind {String(m.kind)}
               </span>
             )
-            : (
-              <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-                no chart — {gaps} of {labels.length} runs produced no sample
-              </span>
-            )}
+            : seriesMismatch
+              ? (
+                <span
+                  className="mono"
+                  style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                  data-testid="memory-eval-trend-mismatch"
+                >
+                  no chart — {labels.length} run labels but {points} samples
+                </span>
+              )
+              : points === 0
+                ? (
+                  <span
+                    className="mono"
+                    style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                    data-testid="memory-eval-trend-no-runs"
+                  >
+                    no runs yet — nothing to chart
+                  </span>
+                )
+                : (
+                  <span
+                    className="mono"
+                    style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                    data-testid="memory-eval-trend-gaps"
+                  >
+                    no chart — {gaps} of {labels.length} runs produced no sample
+                  </span>
+                )}
+        {/* Footer count reads `points`, the SAME local the states above are
+            derived from — never the labels array's own length, which would
+            contradict the no-runs state whenever the two arrays disagree. */}
         <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-          {trend.labels ? trend.labels.length : 0} pts
+          {points} pts
           {gaps ? ` · ${gaps} gap(s) — no chart drawn` : ''}
         </div>
       </td>
@@ -405,32 +479,60 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
 
 // ── Limits provenance ──
 //
-// Collapsed by default (a <details>, open state persisted under
-// 'df.memevals.prov' in the useOpenSet/usePersistedState idiom of
-// tab_escalations.jsx:286) so provenance does not dominate the card.
+// Collapsed by default (a <details>, open state persisted in the
+// useOpenSet/usePersistedState idiom of tab_escalations.jsx:286) so provenance
+// does not dominate the card.
+//
+// The persisted key is PER EVAL — `df.memevals.prov.<eval_id>` — and the open
+// state is held in component state seeded from storage exactly once at mount.
+// Both halves matter, and both were once wrong:
+//
+//   * One shared key meant expanding ONE card's provenance wrote '1' for
+//     every card, so the next poll-driven re-render expanded all of them.
+//     A <details> open state is per-disclosure UI state; keying it on the
+//     section makes one operator's click read as a rendering bug everywhere
+//     else.
+//   * Calling the reader inside the JSX attribute (`open={readProvOpen()}`)
+//     re-ran a synchronous localStorage read on EVERY render — once per eval
+//     card per 3s poll tick — and made the toggle unrecoverable, since each
+//     poll overwrote whatever the operator had just opened.
+//
+// No migration off the old flat 'df.memevals.prov' key: a lost <details> open
+// state is a cosmetic default, not data.
 //
 // Everything here is DISPLAYED verbatim.  Nothing is compared, rounded into a
 // verdict, or re-derived — see the verdictBadge comment (PRD section 8,
 // G6/INV-5).  The label/value pairs are built as data rather than as JSX text
 // so the field names live in quoted strings, which also keeps the
 // no-comparison guard's member-access regex unambiguous.
-const ME_PROV_OPEN_KEY = 'df.memevals.prov';
+const ME_PROV_OPEN_PREFIX = 'df.memevals.prov';
 
-function readProvOpen() {
+function provOpenKey(evalId) {
+  return `${ME_PROV_OPEN_PREFIX}.${evalId}`;
+}
+
+// The key is a PARAMETER, not a closed-over module constant: that is what
+// makes one global key shared by every card structurally unrepresentable.
+function readProvOpen(key) {
   try {
-    return localStorage.getItem(ME_PROV_OPEN_KEY) === '1';
+    return localStorage.getItem(key) === '1';
   } catch (e) {
     return false;
   }
 }
 
-function writeProvOpen(open) {
+function writeProvOpen(key, open) {
   try {
-    localStorage.setItem(ME_PROV_OPEN_KEY, open ? '1' : '0');
+    localStorage.setItem(key, open ? '1' : '0');
   } catch (e) { /* private mode — the toggle simply does not persist */ }
 }
 
 function LimitsProvenance({ ev }) {
+  // ABOVE the `if (!lim)` early return below — that guard is a conditional
+  // return, so a hook placed after it would change the hook count on the first
+  // eval with no limits artifact (Rules of Hooks) and blank the card.
+  const provKey = provOpenKey(ev.eval_id);
+  const [provOpen, setProvOpen] = MEuS(() => readProvOpen(provKey));
   const lim = ev.limits;
   if (!lim) {
     return (
@@ -455,7 +557,10 @@ function LimitsProvenance({ ev }) {
     ['generator', lim.generator],
   ];
   return (
-    <details open={readProvOpen()} onToggle={e => writeProvOpen(e.target.open)}>
+    <details
+      open={provOpen}
+      onToggle={e => { setProvOpen(e.target.open); writeProvOpen(provKey, e.target.open); }}
+    >
       <summary className="mono" style={{ fontSize: 10, color: 'var(--fg-3)', cursor: 'pointer' }}>
         limits provenance
       </summary>

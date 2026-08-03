@@ -13,6 +13,52 @@ const { ProjectGroup, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const C = window.DF_CHARTS;
 
+// ── Cross-tab focus helpers (module scope) ──
+//
+// Stable empty payload for the `DF.ESCALATIONS` falsy case.  Hoisted rather
+// than written inline as `|| { subsections: [], ... }` because `escalations` is
+// a dependency of the focus effect below: a fresh literal per render would make
+// an effect that is meant to fire on payload ARRIVAL re-run on every paint.
+// data.js's applyKey refuses null/undefined (data.js:153) so the fallback is
+// unreachable today; hoisting keeps it stable if a change ever makes it
+// reachable.
+const ESC_EMPTY = { subsections: [], summary: { by_level: {}, by_status: {} } };
+
+// Has the escalations payload ARRIVED, as opposed to still being data.js's
+// pre-fetch seed?  Read from data.js's per-key first-success marker, which is
+// the only sound signal:
+//
+//   * Not derivable from the payload's contents — the seed and a loaded but
+//     genuinely EMPTY queue are structurally identical by design (ESCALATIONS
+//     is deliberately not in STABLE_ARRAY_KEYS, data.js:96-105).
+//   * Not derivable from object identity either.  Capturing `DF.ESCALATIONS`
+//     at module-eval time and testing `payload !== SEED` races Babel: this is
+//     a `type="text/babel"` module evaluated after DOMContentLoaded, so
+//     startPolling()'s immediate first fetch can land BEFORE the capture,
+//     freezing a real payload as the "seed" — and nothing unfreezes it while
+//     polling is paused or the endpoint is in backoff, so the tab would claim
+//     "still loading" above a fully-populated queue, indefinitely.
+//   * Not derivable from the `df-data-refresh` event, which fires after
+//     Promise.all even when the escalations fetch FAILED — that reports
+//     arrival on a failure, producing a false miss.
+//
+// The failure direction is chosen on purpose: an endpoint stuck in backoff
+// never sets the marker, so the UI keeps WAITING (and says so) rather than
+// asserting a false "no longer in the queue" — the stronger claim, on evidence
+// that cannot support it.
+function escalationsLoaded() {
+  return !!(DF.__loaded && DF.__loaded.ESCALATIONS);
+}
+
+function findEscalationRow(escalations, id) {
+  for (const sub of (escalations.subsections || [])) {
+    for (const row of (sub.escalations || [])) {
+      if (row.id === id) return row;
+    }
+  }
+  return null;
+}
+
 // ── Local helpers (tabs.jsx-compatible copies; not exported from any namespace) ──
 
 function useOpenSet(ids, defaultOpen = true, storageKey = null) {
@@ -269,7 +315,11 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 // ── EscalationsTab ──
 
 function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
-  const escalations = DF.ESCALATIONS || { subsections: [], summary: { by_level: {}, by_status: {} } };
+  // ESC_EMPTY is hoisted to module scope; see the note at its declaration.
+  // Note it is NOT a "loaded" signal: arrival is read from data.js's
+  // first-success marker (escalationsLoaded), so falling back to this
+  // placeholder cannot be mistaken for an arrived payload.
+  const escalations = DF.ESCALATIONS || ESC_EMPTY;
 
   // Filter subsections by project when projectFilter is active.
   // Orchestrator subsections: filter by subsection label (label == project name).
@@ -329,26 +379,33 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   // Selected row for sidebar
   const [selected, setSelected] = uS(null);
 
+  // A focus id that matched no row. Held rather than dropped: the operator
+  // clicked a link and is owed an answer either way.
+  const [focusMiss, setFocusMiss] = uS(null);
+
   // Cross-tab focus handoff (from the memory-eval escalation links in
   // tab_memory_evals.jsx, lifted through app.jsx). Search every subsection for
   // the row and open the existing detail sidebar with it.
   //
-  // The focus is consumed UNCONDITIONALLY — including when no row matches,
-  // which happens when the escalation resolved between the poll that produced
-  // the link and the click. Leaving it set would reopen a stale drawer on every
-  // later visit to this tab; retrying silently would be worse.
+  // The focus is consumed once a DECISION is REACHABLE, never before. Keyed on
+  // `escalations` as well as `focusId`: while the payload is still the pre-fetch
+  // seed the effect declines to decide, and the dep's per-poll identity change
+  // (applyKey replaces the reference) is what re-runs it — so a cold load, or an
+  // endpoint in backoff, no longer silently eats the focus.
+  //
+  // Once the payload is in, both outcomes are reported. A miss is real: the
+  // escalation may have resolved between the poll that produced the link and
+  // the click. It is still CONSUMED on a miss, because leaving it set would
+  // reopen a stale drawer on every later visit to this tab — but it is now
+  // recorded and rendered rather than dropped in silence.
   uE(() => {
     if (!focusId) return;
-    let found = null;
-    for (const sub of (escalations.subsections || [])) {
-      for (const row of (sub.escalations || [])) {
-        if (row.id === focusId) { found = row; break; }
-      }
-      if (found) break;
-    }
-    if (found) setSelected(found);
+    if (!escalationsLoaded()) return;
+    const found = findEscalationRow(escalations, focusId);
+    if (found) { setSelected(found); setFocusMiss(null); }
+    else { setFocusMiss(focusId); }
     if (onFocusConsumed) onFocusConsumed();
-  }, [focusId]);
+  }, [focusId, escalations]);
 
   // Global summary from top-level data
   const gs = escalations.summary || {};
@@ -358,6 +415,32 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   return (
     <div style={{ position: 'relative' }}>
       <EscalationStatStrip analytics={DF.ESCALATION_ANALYTICS} projectFilter={projectFilter} />
+
+      {/* Cross-tab focus feedback. Two states, not one: a click that lands
+          before the escalations payload does is WAITING, not a miss, and
+          saying "no longer in the queue" while the endpoint is still in
+          backoff would be a false claim. Both name the id, so the operator
+          can see which link they followed. */}
+      {focusId && !escalationsLoaded() && (
+        <div className="badge" data-testid="esc-focus-pending" style={{ marginBottom: 8 }}>
+          waiting for the escalation queue to load — will open{' '}
+          <span className="mono">{focusId}</span> when it arrives
+        </div>
+      )}
+      {focusMiss && (
+        <div className="badge warn" data-testid="esc-focus-miss" style={{ marginBottom: 8 }}>
+          <span className="mono">{focusMiss}</span> is not in the queue — it was
+          likely resolved between the poll that produced the link and the click
+          <button
+            type="button"
+            className="chip"
+            style={{ marginLeft: 8 }}
+            onClick={() => setFocusMiss(null)}
+          >
+            dismiss
+          </button>
+        </div>
+      )}
 
       {/* Controls header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>

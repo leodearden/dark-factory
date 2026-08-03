@@ -173,6 +173,65 @@ def _extract_function_body(src: str, fn_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helper: find the innermost `function` declaration enclosing an offset
+# ---------------------------------------------------------------------------
+
+
+def _enclosing_function(src: str, idx: int) -> tuple[str, list[str]] | None:
+    """Return ``(name, param_names)`` of the innermost ``function`` enclosing ``idx``.
+
+    Returns ``None`` when ``idx`` sits at module scope.
+
+    WHY A BRACE WALK AND NOT A REGEX SPAN.  The obvious spelling —
+    ``function\\s+(\\w+)\\s*\\(([^)]*)\\)\\s*\\{[\\s\\S]{0,300}?<call>`` — silently
+    matches ACROSS function boundaries: with a short helper declared just above
+    the one that actually makes the call, the bounded ``[\\s\\S]`` span reaches
+    past the helper's closing brace and attributes the call to the WRONG
+    function, along with the wrong parameter list.  Measured, not argued: over
+    the shipped ``provOpenKey`` / ``readProvOpen`` pair that span attributes
+    ``localStorage.getItem(key)`` to ``provOpenKey(evalId)`` and reports the
+    key as not-a-parameter — a false FAILURE against correct code.  The walk
+    below is exact.
+    """
+    best: tuple[str, list[str]] | None = None
+    best_start = -1
+    for m in re.finditer(r'\bfunction\s+(\w+)\s*\(', src):
+        paren_depth = 1
+        i = m.end()
+        while i < len(src) and paren_depth > 0:
+            if src[i] == '(':
+                paren_depth += 1
+            elif src[i] == ')':
+                paren_depth -= 1
+            i += 1
+        if paren_depth != 0:
+            continue
+        params_text = src[m.end() : i - 1]
+        start = src.find('{', i)
+        if start == -1:
+            continue
+        depth = 0
+        end = -1
+        for j in range(start, len(src)):
+            if src[j] == '{':
+                depth += 1
+            elif src[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end == -1:
+            continue
+        if start < idx < end and m.start() > best_start:
+            best_start = m.start()
+            best = (
+                m.group(1),
+                [p.strip() for p in params_text.split(',') if p.strip()],
+            )
+    return best
+
+
+# ---------------------------------------------------------------------------
 # Helper: extract a module-scope `const <name> = { ... }` / `[ ... ]` literal
 # ---------------------------------------------------------------------------
 
@@ -595,23 +654,54 @@ def test_index_html_registers_tab_memory_evals_load_order(
         'app.jsx renders MemoryTab, which renders MemoryEvalsSection.',
     )
 
-    # (e) one uniform cache-buster across every /static/redux/* asset,
-    #     including the styles.css <link> — mirrors the guards in
-    #     test_index_html.py:593 (floor 37) and test_tab_escalations.py:487.
-    versions = set(
-        re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)
+    # NOTE: no cache-buster assertion here. The "all /static/redux/?v= share
+    # ONE version" check is asserted once, canonically, in test_index_html.py —
+    # it was replicated across five test modules, each with its own stale
+    # monotonic floor, so every dashboard change re-failed several byte-identical
+    # copies. The monotonic floor this task needs lives in
+    # test_index_html_cache_buster_floor below.
+
+
+def test_index_html_cache_buster_floor(index_html_body: str) -> None:
+    """Every /static/redux/* asset must be at or past this task's version.
+
+    Two of the three fixes in task 3470 are pure edits to .jsx bundles that an
+    already-open dashboard has ALREADY cached — tab_memory_evals.jsx (per-eval
+    provenance key, empty-trend state) and tab_escalations.jsx (focus-miss and
+    focus-pending feedback). Neither adds a route, a template or any other
+    server-side change that would force the browser to refetch. Without a bump
+    an open dashboard keeps running the buggy bundle indefinitely: the operator
+    sees every provenance <details> pop open on the next 3s poll, a blank 26px
+    box where an empty trend should name itself, and a dead cross-tab link,
+    while the fixed source sits on disk unread.
+
+    Bumping is therefore part of the fix, not a cosmetic afterthought, so it is
+    pinned by a test like every prior bump was.
+
+    Scope, deliberately: the FLOOR only. Whether the versions are UNIFORM is one
+    property of index.html, and asserting it here too made this the sixth
+    byte-identical copy of that check (test_index_html.py, test_esc_flow_diagram
+    .py, test_tab_escalation_analytics.py, test_scheduler_page.py, and twice in
+    this module) — so any partial bump failed six tests with six different stale
+    floors in the message, and a reader had to diff them to find the
+    authoritative one. Uniformity is now asserted once, in test_index_html.py.
+    A floor stated as `min(...)` needs no uniformity precondition to be sound:
+    it is the strictly stronger claim under mixed versions, since the oldest
+    asset is the one that would still serve stale module code.
+    """
+    versions = {
+        int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)
+    }
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: '
-        f'{sorted(versions)} — bump all of them uniformly, the stylesheet '
-        '<link> included.'
-    )
-    v = int(next(iter(versions)))
-    assert v >= 38, (
-        f'index.html cache-buster version is {v}, expected >= 38 (proves the '
-        'uniform bump for the memory-evals section actually reaches '
-        'already-open browsers; the previous floor, 37, proved task 3332\'s '
-        '`const API` collision fix).'
+    assert min(versions) >= 42, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        "expected >= 42 so task 3470's tab_memory_evals.jsx and "
+        'tab_escalations.jsx fixes actually reach already-open browsers. This '
+        'floor supersedes the two it subsumes: >= 41 (test_index_html.py) and '
+        '>= 38 (the memory-evals section landing in task 3216).'
     )
 
 
@@ -1371,6 +1461,151 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
     )
 
 
+def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
+    tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """A metric with NO runs is a third suppression state, not a chart.
+
+    The defect: `trendGaps([])` counts zero holes in zero samples, so the
+    `Chart && gaps === 0` gate is TRUE for a metric that has never been
+    measured.  The empty series is then handed to a charts.jsx primitive —
+    and both `Sparkline` (charts.jsx:58) and its `StepSpark` twin `return null`
+    on a zero-length array.  The cell therefore renders an empty 26px <div>
+    plus a "0 pts" footer: a blank box that is indistinguishable from a
+    rendering bug, which is precisely the failure mode the gap-suppression
+    path already exists to avoid.  The deliberate 'no runs' text the row
+    ALREADY computes reaches only a `title=` on that invisible div, so the
+    state is never stated in the open.
+
+    Asserted on structure and on `data-testid` values, never on copy: a
+    rewording keeps this green, deleting a state does not.
+    """
+    body = tab_memory_evals_jsx_body
+    code = tab_memory_evals_jsx_code
+
+    row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
+    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
+
+    # (a) something must MEASURE the series length. Nothing did.
+    points_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
+    )
+    assert points_decl is not None, (
+        'MemoryEvalMetricRow never measures the length of `trend.values`, so '
+        'it cannot tell an empty series from a populated one. `trendGaps([])` '
+        'is 0, so the gap check alone passes a no-runs metric straight to a '
+        'chart primitive that renders nothing.'
+    )
+    points_local = points_decl.group(1)
+
+    # (b) the chart gate must CONSUME that measurement. Re-derived exactly as
+    #     test_trend_holes_are_never_handed_to_a_chart_primitive derives it, so
+    #     the two tests cannot drift apart on what "the gate" means.
+    gate_decl = None
+    for decl in re.finditer(
+        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
+    ):
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
+            gate_decl = decl
+            break
+    assert gate_decl is not None, (
+        'no single-line `const <name> = ...Chart...gaps...;` gate whose local '
+        'reaches a `{<local>` JSX position — see '
+        'test_trend_holes_are_never_handed_to_a_chart_primitive, which derives '
+        'the gate the same way.'
+    )
+    assert re.search(r'\b' + re.escape(points_local) + r'\b', gate_decl.group(0)), (
+        f'the chart gate {gate_decl.group(0).strip()!r} does not consume the '
+        f'series-length local `{points_local}`. An empty series must never '
+        'reach a charts.jsx primitive: both Sparkline and StepSpark return '
+        'null for a zero-length array, leaving a blank 26px box.'
+    )
+
+    # (c) FIVE structurally distinct trend states. A separate no-runs arm is
+    #     required rather than folding it into the gap message because
+    #     "no chart — 0 of 0 runs produced no sample" is a nonsense sentence
+    #     that reads as a bug — the very failure this suppression path exists
+    #     to prevent.  A separate mismatch arm is required for the same reason,
+    #     one payload shape further out: labels and values are PARALLEL arrays
+    #     (memory_evals.py:955,993), so a disagreement makes every other
+    #     sentence this cell could produce untrustworthy.
+    testids = (
+        'memory-eval-trend-chart',
+        'memory-eval-trend-no-kind',
+        'memory-eval-trend-mismatch',
+        'memory-eval-trend-no-runs',
+        'memory-eval-trend-gaps',
+    )
+    assert len(set(testids)) == len(testids), 'the five trend testids must be distinct.'
+    for testid in testids:
+        assert f'data-testid="{testid}"' in code, (
+            f'the trend cell must render a `data-testid="{testid}"` arm. The '
+            'five states — drawn chart, unrenderable kind, labels/values length '
+            'disagreement, no runs yet, and holed series — must be structurally '
+            'distinguishable, so a rewording cannot silently collapse two of '
+            'them into one.'
+        )
+
+    # (d) the existing guards must SURVIVE, re-asserted here so a later
+    #     refactor to a `trendState()` discriminator cannot quietly drop them.
+    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
+    assert bare is None, (
+        f'a chart render site is guarded by `Chart` alone: {bare.group(0)!r} — '
+        'a holed OR empty series would reach the primitive through it.'
+    )
+    assert re.search(r'\{\s*gaps\b', code), (
+        'the `gaps` count must still reach a render position — adding the '
+        'no-runs state must not cost the holed-series disclosure.'
+    )
+
+    # (e) ONE series count feeds every disclosure in this cell.  Measuring the
+    #     state from `trend.values` while the footer counts `trend.labels` lets
+    #     a payload where the two disagree render the mutually contradictory
+    #     pair "no runs yet — nothing to chart" next to "N pts": the same
+    #     reads-as-a-bug outcome this state was added to prevent, moved one
+    #     line down.
+    assert re.search(r'\{\s*' + re.escape(points_local) + r'\s*\}', row_body), (
+        f'the series-length local `{points_local}` never reaches a bare '
+        '`{<local>}` render position, so the footer count is derived from some '
+        'OTHER measurement than the one the trend states are gated on.'
+    )
+    stray = re.search(r'\{[^{}]*trend\.labels[^{}]*\.length[^{}]*\}', row_body)
+    assert stray is None, (
+        f'a render expression still counts `trend.labels` directly: '
+        f'{stray.group(0)!r}. Every count in this cell must read the single '
+        f'`{points_local}` local, or a labels/values disagreement prints two '
+        'contradictory sentences side by side.'
+    )
+
+    # ...and the disagreement itself is NAMED rather than silently reconciled
+    #    by picking one array's length over the other.
+    mismatch_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*\.length\s*!==\s*[^;\n]*;', row_body
+    )
+    assert mismatch_decl is not None, (
+        'MemoryEvalMetricRow never compares the labels and values lengths. They '
+        'are parallel arrays built from one `runs` list server-side '
+        '(memory_evals.py:955,993); a payload where they disagree is malformed, '
+        'and nothing this cell says about the series would be trustworthy.'
+    )
+    mismatch_local = mismatch_decl.group(1)
+    assert re.search(r'\b' + re.escape(mismatch_local) + r'\b', gate_decl.group(0)), (
+        f'the chart gate {gate_decl.group(0).strip()!r} does not consume '
+        f'`{mismatch_local}`, so a malformed series is still drawn — against a '
+        'title derived from the other, differently-sized array.'
+    )
+    assert re.search(
+        re.escape(mismatch_local)
+        + r'[\s\S]{0,400}?data-testid="memory-eval-trend-mismatch"',
+        row_body,
+    ), (
+        f'`{mismatch_local}` does not gate the '
+        '`data-testid="memory-eval-trend-mismatch"` arm, so the disagreement is '
+        'measured but never stated.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-9 test: escalation links, storm aggregate banner, unmatched list
 # ---------------------------------------------------------------------------
@@ -1608,6 +1843,139 @@ def test_limits_provenance_rendered(
             'Provenance is DISPLAYED, never used to re-derive a verdict '
             '(PRD section 8, G6/INV-5).'
         )
+
+
+def test_limits_provenance_open_state_is_per_eval(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """The provenance <details> open state must be PER EVAL and read once at mount.
+
+    The defect this pins, in two halves:
+
+    (1) A single module-global key.  `ME_PROV_OPEN_KEY = 'df.memevals.prov'`
+        was one string shared by every eval card, so expanding one card's
+        provenance wrote '1' and the next re-render expanded ALL of them.  The
+        open state of a <details> is per-disclosure UI state; keying it on the
+        section rather than on the eval makes one operator's click look like a
+        rendering bug across every other card.
+
+    (2) The attribute was a CALL: `<details open={readProvOpen()} ...>`.  A
+        function call in a JSX attribute re-runs on every render — here a
+        synchronous `localStorage.getItem` per eval card per 3s poll tick — and
+        makes the DOM's own open state unrecoverable, since the next poll
+        overwrites whatever the operator just toggled with the stored value.
+        The fix is React state seeded from storage exactly once at mount.
+
+    Every identifier below is DERIVED from the source, never pinned by
+    spelling: renaming the state local, the helpers, or the hook alias is not a
+    test failure.  What must hold is the structure.
+    """
+    code = tab_memory_evals_jsx_code
+
+    prov_body = _extract_function_body(code, 'LimitsProvenance')
+    assert prov_body, 'could not extract the LimitsProvenance body.'
+
+    # (a) the `open=` attribute is a bare identifier, not a call.
+    open_attr = re.search(r'<details\s[^>]*open=\{(\w+)\}', prov_body)
+    assert open_attr is not None, (
+        'the provenance <details> must take its open state from a bare '
+        'identifier (`open={someLocal}`). Not found — see (b): it must be '
+        'React state seeded from localStorage at mount.'
+    )
+    open_local = open_attr.group(1)
+
+    # ...and the NEGATIVE that is the actual defect: no call in the attribute.
+    call_attr = re.search(r'<details\s[^>]*open=\{\s*\w+\s*\(', code)
+    assert call_attr is None, (
+        f'the provenance <details> reads its open state from a function call '
+        f'in the attribute: {call_attr.group(0)!r}. That is a synchronous '
+        'localStorage read on EVERY render — once per eval card per 3s poll '
+        'tick — and it clobbers the operator\'s toggle on the next poll. Seed '
+        'React state from storage once at mount instead.'
+    )
+
+    # (b) that identifier is React useState, seeded by the read helper.
+    #     Any useState alias is accepted (the file uses ME-prefixed aliases:
+    #     MESpark / MEStep / MEC / MEDF), so the assertion is on the
+    #     destructuring SHAPE plus the initializer, not on the hook's spelling.
+    state_decl = re.search(
+        r'const\s*\[\s*' + re.escape(open_local) + r'\s*,\s*(\w+)\s*\]\s*=\s*(\w+)\(([\s\S]{0,200}?)\);',
+        prov_body,
+    )
+    assert state_decl is not None, (
+        f'`{open_local}` reaches the <details> `open=` attribute but is not '
+        f'declared as React state (`const [{open_local}, setX] = useState(...)`). '
+        'Holding the open state in the component is what makes it per-card '
+        'rather than per-section.'
+    )
+    initializer = state_decl.group(3)
+    read_helpers = sorted({
+        fn[0]
+        for m in re.finditer(r'localStorage\.getItem\(', code)
+        if (fn := _enclosing_function(code, m.start())) is not None
+    })
+    assert read_helpers, (
+        'no function in tab_memory_evals.jsx reads localStorage — the '
+        'provenance open state must still be PERSISTED across reloads.'
+    )
+    assert any(re.search(r'\b' + re.escape(h) + r'\s*\(', initializer) for h in read_helpers), (
+        f'the state initializer {initializer.strip()!r} does not call the '
+        f'localStorage read helper (one of {read_helpers}). The stored open '
+        'state must seed the component exactly once at mount.'
+    )
+
+    # (c) HOOK ORDER: the state declaration must precede the `if (!lim)` early
+    #     return LimitsProvenance already has for a null limits artifact. A
+    #     hook after a conditional return is a Rules-of-Hooks violation that
+    #     blanks the card at runtime the first time an eval has no limits.
+    lim_local = re.search(r'\b(\w+)\s*=\s*ev\.limits\b', prov_body)
+    assert lim_local is not None, (
+        'LimitsProvenance must read `ev.limits` into a local.'
+    )
+    guard = re.search(
+        r'if\s*\(\s*!\s*' + re.escape(lim_local.group(1)) + r'\s*\)', prov_body
+    )
+    assert guard is not None, (
+        'LimitsProvenance must keep its `if (!lim)` early-return guard for a '
+        'null limits artifact.'
+    )
+    assert state_decl.start() < guard.start(), (
+        'the provenance open-state hook is declared AFTER the `if (!lim)` '
+        'early return. That is a conditional hook (Rules of Hooks): the first '
+        'eval without a limits artifact changes the hook count and React '
+        'blanks the card. Move the hook above the guard.'
+    )
+
+    # (d) the persisted key is derived from the EVAL IDENTITY, so the key
+    #     expression reaching localStorage varies per card.
+    assert re.search(r'\bev\.eval_id\b', prov_body), (
+        'LimitsProvenance never reads `ev.eval_id`, so its persisted open-state '
+        'key cannot vary per eval — one card\'s toggle would expand every other '
+        'card on the next poll-driven re-render.'
+    )
+
+    # (e) the read and write helpers take the key as a PARAMETER rather than
+    #     closing over one module constant. This is what makes a single global
+    #     key structurally unrepresentable, not merely absent today.
+    for call in ('getItem', 'setItem'):
+        sites = list(re.finditer(
+            r'localStorage\.' + call + r'\(\s*([\w.]+)', code
+        ))
+        assert sites, f'no `localStorage.{call}(` call site found in tab_memory_evals.jsx.'
+        for site in sites:
+            first_arg = site.group(1)
+            enclosing = _enclosing_function(code, site.start())
+            assert enclosing is not None, (
+                f'a `localStorage.{call}(` call sits at module scope — the '
+                'storage key must be a parameter of an enclosing helper.'
+            )
+            fn_name, param_names = enclosing
+            assert first_arg in param_names, (
+                f'`{fn_name}` passes {first_arg!r} to localStorage.{call}() but '
+                f'its parameters are {param_names}. The storage key must be a '
+                'PARAMETER, so a single module-global key shared by every eval '
+                'card is unrepresentable rather than merely not-currently-written.'
+            )
 
 
 # ---------------------------------------------------------------------------

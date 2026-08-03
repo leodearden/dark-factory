@@ -37,6 +37,22 @@ def tab_escalations_jsx_body(_client):
 
 
 @pytest.fixture(scope='module')
+def tab_escalations_jsx_code(tab_escalations_jsx_body):
+    """`tab_escalations.jsx` with every comment stripped.
+
+    Same rationale as the `tab_memory_evals_jsx_code` fixture in
+    test_tab_memory_evals.py: this file carries explanatory prose naming most
+    of the identifiers the render code also names, so a whole-file substring
+    grep is satisfied by a MENTION — delete the render site, leave the comment,
+    and the assertion stays green.
+
+    Safe to strip naively: the source contains no `//` inside a string literal
+    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
+    """
+    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_escalations_jsx_body)
+
+
+@pytest.fixture(scope='module')
 def app_jsx_body(_client):
     return _client.get('/static/redux/app.jsx').text
 
@@ -485,16 +501,21 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
         'tab_escalations.jsx must load before app.jsx so EscalationsTab is set on window.DF_TABS.',
     )
 
-    # (g) All /static/redux/ v= cache-busters share one version >= 10
-    import re as _re
-    versions = set(_re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
-        'bump all of them uniformly to the same value.'
+    # (g) every /static/redux/ cache-buster is at or past this tab's floor.
+    #     FLOOR only: whether the versions are UNIFORM is asserted once,
+    #     canonically, in test_index_html.py. It was replicated byte-identically
+    #     across five test modules, each with its own stale monotonic floor, so a
+    #     partial bump failed five tests with five different floors in the
+    #     message. `min(...)` is the strictly stronger floor claim under mixed
+    #     versions anyway — the OLDEST asset is the one that serves stale code.
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    v = int(next(iter(versions)))
-    assert v >= 10, (
-        f'index.html cache-buster version is {v}, expected >= 10.'
+    assert min(versions) >= 10, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        'expected >= 10 (the floor tab_escalations.jsx landed at).'
     )
 
 
@@ -907,4 +928,224 @@ def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx
         'No `spark=` prop found within ~200 chars of a churn tile label / '
         'churn_daily reference — churn-24h must be RETAINED with its own '
         'sparkline per the open-question-4 decision (keep all four tiles).'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 3470: cross-tab focus must retry until the payload lands, then report
+# ---------------------------------------------------------------------------
+
+
+def test_focus_handoff_retries_then_reports_a_miss(
+    tab_escalations_jsx_code: str,
+) -> None:
+    """A cross-tab focus that finds no row must retry, then SAY it missed.
+
+    Two halves of one defect in the focus effect:
+
+    (1) It consumes `focusId` UNCONDITIONALLY.  On a miss the operator — who
+        just clicked an escalation link over in the memory-evals section —
+        lands on the Escalations tab with nothing selected and no explanation.
+        A dead click with zero feedback is exactly the silent degradation this
+        repo's loud-over-silent norm exists to prevent.
+
+    (2) It is keyed only on `[focusId]`, so the lookup runs ONCE.  `DF.ESCALATIONS`
+        starts as data.js's seed (`subsections: []`) and `applyKey` replaces the
+        reference wholesale on the first successful poll — ESCALATIONS is
+        deliberately not in STABLE_ARRAY_KEYS (data.js:96-105).  So on a cold
+        load, or with the escalations endpoint sitting in data.js's exponential
+        backoff, the single mount-time pass searches an EMPTY payload, drops the
+        focus, and never retries when the rows arrive.
+
+    Asserted structurally and on `data-testid` values, never on copy.
+    """
+    code = tab_escalations_jsx_code
+
+    # (a) module-scope helpers exist AND are called. Naming a helper and then
+    #     never calling it is the dead-code failure the `trendGaps` precedent
+    #     in test_tab_memory_evals.py:1311-1318 guards against.
+    for helper in ('findEscalationRow', 'escalationsLoaded'):
+        assert re.search(rf'\bfunction\s+{helper}\s*\(', code), (
+            f'tab_escalations.jsx must define `function {helper}(`. Lifting the '
+            'row search and the payload-arrival check to module scope is what '
+            'keeps the focus effect small enough to stay under the 900-char cap '
+            'the cross-tab contract test (test_tab_memory_evals.py) matches on.'
+        )
+        assert len(re.findall(rf'\b{helper}\s*\(', code)) >= 2, (
+            f'`{helper}` is defined but never called.'
+        )
+
+    # Extract the focus effect the same way the cross-tab contract test does,
+    # so the two cannot drift apart on what "the focus effect" means.
+    effect = re.search(
+        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[([^\]]*focusId[^\]]*)\]\)',
+        code,
+    )
+    assert effect is not None, (
+        'no `uE` effect keyed on `focusId` found within the 900-char body cap. '
+        'If the effect body outgrew the cap, the cross-tab handoff contract '
+        'test in test_tab_memory_evals.py has silently stopped matching too.'
+    )
+    eff, deps = effect.group(1), effect.group(2)
+
+    # (b) the effect DECLINES to decide before the payload arrives.
+    assert re.search(r'if\s*\(\s*!\s*escalationsLoaded\s*\([^)]*\)\s*\)\s*\{?\s*return', eff), (
+        'the focus effect must bail out early while the escalations payload is '
+        'still data.js\'s seed. Searching an empty payload and calling it a '
+        'miss asserts "no longer in the queue" on evidence that cannot support '
+        'it — the endpoint may simply be in backoff.'
+    )
+
+    # (c) the dep array names the escalations payload local, so the lookup
+    #     RETRIES on each 3s poll instead of firing once at mount.
+    #     Derived from inside the COMPONENT body, not the whole file: the
+    #     module-scope seed capture reads `DF.ESCALATIONS` too, and it is a
+    #     different thing — the frozen pre-fetch reference, which correctly
+    #     must NOT appear in the deps.
+    tab_body = _extract_function_body(code, 'EscalationsTab')
+    assert tab_body, 'could not extract the EscalationsTab body.'
+    esc_local = re.search(r'const\s+(\w+)\s*=\s*DF\.ESCALATIONS', tab_body)
+    assert esc_local is not None, (
+        'EscalationsTab must read `DF.ESCALATIONS` into a local.'
+    )
+    assert re.search(r'\b' + re.escape(esc_local.group(1)) + r'\b', deps), (
+        f'the focus effect\'s dep array is `[{deps.strip()}]` — it does not '
+        f'name `{esc_local.group(1)}`, so the lookup never re-runs when the '
+        'payload lands. A cold load drops the focus permanently.'
+    )
+
+    # (d) a miss is RECORDED BY THE NO-ROW BRANCH into the state the miss
+    #     NOTICE renders — not merely stored somewhere.
+    #
+    #     Both anchors are load-bearing.  A loop over every `uS` declaration
+    #     asking only "is this setter called anywhere in the effect, and does
+    #     this state reach any JSX position?" is VACUOUS here: `setSelected` is
+    #     also called in this effect and `selected` also reaches render, it is
+    #     declared first, so such a loop binds to `selected` and passes — as it
+    #     did on the pre-fix code, which recorded no miss at all.
+    no_row_branch = re.search(r'\belse\b([\s\S]*)$', eff)
+    assert no_row_branch is not None, (
+        'the focus effect has no `else` branch: a lookup that found NO row must '
+        'take a distinct path, not fall through to the one a hit takes.'
+    )
+    branch = no_row_branch.group(1)
+    miss_state = None
+    for decl in re.finditer(r'const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*uS\(', code):
+        state, setter = decl.group(1), decl.group(2)
+        if not re.search(r'\b' + re.escape(setter) + r'\s*\(', branch):
+            continue
+        # ...and that same state must GATE the miss notice's subtree. Derived
+        # from the testid, not from the state's spelling, so a rename is free.
+        if not re.search(
+            r'\{\s*' + re.escape(state) + r'\s*&&[\s\S]{0,400}?data-testid="esc-focus-miss"',
+            code,
+        ):
+            continue
+        miss_state = state
+        break
+    assert miss_state is not None, (
+        'no `uS` state is both written by the focus effect\'s no-row branch and '
+        'the gate on the `data-testid="esc-focus-miss"` subtree. A miss must be '
+        'recorded by the branch that observed it AND displayed — the operator '
+        'clicked a link and is owed an answer either way.'
+    )
+
+    # (e) both no-selection outcomes are visible, pinned by testid not by copy.
+    #     `pending` needs its own state because with the endpoint in backoff the
+    #     payload never leaves the seed: a miss-only fix leaves precisely the
+    #     cold-load case silent, which is half the defect.
+    for testid in ('esc-focus-miss', 'esc-focus-pending'):
+        assert f'data-testid="{testid}"' in code, (
+            f'the tab must render a `data-testid="{testid}"` notice.'
+        )
+
+    # (f) the stale-drawer invariant survives: the focus is still consumed.
+    assert 'onFocusConsumed' in eff, (
+        'the focus effect must still call onFocusConsumed() once a decision is '
+        'reachable — leaving the focus set would reopen a stale drawer on every '
+        'later visit to this tab.'
+    )
+
+
+def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
+    data_js_body: str,
+    tab_escalations_jsx_code: str,
+) -> None:
+    """"Has the payload arrived?" must come from data.js, not from a captured ref.
+
+    The seed-identity form — capture `DF.ESCALATIONS` at module-eval time, then
+    test `payload !== SEED` — races Babel and can WEDGE.  data.js is a classic
+    script whose `startPolling()` fires its first fetch at load time
+    (`refreshDFData` before the interval); tab_escalations.jsx is
+    `type="text/babel"`, transpiled and evaluated after DOMContentLoaded.  So
+    the first escalations response can land BEFORE the capture runs, making the
+    captured "seed" a REAL payload.  Nothing then clears it while either
+    (a) `tw.pauseLive` was already on at load — `startPolling` bypasses
+    `__DF_PAUSE` for that first fetch, but every later `pollTick` is skipped —
+    or (b) the endpoint enters backoff (up to 60s) right after that first
+    success.  In those windows the tab renders a "still loading" notice directly
+    above a fully-populated escalation table and never consumes the cross-tab
+    focus: the same dead-link outcome the focus fix exists to remove, in a new
+    form.
+
+    The sound signal is a per-key FIRST-SUCCESS marker recorded where the apply
+    actually happens.  Asserted structurally, deriving the registry expression
+    and the key from the source rather than pinning either spelling.
+    """
+    code = tab_escalations_jsx_code
+
+    # (a) data.js records the marker inside applyKey — the one place that knows
+    #     a real server value was applied.
+    apply_body = _extract_function_body(data_js_body, 'applyKey')
+    assert apply_body, 'could not extract data.js\'s applyKey body.'
+    marker = re.search(r'([\w.$]+)\[\s*key\s*\]\s*=\s*true', apply_body)
+    assert marker is not None, (
+        'data.js\'s applyKey records no per-key first-success marker '
+        '(`<registry>[key] = true`). Without one, a consumer cannot tell a '
+        'pre-fetch seed from a loaded-but-empty payload: the two are '
+        'structurally identical by design, so nothing about a payload\'s '
+        'contents can distinguish them.'
+    )
+    registry = marker.group(1)
+    leaf = registry.split('.')[-1]
+
+    # (b) the marker means "a real value LANDED", so the null/undefined guard
+    #     must come first — a response that omits the key must not mark it.
+    guard = re.search(
+        r'if\s*\([^)]*value\s*===\s*(?:undefined|null)[\s\S]{0,120}?return', apply_body
+    )
+    assert guard is not None and guard.end() <= marker.start(), (
+        f'applyKey marks `{registry}[key]` before (or without) its '
+        'null/undefined early return, so the marker would claim arrival for a '
+        'response that omitted the key entirely.'
+    )
+
+    # (c) the registry is initialised at module scope, so the first applyKey
+    #     call has a target — the same reason every DF_DATA key is seeded.
+    assert re.search(rf'\b{re.escape(leaf)}\s*[:=]\s*\{{\s*\}}', data_js_body), (
+        f'data.js never initialises the `{leaf}` marker registry to an empty '
+        'object, so the first applyKey call would throw on a missing target.'
+    )
+
+    # (d) tab_escalations.jsx reads THAT marker, keyed on its own payload key.
+    loaded_body = _extract_function_body(code, 'escalationsLoaded')
+    assert loaded_body, 'could not extract the escalationsLoaded body.'
+    assert leaf in loaded_body, (
+        f'escalationsLoaded does not read data.js\'s `{leaf}` marker registry: '
+        f'{loaded_body.strip()!r}'
+    )
+    assert 'ESCALATIONS' in loaded_body, (
+        'escalationsLoaded must key the marker lookup on its own payload key, '
+        f'not on whatever landed last: {loaded_body.strip()!r}'
+    )
+
+    # (e) and the racy form is GONE: no module-scope (column-0) capture of
+    #     `DF.ESCALATIONS`. The component's own per-render read is indented and
+    #     is a different thing entirely.
+    seed_capture = re.search(r'^const\s+\w+\s*=\s*DF\.ESCALATIONS', code, re.M)
+    assert seed_capture is None, (
+        f'tab_escalations.jsx still captures `DF.ESCALATIONS` at module scope: '
+        f'{seed_capture.group(0)!r}. A first poll that resolves before this '
+        'module is evaluated freezes a real payload as the "seed", and paused '
+        'polling or endpoint backoff makes that wedge permanent.'
     )

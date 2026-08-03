@@ -147,6 +147,28 @@ window.DF_DATA = {
     issue_count: 0,
     unmatched_escalations: [],
   },
+  // Per-key FIRST-SUCCESS markers: `__loaded[KEY]` flips true the first time a
+  // real server value for that key is applied, and never back.
+  //
+  // Consumers need this to tell a PRE-FETCH SEED from a loaded-but-genuinely-
+  // EMPTY payload.  By design the two are structurally identical — the seeds
+  // above deliberately mirror the server's own healthy empty shape so no
+  // component has to branch on which it got (see the MEMORY_EVALS note) — so
+  // nothing about a payload's CONTENTS can distinguish them.
+  //
+  // Nor can arrival be inferred client-side from object identity.  Capturing a
+  // seed reference at module-eval time and testing `payload !== SEED` races
+  // this file: a `type="text/babel"` module is transpiled and evaluated after
+  // DOMContentLoaded, while startPolling()'s immediate first fetch can resolve
+  // BEFORE that — freezing a REAL payload as the "seed", and never unfreezing
+  // it while polling is paused (`__DF_PAUSE` skips every later pollTick) or the
+  // endpoint sits in backoff.  A consumer keyed on that comparison then claims
+  // "still loading" over a fully-populated table, indefinitely.
+  //
+  // Nested under DF_DATA rather than added as a second global so a consumer
+  // holding `const DF = window.DF_DATA` reads it with no new capture.  It is
+  // not an endpoint key, so applyKey never overwrites it.
+  __loaded: {},
 };
 
 function applyKey(key, value) {
@@ -157,6 +179,10 @@ function applyKey(key, value) {
   } else {
     window.DF_DATA[key] = value;
   }
+  // Marked AFTER the apply, and only past the null/undefined guard above, so
+  // the marker means "a real server value for this key has LANDED" — never
+  // "a fetch was attempted" and never "the response omitted this key".
+  window.DF_DATA.__loaded[key] = true;
 }
 
 // Flow-control state is keyed by endpoint PATH (query string stripped): four
