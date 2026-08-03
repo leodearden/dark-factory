@@ -641,7 +641,9 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
     return _stderr_has_cli_input_required(result.stderr)
 
 
-def require_non_blank_prompt(prompt: str | None, *, context: str) -> None:
+def require_non_blank_prompt(
+    prompt: str | None, *, context: str, detail: str = ''
+) -> None:
     """Raise ``ValueError`` when *prompt* is None, empty, or whitespace-only.
 
     The other half of the esc-3118-1 fix: make the "prompt never reached the
@@ -660,15 +662,30 @@ def require_non_blank_prompt(prompt: str | None, *, context: str) -> None:
     Called at every boundary that can originate an invocation, so the failure
     surfaces at the caller that built the blank prompt — with *context* naming
     it — instead of as an unattributable CLI error many layers away.
+
+    THE SINGLE raise site for "blank prompt" across this module, deliberately:
+    a caller that wants to defensively handle "I built a blank prompt" catches
+    ONE exception type, and it does not vary with an unrelated flag.  The
+    ``invoke_with_cap_retry`` resume branch — which previously raised its own
+    hand-rolled ``TypeError`` for the same caller bug — delegates here and
+    passes its resume-specific rationale as *detail* rather than forking the
+    type.  *detail*, when given, is appended to the standard message.
+
+    None is accepted and rejected loudly (not an ``AttributeError``): an
+    explicitly-passed ``prompt=None`` is precisely the shape this guard exists
+    to catch.
     """
     if prompt is None or not prompt.strip():
-        raise ValueError(
+        message = (
             f'{context}: prompt must be a non-empty, non-whitespace string. '
             f'The claude CLI receives the prompt ONLY via stdin (the argv carries '
             f'no positional prompt), so a blank prompt is piped silently and the '
             f'CLI rejects the invocation before any model turn with an opaque '
             f'argument error (esc-3118-1). Got {prompt!r}.'
         )
+        if detail:
+            message = f'{message}  {detail}'
+        raise ValueError(message)
 
 
 def _should_retry_cli_input_rejected(result: AgentResult, retries_used: int) -> bool:
@@ -1281,17 +1298,25 @@ async def invoke_with_cap_retry(
     # this swap: its resumed session must receive the real prompt, not the short
     # crash-recovery continuation prompt.
     if invoke_kwargs.get('resume_session_id'):
-        # `.strip()` (task 3143): a whitespace-only prompt corrupts the
-        # fresh-fallback exactly as an empty one does — the CLI receives it via
-        # stdin and rejects the invocation before any model turn. Same
-        # TypeError, same message; one more shape caught.
-        if not original_prompt.strip():
-            raise TypeError(
-                "invoke_with_cap_retry: 'prompt' must be a non-empty string when "
-                "'resume_session_id' is set.  The prompt is the real task context used "
-                'for fresh-fallback recovery if the resume invocation fails; passing an '
-                'empty or missing prompt silently corrupts that fallback.'
-            )
+        # ONE exception type for "blank prompt" (task 3143 amendment): this
+        # branch used to raise its own hand-rolled TypeError, so the SAME
+        # caller bug surfaced as TypeError or ValueError depending on an
+        # unrelated flag — a caller defending against it had to catch both.
+        # Delegating also fixes the None shape: `original_prompt` is
+        # `invoke_kwargs.get('prompt', '')`, so an explicitly-passed
+        # `prompt=None` used to die on `None.strip()` with an incidental
+        # AttributeError instead of this deliberate, well-messaged raise —
+        # precisely the shape the guard exists to catch loudly.  The
+        # resume-specific rationale rides along as `detail` so nothing is lost.
+        require_non_blank_prompt(
+            original_prompt,
+            context=f'{label} (resume_session_id set)',
+            detail=(
+                'On a resume invocation the prompt is the real task context '
+                'kept for fresh-fallback recovery if the resume fails; passing '
+                'an empty or missing prompt silently corrupts that fallback.'
+            ),
+        )
         if not resume_delivers_prompt:
             invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
     else:
@@ -1299,9 +1324,9 @@ async def invoke_with_cap_retry(
         # is always a caller bug.  Raised here — before any invoke_slot is
         # acquired — so a blank prompt never consumes an account slot, never
         # burns a dispatch, and never reaches the CLI as an opaque argument
-        # error (esc-3118-1).  Deliberately NOT applied on the resume branch
-        # above, which has its own (TypeError) contract and legitimately
-        # overwrites `prompt` with a short continuation string.
+        # error (esc-3118-1).  Same guard, same exception type as the resume
+        # branch above; only the context/detail differ, since that branch
+        # legitimately overwrites `prompt` with a short continuation string.
         require_non_blank_prompt(invoke_kwargs.get('prompt'), context=f'{label}')
     consecutive_cap_hits = 0
     cli_input_rejected_retries = 0

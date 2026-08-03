@@ -829,34 +829,50 @@ class TestNonBlankPromptPrecondition:
         gate.invoke_slot.assert_not_called()
         assert cli.calls == []
 
-    async def test_resume_with_empty_prompt_still_raises_typeerror(self):
-        """REGRESSION: the existing resume-path contract is unchanged."""
+    @pytest.mark.parametrize(
+        'prompt',
+        [
+            pytest.param('', id='empty'),
+            pytest.param('   ', id='whitespace_only'),
+            # REGRESSION (amendment): `original_prompt` is
+            # invoke_kwargs.get('prompt', ''), so an explicitly-passed None
+            # used to die on `None.strip()` with an incidental AttributeError
+            # instead of the deliberate guard -- precisely the shape the guard
+            # exists to catch loudly.
+            pytest.param(None, id='explicit_none'),
+        ],
+    )
+    async def test_resume_with_blank_prompt_raises_valueerror(self, prompt):
+        """ONE exception type for one caller bug.
+
+        The same blank prompt must not surface as ValueError or TypeError
+        depending on whether an unrelated flag (resume_session_id) is set --
+        a caller defending against 'I built a blank prompt' would have to
+        catch both.  The resume branch delegates to require_non_blank_prompt
+        and carries its fresh-fallback rationale as `detail`.
+        """
         gate = make_gate_mock(account_count=2)
+        cli = _CountingCli(_succeeded())
 
-        with pytest.raises(TypeError):
-            await invoke_with_cap_retry(
-                gate,
-                'test[resume-empty]',
-                invoke_fn=_CountingCli(_succeeded()),
-                backend='claude',
-                prompt='',
-                resume_session_id='abc',
-            )
-
-    async def test_resume_with_whitespace_only_prompt_raises_typeerror(self):
-        """The resume guard's condition is strengthened to ``.strip()`` --
-        same exception, same message, one more shape caught."""
-        gate = make_gate_mock(account_count=2)
-
-        with pytest.raises(TypeError):
+        with pytest.raises(ValueError) as excinfo:
             await invoke_with_cap_retry(
                 gate,
                 'test[resume-blank]',
-                invoke_fn=_CountingCli(_succeeded()),
+                invoke_fn=cli,
                 backend='claude',
-                prompt='   ',
+                prompt=prompt,
                 resume_session_id='abc',
             )
+
+        # AttributeError is a subclass of nothing relevant here, but pin the
+        # exact type anyway: `pytest.raises(ValueError)` would NOT catch the
+        # AttributeError the old `.strip()` produced, yet an over-broad
+        # assertion could hide a future regression to it.
+        assert type(excinfo.value) is ValueError
+        # The resume-specific rationale must survive the delegation.
+        assert 'fresh-fallback' in str(excinfo.value)
+        gate.invoke_slot.assert_not_called()
+        assert cli.calls == []
 
     async def test_a_normal_prompt_still_dispatches(self):
         """REGRESSION: the guard must not narrow the happy path."""
