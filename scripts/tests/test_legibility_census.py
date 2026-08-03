@@ -2913,14 +2913,14 @@ def test_build_stage_invokes_threads_each_stage_timeout(monkeypatch):
     # Record the timeout every stage invoke threads to coder._invoke_cli.
     recorded = []
 
-    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None, cwd=None):
         recorded.append(timeout)
         return "dummy"
 
     monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
 
     cfg = _config_with_timeouts(111, 222, 333)
-    mining, verify, synth = mod._build_stage_invokes(cfg)
+    mining, verify, synth = mod._build_stage_invokes(cfg, project_root="/home/leo/src/dark-factory")
 
     # Drive each partial exactly as its census seam does: two positional
     # args, no kwargs (invoke(prompt, model)).
@@ -2947,7 +2947,7 @@ def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
 
     recorded = []
 
-    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None, cwd=None):
         recorded.append({"model": model, "timeout": timeout})
         return '{"verified": true}'
 
