@@ -640,30 +640,19 @@ def ensure_fresh_collection(
 # Shared FalkorDB test scaffolding (task 3502)
 # ---------------------------------------------------------------------------
 #
-# De-duplicates the _falkor_available()/FALKOR_HOST/FALKOR_PORT/skip-marker
-# scaffolding that was forked — byte-identical modulo docstring — across six
-# live-FalkorDB test modules: test_list_indices_integration.py,
-# test_falkor_fulltext_integration.py, test_merge_entities.py,
-# test_startup_identity_scan.py, test_reassign_edge.py and
-# test_refresh_entity_summary.py. Three of those docstrings literally said
-# "mirrors test_merge_entities.py" / "mirrors test_list_indices_integration.py",
-# so the copy-paste was self-documented.
-#
-# Deliberately placed directly after the Qdrant section above so the two
-# reachability-probe pairs (constants → probe → skipif factory) sit adjacent
-# and read as one convention. tests/test_falkor_probe_routing_guard.py
-# enforces that no test module re-forks this scaffolding.
+# Connection constants, reachability probe and skip-marker factory for tests
+# that drive a live FalkorDB. Placed directly after the Qdrant section above so
+# the two reachability-probe pairs (constants → probe → skipif factory) read as
+# one convention. tests/test_falkor_probe_routing_guard.py enforces that no
+# test module forks this scaffolding back into itself.
 # ---------------------------------------------------------------------------
 
 def _falkor_host_from_env() -> str:
     """Derive the FalkorDB host from FALKOR_HOST, defaulting to localhost.
 
-    Extracted from the bare module-level expression that fed FALKOR_HOST so
-    the derivation — the part actually worth testing — is reachable at call
-    time. As an inline expression it could only be exercised via
-    ``importlib.reload``, so a unit test could pin nothing but the literal
-    default, which coupled the default `-m 'not integration'` lane to the
-    operator's environment: a set FALKOR_HOST turned an unrelated test red.
+    A named function rather than an expression inlined at the constant's
+    assignment, so the derivation is reachable at call time and can be tested
+    under a monkeypatched environment without ``importlib.reload``.
     """
     return os.environ.get('FALKOR_HOST', 'localhost')
 
@@ -698,9 +687,7 @@ def _falkor_port_from_env() -> int:
         ) from None
 
 
-# Evaluated once at import, exactly as the six forks evaluated their own copies
-# at their own module import — every consumer keeps importing these constants
-# unchanged. Only *where* the expression lives has moved.
+# Evaluated once at import; consumers import the constants, not the helpers.
 FALKOR_HOST: str = _falkor_host_from_env()
 FALKOR_PORT: int = _falkor_port_from_env()
 
@@ -708,25 +695,25 @@ FALKOR_PORT: int = _falkor_port_from_env()
 def _falkor_available() -> bool:
     """Probe whether a FalkorDB instance is reachable at FALKOR_HOST:FALKOR_PORT.
 
-    Uses the falkordb-native sync client rather than ``redis`` because redis is
-    not a declared dependency of fused-memory — only a transitive of
-    graphiti-core[falkordb]. If falkordb ever switches transport, this probe
-    fails loudly instead of silently disappearing.
+    Returns False rather than raising for any failure — construct, query or
+    close — and is bounded by ``socket_connect_timeout=2``, so an unreachable
+    host costs ~2s at most.
 
-    Imports FalkorDB lazily (rather than at module scope, as the six forks did)
-    for two reasons, both load-bearing and both already established by
-    ``_qdrant_available`` above. (1) conftest.py imports this module every test
-    session, so a module-scope falkordb import would be paid even by sessions
-    that never touch FalkorDB; in a single test module the import was scoped to
-    that module's own collection. (2) The lazy form resolves the name at call
-    time, which is what lets tests deterministically patch
-    ``falkordb.FalkorDB`` and unit-test this contract with no live service.
+    Uses the falkordb-native sync client rather than ``redis``: redis is not a
+    declared dependency of fused-memory, only a transitive of
+    graphiti-core[falkordb], so a redis-based probe would break silently if
+    falkordb ever switched transport.
 
-    Deliberately NOT cached: each consuming module pays its own bounded ~2s
-    probe at its own collection time, exactly as before. Memoising would be a
-    behaviour change disguised as a refactor — test_integration_marker_real_service.py
-    reasons explicitly about the up-to-~2s-per-module cost, and a cache would
-    break the call-time-tracking property that ``falkor_skipif`` relies on.
+    Imports FalkorDB lazily so (a) conftest.py's session-wide import of this
+    module does not drag falkordb into sessions that never touch it, and (b)
+    the name resolves at call time, which is what lets tests patch
+    ``falkordb.FalkorDB`` deterministically. Same convention as
+    ``_qdrant_available`` above.
+
+    Deliberately NOT cached: each consuming module pays its own probe at its
+    own collection time. Memoising would break the call-time tracking
+    ``falkor_skipif`` relies on, and test_integration_marker_real_service.py
+    budgets for the per-module cost explicitly.
     """
     from falkordb import FalkorDB
 
@@ -747,17 +734,16 @@ def _falkor_available() -> bool:
 def falkor_skipif(reason: str = 'FalkorDB not reachable'):
     """Return a ``pytest.mark.skipif`` marker gated on `_falkor_available()`.
 
-    A factory rather than a module-level marker constant: _fm_helpers is
-    imported by conftest.py on every test session, so evaluating the probe at
-    import time would run a bounded ~2s connection attempt even for sessions
-    that never touch FalkorDB. Calling this from a module's ``pytestmark`` —
-    or as a class/function decorator, which four of the six migrated modules
-    do — instead defers the probe to that module's own collection time,
-    identical timing to each file's previous local copy.
+    A factory rather than a module-level marker constant: conftest.py imports
+    this module on every session, so evaluating the probe at import time would
+    cost a bounded ~2s connection attempt even for sessions that never touch
+    FalkorDB. Called from a consuming module's ``pytestmark``, or as a
+    class/function decorator, the probe instead fires at that module's own
+    collection time.
 
     Resolves ``_falkor_available`` through the module global at call time
     rather than capturing it, so the marker tracks whatever the probe
-    currently reports. tests/test_fm_helpers.py pins that property.
+    currently reports.
     """
     return pytest.mark.skipif(not _falkor_available(), reason=reason)
 
@@ -765,28 +751,18 @@ def falkor_skipif(reason: str = 'FalkorDB not reachable'):
 def unique_graph_name(slug: str) -> str:
     """Return a fresh per-run FalkorDB graph name, ``_test_<slug>_<8 hex>``.
 
-    A new name is minted on every invocation so that concurrent test runs —
+    A fresh name is minted on every call so that concurrent test runs —
     pytest-xdist ``-n auto``, or a CI matrix pointed at one shared FalkorDB —
-    never select the same graph and wipe each other's fixtures. This rationale
-    was previously a 2-to-3-line comment copy-pasted into each live fixture;
-    it lives here now.
+    never select the same graph and wipe each other's fixtures.
 
-    The caller remains responsible for the surrounding lifecycle: the
-    best-effort delete of a stale graph left by a prior run, and the teardown
-    ``graph.delete()`` / ``client.aclose()`` pair.
+    The caller still owns the rest of the lifecycle: the best-effort delete of
+    a stale graph left by a prior run, and the teardown ``graph.delete()`` /
+    ``client.aclose()`` pair.
 
     Args:
-        slug: Should embed the owning task id, following the existing
-            convention — ``530_list_indices_integration``,
-            ``3334_falkor_fulltext``, ``2210_startup_scan``,
-            ``3009_reassign_edge``, ``2084_edge_dedup``,
-            ``2207_merge_entities`` — so a graph orphaned by a killed run is
+        slug: Should embed the owning task id, by convention (e.g.
+            ``2207_merge_entities``), so a graph orphaned by a killed run is
             traceable back to the test module that created it.
-
-    Returns:
-        The graph name. The 8-hex suffix comes from ``uuid.uuid4()``; the
-        prefix and slug are reproduced verbatim, so migrating a call site to
-        this helper keeps a module inside its existing graph-name namespace.
     """
     return f'_test_{slug}_{uuid.uuid4().hex[:8]}'
 

@@ -551,14 +551,8 @@ class TestQdrantHelpers:
 # ---------------------------------------------------------------------------
 # Tests for shared FalkorDB test scaffolding (task 3502)
 # ---------------------------------------------------------------------------
-# De-duplicates the _falkor_available()/FALKOR_HOST/FALKOR_PORT/skip-marker
-# scaffolding that was forked, byte-identical modulo docstring, in six
-# live-FalkorDB test modules: test_list_indices_integration.py,
-# test_falkor_fulltext_integration.py, test_merge_entities.py,
-# test_startup_identity_scan.py, test_reassign_edge.py and
-# test_refresh_entity_summary.py. No real FalkorDB is used here —
-# falkordb.FalkorDB is monkeypatched throughout, so this suite runs in the
-# default `-m 'not integration'` lane.
+# No real FalkorDB is used here — falkordb.FalkorDB is monkeypatched
+# throughout, so this suite runs in the default `-m 'not integration'` lane.
 
 class TestFalkorHelpers:
     """Unit tests for FALKOR_HOST/FALKOR_PORT, _falkor_available(), falkor_skipif()."""
@@ -566,10 +560,8 @@ class TestFalkorHelpers:
     def test_falkor_host_from_env_default(self, monkeypatch):
         """_falkor_host_from_env() falls back to the local-FalkorDB default.
 
-        The ``delenv`` is what makes this assertion deterministic: FALKOR_HOST
-        is explicitly env-derived, so asserting a default without first
-        clearing the variable couples the default `-m 'not integration'` lane
-        to the operator's environment.
+        The ``delenv`` is what makes the assertion deterministic under an
+        operator environment that sets FALKOR_HOST.
         """
         from _fm_helpers import _falkor_host_from_env
 
@@ -578,12 +570,7 @@ class TestFalkorHelpers:
         assert _falkor_host_from_env() == 'localhost'
 
     def test_falkor_host_from_env_override(self, monkeypatch):
-        """FALKOR_HOST is honoured — the whole reason the env read exists.
-
-        A non-localhost host is the normal configuration when FalkorDB is not
-        on the loopback interface (docker network, CI matrix, a second
-        instance), so the override is contract, not an edge case.
-        """
+        """FALKOR_HOST is honoured — the normal shape when FalkorDB is not on loopback."""
         from _fm_helpers import _falkor_host_from_env
 
         monkeypatch.setenv('FALKOR_HOST', 'falkordb.internal')
@@ -602,10 +589,9 @@ class TestFalkorHelpers:
     def test_falkor_port_from_env_coerces_to_int(self, monkeypatch):
         """An overridden FALKOR_PORT is coerced from str to int.
 
-        This is the only assertion in the suite that can fail if the ``int()``
-        is dropped: without it the call returns the string ``'7000'``, and
-        ``'7000' == 7000`` is False. The coercion is load-bearing because a str
-        port silently breaks ``FalkorDB(port=...)``.
+        The coercion is load-bearing: a str port silently breaks
+        ``FalkorDB(port=...)``. This is the assertion that fails if ``int()``
+        is ever dropped — ``'7000' == 7000`` is False.
         """
         from _fm_helpers import _falkor_port_from_env
 
@@ -646,20 +632,13 @@ class TestFalkorHelpers:
         """The module constants are derived through the helpers, not hardcoded.
 
         Deliberately takes no monkeypatch: the constants were computed from the
-        ambient environment at import time, so calling ``setenv`` here would
-        prove nothing. The two halves differ in strength, honestly:
-
-        * the ``isinstance`` pair is env-INDEPENDENT — it holds under any
-          environment and catches the real hazard, a str port silently
-          breaking ``FalkorDB(port=...)``;
-        * the two equality assertions pin that the constants flow THROUGH
-          these helpers rather than being hardcoded. That is strong under a
-          configured environment and a smoke check under the default one.
-
-        Note what is deliberately absent: no ``FALKOR_HOST == 'localhost'`` or
-        ``FALKOR_PORT == 6379`` against the live constants. That was the
-        defect — it turned this unit test red whenever an operator configured
-        a non-default FalkorDB.
+        ambient environment at import time, so ``setenv`` here would prove
+        nothing. The ``isinstance`` pair holds under any environment and
+        catches the real hazard (a str port silently breaking
+        ``FalkorDB(port=...)``); the equalities pin that the constants flow
+        through these helpers — strong under a configured environment, a smoke
+        check under the default one. No assertion here may pin a literal
+        default, which would couple this lane to the operator's environment.
         """
         from _fm_helpers import (
             FALKOR_HOST,
@@ -738,11 +717,10 @@ class TestFalkorHelpers:
         fake_graph.query.assert_called_once_with('RETURN 1')
 
     def test_falkor_skipif_default_reason(self):
-        """falkor_skipif() returns a skipif marker whose default reason is the forks' string.
+        """falkor_skipif() returns a pytest.mark.skipif marker with a non-empty default reason.
 
-        Pinned exactly ('FalkorDB not reachable') — the string all six forks
-        passed — so the skip lines in ``-rs`` output do not silently change
-        wording as a side effect of the consolidation.
+        The exact wording is deliberately not pinned — matching the Qdrant
+        sibling above. A reword is cosmetic and nothing depends on the prose.
         """
         from _fm_helpers import falkor_skipif
 
@@ -750,7 +728,6 @@ class TestFalkorHelpers:
 
         assert m.name == 'skipif'
         assert isinstance(m.kwargs['reason'], str) and m.kwargs['reason']
-        assert m.kwargs['reason'] == 'FalkorDB not reachable'
 
     def test_falkor_skipif_custom_reason(self):
         """falkor_skipif(reason=...) propagates a caller-supplied reason string."""
@@ -761,11 +738,9 @@ class TestFalkorHelpers:
     def test_falkor_skipif_condition_tracks_probe(self, monkeypatch):
         """falkor_skipif()'s condition is `not _falkor_available()`, evaluated at call time.
 
-        The load-bearing property of the whole migration: the factory must
-        resolve _falkor_available through the module global rather than
-        capturing it, so each migrated module's probe still fires at that
-        module's own collection time — exactly as the inline
-        ``not _falkor_available()`` decorator argument did.
+        The load-bearing property: the factory resolves _falkor_available
+        through the module global rather than capturing it, so each consuming
+        module's probe fires at that module's own collection time.
         """
         import _fm_helpers
 
