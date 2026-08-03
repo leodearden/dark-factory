@@ -1430,6 +1430,100 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
     )
 
 
+def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
+    tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """A metric with NO runs is a third suppression state, not a chart.
+
+    The defect: `trendGaps([])` counts zero holes in zero samples, so the
+    `Chart && gaps === 0` gate is TRUE for a metric that has never been
+    measured.  The empty series is then handed to a charts.jsx primitive —
+    and both `Sparkline` (charts.jsx:58) and its `StepSpark` twin `return null`
+    on a zero-length array.  The cell therefore renders an empty 26px <div>
+    plus a "0 pts" footer: a blank box that is indistinguishable from a
+    rendering bug, which is precisely the failure mode the gap-suppression
+    path already exists to avoid.  The deliberate 'no runs' text the row
+    ALREADY computes reaches only a `title=` on that invisible div, so the
+    state is never stated in the open.
+
+    Asserted on structure and on `data-testid` values, never on copy: a
+    rewording keeps this green, deleting a state does not.
+    """
+    body = tab_memory_evals_jsx_body
+    code = tab_memory_evals_jsx_code
+
+    row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
+    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
+
+    # (a) something must MEASURE the series length. Nothing did.
+    points_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
+    )
+    assert points_decl is not None, (
+        'MemoryEvalMetricRow never measures the length of `trend.values`, so '
+        'it cannot tell an empty series from a populated one. `trendGaps([])` '
+        'is 0, so the gap check alone passes a no-runs metric straight to a '
+        'chart primitive that renders nothing.'
+    )
+    points_local = points_decl.group(1)
+
+    # (b) the chart gate must CONSUME that measurement. Re-derived exactly as
+    #     test_trend_holes_are_never_handed_to_a_chart_primitive derives it, so
+    #     the two tests cannot drift apart on what "the gate" means.
+    gate_decl = None
+    for decl in re.finditer(
+        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
+    ):
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
+            gate_decl = decl
+            break
+    assert gate_decl is not None, (
+        'no single-line `const <name> = ...Chart...gaps...;` gate whose local '
+        'reaches a `{<local>` JSX position — see '
+        'test_trend_holes_are_never_handed_to_a_chart_primitive, which derives '
+        'the gate the same way.'
+    )
+    assert re.search(r'\b' + re.escape(points_local) + r'\b', gate_decl.group(0)), (
+        f'the chart gate {gate_decl.group(0).strip()!r} does not consume the '
+        f'series-length local `{points_local}`. An empty series must never '
+        'reach a charts.jsx primitive: both Sparkline and StepSpark return '
+        'null for a zero-length array, leaving a blank 26px box.'
+    )
+
+    # (c) FOUR structurally distinct trend states. A fourth arm is required
+    #     rather than folding no-runs into the gap message because
+    #     "no chart — 0 of 0 runs produced no sample" is a nonsense sentence
+    #     that reads as a bug — the very failure this suppression path exists
+    #     to prevent.
+    testids = (
+        'memory-eval-trend-chart',
+        'memory-eval-trend-no-kind',
+        'memory-eval-trend-no-runs',
+        'memory-eval-trend-gaps',
+    )
+    assert len(set(testids)) == len(testids), 'the four trend testids must be distinct.'
+    for testid in testids:
+        assert f'data-testid="{testid}"' in code, (
+            f'the trend cell must render a `data-testid="{testid}"` arm. The '
+            'four states — drawn chart, unrenderable kind, no runs yet, and '
+            'holed series — must be structurally distinguishable, so a '
+            'rewording cannot silently collapse two of them into one.'
+        )
+
+    # (d) the existing guards must SURVIVE, re-asserted here so a later
+    #     refactor to a `trendState()` discriminator cannot quietly drop them.
+    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
+    assert bare is None, (
+        f'a chart render site is guarded by `Chart` alone: {bare.group(0)!r} — '
+        'a holed OR empty series would reach the primitive through it.'
+    )
+    assert re.search(r'\{\s*gaps\b', code), (
+        'the `gaps` count must still reach a render position — adding the '
+        'no-runs state must not cost the holed-series disclosure.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-9 test: escalation links, storm aggregate banner, unmatched list
 # ---------------------------------------------------------------------------
