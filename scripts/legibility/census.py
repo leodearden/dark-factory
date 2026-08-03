@@ -1242,6 +1242,48 @@ def run_census(
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
 
+    # DETECTOR for a systemic verifier failure. Scoping the subprocess cwd
+    # removed one CAUSE of the 2026-08-03 silent mass rejection; it is not a
+    # detector for the class. _build_default_verify_fn fails CLOSED per
+    # cluster -- correctly, an unverifiable claim must reject rather than
+    # crash -- so ANY systemic failure (model unreachable mid-run, a
+    # different permission denial, a persistent parse failure) still
+    # presents as an ordinary all-rejected run, and the report below states
+    # zero verified clusters in the same voice it would use for a genuinely
+    # unremarkable census. "clusters were offered and NONE survived" is the
+    # observable signature of that incident, so say it out loud.
+    #
+    # Not an error and not a defer: an all-rejected run is legitimately
+    # possible, so this must not fail a census whose mining is already
+    # paid for. The escalate_fn call is wrapped because, unlike the
+    # defer-path escalation above (which returns immediately afterwards),
+    # this one sits between the mining spend and the output writes -- a
+    # raising escalate_fn must not be what discards the run's results.
+    if clusters_to_verify and not verified:
+        suspect = (
+            f"census: ALL {len(clusters_to_verify)} verified-candidate cluster(s) were "
+            "REJECTED and none survived -- suspect a systemic verifier failure "
+            "(model unreachable, tool access denied, or unparseable verdicts) rather "
+            "than genuinely unfounded claims. This is the observable signature of the "
+            "2026-08-03 sandbox incident, where the verify subprocess was rooted "
+            "outside the censused tree and every read was permission-denied. Check "
+            "the per-cluster 'verify failed' warnings above; a run with real findings "
+            "is being reported as an empty census if this is systemic."
+        )
+        logger.warning("%s", suspect)
+        try:
+            escalate_fn(
+                category="infra_issue",
+                severity="info",
+                summary=(
+                    f"legibility census: all {len(clusters_to_verify)} cluster(s) rejected "
+                    "-- possible systemic verifier failure"
+                ),
+                detail=suspect,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
+            logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
+
     synthesis_md = synthesize_fn(verified, model=config.models.census_synthesis)
 
     verified_sightings = [s for cluster in verified for s in (cluster.get("sightings") or [])]
@@ -1647,7 +1689,14 @@ def _build_default_verify_fn(project_root: str, invoke):
     a single error surfacing. What keeps the default honest rather than
     indiscriminate is ``_build_stage_invokes`` scoping the subprocess cwd to
     *project_root* -- a rejection then means the claim really could not be
-    verified, not that the verifier could not see the tree."""
+    verified, not that the verifier could not see the tree.
+
+    Scoping the cwd removed one CAUSE, not the class: a model that goes
+    unreachable mid-run, a different permission denial, or persistently
+    unparseable verdicts all still land here as ordinary rejections. So
+    ``run_census`` additionally DETECTS the signature -- clusters offered,
+    none verified -- and says so loudly rather than quietly reporting an
+    empty census."""
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
         for cluster in clusters:
@@ -1836,11 +1885,26 @@ def _build_stage_invokes(cfg, *, project_root):
     directory permission-denied every verifier read. Scoping only verify
     would nonetheless leave mining and synthesis silently rooted in
     whatever directory the operator launched from — an asymmetry with no
-    defensible reason that a later reader would file as a bug. It costs
-    nothing: mining and synthesis are text-in/text-out and take no tool
-    action, so their cwd is unobservable, and binding it makes "the census
-    subprocess runs inside the censused project" a uniform invariant
-    instead of a verify-only patch.
+    defensible reason that a later reader would file as a bug. Binding all
+    three makes "the census subprocess runs inside the censused project" a
+    uniform invariant instead of a verify-only patch.
+
+    That uniformity is NOT free, and the cost belongs on the record.
+    Mining and synthesis take no tool action, but their cwd is still
+    observable: ``claude -p`` assembles context from the directory it runs
+    in — CLAUDE.md, ``.claude/settings.json`` (hooks included) and
+    ``.mcp.json`` are all cwd-relative. Scoping the subprocess to the
+    censused project therefore prepends THAT project's CLAUDE.md to every
+    mining call — and mining is both the highest-volume stage (hundreds of
+    calls) and the dominant cost of a ~$100 census — and can fire that
+    project's session hooks inside the census subprocess. It is still the
+    right trade: reading the censused project's own conventions is if
+    anything more correct for mining, and the alternative is two stages
+    silently rooted in an arbitrary directory. But if the added per-call
+    context ever measures material, the lever is an explicit
+    ``--settings``/``--strict-mcp-config``-style flag on the mining and
+    synthesis partials — NOT un-scoping their cwd, which would restore the
+    asymmetry this paragraph exists to rule out.
 
     ``coder._invoke_cli`` is looked up here at call time (inside this
     function, invoked from ``main``), never bound at import, so
