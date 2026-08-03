@@ -1614,9 +1614,12 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
     """POST one JSON-RPC ``tools/call`` envelope to *url* and unwrap the
     result via ``census_trigger._extract_tool_result`` (reused rather than
     reimplemented -- the same MCP envelope shape applies everywhere in this
-    codebase). ``httpx`` is imported lazily since it is not a ``scripts/``
-    dependency (mirrors ``census_trigger.default_status_fetcher`` /
-    ``nightly._default_poster``)."""
+    codebase). ``httpx`` is imported lazily so importing this module for its
+    unit-tested pure core never needs it, and so the tests can substitute a
+    stub for the real POST -- not for availability, since httpx is a direct
+    dependency of ``shared`` (``httpx>=0.27``, task 2965) and this module
+    runs under ``uv run --project shared``. Mirrors
+    ``census_trigger.default_status_fetcher`` / ``nightly._default_poster``."""
     import httpx
 
     response = httpx.post(

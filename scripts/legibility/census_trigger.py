@@ -716,8 +716,10 @@ def default_status_fetcher(project_root: str | Path):
     `evaluate` CLI (task ε injects the real MCP-backed fetcher for the
     nightly trickle instead -- see module docstring). Reads the fused-memory
     MCP endpoint from the `FUSED_MEMORY_MCP_URL` env var, defaulting to
-    `http://localhost:8002`. `httpx` is imported lazily since it is not a
-    scripts/ dependency (see module docstring); that ImportError, along with
+    `http://localhost:8002`. `httpx` is imported lazily so importing this
+    module for its pure core never needs it, and so tests can substitute a
+    stub for the real POST -- not for availability (see module docstring);
+    that ImportError, along with
     any network/HTTP/parse failure, is wrapped as `StatusFetchUnavailable`
     so callers can catch fetch failures deterministically rather than a bare
     Exception. The raw JSON-RPC `tools/call` response is unwrapped via
