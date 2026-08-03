@@ -224,15 +224,25 @@ def _call_wait_budget(call: ast.Call) -> float:
     """Return the wait-budget contribution of a single ``ast.Call`` node.
 
     Recognises exactly two call shapes -- ``asyncio.wait_for(..., timeout=N)``
-    and ``_await_outcome(...)`` (whose hidden default is
-    ``MERGE_RESULT_TIMEOUT`` when no ``timeout=`` kwarg is given). Every
-    other call shape -- ``asyncio.sleep``, ``.wait()``, ``.result()``,
-    ``.join()``, attribute access, arithmetic, unknown names -- contributes
-    0.0 and is skipped silently (this is a conservative FLOOR, not a full
-    audit; see the plan's floor/superset design decision).
+    (the attribute's value must itself be the ``asyncio`` name, so
+    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match) and
+    ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
+    when no ``timeout=`` kwarg is given). Every other call shape --
+    ``asyncio.sleep``, ``.wait()``, ``.result()``, ``.join()``, a
+    non-``asyncio`` ``.wait_for(...)``, attribute access, arithmetic,
+    unknown names -- contributes 0.0 and is skipped silently (this is a
+    conservative FLOOR over call *shapes*: an unrecognised shape can only
+    under-count, never fabricate a wait; see the plan's floor/superset
+    design decision, and ``_method_wait_budget`` below for the orthogonal
+    over-count risk from control flow).
     """
     func = call.func
-    if isinstance(func, ast.Attribute) and func.attr == 'wait_for':
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == 'wait_for'
+        and isinstance(func.value, ast.Name)
+        and func.value.id == 'asyncio'
+    ):
         for kw in call.keywords:
             if kw.arg == 'timeout':
                 return _resolve_wait_value(kw.value)
@@ -248,7 +258,22 @@ def _call_wait_budget(call: ast.Call) -> float:
 
 
 def _method_wait_budget(fn: ast.AST) -> float:
-    """Sum every recognised wait-call contribution anywhere in *fn*'s body."""
+    """Sum every recognised wait-call contribution anywhere in *fn*'s body.
+
+    Control-flow-BLIND by construction: ``ast.walk`` visits every call in
+    the subtree regardless of branch, so waits in mutually exclusive
+    ``if``/``else`` arms or ``try``/``except`` handlers are summed
+    together rather than maxed -- the computed total can OVER-count
+    relative to any single real execution path (pinned by
+    ``TestWaitBudgetAuditHelper.test_mutually_exclusive_branches_are_summed_not_maxed``).
+    This is a deliberate, tolerated imprecision, not a design goal: it runs
+    in the opposite direction from ``_call_wait_budget``'s shape-based
+    under-count (an unrecognised call shape contributes 0.0), so the
+    "conservative FLOOR" framing used elsewhere in this module applies to
+    shape recognition only, not to control flow. The combined result is a
+    same-ballpark estimate meant to catch gross under-marking, not a
+    number that is exactly load-bearing.
+    """
     return sum(
         _call_wait_budget(node) for node in ast.walk(fn) if isinstance(node, ast.Call)
     )
@@ -5338,6 +5363,54 @@ class TestTwoSequentialWaits:
         assert budgets == {'TestTwoSequentialWaits': 90.0}, (
             f'Expected two sequential 45.0s waits in one method to sum to '
             f'90.0, got {budgets!r}.'
+        )
+
+    def test_mutually_exclusive_branches_are_summed_not_maxed(self) -> None:
+        """Two 45.0s waits in opposite arms of an `if`/`else` -- which can
+        never both execute in a single real run -- sum to 90.0, not the
+        45.0 a control-flow-aware count would give.
+
+        This pins a deliberate, tolerated LIMITATION, not a design goal:
+        `_method_wait_budget` walks the whole method body via `ast.walk`
+        with no awareness of branches, so mutually exclusive arms over-count
+        relative to any real execution path (see `_method_wait_budget`'s
+        docstring). It is what makes `TestOverlapSignal`'s computed 160.0s
+        exceed a control-flow-aware hand count of 135.0s for the same
+        method's try/except paths.
+        """
+        source = '''
+class TestBranchesSummed:
+    async def test_branches(self, cond):
+        if cond:
+            await asyncio.wait_for(x, timeout=45.0)
+        else:
+            await asyncio.wait_for(y, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestBranchesSummed': 90.0}, (
+            f'Expected mutually exclusive if/else branches to be SUMMED '
+            f'(90.0), not maxed (45.0) -- this pins the branch-blind '
+            f'limitation documented on _method_wait_budget, not a design '
+            f'goal; got {budgets!r}.'
+        )
+
+    def test_non_asyncio_wait_for_is_not_counted(self) -> None:
+        """A `.wait_for(...)` call on something other than `asyncio` (e.g.
+        `gate.wait_for(x, timeout=999.0)`) contributes 0.0 -- the match is
+        deliberately narrowed to `asyncio.wait_for` specifically, so an
+        unrelated same-named method can't be mistaken for the real thing.
+        """
+        source = '''
+class TestNonAsyncioWaitFor:
+    async def test_it(self, gate):
+        await gate.wait_for(x, timeout=999.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestNonAsyncioWaitFor': 0.0}, (
+            f'Expected a non-asyncio .wait_for(...) call to contribute 0.0, '
+            f'got {budgets!r}.'
         )
 
     def test_takes_max_over_methods_not_class_wide_sum(self) -> None:
