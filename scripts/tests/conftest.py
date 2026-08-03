@@ -20,6 +20,9 @@ two different names and with two different return types (task 3336). They are
 real pytest fixtures rather than importable helpers because fixtures
 auto-resolve for every file in this directory, whereas a `from conftest import
 ...` spelling is fragile under the repo-wide `--import-mode=importlib` addopts.
+
+`install_fake_httpx` (task 3376) follows the same convention, collapsing six
+copies of one fake-httpx idiom spread across four of this directory's files.
 """
 import json
 import sqlite3
@@ -163,5 +166,50 @@ def project_root_with_tasks_db():
         if not db.exists():
             db.write_text('')
         return db
+
+    return _make
+
+
+# ---------------------------------------------------------------------------
+# Shared fake-httpx fixture (task 3376).
+#
+# A fixture rather than an importable helper for the same reason as the
+# tasks.db fixtures above: fixtures auto-resolve for every file in this
+# directory, whereas `from conftest import ...` is fragile under the repo-wide
+# `--import-mode=importlib` addopts (pyproject.toml:47).
+#
+# Deduplicates six copies of the identical idiom across four files:
+# test_census_trigger.py (x3), test_legibility_census.py,
+# test_legibility_nightly.py and test_legibility_transcript_persistence.py.
+# It injects only the MODULE, so each file keeps its own `_FakeHttpxResponse`
+# — those shapes genuinely differ (payload-taking vs no-arg) and are
+# orthogonal to this dedup.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def install_fake_httpx(monkeypatch):
+    """Factory: install a stub ``httpx`` module exposing *post*, return it.
+
+    The seam exists for DETERMINISM, not because the package is missing.
+    httpx IS installed here — a direct dependency of ``shared``
+    (``shared/pyproject.toml``, ``httpx>=0.27``, added for task 2965) — so the
+    lazy, function-local ``import httpx`` in the modules under test resolves to
+    the real library and its POST genuinely goes out to
+    ``$FUSED_MEMORY_MCP_URL`` (default ``localhost:8002``).  On any box running
+    the fused-memory stack that POST SUCCEEDS, so a test leaning on ambient
+    unreachability flaps with the host's listener state — the exact defect
+    tasks 3237/3291 fixed by injecting a fake.  Injecting makes both the
+    request shape assertable and the failure path deterministic regardless of
+    what is listening, which makes this seam MORE necessary now, not less.
+
+    Uses ``monkeypatch.setitem`` (never a bare ``sys.modules[...] = ...``) so
+    the real module is restored at teardown and cannot leak into later tests.
+    """
+    def _make(post):
+        fake = type(sys)('httpx')
+        fake.post = post
+        monkeypatch.setitem(sys.modules, 'httpx', fake)
+        return fake
 
     return _make

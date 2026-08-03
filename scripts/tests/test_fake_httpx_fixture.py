@@ -13,6 +13,16 @@ pytest collects in file order, so it is placed last.
 """
 import sys
 
+# Imported eagerly, at module scope, for two reasons.  (1) It is the executable
+# proof of this file's premise: httpx IS importable here — a direct dependency
+# of `shared` (shared/pyproject.toml, `httpx>=0.27`, task 2965) — so if that
+# dependency were ever dropped, collection of this file fails loudly instead of
+# the suite quietly agreeing with a stale "httpx is not installed" claim.
+# (2) It puts the REAL module in sys.modules before any fixture runs, so the
+# teardown-restoration test below compares against a known object rather than
+# taking a vacuous "key was absent" branch.
+import httpx as _real_httpx
+
 
 def test_install_fake_httpx_shadows_the_real_module_for_lazy_imports(
     install_fake_httpx,
@@ -62,25 +72,27 @@ def test_install_fake_httpx_accepts_post_positionally(install_fake_httpx):
 
 
 def test_install_fake_httpx_is_restored_after_teardown():
-    """After a fixture-using test, ``httpx`` must be absent or the GENUINE package.
+    """After the fixture-using tests above, ``httpx`` must be the GENUINE package.
 
     This is what forces ``monkeypatch.setitem`` over a raw
     ``sys.modules['httpx'] = ...`` assignment: a raw assignment leaves the stub
-    installed for every subsequent test in the session, which would poison any
-    later test that legitimately imports httpx.
+    installed for the rest of the session, poisoning any later test that
+    legitimately imports httpx.
+
+    The module-level ``import httpx as _real_httpx`` guarantees the key was
+    populated with the real module before any fixture ran, so this is an exact
+    identity check and cannot pass by way of a "key was absent" shortcut.
     """
-    leaked = sys.modules.get('httpx')
-    if leaked is None:
-        return  # monkeypatch deleted a key it had created — correct restoration.
-
-    assert getattr(leaked, '__file__', None) is not None, (
-        'a stub module leaked past fixture teardown (no __file__)'
+    assert sys.modules.get('httpx') is _real_httpx, (
+        'a stub module leaked past fixture teardown'
     )
-    assert hasattr(leaked, 'Client'), (
-        'a stub module leaked past fixture teardown (no httpx.Client)'
-    )
-    # The real package must still be usable, not a husk left behind by a stub.
-    import httpx
 
-    assert httpx is leaked
-    assert isinstance(getattr(httpx, '__version__', None), str)
+    # And a fresh lazy import — the shape the production call-sites use — must
+    # reach the real library again, not a husk left behind by the stub.
+    def _lazy_import_site():
+        import httpx
+
+        return httpx
+
+    assert _lazy_import_site() is _real_httpx
+    assert hasattr(_real_httpx, 'Client')
