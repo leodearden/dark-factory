@@ -15,7 +15,6 @@ every ordinary ``uv run pytest tests/`` invocation.
 from __future__ import annotations
 
 import pytest
-
 from _capacity_skip import (
     CAPACITY_FAILURE_MARKERS,
     REAL_CLI_CAP_MESSAGES,
