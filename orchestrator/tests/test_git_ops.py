@@ -5096,12 +5096,25 @@ class TestRunCancellationReapsChild:
         # wait_for timeout below — simulates a persistently-hung script.
         script = (
             'import os, time, sys\n'
-            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            # Publish the pid ATOMICALLY. A bare open(...,'w') makes the path
+            # visible EMPTY before the content is flushed, so the reader below
+            # — which polls on mere existence — can observe '' and die in
+            # int(''). os.replace() is atomic, so the path appears only once it
+            # already carries the full pid.
+            f"_tmp = {str(pid_file)!r} + '.tmp'\n"
+            "open(_tmp, 'w').write(str(os.getpid()))\n"
+            f"os.replace(_tmp, {str(pid_file)!r})\n"
             'time.sleep(60)\n'
         )
+        # The deadline must outlast the child's interpreter startup, or the
+        # child is cancelled before it ever publishes its pid and the poll
+        # below fails as 'child never started'. Measured on a loaded box:
+        # 1.0s missed the pid in 39/40 trials, 3.0s in 12/40, 5.0s in 0/40.
+        # The child sleeps 60s, so a 5.0s deadline still cancels _run with the
+        # child very much alive — which is what this test is about.
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(
-                _run(['python3', '-c', script]), timeout=1.0
+                _run(['python3', '-c', script]), timeout=5.0
             )
 
         # Wait for the child to have written its pid (should be near-instant).
@@ -5127,7 +5140,11 @@ class TestRunCancellationReapsChild:
         pid_file = tmp_path / 'child.pid'
         script = (
             'import os, time\n'
-            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            # Atomic pid publish — see the sibling test above for why a bare
+            # open(...,'w') lets the reader observe an empty file.
+            f"_tmp = {str(pid_file)!r} + '.tmp'\n"
+            "open(_tmp, 'w').write(str(os.getpid()))\n"
+            f"os.replace(_tmp, {str(pid_file)!r})\n"
             'time.sleep(60)\n'
         )
         task = asyncio.ensure_future(_run(['python3', '-c', script]))

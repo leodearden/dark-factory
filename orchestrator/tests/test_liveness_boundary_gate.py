@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -339,12 +340,22 @@ class TestB2PreTurn1Wedge:
       (b) Consumer: zero-output AgentResult → breaker trips → BLOCKED, no resume.
     """
 
-    async def test_zero_turn_wedge_killed_at_grace_not_ceiling(self, tmp_path: Path) -> None:
+    async def test_zero_turn_wedge_killed_at_grace_not_ceiling(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """(a) Watchdog: 0-turn real transcript → fast kill at startup_grace_secs, not ceiling.
 
         Uses REAL count_transcript_turns reading a real 0-assistant JSONL transcript.
-        grace=0.05s, ceiling=5.0s, assert wall<2.0s (killed at grace, not ceiling).
+        grace=0.05s, ceiling=5.0s; asserts the kill came from the startup-grace
+        branch and that the WATCHDOG'S OWN clock puts it well under the ceiling.
+
+        Deliberately NOT asserted on outer wall-clock: under a saturated parallel
+        run the coroutine can be descheduled for seconds either side of
+        ``_run_subprocess``, so wall time is not a sound proxy for which kill
+        path fired. Observed in CI: 6.98s wall for a kill the watchdog itself
+        measured at 0.1s — a green behaviour reported red.
         """
+        caplog.set_level(logging.WARNING, logger='shared.cli_invoke')
         sid = str(uuid.uuid4())
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
@@ -365,7 +376,6 @@ class TestB2PreTurn1Wedge:
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
         ):
-            t0 = time.monotonic()
             result = await _run_subprocess(
                 ['fake'],
                 cwd=tmp_path,
@@ -376,16 +386,29 @@ class TestB2PreTurn1Wedge:
                 session_id=sid,
                 config_dir=cfg_dir,
             )
-            wall = time.monotonic() - t0
 
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
         assert result.transcript_turns == 0, (
             f'Expected transcript_turns=0; got {result.transcript_turns!r}'
         )
         terminate_pg_mock.assert_called_once()
-        # Upper bound generous (2s) to avoid CI flakiness; key assertion: killed at grace.
-        assert wall < 2.0, (
-            f'Expected fast kill (<2s), got {wall:.3f}s — wedge not killed at grace bound'
+        # The kill came from the startup-grace branch, not the ceiling. This log
+        # line is emitted at exactly one place in cli_invoke (the
+        # `not seen_turn and live_turns == 0 and elapsed >= startup_grace_secs`
+        # branch), so its presence discriminates the two paths deterministically
+        # — the ceiling path never emits it.
+        wedge_log = re.search(r'Startup wedge detected after ([\d.]+)s', caplog.text)
+        assert wedge_log is not None, (
+            'Expected the startup-grace kill path to fire and log the wedge; '
+            f'caplog.text snippet: {caplog.text[-500:]!r}'
+        )
+        # Quantitative half, on the WATCHDOG'S clock: detected at the 0.05s grace
+        # bound, nowhere near the 5.0s ceiling. Guards a regression that still
+        # takes the wedge branch but only after ignoring startup_grace_secs.
+        detected_after = float(wedge_log.group(1))
+        assert detected_after < 2.0, (
+            f'Expected fast kill (<2s on the watchdog clock), got {detected_after}s '
+            '— wedge not killed at grace bound'
         )
 
     async def test_zero_output_result_trips_breaker(self, tmp_path: Path) -> None:
