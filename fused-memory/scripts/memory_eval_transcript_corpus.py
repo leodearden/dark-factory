@@ -233,16 +233,9 @@ from shared.memory_eval_metrics import (  # noqa: E402
     validate_stamp,
 )
 
-# `validate_stamp` is the module's one shape check for a run stamp. The
-# alternatives here are worse: re-deriving the stamp regex would be a SECOND
-# definition of a shape that module documents as the one thing it must
-# validate (an override "is going into a filename the window loader will
-# order and cut by string comparison"), and not validating at all is the
-# defect this fixes. The public `run_stamp()`/`write_metric_series(stamp=)`
-# entry points both route through it; this script needs the check WITHOUT
-# their side effects, since it stamps three artifacts of its own. Task 3434
-# promoted it to that module's `__all__` so this import no longer needs the
-# underscore-private workaround.
+# `validate_stamp` rather than an entry point: this script stamps three artifacts of
+# its own, so it needs the shape check WITHOUT `run_stamp()`/`write_metric_series(stamp=)`'s
+# side effects. Why the check is exported at all is documented on the function itself.
 
 # INV-5 / D9: TWO existing readers, ONE core, ZERO new parsers. The scan path
 # streams via iter_json_lines (memory-bounded across thousands of multi-MB gz
