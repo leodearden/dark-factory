@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+# Bounded retry budget for a pre-turn CLI rejection (task 3143 / esc-3118-1):
+# the CLI exited on argument validation before contacting the API, so nothing
+# was billed and no work was lost — a free retry.  ONE is deliberate: a single
+# rejection is consistent with a transient race delivering the prompt to the
+# child's stdin, but a SECOND consecutive one is deterministic (a genuinely
+# blank prompt, a broken argv, a wrapper that never pipes stdin) and must reach
+# a human via the normal steward/escalation path instead of looping.
+_MAX_CLI_INPUT_REJECTED_RETRIES = 1
 # Poll interval for the two-regime liveness watchdog in _run_subprocess.
 # Each tick reads the on-disk transcript to check for assistant turns; the
 # actual sleep per tick is min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling)
@@ -631,6 +639,16 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
     return _stderr_has_cli_input_required(result.stderr)
 
 
+def _should_retry_cli_input_rejected(result: AgentResult, retries_used: int) -> bool:
+    """The SINGLE definition of the pre-turn-rejection retry policy.
+
+    Called by both ``invoke_with_cap_retry`` dispatch sites — the gated
+    ``while True`` loop and the ``usage_gate is None`` fast path — so the
+    ceiling can never drift between them.
+    """
+    return is_cli_invocation_rejected(result) and retries_used < _MAX_CLI_INPUT_REJECTED_RETRIES
+
+
 def is_server_error_status(status: int | None) -> TypeGuard[int]:
     """Return True when *status* is a server-side HTTP error (5xx).
 
@@ -1205,6 +1223,18 @@ async def invoke_with_cap_retry(
     (multi-backend reconnect, PRD harness-backend-reconnect-pi T1) — the
     default ``invoke_claude_agent`` path never does, since it has no
     ``backend`` parameter.
+
+    A pre-turn CLI REJECTION (``is_cli_invocation_rejected``: the prompt never
+    reached the child's stdin, so the CLI exited on argument validation before
+    contacting the API) is retried FRESH at most
+    ``_MAX_CLI_INPUT_REJECTED_RETRIES`` (1) time — nothing was billed and no
+    transcript exists, so the retry is free and loses nothing.  The branch sits
+    ABOVE the heuristic cap safety-net deliberately: the CLI's stdin wait is
+    only 3s, so a fast-exit rejection falls inside that net's sub-5s window and
+    would otherwise be converted into a synthetic cap hit, churning the whole
+    account pool for a local argument error the API never saw.  Once the budget
+    is spent the failed result is returned unchanged for normal steward
+    handling — a second consecutive rejection is deterministic, not a glitch.
     """
     model = invoke_kwargs.get('model', 'opus')
     original_prompt = invoke_kwargs.get('prompt', '')
@@ -1229,6 +1259,7 @@ async def invoke_with_cap_retry(
         if not resume_delivers_prompt:
             invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
     consecutive_cap_hits = 0
+    cli_input_rejected_retries = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     retry_start = time.monotonic()
     last_cap_wait_log_at: float | None = None
@@ -1455,6 +1486,52 @@ async def invoke_with_cap_retry(
                     if not unattributed_cap:
                         slot.confirm(result.cost_usd)
                     break
+
+                # Pre-turn CLI REJECTION (task 3143 / esc-3118-1): the prompt
+                # never reached the child's stdin, so the CLI exited on
+                # argument validation BEFORE contacting the API.  The agent was
+                # never asked anything, nothing was billed and no transcript
+                # exists — so this is a free retry, not an agent failure.
+                #
+                # POSITIONING is load-bearing in two directions:
+                # - ABOVE the heuristic cap safety-net below: the CLI's stdin
+                #   wait is only 3s, so a fast-exit rejection lands inside that
+                #   net's `duration_ms < 5000` window.  Reaching it would
+                #   convert a local argument error into a SYNTHETIC CapHit and
+                #   churn the whole account pool through compounding cooldowns.
+                #   (The CliLocalError escape added with CLI_INPUT_REQUIRED_MARKERS
+                #   also covers this — defence in depth, not redundancy: this
+                #   branch retries, that escape merely declines to cap.)
+                # - BELOW the ModelNotFound/AuthFailed branches: those are
+                #   account- or model-scoped verdicts that must keep their own
+                #   terminal/failover handling.
+                #
+                # Retried FRESH, never resumed: no session was ever created, so
+                # there is nothing to resume, and reusing the prior attempt's
+                # pre-allocated session_id would hit the reify-3604 'Session ID
+                # ... is already in use' wedge.  _reset_for_fresh_retry
+                # regenerates it.  The caller's rebuild_prompt hook is
+                # deliberately NOT invoked: it signals session_lost, and here no
+                # context was ever built, let alone lost — the original prompt
+                # is still exactly the right thing to send.
+                #
+                # slot.confirm settles the slot as a normal zero-cost
+                # completion (mirroring the ModelNotFound branch's shape): no
+                # account is marked capped or auth_failed, because nothing about
+                # the ACCOUNT failed.
+                if _should_retry_cli_input_rejected(result, cli_input_rejected_retries):
+                    cli_input_rejected_retries += 1
+                    if not unattributed_cap:
+                        slot.confirm(result.cost_usd)
+                    logger.warning(
+                        f'{label}: CLI rejected the invocation before any model turn '
+                        f'(no prompt reached the CLI) on account {account_name} — '
+                        f'retrying fresh '
+                        f'({cli_input_rejected_retries}/{_MAX_CLI_INPUT_REJECTED_RETRIES}). '
+                        f'Cause: {_cli_input_rejection_cause(result.stderr)}',
+                    )
+                    _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    continue
 
                 # Wedge guard: a full-timeout CLI call (timed_out=True with zero
                 # turns and zero cost) means the subprocess never executed any
