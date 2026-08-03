@@ -59,6 +59,7 @@ from _orch_helpers import (  # noqa: E402
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
+    stamp_stock_routing_config,
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
@@ -855,6 +856,14 @@ def make_steward(tmp_path: Path):
         config.backends.steward = 'claude'
         config.escalation.host = '127.0.0.1'
         config.escalation.port = 8100
+        config.timeouts.steward = 1800.0
+        config.steward_completion_timeout = 300.0
+        config.fused_memory.url = 'http://localhost:8002'
+        config.fused_memory.project_id = 'dark_factory'
+        # Real routing.* containers: anything not patching the invoke seam reaches
+        # the real resolve_route, which does membership/dict ops a bare MagicMock
+        # child cannot satisfy.  Stock values => byte-equivalent role_default routes.
+        stamp_stock_routing_config(config)
         for k, v in (config_overrides or {}).items():
             setattr(config, k, v)
 
