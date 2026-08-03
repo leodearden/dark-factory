@@ -1490,3 +1490,186 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
                 f'A second identical call must re-probe (no cache entry from '
                 f'the downgrade); got {scoped_probe_mock.await_count} probe calls'
             )
+
+    # -- step-7: LEAF SIGNAL direction 2 (genuine red main) + envelope ------
+
+    def test_genuine_red_main_preserved(self, tmp_path: Path) -> None:
+        """(step-7a) The isolated re-run STILL FAILS on the main probe -> the
+        signature-match verdict (True, MAIN_SHA) is preserved exactly as
+        before, IS cached, and no suppressed-flake record is appended."""
+        from orchestrator import verify as verify_module
+
+        config, worktree, git_ops, module_configs, _run_calls, fake_run = self._setup(tmp_path)
+
+        scoped_probe_mock = AsyncMock(return_value=LOAD_FLAKE_MAIN_RESULT)
+        still_failing = VerifyResult(
+            passed=False,
+            test_output=f'FAILED {PROBE_NODE_ID}\n',
+            lint_output='',
+            type_output='',
+            summary='test_failure',
+            cause_hint=f'FAILED {PROBE_NODE_ID}',
+            category='test_failure',
+        )
+        isolated_rerun_mock = AsyncMock(return_value=still_failing)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', scoped_probe_mock),
+            patch.object(verify_module, 'run_verification', isolated_rerun_mock),
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, module_configs, ['src/foo.py'],
+                    LOAD_FLAKE_MAIN_RESULT, git_ops,
+                )
+            )
+
+        assert result == (True, MAIN_SHA), (
+            f'Expected the preexisting verdict PRESERVED when the isolated '
+            f're-run still fails; got {result!r}'
+        )
+        assert verify_module._PROBE_CACHE != {}, (
+            'Expected the (True, main_sha) verdict to be cached, same as pre-3597'
+        )
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert new_records == [], f'Expected no new suppressed-flake record, got {new_records!r}'
+
+    def test_unconfirmable_keeps_todays_verdict(self, tmp_path: Path) -> None:
+        """(step-7b) A compile_error-shaped signature match with
+        module_configs=[] (no recoverable node-id / no discovered
+        subproject — the shape the whole pre-existing 993-line suite uses)
+        -> (True, MAIN_SHA) unchanged, cached, and run_verification never
+        awaited. Byte-identical-behaviour guard for that suite."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        isolated_rerun_mock = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=SAME_RESULT)),
+            patch.object(verify_module, 'run_verification', isolated_rerun_mock),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, mock_git_ops,
+                )
+            )
+
+        assert result == (True, MAIN_SHA), f'Expected (True, {MAIN_SHA!r}), got {result!r}'
+        assert verify_module._PROBE_CACHE != {}, 'Expected the verdict to be cached'
+        isolated_rerun_mock.assert_not_awaited()
+
+    def test_gate_never_runs_when_main_passes(self, tmp_path: Path) -> None:
+        """(step-7c) Main probe PASSES -> (False, '') with run_verification
+        never awaited — the gate only runs after a signature match. Stubs
+        run_verification to return PASSING_RESULT so an accidental
+        invocation could not be mistaken for the right answer."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        isolated_rerun_mock = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=PASSING_RESULT)),
+            patch.object(verify_module, 'run_verification', isolated_rerun_mock),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, mock_git_ops,
+                )
+            )
+
+        assert result == (False, ''), result
+        isolated_rerun_mock.assert_not_awaited()
+
+    def test_gate_never_runs_on_different_signature(self, tmp_path: Path) -> None:
+        """(step-7c) A DIFFERENT (category, cause_hint) on main -> (False, '')
+        with run_verification never awaited."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        isolated_rerun_mock = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification',
+                         new=AsyncMock(return_value=DIFFERENT_RESULT)),
+            patch.object(verify_module, 'run_verification', isolated_rerun_mock),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, mock_git_ops,
+                )
+            )
+
+        assert result == (False, ''), result
+        isolated_rerun_mock.assert_not_awaited()
+
+    def test_cache_hit_path_untouched(self, tmp_path: Path) -> None:
+        """(step-7d) A pre-seeded _PROBE_CACHE True entry short-circuits to
+        (True, MAIN_SHA) without running the probe or the gate."""
+        import time as time_module
+
+        from orchestrator import verify as verify_module
+        from orchestrator.workflow import _normalize_cause_hint as _norm
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        _norm_hint = _norm(FAILING_RESULT.cause_hint)
+        _cache_key = (MAIN_SHA, FAILING_RESULT.category or '', _norm_hint)
+        verify_module._PROBE_CACHE[_cache_key] = (time_module.monotonic(), True)
+
+        scoped_probe_mock = AsyncMock(return_value=PASSING_RESULT)
+        isolated_rerun_mock = AsyncMock(return_value=PASSING_RESULT)
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', scoped_probe_mock),
+            patch.object(verify_module, 'run_verification', isolated_rerun_mock),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], FAILING_RESULT, mock_git_ops,
+                )
+            )
+
+        assert result == (True, MAIN_SHA), result
+        scoped_probe_mock.assert_not_awaited()
+        isolated_rerun_mock.assert_not_awaited()
