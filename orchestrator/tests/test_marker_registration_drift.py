@@ -9,6 +9,7 @@ strings only — no disk I/O, no pytest config.
 from __future__ import annotations
 
 import ast
+from pathlib import Path
 
 import pytest
 
@@ -263,3 +264,98 @@ class TestAppliedMarkerNames:
         """
         with pytest.raises(SyntaxError):
             _applied_marker_names('def f(:\n    pass\n')
+
+
+class TestUnregisteredMarkers:
+    """``_registered_marker_names`` and ``_unregistered_markers`` — the
+    drift-diff half, unit-tested against synthetic ini lines and synthetic
+    ``tmp_path`` trees. This is the efficacy proof that the guard can
+    actually FAIL: the real tree (wired in ``TestMarkerRegistrationDrift``
+    below) is green on arrival by construction, since every marker in use
+    today is already registered.
+    """
+
+    # -- _registered_marker_names: pytest's own MarkGenerator normalisation ---
+    # Real shapes taken verbatim (as a prefix) from a live
+    # ``pytestconfig.getini('markers')`` probe of this project.
+
+    def test_colon_form_strips_the_description(self):
+        line = (
+            'slow: marks heavyweight tests that shell out to real subprocesses '
+            '(uv run pytest, plan-tools MCP servers) rather than mocking them, '
+            'so they run materially slower than the rest of the suite.'
+        )
+        assert _registered_marker_names([line]) == frozenset({'slow'})
+
+    def test_paren_form_strips_the_call_signature_and_the_description(self):
+        """Builtins arrive with a call signature, e.g. ``parametrize(argnames,
+        argvalues): call a test ...`` — the second split exists for this."""
+        line = (
+            'parametrize(argnames, argvalues): call a test function multiple '
+            'times passing in different arguments in turn.'
+        )
+        assert _registered_marker_names([line]) == frozenset({'parametrize'})
+
+    def test_bare_name_with_no_description(self):
+        assert _registered_marker_names(['anyio']) == frozenset({'anyio'})
+
+    def test_whitespace_padded_input_is_stripped(self):
+        assert _registered_marker_names(['  slow  ']) == frozenset({'slow'})
+
+    def test_multiple_lines_all_normalised(self):
+        assert _registered_marker_names(['slow: x', 'parametrize(a): y', 'anyio']) == frozenset({
+            'slow', 'parametrize', 'anyio',
+        })
+
+    # -- _unregistered_markers: the sweep + diff, over a synthetic tree -------
+
+    def test_a_clean_tree_yields_nothing(self, tmp_path: Path):
+        (tmp_path / 'test_ok.py').write_text(
+            'import pytest\n\n\n@pytest.mark.slow\ndef test_x():\n    pass\n'
+        )
+        assert _unregistered_markers(tmp_path, frozenset({'slow'})) == {}
+
+    def test_a_planted_typo_is_reported_with_a_relative_path(self, tmp_path: Path):
+        """The task description's own typo example."""
+        (tmp_path / 'test_typo.py').write_text(
+            'import pytest\n\n\n@pytest.mark.slwo\ndef test_x():\n    pass\n'
+        )
+        assert _unregistered_markers(tmp_path, frozenset({'slow'})) == {
+            'slwo': {'test_typo.py'},
+        }
+
+    def test_the_typo_via_class_level_pytestmark_is_also_reported(self, tmp_path: Path):
+        (tmp_path / 'test_typo.py').write_text(
+            'import pytest\n\n\nclass TestX:\n    pytestmark = pytest.mark.slwo\n'
+        )
+        assert _unregistered_markers(tmp_path, frozenset({'slow'})) == {
+            'slwo': {'test_typo.py'},
+        }
+
+    def test_the_same_typo_in_two_files_is_one_key_with_both_paths(self, tmp_path: Path):
+        for name in ('test_a.py', 'test_b.py'):
+            (tmp_path / name).write_text(
+                'import pytest\n\n\n@pytest.mark.slwo\ndef test_x():\n    pass\n'
+            )
+        assert _unregistered_markers(tmp_path, frozenset({'slow'})) == {
+            'slwo': {'test_a.py', 'test_b.py'},
+        }
+
+    def test_a_syntax_error_fails_loudly_naming_the_file(self, tmp_path: Path):
+        """Never swallowed, never silently skipped — the opposite of
+        ``orchestrator.pytest_markers``' fail-safe polarity, same as
+        ``_applied_marker_names`` itself."""
+        (tmp_path / 'test_broken.py').write_text('def f(:\n    pass\n')
+        with pytest.raises(AssertionError, match='test_broken.py'):
+            _unregistered_markers(tmp_path, frozenset({'slow'}))
+
+    def test_recurses_into_nested_subdirs_and_ignores_non_py_siblings(self, tmp_path: Path):
+        nested = tmp_path / 'nested'
+        nested.mkdir()
+        (nested / 'test_nested.py').write_text(
+            'import pytest\n\n\n@pytest.mark.slwo\ndef test_x():\n    pass\n'
+        )
+        (tmp_path / 'not_a_test.txt').write_text('pytest.mark.slwo')
+        assert _unregistered_markers(tmp_path, frozenset({'slow'})) == {
+            'slwo': {'nested/test_nested.py'},
+        }
