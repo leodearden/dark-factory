@@ -16,6 +16,7 @@ whether multi-DB aggregation applied here and concluded it is moot.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -31,19 +32,30 @@ logger = logging.getLogger(__name__)
 # line number — a numbered citation across these two packages has gone stale
 # before). `INDEXED BY` makes the index a hard constraint: SQLite raises
 # `no such index: idx_wo_created` rather than silently falling back to a scan
-# if it is ever absent. `with_db` (dashboard/data/db.py) catches that
-# OperationalError, so the actual observable of a missing index is a
-# silently EMPTY operations chart plus a WARNING log — not an error surfaced
-# to the user (pinned by TestOperationsBreakdownMissingIndexDegradation).
+# if it is ever absent. `get_operations_breakdown`'s `_query` catches exactly
+# that error and retries against `OPS_BREAKDOWN_SQL_UNHINTED`, so the actual
+# observable of a missing index is a correct-but-slow chart plus an ERROR log
+# naming `idx_wo_created` (pinned by
+# TestOperationsBreakdownMissingIndexFallback) — never a 500, and no longer a
+# silently empty chart either (amended, task 3519 review pass; the original
+# version of this comment described the pre-amendment silent-empty behaviour).
 # The index cannot go missing in normal operation: fused-memory's
-# initialize() re-runs the `IF NOT EXISTS` DDL on every start. The residual
-# risk this comment guards against is a future SCHEMA EDIT on the
-# fused-memory side (a rename or drop), which nothing else would catch
-# before this endpoint silently went blank.
+# initialize() re-runs the `IF NOT EXISTS` DDL on every start, and
+# fused-memory/tests/test_write_journal.py::test_schema_creates_idx_wo_created
+# already fails CI on a rename or a drop there. The residual risk this
+# fallback guards against is narrower than "nothing else catches it": a
+# schema edit that lands without that suite running, or a journal DB produced
+# by an older fused-memory build.
 OPS_BREAKDOWN_SQL = (
     'SELECT operation, COUNT(*) AS cnt FROM write_ops INDEXED BY idx_wo_created'
     ' WHERE created_at >= ? GROUP BY operation ORDER BY cnt DESC'
 )
+
+# Fallback used by `get_operations_breakdown` when idx_wo_created is
+# unexpectedly absent (see the coupling comment above). Derived from
+# OPS_BREAKDOWN_SQL by construction, rather than retyped, so the two strings
+# cannot silently diverge.
+OPS_BREAKDOWN_SQL_UNHINTED = OPS_BREAKDOWN_SQL.replace(' INDEXED BY idx_wo_created', '')
 
 
 async def get_memory_timeseries(
@@ -119,6 +131,14 @@ async def get_operations_breakdown(
     back to the same ``SCAN`` (measured 18.12 s) — the hint is load-bearing;
     a reshape alone does nothing.
 
+    The hint is tuned for SHORT windows — it is measured only against the
+    24h default. ``INDEXED BY`` is unconditional, so a caller passing a much
+    wider ``hours`` (e.g. a multi-month report) forces the same range seek
+    over a large fraction of the index and loses the in-order ``GROUP BY``
+    that ``idx_wo_operation`` would otherwise give it for free; unlike the
+    unhinted form, the planner is no longer free to correct that choice. No
+    caller passes a non-default ``hours`` today (task 3519 review pass).
+
     Full variant table and measurements are recorded, authoritatively, in the
     "Follow-on: α's residual is now owned (added 2026-08-02)" section of
     plans/dashboard-availability-prd.md.
@@ -126,8 +146,24 @@ async def get_operations_breakdown(
     since = (resolve_now(now) - timedelta(hours=hours)).isoformat()
 
     async def _query(db: aiosqlite.Connection) -> dict:
-        async with db.execute(OPS_BREAKDOWN_SQL, (since,)) as cursor:
-            rows = await cursor.fetchall()
+        try:
+            async with db.execute(OPS_BREAKDOWN_SQL, (since,)) as cursor:
+                rows = await cursor.fetchall()
+        except sqlite3.OperationalError as exc:
+            if 'no such index' not in str(exc):
+                raise
+            # idx_wo_created is missing — see the coupling comment at
+            # OPS_BREAKDOWN_SQL. Fall back to the unhinted query so the chart
+            # stays correct (just slow) instead of going silently blank, and
+            # log loudly enough to name the index without needing the
+            # traceback.
+            logger.error(
+                'write_ops index idx_wo_created missing — operations breakdown '
+                'falling back to unhinted scan',
+                exc_info=True,
+            )
+            async with db.execute(OPS_BREAKDOWN_SQL_UNHINTED, (since,)) as cursor:
+                rows = await cursor.fetchall()
         return {
             'labels': [r[0] or 'unknown' for r in rows],
             'values': [r[1] for r in rows],
