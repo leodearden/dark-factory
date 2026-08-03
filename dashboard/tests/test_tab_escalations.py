@@ -932,7 +932,6 @@ def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx
 
 
 def test_focus_handoff_retries_then_reports_a_miss(
-    tab_escalations_jsx_body: str,
     tab_escalations_jsx_code: str,
 ) -> None:
     """A cross-tab focus that finds no row must retry, then SAY it missed.
@@ -955,7 +954,6 @@ def test_focus_handoff_retries_then_reports_a_miss(
 
     Asserted structurally and on `data-testid` values, never on copy.
     """
-    body = tab_escalations_jsx_body
     code = tab_escalations_jsx_code
 
     # (a) module-scope helpers exist AND are called. Naming a helper and then
@@ -1015,12 +1013,13 @@ def test_focus_handoff_retries_then_reports_a_miss(
     miss_state = None
     for decl in re.finditer(r'const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*uS\(', code):
         state, setter = decl.group(1), decl.group(2)
-        if re.search(r'\b' + re.escape(setter) + r'\s*\(', eff):
-            if re.search(r'\{\s*' + re.escape(state) + r'\b', code) or re.search(
-                r'\b' + re.escape(state) + r'\s*&&', code
-            ):
-                miss_state = state
-                break
+        setter_called = re.search(r'\b' + re.escape(setter) + r'\s*\(', eff)
+        reaches_render = re.search(
+            r'\{\s*' + re.escape(state) + r'\b', code
+        ) or re.search(r'\b' + re.escape(state) + r'\s*&&', code)
+        if setter_called and reaches_render:
+            miss_state = state
+            break
     assert miss_state is not None, (
         'no `uS` state whose setter the focus effect calls also reaches a JSX '
         'render position. A miss must be DISPLAYED, not swallowed — the '
