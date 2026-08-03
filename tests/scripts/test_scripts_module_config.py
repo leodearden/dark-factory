@@ -65,11 +65,22 @@ import shlex
 import tomllib
 from typing import Any
 
+import pytest
+
 from orchestrator import verify, verify_cmd, verify_plan
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
+
+# This worktree's own top-level orchestrator config — the repo-root fleet chain
+# `_root_scripts_suites_pytest_targets` reads. `dark-factory-orchestrator.yaml`
+# is the canonical, REQUIRED filename for a project's top-level config (it is
+# what the dashboard's escalation-URL discovery keys on); the legacy spellings
+# are a discovery fallback for unmigrated projects, not a choice this repo has.
+# Anchored to REPO_ROOT rather than taken from the ambient ORCH_CONFIG_PATH for
+# the reason that helper's docstring records at length.
+ROOT_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 
 MODULE_PREFIX = 'scripts'
 
@@ -1024,13 +1035,42 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
     )
 
 
-def _root_scripts_suites_pytest_targets() -> list[str]:
+def _root_scripts_suites_pytest_targets(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Positional targets of the fleet chain's pytest segment for the scripts suites.
 
-    Read through the PRODUCTION loader — ``OrchestratorConfig(project_root=...)``
-    exposes the repo-root ``test_command``, which is the same value
+    Read through the PRODUCTION loader — the ``test_command`` an
+    ``OrchestratorConfig`` carries is the same value
     ``verify._build_fallback_config`` receives as its ``config`` — rather than
     by ``yaml.safe_load``, for the reason the module docstring records.
+
+    ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene, and an earlier
+    draft omitted it on the false premise that ``project_root=REPO_ROOT``
+    selects which yaml is read. It does not: ``project_root`` is only a model
+    FIELD, and ``OrchestratorConfig.settings_customise_sources`` builds its
+    ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
+    falling back to a CWD-relative ``config.yaml``. Both ambient states are
+    wrong here, in opposite directions:
+
+      * UNSET — which is the state INSIDE VERIFY, because
+        ``verify._target_subprocess_env`` deliberately scrubs the whole
+        ``ORCH_`` prefix (task 2957) — finds no file, so every value collapses
+        to the pydantic defaults, where ``test_command`` is the bare literal
+        ``'pytest'``. The guard then fails with a message about the fleet chain
+        having dropped both scripts trees, when the chain is in fact correct
+        and was simply never read.
+      * SET, as an operator's shell has it, points at whichever checkout that
+        orchestrator serves — typically the MAIN one, not this worktree. The
+        guard would then assert about a different checkout's yaml and report
+        GREEN on a worktree that had dropped ``scripts/tests/`` from its own
+        chain: the exact reports-green-while-checking-something-else failure
+        this file exists to prevent, one env var over.
+
+    Setting the env var IS the production load path (``config.load_config``
+    stamps ``os.environ['ORCH_CONFIG_PATH']`` before constructing), so this
+    stays a read through the real loader — it is pinned to THIS worktree's
+    committed yaml rather than left to the ambient environment. Same remedy,
+    same reason, as ``tests/scripts/test_orchestrator_watchdog.py``'s
+    ``test_orch_restart_min_interval_secs_matches_config_default``.
 
     The segment is selected by CONTENT (the one pytest segment whose targets
     name either scripts test tree) and not by POSITION ("the trailing
@@ -1039,6 +1079,19 @@ def _root_scripts_suites_pytest_targets() -> list[str]:
     checking something else entirely while still reporting green — the same
     reports-green failure mode this whole file exists to prevent.
     """
+    # Fail LOUDLY on a missing file. YamlSettingsSource.__call__ guards its read
+    # with `if self.config_path.exists()`, so a bad path is not an error — it
+    # silently yields the defaults, i.e. the `'pytest'` string above, and the
+    # anchoring this docstring just justified would be undone without a word.
+    assert ROOT_CONFIG_PATH.is_file(), (
+        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
+        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
+        'skips a non-existent path rather than raising), and every assertion '
+        'below would be about a config this repo does not declare. '
+        'dark-factory-orchestrator.yaml is the canonical, required filename for '
+        'a project\'s top-level orchestrator config'
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
     root_cmd = OrchestratorConfig(project_root=REPO_ROOT).test_command
     assert root_cmd, (
         f'the repo-root orchestrator config declares test_command={root_cmd!r}, '
@@ -1058,7 +1111,9 @@ def _root_scripts_suites_pytest_targets() -> list[str]:
     return _targets(matching[0], _PYTEST)
 
 
-def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites() -> None:
+def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The fleet chain and the ``scripts`` module config must name the SAME suites.
 
     Both yamls ASSERT this coupling in prose and, until this guard, nothing
@@ -1095,7 +1150,7 @@ def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites() -> No
     about the chain gating scripts/ diffs. It does not license "fixing" a
     scripts/ coverage question in the root yaml.
     """
-    root_targets = _root_scripts_suites_pytest_targets()
+    root_targets = _root_scripts_suites_pytest_targets(monkeypatch)
 
     discovered = _discovered()
     assert MODULE_PREFIX in discovered, (
