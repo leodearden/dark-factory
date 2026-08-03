@@ -1212,13 +1212,17 @@ class TestScoperTrailingClausePreservation:
     def test_root_type_check_fan_out_still_truncates(self):
         """HAZARD GUARD: a cwd-sequenced same-tool fan-out must NOT keep its tail.
 
-        ``dark-factory-orchestrator.yaml:51`` is ``cd fused-memory && npx
-        pyright && cd ../orchestrator && npx pyright && cd ../dashboard &&
-        npx pyright``. Preserving that tail would (a) run pyright fully
-        UNSCOPED over two more subprojects, defeating scoping entirely, and
-        (b) break correctness — scoping applies ``strip_cwd``, which removes
-        the leading ``cd fused-memory``, so a surviving ``cd ../orchestrator``
-        would resolve relative to the worktree ROOT and escape the repo.
+        ``dark-factory-orchestrator.yaml::type_check_command`` is a ``cd <dir>
+        && npx pyright`` sequence over every subproject; its live text is
+        ``ROOT_TYPE_CHECK_COMMAND`` (deliberately not restated here — a
+        hand-copy in prose is exactly the drift ``test_verify_config_corpus.py``
+        exists to prevent, and this docstring's old ``:51`` line-number label
+        is how the previous copy rotted). Preserving that tail would (a) run
+        pyright fully UNSCOPED over every remaining subproject, defeating
+        scoping entirely, and (b) break correctness — scoping applies
+        ``strip_cwd``, which removes the leading ``cd fused-memory``, so a
+        surviving ``cd ../orchestrator`` would resolve relative to the
+        worktree ROOT and escape the repo.
         """
         scoped = verify._scope_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
         assert scoped == 'npx pyright fused-memory/tests/test_harness.py'
@@ -1226,7 +1230,14 @@ class TestScoperTrailingClausePreservation:
         assert 'cd ../dashboard' not in scoped
 
     def test_root_test_fan_out_still_truncates(self):
-        """Same hazard for ``dark-factory-orchestrator.yaml:41``'s 8-segment fan-out."""
+        """Same hazard for ``dark-factory-orchestrator.yaml::test_command``'s fan-out.
+
+        Labelled by yaml KEY, not line number: the old ``:41`` label pointed at
+        a line the key has long since moved off (it is line 72 today) — the
+        drift that motivated task 3495. ``ROOT_TEST_COMMAND``'s exact text is
+        pinned against the live yaml by ``test_verify_config_corpus.py``, so
+        this docstring names the key and leaves the value to the gate.
+        """
         scoped = verify._scope_to_keyword(ROOT_TEST_COMMAND, 'pytest', self._FILES)
         assert scoped == 'uv run pytest fused-memory/tests/test_harness.py'
         assert 'cd ../escalation' not in scoped
