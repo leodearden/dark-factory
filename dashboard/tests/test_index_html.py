@@ -689,20 +689,26 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 41,
+    """All /static/redux/*?v= cache-busters must share a single version >= 42,
     and graph_layout.js / prd_grouping.js / task_status_counts.js /
     runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
     must all be among the versioned assets.
 
-    Mirrors the existing single-shared-version guards in test_tab_escalations.py,
-    test_tab_scheduler.py, and test_scheduler_page.py. Floor provenance: 30
-    proved the uniform bump from 29 alongside task 2637's runtime_format.js
-    addition; 37 proved the bump for task 3332's `const API` collision fix
-    (esc_flow_layout.js / graph_layout.js renamed to ESC_FLOW_LAYOUT_API /
-    GRAPH_LAYOUT_API); 38 was task 3216's memory-evals floor; 39 proved the
-    bump for task 3436's null-sample fix; 40 was task 3516's split of the
-    merged "N active" pip; 41 proves the bump for task 3442's parity-badge
-    change.
+    This is the canonical home for the UNIFORMITY check ("all versions are
+    the same"). It used to be replicated byte-identically across five/six
+    test modules, each restating it alongside its own stale monotonic floor —
+    task 3603 consolidated it here; the other modules now assert only their
+    own `min(versions) >= N` floor, which needs no uniformity precondition to
+    be sound (the OLDEST asset is the one that would still serve stale code).
+
+    Floor provenance: 30 proved the uniform bump from 29 alongside task
+    2637's runtime_format.js addition; 37 proved the bump for task 3332's
+    `const API` collision fix (esc_flow_layout.js / graph_layout.js renamed
+    to ESC_FLOW_LAYOUT_API / GRAPH_LAYOUT_API); 38 was task 3216's
+    memory-evals floor; 39 proved the bump for task 3436's null-sample fix;
+    40 was task 3516's split of the merged "N active" pip; 41 proved the
+    bump for task 3442's parity-badge change; 42 proves the bump for task
+    3470's tab_memory_evals.jsx and tab_escalations.jsx fixes.
 
     Each of those raises matter more than a usual bump, for the same reason:
     an already-open browser holds a cached copy of the BROKEN file, so without
@@ -722,17 +728,14 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = int(next(iter(versions)))
-    assert v >= 41, (
-        f'index.html cache-buster version is {v}, expected >= 41 (proves the '
-        "uniform bump for task 3442's parity-badge change actually reaches "
-        'already-open browsers, which otherwise keep the cached '
-        'tab_memory_evals.jsx?v=40: it shows no `escalation open` affordance '
-        'on any `*_open` state but recovered_open, and renders an '
-        "unrecognised verdict as the muted 'no verdict' badge — reporting a "
-        'verdict that IS present but unreadable as one that was never made; '
-        "the previous floors were 40 for task 3516's split of the merged \"N "
-        "active\" pip, 39 for task 3436's null-sample fix, 38 for task 3216's "
-        "memory-evals work and 37 for task 3332's `const API` collision fix)."
+    assert v >= 42, (
+        f'index.html cache-buster version is {v}, expected >= 42 (proves the '
+        "uniform bump for task 3470's tab_memory_evals.jsx and "
+        'tab_escalations.jsx fixes actually reaches already-open browsers; '
+        "the previous floors were 41 for task 3442's parity-badge change, 40 "
+        "for task 3516's split of the merged \"N active\" pip, 39 for task "
+        "3436's null-sample fix, 38 for task 3216's memory-evals work and 37 "
+        "for task 3332's `const API` collision fix)."
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
@@ -749,7 +752,7 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'missing tag blanks the Tasks tab, and an unversioned one would both '
         'miss an already-open browser (still holding the tab_tasks.jsx that '
         'renders the merged pip) and break the single-shared-version invariant '
-        'this test and five other modules assert.'
+        'this test is the sole remaining home for.'
     )
     assert re.search(r'/static/redux/runtime_format\.js\?v=\d+', index_html_body), (
         'runtime_format.js is not present among the versioned /static/redux/* '
@@ -759,7 +762,7 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'orch_filter.js is not present among the versioned /static/redux/* '
         'assets in index.html — a tag added without a cache-buster would both '
         'miss an already-open browser and break the single-shared-version '
-        'invariant this test and four other modules assert.'
+        'invariant this test is the sole remaining home for.'
     )
     assert re.search(r'/static/redux/esc_flow_layout\.js\?v=\d+', index_html_body), (
         'esc_flow_layout.js is not present among the versioned /static/redux/* '
@@ -774,6 +777,6 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'assets in index.html — charts.jsx destructures window.DF_SPARK_PATH at '
         'top level with no fallback, so a missing tag blanks nearly every tab, '
         'and an unversioned one would both miss an already-open browser and '
-        'break the single-shared-version invariant this test and four other '
-        'modules assert.'
+        'break the single-shared-version invariant this test is the sole '
+        'remaining home for.'
     )
