@@ -1487,20 +1487,35 @@ class TestProceduralTopicClusterTopicIdSlug:
         assert [c.topic_id for c in clusters] == ['eval-worktree-plan-tools-missing']
 
 
+def _seeded_cluster(topic_id: str) -> ProceduralTopicCluster:
+    """Look up one seeded cluster from the live default set by topic_id.
+
+    Shared by the per-cluster test classes below, which otherwise each
+    carried a private copy of the same three-line lookup. Deliberately
+    reads the DEFAULT ``ReconciliationConfig()`` rather than calling
+    ``_default_topic_guard_clusters()`` directly, so these tests exercise
+    the same path the server does (default_factory -> validated models).
+    Raises ``StopIteration`` if the topic is not seeded, which is the
+    intended red signal for a missing registration.
+    """
+    clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+    return next(c for c in clusters if c.topic_id == topic_id)
+
+
 class TestProceduralTopicGuardClustersDefault:
     """ReconciliationConfig seeds all known topic-guard clusters by default.
 
     Mix of known-contradictory (plan-tools, venv-shadowing, architect
     report_task_already_done main-reachability) and known-recurring
     (pytest-xdist, architect plan-revalidation after requeue/lock, `ruff
-    format` not an enforced gate) topics -- see the >=5 count and the
+    format` not an enforced gate) topics -- see the >=6 count and the
     per-topic-id assertions below.
     """
 
     def test_default_seeds_non_empty_clusters(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert isinstance(clusters, list)
-        assert len(clusters) >= 5
+        assert len(clusters) >= 6
 
     def test_default_seeds_all_known_topic_ids(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
@@ -1513,8 +1528,7 @@ class TestProceduralTopicGuardClustersDefault:
         assert 'ruff-format-not-an-enforced-gate' in topic_ids
 
     def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(c for c in clusters if c.topic_id == 'pytest-xdist-serial-override')
+        cluster = _seeded_cluster('pytest-xdist-serial-override')
         assert '8bb3eb15-1133-4e7b-ac1f-5bac10329b51' in cluster.hint
 
     def test_every_seeded_cluster_is_well_formed(self):
@@ -1523,6 +1537,39 @@ class TestProceduralTopicGuardClustersDefault:
             assert isinstance(cluster, ProceduralTopicCluster)
             assert cluster.phrases, f'{cluster.topic_id} has empty phrases'
             assert cluster.min_phrase_hits >= 1
+
+    def test_no_seeded_phrase_nests_inside_another_in_the_same_cluster(self):
+        """The invariant that keeps every cluster's ``min_phrase_hits`` meaningful.
+
+        ``find_matching_topic_cluster`` counts DISTINCT phrases present as
+        plain substrings, so if one phrase nests inside another in the SAME
+        cluster, a SINGLE occurrence of the longer form scores two distinct
+        hits and satisfies ``min_phrase_hits=2`` on its own -- defeating that
+        field's stated purpose ("Default 2 so a single incidental keyword
+        never triggers a false block").
+
+        The hazard is generic to the matcher, not specific to any one seed:
+        the concrete temptations are 'ruff format --check' beside bare 'ruff
+        format' (ruff-format cluster, task 3435) and bare 'plan.json' beside
+        '.task/plan.json' (plan-revalidation cluster). So the guard is
+        asserted over EVERY seeded cluster rather than one, and holds for all
+        six today.
+
+        Compared by INDEX, not identity: two phrases that are accidentally
+        equal must fail here too (an exact duplicate is the degenerate
+        nesting case, and ``is not`` would silently skip it only when the
+        interpreter happens to intern both copies to one object).
+        """
+        for cluster in ReconciliationConfig().procedural_knowledge_topic_guard_clusters:
+            phrases = [p.lower() for p in cluster.phrases]
+            for i, outer in enumerate(phrases):
+                for j, inner in enumerate(phrases):
+                    if i != j:
+                        assert inner not in outer, (
+                            f'{cluster.topic_id}: {inner!r} nests inside {outer!r} -- one '
+                            f'occurrence would score two distinct hits and defeat '
+                            f'min_phrase_hits'
+                        )
 
 
 class TestReportTaskAlreadyDoneMainReachabilityCluster:
@@ -1533,13 +1580,10 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
     known-contradictory seeds (plan-tools, venv-shadowing) above.
     """
 
+    TOPIC_ID = 'architect-report-task-already-done-main-reachability'
+
     def test_cluster_present_with_expected_phrases_and_hint(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c
-            for c in clusters
-            if c.topic_id == 'architect-report-task-already-done-main-reachability'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         assert cluster.phrases == [
             'report_task_already_done',
             'main-reachable',
@@ -1550,12 +1594,7 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
         assert '3011' in cluster.hint
 
     def test_matches_representative_near_duplicate_note(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c
-            for c in clusters
-            if c.topic_id == 'architect-report-task-already-done-main-reachability'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         note = (
             'The architect report_task_already_done requires a main-reachable '
             'commit, verified via git merge-base --is-ancestor by '
@@ -1563,15 +1602,10 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
         )
         result = find_matching_topic_cluster(note, [cluster])
         assert result is not None
-        assert result[0].topic_id == 'architect-report-task-already-done-main-reachability'
+        assert result[0].topic_id == self.TOPIC_ID
 
     def test_does_not_match_unrelated_merge_base_note(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c
-            for c in clusters
-            if c.topic_id == 'architect-report-task-already-done-main-reachability'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         # Only 'merge-base --is-ancestor' occurs here (1 distinct hit) -- a
         # plain git-ancestry-check note unrelated to report_task_already_done
         # must NOT reach min_phrase_hits and mis-route to gate 3011.
@@ -1590,11 +1624,10 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
     lost_plan_reconstruction).
     """
 
+    TOPIC_ID = 'architect-plan-revalidation-requeue-lock'
+
     def test_cluster_present_with_expected_phrases_and_hint(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c for c in clusters if c.topic_id == 'architect-plan-revalidation-requeue-lock'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         assert cluster.phrases == [
             '.task/plan.json',
             'plan-revalidation',
@@ -1606,10 +1639,7 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         assert '2973' in cluster.hint
 
     def test_matches_representative_near_duplicate_note(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c for c in clusters if c.topic_id == 'architect-plan-revalidation-requeue-lock'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         note = (
             'During architect plan-revalidation after a requeue rebase, check '
             'whether .task/plan.json still exists before choosing confirm vs '
@@ -1617,13 +1647,10 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         )
         result = find_matching_topic_cluster(note, [cluster])
         assert result is not None
-        assert result[0].topic_id == 'architect-plan-revalidation-requeue-lock'
+        assert result[0].topic_id == self.TOPIC_ID
 
     def test_does_not_match_unrelated_plan_tools_note(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(
-            c for c in clusters if c.topic_id == 'architect-plan-revalidation-requeue-lock'
-        )
+        cluster = _seeded_cluster(self.TOPIC_ID)
         # A generic plan-tools note (not about revalidation-after-requeue)
         # only hits '.task/plan.json' (1 distinct hit) -- must NOT reach
         # min_phrase_hits and mis-route to gate 2973.
@@ -1665,9 +1692,14 @@ class TestRuffFormatNotAnEnforcedGateCluster:
     auditable against the corpus it was derived from.
     """
 
+    TOPIC_ID = 'ruff-format-not-an-enforced-gate'
+
+    @classmethod
+    def _cluster(cls):
+        return _seeded_cluster(cls.TOPIC_ID)
+
     def test_cluster_present_with_expected_phrases_and_hint(self):
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        cluster = next(c for c in clusters if c.topic_id == 'ruff-format-not-an-enforced-gate')
+        cluster = self._cluster()
         assert cluster.phrases == [
             'ruff format',
             'ruff check',
@@ -1677,11 +1709,6 @@ class TestRuffFormatNotAnEnforcedGateCluster:
         ]
         assert cluster.min_phrase_hits == 2
         assert '3342' in cluster.hint
-
-    @staticmethod
-    def _cluster():
-        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        return next(c for c in clusters if c.topic_id == 'ruff-format-not-an-enforced-gate')
 
     def test_matches_representative_near_duplicate_note(self):
         note = (
@@ -1702,12 +1729,6 @@ class TestRuffFormatNotAnEnforcedGateCluster:
                 id='210be257-fused-memory-2026-07-09',
             ),
             pytest.param(
-                'Amendment/cleanup agents should NOT run `ruff format` on touched '
-                'files in this codebase — it rewrites large unrelated regions. '
-                'Verify with `ruff check` (lint) only',
-                id='e8c5eb3f-orchestrator-merge-types-2026-07-12',
-            ),
-            pytest.param(
                 'In dark-factory, `ruff format` is NOT a quality gate — the '
                 'declared gates in each orchestrator.yaml are `ruff check` '
                 '(lint_command), `npx pyright` (type_check_command) and pytest '
@@ -1717,13 +1738,23 @@ class TestRuffFormatNotAnEnforcedGateCluster:
         ],
     )
     def test_matches_the_preferences_and_norms_entries_that_grew_the_cluster(self, excerpt):
-        """The three preferences_and_norms entries of gate 3342's corpus match.
+        """The preferences_and_norms half of gate 3342's corpus matches.
 
         This is task 3435's core claim made executable: these are the writes
         that grew the cluster UNCAUGHT, because the write-time guard only
         consults this cluster list for explicit ``category='procedural_knowledge'``
         writes. Each excerpt is a contiguous verbatim span of the stored
         content, so the literal-substring convention stays auditable.
+
+        Reviewer (test-proportionality): parametrized by distinct HIT-PROFILE
+        rather than one case per corpus entry. 210be257 is
+        {'ruff format', 'enforced gate'} -- the ONLY entry in all 14 where
+        'enforced gate' is load-bearing (drop that phrase and this entry stops
+        matching), and the only one that matches WITHOUT the anchor pair.
+        c565afd0 is the bare {'ruff format', 'ruff check'} anchor pair, sitting
+        exactly AT min_phrase_hits. e8c5eb3f is dropped as an exact
+        profile-duplicate of c565afd0; it was verified matching out-of-band at
+        derivation time, as the schema.py comment records.
 
         NOTE: soft-blocking a ``preferences_and_norms`` write additionally
         requires companion task 3430's category generalization at the CALL
@@ -1740,12 +1771,6 @@ class TestRuffFormatNotAnEnforcedGateCluster:
         'excerpt',
         [
             pytest.param(
-                'The actual enforced gate is `ruff check` (lint), which passes '
-                "cleanly. Don't try to \"fix\" this by running ruff format "
-                'wholesale — it creates unrelated diff noise.',
-                id='f1e41082-fused-memory-2026-07-04',
-            ),
-            pytest.param(
                 'In dark-factory, `ruff format` is NOT an enforced gate — many '
                 'committed files are not format-clean (e.g. '
                 'tests/scripts/test_dashboard_service_template.py on main had '
@@ -1759,22 +1784,9 @@ class TestRuffFormatNotAnEnforcedGateCluster:
                 id='d72c66dc-shared-orchestrator-yaml-2026-07-31',
             ),
             pytest.param(
-                'The enforced lint gate per CONTRIBUTING.md (lines ~137, ~160) '
-                'is `ruff check <touched packages>`, not `ruff format`.',
-                id='a598dc3c-shared-tests-2026-08-01',
-            ),
-            pytest.param(
                 'hooks/project-checks (the main-branch-only pre-commit gate) '
                 'invokes `ruff check` but never `ruff format --check`',
                 id='87a4982d-hooks-project-checks-2026-07-16',
-            ),
-            pytest.param(
-                "orchestrator's real lint/format gate — hooks/project-checks, "
-                'which hooks/pre-commit only runs when branch==main — is `ruff '
-                'check --quiet` plus `uv run pyright` per pyright-configured '
-                'package; it never invokes `ruff format` or `ruff format '
-                '--check` anywhere.',
-                id='69bd6ae5-orchestrator-2026-07-31',
             ),
         ],
     )
@@ -1785,11 +1797,17 @@ class TestRuffFormatNotAnEnforcedGateCluster:
         seeding this cluster bites immediately rather than waiting on task
         3430. Excerpts are contiguous verbatim spans of the stored content.
 
-        Coverage spread is deliberate: 4ab1c78f is the 4-hit maximum
-        ('ruff format' + 'ruff check' + 'enforced gate' + 'format-clean'),
-        d72c66dc / a598dc3c carry 'enforced lint gate', and 87a4982d /
-        69bd6ae5 sit exactly AT the threshold on the 'ruff format' +
-        'ruff check' anchor pair alone.
+        Reviewer (test-proportionality): one case per distinct HIT-PROFILE,
+        not one per corpus entry. 4ab1c78f is the 4-hit maximum and the sole
+        exerciser of 'format-clean'; d72c66dc carries 'enforced lint gate';
+        87a4982d sits exactly AT the threshold on the 'ruff format' +
+        'ruff check' anchor pair alone, which is what makes 'ruff check'
+        load-bearing for the half of the corpus that says nothing about
+        "gates". Dropped as profile-duplicates: f1e41082 (a strict subset of
+        4ab1c78f's phrases), a598dc3c (== d72c66dc) and 69bd6ae5
+        (== 87a4982d). All 14 entries were verified matching out-of-band at
+        derivation time, as the schema.py comment records; re-deriving them
+        here bought no additional signal.
         """
         result = find_matching_topic_cluster(excerpt, [self._cluster()])
         assert result is not None, f'procedural_knowledge excerpt must match: {excerpt!r}'
@@ -1821,25 +1839,52 @@ class TestRuffFormatNotAnEnforcedGateCluster:
         # soft-blocked and mis-routed to gate 3342.
         assert find_matching_topic_cluster(note, [self._cluster()]) is None
 
-    def test_no_seeded_phrase_nests_inside_another(self):
-        """The invariant that keeps ``min_phrase_hits=2`` meaningful.
+    @pytest.mark.parametrize(
+        'note',
+        [
+            pytest.param(
+                'I ran ruff check and ruff format before committing.',
+                id='both-tools-named-in-passing',
+            ),
+            pytest.param(
+                'Before committing run `ruff check` on touched packages and '
+                '`ruff format` on files you created.',
+                id='ordinary-two-tool-workflow-note',
+            ),
+        ],
+    )
+    def test_known_residual_generic_two_tool_note_matches(self, note):
+        """The ACCEPTED false-positive class, pinned so it stays visible.
 
-        If one phrase were a substring of another (the concrete temptation
-        being to add 'ruff format --check' alongside bare 'ruff format'), a
-        SINGLE occurrence would score two DISTINCT hits and satisfy the
-        threshold on its own -- defeating the field's stated purpose
-        ("Default 2 so a single incidental keyword never triggers a false
-        block"). This is the regression guard against a future well-meaning
-        addition re-introducing that.
+        This is NOT a defect and NOT a regression: it is the residual the
+        seed's schema.py comment knowingly accepts. The 'ruff format' +
+        'ruff check' anchor pair reaches min_phrase_hits=2 on its own, so an
+        ordinary note that merely NAMES both tools -- saying nothing about
+        gates -- is soft-blocked and routed to gate 3342.
+
+        It is accepted rather than tuned away because both alternatives are
+        worse. Dropping 'ruff check' would stop the cluster matching the
+        entries that sit on the bare anchor pair (87a4982d, c565afd0, and
+        e8c5eb3f / 69bd6ae5 beside them). Raising min_phrase_hits to 3 is
+        unavailable: no third phrase co-occurs across the corpus, so a 3-hit
+        cluster would MISS most of the 14 real entries and become exactly the
+        silent no-op guard this module treats as strictly worse than a loud
+        one. The block itself is SOFT -- overridable with
+        ``metadata={'allow_near_duplicate': True}`` -- so the cost is one
+        redirect, not a lost write.
+
+        Pinning it here makes the false-positive BOUNDARY executable: a future
+        tuner narrowing the phrase list can tell 'intended residual' from
+        'regression', because removing this behaviour must be a visible,
+        deliberate change to this test rather than a silent widening of the
+        three at-most-1-hit negatives above.
         """
-        phrases = [p.lower() for p in self._cluster().phrases]
-        for outer in phrases:
-            for inner in phrases:
-                if outer is not inner:
-                    assert inner not in outer, (
-                        f'{inner!r} nests inside {outer!r} -- one occurrence would '
-                        f'score two distinct hits and defeat min_phrase_hits'
-                    )
+        result = find_matching_topic_cluster(note, [self._cluster()])
+        assert result is not None, (
+            f'residual documented in schema.py no longer holds for {note!r} -- if this '
+            f'was deliberate, update the ACCEPTED RESIDUAL comment on the seed too'
+        )
+        assert result[0].topic_id == self.TOPIC_ID
 
     def test_full_default_cluster_list_resolves_here_not_an_earlier_cluster(self):
         # This cluster is seeded LAST, and find_matching_topic_cluster returns

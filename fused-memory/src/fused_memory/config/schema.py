@@ -751,10 +751,10 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # ("Default 2 so a single incidental keyword never triggers a
             # false block"). Omitting them costs zero coverage: every corpus
             # entry containing a flag-suffixed form also contains bare
-            # 'ruff format'. This hazard is new to this cluster (the earlier
-            # seeds' phrases barely interact), so a no-phrase-nests-inside-
-            # another invariant test guards it against a well-meaning
-            # re-introduction.
+            # 'ruff format'. The hazard is generic to the matcher rather than
+            # special to this seed, so the guarding invariant test (no phrase
+            # nests inside another in the same cluster) is asserted over ALL
+            # seeded clusters, not just this one.
             #
             # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
             # above): 'lint_command', 'pre-existing' and 'quality gate' are
@@ -775,7 +775,10 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # third phrase co-occurs across the corpus, so a 3-hit cluster
             # would MISS most of the 14 real entries and become exactly the
             # silent no-op guard this module treats as strictly worse than a
-            # loud one.
+            # loud one. That residual is PINNED by a positive test
+            # (test_known_residual_generic_two_tool_note_matches), so a future
+            # tuner can tell it apart from a regression and cannot narrow it
+            # away silently.
             #
             # Registered prospectively while gate 3342 is still blocked,
             # following the task-3013 precedent: the guard is forward-looking
