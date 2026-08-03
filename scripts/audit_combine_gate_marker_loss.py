@@ -12,10 +12,11 @@ this report is never done by this script (the audit/repair split of tasks
 3146 / 3329).
 
 Background (task 3591): the curator's combine path
-(fused-memory/src/fused_memory/server/task_interceptor.py:2100) writes exactly
-``{'curator_action': 'combine', 'curator_justification', 'combined_at'}`` and
-passes ``metadata_mode='replace'``, so every OTHER key the surviving task
-carried is DROPPED rather than merged. The load-bearing casualty is
+(fused-memory/src/fused_memory/middleware/task_interceptor.py, combine block
+~2158) writes exactly
+``{'curator_action': 'combine', 'curator_justification', 'combined_at'}``, and
+it USED TO pass ``metadata_mode='replace'`` — so every OTHER key the surviving
+task carried was DROPPED rather than merged. The load-bearing casualty is
 ``metadata.delivered_checks``: orchestrator/src/orchestrator/delivered_checks.py
 defines both ``gate_mark_done_on_delivered_checks`` and
 ``verify_delivered_checks_on_main`` off that key, so wiping it SILENTLY REMOVES
@@ -25,12 +26,18 @@ supposed to hold it. ``prd_path``/``prd_task_label`` (provenance) and
 task bearing the combine signature whose pre-combine metadata can be
 reconstructed from an independent source, and reports the keys that are gone.
 
-WHAT A LIVE HIT MEANS, MEASURED RATHER THAN ASSUMED. As of main tip
-9cec63e10e (2026-08-03) the combine path STILL reads ``metadata_mode='replace'``
-(task_interceptor.py:2130); task 3446's fix is unmerged, on branch ``task/3446``
-(commits 556e720c3d, 8750bbaaaa). So a NON-TERMINAL finding from this script
-means the fix HAS NOT LANDED YET — not that it regressed. Once 3446 merges,
-that reading inverts and a fresh live hit becomes a regression signal.
+WHAT A LIVE HIT MEANS, MEASURED RATHER THAN ASSUMED. Task 3446's fix HAS
+LANDED: merge commit ``f70877e327`` ("Merge task/3446 into main") is an
+ancestor of this branch, and the combine path now passes
+``metadata_mode='merge'`` (fused-memory/src/fused_memory/middleware/
+task_interceptor.py:2208, under the "Do NOT 'restore' replace" comment). The
+leak is therefore CLOSED, and the reading is the regression-signal one: a
+FRESH actionable finding (gate_removing / provenance / dispatch) on a
+non-terminal task means the fix REGRESSED and must be investigated. Rows that
+predate the fix are HISTORICAL DAMAGE, not evidence of a live leak — the 24
+then-live victims were hand-remediated on 2026-08-03 and the ~67 terminal
+combine targets were deliberately left alone, which is why terminal findings
+never drive the exit code (see :func:`main`).
 
 EPISTEMIC HONESTY. Findings are ``ticket-evidenced``, never certain. The
 creating ticket is a SUBMIT-TIME snapshot, so it cannot see a key legitimately
@@ -409,6 +416,26 @@ _SEVERITY_PRECEDENCE = (
     SEVERITY_BENIGN,
 )
 
+# The severities that denote a REAL consumer losing something: a removed
+# mark-done gate, an orphaned PRD provenance chain, a mis-dispatched task.
+#
+# THIS TUPLE IS THE EXIT CODE'S DEFINITION, and it exists because the severity
+# ladder above would otherwise rank consumers for a reader while nothing
+# downstream acted on the ranking. SEVERITY_INFORMATIONAL and SEVERITY_BENIGN
+# are deliberately EXCLUDED: benign is by construction a no-op (an absent
+# task_kind is behaviourally identical to the non-deterministic value lost),
+# and informational is real-but-inert provenance. Measured on the live store
+# (2026-08-03), keying the exit on "any non-terminal finding" made the script
+# exit 1 on 9 live rows of which ZERO were gate_removing or provenance — i.e.
+# red on day one for noise, which is exactly the permanently-red-and-therefore-
+# ignored failure the terminal-suppression rule already refuses to accept.
+# Excluded rows are still REPORTED in full and still counted in COVERAGE.
+_ACTIONABLE_SEVERITIES = (
+    SEVERITY_GATE_REMOVING,
+    SEVERITY_PROVENANCE,
+    SEVERITY_DISPATCH,
+)
+
 # The task_kind value that is actually load-bearing (scheduler.py:2046).
 TASK_KIND_DETERMINISTIC = "deterministic"
 
@@ -568,11 +595,13 @@ SOURCE_NONE = "none"
 # MEASURED SPLIT that validates this constant exactly (live store, 2026-08-03,
 # 91 combine targets): done=63 + cancelled=4 = the 67 terminal targets that
 # were deliberately left un-remediated; pending=21 + in-progress=2 + blocked=1
-# = the 24 live victims that were hand-remediated the same day. The exit code
-# keys on NON-terminal findings only — if the terminal backlog drove it, this
-# detector would be permanently red and therefore ignored, destroying its value
-# as a re-runnable regression check. Terminal findings are suppressed from the
-# EXIT CODE, never from the report.
+# = the 24 live victims that were hand-remediated the same day. Non-terminal
+# is NECESSARY but not SUFFICIENT for a finding to drive the exit code — see
+# :func:`is_actionable`, which also requires a consumer-bearing severity. If
+# the terminal backlog drove the exit, this detector would be permanently red
+# and therefore ignored, destroying its value as a re-runnable regression
+# check. Terminal findings are suppressed from the EXIT CODE, never from the
+# report.
 TERMINAL_STATUSES = ("done", "cancelled")
 
 # The pseudo-key used for a target no comparison source can speak for. It is
@@ -606,6 +635,32 @@ class Finding(NamedTuple):
     expected_source: str
     terminal: bool
     reason: str
+
+
+def is_actionable(finding: Finding) -> bool:
+    """Whether *finding* should drive :data:`EXIT_LIVE_FINDINGS`.
+
+    THREE independent exclusions, each for a different reason:
+
+    * ``terminal`` — done/cancelled tasks will never be dispatched again, so
+      the loss can no longer change any behaviour. The ~67-row terminal
+      backlog was deliberately left un-remediated; letting it set the exit
+      code would pin this detector permanently red.
+    * severity not in :data:`_ACTIONABLE_SEVERITIES` — informational and
+      benign rows name no consumer that lost anything it acts on.
+    * :data:`NO_COMPARISON_SOURCE_KEY` — that row asserts UNKNOWN, *neither
+      clean nor damaged*. Exiting non-zero on it would report "we could not
+      check this task" as "this task is damaged", which is a distinct and
+      louder claim than the evidence supports.
+
+    Excluded findings are still printed in full and still counted in the
+    COVERAGE block; only the exit code ignores them.
+    """
+    return (
+        not finding.terminal
+        and finding.key != NO_COMPARISON_SOURCE_KEY
+        and finding.severity in _ACTIONABLE_SEVERITIES
+    )
 
 
 class AuditCoverage(NamedTuple):
@@ -848,6 +903,11 @@ def format_report(audits: list[ProjectAudit]) -> str:
     can still act on. Terminal findings are printed IN FULL regardless — they
     are suppressed from the exit code, never from the report.
 
+    NOTE that "live" and "exit-code-driving" are NOT the same set: a live row
+    can still be informational, benign, or '(no comparison source)', none of
+    which turn the exit red. The trailing summary line therefore prints the
+    ACTIONABLE count alongside the live count (see :func:`is_actionable`).
+
     Both the FIDELITY and COVERAGE blocks are emitted for every project,
     INCLUDING projects with zero findings.
 
@@ -856,6 +916,7 @@ def format_report(audits: list[ProjectAudit]) -> str:
     lines: list[str] = []
     total_live = 0
     total_terminal = 0
+    total_actionable = 0
     for audit in audits:
         lines.append(f"{audit.project_root} (project_id={audit.project_id}):")
         if audit.project_id_mismatch:
@@ -868,15 +929,22 @@ def format_report(audits: list[ProjectAudit]) -> str:
         total_live += len(live)
         total_terminal += len(terminal)
 
+        total_actionable += sum(1 for f in audit.findings if is_actionable(f))
+
         lines.extend(_format_section("live findings", live))
         lines.extend(_format_section("terminal findings (reported, but not "
                                      "counted toward the exit code)", terminal))
         lines.append(_FIDELITY_CAVEAT)
         lines.extend(_format_coverage(audit.coverage))
 
+    # The actionable count is spelled out because it, NOT the live count, is
+    # what the exit code keys on: a live row that is informational, benign, or
+    # '(no comparison source)' exits 0. Printing only "N live" beside a 0 exit
+    # would read as a contradiction.
     lines.append(
         f"{total_live + total_terminal} finding(s) across {len(audits)} "
-        f"project(s): {total_live} live, {total_terminal} terminal"
+        f"project(s): {total_live} live ({total_actionable} actionable, "
+        f"i.e. exit-code-driving), {total_terminal} terminal"
     )
     return "\n".join(lines)
 
@@ -915,8 +983,9 @@ def format_json(audits: list[ProjectAudit]) -> str:
 # returns can never drift into disagreeing about what a number means. Each
 # denotes EXACTLY ONE outcome -- that is the whole reason 3 exists rather than
 # being folded into 0.
-EXIT_OK = 0                # audited; no LIVE findings and no id mismatch
-EXIT_LIVE_FINDINGS = 1     # a non-terminal finding, or the project_id guard fired
+EXIT_OK = 0                # audited; no ACTIONABLE findings and no id mismatch
+EXIT_LIVE_FINDINGS = 1     # an actionable finding (is_actionable), or the
+                           # project_id guard fired
 EXIT_NO_ROOT = 2           # no project root resolved to a readable tasks.db
 EXIT_NOTHING_SCANNED = 3   # roots resolved but EVERY one failed to audit
 
@@ -932,12 +1001,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "separate, individually-reviewed follow-up."
         ),
         epilog=(
-            "exit codes: 0 = audited, no LIVE findings; 1 = at least one "
-            "NON-TERMINAL finding, or the project-id mismatch guard fired; "
-            "2 = no project root resolved to a readable tasks.db; 3 = roots "
-            "resolved but every one failed to audit, so NOTHING was scanned "
-            "(never treat 3 as a clean run). Terminal (done/cancelled) "
-            "findings are always reported but never affect the exit code."
+            "exit codes: 0 = audited, no ACTIONABLE findings; 1 = at least "
+            "one actionable finding -- a NON-TERMINAL loss whose severity is "
+            "gate_removing, provenance or dispatch -- or the project-id "
+            "mismatch guard fired; 2 = no project root resolved to a readable "
+            "tasks.db; 3 = roots resolved but every one failed to audit, so "
+            "NOTHING was scanned (never treat 3 as a clean run). Terminal "
+            "(done/cancelled) findings, informational/benign findings, and "
+            "'(no comparison source)' rows are always reported in full but "
+            "never affect the exit code."
         ),
     )
     parser.add_argument(
@@ -967,10 +1039,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
-    Exit codes: 0 = audited, no LIVE findings; 1 = at least one NON-TERMINAL
-    finding or a fired project-id mismatch guard; 2 = no project root resolved
-    to a readable tasks.db; 3 = roots resolved but EVERY one failed to audit,
-    so NOTHING was scanned.
+    Exit codes: 0 = audited, no ACTIONABLE findings; 1 = at least one
+    actionable finding (see :func:`is_actionable`) or a fired project-id
+    mismatch guard; 2 = no project root resolved to a readable tasks.db;
+    3 = roots resolved but EVERY one failed to audit, so NOTHING was scanned.
 
     3 exists because 0 would otherwise be returned for two opposite outcomes --
     "audited everything, found nothing" and "audited nothing at all" -- and a
@@ -978,10 +1050,16 @@ def main(argv: list[str] | None = None) -> int:
     a clean run. That is exactly the silent fail-soft this module refuses to do
     (see the module docstring).
 
-    1 keys on NON-TERMINAL findings only. The ~67 terminal combine targets
-    were deliberately left un-remediated; if they drove the exit code this
-    detector would be permanently red and therefore ignored, destroying its
-    value as a re-runnable regression check. They are still printed in full.
+    1 keys on ACTIONABLE findings only -- non-terminal AND severity in
+    {gate_removing, provenance, dispatch} AND not the '(no comparison source)'
+    pseudo-row. Everything excluded is excluded for the SAME reason the ~67
+    terminal combine targets are: a row that names no consumer which lost
+    something it acts on cannot be acted upon, and if such rows drove the exit
+    code this detector would be permanently red and therefore ignored,
+    destroying its value as a re-runnable regression check. Measured on the
+    live store (2026-08-03) that was not hypothetical: 9 non-terminal rows,
+    zero of them gate_removing or provenance. Every excluded row is still
+    printed in full and still counted in COVERAGE.
 
     A single unreadable project (a corrupt/locked tasks.db) does NOT abort the
     sweep: it is logged to stderr and skipped so every other project is still
@@ -1026,9 +1104,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_NOTHING_SCANNED
 
-    live = any(not f.terminal for a in audits for f in a.findings)
+    actionable = any(is_actionable(f) for a in audits for f in a.findings)
     mismatch = any(a.project_id_mismatch for a in audits)
-    return EXIT_LIVE_FINDINGS if (live or mismatch) else EXIT_OK
+    return EXIT_LIVE_FINDINGS if (actionable or mismatch) else EXIT_OK
 
 
 if __name__ == "__main__":

@@ -2,10 +2,13 @@
 detector for curator-combine metadata loss.
 
 Task 3591: ``TaskInterceptor``'s combine path
-(fused-memory/src/fused_memory/server/task_interceptor.py:2100) writes
-``{'curator_action': 'combine', 'curator_justification', 'combined_at'}``
-with ``metadata_mode='replace'``, so every OTHER metadata key the task
-carried is dropped. This module tests the detector that enumerates the
+(fused-memory/src/fused_memory/middleware/task_interceptor.py, combine block
+~2158) writes ``{'curator_action': 'combine', 'curator_justification',
+'combined_at'}``, and USED TO pass ``metadata_mode='replace'``, so every
+OTHER metadata key the task carried was dropped. Task 3446 fixed that (merge
+``f70877e327``); the mode at :2208 is now ``'merge'``, so the historical
+damage this detector reports is a closed leak rather than an open one. This
+module tests the detector that enumerates the
 observable blast radius. Neither the detector nor these tests ever mutate a
 task, ticket, or manifest record.
 
@@ -29,6 +32,7 @@ import sys
 from pathlib import Path
 
 from audit_combine_gate_marker_loss import (
+    NO_COMPARISON_SOURCE_KEY,
     SOURCE_MANIFEST,
     SOURCE_NONE,
     SOURCE_TICKET,
@@ -51,6 +55,7 @@ from audit_combine_gate_marker_loss import (
     classify_gap,
     format_json,
     format_report,
+    is_actionable,
     load_combine_targets,
     load_ticket_expectations,
     resolve_project_id,
@@ -697,6 +702,60 @@ def test_severity_constants_are_distinct_strings(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# is_actionable — the predicate the exit code keys on.
+#
+# The severity ladder above RANKS consumers for a reader; this predicate is
+# the only thing that makes the ranking load-bearing. Three independent
+# exclusions: terminal, non-actionable severity, and the UNKNOWN pseudo-row.
+# ---------------------------------------------------------------------------
+
+def _f(**kw):
+    """A Finding with actionable defaults, so each test overrides ONE axis."""
+    base = dict(tag="master", task_id=1, status="pending", key="delivered_checks",
+                severity=SEVERITY_GATE_REMOVING, expected_source=SOURCE_MANIFEST,
+                terminal=False, reason="r")
+    return Finding(**{**base, **kw})
+
+
+def test_is_actionable_true_for_every_consumer_bearing_severity():
+    for severity in (SEVERITY_GATE_REMOVING, SEVERITY_PROVENANCE,
+                     SEVERITY_DISPATCH):
+        assert is_actionable(_f(severity=severity)) is True, severity
+
+
+def test_is_actionable_false_for_inert_severities():
+    """These name no consumer that lost something it acts on."""
+    for severity in (SEVERITY_INFORMATIONAL, SEVERITY_BENIGN):
+        assert is_actionable(_f(severity=severity)) is False, severity
+
+
+def test_is_actionable_false_for_a_terminal_finding_however_severe():
+    """Actionable severity is NOT sufficient: terminal still suppresses."""
+    for status in TERMINAL_STATUSES:
+        assert is_actionable(_f(status=status, terminal=True)) is False, status
+
+
+def test_is_actionable_false_for_the_no_comparison_source_row():
+    """UNKNOWN is neither clean nor damaged, so it must not turn the exit red."""
+    assert is_actionable(_f(key=NO_COMPARISON_SOURCE_KEY,
+                            severity=SEVERITY_INFORMATIONAL,
+                            expected_source=SOURCE_NONE)) is False
+
+
+def test_is_actionable_excludes_no_comparison_source_independently_of_severity():
+    """Belt AND braces: the pseudo-row is excluded by KEY, so it stays inert
+    even if a future change were to hand it an actionable severity."""
+    assert is_actionable(_f(key=NO_COMPARISON_SOURCE_KEY,
+                            severity=SEVERITY_GATE_REMOVING)) is False
+
+
+def test_is_actionable_false_for_an_unknown_severity():
+    """Fails CLOSED on a severity added later: an unrecognised value is not
+    silently promoted into the exit code."""
+    assert is_actionable(_f(severity="severity-invented-tomorrow")) is False
+
+
+# ---------------------------------------------------------------------------
 # audit_project — the join.
 #
 # Unions both comparison sources with PER-KEY provenance and emits one Finding
@@ -1058,6 +1117,34 @@ def test_format_report_renders_terminal_findings_in_full():
     assert "task_kind" in report
 
 
+def test_format_report_summary_separates_live_from_actionable():
+    """"N live" beside a 0 exit would read as a contradiction, so the summary
+    names the ACTIONABLE count — the one the exit code actually keys on."""
+    report = format_report([_audit(findings=[
+        # Live, but inert: informational + benign -> 0 actionable.
+        _finding(task_id=11, terminal=False, key="source",
+                 severity=SEVERITY_INFORMATIONAL),
+        _finding(task_id=12, terminal=False, key="task_kind",
+                 severity=SEVERITY_BENIGN),
+        # Actionable severity but TERMINAL -> still not counted.
+        _finding(task_id=22, terminal=True, status="done",
+                 key="delivered_checks", severity=SEVERITY_GATE_REMOVING),
+    ])])
+
+    assert "2 live (0 actionable" in report
+
+
+def test_format_report_summary_counts_an_actionable_row():
+    report = format_report([_audit(findings=[
+        _finding(task_id=11, terminal=False, key="delivered_checks",
+                 severity=SEVERITY_GATE_REMOVING),
+        _finding(task_id=12, terminal=False, key="source",
+                 severity=SEVERITY_INFORMATIONAL),
+    ])])
+
+    assert "2 live (1 actionable" in report
+
+
 def test_format_report_prints_the_benign_reason():
     """A benign demotion prints WHY, so a reader never takes it on trust."""
     report = format_report([_audit(findings=[
@@ -1270,6 +1357,99 @@ def test_main_exit_1_and_ranks_a_live_delivered_checks_loss_first(
     assert f"severity={SEVERITY_GATE_REMOVING}" in first
 
 
+def test_main_exit_0_when_live_findings_are_only_informational(
+        tmp_path, make_tasks_db):
+    """A LIVE but INERT loss exits 0 while still being reported in full.
+
+    Measured on the live store (2026-08-03) this was the actual steady state:
+    9 non-terminal rows, zero gate_removing or provenance. Keying the exit on
+    'any non-terminal finding' made the detector red on day one for noise, so
+    a later real gate_removing loss would have changed nothing observable.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 55, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        # `source` -> informational; a non-deterministic `task_kind` -> benign.
+        tickets=[{"project_id": "dark_factory", "task_id": 55,
+                  "metadata": {"source": "prd", "task_kind": "normal"}}],
+    )
+
+    result = _run_cli("--project-root", str(root), "--project-id", "dark_factory")
+
+    assert result.returncode == 0
+    assert "55" in result.stdout                 # still REPORTED
+    assert "key=source" in result.stdout
+    assert f"severity={SEVERITY_BENIGN}" in result.stdout
+
+
+def test_main_exit_0_on_a_no_comparison_source_row_which_is_still_printed(
+        tmp_path, make_tasks_db):
+    """'(no comparison source)' asserts UNKNOWN -- neither clean nor damaged.
+
+    Exiting 1 on it would upgrade "we could not check this task" into "this
+    task is damaged", a louder claim than the evidence supports. The row is
+    still printed and still counted in COVERAGE so the sweep can never read
+    as complete.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        # Non-terminal, and NO ticket and NO manifest binds it.
+        tasks=[{"id": 56, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+    )
+
+    result = _run_cli("--project-root", str(root), "--project-id", "dark_factory")
+
+    assert result.returncode == 0
+    assert NO_COMPARISON_SOURCE_KEY in result.stdout
+    assert "56" in result.stdout
+    assert "COVERAGE" in result.stdout
+
+
+def test_main_exit_1_on_a_live_provenance_loss(tmp_path, make_tasks_db):
+    """provenance is actionable too, not just gate_removing."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 57, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "dark_factory", "task_id": 57,
+                  "metadata": {"prd_path": "plans/x-prd.md"}}],
+    )
+
+    result = _run_cli("--project-root", str(root), "--project-id", "dark_factory")
+
+    assert result.returncode == 1
+    assert f"severity={SEVERITY_PROVENANCE}" in result.stdout
+
+
+def test_main_exit_1_on_a_live_deterministic_task_kind_loss(
+        tmp_path, make_tasks_db):
+    """dispatch is actionable; the BENIGN twin of the same key is not."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 58, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        tickets=[{"project_id": "dark_factory", "task_id": 58,
+                  "metadata": {"task_kind": "deterministic"}}],
+    )
+
+    result = _run_cli("--project-root", str(root), "--project-id", "dark_factory")
+
+    assert result.returncode == 1
+    assert f"severity={SEVERITY_DISPATCH}" in result.stdout
+
+
+def test_main_exit_0_when_a_gate_removing_loss_is_terminal(tmp_path, make_tasks_db):
+    """Actionable severity is NOT enough -- terminal still suppresses."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 59, "status": "done", "metadata": _WIPE_SIGNATURE}],
+        manifests=[("plans/u-prd.capability-manifest.yaml", _manifest_doc(59))],
+    )
+
+    result = _run_cli("--project-root", str(root), "--project-id", "dark_factory")
+
+    assert result.returncode == 0
+    assert f"severity={SEVERITY_GATE_REMOVING}" in result.stdout
+
+
 def test_main_exit_2_when_no_project_root_resolves(tmp_path):
     """Nothing resolvable -> exit 2, empty stdout, reason on stderr."""
     result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
@@ -1316,7 +1496,8 @@ def test_main_json_flag_carries_coverage(tmp_path, make_tasks_db):
 
     result = _run_cli("--project-root", str(root), "--project-id", "dark_factory", "--json")
 
-    assert result.returncode == 1
+    # 0, not 1: the only finding is a lost `source`, which is informational.
+    assert result.returncode == 0
     payload = json.loads(result.stdout)
     project = payload["projects"][0]
     assert project["coverage"]["total_combine_targets"] == 1
