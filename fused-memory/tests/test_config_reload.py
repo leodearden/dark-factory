@@ -568,7 +568,11 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
     """
 
     PATH = 'write_triage.t_high_by_category'
-    MEASURED = {'procedural_knowledge': 0.8868293243724489}
+    # SYNTHETIC, deliberately: a real cutoff copied in here would be one
+    # re-calibration away from equalling the live config's map, at which
+    # point diff_config would report no change and the applied_candidates
+    # lookup below would raise KeyError on a test that is not about that.
+    SYNTHETIC = {'procedural_knowledge': 0.5}
 
     def test_the_leaf_is_allowlisted(self):
         assert self.PATH in RELOADABLE_FIELDS, (
@@ -580,7 +584,7 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
         from fused_memory.config.reload import _iter_leaves  # noqa: PLC0415
 
         config = FusedMemoryConfig()
-        object.__setattr__(config.write_triage, 't_high_by_category', dict(self.MEASURED))
+        object.__setattr__(config.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
         paths = [path for path, _ in _iter_leaves(config)]
 
         assert paths.count(self.PATH) == 1, (
@@ -590,7 +594,7 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
             'the map must not be descended into: a per-category leaf would let '
             'one cutoff land while another did not'
         )
-        assert dict(_iter_leaves(config))[self.PATH] == self.MEASURED, (
+        assert dict(_iter_leaves(config))[self.PATH] == self.SYNTHETIC, (
             'the leaf value must be the whole mapping'
         )
 
@@ -598,11 +602,15 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
         live = FusedMemoryConfig()
         fresh = FusedMemoryConfig()
         old = live.write_triage.t_high_by_category
-        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.MEASURED))
+        assert old != self.SYNTHETIC, (
+            'the fixture must DIFFER from the live map, or diff_config reports '
+            'no change and this test asserts nothing'
+        )
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
 
         d = diff_config(live, fresh)
 
-        assert d.applied_candidates[self.PATH] == {'old': old, 'new': self.MEASURED}
+        assert d.applied_candidates[self.PATH] == {'old': old, 'new': self.SYNTHETIC}
         assert self.PATH not in d.restart_required
 
     def test_apply_reload_replaces_the_map_wholesale(self):
@@ -619,8 +627,8 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
         object.__setattr__(live.write_triage, 't_high_by_category', {
             'procedural_knowledge': 0.5, 'observations_and_summaries': 0.6,
         })
-        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.MEASURED))
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
 
         apply_reload(live, fresh)
 
-        assert live.write_triage.t_high_by_category == self.MEASURED
+        assert live.write_triage.t_high_by_category == self.SYNTHETIC

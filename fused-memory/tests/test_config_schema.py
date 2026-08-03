@@ -1748,8 +1748,25 @@ class TestWriteTriageConfig:
     def test_accepts_a_measured_mapping(self):
         from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
 
-        mapping = {'procedural_knowledge': 0.8868293243724489}
+        # Synthetic, full-precision: pins that a derived cutoff's precision
+        # survives the field without being mistakable for a measured value.
+        mapping = {'procedural_knowledge': 0.1234567890123456}
         assert WriteTriageConfig(t_high_by_category=mapping).t_high_by_category == mapping
+
+    @pytest.mark.parametrize('value', [0.0, 1.0])
+    def test_accepts_a_per_category_cutoff_at_the_cosine_unit_bounds(self, value):
+        """Both bounds are INCLUSIVE, exactly as the pooled sibling's are.
+
+        A cosine of 1.0 is a legitimately measurable cutoff (identical
+        embeddings), and 0.0 is a measured number too. Tightening the check
+        to a strict inequality would reject a real calibration output while
+        passing every other test in this class.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig(
+            t_high_by_category={'procedural_knowledge': value},
+        ).t_high_by_category == {'procedural_knowledge': value}
 
     def test_an_empty_mapping_is_accepted_and_means_no_category_calibrated(self):
         """Distinct from None only in provenance, identical in effect.
@@ -1775,6 +1792,46 @@ class TestWriteTriageConfig:
 
         with pytest.raises(ValidationError):
             WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
+
+    def test_the_rejection_names_the_offending_category(self):
+        """Which category is bad IS the actionable half of the error.
+
+        The map is written per category by the calibration script; an error
+        that only said "a cutoff is out of range" would leave an operator
+        diffing three numbers to find the one that failed.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteTriageConfig(t_high_by_category={
+                'procedural_knowledge': 0.9, 'observations_and_summaries': 42.0,
+            })
+
+        message = str(excinfo.value)
+        assert 'observations_and_summaries' in message
+        assert '42.0' in message, 'the offending VALUE is evidence for the refusal'
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_a_bool_map_value_is_coerced_exactly_as_the_pooled_sibling_is(self, value):
+        """Measured, not assumed — and the consumer never sees a bool.
+
+        `audit_duplicate_memories._calibrated_float` deliberately refuses a
+        bool, so what matters here is that a YAML `true` cannot reach it AS a
+        bool: pydantic resolves it to a float at load, identically for the map
+        and for the pooled t_high beside it. Demanding stricter parsing for
+        one than the other would be an inconsistency invented here.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        coerced = WriteTriageConfig(
+            t_high_by_category={'procedural_knowledge': value},
+        ).t_high_by_category
+        assert coerced is not None
+        assert coerced['procedural_knowledge'] == float(value)
+        assert not isinstance(coerced['procedural_knowledge'], bool)
+        assert coerced['procedural_knowledge'] == WriteTriageConfig(
+            t_high=value,  # pyright: ignore[reportArgumentType]
+        ).t_high
 
     @pytest.mark.parametrize('value', [None, [0.9], 'abc', {'x': 1}])
     def test_rejects_a_non_numeric_per_category_cutoff(self, value):
