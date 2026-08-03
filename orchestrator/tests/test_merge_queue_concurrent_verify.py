@@ -5115,3 +5115,252 @@ class TestAwaitOutcomeHelper:
             f'timeout -- naming the label and the deadline -- not surface '
             f'as a confusing `outcome is None`.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3492 step-1: wait-budget audit helper (source-level AST scan)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitBudgetAuditHelper:
+    """`_worst_per_method_wait_budget` statically scans a module's source and
+    computes, per `Test*` class, the MAX over its `test_*` methods of that
+    method's summed sequential real-time wait budget.
+
+    This is the audit engine behind task 3492's guard. pytest-timeout's
+    class-level `@pytest.mark.timeout` mark applies to EACH test method
+    independently, not to the class total, so the unit that matters is
+    per-method, not a class-wide sum (see the plan's design decision: a
+    class-wide sum would both false-positive on many-light-methods classes
+    like `TestRunInflightVerifyAbortPoll` and could dilute one heavy method
+    below the threshold).
+
+    Every case here is driven from a SYNTHETIC source string, not this
+    module's own source, so these tests are provably non-vacuous and do not
+    shift when this file is later edited.
+
+    RED (task 3492 step-1): `_worst_per_method_wait_budget` does not exist
+    yet -- every case below fails on NameError.
+    """
+
+    def test_two_sequential_wait_for_calls_sum_within_one_method(self) -> None:
+        """Two sequential `asyncio.wait_for(..., timeout=45.0)` calls in the
+        SAME method sum to 90.0 -- pytest-timeout enforces the whole method
+        body, so sequential waits stack.
+        """
+        source = '''
+class TestTwoSequentialWaits:
+    async def test_two_waits(self):
+        await asyncio.wait_for(x, timeout=45.0)
+        await asyncio.wait_for(y, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestTwoSequentialWaits': 90.0}, (
+            f'Expected two sequential 45.0s waits in one method to sum to '
+            f'90.0, got {budgets!r}.'
+        )
+
+    def test_takes_max_over_methods_not_class_wide_sum(self) -> None:
+        """A class with TWO methods, each with one 45.0 wait, budgets at
+        45.0 -- the MAX over methods, NOT the 90.0 class-wide sum.
+
+        This is the distinction that makes the audit correct: pytest-timeout
+        applies the class mark to each method independently. Summing across
+        methods would misidentify a class like
+        `TestRunInflightVerifyAbortPoll` (four 45s methods, a 180s
+        class-wide sum but only a 45s worst method) as a false-positive
+        breach.
+        """
+        source = '''
+class TestTwoLightMethods:
+    async def test_one(self):
+        await asyncio.wait_for(x, timeout=45.0)
+
+    async def test_two(self):
+        await asyncio.wait_for(y, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestTwoLightMethods': 45.0}, (
+            f'Expected the MAX over methods (45.0), not the class-wide sum '
+            f'(90.0); got {budgets!r}. Summing across methods would '
+            f'misidentify the breaching set the guard is meant to compute.'
+        )
+
+    def test_bare_await_outcome_contributes_hidden_default_budget(self) -> None:
+        """A bare `_await_outcome(req, label='x')` call with no explicit
+        `timeout=` contributes the hidden default, MERGE_RESULT_TIMEOUT
+        (45.0) -- invisible to a naive `timeout=` grep, which is exactly
+        why the guard must special-case this call shape.
+        """
+        source = '''
+class TestBareAwaitOutcome:
+    async def test_bare_default(self):
+        await _await_outcome(req, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestBareAwaitOutcome': 45.0}, (
+            f'Expected a bare _await_outcome() call to contribute the '
+            f'hidden MERGE_RESULT_TIMEOUT default (45.0), got {budgets!r}.'
+        )
+
+    def test_await_outcome_explicit_timeout_overrides_default(self) -> None:
+        """`_await_outcome(req, label='x', timeout=10.0)` contributes its
+        explicit 10.0, not the 45.0 default -- proves the explicit
+        `timeout=` kwarg is read, not just assumed.
+        """
+        source = '''
+class TestExplicitAwaitOutcome:
+    async def test_explicit_timeout(self):
+        await _await_outcome(req, label='x', timeout=10.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestExplicitAwaitOutcome': 10.0}, (
+            f'Expected an explicit timeout=10.0 kwarg to override the '
+            f'hidden default, got {budgets!r}.'
+        )
+
+    def test_dynamic_timeout_value_contributes_zero_and_does_not_raise(self) -> None:
+        """A non-literal/dynamic timeout such as `timeout=some_var`
+        contributes 0.0 and does NOT raise -- the helper is conservative:
+        unknown means ignore, never guess.
+        """
+        source = '''
+class TestDynamicTimeout:
+    async def test_dynamic(self):
+        await asyncio.wait_for(x, timeout=some_var)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestDynamicTimeout': 0.0}, (
+            f'Expected an unresolvable dynamic timeout to contribute 0.0 '
+            f'without raising, got {budgets!r}.'
+        )
+
+    def test_merge_result_timeout_name_resolves_to_45(self) -> None:
+        """`timeout=MERGE_RESULT_TIMEOUT` resolves the name reference to
+        its known numeric value, 45.0.
+        """
+        source = '''
+class TestMergeResultTimeoutName:
+    async def test_it(self):
+        await asyncio.wait_for(x, timeout=MERGE_RESULT_TIMEOUT)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestMergeResultTimeoutName': 45.0}, (
+            f'Expected timeout=MERGE_RESULT_TIMEOUT to resolve to 45.0, '
+            f'got {budgets!r}.'
+        )
+
+    def test_heavy_barrier_test_timeout_name_resolves_to_300(self) -> None:
+        """`timeout=HEAVY_BARRIER_TEST_TIMEOUT` resolves the name reference
+        to its known numeric value, 300.0.
+        """
+        source = '''
+class TestHeavyBarrierTimeoutName:
+    async def test_it(self):
+        await asyncio.wait_for(x, timeout=HEAVY_BARRIER_TEST_TIMEOUT)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestHeavyBarrierTimeoutName': 300.0}, (
+            f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to '
+            f'300.0, got {budgets!r}.'
+        )
+
+    def test_asyncio_sleep_is_outside_the_counted_shape_set(self) -> None:
+        """`asyncio.sleep(999)` contributes 0.0 -- sleeps are deliberately
+        OUT of the counted shape set (the guard is a conservative floor,
+        not a full audit; see the floor/superset design decision).
+        """
+        source = '''
+class TestSleepNotCounted:
+    async def test_sleeps(self):
+        await asyncio.sleep(999)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestSleepNotCounted': 0.0}, (
+            f'Expected asyncio.sleep(...) to contribute 0.0 (not a counted '
+            f'call shape), got {budgets!r}.'
+        )
+
+    def test_non_test_methods_do_not_contribute(self) -> None:
+        """A non-`test_*` method (a private helper or a fixture) contributes
+        nothing -- only real test methods drive the budget.
+        """
+        source = '''
+class TestHelperMethodsIgnored:
+    async def _helper(self):
+        await asyncio.wait_for(x, timeout=999.0)
+
+    @pytest.fixture
+    def some_fixture(self):
+        return object()
+
+    async def test_actual(self):
+        await asyncio.wait_for(y, timeout=5.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestHelperMethodsIgnored': 5.0}, (
+            f'Expected only test_* methods to contribute to the budget '
+            f'(5.0), with the 999.0s wait in a non-test helper ignored; '
+            f'got {budgets!r}.'
+        )
+
+    def test_class_with_no_test_methods_is_zero_or_absent(self) -> None:
+        """A class with no test methods at all budgets 0.0 (or is absent
+        from the result) -- no crash.
+        """
+        source = '''
+class TestNoTestMethods:
+    async def _helper(self):
+        await asyncio.wait_for(x, timeout=45.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets.get('TestNoTestMethods', 0.0) == 0.0, (
+            f'Expected a class with no test_* methods to budget 0.0 (or be '
+            f'absent), got {budgets!r}.'
+        )
+
+    def test_class_with_no_waits_is_zero(self) -> None:
+        """A class whose test methods never wait budgets 0.0 -- no crash."""
+        source = '''
+class TestNoWaits:
+    async def test_nothing(self):
+        x = 1 + 1
+        return x
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets.get('TestNoWaits', 0.0) == 0.0, (
+            f'Expected a class with no waits at all to budget 0.0, got '
+            f'{budgets!r}.'
+        )
+
+    def test_syntactically_odd_but_parseable_input_does_not_raise(self) -> None:
+        """A syntactically odd but still-parseable module -- no `Test*`
+        classes at all, only module-level and conditionally-nested code --
+        does not raise.
+        """
+        source = '''
+x = 1
+def free_function():
+    return 42
+if x:
+    class NotATestClass:
+        def method(self):
+            pass
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {}, (
+            f'Expected a module with no Test* classes to yield an empty '
+            f'result without raising, got {budgets!r}.'
+        )
