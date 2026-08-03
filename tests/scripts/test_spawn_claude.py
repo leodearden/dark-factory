@@ -387,12 +387,16 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
 # _SPAWN_RUN_CAP_SECS: derived, not tuned. Worst-case single-test
 # composition on this channel is one _run_spawn/proc.wait budget plus at
 # most one _wait_for_path_scaled readiness gate (verified across every
-# _wait_for_path* call site: :2570/:2751/:2818 each follow a _run_spawn),
-# so 120 + _READINESS_WAIT_CAP_SECS (30) = 150s, 2x headroom inside the
-# governing --timeout=300 (scripts/orchestrator.yaml:17 -- the repo-root
-# pyproject.toml sets no timeout and shared/pyproject.toml's timeout=60
-# does not govern this file). Measured happy path for the flaking test:
-# 1.36-2.19s per param (n=6) at load-per-core 2.2, so 120 is ~55x.
+# _run_spawn call site that is followed by a _wait_for_path_scaled call:
+# _run_sibling_capture_spawn, test_sibling_mode_is_fire_and_forget, and
+# test_sibling_mode_foreground_emulator_is_fire_and_forget -- named by
+# function rather than line number, since line numbers rot as the file
+# shifts), so 120 + _READINESS_WAIT_CAP_SECS (30) = 150s, 2x headroom
+# inside the governing --timeout=300 (scripts/orchestrator.yaml's
+# test_command key -- the repo-root pyproject.toml sets no timeout and
+# shared/pyproject.toml's timeout=60 does not govern this file). Measured
+# happy path for the flaking test: 1.36-2.19s per param (n=6) at
+# load-per-core 2.2, so 120 is ~55x.
 #
 # Deliberately LARGER than _READINESS_WAIT_CAP_SECS (30): a readiness-wait
 # cap is paid in full on the failure path, whereas a subprocess wall-clock
@@ -444,6 +448,14 @@ def _run_spawn(
     verdict is load-INSENSITIVE (the no-emulator/no-tmux 126 sites, per
     task 3486's audit) -- there, scaling would only make a genuine
     regression take longer to report.
+
+    `timeout` must be passed as an UNSCALED base. A caller that already
+    computed a load-adaptive value (e.g. via _set_started_grace or
+    _load_scaled_grace) and adds fixed margin on top -- as the
+    "must-not-be-flagged" family below does (grace + sleep + margin) --
+    must also pass scale_timeout=False, or _spawn_run_budget scales an
+    already-scaled number a second time, discarding that site's own
+    derivation under load instead of honoring it.
     """
     budget = _spawn_run_budget(timeout) if scale_timeout else timeout
     return subprocess.run(
@@ -748,6 +760,13 @@ def test_window_close_yields_129_not_hang(
     # shared/pyproject.toml's timeout=60 does NOT govern this file, and the
     # real ceiling is the --timeout=300 scripts/orchestrator.yaml:17 passes.
     # This descriptive pytest.fail still fires well before that blunt kill.
+    #
+    # Deliberately NOT routed through _spawn_run_budget/_SPAWN_RUN_CAP_SECS
+    # (task 3599): this readiness-adjacent policy (cap 30) is a separate
+    # policy owner from that whole-invocation channel (cap 120) -- see the
+    # explicit divergence note in
+    # test_failed_to_start_detected_on_detached_exit0, the one Popen+wait
+    # site in this file that DOES use _spawn_run_budget.
     try:
         rc = proc.wait(timeout=_load_scaled_grace(15, cap_secs=_READINESS_WAIT_CAP_SECS))
     except subprocess.TimeoutExpired:
@@ -942,6 +961,9 @@ def test_window_close_129_robust_to_delayed_trap_install(
     # SIGHUP arrives after the HUP trap is armed — must yield exit 129.
     os.killpg(leader_pid, signal.SIGHUP)
 
+    # Deliberately NOT routed through _spawn_run_budget/_SPAWN_RUN_CAP_SECS
+    # (task 3599) -- same readiness-adjacent policy (cap 30), left untouched
+    # for the same reason as test_window_close_yields_129_not_hang above.
     try:
         rc = proc.wait(timeout=_load_scaled_grace(15, cap_secs=_READINESS_WAIT_CAP_SECS))
     except subprocess.TimeoutExpired:
@@ -1167,7 +1189,8 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
 
     RED today: resolve_detached's launch_rc==0 (no sentinel) branch calls the
     unbounded await_sentinel, which loops forever since the sentinel is never
-    written -> proc.wait(timeout=20) raises TimeoutExpired -> pytest.fail.
+    written -> proc.wait(timeout=_spawn_run_budget(20)) raises
+    TimeoutExpired -> pytest.fail.
     """
     bin_dir = _make_bin_dir(tmp_path)
 
@@ -1198,16 +1221,27 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
         start_new_session=True,
     )
 
-    # Must-not-hang guard, not a latency SLA -- mirrors
-    # test_window_close_yields_129_not_hang's Popen+wait(timeout) pattern.
-    # Pre-impl this hangs forever (unbounded await_sentinel), so a bounded
-    # wait cleanly separates pass/fail from an infinite hang. Task 3599:
-    # the bound is now load-scaled via _spawn_run_budget -- the same
-    # whole-invocation wall-clock policy _run_spawn itself uses, reached
-    # here via Popen+wait instead of subprocess.run. The rc==144 verdict IS
-    # load-sensitive (it needs the watchdog to flag AND the parent to
-    # exit), unlike the SPAWN_STARTED_GRACE_SECS pin above, which stays
-    # fixed on its own, different channel.
+    # Must-not-hang guard, not a latency SLA. Pre-impl this hangs forever
+    # (unbounded await_sentinel), so a bounded wait cleanly separates
+    # pass/fail from an infinite hang. Task 3599: the bound is now
+    # load-scaled via _spawn_run_budget -- the same whole-invocation
+    # wall-clock policy _run_spawn itself uses, reached here via Popen+wait
+    # instead of subprocess.run. The rc==144 verdict IS load-sensitive (it
+    # needs the watchdog to flag AND the parent to exit), unlike the
+    # SPAWN_STARTED_GRACE_SECS pin above, which stays fixed on its own,
+    # different channel.
+    #
+    # Deliberate divergence, stated explicitly rather than left implicit:
+    # this file has two OTHER Popen+wait must-not-hang sites
+    # (test_window_close_yields_129_not_hang and
+    # test_window_close_129_robust_to_delayed_trap_install), both of which
+    # stay on _load_scaled_grace(15, cap_secs=_READINESS_WAIT_CAP_SECS)
+    # (cap 30) -- task 3486's readiness-gate policy, which this task's plan
+    # explicitly left untouched as outside its defect. This site does NOT
+    # mirror that pattern; it shares _spawn_run_budget's larger cap (120)
+    # instead, because it is the same whole-invocation wall-clock channel
+    # _run_spawn covers, just reached via Popen+wait rather than
+    # subprocess.run.
     try:
         rc = proc.wait(timeout=_spawn_run_budget(20))
     except subprocess.TimeoutExpired:
@@ -1535,57 +1569,25 @@ def test_wait_for_path_scaled_cap_secs_override_widens_the_clamp(
 # while passing in isolation.
 
 
-def test_spawn_run_budget_loaded_host_matches_load_scaled_grace(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """On a loaded host, _spawn_run_budget matches _load_scaled_grace's own
-    output -- used as the oracle for cap_secs forwarding, so the
-    floor/scale/clamp/error-safe arithmetic already pinned by the
-    test_load_scaled_grace_* family is not re-derived here. That oracle
-    alone can't catch a bug shared by both functions, so a literal expected
-    value is also pinned (96.0 loadavg / 32 cores => load-per-core 3.0,
-    base 30 => ceil(30 * 3.0) = 90).
+def test_spawn_run_cap_leaves_headroom_inside_governing_timeout() -> None:
+    """_SPAWN_RUN_CAP_SECS must leave headroom inside the governing
+    --timeout=300 (scripts/orchestrator.yaml's test_command key) even
+    stacked with one _wait_for_path_scaled readiness gate -- the worst-case
+    single-test composition _run_sibling_capture_spawn,
+    test_sibling_mode_is_fire_and_forget, and
+    test_sibling_mode_foreground_emulator_is_fire_and_forget each exercise
+    (a _run_spawn call followed by a _wait_for_path_scaled call).
+
+    Deliberately just this one static invariant between the two module-
+    level constants, no monkeypatching: the scale/floor/clamp arithmetic
+    _spawn_run_budget delegates to is already pinned by the
+    test_load_scaled_grace_* family above, and _spawn_run_budget's own
+    forwarding of it is pinned against real subprocess.run calls by the
+    test_run_spawn_* family below -- re-deriving that arithmetic a third
+    time here would be pure duplication (task 3599 amendment; a prior
+    revision of this test file had three test_spawn_run_budget_* tests
+    doing exactly that).
     """
-    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    assert _spawn_run_budget(30) == _load_scaled_grace(
-        30, cap_secs=_SPAWN_RUN_CAP_SECS
-    )
-    assert _spawn_run_budget(30) == 90
-
-
-def test_spawn_run_budget_idle_host_returns_base_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An idle host (load-per-core < 1) floors at base_secs unchanged.
-
-    Load-bearing safety property: an idle host is byte-identical to today's
-    fixed pins at every _run_spawn call site, so routing _run_spawn's
-    timeout through this function can only LENGTHEN a budget under
-    contention, never shorten one.
-    """
-    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    assert _spawn_run_budget(30) == 30
-    assert _spawn_run_budget(15) == 15
-
-
-def test_spawn_run_budget_clamps_to_spawn_run_cap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pathological load (load-per-core 100) clamps at _SPAWN_RUN_CAP_SECS
-    instead of growing unbounded, mirroring
-    test_load_scaled_grace_clamps_to_cap one layer up. _SPAWN_RUN_CAP_SECS
-    itself must leave headroom inside the governing --timeout=300
-    (scripts/orchestrator.yaml:17) even stacked with one
-    _wait_for_path_scaled readiness gate.
-    """
-    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    assert _spawn_run_budget(30) == _SPAWN_RUN_CAP_SECS == 120
     assert _SPAWN_RUN_CAP_SECS + _READINESS_WAIT_CAP_SECS < 300
 
 
@@ -1794,7 +1796,13 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     env = _base_env(bin_dir, "custom-term")
     grace = _set_started_grace(env)
 
-    result = _run_spawn(env, tmp_path, timeout=grace + 8 + 6)
+    # scale_timeout=False (task 3599 amendment): `grace` is already
+    # load-scaled (_set_started_grace delegates to _load_scaled_grace), so
+    # routing grace + 8 + 6 through _spawn_run_budget would scale an
+    # already-scaled number a second time -- e.g. at load-per-core 3.0,
+    # grace=24 and the sum 38 would become ceil(38*3)=114, discarding this
+    # margin's own derivation instead of honoring it.
+    result = _run_spawn(env, tmp_path, timeout=grace + 8 + 6, scale_timeout=False)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (
@@ -1863,7 +1871,11 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     env = _base_env(bin_dir, "xterm")
     grace = _set_started_grace(env)
 
-    result = _run_spawn(env, tmp_path, timeout=grace + 6 + 6)
+    # scale_timeout=False (task 3599 amendment): `grace` is already
+    # load-scaled (_set_started_grace delegates to _load_scaled_grace), so
+    # a second pass through _spawn_run_budget would double-count contention
+    # -- see the identical rationale on the transcript-evidence test above.
+    result = _run_spawn(env, tmp_path, timeout=grace + 6 + 6, scale_timeout=False)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (
@@ -1973,7 +1985,11 @@ def test_normal_spawn_exit0_not_flagged(tmp_path: pathlib.Path) -> None:
     env = _base_env(bin_dir, "xterm")
     grace = _set_started_grace(env)
 
-    result = _run_spawn(env, tmp_path, timeout=grace + 20)
+    # scale_timeout=False (task 3599 amendment): `grace` is already
+    # load-scaled (_set_started_grace delegates to _load_scaled_grace) --
+    # see the identical double-scaling rationale on the two must-not-be-
+    # flagged tests above.
+    result = _run_spawn(env, tmp_path, timeout=grace + 20, scale_timeout=False)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (
