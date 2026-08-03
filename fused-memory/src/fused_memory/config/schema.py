@@ -1627,6 +1627,51 @@ class WriteTriageConfig(BaseModel):
             'hot-reloadable via reload_config.'
         ),
     )
+    t_high_by_category: dict[str, float] | None = Field(
+        default=None,
+        description=(
+            'Per-Mem0-category deterministic cutoffs, each derived from that '
+            "category's OWN measured pairs. Like the pooled t_high above, this is "
+            'an OUTPUT of scripts/calibrate_write_triage.py and must never be '
+            'hand-set. A category ABSENT from this map is UNCALIBRATED FOR THAT '
+            'CATEGORY — absence is the ONLY spelling of that, so a category is '
+            'never present with a null. None (and the empty map) mean no category '
+            'is calibrated. Read by '
+            'scripts/audit_duplicate_memories.py resolve_ann_threshold, which '
+            'resolves per category and discloses every fallback to the pooled '
+            'cutoff. Green-tier hot-reloadable via reload_config, as ONE atomic '
+            'leaf.'
+        ),
+    )
+
+    @field_validator('t_high_by_category')
+    @classmethod
+    def _bound_per_category_cutoffs(
+        cls, value: dict[str, float] | None,
+    ) -> dict[str, float] | None:
+        """Every cutoff must lie in the cosine unit range, or none load.
+
+        Bounded here rather than at the consumer because the failure would
+        otherwise be invisible until it changed what got DELETED: a cutoff of
+        42.0 matches nothing and a negative one matches everything, and
+        either surfaces as (un)deleted memories rather than as a config
+        error. Rejecting the whole map on one bad entry keeps a half-valid
+        set of cutoffs from gating a sweep.
+        """
+        if value is None:
+            return None
+        out_of_range = {
+            category: cutoff for category, cutoff in value.items()
+            if not 0.0 <= cutoff <= 1.0
+        }
+        if out_of_range:
+            raise ValueError(
+                f'write_triage.t_high_by_category cutoffs must lie in the cosine '
+                f'unit range [0.0, 1.0]; got {out_of_range!r}. This map is an '
+                'output of scripts/calibrate_write_triage.py — re-run it rather '
+                'than hand-editing.',
+            )
+        return value
 
 
 class Mem0UpdateConfig(BaseModel):
