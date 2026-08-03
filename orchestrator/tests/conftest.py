@@ -802,8 +802,18 @@ def make_steward(tmp_path: Path):
     # Per-call counter so repeated default builds get isolated directories.
     default_worktree_count = itertools.count(1)
 
-    def _make(*, worktree: Path | None = None, config_overrides: dict | None = None):
+    def _make(
+        *,
+        worktree: Path | None = None,
+        config_overrides: dict | None = None,
+        task: dict | None = None,
+        event_store=None,
+        cost_store=None,
+    ):
         from orchestrator.steward import TaskSteward
+
+        if task is None:
+            task = {'id': '42', 'title': 'Test Task', 'description': 'desc'}
 
         if worktree is None:
             n = next(default_worktree_count)
@@ -860,14 +870,16 @@ def make_steward(tmp_path: Path):
         mcp.mcp_config_json.return_value = {'mcpServers': {}}
 
         return TaskSteward(
-            task_id='42',
-            task={'id': '42', 'title': 'Test Task', 'description': 'desc'},
+            task_id=task['id'],
+            task=task,
             worktree=worktree,
             config=config,
             mcp=mcp,
             escalation_queue=queue,
             briefing=briefing,
             usage_gate=None,
+            event_store=event_store,
+            cost_store=cost_store,
         )
 
     return _make
