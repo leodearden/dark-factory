@@ -82,6 +82,7 @@ __all__ = [
     'lane_lock_path',
     'leaked_lane_lock',
     'real_git_ops',
+    'wait_for_lane_lock_holder',
     'wait_until',
 ]
 
@@ -98,6 +99,16 @@ _FOREIGN_HOLDER_STARTUP_SECS = 5.0
 #: Bound on how long :func:`foreign_lane_lock_holder` waits, on exit, for the
 #: kernel to stop attributing the lock to the child.
 _FOREIGN_HOLDER_TEARDOWN_SECS = 5.0
+
+#: Bound on how long :func:`wait_for_lane_lock_holder` polls for the kernel to
+#: ATTRIBUTE the lock to a specific pid (as opposed to merely being held by
+#: somebody).  Derivation: task 3451 measured worst-case happy-path subprocess
+#: spawn latency at 4.71s (n=3: 2.13/3.10/4.71) at load-per-core 6.6 on this
+#: host, and task 3491 settled on 30s as the ceiling for this same
+#: load-sensitive full-suite-flake class.  A longer bound only lengthens how
+#: long a genuinely broken staging takes to fail — it can never make a broken
+#: staging pass.
+_FOREIGN_HOLDER_ATTRIBUTION_SECS = 30.0
 
 
 @contextlib.contextmanager
@@ -228,6 +239,49 @@ async def wait_until(
         if time.monotonic() >= deadline:
             return False
         await asyncio.sleep(interval)
+
+
+def wait_for_lane_lock_holder(
+    lock_path: Path,
+    pid: int,
+    timeout: float = _FOREIGN_HOLDER_ATTRIBUTION_SECS,
+    interval: float = 0.02,
+    read_holders: Callable[[Path], list[int]] | None = None,
+) -> list[int]:
+    """Poll until *pid* is among *lock_path*'s kernel-reported FLOCK holders.
+
+    Why this exists: :func:`lane_lock_holder_pids` is deliberately fail-safe —
+    a missing lock file, an unreadable ``/proc/locks``, and an unparseable row
+    all yield ``[]``, the SAME thing "nobody holds it" yields.  A single read
+    therefore cannot distinguish "the child does not hold the lock" from "the
+    kernel table has not settled yet" or "this particular read was bad".  That
+    ambiguity is exactly what produced the observed ``assert 658016 in []``
+    under 16-worker xdist load: the child genuinely held the lock, but the
+    one-shot read landed on an empty snapshot.
+
+    Returns the snapshot in which *pid* first appeared, so a caller's own
+    assertion (e.g. ``assert pid in holders``) reports the real list the
+    kernel returned.  On timeout, returns the LAST snapshot read instead of
+    raising — mirroring :func:`wait_until`'s deliberate return-don't-raise
+    contract (:222-241) — so the caller's assertion still carries the genuine
+    kernel-observed evidence rather than a helper-internal traceback.
+
+    *read_holders* defaults to ``None`` and is resolved to the module-global
+    :func:`lane_lock_holder_pids` at CALL time (a bare name lookup inside the
+    function body, not a def-time default), so a ``monkeypatch.setattr`` on
+    this module's ``lane_lock_holder_pids`` attribute is honoured — the same
+    module-attribute stubbing seam this suite already uses on
+    ``git_ops_mod.acquire_merge_verify_flock`` (e.g. :834-848).
+    """
+    reader = read_holders if read_holders is not None else lane_lock_holder_pids
+    deadline = time.monotonic() + timeout
+    while True:
+        holders = reader(lock_path)
+        if pid in holders:
+            return holders
+        if time.monotonic() >= deadline:
+            return holders
+        time.sleep(interval)
 
 
 def lane_is_free(lock_path: Path) -> bool:
