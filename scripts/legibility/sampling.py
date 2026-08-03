@@ -14,7 +14,7 @@ CLI acceptance surface.
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 §5.2, contract §7.4). It owns its own signal-scoring primitives, reusing
 only the low-level JSONL-line iterator
-(:func:`legibility.inventory._iter_json_lines`) from its own sibling
+(:func:`legibility.inventory.iter_json_lines`) from its own sibling
 module rather than duplicating it.
 
 This module was originally "self-contained — does not import task α's
