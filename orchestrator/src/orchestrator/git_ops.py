@@ -13588,11 +13588,24 @@ class GitOps:
         unrecovered WIP; it is never overwritten.
         Raises :class:`MergeParkLockContentionError` (a ``MergeParkError``
         SUBCLASS, so it must be caught FIRST) instead of the generic
-        ``MergeParkError`` when either of those two failures happens while a
-        FOREIGN git process holds ``<git-dir>/index.lock`` — transient
-        contention rather than a park infra fault.  Both failure sites
-        re-probe the lock, closing the TOCTOU window advance_main's
-        pre-park gate cannot cover.
+        ``MergeParkError`` when the ``git stash create`` failure happens
+        while a FOREIGN git process holds ``<git-dir>/index.lock`` —
+        transient contention rather than a park infra fault.  That re-probe
+        closes the TOCTOU window advance_main's pre-park gate cannot cover.
+
+        The transient classification is DELIBERATELY confined to the
+        stash-create site, which is the only failure that leaves NOTHING
+        behind: no ref, no tree write.  A ``read-tree`` failure happens
+        AFTER ``update-ref`` has already created MERGE_PARK_REF, so
+        classifying it transient would return a per-task
+        ``'park_lock_contended'`` (no cleanup, no apply) while leaving the
+        ref dangling — and the NEXT advance's single-flight guard would then
+        raise :class:`MergeParkContentionError` and halt the whole queue.
+        That converts a transient race into a guaranteed later halt, so the
+        read-tree site keeps the loud generic ``MergeParkError``
+        (``'stash_failed'``) with the WIP safe on the ref.  It also keeps
+        the ``'park_lock_contended'`` operator message's "NOTHING in
+        project_root was modified" claim (merge_gates) factually true.
         """
         # Single-flight guard: explicit pre-check so a stale/contended ref
         # fails loudly with a clear message rather than via the terser
@@ -13653,18 +13666,17 @@ class GitOps:
             cwd=self.project_root,
         )
         if reset_rc != 0:
-            # Same re-probe as the stash-create failure above, so a lock that
-            # appears mid-park is classified consistently rather than by
-            # which step happened to hit it.
-            lock_held, lock_age = await self._index_lock_state()
-            if lock_held:
-                raise MergeParkLockContentionError(
-                    f'read-tree -u --reset HEAD failed after parking WIP on '
-                    f'{MERGE_PARK_REF} because a foreign git process holds '
-                    f'{await self._index_lock_path()} (age={lock_age:.1f}s) — '
-                    f'transient contention (rc={reset_rc}). WIP is safe on '
-                    f'the ref.'
-                )
+            # NO lock re-probe here, deliberately — unlike the stash-create
+            # site above, this failure happens AFTER update-ref created
+            # MERGE_PARK_REF.  Raising the transient subclass would make
+            # advance_main return 'park_lock_contended', which neither
+            # deletes the ref nor sets did_park, so nothing ever applies or
+            # cleans it up; the next advance's single-flight guard would
+            # then hit MergeParkContentionError -> 'stash_failed' and halt
+            # the entire queue.  Keeping the loud generic MergeParkError
+            # here trades a same-cycle halt (WIP safe on the ref, one
+            # recovery) for a guaranteed later one, and keeps
+            # 'park_lock_contended' honestly meaning "nothing was modified".
             raise MergeParkError(
                 f'read-tree -u --reset HEAD failed after parking WIP on '
                 f'{MERGE_PARK_REF} (rc={reset_rc}, stderr={reset_err!r}) — '

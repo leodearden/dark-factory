@@ -14053,6 +14053,64 @@ class TestAdvanceMainIndexLockStandoff:
         # `except MergeParkError` handler still catches it.
         assert issubclass(MergeParkLockContentionError, MergeParkError)
 
+    async def test_read_tree_failure_under_a_lock_is_NOT_transient(
+        self, git_ops: GitOps,
+    ):
+        """A read-tree failure must halt loudly even with a lock present.
+
+        read-tree runs AFTER `update-ref` has already created
+        MERGE_PARK_REF.  Classifying it as transient lock contention would
+        return a per-task 'park_lock_contended' that neither deletes the ref
+        nor applies it, leaving MERGE_PARK_REF dangling — and the NEXT
+        advance's single-flight guard would raise MergeParkContentionError
+        -> 'stash_failed', halting the WHOLE queue.  That converts a
+        transient race into a guaranteed later halt, so this site keeps the
+        generic MergeParkError (WIP safe on the ref, recovered this cycle).
+        """
+        (git_ops.project_root / 'README.md').write_text('# dirty for read-tree\n')
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'read-tree', '-u']:
+                # A foreign `git commit --only` grabs the index between the
+                # successful update-ref and the tree clean.
+                lock_path.write_text('')
+                return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=mock_run),
+                pytest.raises(MergeParkError) as excinfo,
+            ):
+                await git_ops._park_wip_on_private_ref('lbl')
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+
+        assert not isinstance(excinfo.value, MergeParkLockContentionError), (
+            'the post-update-ref read-tree failure must NOT be classified as '
+            'transient lock contention — that leaves MERGE_PARK_REF dangling '
+            f'and halts the queue on the NEXT advance; got {excinfo.value!r}'
+        )
+
+        # The WIP really is preserved on the ref, which is what justifies
+        # halting loudly here rather than pretending nothing happened.
+        rc, sha, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0 and sha.strip(), (
+            'MERGE_PARK_REF must still hold the parked WIP after a read-tree '
+            'failure, so the halt is recoverable'
+        )
+        await _run(
+            ['git', 'update-ref', '-d', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+
     async def test_stash_failure_without_a_lock_still_halts(self, git_ops: GitOps):
         """NON-REGRESSION: a genuine park failure with NO index.lock present
         keeps its existing loud queue-halt semantics.
