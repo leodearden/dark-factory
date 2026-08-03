@@ -21,11 +21,16 @@ Every LLM / MCP / git side effect in this module is an INJECTED seam
 ``escalate_fn``, ``status_fetcher``, ``commit``, ``batch_source``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
---project shared``) has no MCP client / httpx / live models, so every
-seam is ALWAYS faked in this module's own test suite; the deterministic
-core (duplicate/dup_rate, the mining batch loop + saturation stop, the
-origin x manifestation matrix, census-state advance, codebook lifecycle
-transforms, report rendering) is unit-tested with no network.
+--project shared``) has no MCP client and no live models, so every seam is
+ALWAYS faked in this module's own test suite; the deterministic core
+(duplicate/dup_rate, the mining batch loop + saturation stop, the origin x
+manifestation matrix, census-state advance, codebook lifecycle transforms,
+report rendering) is unit-tested with no network. Note that httpx IS
+available there -- a direct dependency of ``shared``
+(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965) -- so the seams are
+what keep the suite off the network, not an absent HTTP client: an
+un-faked poster would really reach whatever is listening on
+``$FUSED_MEMORY_MCP_URL`` (default localhost:8002).
 
 Model routing (ratified static policy, PRD §5/§12 -- deliberately NOT the
 adaptive ``resolve_route`` ladder): Sonnet for mining + verification,
@@ -1609,9 +1614,12 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
     """POST one JSON-RPC ``tools/call`` envelope to *url* and unwrap the
     result via ``census_trigger._extract_tool_result`` (reused rather than
     reimplemented -- the same MCP envelope shape applies everywhere in this
-    codebase). ``httpx`` is imported lazily since it is not a ``scripts/``
-    dependency (mirrors ``census_trigger.default_status_fetcher`` /
-    ``nightly._default_poster``)."""
+    codebase). ``httpx`` is imported lazily so importing this module for its
+    unit-tested pure core never needs it, and so the tests can substitute a
+    stub for the real POST -- not for availability, since httpx is a direct
+    dependency of ``shared`` (``httpx>=0.27``, task 2965) and this module
+    runs under ``uv run --project shared``. Mirrors
+    ``census_trigger.default_status_fetcher`` / ``nightly._default_poster``."""
     import httpx
 
     response = httpx.post(

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -570,7 +569,7 @@ def test_compute_tasks_landed_empty_project_computes_a_real_zero_delta(caplog):
 
 
 def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(
-    tmp_path, monkeypatch
+    tmp_path, install_fake_httpx
 ):
     """An unreachable endpoint must surface as StatusFetchUnavailable, never
     as a raw transport exception.
@@ -582,18 +581,15 @@ def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
     (http://localhost:8002). httpx is installed today, and a real fused-memory
     MCP server listens on :8002 on any machine running the stack -- so the
     test flapped pass/fail with that live server's connection state instead of
-    testing this module. Injecting a failing `httpx` module (the same
-    sys.modules convention used by
-    test_default_status_fetcher_sends_streamable_http_accept_headers below)
-    makes the "unreachable" premise true by construction.
+    testing this module. Injecting a failing `httpx` module (via the shared
+    `install_fake_httpx` fixture, as
+    test_default_status_fetcher_sends_streamable_http_accept_headers below
+    also does) makes the "unreachable" premise true by construction.
     """
-    fake_httpx = type(sys)("httpx")
-
     def _fake_post(url, **kwargs):
         raise OSError("[Errno 111] Connection refused")
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    install_fake_httpx(_fake_post)
 
     fetcher = ct.default_status_fetcher(tmp_path)
 
@@ -612,15 +608,19 @@ class _FakeHttpxResponse:
         return self._payload
 
 
-def test_default_status_fetcher_sends_streamable_http_accept_headers(tmp_path, monkeypatch):
+def test_default_status_fetcher_sends_streamable_http_accept_headers(
+    tmp_path, install_fake_httpx
+):
     """Task 2953: the streamable-HTTP MCP transport 406s
     ("Not Acceptable: Client must accept application/json") any tools/call
     POST whose Accept header doesn't include both application/json and
     text/event-stream -- verified live against a local MCP /mcp endpoint.
-    default_status_fetcher's httpx import is lazy (httpx is not a scripts/
-    dependency, though it is importable in this test env as a transitive
-    one), so a fake `httpx` module is injected into sys.modules for the
-    duration of this test to capture the outbound call without a network."""
+    default_status_fetcher's httpx import is lazy, but httpx is genuinely
+    available here: a DIRECT dependency of `shared` (shared/pyproject.toml,
+    `httpx>=0.27`, task 2965), not a transitive one. So the real POST would
+    actually go out; the shared `install_fake_httpx` fixture substitutes a
+    stub to capture the outbound call without a network, and without
+    depending on whatever is listening on localhost:8002."""
     captured_kwargs = {}
     rpc_response = {
         "jsonrpc": "2.0",
@@ -628,14 +628,11 @@ def test_default_status_fetcher_sends_streamable_http_accept_headers(tmp_path, m
         "result": {"structuredContent": {"statuses": {"1": "done"}}},
     }
 
-    fake_httpx = type(sys)("httpx")
-
     def _fake_post(url, **kwargs):
         captured_kwargs.update(kwargs)
         return _FakeHttpxResponse(rpc_response)
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    install_fake_httpx(_fake_post)
 
     fetcher = ct.default_status_fetcher(tmp_path)
     result = fetcher()
@@ -653,13 +650,15 @@ def test_default_status_fetcher_sends_streamable_http_accept_headers(tmp_path, m
     assert envelope.get("params", {}).get("name") == "get_statuses"
 
 
-def _capture_get_statuses_project_root(monkeypatch, project_root):
+def _capture_get_statuses_project_root(install_fake_httpx, project_root):
     """Drive `default_status_fetcher(project_root)` against a fake httpx and
     return the `project_root` argument it actually put on the wire. Reuses
-    the `_FakeHttpxResponse` + sys.modules injection harness above (the
-    `import httpx` inside `_fetch` is lazy precisely so this works)."""
+    the `_FakeHttpxResponse` + shared `install_fake_httpx` harness above (the
+    `import httpx` inside `_fetch` is lazy precisely so this works).
+
+    Takes the fixture as a parameter rather than requesting it: this is a
+    plain helper, not a test, so pytest will not inject fixtures into it."""
     captured_kwargs = {}
-    fake_httpx = type(sys)("httpx")
 
     def _fake_post(url, **kwargs):
         captured_kwargs.update(kwargs)
@@ -667,14 +666,15 @@ def _capture_get_statuses_project_root(monkeypatch, project_root):
             {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"statuses": {}}}}
         )
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    install_fake_httpx(_fake_post)
 
     ct.default_status_fetcher(project_root)()
     return captured_kwargs["json"]["params"]["arguments"]["project_root"]
 
 
-def test_default_status_fetcher_sends_absolute_project_root_for_dot(tmp_path, monkeypatch):
+def test_default_status_fetcher_sends_absolute_project_root_for_dot(
+    tmp_path, monkeypatch, install_fake_httpx
+):
     """Task 3291 root cause. fused-memory's `_normalize_project_root` hard-
     rejects ANY relative path -- verified live against localhost:8002, which
     answered `{"project_root": "."}` with
@@ -688,26 +688,28 @@ def test_default_status_fetcher_sends_absolute_project_root_for_dot(tmp_path, mo
     path is meaningless over the wire."""
     monkeypatch.chdir(tmp_path)
 
-    sent = _capture_get_statuses_project_root(monkeypatch, ".")
+    sent = _capture_get_statuses_project_root(install_fake_httpx, ".")
 
     assert sent == str(tmp_path.resolve())
     assert Path(sent).is_absolute()
 
 
 def test_default_status_fetcher_sends_absolute_project_root_for_relative_subdir(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, install_fake_httpx
 ):
     """Second case so the fix cannot pass by special-casing `"."` alone."""
     (tmp_path / "sub" / "dir").mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
 
-    sent = _capture_get_statuses_project_root(monkeypatch, "sub/dir")
+    sent = _capture_get_statuses_project_root(install_fake_httpx, "sub/dir")
 
     assert sent == str((tmp_path / "sub" / "dir").resolve())
     assert Path(sent).is_absolute()
 
 
-def test_default_status_fetcher_leaves_absolute_project_root_unchanged(tmp_path, monkeypatch):
+def test_default_status_fetcher_leaves_absolute_project_root_unchanged(
+    tmp_path, monkeypatch, install_fake_httpx
+):
     """The other half of the contract: an ALREADY-absolute root must cross the
     wire byte-for-byte unchanged. Both tests above start from a relative path,
     so on their own they would not notice a "fix" that mangles absolute inputs.
@@ -721,7 +723,7 @@ def test_default_status_fetcher_leaves_absolute_project_root_unchanged(tmp_path,
     monkeypatch.chdir(tmp_path)
     absolute_root = str(tmp_path)
 
-    sent = _capture_get_statuses_project_root(monkeypatch, absolute_root)
+    sent = _capture_get_statuses_project_root(install_fake_httpx, absolute_root)
 
     assert sent == absolute_root
 
