@@ -30,10 +30,15 @@ CREATE TABLE IF NOT EXISTS write_ops (
 -- Mirrors the real six-index set fused-memory creates on write_ops, so
 -- query-plan assertions against this fixture (see
 -- TestOperationsBreakdownQueryPlan) exercise the same planner choices as the
--- live journal. Copied from the `SCHEMA_SQL` constant in
--- fused_memory/services/write_journal.py (cited by FILE + CONSTANT NAME, not
--- line number: fused-memory/tests/test_write_journal.py:718-724 records that a
--- line-number cross-package citation already went stale once).
+-- live journal. Two sources, both in fused_memory/services/write_journal.py
+-- (cited by FILE + CONSTANT/METHOD NAME, not line number:
+-- fused-memory/tests/test_write_journal.py:718-724 records that a
+-- line-number cross-package citation already went stale once):
+-- idx_wo_causation, idx_wo_project_time, idx_wo_operation and idx_wo_created
+-- come from the `SCHEMA_SQL` constant; idx_wo_kind_time and idx_wo_agent_time
+-- are NOT in SCHEMA_SQL — they're created separately inside
+-- `WriteJournal._migrate()` (they depend on the `kind` column that migration
+-- adds). Keep both sources in sync when mirroring future index changes here.
 CREATE INDEX IF NOT EXISTS idx_wo_causation ON write_ops(causation_id);
 CREATE INDEX IF NOT EXISTS idx_wo_project_time ON write_ops(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
@@ -455,22 +460,47 @@ class TestNowThreading:
         assert sum(result['values']) == 1
 
 
+# Deliberately UNEQUAL per-operation weights (sum to 500, matching the
+# architect's validated row count / date spread). An even `i % 5` split ties
+# every group's count at 100, which makes `values == sorted(values,
+# reverse=True)` vacuously true for ANY ordering and silently drops the
+# ORDER BY assertion in TestOperationsBreakdownResultEquivalence
+# (reviewer_comprehensive finding, task 3519 amendment). The weighted split
+# makes that assertion real; see TestOperationsBreakdownResultEquivalence's
+# `test_hinted_and_unhinted_agree_on_ties` for dedicated tied-count coverage.
+_OPS_BREAKDOWN_WEIGHTS = {
+    'operation-0': 200,
+    'operation-1': 120,
+    'operation-2': 90,
+    'operation-3': 60,
+    'operation-4': 30,
+}
+
+
 def _seed_ops_breakdown_plan_fixture(db_path):
     """Seed 500 rows / 5 operations spread over ~20 days for plan assertions.
 
-    Matches the architect's validated fixture shape exactly (500 rows, 5
-    distinct operations, sqlite 3.50.4, real six-index schema): reproducing
-    it here is what makes the acceptance strings in
-    TestOperationsBreakdownQueryPlan reliable rather than guessed. Returns
-    the ``since`` ISO timestamp to use (the fixture's start instant), which
-    is what makes the plan meaningful — EXPLAIN QUERY PLAN reasons about the
+    Matches the architect's validated fixture shape (500 rows, 5 distinct
+    operations, sqlite 3.50.4, real six-index schema) for the query-plan
+    acceptance strings in TestOperationsBreakdownQueryPlan, which are
+    determined by row/operation counts and date spread, not by the
+    per-operation split. Per-operation counts follow `_OPS_BREAKDOWN_WEIGHTS`
+    rather than an even split — see that constant's comment. Returns the
+    ``since`` ISO timestamp to use (the fixture's start instant), which is
+    what makes the plan meaningful — EXPLAIN QUERY PLAN reasons about the
     predicate shape, not matched-row counts.
     """
     base = datetime(2026, 4, 1, tzinfo=UTC)
+    operations = [
+        operation
+        for operation, count in _OPS_BREAKDOWN_WEIGHTS.items()
+        for _ in range(count)
+    ]
+    assert len(operations) == 500, f'weights must sum to 500 rows, got {len(operations)}'
     rows = [
         (
             f'op-{i}',
-            f'operation-{i % 5}',
+            operations[i],
             'dark_factory',
             'agent-a',
             'read' if i % 2 == 0 else 'write',
@@ -529,37 +559,101 @@ class TestOperationsBreakdownResultEquivalence:
     property under test. Its value is that it goes red if a future edit to
     OPS_BREAKDOWN_SQL changes semantics rather than just the query plan.
 
-    Reuses the same 500-row / 5-operation fixture as
-    TestOperationsBreakdownQueryPlan, which (verified) happens to tie every
-    operation's count at 100 — exactly the shape that exposes the tie-order
-    hazard: ``GROUP BY`` ties are unspecified by ``ORDER BY cnt DESC``, and the
-    hinted/unhinted plans walk different indexes, so they can (and here, do)
-    emit the tied labels in different orders. Comparing as a dict rather than
-    an ordered list is what makes this test measure the real property instead
-    of flaking on that incidental ordering.
+    Reuses the weighted 500-row / 5-operation fixture from
+    TestOperationsBreakdownQueryPlan. Per-operation counts are deliberately
+    UNEQUAL (see `_OPS_BREAKDOWN_WEIGHTS`), so `test_hinted_and_unhinted_agree`
+    below can compare hinted vs unhinted as ORDERED lists — strictly stronger
+    than a dict comparison — and the descending-by-count assertion is
+    non-vacuous (reviewer_comprehensive finding, task 3519 amendment: an even
+    `i % 5` split ties every group at 100, so `sorted(values, reverse=True)
+    == values` held for ANY order and pinned nothing).
+
+    `test_hinted_and_unhinted_agree_on_ties` below keeps coverage for the
+    ordering hazard the architect originally measured with that even split:
+    ``GROUP BY`` ties are unspecified by ``ORDER BY cnt DESC``, and the
+    hinted/unhinted plans walk different indexes, so tied groups CAN
+    legitimately come back in different orders. That case is compared as a
+    dict, which is the correct tool for a genuinely-tied shape.
     """
 
     @pytest.mark.asyncio
     async def test_hinted_and_unhinted_agree(self, tmp_path):
-        from dashboard.data.write_journal import OPS_BREAKDOWN_SQL, get_operations_breakdown
+        from dashboard.data.write_journal import (
+            OPS_BREAKDOWN_SQL_UNHINTED,
+            get_operations_breakdown,
+        )
 
         db_path = tmp_path / 'ops_equivalence.db'
         since = _seed_ops_breakdown_plan_fixture(db_path)
         fixed_now = datetime.fromisoformat(since) + timedelta(hours=24)
 
-        # Derive the unhinted query from the real constant (rather than
-        # retyping a second copy) so this test cannot silently drift from
-        # what get_operations_breakdown actually runs.
-        unhinted_sql = OPS_BREAKDOWN_SQL.replace(' INDEXED BY idx_wo_created', '')
-        assert unhinted_sql != OPS_BREAKDOWN_SQL, (
-            'hint text not found in OPS_BREAKDOWN_SQL — constant format changed?'
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            hinted = await get_operations_breakdown(conn, now=fixed_now)
+
+            # Query the real fallback constant directly (rather than
+            # retyping a second copy) so this test cannot silently drift
+            # from what get_operations_breakdown actually falls back to.
+            async with conn.execute(OPS_BREAKDOWN_SQL_UNHINTED, (since,)) as cursor:
+                unhinted_rows = await cursor.fetchall()
+        unhinted = {
+            'labels': [r[0] or 'unknown' for r in unhinted_rows],
+            'values': [r[1] for r in unhinted_rows],
+        }
+
+        # The five weighted counts (200/120/90/60/30) are all distinct, so
+        # there is no tie-order ambiguity here: ordered-list equality is
+        # valid and strictly stronger than a dict comparison (it also
+        # subsumes a same-group-count check).
+        assert hinted['labels'] == unhinted['labels'], (
+            f"hinted labels {hinted['labels']} != unhinted {unhinted['labels']}"
         )
+        assert hinted['values'] == unhinted['values'], (
+            f"hinted values {hinted['values']} != unhinted {unhinted['values']}"
+        )
+        # The descending-by-count contract must survive the plan change —
+        # a real assertion now that the weighted counts are all distinct.
+        assert hinted['values'] == sorted(hinted['values'], reverse=True)
+
+    @pytest.mark.asyncio
+    async def test_hinted_and_unhinted_agree_on_ties(self, tmp_path):
+        """Tied counts: hinted/unhinted may legitimately disagree on order.
+
+        Reproduces the architect's original tie-order finding directly (an
+        even `i % 5` split ties every operation's count): ``ORDER BY cnt
+        DESC`` leaves tie order unspecified, and the hinted plan walks a
+        different index than the unhinted one, so a tied group can come back
+        in a different position. Compared as a dict, which is the correct
+        tool for this shape — an ordered-list comparison here would be a
+        guaranteed flake, not a real signal.
+        """
+        from dashboard.data.write_journal import (
+            OPS_BREAKDOWN_SQL_UNHINTED,
+            get_operations_breakdown,
+        )
+
+        db_path = tmp_path / 'ops_equivalence_ties.db'
+        base = datetime(2026, 4, 1, tzinfo=UTC)
+        rows = [
+            (
+                f'tie-{i}',
+                f'operation-{i % 5}',
+                'dark_factory',
+                'agent-a',
+                'read' if i % 2 == 0 else 'write',
+                (base + timedelta(minutes=i * 57.6)).isoformat(),
+            )
+            for i in range(250)
+        ]
+        _seed_write_ops(db_path, rows)
+        since = base.isoformat()
+        fixed_now = base + timedelta(hours=24)
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             hinted = await get_operations_breakdown(conn, now=fixed_now)
 
-            async with conn.execute(unhinted_sql, (since,)) as cursor:
+            async with conn.execute(OPS_BREAKDOWN_SQL_UNHINTED, (since,)) as cursor:
                 unhinted_rows = await cursor.fetchall()
         unhinted = {
             'labels': [r[0] or 'unknown' for r in unhinted_rows],
@@ -571,32 +665,35 @@ class TestOperationsBreakdownResultEquivalence:
         assert hinted_counts == unhinted_counts, (
             f'hinted {hinted_counts} != unhinted {unhinted_counts}'
         )
-        # The live cross-check the task's VERIFY item 2 names: same group count.
-        assert len(hinted['labels']) == len(unhinted['labels'])
-        # The descending-by-count contract must survive the plan change.
-        assert hinted['values'] == sorted(hinted['values'], reverse=True)
+        assert len(hinted['labels']) == 5
+        assert set(hinted['values']) == {50}, (
+            f"expected every group tied at 50, got: {hinted['values']}"
+        )
 
 
-class TestOperationsBreakdownMissingIndexDegradation:
+class TestOperationsBreakdownMissingIndexFallback:
     """Pins the ACTUAL observable when idx_wo_created goes missing.
 
-    Genuinely red-before / green-after step-2: before the hint landed, this
-    same index-less DB returned real rows (no dependency on the index
-    existing). After step-2, ``INDEXED BY`` makes the index a hard
-    constraint, so a missing index now degrades the result.
+    Superseded characterization (task 3519 review pass, reviewer_comprehensive
+    robustness finding): the original behaviour pinned here was a silent
+    empty chart, accepted via an explicit design decision reasoning that
+    letting the error propagate would risk a 500 on an endpoint polled every
+    3s. That tradeoff missed a third option — catch precisely this error and
+    retry without the hint — which keeps the endpoint correct (just slow)
+    without ever letting the error surface as a 500.
+    ``get_operations_breakdown``'s ``_query`` now does exactly that.
 
-    This corrects the task description's premise that the hint fails loudly
-    (INV-4). It does raise ``sqlite3.OperationalError: no such index``, but
-    ``with_db`` (dashboard/src/dashboard/data/db.py) catches exactly that and
-    returns the default — so the user-visible effect of a missing index is a
-    silently EMPTY operations chart, not an error, with only a WARNING log
-    (carrying ``exc_info=True``, so the traceback does name
-    ``idx_wo_created``) as the diagnostic trail. See the design decision
-    recording why this degradation is accepted rather than special-cased.
+    Genuinely red-before / green-after this amendment: before it, this same
+    index-less DB returned ``{'labels': [], 'values': []}`` plus a WARNING
+    from ``dashboard.data.db``. After it, the same DB returns the real rows
+    plus an ERROR from ``dashboard.data.write_journal`` that names
+    ``idx_wo_created`` directly — a stronger, more specific diagnostic than
+    the generic ``with_db: query failed`` WARNING it replaces for this one
+    error shape.
     """
 
     @pytest.mark.asyncio
-    async def test_missing_index_degrades_to_empty_default_with_warning(
+    async def test_missing_index_falls_back_to_unhinted_with_error_log(
         self, tmp_path, caplog,
     ):
         from dashboard.data.write_journal import get_operations_breakdown
@@ -619,13 +716,16 @@ class TestOperationsBreakdownMissingIndexDegradation:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
+            with caplog.at_level(logging.ERROR, logger='dashboard.data.write_journal'):
                 result = await get_operations_breakdown(conn)
 
-        assert result == {'labels': [], 'values': []}, (
-            f'expected the silent default, got: {result}'
+        result_counts = dict(zip(result['labels'], result['values'], strict=True))
+        assert result_counts == {'search': 1, 'add_memory': 1}, (
+            f'expected the fallback to still return the real rows, got: {result}'
         )
         assert any(
-            record.name == 'dashboard.data.db' and record.levelno == logging.WARNING
+            record.name == 'dashboard.data.write_journal'
+            and record.levelno == logging.ERROR
+            and 'idx_wo_created' in record.getMessage()
             for record in caplog.records
-        ), f'expected a WARNING from dashboard.data.db, got: {caplog.record_tuples}'
+        ), f'expected an ERROR naming idx_wo_created, got: {caplog.record_tuples}'
