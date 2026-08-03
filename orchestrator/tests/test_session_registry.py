@@ -272,7 +272,13 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
         'manual_boost': 2,
         'state': 'answered',
         'severity': 'critical',
-        'escalations_dir': '/p/data/reconciliation/escalations',
+        # Deliberately the '' unset/legacy sentinel rather than a concrete
+        # value, unlike every other field above: escalations_dir is a GUARD
+        # INPUT to the reaper's queue check, so a non-empty shared default
+        # silently short-circuits every reap test that does not override it.
+        # A test needing a real queue passes escalations_dir= at its own call
+        # site; '' also matches every one of the ~300 real on-disk records.
+        'escalations_dir': '',
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
@@ -287,12 +293,15 @@ def test_decision_state_enum_values() -> None:
 
 
 def test_decision_record_dict_round_trip_is_lossless() -> None:
-    d = _make_decision()
+    # escalations_dir is stated explicitly (the fixture defaults it to the ''
+    # unset sentinel): a dropped key would round-trip indistinguishably from
+    # '', so only a non-empty value keeps this test's field-drop catch power.
+    d = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
     assert sr.DecisionRecord.from_dict(d.to_dict()) == d
 
 
 def test_decision_record_json_round_trip_is_lossless() -> None:
-    d = _make_decision()
+    d = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
     assert sr.DecisionRecord.from_json(d.to_json()) == d
 
 
@@ -301,7 +310,13 @@ def test_decision_record_round_trip_with_null_fields() -> None:
     project-level decision with no session/task/escalation context yet);
     the round trip must preserve that, not coerce it or drop the key.
     """
-    d = _make_decision(session_id=None, task_id=None, escalation_id=None, options=None)
+    d = _make_decision(
+        session_id=None,
+        task_id=None,
+        escalation_id=None,
+        options=None,
+        escalations_dir='/p/data/reconciliation/escalations',
+    )
     round_tripped = sr.DecisionRecord.from_dict(d.to_dict())
     assert round_tripped == d
     assert round_tripped.session_id is None
@@ -389,10 +404,9 @@ def test_decision_record_to_dict_always_includes_escalations_dir() -> None:
     record -- so a round-tripped record never loses its queue stamp and the
     cockpit's read-modify-write helpers carry it through untouched.
     """
-    assert (
-        _make_decision().to_dict()['escalations_dir'] == '/p/data/reconciliation/escalations'
-    )
-    assert 'escalations_dir' in _make_decision(escalations_dir='').to_dict()
+    stamped = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
+    assert stamped.to_dict()['escalations_dir'] == '/p/data/reconciliation/escalations'
+    assert 'escalations_dir' in _make_decision().to_dict()
 
 
 def test_decision_path_for_id_under_decisions_dir(tmp_path: Path) -> None:
@@ -3254,11 +3268,6 @@ def test_main_reap_decisions_closes_answered_from_archived_escalation(
             project='df',
             escalation_id='esc-resolved',
             state=sr.DecisionState.OPEN,
-            # Queue-less, as this record was before escalations_dir existed
-            # (_make_decision's field map now defaults it to a foreign queue
-            # so the round-trip tests cover it). The queue-scoped variants
-            # live in test_main_reap_decisions_queue_scoping_matrix.
-            escalations_dir='',
         ),
         root=tmp_path,
     )
