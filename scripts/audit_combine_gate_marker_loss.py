@@ -482,6 +482,76 @@ def classify_gap(key: str, expected_value: object) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# project_id resolution and the mismatch guard.
+# ---------------------------------------------------------------------------
+
+
+def resolve_project_id(project_root: str, override: str | None = None) -> str:
+    """Derive the tickets.db ``project_id`` for *project_root*.
+
+    ``/home/leo/src/dark-factory`` -> ``dark_factory``: the directory name with
+    ``-`` mapped to ``_``. *override* wins outright when supplied, which is the
+    escape hatch for a project whose directory name does not match its id.
+    """
+    if override:
+        return override
+    return Path(project_root).name.replace("-", "_")
+
+
+def _distinct_ticket_project_ids(tickets_db_path: str) -> set[str]:
+    """Every distinct ``project_id`` holding a created-row, read-only.
+
+    Returns an empty set when the file is absent, so a caller cannot tell a
+    missing store from an empty one by exception handling alone — that
+    distinction is drawn by the guard below, deliberately.
+    """
+    if not Path(tickets_db_path).exists():
+        return set()
+    conn = sqlite3.connect(f"file:{tickets_db_path}?mode=ro", uri=True)
+    try:
+        cursor = conn.execute(
+            "SELECT DISTINCT project_id FROM tickets WHERE status = ?",
+            (TICKET_STATUS_CREATED,),
+        )
+        return {row[0] for row in cursor if row[0]}
+    finally:
+        conn.close()
+
+
+def _project_id_mismatch(
+    tickets_db_path: str,
+    project_id: str,
+    ticket_expectations: dict[str, dict],
+) -> str | None:
+    """Detect a mis-derived *project_id*, returning a message or ``None``.
+
+    WHY THIS GUARD EXISTS. :func:`resolve_project_id` derives the id
+    HEURISTICALLY from a directory name. A wrong derivation yields zero ticket
+    expectations, which makes every combine target look totally wiped and
+    produces a wall of confident FALSE POSITIVES an operator would read as a
+    real incident. Silently reporting that would be exactly the
+    no-silent-fail-soft violation named in
+    docs/legibility/design-invariants.md, so the mismatch is stated loudly and
+    names both the resolved id and the ids actually present.
+
+    Deliberately INERT when the tickets.db is absent, or holds no created-rows
+    at all: those are honest "no comparison source", not misconfiguration, and
+    firing there would cry wolf on every fresh project.
+    """
+    if ticket_expectations:
+        return None
+    present = _distinct_ticket_project_ids(tickets_db_path)
+    if not present or project_id in present:
+        return None
+    return (
+        f"PROJECT_ID MISMATCH: resolved project_id={project_id!r} matches ZERO "
+        f"created tickets, but the ticket store holds created-rows for "
+        f"{sorted(present)}. Every finding below is therefore unevidenced and "
+        f"probably a FALSE POSITIVE -- re-run with --project-id set correctly."
+    )
+
+
+# ---------------------------------------------------------------------------
 # The audit itself.
 # ---------------------------------------------------------------------------
 
@@ -561,6 +631,10 @@ class ProjectAudit(NamedTuple):
     project_id: str
     findings: list[Finding]
     coverage: AuditCoverage
+    # Non-None means the resolved project_id matched NOTHING in a tickets.db
+    # that plainly holds created-rows for other projects — see
+    # _project_id_mismatch. Defaulted so the field is purely additive.
+    project_id_mismatch: str | None = None
 
 
 def _finding_sort_key(finding: Finding) -> tuple[int, int, str, str]:
@@ -595,7 +669,7 @@ def _expected_from_manifest(expectation: ManifestExpectation) -> dict[str, objec
     return expected
 
 
-def audit_project(project_root: str, project_id: str) -> ProjectAudit:
+def audit_project(project_root: str, project_id: str | None = None) -> ProjectAudit:
     """Audit one project root for curator-combine metadata loss.
 
     Reads the task store, the ticket store and every capability manifest, all
@@ -616,6 +690,7 @@ def audit_project(project_root: str, project_id: str) -> ProjectAudit:
     source rather than aborting; a target no source covers is still emitted,
     carrying :data:`SOURCE_NONE`.
     """
+    project_id = resolve_project_id(project_root, override=project_id)
     targets = load_combine_targets(str(tasks_db_path(project_root)))
     ticket_expectations = load_ticket_expectations(
         str(tickets_db_path(project_root)), project_id
@@ -692,6 +767,9 @@ def audit_project(project_root: str, project_id: str) -> ProjectAudit:
         project_root=project_root,
         project_id=project_id,
         findings=findings,
+        project_id_mismatch=_project_id_mismatch(
+            str(tickets_db_path(project_root)), project_id, ticket_expectations
+        ),
         coverage=AuditCoverage(
             total_combine_targets=len(targets),
             targets_with_ticket=with_ticket,
@@ -779,6 +857,10 @@ def format_report(audits: list[ProjectAudit]) -> str:
     total_terminal = 0
     for audit in audits:
         lines.append(f"{audit.project_root} (project_id={audit.project_id}):")
+        if audit.project_id_mismatch:
+            # ABOVE the findings on purpose: a reader must see that the rows
+            # below are unevidenced before reading a single one of them.
+            lines.append(f"  {audit.project_id_mismatch}")
 
         live = [f for f in audit.findings if not f.terminal]
         terminal = [f for f in audit.findings if f.terminal]
@@ -814,6 +896,7 @@ def format_json(audits: list[ProjectAudit]) -> str:
                 {
                     "project_root": audit.project_root,
                     "project_id": audit.project_id,
+                    "project_id_mismatch": audit.project_id_mismatch,
                     "coverage": audit.coverage._asdict(),
                     "findings": [f._asdict() for f in audit.findings],
                 }
