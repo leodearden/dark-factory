@@ -198,6 +198,132 @@ class TestParseClaudeOutputMintsCliInputRejectedSubtype:
         assert is_zero_output_timeout(result) is False
 
 
+class TestPredicateAndClassifierAgree:
+    """The RETRY layer and the REPORTING layer must not tell an operator two
+    different stories about one run.
+
+    ``is_cli_invocation_rejected`` (which gates the bounded retry in
+    ``invoke_with_cap_retry``) and ``classify_agent_failure``'s
+    CLI_INPUT_REJECTED rule (which builds the escalation summary) originally
+    keyed on DIFFERENT evidence: the predicate on
+    success/timed_out/turns/cost + the stderr markers, the rule purely on
+    ``subtype``.  Since ``_parse_claude_output`` mints that subtype only
+    inside its empty-stdout branch, a rejection that emitted some stdout --
+    or one whose subtype a caller stamped by hand -- could be retried as a
+    rejection and then reported as EMPTY_OUTPUT.  Each now consults the
+    other's evidence, so neither can claim a result the other rejects --
+    except for the one deliberate asymmetry pinned at the bottom of this
+    suite, where the predicate is the stricter of the two because it gates an
+    action with a cost.
+    """
+
+    @staticmethod
+    def _rejection_shape(**overrides) -> AgentResult:
+        kwargs = {
+            'success': False,
+            'output': '',
+            'subtype': 'error_cli_input_rejected',
+            'stderr': FAST_EXIT_STDERR,
+            'turns': 0,
+            'cost_usd': 0.0,
+            'timed_out': False,
+        }
+        kwargs.update(overrides)
+        return AgentResult(**kwargs)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        'result_kwargs',
+        [
+            # Both signals present -- the canonical minted payload.
+            pytest.param({}, id='subtype_and_stderr'),
+            # Subtype only: a hand-stamped result, or CLI wording that drifted
+            # off the marker table.  The classifier fires on it, so the retry
+            # layer must too.
+            pytest.param(
+                {'stderr': 'some other terminal noise\n'}, id='subtype_only'
+            ),
+            # Stderr only: a rejection that emitted stdout never entered
+            # _parse_claude_output's empty-stdout branch, so no subtype was
+            # minted.  The retry layer fires on it, so the classifier must too.
+            pytest.param(
+                {'subtype': '', 'output': 'partial banner text'},
+                id='stderr_only',
+            ),
+            pytest.param(
+                {'subtype': 'error_empty_output'}, id='stderr_with_generic_subtype'
+            ),
+        ],
+    )
+    def test_predicate_true_implies_classified_cli_input_rejected(self, result_kwargs):
+        result = self._rejection_shape(**result_kwargs)
+        assert is_cli_invocation_rejected(result) is True
+        assert classify_agent_failure(result).kind is AgentFailureKind.CLI_INPUT_REJECTED, (
+            'the retry layer treated this as a pre-turn rejection, so the '
+            'reporting layer must describe it as one -- otherwise the run is '
+            'retried as a rejection and escalated as something else'
+        )
+
+    @pytest.mark.parametrize(
+        'result_kwargs',
+        [
+            pytest.param({}, id='subtype_and_stderr'),
+            pytest.param(
+                {'stderr': 'some other terminal noise\n'}, id='subtype_only'
+            ),
+            pytest.param(
+                {'subtype': '', 'output': 'partial banner text'},
+                id='stderr_only',
+            ),
+        ],
+    )
+    def test_classified_cli_input_rejected_implies_predicate_true(self, result_kwargs):
+        """The converse, over the shapes that reach rule 8.
+
+        Rules 2/3/6/7 (timeout, server error, ModelNotFound, api_error_status)
+        sit ABOVE rule 8 and legitimately claim a run first; those precedences
+        are pinned separately and are unchanged here.
+        """
+        result = self._rejection_shape(**result_kwargs)
+        assert classify_agent_failure(result).kind is AgentFailureKind.CLI_INPUT_REJECTED
+        assert is_cli_invocation_rejected(result) is True
+
+    def test_higher_precedence_rules_still_outrank_the_predicate(self):
+        """The disjunct must not disturb rule ordering: a run carrying an
+        api_error_status is still API_ERROR even though it also satisfies the
+        rejection stderr scan."""
+        result = self._rejection_shape(subtype='', api_error_status=429)
+        assert is_cli_invocation_rejected(result) is True
+        assert classify_agent_failure(result).kind is AgentFailureKind.API_ERROR
+
+    def test_a_billed_run_is_neither(self):
+        """NEGATIVE: turns/cost above zero mean the model WAS reached, so the
+        stderr marker alone must not make either layer call it a rejection."""
+        result = self._rejection_shape(subtype='', turns=4, cost_usd=1.25)
+        assert is_cli_invocation_rejected(result) is False
+        assert classify_agent_failure(result).kind is not AgentFailureKind.CLI_INPUT_REJECTED
+
+    def test_the_one_documented_asymmetry_is_the_retry_declining(self):
+        """A hand-stamped subtype on a BILLED run is contradictory evidence,
+        and the two layers deliberately resolve it differently.
+
+        The shape is unreachable from our own parser: ``_parse_claude_output``
+        mints ``error_cli_input_rejected`` only when stdout is empty, and an
+        empty stdout is exactly the case where turns/cost were never parsed
+        (so both are 0).  Only a hand-stamp produces it.
+
+        The classifier honours the stamp -- an explicit adjudication, and the
+        summary it builds is still the CLI's own stderr line, so the operator
+        is told the truth.  The retry predicate declines, because it gates an
+        ACTION with a cost and must never re-dispatch a run that observably
+        billed.  Stricter-on-the-acting-side is the safe direction of any
+        residual asymmetry, and pinning it here keeps it deliberate rather
+        than accidental.
+        """
+        result = self._rejection_shape(turns=4, cost_usd=1.25)
+        assert classify_agent_failure(result).kind is AgentFailureKind.CLI_INPUT_REJECTED
+        assert is_cli_invocation_rejected(result) is False
+
+
 class TestClassifyAgentFailureCliInputRejected:
     """The escalation summary an operator reads is built from
     ``classify_agent_failure(...).summary``.  For a pre-turn rejection the

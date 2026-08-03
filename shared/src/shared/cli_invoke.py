@@ -633,12 +633,38 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
     pre-turn rejection: when ``timed_out`` is set the timeout predicates stay
     authoritative and this one returns False even if the marker text is
     present on stderr.
+
+    EVIDENCE (either suffices, both mean the same thing):
+
+    - ``result.subtype == 'error_cli_input_rejected'`` — the subtype
+      ``_parse_claude_output`` mints for exactly this shape, so a result that
+      has already been adjudicated stays adjudicated;
+    - the stderr marker scan — catches a rejection that ``_parse_claude_output``
+      could not label, e.g. one that happened to emit some stdout and so never
+      entered the empty-stdout branch where the subtype is minted.
+
+    Accepting BOTH is what keeps this predicate (the retry policy) and
+    ``classify_agent_failure``'s CLI_INPUT_REJECTED rule (the taxonomy) from
+    disagreeing about what happened: that rule consults this predicate, and
+    this predicate accepts that rule's subtype, so neither can claim a result
+    the other rejects.  See ``TestPredicateAndClassifierAgree``.
+
+    ONE deliberate asymmetry remains, pinned there too: a hand-stamped subtype
+    on a run that observably BILLED (turns/cost above zero — unreachable from
+    ``_parse_claude_output``, which mints that subtype only when stdout is
+    empty and therefore turns/cost were never parsed) is still classified
+    CLI_INPUT_REJECTED but is NOT retried.  This predicate gates an ACTION
+    with a cost, so on contradictory evidence it declines; stricter on the
+    acting side is the safe direction.
     """
     if result.success or result.timed_out:
         return False
     if result.turns != 0 or result.cost_usd != 0.0:
         return False
-    return _stderr_has_cli_input_required(result.stderr)
+    return (
+        result.subtype == 'error_cli_input_rejected'
+        or _stderr_has_cli_input_required(result.stderr)
+    )
 
 
 def require_non_blank_prompt(
@@ -828,10 +854,19 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
        NON-5xx statuses ever reach here (a 5xx is claimed above), so this
        rule now covers 4xx/429 exclusively — its verdict for those is
        unchanged.
-    8. ``result.subtype == 'error_cli_input_rejected'`` →
-       ``CLI_INPUT_REJECTED`` (task 3143 / esc-3118-1): the CLI rejected the
+    8. ``result.subtype == 'error_cli_input_rejected'`` OR
+       ``is_cli_invocation_rejected(result)`` → ``CLI_INPUT_REJECTED``
+       (task 3143 / esc-3118-1): the CLI rejected the
        invocation on ARGUMENT VALIDATION before any model turn, because no
-       prompt ever reached it.  Placed immediately ABOVE rule 9 because a
+       prompt ever reached it.  The predicate disjunct keeps this rule and
+       the retry policy in ``invoke_with_cap_retry`` from telling an operator
+       two different stories about one run — the subtype is minted only
+       inside ``_parse_claude_output``'s empty-stdout branch, so a rejection
+       that emitted some stdout carries no subtype yet still satisfies the
+       predicate.  Precedence is unchanged by the disjunct: the predicate
+       requires ``not timed_out``, so rule 2 still claims every killed run,
+       and rules 3/6/7 still claim a run carrying a server error, a
+       ModelNotFound marker or an ``api_error_status``.  Placed immediately ABOVE rule 9 because a
        rejection is a strict, MORE SPECIFIC subset of "empty stdout": both
        arrive with empty output, but only this one means the agent was never
        asked anything.  Ranked below it, the generic rule would claim every
@@ -993,7 +1028,17 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     # the prompt never reached the CLI and no model turn ever ran.  The cause
     # is carried through verbatim from stderr (the only evidence there is)
     # rather than replaced by a fixed string.
-    if result.subtype == 'error_cli_input_rejected':
+    #
+    # The `or is_cli_invocation_rejected(...)` disjunct is what keeps the
+    # TAXONOMY (this rule) and the RETRY POLICY (that predicate) from
+    # disagreeing about what happened: the subtype is minted only inside
+    # _parse_claude_output's empty-stdout branch, so a rejection that emitted
+    # some stdout carries no subtype at all — it would be retried by
+    # invoke_with_cap_retry and then reported downstream as EMPTY_OUTPUT,
+    # i.e. the two layers telling an operator two different stories about one
+    # run.  Consulting the predicate here closes that direction; the predicate
+    # accepting this rule's subtype closes the other.
+    if result.subtype == 'error_cli_input_rejected' or is_cli_invocation_rejected(result):
         cause = _cli_input_rejection_cause(result.stderr)
         return AgentFailureClass(
             kind=AgentFailureKind.CLI_INPUT_REJECTED,
