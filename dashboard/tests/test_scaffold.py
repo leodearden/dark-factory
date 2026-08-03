@@ -34,8 +34,25 @@ class TestConfigDefaults:
         cfg = DashboardConfig()
         assert cfg.host == '127.0.0.1'
         assert cfg.port == 8080
-        assert cfg.project_root == Path('/home/leo/src/dark-factory')
+        # Machine-independent: the default is the process's cwd, not a literal
+        # pinned to one developer's checkout (task 3503).
+        assert cfg.project_root == Path.cwd().resolve()
         assert cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)
+
+    def test_default_project_root_tracks_cwd(self, monkeypatch, tmp_path):
+        """The default must be *derived* from cwd, not frozen at import time.
+
+        Constructing from two different working directories must yield two
+        different project_roots.  A hardcoded absolute literal — the shape this
+        replaced — would return the same path from both and fail here.
+        """
+        before = DashboardConfig().project_root
+
+        monkeypatch.chdir(tmp_path)
+        after = DashboardConfig().project_root
+
+        assert after == tmp_path.resolve()
+        assert after != before
 
     def test_known_project_roots_default_empty_list(self):
         cfg = DashboardConfig()
