@@ -265,7 +265,7 @@ def test_select_scored_records_includes_matching_session(tmp_path):
 def test_select_scored_records_reads_gz_archive_root(tmp_path):
     # End-to-end proof that the shipped agent_transcript_roots is LIVE with no
     # operator flip: resolve (cfg.project_root) -> enumerate (walk the archive)
-    # -> gz-read (_iter_json_lines) -> classify (encoded worktree parent dir).
+    # -> gz-read (iter_json_lines) -> classify (encoded worktree parent dir).
     # An archived role transcript at the production nested layout
     # <archive>/<task_id>/<enc>/<sid>.jsonl.gz is enumerated ALONGSIDE an
     # (empty) ~/.claude/projects tree and classified 'orchestrated-task'.
