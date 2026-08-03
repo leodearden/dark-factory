@@ -1179,19 +1179,23 @@ def parse_test_module(path: pathlib.Path) -> ast.Module:
     return ast.parse(_test_module_source(path), filename=str(path))
 
 
-def calls_named(tree: ast.Module, name: str) -> list[ast.Call]:
-    """Every ``ast.Call`` in *tree* whose callee is ``name(...)`` or ``….name(...)``.
+def calls_named(node: ast.AST, name: str) -> list[ast.Call]:
+    """Every ``ast.Call`` under *node* whose callee is ``name(...)`` / ``….name(...)``.
 
     AST, not string grep: prose that merely mentions the name — a docstring
     describing the helper a guard enforces — must not satisfy or trip a check.
+
+    Takes any node, not only a module, so a guard can ask the narrower question
+    "is it called *here*" — inside a decorator, or inside the value assigned to
+    ``pytestmark`` — rather than only "is it called anywhere in the file".
     """
     found: list[ast.Call] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+    for descendant in ast.walk(node):
+        if not isinstance(descendant, ast.Call):
             continue
-        func = node.func
+        func = descendant.func
         if (isinstance(func, ast.Name) and func.id == name) or (
             isinstance(func, ast.Attribute) and func.attr == name
         ):
-            found.append(node)
+            found.append(descendant)
     return found
