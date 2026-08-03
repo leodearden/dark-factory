@@ -401,13 +401,21 @@ finish_failed_to_start() {
   exit "$code"
 }
 
-# Mirror session_registry.transcript_path_for_cwd's encoding byte-for-byte:
-# every '/' then every '.' maps to '-' (empirically re-verified 2026-07-07,
-# e.g. /home/leo/src/dark-factory -> -home-leo-src-dark-factory). Used to
-# locate this spawn's transcript directory under $CLAUDE_PROJECTS_DIR.
+# Mirror of orchestrator.session_registry.encode_cwd, THE canonical cwd
+# encoding: every '/', '.' and '_' maps to '-', and case is PRESERVED (no
+# lowercasing step). E.g. /media/leo/data_lv_1/leo/reify-build ->
+# -media-leo-data-lv-1-leo-reify-build. Used to locate this spawn's transcript
+# directory under $CLAUDE_PROJECTS_DIR.
+#
+# Do not restate this rule from memory. scripts/tests/test_legibility_inventory.py's
+# TestEncoderLockstep now pins THIS copy to the canonical and to real on-disk
+# dir names, by extracting the function below and running it (task 3464) --
+# keep the `_encode_cwd() {` / `}` framing on their own lines, since that is
+# the shape the extraction anchors on.
 _encode_cwd() {
   local e="${1//\//-}"
-  printf '%s' "${e//./-}"
+  e="${e//./-}"
+  printf '%s' "${e//_/-}"
 }
 
 # Best-effort: is any process named `claude` a descendant of this script's

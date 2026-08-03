@@ -1746,9 +1746,10 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     before exiting and letting $inner write the sentinel -- so the
     transcript evidence is available from t~0, long before the sentinel can
     possibly exist, and _started_watchdog (which polls continuously and
-    returns on first evidence) observes only the transcript. <enc> mirrors
-    session_registry.transcript_path_for_cwd's encoding: cwd with every '/'
-    and '.' replaced by '-'.
+    returns on first evidence) observes only the transcript. <enc> is COMPUTED
+    by session_registry.encode_cwd (the canonical: every '/', '.' and '_' maps
+    to '-', case preserved) rather than restated in prose or hand-copied here
+    -- see the comment at the assignment below for why.
 
     Grace is load-adaptive via _set_started_grace (task 3451), which shares
     one policy across all three must-not-be-flagged sites in this file.
@@ -1773,7 +1774,15 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     """
     bin_dir = _make_bin_dir(tmp_path)
 
-    enc = str(tmp_path).replace("/", "-").replace(".", "-")
+    # THE canonical encoder, not a hand-copied expression. A local
+    # str.replace chain here is a mirror of the code under test, so it moves in
+    # lockstep with a bug in that code and can never detect one -- exactly how
+    # the missing '_' -> '-' rule survived a fully green suite (task 3272).
+    # encode_cwd is itself pinned to hard-coded real on-disk dir names by
+    # test_legibility_inventory.py's TestEncoderLockstep, so calling it gives
+    # this fixture a real oracle transitively. (A hard-coded literal, the
+    # strongest option, is not available: tmp_path is generated per run.)
+    enc = session_registry.encode_cwd(str(tmp_path))
 
     # Fake claude: write the transcript file immediately (mirroring a real
     # Claude Code session creating ~/.claude/projects/<enc>/*.jsonl the moment
