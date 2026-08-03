@@ -95,7 +95,159 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # TestFleetLintCoversEveryWorkspaceMember.
 # test_every_present_workspace_member_tests_dir_is_magicmock_checked rather
 # than silently escaping this gate.
-lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
+#
+# NON-MEMBER TARGETS ADDED DELIBERATELY (task 3485).
+#
+# `conftest.py`, `df_pytest_isolation.py` and `skills` are NOT workspace
+# members; they are named here because before this task they were linted by
+# NOTHING, on checks reporting green. This command targeted only the 7
+# [tool.uv.workspace].members; scripts/orchestrator.yaml targets scripts/;
+# tests/scripts/orchestrator.yaml targets tests/scripts/. Nothing covered
+# these three paths — the same vacuous-gate class tasks 3350 and 3445 closed
+# for tests/scripts/ and scripts/. `skills` is written bare, matching the
+# existing targets' style; ruff traverses the directory.
+#
+# MEASUREMENT: at base main 1f83dbed15, `uv run --project shared ruff check
+# --select E,F,UP,B,SIM,I --ignore E501 --line-length 100 conftest.py
+# df_pytest_isolation.py skills/` returned exactly 2 findings, both SIM105
+# (`try`/`except ImportError`/`pass`) in conftest.py at lines 40 and 45;
+# df_pytest_isolation.py 0, skills/ 0. Both were FIXED — by hand, with
+# contextlib.suppress, in the commit immediately preceding this one — rather
+# than the command being weakened with an exclude or a narrowed target (task
+# 3350's precedent). Fix-and-declare stays atomic: at no point does a declared
+# target carry a finding. That matters because verify.run_full_verification
+# asyncio-gathers over ALL module_configs.values(), not just those a diff
+# touches, and this file sets merge_verify_breadth: "full" — so a red
+# lint_command here blocks every merge, review checkpoint and main-tip sweep
+# repo-wide, on branches with no defect.
+#
+# RULE-SET / LANDING-ORDER NOTE. The measurement above passes the members'
+# rule set as EXPLICIT --select flags because task 3457's root [tool.ruff]
+# table is NOT on main at this base (verified two ways: 5a286fcc36 is not an
+# ancestor of HEAD, and `ruff check --show-settings conftest.py` enables only
+# E401/E402/E7xx/E9/F). So TODAY this command checks these three paths under
+# ruff's BUILT-IN defaults, and widens automatically to E,F,UP,B,SIM,I the
+# moment 3457 lands. Both states are green, deliberately: the fix was measured
+# under the WIDE set, and the built-in defaults are a strict SUBSET of it, so
+# 3457 landing cannot retroactively red-wall main. Do not "simplify" the guard
+# to read the resolved config — that would make it silently weaker today and
+# change meaning later.
+#
+# WHY THE ROOT COMMAND IS THE ONLY LEVER FOR THE TWO ROOT FILES.
+# _discover_module_configs SKIPS a root-level config (prefix == '.'), so
+# conftest.py and df_pytest_isolation.py can never belong to a module config,
+# no matter what orchestrator.yaml is added where. Widening this head is
+# therefore mandatory for them; once made, it covers `skills` through the same
+# lever at zero routing risk (see the WHY NOT skills/orchestrator.yaml block
+# below). Note precisely what "only lever" means: it is the only lever for
+# DECLARING them as lint targets, NOT for getting them linted when they
+# change — see SCOPE HONESTY below.
+#
+# SCOPE HONESTY — what this widening does and does not buy. Measured, not
+# assumed; an earlier draft of this block overclaimed and was corrected.
+#
+# WHAT IT BUYS: DRIFT DETECTION on the merge-lane global gate. The VERBATIM
+# (unscoped) form of this command is reached only through
+# verify.run_verification with module_config is None — its "Global fallback"
+# branch, which assigns lint_cmd = config.lint_command untouched. Live
+# triggers: a MERGE-LANE verify of a diff with zero .py/.rs files and no
+# module config (docs/yaml/markdown-only — via the INV-1 escalation or the
+# manifest-drift / verify-pipeline-guard override), and force_workspace train
+# / merge_verify_workspace runs. For role='task' a zero-source diff returns a
+# trivial pass before reaching it. So these paths are linted on diffs that do
+# NOT touch them.
+#
+# WHAT IT DOES NOT BUY: it does NOT lint them on diffs that DO touch them.
+# Three independent reasons, each sufficient on its own:
+#   1. On the module-config-less path (verify._build_fallback_config) the lint
+#      leg is narrowed UNCONDITIONALLY whenever the diff holds any .py file,
+#      and on that path the head targets are DISCARDED, not supplemented:
+#      verify._scope_to_keyword truncates the head at the keyword (retaining
+#      only up to and including `ruff check`), so all positional targets are
+#      dropped before parsing, and verify_cmd.scope_to then REPLACES targets
+#      wholesale with the touched files. Adding names to the ruff head is a
+#      strict no-op on EVERY narrowed run. (The `&& python3
+#      check_bare_magicmock_config.py` tail IS preserved — 'ruff check' is in
+#      verify_cmd._TAIL_PRESERVING_KEYWORDS — which is exactly why the guard's
+#      chain-SHAPE assertion is load-bearing.)
+#   2. There is no widen-to-verbatim branch on the LINT slot anywhere. D2
+#      (STRUCTURAL -> unscoped) widens PYRIGHT only; D1 (CONFTEST/TEST_DATA ->
+#      FULL_SUITE) widens PYTEST only. Neither _build_fallback_config nor
+#      verify_plan._derive_module_runs branches lint on file kind at all.
+#   3. A diff that touches these files alongside subproject files resolves a
+#      NON-EMPTY module_configs, where each module lints only its own src/ and
+#      tests/ — no registered prefix owns a repo-root path — so this command is
+#      never invoked at all. Same under merge_verify_breadth: "full", whose
+#      expansion iterates module_configs.values().
+#
+# A superseded draft of this block claimed conftest.py is itself a STRUCTURAL
+# trigger that forces the verbatim form. It is not: verify_plan.classify_file
+# tests the conftest.py basename and returns FileKind.CONFTEST BEFORE the
+# Protocol/TypedDict content check that produces STRUCTURAL, and FileKind's own
+# docstring states that a Protocol/TypedDict defined inside a conftest.py is
+# never STRUCTURAL. Recorded rather than silently deleted, because the claim
+# was load-bearing in the original rationale.
+#
+# RESIDUAL GAP, stated plainly rather than left invisible: because
+# _discover_module_configs skips prefix == '.', NO lever available today lints
+# conftest.py / df_pytest_isolation.py on the diffs that change them. Filed as
+# follow-up ticket tkt_0RS0K2EAS12A8A3G0JXMAVYD0P (a curator ticket from task
+# 3485, not yet a task id). The widening is KEPT regardless: drift detection on
+# the merge gate is real, every target exists, the command runs rc=0, and it
+# costs nothing. And the 2 SIM105 fixes in the preceding commit stand on their
+# own merits independent of which gate observes them — they are real findings
+# removed from the tree.
+#
+# Guarded by tests/scripts/test_root_lint_covers_nonmember_py.py.
+# Production code is cited BY SYMBOL throughout this block and never by
+# file:line — task 3445's explicit correction of the convention task 3350
+# established, after every line pin copied forward had already rotted at HEAD.
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
+#
+# WHY NOT skills/orchestrator.yaml (task 3485).
+#
+# Task 3485 was explicitly asked to choose between extending the ruff head
+# above and registering a module config for skills/. It chose the head. The
+# rationale is recorded here because the alternative is the obvious-looking
+# "better" fix and would otherwise be re-proposed on every read.
+#
+# FEASIBLE, BUT NOT SUFFICIENT. _discover_module_configs registers a module
+# iff the directory directly contains an `orchestrator.yaml` carrying at least
+# one overridable field, and it SKIPS prefix == '.'. A skills/orchestrator.yaml
+# (prefix `skills`, depth 1) is well inside the effective lock_depth of 4 — the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml ships
+# lock_depth: 4, layered over the pydantic Field default of 2 — so it would in
+# fact be discovered. But it could never cover conftest.py or
+# df_pytest_isolation.py, which sit at the repo ROOT and are excluded by that
+# same prefix == '.' skip. Widening the head above is therefore REQUIRED
+# regardless; once made, it covers `skills` through the same lever with no
+# routing change at all.
+#
+# WHAT REGISTERING ONE WOULD BUY: a strictly stronger gate. A module config
+# participates in run_full_verification's asyncio.gather over
+# module_configs.values(); this root command does not (see SCOPE HONESTY
+# above).
+#
+# WHAT IT WOULD COST: a TEST-routing change, and a new vacuous gate. Today a
+# skills/-only diff matches no module config, so run_scoped_verification falls
+# through to _build_fallback_config and runs the whole fleet test chain.
+# Registering a module config makes module_configs non-empty, and a config
+# with no test_command yields a ScopeKind.SKIPPED PlannedRun that
+# _run_or_skip_timed turns into a CheckRun.skipped — VACUOUSLY PASSING at
+# rc=0. That closes one vacuous gate by opening another, which is precisely
+# the failure class tasks 3350, 3445 and 3485 exist to prevent. Declaring an
+# honest test_command instead is a separate design question: skills/ has no
+# tests/ directory of its own, and pointing it at tests/scripts/ would
+# replicate the byte-identical duplicate-run cost tests/scripts/
+# orchestrator.yaml already documents about itself.
+#
+# CONCLUSION: widen the root command here; leave skills/orchestrator.yaml to a
+# follow-up that can settle the test-routing question on its own merits. Filed
+# from task 3485 as [tkt_0RS0CK3MYE2HG5H7TDMGQP24QB] — a curator TICKET id,
+# not a task id: the curator runs asynchronously and decides create/combine/
+# drop, so the resulting task number is not knowable at this commit. That
+# follow-up cannot subsume the widening above; do not "consolidate" by
+# removing the non-member targets from the ruff head.
 # The bare ``npx pyright`` spelling is DELIBERATE and safe (task 3367 /
 # esc-3359-1): every ``cd`` target below pins pyright's own interpreter via
 # ``[tool.pyright] venvPath = ".."`` / ``venv = ".venv"`` in its pyproject.toml,
