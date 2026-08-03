@@ -35,6 +35,9 @@ with its rationale lives above :func:`_classify_record`):
   1. ``severity == 'info'``                -> ``NON_PINNING``
   2. ``severity`` not in ``KNOWN_SEVERITIES`` -> ``QUEUE_HANDOFF`` (fail-safe)
   3. ``level != 0``                        -> ``QUEUE_HANDOFF``
+  3b. ``severity`` in ``BORN_AT_L2_SEVERITIES`` at ``level == 0``
+                                           -> ``QUEUE_HANDOFF`` (fail-safe:
+                                              contradictory state)
   4. ``level == 0``                        -> filing-incarnation liveness
                                               (``DEAD_L0`` only when the filer
                                               is PROVABLY dead)
@@ -51,7 +54,7 @@ import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from escalation.models import KNOWN_SEVERITIES
+from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -82,9 +85,9 @@ class PinRecord(Protocol):
     (``orchestrator`` already depends on ``escalation``; ``escalation`` reaches
     for ``orchestrator`` only lazily, inside ``server.py`` function bodies).
 
-    ``filing_claimant_run_id`` carries the FILING incarnation's identity in
-    ``shared.task_claimant.compose_claimant_run_id`` format
-    (``{run_id}/{session_id}/pid={owner_pid}``); ``None`` means unknown.
+    ``filing_claimant_run_id`` semantics are documented once, on
+    :func:`classify_pins` (normative source: spec
+    ``docs/task-escalation-state-spec.md`` S6).
 
     The four members are declared READ-ONLY (property form rather than plain
     ``id: str`` attributes) because a protocol attribute is writable-invariant:
@@ -163,24 +166,52 @@ class PinReport:
 #   3. level != 0                        -> QUEUE_HANDOFF
 #      L1/L2 are queue-backed handoffs with supervised consumers; written
 #      `!= 0` (not `>= 1`) so a corrupt/out-of-range level fails safe too.
-#   4. level == 0, known non-info severity -> filing-incarnation liveness:
+#   3b. level == 0 AND severity in BORN_AT_L2_SEVERITIES -> QUEUE_HANDOFF
+#      Same spirit as link 3's `!= 0`: a critical/urgent record is BORN at L2
+#      and routed straight to a human, so one sitting at L0 is contradictory
+#      state and must not reach the conversion-eligible branch below.
+#   4. level == 0, L0-legal non-info severity -> filing-incarnation liveness:
 #        no incarnation live at all         -> DEAD_L0
 #        live, and both identities known and DIFFERENT -> DEAD_L0
 #        live, and identities MATCH         -> QUEUE_HANDOFF
 #        live, either identity unknown      -> QUEUE_HANDOFF (fail-safe pin)
+#      "unknown" here means None, blank, OR not in compose_claimant_run_id
+#      shape — see `_norm_id`: a format mismatch is not PROOF of a dead filer.
 # ---------------------------------------------------------------------------
 
 
-def _norm_id(value: str | None) -> str | None:
-    """Normalise a claimant identity to ``None`` (unknown) or an exact string.
+#: The labelled tail every ``shared.task_claimant.compose_claimant_run_id``
+#: value ends with (``{run_id}/{session_id}/pid={owner_pid}``).  Its presence
+#: is a cheap SHAPE check, not a parse — see :func:`_norm_id`.
+_COMPOSED_ID_MARKER = '/pid='
 
-    Only ``None``/blank collapse to unknown — the value itself is NEVER parsed
-    or partially matched (see link 4).
+
+def _norm_id(value: str | None) -> str | None:
+    """Normalise a claimant identity to a COMPARABLE string, or ``None``.
+
+    ``None`` means "unknown", which link 4 fails safe to pinning.  Two things
+    collapse to unknown:
+
+    * ``None`` or blank-after-strip — there is nothing to compare.
+    * a value that is not in ``compose_claimant_run_id`` shape (no ``/pid=``
+      marker).  Comparing a composed identity against a bare ``session_id``
+      would ALWAYS mismatch, converting a genuinely LIVE filer's L0 to
+      ``DEAD_L0`` — the unsafe direction.  The in-repo liveness resolver
+      (``orchestrator.task_ground_truth.TaskGroundTruth._resolve_live_claimant``)
+      is heterogeneous today: its DB source yields the composed identity, its
+      plan.lock source yields a bare ``session_id``, and its in-memory source
+      yields ``None``.  A format mismatch is not PROOF that the filer is dead,
+      and this module may only convert on proof.
+
+    A SHAPE check, never a parse: the value is compared WHOLE and never
+    decomposed (a differing ``pid=`` suffix is a different incarnation).
     """
     if value is None:
         return None
     stripped = value.strip()
-    return stripped or None
+    if not stripped or _COMPOSED_ID_MARKER not in stripped:
+        return None
+    return stripped
 
 
 def _classify_record(
@@ -190,9 +221,9 @@ def _classify_record(
     live_claimant_id: str | None,
 ) -> PinClass:
     """Map one open escalation to its :class:`PinClass` (see the chain above)."""
-    # Normalise once. `severity` is read defensively (getattr + str()) because
-    # records arrive from JSON on disk, where the field may be absent or null.
-    sev = str(getattr(record, 'severity', '') or '').strip().lower()
+    # Normalise once.  `or ''` is load-bearing: an `Escalation` rehydrated from
+    # JSON on disk can carry a null `severity` despite the `str` annotation.
+    sev = str(record.severity or '').strip().lower()
 
     # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.
     if sev == 'info':
@@ -213,6 +244,17 @@ def _classify_record(
     # also fails safe to pinning instead of falling into the conversion-
     # eligible L0 branch below.
     if record.level != 0:
+        return PinClass.QUEUE_HANDOFF
+
+    # Link 3b — a BORN_AT_L2 severity (critical/urgent) at level 0 is
+    # CONTRADICTORY state: such records are created directly at L2 and routed
+    # straight to a human, which is why every in-repo producer stamps
+    # `level=2` alongside them and why `workflow.py` already treats the two
+    # signals as one (`e.severity in BORN_AT_L2_SEVERITIES or e.level >= 2`).
+    # Fail it safe to pinning for exactly the reason link 3 is written `!= 0`
+    # — a human-routed record must never fall into the conversion-eligible
+    # branch below on the strength of a level field that contradicts it.
+    if sev in BORN_AT_L2_SEVERITIES:
         return PinClass.QUEUE_HANDOFF
 
     # Link 4 — the filing-incarnation rule (spec S6): an L0 is a live handoff
@@ -262,6 +304,27 @@ def classify_pins(
         cannot express that distinction, and it is exactly the case the
         dead-L0 rule exists for.  ``None`` (or an unknown filing identity on
         the record) fails safe to pinning.
+
+        PRECONDITION: it must be a full
+        ``shared.task_claimant.compose_claimant_run_id`` string
+        (``{run_id}/{session_id}/pid={owner_pid}``) — the same form
+        ``PinRecord.filing_claimant_run_id`` carries.  A bare ``session_id``
+        or any other shape is NOT a valid substitute; it is detected by the
+        ``/pid=`` shape check in :func:`_norm_id` and treated as UNKNOWN
+        (fail-safe to pinning) rather than silently mismatching every
+        composed filing identity and converting live L0s.
+
+    NORMATIVE (spec ``docs/task-escalation-state-spec.md`` S6 — this docstring
+    is the single in-code statement of it; other sites cross-reference here).
+    ``PinRecord.filing_claimant_run_id`` is the identity of the incarnation
+    that FILED the record, in ``compose_claimant_run_id`` format.  Liveness is
+    judged against THAT incarnation, never against "some workflow for this
+    task is alive": a newer live incarnation never keeps a prior incarnation's
+    unconsumed L0 alive.  ``None`` means "filing identity unknown" — legacy
+    records, and every producer not yet stamping it — which fails safe to
+    PINNING, because the classifier may only convert an L0 when it can PROVE
+    the filing incarnation is dead.  The identity is stored and compared
+    verbatim, never parsed.
 
     See the precedence chain above :func:`_classify_record` for the rules, and
     :class:`PinReport` for the buckets and the two derived predicates.
