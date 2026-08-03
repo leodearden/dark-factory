@@ -259,6 +259,17 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     concrete, distinguishable value so a round-trip test can catch a field
     being dropped/mis-typed; ``overrides`` lets a test tweak just the
     field(s) it cares about.
+
+    ONE DELIBERATE EXCEPTION: ``escalations_dir`` is absent from the map
+    below, so the DecisionRecord dataclass default ('' -- unset/legacy)
+    supplies it. It is the only field that is a GUARD INPUT to the reaper's
+    axis-2 queue check (``_run_reap_decisions._status``), so a non-empty
+    shared default here would make every _make_decision()-built decision
+    carry a queue FOREIGN to the tmp_path queue a reap test invokes the
+    reaper with -- short-circuiting _status before read_escalation_status
+    runs and collapsing the test into a vacuous ``assert state == OPEN``. Do
+    not add it here; a test needing a real queue passes ``escalations_dir=``
+    at its own call site.
     """
     fields: dict = {
         'id': 'dec-1',
@@ -272,42 +283,20 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
         'manual_boost': 2,
         'state': 'answered',
         'severity': 'critical',
-        # Deliberately the '' unset/legacy sentinel rather than a concrete
-        # value, unlike every other field above: escalations_dir is a GUARD
-        # INPUT to the reaper's queue check, so a non-empty shared default
-        # silently short-circuits every reap test that does not override it.
-        # A test needing a real queue passes escalations_dir= at its own call
-        # site; '' also matches every one of the ~300 real on-disk records.
-        # Pinned by test_make_decision_defaults_to_the_unset_queue_sentinel.
-        'escalations_dir': '',
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
 
 
 def test_make_decision_defaults_to_the_unset_queue_sentinel() -> None:
-    """_make_decision must default escalations_dir to the '' unset sentinel.
+    """The fixture must not hand escalations_dir a non-'' default.
 
-    escalations_dir is the ONLY DecisionRecord field that is a guard input to
-    the reaper's axis-2 queue check (``_run_reap_decisions._status``). Giving
-    this SHARED fixture a non-empty default makes every _make_decision()-built
-    decision carry a queue FOREIGN to the tmp_path-rooted queue a reap test
-    invokes the reaper with, so _status short-circuits to None before
-    read_escalation_status ever runs -- silently collapsing every
-    reap-decisions test that does not override the field into a vacuous
-    ``assert state == OPEN`` that passes no matter what it claims to pin.
-
-    That is not hypothetical: it cost three live regression tests at once
-    (task 3528, caught in review), all of them covering the very function
-    this field guards -- ..._leaves_pending_escalation_open,
-    ..._scopes_to_project and ..._fail_soft_on_bad_escalations_dir each kept
-    passing with its premise inverted.
-
-    A test that needs a real queue must pass ``escalations_dir=`` explicitly
-    at its own call site rather than changing this default. The '' sentinel
-    also matches every one of the ~300 real on-disk records, so the bare
-    fixture reproduces the common production shape and exercises the full
-    code path.
+    Guards the one exception documented on _make_decision: escalations_dir is
+    a control-flow guard input to ``_run_reap_decisions._status``, and a
+    non-empty shared default silently neuters every reap-decisions test that
+    does not override it (task 3528 -- it cost three live regression tests at
+    once, each still passing with its premise inverted). Omitting the key is
+    the structural fix; this is the one-line tripwire against re-adding it.
     """
     assert _make_decision().escalations_dir == ''
 
@@ -321,9 +310,10 @@ def test_decision_state_enum_values() -> None:
 
 
 def test_decision_record_dict_round_trip_is_lossless() -> None:
-    # escalations_dir is stated explicitly (the fixture defaults it to the ''
-    # unset sentinel): a dropped key would round-trip indistinguishably from
-    # '', so only a non-empty value keeps this test's field-drop catch power.
+    # escalations_dir is stated explicitly (the fixture deliberately omits it
+    # and lets the '' dataclass default stand): a dropped key would round-trip
+    # indistinguishably from '', so only a non-empty value keeps this test's
+    # field-drop catch power.
     d = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
     assert sr.DecisionRecord.from_dict(d.to_dict()) == d
 
@@ -3537,6 +3527,111 @@ def test_main_reap_decisions_queue_match_is_spelling_insensitive(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-dotted-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_normalizes_the_reapers_own_escalations_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (e) MIRRORED: the REAPER's side of the compare is normalized too.
+
+    ..._queue_match_is_spelling_insensitive only exercises the DECISION side
+    -- it stores a dotted spelling and passes the already-canonical
+    ``str(orch)`` to the CLI, so the reaper-side normalize is a no-op there.
+    Here it is the other way round: the record carries the canonical form and
+    the CLI is handed a relative, dotted spelling of the same queue.
+
+    This is the real invocation shape, not a contrivance. Both SKILL.md files
+    now promise "stored normalized, so any spelling of the same directory
+    works", and the recon watcher's documented command is
+    ``--escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations``
+    where ``$DARK_FACTORY_ROOT`` may legitimately be relative or symlinked.
+    Drop the reaper-side normalize and EVERY stamped decision becomes a
+    permanent no-close -- fail-open, so invisible: nothing errors, decisions
+    just quietly stop closing. Running under monkeypatch.chdir also pins that
+    the reaper side resolves against the cwd, matching
+    normalize_escalations_dir's documented expanduser/resolve contract.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    (tmp_path / 'x').mkdir()
+    monkeypatch.chdir(tmp_path)
+    relative = f'x/../{orch.name}/'
+    assert not Path(relative).is_absolute()
+    sr.write_decision(
+        _make_decision(
+            id='dec-canonical-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', relative])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-canonical-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_its_stamped_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pins the acknowledged MODE-2 tradeoff (task 3528, raised in review).
+
+    A MODE-2 same-subject duplicate (esc-5914-1) collapses to ONE record by
+    design -- but ``escalations_dir`` is single-valued and write_decision
+    rewrites the whole file, so the survivor carries only the LAST filer's
+    queue (pinned by ..._same_id_from_two_queues_stays_one_decision). The
+    axis-2 guard then makes the OTHER queue's reaper skip it outright.
+
+    So if the escalation that actually reaches a terminal status is the one
+    in the NON-stamped queue -- entirely possible for two independently-filed
+    escalations covering the same gate -- the decision now stays OPEN and
+    needs human closure, where before this change either reaper would have
+    closed it. That is a real behaviour change for the MODE-2 population,
+    accepted because it is the fail-OPEN direction: an over-held decision is
+    a visible, human-triageable cockpit row, while a falsely closed one is
+    invisible (the ~7-day loss this task exists to prevent). Pinned here so
+    the tradeoff is explicit rather than latent; documented on
+    _run_reap_decisions and in the recon watcher's MODE-2 bullet.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    # The same gate is filed as a separate escalation in each queue; only the
+    # orchestrator's copy has resolved.
+    (orch / 'archive' / '2026-07-26' / 'esc-5914-1.json').write_text(
+        json.dumps({'status': 'resolved'})
+    )
+    (recon / 'esc-5914-1.json').write_text(json.dumps({'status': 'pending'}))
+    for queue in (orch, recon):  # two watchers, one collapsed record; recon files last
+        assert (
+            sr.main(
+                [
+                    'write-decision',
+                    '--id',
+                    'esc-5914-1',
+                    '--project',
+                    'df',
+                    '--text',
+                    'Adopt the reify plan?',
+                    '--escalation-id',
+                    'esc-5914-1',
+                    '--escalations-dir',
+                    str(queue),
+                ]
+            )
+            == 0
+        )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['esc-5914-1'] == sr.DecisionState.OPEN
 
 
 def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
