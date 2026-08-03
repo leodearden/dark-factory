@@ -28,6 +28,8 @@ from pathlib import Path
 
 from audit_combine_gate_marker_loss import (
     CombineTarget,
+    ManifestExpectation,
+    build_manifest_index,
     load_combine_targets,
     load_ticket_expectations,
     tickets_db_path,
@@ -368,3 +370,203 @@ def test_load_ticket_expectations_skips_absent_or_wrong_typed_metadata(tmp_path)
 def test_load_ticket_expectations_absent_db_returns_empty(tmp_path):
     """A project with no tickets.db is honest 'no comparison source', not a crash."""
     assert load_ticket_expectations(str(tmp_path / "nope.db"), "dark_factory") == {}
+
+
+# ---------------------------------------------------------------------------
+# build_manifest_index — comparison source (2), the capability manifests.
+#
+# Keyed by task_id and built by GLOBBING every manifest, deliberately WITHOUT
+# consulting live metadata.prd_path: prd_path is itself one of the wiped keys,
+# so following the live pointer would blind the detector precisely on the
+# victims it exists to find.
+# ---------------------------------------------------------------------------
+
+_GREP_CHECK = {"kind": "grep", "pattern": "def foo", "paths": ["a.py"], "expect": "present"}
+_SCRIPT_CHECK = {"kind": "script", "script": "scripts/x.sh", "timeout_secs": 30}
+_MANUAL_CHECK = {"kind": "manual", "reason": "needs a human eye"}
+
+
+def _capability(name: str, check: dict | None) -> dict:
+    cap = {"name": name, "binding": "capability->producer (wired)", "verdict": "PASS"}
+    if check is not None:
+        cap["delivered_check"] = check
+    return cap
+
+
+def _write_manifest(root: Path, relpath: str, doc) -> Path:
+    """Write *doc* to ``<root>/<relpath>``; a str is written VERBATIM.
+
+    Verbatim passthrough is what lets a test seed unparseable YAML.
+    """
+    import yaml
+
+    path = root / relpath
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(doc if isinstance(doc, str) else yaml.safe_dump(doc), encoding="utf-8")
+    return path
+
+
+def test_build_manifest_index_maps_task_id_to_expectation(tmp_path):
+    """task_id -> (manifest_path, prd_path, label, delivered_check_names)."""
+    manifest = _write_manifest(tmp_path, "plans/a-prd.capability-manifest.yaml", {
+        "prd": "plans/a-prd.md",
+        "schema_version": 1,
+        "tasks": [{"label": "δ", "task_id": 3157,
+                   "capabilities": [_capability("cap-one", _GREP_CHECK)]}],
+    })
+
+    index = build_manifest_index(str(tmp_path))
+
+    assert set(index) == {"3157"}
+    expectation = index["3157"]
+    assert isinstance(expectation, ManifestExpectation)
+    assert expectation.manifest_path == str(manifest)
+    assert expectation.prd_path == "plans/a-prd.md"
+    assert expectation.label == "δ"
+    assert expectation.delivered_check_names == ("cap-one",)
+
+
+def test_build_manifest_index_keeps_grep_AND_script_drops_only_manual(tmp_path):
+    """THE MECHANICAL-KINDS RULE, corrected against the real stamping site.
+
+    fused-memory/src/fused_memory/server/manifest_stamping.py:311 reads
+    `if check is None or check.kind not in ('grep', 'script'): continue` — so
+    BOTH grep and script are copied into metadata.delivered_checks and only
+    'manual' is dropped. A grep-only filter would silently under-count the
+    expected entries and yield FALSE NEGATIVES on exactly the highest-severity
+    class, so the rule is pinned here with all three kinds on one task.
+    """
+    _write_manifest(tmp_path, "plans/b-prd.capability-manifest.yaml", {
+        "prd": "plans/b-prd.md",
+        "schema_version": 1,
+        "tasks": [{"label": "ε", "task_id": 3319, "capabilities": [
+            _capability("cap-grep", _GREP_CHECK),
+            _capability("cap-script", _SCRIPT_CHECK),
+            _capability("cap-manual", _MANUAL_CHECK),
+            _capability("cap-no-check", None),
+        ]}],
+    })
+
+    names = build_manifest_index(str(tmp_path))["3319"].delivered_check_names
+
+    assert names == ("cap-grep", "cap-script")
+
+
+def test_build_manifest_index_globs_both_plans_and_docs_prds(tmp_path):
+    """Both manifest homes are swept: <root>/plans and <root>/docs/prds."""
+    _write_manifest(tmp_path, "plans/c-prd.capability-manifest.yaml", {
+        "prd": "plans/c-prd.md", "schema_version": 1,
+        "tasks": [{"label": "α", "task_id": 1,
+                   "capabilities": [_capability("c", _GREP_CHECK)]}],
+    })
+    _write_manifest(tmp_path, "docs/prds/d-prd.capability-manifest.yaml", {
+        "prd": "docs/prds/d-prd.md", "schema_version": 1,
+        "tasks": [{"label": "β", "task_id": 2,
+                   "capabilities": [_capability("d", _GREP_CHECK)]}],
+    })
+
+    assert set(build_manifest_index(str(tmp_path))) == {"1", "2"}
+
+
+def test_build_manifest_index_resolves_a_task_with_no_live_prd_path(tmp_path):
+    """THE POINT OF THE REVERSE INDEX. The index is built by GLOBBING, never by
+    following a task's live metadata.prd_path — which is itself one of the
+    wiped keys. A task whose live metadata carries no prd_path at all (the
+    3157/3319 shape) must still resolve, because nothing in this function ever
+    consults tasks.db."""
+    _write_manifest(tmp_path, "plans/e-prd.capability-manifest.yaml", {
+        "prd": "plans/e-prd.md", "schema_version": 1,
+        "tasks": [{"label": "δ", "task_id": 3157,
+                   "capabilities": [_capability("gate", _GREP_CHECK)]}],
+    })
+
+    index = build_manifest_index(str(tmp_path))
+
+    # No tasks.db exists under tmp_path at all, and the lookup still succeeds.
+    assert not (tmp_path / ".taskmaster").exists()
+    assert index["3157"].delivered_check_names == ("gate",)
+
+
+def test_build_manifest_index_skips_manifest_tasks_with_no_task_id(tmp_path):
+    """task_id is None at authoring time, stamped by commit_planning. An
+    unstamped block binds nothing and cannot be keyed."""
+    _write_manifest(tmp_path, "plans/f-prd.capability-manifest.yaml", {
+        "prd": "plans/f-prd.md", "schema_version": 1,
+        "tasks": [
+            {"label": "α", "capabilities": [_capability("x", _GREP_CHECK)]},
+            {"label": "β", "task_id": 7, "capabilities": [_capability("y", _GREP_CHECK)]},
+        ],
+    })
+
+    assert set(build_manifest_index(str(tmp_path))) == {"7"}
+
+
+def test_build_manifest_index_flags_a_task_bound_by_two_manifests(tmp_path):
+    """Ambiguity is REPORTED, never resolved by silently taking the first.
+
+    Measured: 31 live manifests bind 250 task_ids with ZERO bound twice, so
+    this is a defensive path — but a silent first-wins would attribute the
+    wrong delivered_checks to a task if it ever occurred.
+    """
+    first = _write_manifest(tmp_path, "plans/g-prd.capability-manifest.yaml", {
+        "prd": "plans/g-prd.md", "schema_version": 1,
+        "tasks": [{"label": "α", "task_id": 55,
+                   "capabilities": [_capability("from-g", _GREP_CHECK)]}],
+    })
+    second = _write_manifest(tmp_path, "plans/h-prd.capability-manifest.yaml", {
+        "prd": "plans/h-prd.md", "schema_version": 1,
+        "tasks": [{"label": "β", "task_id": 55,
+                   "capabilities": [_capability("from-h", _GREP_CHECK)]}],
+    })
+
+    expectation = build_manifest_index(str(tmp_path))["55"]
+
+    assert expectation.ambiguous is True
+    assert set(expectation.bound_by) == {str(first), str(second)}
+
+
+def test_build_manifest_index_unambiguous_binding_is_not_flagged(tmp_path):
+    """The ordinary case carries ambiguous=False and a single binding."""
+    manifest = _write_manifest(tmp_path, "plans/i-prd.capability-manifest.yaml", {
+        "prd": "plans/i-prd.md", "schema_version": 1,
+        "tasks": [{"label": "α", "task_id": 56,
+                   "capabilities": [_capability("only", _GREP_CHECK)]}],
+    })
+
+    expectation = build_manifest_index(str(tmp_path))["56"]
+
+    assert expectation.ambiguous is False
+    assert expectation.bound_by == (str(manifest),)
+
+
+def test_build_manifest_index_records_parse_failures_without_raising(tmp_path):
+    """An unparseable or schema-invalid manifest is skipped and RECORDED.
+
+    Recorded rather than swallowed: the count reaches the coverage block, so a
+    sweep that could not read half the manifests never reads as complete.
+    """
+    bad_yaml = _write_manifest(tmp_path, "plans/j-prd.capability-manifest.yaml",
+                               "prd: [unclosed\n  - nope")
+    bad_schema = _write_manifest(tmp_path, "plans/k-prd.capability-manifest.yaml", {
+        "prd": "plans/k-prd.md", "schema_version": 99, "tasks": [],
+    })
+    _write_manifest(tmp_path, "plans/l-prd.capability-manifest.yaml", {
+        "prd": "plans/l-prd.md", "schema_version": 1,
+        "tasks": [{"label": "α", "task_id": 8,
+                   "capabilities": [_capability("ok", _GREP_CHECK)]}],
+    })
+
+    failures: list[str] = []
+    index = build_manifest_index(str(tmp_path), parse_failures=failures)
+
+    assert set(index) == {"8"}
+    assert len(failures) == 2
+    assert any(str(bad_yaml) in f for f in failures)
+    assert any(str(bad_schema) in f for f in failures)
+
+
+def test_build_manifest_index_no_manifest_dirs_returns_empty(tmp_path):
+    """A project with no plans/ or docs/prds/ at all yields {} , never a raise."""
+    failures: list[str] = []
+    assert build_manifest_index(str(tmp_path), parse_failures=failures) == {}
+    assert failures == []
