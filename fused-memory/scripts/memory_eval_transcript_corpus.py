@@ -230,21 +230,19 @@ from shared.memory_eval_metrics import (  # noqa: E402
     eval_dir,
     report_artifact_path,
     run_stamp,
-)
-from shared.memory_eval_metrics import (  # noqa: E402
-    _validate_stamp as validate_stamp,  # noqa: PLC2701
+    validate_stamp,
 )
 
-# `_validate_stamp` is imported across a package boundary under an underscore,
-# which normally means "find another way". The alternatives here are worse:
-# re-deriving the stamp regex would be a SECOND definition of a shape that
-# module documents as the one thing it must validate (an override "is going
-# into a filename the window loader will order and cut by string comparison"),
-# and not validating at all is the defect this fixes. The public
-# `run_stamp()`/`write_metric_series(stamp=)` entry points both route through
-# it; this script needs the check WITHOUT their side effects, since it stamps
-# three artifacts of its own. Promoting it to that module's `__all__` is a
-# one-line change filed as a follow-up — outside this task's locked modules.
+# `validate_stamp` is the module's one shape check for a run stamp. The
+# alternatives here are worse: re-deriving the stamp regex would be a SECOND
+# definition of a shape that module documents as the one thing it must
+# validate (an override "is going into a filename the window loader will
+# order and cut by string comparison"), and not validating at all is the
+# defect this fixes. The public `run_stamp()`/`write_metric_series(stamp=)`
+# entry points both route through it; this script needs the check WITHOUT
+# their side effects, since it stamps three artifacts of its own. Task 3434
+# promoted it to that module's `__all__` so this import no longer needs the
+# underscore-private workaround.
 
 # INV-5 / D9: TWO existing readers, ONE core, ZERO new parsers. The scan path
 # streams via iter_json_lines (memory-bounded across thousands of multi-MB gz
