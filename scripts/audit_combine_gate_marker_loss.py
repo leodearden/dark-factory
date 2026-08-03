@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -60,6 +61,19 @@ from typing import NamedTuple
 # tests shell out to the script path and resolve this import solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0].
 from _task_db_scan import discover_project_roots, tasks_db_path  # noqa: F401
+
+# Bind `shared` to the SAME checkout as this script via a __file__-relative
+# path, never a hardcoded absolute. An editable install puts the MAIN
+# checkout's shared/src on sys.path for a bare `python3`, so without this a
+# copy of this script running from a worktree would validate manifests using
+# the MAIN checkout's schema. Same reasoning and same form as
+# repair_wiped_metadata_files.py:65-75 (tasks 2881/2882/3329). The
+# shared.capability_manifest import below MUST stay after this insert.
+_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
+from shared.capability_manifest import load_capability_manifest  # noqa: E402
 
 # The curator verdict this audit is about. The sibling verdict is 'create',
 # which files a NEW task and wipes nothing.
@@ -209,3 +223,137 @@ def load_ticket_expectations(tickets_db_path: str, project_id: str) -> dict[str,
     finally:
         conn.close()
     return expectations
+
+
+# ---------------------------------------------------------------------------
+# Comparison source (2) — the capability manifests.
+#
+# WHY A GLOBBED REVERSE INDEX RATHER THAN FOLLOWING metadata.prd_path.
+# prd_path is ITSELF one of the wiped keys. Resolving a task's manifest by
+# reading its live metadata.prd_path would therefore fail on exactly the
+# victims this detector exists to find: a task that lost prd_path would
+# resolve to no manifest and be filed under "no comparison source" instead of
+# being reported as a delivered_checks loss. So the index is built by globbing
+# EVERY manifest and keying on the stamped task_id, with nothing read from
+# tasks.db at all.
+#
+# Measured: 31 live manifests bind 250 task_ids with ZERO task_id bound by
+# more than one manifest, so the reverse index is unambiguous in practice. The
+# ambiguous case is still detected and flagged rather than silently first-wins.
+# ---------------------------------------------------------------------------
+
+# Both manifest homes, swept in this order. Sorted within each glob so the
+# report is deterministic run-to-run.
+_MANIFEST_GLOBS = (
+    ("plans", "*.capability-manifest.yaml"),
+    ("docs/prds", "*.capability-manifest.yaml"),
+)
+
+# The delivered_check kinds that commit_planning actually copies into
+# metadata.delivered_checks. THE REAL RULE, read off the stamping site:
+# fused-memory/src/fused_memory/server/manifest_stamping.py:311 is
+# `if check is None or check.kind not in ('grep', 'script'): continue`, i.e.
+# BOTH mechanical kinds are copied and only 'manual' is dropped (corroborated
+# by DeliveredCheckMeta.kind: Literal['grep', 'script']). A grep-only filter
+# here would under-count the expected entries and produce FALSE NEGATIVES on
+# the one severity class that removes a mark-done gate.
+MECHANICAL_CHECK_KINDS = ("grep", "script")
+
+
+class ManifestExpectation(NamedTuple):
+    """What a capability manifest says a task's metadata should carry.
+
+    ``delivered_check_names`` holds the capability names whose
+    ``delivered_check`` is mechanical, i.e. exactly the entries
+    ``commit_planning`` would have stamped into
+    ``metadata.delivered_checks``. Non-empty means the task was gated.
+
+    ``ambiguous`` is True when more than one manifest binds this task_id, in
+    which case ``bound_by`` names every one of them and the other fields come
+    from the first in sorted order. Flagged rather than silently resolved: a
+    first-wins choice would attribute another PRD's checks to the task.
+    """
+
+    task_id: str
+    manifest_path: str
+    prd_path: str
+    label: str
+    delivered_check_names: tuple[str, ...]
+    ambiguous: bool
+    bound_by: tuple[str, ...]
+
+
+def _manifest_paths(project_root: str) -> list[Path]:
+    """Every capability-manifest sidecar under *project_root*, sorted."""
+    root = Path(project_root)
+    paths: list[Path] = []
+    for subdir, pattern in _MANIFEST_GLOBS:
+        paths.extend(sorted((root / subdir).glob(pattern)))
+    return paths
+
+
+def build_manifest_index(
+    project_root: str,
+    parse_failures: list[str] | None = None,
+) -> dict[str, ManifestExpectation]:
+    """Build the task_id -> :class:`ManifestExpectation` reverse index.
+
+    Globs both manifest homes (``<root>/plans`` and ``<root>/docs/prds``) and
+    keys on each manifest task's STAMPED ``task_id``. A block whose
+    ``task_id`` is still ``None`` (authoring time, before ``commit_planning``
+    stamps it) binds nothing and is skipped.
+
+    *parse_failures* is an optional accumulator: a manifest that fails to read,
+    parse, or validate is appended to it as a ``"<path>: <error>"`` string and
+    skipped, so one malformed sidecar cannot abort the sweep AND the count
+    still reaches the coverage block. Recorded rather than swallowed — a sweep
+    that could not read half the manifests must never read as complete
+    (docs/legibility/design-invariants.md, no-silent-fail-soft).
+
+    Reuses ``shared.capability_manifest``'s validated pydantic models rather
+    than re-implementing YAML shape validation, so the mechanical-kind filter
+    is a one-line test against an already-parsed ``Literal`` kind.
+    """
+    index: dict[str, ManifestExpectation] = {}
+    for path in _manifest_paths(project_root):
+        try:
+            doc = load_capability_manifest(path)
+        except Exception as exc:  # noqa: BLE001 — see docstring: recorded, not swallowed
+            # Deliberately broad: load_capability_manifest raises OSError,
+            # yaml.YAMLError and pydantic.ValidationError, and a future schema
+            # change could add more. Every one means the same thing here —
+            # this sidecar is unreadable — and it is RECORDED, so breadth
+            # loses no information.
+            if parse_failures is not None:
+                parse_failures.append(f"{path}: {exc}")
+            continue
+
+        for task in doc.tasks:
+            if task.task_id is None:
+                continue
+            key = str(task.task_id)
+            names = tuple(
+                cap.name
+                for cap in task.capabilities
+                if cap.delivered_check is not None
+                and cap.delivered_check.kind in MECHANICAL_CHECK_KINDS
+            )
+            existing = index.get(key)
+            if existing is not None:
+                # Second binding: keep the first (sorted) manifest's fields but
+                # flag the collision and name every binder.
+                index[key] = existing._replace(
+                    ambiguous=True,
+                    bound_by=existing.bound_by + (str(path),),
+                )
+                continue
+            index[key] = ManifestExpectation(
+                task_id=key,
+                manifest_path=str(path),
+                prd_path=doc.prd,
+                label=task.label,
+                delivered_check_names=names,
+                ambiguous=False,
+                bound_by=(str(path),),
+            )
+    return index
