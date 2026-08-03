@@ -41,10 +41,14 @@ from audit_combine_gate_marker_loss import (
     Finding,
     ManifestExpectation,
     ProjectAudit,
+    _COVERAGE_CAVEAT,
+    _FIDELITY_CAVEAT,
     _severity_rank,
     audit_project,
     build_manifest_index,
     classify_gap,
+    format_json,
+    format_report,
     load_combine_targets,
     load_ticket_expectations,
     tickets_db_path,
@@ -958,3 +962,144 @@ def test_audit_project_tolerates_a_missing_tickets_db(tmp_path, make_tasks_db):
     assert not (root / "data" / "reconciliation" / "tickets.db").exists()
     assert set(_by_key(audit_project(str(root), "dark_factory"))) == {
         "delivered_checks", "prd_path", "prd_task_label"}
+
+
+# ---------------------------------------------------------------------------
+# format_report / format_json — the MANDATORY honesty blocks.
+#
+# Both blocks print even for a zero-finding audit. A clean-looking report that
+# omitted them would let a sweep which could see almost nothing read as a
+# clean bill of health — the no-silent-fail-soft violation named in
+# docs/legibility/design-invariants.md.
+#
+# The tests pin the module-level CONSTANTS rather than re-stating their prose,
+# so an editor improving the wording updates one place and the tests follow.
+# ---------------------------------------------------------------------------
+
+def _audit(findings=(), coverage=None, root="/tmp/proj", project_id="dark_factory"):
+    return ProjectAudit(
+        project_root=root,
+        project_id=project_id,
+        findings=list(findings),
+        coverage=coverage or AuditCoverage(0, 0, 0, 0, 0),
+    )
+
+
+def _finding(**kw):
+    base = dict(tag="master", task_id=1, status="pending", key="source",
+                severity=SEVERITY_INFORMATIONAL, expected_source=SOURCE_TICKET,
+                terminal=False, reason="because")
+    base.update(kw)
+    return Finding(**base)
+
+
+def test_format_report_always_emits_both_caveats_even_with_zero_findings():
+    """The whole point: an empty finding list is NOT a clean bill of health."""
+    report = format_report([_audit()])
+
+    assert _FIDELITY_CAVEAT in report
+    assert _COVERAGE_CAVEAT in report
+
+
+def test_fidelity_caveat_states_the_submit_time_bound_and_measured_agreement():
+    """The constant carries the evidence, so no caller can paraphrase it away."""
+    assert "submit" in _FIDELITY_CAVEAT.lower()
+    assert "367/368" in _FIDELITY_CAVEAT      # task_kind agreement
+    assert "368/368" in _FIDELITY_CAVEAT      # source agreement
+    assert "3295" in _FIDELITY_CAVEAT         # the mismatch proving mutability
+    assert "ticket-evidenced" in _FIDELITY_CAVEAT
+
+
+def test_coverage_caveat_names_the_uncoverable_population():
+    assert "comparison source" in _COVERAGE_CAVEAT.lower()
+
+
+def test_format_report_names_the_no_comparison_source_count():
+    """COVERAGE prints targets_without_comparison_source as a number."""
+    report = format_report([_audit(coverage=AuditCoverage(91, 66, 40, 25, 2))])
+
+    assert "25" in report
+    assert "91" in report
+    assert "2" in report
+
+
+def test_format_report_does_not_call_ticket_evidenced_on_manifest_findings():
+    """A manifest-sourced finding rests on the sidecar, not on a ticket. The
+    per-finding line must say so rather than inheriting the ticket label."""
+    report = format_report([_audit(findings=[
+        _finding(task_id=3157, key="delivered_checks", severity=SEVERITY_GATE_REMOVING,
+                 expected_source=SOURCE_MANIFEST),
+    ])])
+
+    line = next(ln for ln in report.splitlines() if "3157" in ln)
+    assert f"source={SOURCE_MANIFEST}" in line
+    assert "ticket-evidenced" not in line
+
+
+def test_format_report_renders_live_before_terminal():
+    """The live section comes FIRST: those are the rows an operator can act on."""
+    report = format_report([_audit(findings=[
+        _finding(task_id=11, terminal=False),
+        _finding(task_id=22, terminal=True, status="done"),
+    ])])
+
+    assert report.index("11") < report.index("22")
+    lowered = report.lower()
+    assert lowered.index("live") < lowered.index("terminal")
+
+
+def test_format_report_renders_terminal_findings_in_full():
+    """Terminal findings are suppressed from the EXIT CODE, never the report."""
+    report = format_report([_audit(findings=[
+        _finding(task_id=22, terminal=True, status="done", key="task_kind",
+                 severity=SEVERITY_BENIGN),
+    ])])
+
+    assert "22" in report
+    assert "task_kind" in report
+
+
+def test_format_report_prints_the_benign_reason():
+    """A benign demotion prints WHY, so a reader never takes it on trust."""
+    report = format_report([_audit(findings=[
+        _finding(key="task_kind", severity=SEVERITY_BENIGN,
+                 reason="absent is identical to 'normal'"),
+    ])])
+
+    assert "absent is identical to 'normal'" in report
+
+
+def test_format_report_groups_by_project_root():
+    report = format_report([_audit(root="/tmp/a"), _audit(root="/tmp/b")])
+
+    assert "/tmp/a" in report and "/tmp/b" in report
+    assert report.index("/tmp/a") < report.index("/tmp/b")
+
+
+def test_format_json_returns_an_object_carrying_coverage():
+    """An OBJECT, never a bare array, so coverage travels with the findings."""
+    payload = json.loads(format_json([_audit(
+        findings=[_finding(task_id=5)],
+        coverage=AuditCoverage(91, 66, 40, 25, 2),
+    )]))
+
+    assert isinstance(payload, dict)
+    project = payload["projects"][0]
+    assert project["project_root"] == "/tmp/proj"
+    assert project["coverage"]["targets_without_comparison_source"] == 25
+    assert project["findings"][0]["task_id"] == 5
+    assert project["findings"][0]["expected_source"] == SOURCE_TICKET
+
+
+def test_format_json_carries_the_fidelity_caveat():
+    """The honesty block travels to machine consumers too."""
+    payload = json.loads(format_json([_audit()]))
+
+    assert _FIDELITY_CAVEAT in json.dumps(payload)
+
+
+def test_formatters_are_pure_and_print_nothing(capsys):
+    """Both return str and neither prints — main() does the single print."""
+    assert isinstance(format_report([_audit()]), str)
+    assert isinstance(format_json([_audit()]), str)
+    assert capsys.readouterr().out == ""
