@@ -240,7 +240,12 @@ def _write_fake_claude_capturing_prompt_and_writing_result(
 
 
 def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
-    """Poll until *path* exists, raising ``AssertionError`` on timeout."""
+    """Poll until *path* exists, raising ``AssertionError`` on timeout.
+
+    Low-level primitive only -- direct callers should prefer
+    _wait_for_path_scaled (below) for a load-adaptive budget instead of a
+    fixed timeout; this function remains only as its poll implementation.
+    """
     deadline = time.monotonic() + timeout
     while not path.exists():
         if time.monotonic() >= deadline:
@@ -248,6 +253,75 @@ def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
                 f"Timed out after {timeout}s waiting for {path} to appear"
             )
         time.sleep(0.05)
+
+
+# _READINESS_WAIT_CAP_SECS: measured, not guessed -- on this host (nproc 32,
+# /proc/loadavg 100.32 => load-per-core 3.14), whole-test wall for every
+# _wait_for_path-gated test was <= 3.15s (konsole 2.46s, custom-term 1.72s,
+# sibling lanes 0.94-1.16s), and whole-test wall upper-bounds any single gate
+# inside it -- so a 30s ceiling is ~12x the worst observed gate.
+#
+# Deliberately NOT raised to 60 the way _NOT_FLAGGED_GRACE_BASE_SECS (below)
+# uses cap_secs=60: a started-grace is an upper bound the watchdog polls to
+# and the happy path never pays (see the comment above
+# _NOT_FLAGGED_GRACE_BASE_SECS), whereas a readiness-wait cap IS paid in full
+# on the failure path, so it stays tight rather than inheriting that raise.
+#
+# Headroom against the real per-test ceiling: `pytest --collect-only` reports
+# configfile: pyproject.toml (the repo root, which sets no `timeout`); the
+# value that actually governs this file is the --timeout=300 passed by
+# scripts/orchestrator.yaml:17. Worst case in the busiest rewired test
+# (test_window_close_129_robust_to_delayed_trap_install, whose readyfile
+# gate overrides cap_secs to 60 -- see _wait_for_path_scaled) is
+# 30 (pidfile) + 60 + 1.0 DELAY (readyfile) + 30 (proc.wait) = 121s,
+# comfortably inside 300s.
+_READINESS_WAIT_CAP_SECS = 30
+
+
+def _wait_for_path_scaled(
+    path: pathlib.Path,
+    base_secs: int,
+    *,
+    extra_secs: float = 0.0,
+    cap_secs: int = _READINESS_WAIT_CAP_SECS,
+) -> float:
+    """Wait for *path* with a load-scaled budget, and return the budget used.
+
+    A fixed _wait_for_path timeout races a host-load-dependent subprocess
+    startup chain -- observed once as
+    test_window_close_yields_129_not_hang[konsole] failing at
+    _wait_for_path(pidfile, timeout=5.0) during task 3451's step-7
+    full-suite verify, passing in isolation and on immediate rerun.
+
+    Returning the budget makes the policy assertable on an already-existing
+    path with zero sleeping -- the direct analogue of _set_started_grace
+    returning the int it wrote into env (see below), and the reason no
+    forbidden source-grepping meta-test is needed to pin the fix.
+
+    Floored at base_secs: an idle host (load-per-core <= 1) returns
+    base_secs unchanged, so every rewired call site stays byte-identical to
+    its old fixed pin on an unloaded host.
+
+    extra_secs exists for gates that sit behind a DELIBERATELY INJECTED,
+    wall-clock-fixed sleep (today only
+    test_window_close_129_robust_to_delayed_trap_install's DELAY = 1.0,
+    injected by _STRESS_DETACHING_TERM_TEMPLATE before $inner runs). Such a
+    sleep does not stretch with host load, so it is added UNSCALED and is
+    NOT subject to cap_secs -- only the load-dependent startup chain around
+    it is scaled.
+
+    cap_secs overrides _READINESS_WAIT_CAP_SECS for a call site whose
+    pre-existing budget already exceeded it -- mirroring
+    _NOT_FLAGGED_GRACE_BASE_SECS's own cap raise (30 -> 60) below. Today
+    only test_window_close_129_robust_to_delayed_trap_install's readyfile
+    gate needs this: its old inline form summed two INDEPENDENTLY-capped
+    _load_scaled_grace(5) halves (up to 2*30=60s under load), so collapsing
+    it onto the default single 30s cap would nearly halve its loaded-host
+    protection.
+    """
+    budget = _load_scaled_grace(base_secs, cap_secs=cap_secs) + extra_secs
+    _wait_for_path(path, timeout=budget)
+    return budget
 
 
 def _write_foreground_terminal(bin_dir: pathlib.Path, name: str) -> None:
@@ -541,7 +615,7 @@ def test_window_close_yields_129_not_hang(
     blind pre-signal sleep, making SIGHUP-after-trap-install deterministic
     under full-suite xdist load.
 
-    Synchronization contract (load-independent):
+    Synchronization contract -- the ORDERING below is load-independent:
       1. _DETACHING_TERM_TEMPLATE publishes the leader pid IMMEDIATELY after
          setsid (no blind sleep).
       2. The fake claude writes a readiness marker file before exec sleep 300.
@@ -550,6 +624,11 @@ def test_window_close_yields_129_not_hang(
          is installed.
       4. The test waits for BOTH the pidfile AND the readiness marker before
          sending SIGHUP — SIGHUP is always delivered after trap installation.
+
+    The WAIT BUDGETS around that ordering are a separate matter and are NOT
+    load-independent -- they are load-scaled via _wait_for_path_scaled (task
+    3486), after a burst-load excursion past a fixed 5.0s pidfile timeout was
+    observed here in test_window_close_yields_129_not_hang[konsole].
     """
     bin_dir = _make_bin_dir(tmp_path)
 
@@ -587,8 +666,11 @@ def test_window_close_yields_129_not_hang(
     # The pidfile appears first (published immediately by the terminal);
     # the readyfile appears only after spawn-claude.sh has armed its traps and
     # invoked the fake claude — proof that SIGHUP will land on a live HUP trap.
-    _wait_for_path(pidfile, timeout=5.0)
-    _wait_for_path(readyfile, timeout=10.0)
+    # Budgets are load-scaled (task 3486's _wait_for_path_scaled) rather than
+    # fixed, since a burst-load excursion past a fixed 5.0s pidfile timeout is
+    # exactly the flake that was observed here (this test, konsole lane).
+    _wait_for_path_scaled(pidfile, 5)
+    _wait_for_path_scaled(readyfile, 10)
 
     leader_pid = int(pidfile.read_text().strip())
     # Send SIGHUP to the entire process group of the session leader.
@@ -597,12 +679,18 @@ def test_window_close_yields_129_not_hang(
 
     # Must-not-hang guard — NOT a latency SLA.
     # The success path takes ~2-4s (await_sentinel 2s poll + pidfile handshake).
-    # A genuine hang is infinite (no sentinel ever written), so 15s cleanly
-    # separates pass from hang while staying well under the global 60s
-    # pytest-timeout (shared/pyproject.toml, timeout_method=signal), so this
-    # descriptive pytest.fail still fires before the blunt signal-kill.
+    # A genuine hang is infinite (no sentinel ever written), so a load-scaled
+    # budget (base 15s, capped at _READINESS_WAIT_CAP_SECS -- named
+    # explicitly rather than relying on _load_scaled_grace's own matching
+    # default) cleanly separates pass from hang while staying well under the
+    # governing 300s pytest-timeout: this file's rootdir/configfile is the
+    # repo-root pyproject.toml (verified via `pytest --collect-only`), whose
+    # [tool.pytest.ini_options] sets no `timeout` of its own -- so
+    # shared/pyproject.toml's timeout=60 does NOT govern this file, and the
+    # real ceiling is the --timeout=300 scripts/orchestrator.yaml:17 passes.
+    # This descriptive pytest.fail still fires well before that blunt kill.
     try:
-        rc = proc.wait(timeout=15)
+        rc = proc.wait(timeout=_load_scaled_grace(15, cap_secs=_READINESS_WAIT_CAP_SECS))
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
@@ -758,19 +846,32 @@ def test_window_close_129_robust_to_delayed_trap_install(
 
     # Gate on BOTH the leader pid AND the readiness marker (post-trap proof).
     # The pid is published immediately; the readiness file appears only after
-    # the DELAY + $inner trap-install sequence completes. Budgets are
-    # load-scaled (task 2733's _load_scaled_grace, mirrored from the sibling
-    # transcript tests below) rather than fixed, so a load-slowed-but-correct
-    # run doesn't spuriously time out.
-    _wait_for_path(pidfile, timeout=_load_scaled_grace(5))
-    _wait_for_path(readyfile, timeout=_load_scaled_grace(5) + DELAY + _load_scaled_grace(5))
+    # the DELAY + $inner trap-install sequence completes. Both gates route
+    # through _wait_for_path_scaled (task 3486) -- the single policy owner
+    # for every readiness gate in this file, rather than hand-rolling the
+    # load scaling inline -- so a load-slowed-but-correct run doesn't
+    # spuriously time out. DELAY is a wall-clock-fixed injected sleep, not
+    # load-dependent, so it is passed as extra_secs and added unscaled on
+    # top of the scaled base.
+    #
+    # readyfile passes cap_secs=60 (not the default 30): the old inline form
+    # summed two INDEPENDENTLY-capped _load_scaled_grace(5) halves, up to
+    # 2*30=60s under load. A bare _wait_for_path_scaled(readyfile, 10) --
+    # single 30s cap -- would nearly halve that loaded-host budget (e.g.
+    # 61s -> 31s at the load-per-core 6.6 recorded near
+    # _NOT_FLAGGED_GRACE_BASE_SECS below); cap_secs=60 mirrors that same
+    # constant's own cap raise and keeps this gate's loaded-host protection
+    # >= what it replaces. The idle-host floor is unaffected by the cap
+    # either way: 5 + DELAY + 5 == _load_scaled_grace(10) + DELAY == 11.0s.
+    _wait_for_path_scaled(pidfile, 5)
+    _wait_for_path_scaled(readyfile, 10, extra_secs=DELAY, cap_secs=60)
 
     leader_pid = int(pidfile.read_text().strip())
     # SIGHUP arrives after the HUP trap is armed — must yield exit 129.
     os.killpg(leader_pid, signal.SIGHUP)
 
     try:
-        rc = proc.wait(timeout=_load_scaled_grace(15))
+        rc = proc.wait(timeout=_load_scaled_grace(15, cap_secs=_READINESS_WAIT_CAP_SECS))
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
@@ -1177,6 +1278,167 @@ def test_load_scaled_grace_getloadavg_error_returns_base(
 
     monkeypatch.setattr(os, "getloadavg", _raise_attributeerror)
     assert _load_scaled_grace(3, cap_secs=30) == 3
+
+
+# ===========================================================================
+# Task 3486: _wait_for_path_scaled -- load-scaled readiness-gate policy
+# ===========================================================================
+# FOURTH recurrence of the fixed-timeout-vs-load-dependent-startup flake
+# class in this file: task 2367 bumped a fixed started-grace 1s/2s -> 3s/8s;
+# task 2733 added _load_scaled_grace above; task 3451 added _set_started_grace
+# for the started-grace family; task 3486 (here) covers the _wait_for_path
+# readiness-gate family. Observed instance:
+# test_window_close_yields_129_not_hang[konsole] timing out at
+# _wait_for_path(pidfile, timeout=5.0) during task 3451's step-7 full-suite
+# verify -- passing in isolation and on immediate rerun (a burst-load
+# excursion past a fixed pin, not a genuine hang).
+
+
+def test_wait_for_path_scaled_returns_load_scaled_budget_on_loaded_host(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a loaded host, the returned budget matches _load_scaled_grace's own
+    output -- used as the oracle for arg-forwarding (cap_secs in
+    particular), so a change to how arguments reach _load_scaled_grace is
+    pinned here without duplicating its floor/scale/clamp/error-safe
+    arithmetic, already pinned once by the test_load_scaled_grace_* family
+    above. That oracle alone can't catch a bug shared by both functions, so
+    a literal expected value is also pinned below (96.0 loadavg / 32 cores
+    => load-per-core 3.0, base 5 => ceil(5 * 3.0) = 15).
+
+    The path already exists, so the call returns immediately: this is what
+    makes the policy assertable without ever sleeping.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    budget = _wait_for_path_scaled(existing, 5)
+    assert budget == 15
+    assert budget == _load_scaled_grace(5, cap_secs=_READINESS_WAIT_CAP_SECS)
+
+
+def test_wait_for_path_scaled_idle_host_floors_at_base(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle host (load-per-core < 1) floors at base_secs unchanged --
+    pinning the no-regression property that every rewired call site stays
+    byte-identical to the fixed pin it replaces on an unloaded host.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    assert _wait_for_path_scaled(existing, 5) == 5
+
+
+def test_wait_for_path_scaled_enforces_the_scaled_budget_not_the_base(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Propagation test -- the one property the return value alone cannot
+    prove: a buggy implementation could return the scaled number but still
+    pass the raw, unscaled base (or, for the second case below, a budget
+    without extra_secs) through to _wait_for_path. Points at a path that
+    never appears so the real enforced timeout is observable both via the
+    raised message and via measured wall-clock.
+
+    Deliberately sized at ~2s/~3s of real wall-clock (base_secs=1 x
+    load-per-core 2.0 => scaled budget 2; plus extra_secs=1.0 => 3); a
+    larger base would only make the suite slower without pinning anything
+    further.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    missing = tmp_path / "never-appears"
+
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match=r"Timed out after 2"):
+        _wait_for_path_scaled(missing, 1)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 2.0, (
+        f"expected the SCALED budget (2s), not the 1s base, to be enforced; "
+        f"only waited {elapsed:.2f}s"
+    )
+
+    # extra_secs must reach _wait_for_path too, not just the return value --
+    # a buggy impl could compute `scaled + extra_secs` for the return but
+    # pass only `scaled` through to _wait_for_path, which the assertion
+    # above alone (extra_secs defaults to 0.0 there) would not catch.
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match=r"Timed out after 3"):
+        _wait_for_path_scaled(missing, 1, extra_secs=1.0)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 3.0, (
+        f"expected the SCALED budget + extra_secs (3s) to be enforced; "
+        f"only waited {elapsed:.2f}s"
+    )
+
+
+def test_wait_for_path_scaled_adds_extra_secs_unscaled(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """extra_secs is added ON TOP of the scaled base, unscaled by load and
+    exempt from the cap -- the one gate shape a bare (path, base_secs)
+    signature cannot express:
+    test_window_close_129_robust_to_delayed_trap_install's readyfile gate,
+    which waits out a deliberately injected, wall-clock-fixed sleep (DELAY)
+    on top of the load-dependent subprocess-startup chain. A `sleep 1.0` in
+    a shell script takes 1.0s regardless of host load, so scaling it would
+    inflate the budget for a component that provably does not stretch; and
+    clamping it would silently eat a delay the test deliberately injected.
+
+    Both cases use an already-existing path so the call returns instantly.
+    """
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    # Loaded host (load-per-core 2.0): extra_secs is added on top of the
+    # scaled base, not folded into the scaling itself.
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+    assert _wait_for_path_scaled(
+        existing, 10, extra_secs=1.0
+    ) == _load_scaled_grace(10, cap_secs=_READINESS_WAIT_CAP_SECS) + 1.0
+
+    # Pathological host: the cap clamps only the scaled part; extra_secs
+    # survives the clamp untouched. Mirrors test_load_scaled_grace_clamps_to_cap
+    # one layer up.
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+    assert (
+        _wait_for_path_scaled(existing, 10, extra_secs=1.0)
+        == _READINESS_WAIT_CAP_SECS + 1.0
+    )
+
+
+def test_wait_for_path_scaled_cap_secs_override_widens_the_clamp(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cap_secs overrides _READINESS_WAIT_CAP_SECS per call site -- the knob
+    test_window_close_129_robust_to_delayed_trap_install's readyfile gate
+    relies on (cap_secs=60) to keep its loaded-host budget >= the two
+    independently-capped _load_scaled_grace(5) halves it replaced. Pinned
+    here at the policy layer so the override itself is tested once, rather
+    than only implicitly through that call site. Mirrors
+    test_load_scaled_grace_clamps_to_cap one layer up.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    # Default cap_secs still clamps at _READINESS_WAIT_CAP_SECS...
+    assert _wait_for_path_scaled(existing, 10) == _READINESS_WAIT_CAP_SECS
+    # ...but an explicit wider cap_secs clamps there instead.
+    assert _wait_for_path_scaled(existing, 10, cap_secs=60) == 60
 
 
 # ===========================================================================
@@ -2239,6 +2501,10 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     env = _hermetic_environ()
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    # Task 3486 audit: SPAWN_LAUNCH_GRACE_SECS="2" and timeout=10 below stay
+    # FIXED on purpose -- rc==126 is load-INSENSITIVE (no tmux/emulator on
+    # PATH fails the availability guard immediately; load-scaling would only
+    # make a genuine regression take longer to report). Measured: 0.05s.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
     env.pop("CLAUDE_TERMINAL_CMD", None)
 
@@ -2301,7 +2567,7 @@ def _run_sibling_capture_spawn(
         env["CLAUDE_SPAWN_PARENT_ID"] = spawner_parent_id
 
     result = _run_spawn(env, tmp_path)
-    _wait_for_path(capture_file, timeout=5.0)
+    _wait_for_path_scaled(capture_file, 5)
     captured = _parse_captured_env(capture_file)
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     return result, captured, fleet_root
@@ -2477,7 +2743,12 @@ def test_sibling_mode_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
         "spawn-claude.sh returns"
     )
 
-    _wait_for_path(started, timeout=5.0)
+    # Safe to lengthen under load: the done-marker snapshot carrying the
+    # actual fire-and-forget assertion was already taken above, and in
+    # fire-and-forget mode nothing rewrites the registry record after
+    # launch, so the record.status == RUNNING assertion below has no
+    # upper-bound dependency on how long this wait took (task 3486 audit).
+    _wait_for_path_scaled(started, 5)
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
@@ -2544,7 +2815,7 @@ def test_sibling_mode_foreground_emulator_is_fire_and_forget(tmp_path: pathlib.P
         "undetached child"
     )
 
-    _wait_for_path(started, timeout=5.0)
+    _wait_for_path_scaled(started, 5)
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
