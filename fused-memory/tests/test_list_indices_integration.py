@@ -17,49 +17,25 @@ Skip automatically when FalkorDB is not reachable.
 from __future__ import annotations
 
 import contextlib
-import os
-import uuid
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import await_index_operational, poll_until
-from falkordb import FalkorDB as _SyncFalkorDB
+from _fm_helpers import (
+    FALKOR_HOST,
+    FALKOR_PORT,
+    await_index_operational,
+    falkor_skipif,
+    poll_until,
+    unique_graph_name,
+)
 from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 
-FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
-FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
-# Per-run graph name so concurrent test runs (xdist, CI matrix on a shared
-# FalkorDB) do not race on the same graph and wipe each other's fixtures.
-TEST_GRAPH: str = f'_test_530_list_indices_integration_{uuid.uuid4().hex[:8]}'
-
-
-def _falkor_available() -> bool:
-    """FalkorDB-native reachability probe.
-
-    Uses the sync ``falkordb.FalkorDB`` client at module import time so the
-    skip-guard does not depend on ``redis`` (which is not a declared
-    dependency of fused-memory — only a transitive of graphiti-core[falkordb]).
-    If falkordb ever switches transport, this probe fails loudly instead of
-    silently disappearing.
-    """
-    try:
-        client = _SyncFalkorDB(
-            host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2
-        )
-        try:
-            client.select_graph('_probe').query('RETURN 1')
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
-        return True
-    except Exception:
-        return False
-
+TEST_GRAPH: str = unique_graph_name('530_list_indices_integration')
 
 pytestmark = [
-    pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable'),
+    falkor_skipif(),
     pytest.mark.timeout(15),
     pytest.mark.integration,
 ]
