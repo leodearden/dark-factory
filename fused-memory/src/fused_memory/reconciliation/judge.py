@@ -669,9 +669,22 @@ Review this run and provide your verdict as JSON.
         # correctly treated as infra rather than a benign empty verdict.
         #
         # Every other failure kind (API_ERROR / TIMED_OUT / MODEL_NOT_FOUND /
-        # MAX_TURNS / ENDED_AWAITING_BACKGROUND / UNKNOWN) is a transport/infra
-        # failure: raise JudgeInfraError (replacing the previous generic
-        # RuntimeError) so review_run can branch on it explicitly.
+        # MAX_TURNS / ENDED_AWAITING_BACKGROUND / CLI_INPUT_REJECTED / UNKNOWN)
+        # is a transport/infra failure: raise JudgeInfraError (replacing the
+        # previous generic RuntimeError) so review_run can branch on it
+        # explicitly.
+        #
+        # CLI_INPUT_REJECTED (task 3143 / esc-3118-1) is deliberately in that
+        # bucket rather than folded into the EMPTY_OUTPUT contract above, even
+        # though both arrive with empty stdout.  The legacy "empty stdout =
+        # valid empty verdict" semantics rest on our having ASKED the judge and
+        # got nothing back; a rejection means the CLI exited on argument
+        # validation before any model turn, so we never asked at all.  Returning
+        # '' would have _parse_verdict fabricate a benign severity=minor verdict
+        # for a review that never happened — loud over silent degradation.  By
+        # the time a rejection reaches here, invoke_with_cap_retry has already
+        # spent its one automatic fresh retry, so raising is escalation, not
+        # impatience.
         #
         # Schema-tool denial first (CLI 2.1.168 regression guard). The verdict
         # contract now rides --json-schema, which is delivered through the
