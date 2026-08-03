@@ -6380,6 +6380,36 @@ async def verify_failure_is_preexisting_on_main(
           - ``git_ops.get_main_sha()`` fails or returns empty.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during probing.
+          - CONFIRM GATE (task 3597): the signature matched, but
+            ``_main_probe_failure_is_isolated_flake`` positively confirmed
+            every named failing test passes in isolation on the main
+            probe — a CPU-starvation load flake, not a real break.  See
+            the CONFIRM GATE paragraph below.
+
+    CONFIRM GATE (task 3597): a signature match alone is not trusted
+    blindly.  A CPU-starvation load flake can starve the SAME timing-
+    sensitive test on both the task branch and this main probe, matching
+    signatures on a main that is actually green (ground truth: esc-3514-2 /
+    task 3514 — 12 named failures on a run that aborted with an xdist
+    worker crash, all passing in isolation, main was not broken).  Before
+    trusting a signature match, ``_main_probe_failure_is_isolated_flake``
+    re-runs JUST the node-ids named in the main probe's own failing
+    output — scoped, forced-serial, generous-timeout — inside this SAME
+    already-open probe worktree (no second ``git worktree add``).  This is
+    a ONE-WAY RATCHET: it can only DOWNGRADE a verdict that the isolated
+    re-run has POSITIVELY shown green, to ``(False, '')`` above.  Every
+    unconfirmable outcome (no recoverable node-id, a node-id owned by no
+    discovered subproject, an infra-sentinel re-run category, a still-
+    failing re-run, or an unexpected exception) preserves today's
+    ``(True, main_sha)`` verdict unchanged — nothing about a genuinely red
+    main is affected.  The downgraded verdict is deliberately NOT written
+    to the ``_PROBE_CACHE`` below (it is a statement about transient host
+    state, not a fact about the main tip, so caching it could mis-
+    attribute a LATER genuine red main with the same signature to every
+    sibling task that hits the cache key within the TTL).  This gate is
+    scoped to the signature-comparison path only — the task-μ baseline-
+    diff fork above (``failing_result.failing_test_ids is not None``)
+    returns before this point and is untouched.
 
     A process-wide TTL cache (keyed by (main_sha, category, normalised cause_hint))
     avoids redundant probes from the same or sibling tasks against an unchanged main.
@@ -6509,6 +6539,44 @@ async def verify_failure_is_preexisting_on_main(
             branch_sig = (failing_result.category or '', _norm_hint)
             main_sig = (main_result.category or '', _normalize(main_result.cause_hint))
             is_preexisting = branch_sig == main_sig
+
+            if is_preexisting:
+                # CONFIRM GATE (task 3597): a CPU-starvation load flake can
+                # starve the SAME timing-sensitive test on both the branch
+                # and this main probe, matching signatures on a main that is
+                # actually green (ground truth: esc-3514-2 / task 3514).
+                # Before trusting the signature match, re-run JUST the
+                # node-ids named in main_result's own output, in isolation,
+                # inside this already-open probe worktree. A positive green
+                # downgrades to (False, ''); every other (unconfirmable)
+                # outcome preserves today's verdict unchanged — see
+                # _main_probe_failure_is_isolated_flake's docstring for the
+                # full one-way-ratchet contract.
+                flake_ids = await _main_probe_failure_is_isolated_flake(
+                    tmp_path, config, module_configs, main_result,
+                )
+                if flake_ids is not None:
+                    logger.warning(
+                        'verify_failure_is_preexisting_on_main: %s passed on '
+                        'isolated re-run on the main probe (sha=%.8s) — '
+                        'downgrading from preexisting-main-break to '
+                        'task-own (main is not red for these tests)',
+                        flake_ids, main_sha,
+                    )
+                    _suppressed_flake_records.append({
+                        'sha': main_sha,
+                        'node_ids': flake_ids,
+                        'first_pass_category': main_result.category,
+                        'first_pass_cause_hint': main_result.cause_hint,
+                        'suppressed_via': 'main_probe_isolated_rerun',
+                    })
+                    # Deliberately NOT cached: a load-flake verdict is a
+                    # statement about transient host state, not the main
+                    # tip, so caching it would mis-attribute a LATER genuine
+                    # red main (same signature) to every sibling task that
+                    # hits this cache key within the TTL.
+                    return False, ''
+
             _PROBE_CACHE[_cache_key] = (time.monotonic(), is_preexisting)
             return is_preexisting, (main_sha if is_preexisting else '')
 
