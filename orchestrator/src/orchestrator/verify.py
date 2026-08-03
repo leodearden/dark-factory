@@ -684,15 +684,9 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     — a human sees it, nothing is silently greened.
 
     The opposite-direction case — an UNLISTED co-occurring load flake that
-    defeats this veto (esc-3514-2 / task 3514: any FAILED line naming a
-    test absent from ``_KNOWN_LOAD_FLAKE_NODEID_RES`` forces ``False``,
-    classifying the whole failure as TEST_FAILURE) — is deliberately NOT
-    fixed by broadening the allow-list; it is instead caught DOWNSTREAM by
-    ``verify_failure_is_preexisting_on_main``'s isolated-re-run confirm
-    gate (``_main_probe_failure_is_isolated_flake``, task 3597), which
-    re-runs the named node-ids in isolation before trusting a preexisting-
-    main-break verdict. Read the two guards as one design: this one stays
-    narrow by choice, that one catches what it declines to cover.
+    defeats this veto (esc-3514-2 / task 3514) — is deliberately NOT fixed
+    by broadening the allow-list; see ``_main_probe_failure_is_isolated_flake``
+    (task 3597) for the downstream confirm gate that catches it instead.
 
     Returns ``False`` for falsy *output* or when the crash signature itself
     is absent.
@@ -6395,32 +6389,17 @@ async def verify_failure_is_preexisting_on_main(
             ``_main_probe_failure_is_isolated_flake`` positively confirmed
             every named failing test passes in isolation on the main
             probe — a CPU-starvation load flake, not a real break.  See
-            the CONFIRM GATE paragraph below.
+            that function's docstring for the full contract (what it
+            re-runs, the precondition that guards against a co-occurring
+            genuine lint/type break, the one-way-ratchet guarantee, and
+            why the downgrade is deliberately not cached).
 
     CONFIRM GATE (task 3597): a signature match alone is not trusted
-    blindly.  A CPU-starvation load flake can starve the SAME timing-
-    sensitive test on both the task branch and this main probe, matching
-    signatures on a main that is actually green (ground truth: esc-3514-2 /
-    task 3514 — 12 named failures on a run that aborted with an xdist
-    worker crash, all passing in isolation, main was not broken).  Before
-    trusting a signature match, ``_main_probe_failure_is_isolated_flake``
-    re-runs JUST the node-ids named in the main probe's own failing
-    output — scoped, forced-serial, generous-timeout — inside this SAME
-    already-open probe worktree (no second ``git worktree add``).  This is
-    a ONE-WAY RATCHET: it can only DOWNGRADE a verdict that the isolated
-    re-run has POSITIVELY shown green, to ``(False, '')`` above.  Every
-    unconfirmable outcome (no recoverable node-id, a node-id owned by no
-    discovered subproject, an infra-sentinel re-run category, a still-
-    failing re-run, or an unexpected exception) preserves today's
-    ``(True, main_sha)`` verdict unchanged — nothing about a genuinely red
-    main is affected.  The downgraded verdict is deliberately NOT written
-    to the ``_PROBE_CACHE`` below (it is a statement about transient host
-    state, not a fact about the main tip, so caching it could mis-
-    attribute a LATER genuine red main with the same signature to every
-    sibling task that hits the cache key within the TTL).  This gate is
-    scoped to the signature-comparison path only — the task-μ baseline-
-    diff fork above (``failing_result.failing_test_ids is not None``)
-    returns before this point and is untouched.
+    blindly — see ``_main_probe_failure_is_isolated_flake``'s docstring for
+    the full contract.  This gate is scoped to the signature-comparison
+    path only — the task-μ baseline-diff fork above
+    (``failing_result.failing_test_ids is not None``) returns before this
+    point and is untouched.
 
     A process-wide TTL cache (keyed by (main_sha, category, normalised cause_hint))
     avoids redundant probes from the same or sibling tasks against an unchanged main.
@@ -6552,27 +6531,37 @@ async def verify_failure_is_preexisting_on_main(
             is_preexisting = branch_sig == main_sig
 
             if is_preexisting:
-                # CONFIRM GATE (task 3597): a CPU-starvation load flake can
-                # starve the SAME timing-sensitive test on both the branch
-                # and this main probe, matching signatures on a main that is
-                # actually green (ground truth: esc-3514-2 / task 3514).
-                # Before trusting the signature match, re-run JUST the
-                # node-ids named in main_result's own output, in isolation,
-                # inside this already-open probe worktree. A positive green
-                # downgrades to (False, ''); every other (unconfirmable)
-                # outcome preserves today's verdict unchanged — see
-                # _main_probe_failure_is_isolated_flake's docstring for the
-                # full one-way-ratchet contract.
+                # CONFIRM GATE (task 3597): a signature match alone is not
+                # trusted blindly — see _main_probe_failure_is_isolated_flake's
+                # docstring for the full contract.
                 flake_ids = await _main_probe_failure_is_isolated_flake(
                     tmp_path, config, module_configs, main_result,
                 )
                 if flake_ids is not None:
+                    # Repeat-count observability (reviewer_comprehensive
+                    # finding 4, task 3597 amendment): the downgrade below is
+                    # deliberately not cached (see comment further down), so
+                    # a sustained load-flake storm re-pays the full probe +
+                    # isolated-rerun cost on every sibling task that hits
+                    # this exact signature. That no-cache decision is
+                    # unchanged — caching would reintroduce the false-
+                    # negative risk it exists to avoid — but the repetition
+                    # itself is now named in the WARNING and recorded on the
+                    # audit entry instead of recurring silently.
+                    _repeat_count = _MAIN_PROBE_DOWNGRADE_REPEAT_COUNTS.get(_cache_key, 0) + 1
+                    _MAIN_PROBE_DOWNGRADE_REPEAT_COUNTS[_cache_key] = _repeat_count
                     logger.warning(
                         'verify_failure_is_preexisting_on_main: %s passed on '
                         'isolated re-run on the main probe (sha=%.8s) — '
                         'downgrading from preexisting-main-break to '
-                        'task-own (main is not red for these tests)',
+                        'task-own (main is not red for these tests)%s',
                         flake_ids, main_sha,
+                        (
+                            f' [repeat #{_repeat_count} for this exact '
+                            f'signature — the verdict is deliberately not '
+                            f'cached, so a persistent load-flake storm '
+                            f're-probes and re-downgrades every time]'
+                        ) if _repeat_count > 1 else '',
                     )
                     _suppressed_flake_records.append({
                         'sha': main_sha,
@@ -6580,6 +6569,7 @@ async def verify_failure_is_preexisting_on_main(
                         'first_pass_category': main_result.category,
                         'first_pass_cause_hint': main_result.cause_hint,
                         'suppressed_via': 'main_probe_isolated_rerun',
+                        'repeat_count': _repeat_count,
                     })
                     # Deliberately NOT cached: a load-flake verdict is a
                     # statement about transient host state, not the main
@@ -7528,6 +7518,22 @@ async def confirm_merge_verify_flake_suppressible(
 #: hotfix for a main that is actually green) survives untouched.
 _MAIN_PROBE_CONFIRM_TIMEOUT_SECS: int = 300
 
+#: Per-signature repeat counter for the main-probe isolated-flake downgrade
+#: (reviewer_comprehensive finding 4, task 3597 amendment pass). The
+#: downgraded verdict is deliberately NOT written to ``_PROBE_CACHE`` (a
+#: load-flake verdict is a statement about transient host state, not a fact
+#: about the main tip — see the call site), so a sustained CPU-starvation
+#: storm makes every sibling task that hits the same (main_sha, category,
+#: hint) signature repeat the full probe + isolated-rerun cost. Caching the
+#: downgrade instead would reintroduce exactly the false-negative risk the
+#: no-cache decision exists to avoid, so this dict only makes the repetition
+#: OBSERVABLE (loud-over-silent-degradation norm) without changing the
+#: caching decision. Grows one entry per distinct downgraded signature for
+#: the life of the process — unpruned, mirroring ``_PROBE_CACHE``'s own
+#: unbounded-growth precedent (neither is actively pruned; both are small,
+#: bounded by the number of distinct signatures ever seen).
+_MAIN_PROBE_DOWNGRADE_REPEAT_COUNTS: dict[tuple[str, str, str], int] = {}
+
 
 async def _main_probe_failure_is_isolated_flake(
     probe_worktree: Path,
@@ -7550,6 +7556,20 @@ async def _main_probe_failure_is_isolated_flake(
     the ALREADY-OPEN *probe_worktree* pinned at main (SAME-TREE, no second
     ``git worktree add``; the caller owns the worktree's lifecycle).
 
+    PRECONDITION — test-leg-only (reviewer_comprehensive finding 1):
+    ``run_verification``'s ``_summarize_checks``/``_worst_category`` picks
+    ONE ``category`` across up to three legs (test/lint/type), so a matched
+    (category, cause_hint) signature does NOT by itself guarantee the
+    lint/type legs were clean on main — a genuine, co-occurring lint/type
+    break can lose the "worst" contest to the test leg's category (e.g. it
+    classifies as the lower-priority ``unknown_test_failure``) and still be
+    real. Re-running just the named TEST node-ids would then wrongly
+    downgrade a genuinely red main. ``VerifyResult.lint_output``/
+    ``type_output`` are populated ONLY when that leg's return code is
+    non-zero (see ``run_verification``'s result construction), so a
+    non-empty value here is a precise, free signal that another leg is not
+    clean — this bails to ``None`` before doing any work.
+
     Returns:
         ``list[str]`` — every named failing test on THIS main tip
         demonstrably PASSED on isolated re-run. The caller MAY downgrade its
@@ -7557,8 +7577,9 @@ async def _main_probe_failure_is_isolated_flake(
         own documented fail-safe return.
 
         ``None`` — every other (fail-safe) path; the caller keeps today's
-        ``(True, main_sha)`` verdict unchanged. Covers: no recoverable
-        node-id in ``main_result.test_output`` (an opaque/lint/type
+        ``(True, main_sha)`` verdict unchanged. Covers: a co-occurring
+        lint/type break on main (see PRECONDITION above); no recoverable
+        node-id in ``main_result.test_output`` (an opaque/lint/type-only
         failure); a node-id that maps to no discovered subproject (or
         *module_configs* is empty); an isolated re-run that still fails,
         times out, or hits an infra-sentinel category
@@ -7579,8 +7600,34 @@ async def _main_probe_failure_is_isolated_flake(
     is ``_run_isolated_confirm_group`` (the bounded
     ``_SWEEP_CONFIRM_MAX_ATTEMPTS``-attempt loop, ``role='task'`` by
     default via ``run_verification``'s own default), unchanged.
+
+    *module_configs* SOURCE (reviewer_comprehensive finding 5): this is the
+    CALLER's snapshot — discovered on the task branch's worktree by
+    ``verify_failure_is_preexisting_on_main``'s own caller — reused as-is
+    rather than re-discovered on *probe_worktree*, unlike
+    ``confirm_main_tip_failure_is_real`` (which re-runs
+    ``_discover_module_configs`` against its own fresh probe tree). This is
+    consistent with, not a new departure from,
+    ``verify_failure_is_preexisting_on_main``'s own PRE-EXISTING behaviour:
+    it already runs ``run_scoped_verification(tmp_path, config,
+    module_configs, ...)`` — the same branch-side *module_configs* — against
+    this same main-pinned *probe_worktree* to produce *main_result* in the
+    first place, so reusing it again here for node-id mapping introduces no
+    tree/config mismatch beyond what that earlier call already accepts. A
+    task that renames/adds a subproject or changes a ``test_command``
+    between branch and main degrades fail-safe, not silently wrong: a stale
+    prefix yields either no recoverable node-id (early-out above), an
+    unmapped node-id (``_group_node_ids_by_subproject`` returns ``None``,
+    below), or a scoped command that errors/still-fails on the probe tree
+    (``_run_isolated_confirm_group`` returns ``False``) — every one of those
+    keeps today's verdict rather than producing a wrong downgrade.
     """
     try:
+        # PRECONDITION (finding 1 above): bail before any work when another
+        # leg is known non-clean on main.
+        if main_result.lint_output or main_result.type_output:
+            return None
+
         node_ids = _extract_failing_test_ids(main_result.test_output)
         if not node_ids:
             return None
@@ -7636,7 +7683,6 @@ async def _main_probe_failure_is_isolated_flake(
             exc_info=True,
         )
         return None
-    return node_ids
 
 
 def _merge_flake_suppressed_pass(
