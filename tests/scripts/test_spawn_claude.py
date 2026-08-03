@@ -428,12 +428,29 @@ def _run_spawn(
     *,
     timeout: int = 30,
     title: str = "",
+    scale_timeout: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
+    """Invoke spawn-claude.sh and return its completed process.
+
+    `timeout` is a load-scaled BASE, not a fixed ceiling: it is a
+    must-not-hang guard, not a latency SLA -- every caller's real contract
+    is an exit code, not a wall-clock duration. Routed through
+    _spawn_run_budget by default, whose _load_scaled_grace floor makes an
+    idle host byte-identical to today's fixed pins at all ~25 call sites,
+    so this can only lengthen the bound under contention, never shorten
+    one.
+
+    scale_timeout=False is the documented opt-out for call sites whose
+    verdict is load-INSENSITIVE (the no-emulator/no-tmux 126 sites, per
+    task 3486's audit) -- there, scaling would only make a genuine
+    regression take longer to report.
+    """
+    budget = _spawn_run_budget(timeout) if scale_timeout else timeout
     return subprocess.run(
         [str(SPAWN_SCRIPT), str(cwd), "false", title, "test prompt"],
         env=env,
         capture_output=True,
-        timeout=timeout,
+        timeout=budget,
     )
 
 
@@ -574,7 +591,11 @@ def test_no_emulator_found_yields_126_ignores_ambient_spawn_backend(
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env.pop("CLAUDE_TERMINAL_CMD", None)
 
-    result = _run_spawn(env, tmp_path, timeout=10)
+    # Task 3599 audit: same no-emulator availability-guard shape as
+    # test_no_emulator_found_yields_126 below -- rc==126 is load-INSENSITIVE
+    # (task 3486), so this stays unscaled rather than inheriting the new
+    # load-scaled default.
+    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
     stderr = result.stderr.decode()
     assert result.returncode == 126, (
         f"expected 126, got {result.returncode}\nstderr: {stderr}"
@@ -802,7 +823,11 @@ def test_no_emulator_found_yields_126(tmp_path: pathlib.Path) -> None:
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env.pop("CLAUDE_TERMINAL_CMD", None)
 
-    result = _run_spawn(env, tmp_path, timeout=10)
+    # Task 3599 audit: rc==126 is load-INSENSITIVE (no emulator on PATH
+    # fails the availability guard immediately; task 3486 measured 0.05s),
+    # so this stays unscaled rather than inheriting the new load-scaled
+    # default.
+    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
     assert result.returncode == 126, (
         f"No emulator must yield 126, got {result.returncode}\n"
         f"stderr: {result.stderr.decode()}"
@@ -2700,10 +2725,13 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     # FIXED on purpose -- rc==126 is load-INSENSITIVE (no tmux/emulator on
     # PATH fails the availability guard immediately; load-scaling would only
     # make a genuine regression take longer to report). Measured: 0.05s.
+    # Task 3599 audit: _run_spawn's timeout now load-scales by default, so
+    # the explicit scale_timeout=False below is what keeps this pin FIXED --
+    # both audits are one decision, not a reversal.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
     env.pop("CLAUDE_TERMINAL_CMD", None)
 
-    result = _run_spawn(env, tmp_path, timeout=10)
+    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
     assert result.returncode == 126, (
         f"missing tmux in tmux-backend mode must yield 126, got "
         f"{result.returncode}\nstderr: {result.stderr.decode()}"
