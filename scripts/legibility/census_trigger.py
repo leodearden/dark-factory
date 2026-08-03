@@ -76,10 +76,18 @@ six §7.4 threshold values, so `CensusConfig`'s fields read their defaults
 from it rather than re-hardcoding them (see the `CensusConfig` docstring).
 
 The get_statuses done-count fetch is injected (`status_fetcher`), not a
-hardcoded MCP/HTTP client: the scripts/ test env (`uv run --project
-shared`) has no httpx and no MCP client available (see
-shared/pyproject.toml), so the pure decision core stays fully unit-testable
-and "a failing get_statuses fails SAFE" is testable with a raising fake.
+hardcoded MCP/HTTP client. The seam exists for DETERMINISM, and it is not a
+workaround for a missing package: httpx IS installed here -- a direct
+dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`, task 2965) --
+so `default_status_fetcher`'s lazy `import httpx` below resolves to the real
+library and really does POST to $FUSED_MEMORY_MCP_URL (default
+localhost:8002). On any box running the fused-memory stack that POST
+SUCCEEDS, so a test leaning on ambient unreachability flaps with the host's
+listener state (task 3291). Injecting therefore matters MORE now, not less:
+it keeps the pure decision core fully unit-testable and makes "a failing
+get_statuses fails SAFE" testable with a raising fake regardless of what is
+listening. (No MCP client library is available in that env either, so a
+hardcoded MCP client could not be exercised there at all.)
 `default_status_fetcher` provides a best-effort glue implementation for the
 standalone CLI, unwrapping the real MCP `tools/call` JSON-RPC envelope via
 `_extract_tool_result` (the tool's actual return value lives at
