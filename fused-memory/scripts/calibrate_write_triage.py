@@ -325,6 +325,31 @@ def summarize_distribution(scores: Sequence[float]) -> dict[str, Any]:
 REASON_EMPTY_CLASS = 'empty_class'
 REASON_NOT_SEPARABLE = 'not_separable'
 REASON_NO_JUDGE_BAND = 'no_judge_band'
+REASON_INSUFFICIENT_PAIRS = 'insufficient_pairs'
+
+MIN_CATEGORY_PAIRS = 20
+"""Pairs a CATEGORY must contribute, per class, to earn a cutoff of its own.
+
+Not a taste threshold — an exceedance bound. Both band edges are fitted to a
+single order statistic of a small sample: ``t_high`` is the smallest duplicate
+strictly above the observed MAXIMUM negative, and ``t_low`` is the duplicate
+p05, which under :func:`_order_statistic`'s nearest-rank rule IS the sample
+minimum for every n <= 20. For n exchangeable draws, a fresh draw falls outside
+the sample's observed extreme with expected probability ``1/(n+1)``. So 20
+pairs pin the expected leak past either fitted edge at <= ~4.8%; at 4 pairs it
+is ~20%, and a cutoff fitted there is a coin-flip dressed as a measurement.
+
+Applied ONLY per category (:func:`derive_bands_per_category`), never to the
+pooled derivation: the pooled band is the calibration of record and clears this
+bar by orders of magnitude, and re-gating it here would be a second policy in
+a function many callers already bind.
+
+A category that fails the bar is not merely un-preferred — it is UNCALIBRATED,
+absent from ``t_high_by_category``, run on the disclosed pooled fallback, and
+fenced out of ``--apply`` deletion by
+``audit_duplicate_memories.restrict_delete_candidates_for_apply``. That fence
+is about STRENGTH of evidence, so a token sample must not buy past it.
+"""
 
 
 def derive_bands(
@@ -472,6 +497,9 @@ def derive_bands_per_category(
     scores_by_category_and_class: Mapping[str, Mapping[str, Sequence[float]]],
     pooled_t_high: float | None,
     pooled_t_low: float | None,
+    *,
+    min_dup_pairs: int = MIN_CATEGORY_PAIRS,
+    min_negative_pairs: int = MIN_CATEGORY_PAIRS,
 ) -> dict[str, dict[str, Any]]:
     """Derive one band pair per Mem0 category, delegating to ``derive_bands``.
 
@@ -481,6 +509,21 @@ def derive_bands_per_category(
     — all its records in one cluster) yields ``REASON_EMPTY_CLASS``; one
     whose negatives reach every duplicate yields ``REASON_NOT_SEPARABLE``.
     Either way the refusal, not a fabricated number, is the finding.
+
+    On TOP of those, and the one rule that is this function's own: a category
+    too THIN to fit a band gets ``REASON_INSUFFICIENT_PAIRS`` even when the
+    arithmetic happened to produce a number. Separability on a handful of
+    pairs is not evidence of separability — see :data:`MIN_CATEGORY_PAIRS`
+    for the exceedance bound that sets the bar, and why a category that fails
+    it must fall back to the pooled cutoff (and its fence) rather than be
+    promoted to full deletion authority on a token sample. The gate applies
+    only to an entry that DERIVED a cutoff, so ``empty_class`` /
+    ``not_separable`` keep naming the more specific reason they already do.
+
+    *min_dup_pairs* / *min_negative_pairs* exist so a test can exercise the
+    delegation on a small hand-built sample; the recorded calibration is
+    produced at the defaults, and lowering them in a real run would put a
+    number into config that :data:`MIN_CATEGORY_PAIRS` says is not evidence.
 
     Every category present in the input is present in the output, an
     uncalibrated one INCLUDED with a null ``t_high`` and its reason code.
@@ -498,6 +541,22 @@ def derive_bands_per_category(
         scores = {name: list(scores_by_class.get(name) or []) for name in PAIR_CLASSES}
         negatives = [s for name in NEGATIVE_PAIR_CLASSES for s in scores[name]]
         t_high, t_low, reason = derive_bands(scores['true_dup'], negatives)
+        if t_high is not None and (
+            len(scores['true_dup']) < min_dup_pairs or len(negatives) < min_negative_pairs
+        ):
+            # A derived number, WITHDRAWN: the sample is too small for either
+            # fitted edge to mean what a cutoff claims. The refusal replaces
+            # any reason derive_bands returned (including no_judge_band) —
+            # there is no band left to qualify.
+            t_high, t_low, reason = None, None, (
+                f'{REASON_INSUFFICIENT_PAIRS}: {len(scores["true_dup"])} duplicate and '
+                f'{len(negatives)} negative pair(s) measured, below the '
+                f'{min_dup_pairs}/{min_negative_pairs} minimum. A fresh pair falls '
+                f'outside a sample this small\'s observed extreme with expected '
+                f'probability 1/(n+1), and both band edges are fitted to exactly '
+                f'that extreme. Refusing a cutoff the sample size cannot support — '
+                f'this category runs on the disclosed pooled fallback instead.'
+            )
         admitted = (
             None if pooled_t_high is None
             else sum(
