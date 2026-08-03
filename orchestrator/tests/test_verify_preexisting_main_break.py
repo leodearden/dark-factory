@@ -990,4 +990,112 @@ class TestVerifyFailureIsPreexistingBaselineDiffFork:
             f'failing_test_ids=None must take the legacy probe path unchanged; got {result!r}'
         )
         baseline_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task 3597: _main_probe_failure_is_isolated_flake — main-probe confirm gate
+#
+# verify._main_probe_failure_is_isolated_flake(probe_worktree, config,
+# module_configs, main_result) -> list[str] | None
+#
+# Before verify_failure_is_preexisting_on_main returns (True, main_sha), this
+# gate re-runs JUST the node-ids named in the MAIN PROBE's own failing output,
+# in isolation (scoped + forced-serial + generous-timeout), inside the
+# ALREADY-OPEN probe worktree pinned at main. A returned list[str] means every
+# named test demonstrably passed in isolation — the caller MAY downgrade to
+# (False, ''). None means every other (fail-safe) path — the caller keeps
+# today's (True, main_sha) verdict.
+# ---------------------------------------------------------------------------
+
+PROBE_NODE_ID = 'tests/test_concurrent_verify_boundary.py::test_concurrent_verify_boundary'
+
+LOAD_FLAKE_MAIN_RESULT = VerifyResult(
+    passed=False,
+    test_output=f'FAILED {PROBE_NODE_ID}\n[gw14] node down: Not properly terminated\n',
+    lint_output='',
+    type_output='',
+    summary='test_failure',
+    cause_hint=f'FAILED {PROBE_NODE_ID}',
+    category='test_failure',
+)
+
+# On-disk layout materialized directly under the probe worktree (no real git
+# checkout involved for these unit tests) so _group_node_ids_by_subproject's
+# Path.exists() probes resolve PROBE_NODE_ID to the 'orchestrator' subproject.
+_PROBE_CONFIRM_PROJECT_LAYOUT = {
+    'orchestrator/tests/test_concurrent_verify_boundary.py': (
+        'def test_concurrent_verify_boundary():\n    pass\n'
+    ),
+}
+
+
+def _write_probe_layout(worktree: Path, layout: dict[str, str]) -> None:
+    for relpath, content in layout.items():
+        p = worktree / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+
+
+class TestMainProbeIsolatedFlakeConfirmGate:
+    """step-1/step-3: verify._main_probe_failure_is_isolated_flake."""
+
+    # -- step-1: POSITIVE path ---------------------------------------------
+
+    def test_returns_node_ids_when_isolated_rerun_passes(self, tmp_path: Path) -> None:
+        """All named failing tests pass on isolated re-run -> the confirmed
+        node-id list, run against the SAME probe worktree (no second `git
+        worktree add`).
+
+        RED today: _main_probe_failure_is_isolated_flake does not exist.
+        """
+        from orchestrator import verify as verify_module
+        from orchestrator.config import ModuleConfig
+
+        config = _make_config(tmp_path)
+        probe_worktree = tmp_path / 'mainprobe-wt'
+        probe_worktree.mkdir()
+        _write_probe_layout(probe_worktree, _PROBE_CONFIRM_PROJECT_LAYOUT)
+
+        module_configs = [
+            ModuleConfig(
+                prefix='orchestrator',
+                test_command=(
+                    'uv run --project orchestrator --directory orchestrator '
+                    'pytest tests/ --tb=short -q'
+                ),
+            )
+        ]
+
+        rv = AsyncMock(return_value=PASSING_RESULT)
+
+        def _fail_if_called(cmd, **kwargs):
+            raise AssertionError(
+                f'orchestrator.git_ops._run should not be called (same-tree '
+                f'gate, no second worktree) — got {cmd!r}'
+            )
+
+        with (
+            patch.object(verify_module, 'run_verification', rv),
+            patch('orchestrator.git_ops._run', side_effect=_fail_if_called),
+        ):
+            result = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    probe_worktree, config, module_configs, LOAD_FLAKE_MAIN_RESULT,
+                )
+            )
+
+        assert result == [PROBE_NODE_ID], f'Expected [{PROBE_NODE_ID!r}], got {result!r}'
+
+        rv.assert_awaited_once()
+        assert rv.call_args.args[0] == probe_worktree, (
+            f'Expected run_verification against the SAME probe worktree '
+            f'{probe_worktree}, got {rv.call_args.args[0]!r}'
+        )
+        called_mc = rv.call_args.args[2]
+        assert '-p no:xdist' in called_mc.test_command, called_mc.test_command
+        assert '-o addopts=' in called_mc.test_command, called_mc.test_command
+        assert '--timeout 300' in called_mc.test_command, called_mc.test_command
+        assert PROBE_NODE_ID in called_mc.test_command, called_mc.test_command
+        assert called_mc.lint_command is None, called_mc.lint_command
+        assert called_mc.type_check_command is None, called_mc.type_check_command
         legacy_probe_mock.assert_awaited_once()
