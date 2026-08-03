@@ -111,7 +111,11 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # ~29% / ~20% spread WITHIN each pair on this host, and the two pairs were
 # taken at different times under different load, so the honest claim is
 # "roughly +1.5 to +2 minutes", not a multiple, and not a figure to plan a
-# tight timeout around. WHO PAYS IT is the sharper half: this is not a
+# tight timeout around. A third run of the union, on the amendment-pass tip
+# (1931 passed, 1 skipped, 310.33s, exit 0), came in FASTER than the slower run
+# of the command it replaced — which is the error bar made concrete, not a
+# revision of the delta: on this host the load at measurement time moves the
+# number more than the extra directory does. WHO PAYS IT is the sharper half: this is not a
 # merge-only cost, because verify_plan._derive_module_runs arm 3 runs this
 # command VERBATIM for any scripts/ production diff — so a one-line edit to an
 # operator script under scripts/ now pays the union where it used to pay
