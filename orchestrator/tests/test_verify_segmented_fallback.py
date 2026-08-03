@@ -24,8 +24,8 @@ from __future__ import annotations
 import pathlib
 
 import pytest
-
 from _verify_config_corpus import DF_CONFIG_PATH, load_config_scalar
+
 from orchestrator.verify_cmd import ChainSegment, split_and_chain_segments
 
 # Loaded from the COMMITTED config rather than hand-copied a third time.
