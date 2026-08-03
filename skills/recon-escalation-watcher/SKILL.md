@@ -76,8 +76,12 @@ no worktree).
 
 ```
 1. Drain all pending recon escalations
-2. Start the watcher (background task, recon queue dir, NO --level)
-3. Wait for the watcher to fire (it exits on the first new escalation)
+2. Start the watcher: `scripts/watcher-rearm.sh` (background task, recon queue
+   dir, NO --level, --timeout 3600)
+3. Wait for it to exit. TWO exit paths — tell them apart, don't assume a fire:
+     FIRED   (exit 0, escalation JSON on stdout) → go to 4
+     CEILING (exit 124, NO escalation payload)   → the bounded slice just
+             expired; SKIP step 4 and fall through to the drain (5)
 4. Read the escalation from watcher output; fetch full detail via MCP
 5. Drain any other pending escalations
 6. Handle each
@@ -85,6 +89,20 @@ no worktree).
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
 8. Go to 2
 ```
+
+**Distinguishing the two exits at step 3.** The wrapper emits a machine-readable
+`WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line to
+**stderr** on every run — use it rather than inventing your own vocabulary. A
+`CEILING` wake carries no escalation payload; reading it as a fired-but-empty
+escalation is the mistake this step exists to prevent. It is not an error and
+needs no report — just re-drain and re-arm.
+
+Also: **exit 0 with EMPTY stdout is a non-fire**, never proof an escalation was
+printed. `escalation.watcher` installs a SIGTERM handler that converts a
+SIGTERM into a clean `sys.exit(0)`, so a killed watcher surfaces as
+`FIRED exit=0` with nothing on stdout (`scripts/watcher-rearm.sh` header,
+lines 57-64). Check for non-empty stdout before treating exit 0 as a fire —
+this queue's **sole closer** must not silently skip a cycle on a caught signal.
 
 ### Draining
 
