@@ -615,14 +615,14 @@ def test_foreign_holder_bounds_clear_measured_spawn_latency():
     following task 3451's own headroom-invariant precedent
     (``test_set_started_grace_floor_clears_measured_happy_path_latency``).
     """
-    assert _FOREIGN_HOLDER_STARTUP_SECS >= 8.0, (
-        f'must clear the measured worst-case happy-path spawn latency '
-        f'(4.71s at load-per-core 6.6, task 3451) with real margin; '
-        f'got {_FOREIGN_HOLDER_STARTUP_SECS}'
-    )
-    assert _FOREIGN_HOLDER_ATTRIBUTION_SECS >= 8.0, (
-        f'must clear the same measured worst-case happy-path spawn latency '
-        f'with real margin; got {_FOREIGN_HOLDER_ATTRIBUTION_SECS}'
+    bounds = {
+        '_FOREIGN_HOLDER_STARTUP_SECS': _FOREIGN_HOLDER_STARTUP_SECS,
+        '_FOREIGN_HOLDER_ATTRIBUTION_SECS': _FOREIGN_HOLDER_ATTRIBUTION_SECS,
+    }
+    assert all(bound >= 8.0 for bound in bounds.values()), (
+        f'both foreign-holder bounds must clear the measured worst-case '
+        f'happy-path spawn latency (4.71s at load-per-core 6.6, task 3451) '
+        f'with real margin; got {bounds!r}'
     )
 
 
