@@ -1619,12 +1619,23 @@ class Harness:
         # dir path as a string. Kept separate from the adopted sidecar dict
         # (which flows into build_workflow) to keep the resume payload clean.
         self._recovered_session_config_dirs: dict[str, str] = {}
-        # Consecutive-per-boot session_resume_fallback streak (task γ storm
-        # escape, INV-4). Incremented on each reason-carrying fallback in
-        # _run_slot; reset to 0 on any eligible resume. When it reaches
+        # session_resume_fallback streak (task γ storm escape, INV-4).
+        # Incremented in _run_slot on each UNEXPLAINED fallback ('stale' /
+        # 'no_transcript'); reset to 0 on any eligible resume. When it reaches
         # session_resume.fallback_storm_threshold, one deduped L1 is filed.
-        # Capped/disabled degradations do NOT feed it (by design).
+        # By-design degradations do NOT feed it: disabled, capped, and (task
+        # 3256) reseeded.
+        #
+        # The run is a ROLLING WINDOW, not a cumulative per-boot count: each
+        # increment must chain within session_resume.storm_window_secs of the
+        # previous fallback, else the streak decays to 0 first (task 3256 — a
+        # slow drip of isolated failures must never accumulate into a false
+        # storm). The stamp below is the chain's comparison point, on the
+        # MONOTONIC clock — 'stale' is itself produced by clock skew, so a
+        # wall-clock decay would be corrupted by the very failure it detects.
+        # None means "no run in progress" (boot, or after an eligible resume).
         self._session_resume_fallback_streak: int = 0
+        self._last_session_resume_fallback_at: float | None = None
 
         # Usage cap gate
         self.usage_gate: UsageGate | None = (
@@ -6119,10 +6130,11 @@ class Harness:
                 )[:200],
                 detail=(
                     f'{threshold} or more session-resume eligibility failures '
-                    'occurred in a row without an intervening successful '
-                    'resume. Every recovered agent session was rejected and '
-                    'degraded to a fresh dispatch — safe, but a RUN this long '
-                    'suggests a systematic cause.\n\n'
+                    'occurred in a chained run — each within '
+                    'session_resume.storm_window_secs of the previous, with no '
+                    'intervening successful resume. Every recovered agent '
+                    'session was rejected and degraded to a fresh dispatch — '
+                    'safe, but a RUN this tight suggests a systematic cause.\n\n'
                     'By-design degradations are EXCLUDED BY CONSTRUCTION and '
                     'cannot have contributed: a lane reseed (which always wipes '
                     '.task/ and its transcript store) is classified '
@@ -6143,8 +6155,9 @@ class Harness:
                     'Check host clock skew (NTP) first, then whether '
                     'transcripts are disappearing from a surviving '
                     '.task/claude-config dir. The streak resets on the next '
-                    'successful resume, so resolve this L1 once the underlying '
-                    'cause is fixed.'
+                    'successful resume, or decays after a storm_window_secs '
+                    'gap, so resolve this L1 once the underlying cause is '
+                    'fixed.'
                 ),
                 level=1,
             )
@@ -7684,6 +7697,10 @@ class Harness:
                 }
                 if eligible:
                     self._session_resume_fallback_streak = 0  # break any storm run
+                    # Drop the chain's comparison point too, so the next
+                    # fallback starts a fresh run instead of chaining off a
+                    # pre-reset stamp (task 3256).
+                    self._last_session_resume_fallback_at = None
                     if self.event_store:
                         self.event_store.emit(
                             EventType.session_resume,
@@ -7725,6 +7742,21 @@ class Harness:
                                 task_id=assignment.task_id,
                                 data={**resume_event_data, 'reason': reason},
                             )
+                        # Rolling-window decay (task 3256): "consecutive" means
+                        # CHAINED within storm_window_secs, not merely
+                        # cumulative-per-boot — which is what makes this a
+                        # storm DETECTOR rather than a running total. A gap at
+                        # least as long as the window means the previous run
+                        # ended, so start counting over. Monotonic, not
+                        # wall-clock: 'stale' is itself produced by clock skew.
+                        now = time.monotonic()
+                        window = self.config.session_resume.storm_window_secs
+                        if (
+                            self._last_session_resume_fallback_at is not None
+                            and (now - self._last_session_resume_fallback_at) >= window
+                        ):
+                            self._session_resume_fallback_streak = 0
+                        self._last_session_resume_fallback_at = now
                         self._session_resume_fallback_streak += 1
                         if (
                             self._session_resume_fallback_streak
