@@ -65,10 +65,17 @@ max_concurrent_tasks: 24
 # (scripts/legibility/digest.py, scripts/census_trigger.py,
 # scripts/tests/test_codebook.py, ...) to prefix ``scripts`` — so a
 # scripts/** diff routes to scripts/orchestrator.yaml's own test_command
-# instead, and this segment never executes for it. The real, still-open
-# gate is scripts/orchestrator.yaml's test_command, which targets only
-# tests/scripts/ under FULL_SUITE / merge-role merge_verify_breadth="full";
-# task 3460 owns closing that gap there — do not re-close it here.
+# instead, and this segment never executes for it. That gate is now CLOSED:
+# as of task 3460, scripts/orchestrator.yaml's test_command reads
+# ``pytest tests/scripts/ scripts/tests/`` — the same two-directory form,
+# in the same order, as this segment — so a scripts/** diff is gated on
+# BOTH directories by its owning module config, under FULL_SUITE and under
+# merge-role merge_verify_breadth="full" alike. The two are kept spelled
+# identically deliberately, so this path and that one cannot drift into
+# different notions of "the scripts suites"; if you widen one, widen the
+# other. Do NOT re-close it here: this segment still never runs for a
+# scripts/** diff, so a change made here to fix a scripts/ coverage
+# question would be inert, and would read as a gate that is not one.
 test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
