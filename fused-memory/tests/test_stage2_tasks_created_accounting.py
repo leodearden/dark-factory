@@ -37,6 +37,9 @@ from fused_memory.reconciliation.prompts.stage2 import (
 from fused_memory.reconciliation.recon_self_model import (
     render_task_creation_accounting_section,
 )
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _count_valid_task_created_records,
+)
 
 
 class TestTaskCreationAccountingWiring:
@@ -112,3 +115,130 @@ class TestTaskCreationAccountingWiring:
             'task_created_records must be declared as a bullet in the '
             '"## Per-Cycle Counter Schema" block.'
         )
+
+
+class TestCountValidTaskCreatedRecords:
+    """Pins _count_valid_task_created_records (task 3046): a defensive,
+    non-raising, deduped counter over stats['task_created_records'] — the
+    code-side complement to the '## Verifying Task Operations' confirmation
+    rule and the '## Task-Creation Accounting' action-record mandate.
+    """
+
+    # -- degenerate input: never raises, always 0 --------------------------
+
+    @pytest.mark.parametrize(
+        'records',
+        [None, {}, 'x', 3, []],
+        ids=['none', 'dict', 'str', 'int', 'empty-list'],
+    )
+    def test_degenerate_input_returns_zero(self, records):
+        assert _count_valid_task_created_records(records) == 0
+
+    # -- confirmation-status predicate ---------------------------------------
+
+    def test_one_created_record_counts_one(self):
+        records = [
+            {
+                'action': 'task_created',
+                'task_id': '3045',
+                'status': 'created',
+                'project_id': 'dark_factory',
+            },
+        ]
+        assert _count_valid_task_created_records(records) == 1
+
+    def test_combined_status_counts_as_success(self):
+        """`combined` is a success per `## Creating Tasks` — a candidate
+        merged into an existing task still returns a task_id."""
+        records = [
+            {
+                'action': 'task_created',
+                'task_id': '3045',
+                'status': 'combined',
+                'project_id': 'dark_factory',
+            },
+        ]
+        assert _count_valid_task_created_records(records) == 1
+
+    def test_failed_status_never_counts_even_with_task_id(self):
+        """`failed` is never counted toward tasks_created regardless of
+        whether a task_id is present — mirrors the '## Verifying Task
+        Operations' rule this helper encodes in Python."""
+        records = [
+            {
+                'action': 'task_created',
+                'task_id': '3045',
+                'status': 'failed',
+                'project_id': 'dark_factory',
+            },
+        ]
+        assert _count_valid_task_created_records(records) == 0
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            {'status': 'created', 'project_id': 'dark_factory'},
+            {'status': 'created', 'project_id': 'dark_factory', 'task_id': None},
+            {'status': 'created', 'project_id': 'dark_factory', 'task_id': ''},
+        ],
+        ids=['missing-task_id', 'none-task_id', 'empty-task_id'],
+    )
+    def test_missing_or_empty_task_id_does_not_count(self, record):
+        assert _count_valid_task_created_records([record]) == 0
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            {'task_id': '3045', 'status': 'pending', 'project_id': 'dark_factory'},
+            {'task_id': '3045', 'project_id': 'dark_factory'},
+        ],
+        ids=['unknown-status', 'missing-status'],
+    )
+    def test_unknown_or_missing_status_does_not_count(self, record):
+        """Only created/combined count — the helper does not guess at an
+        absent or unrecognized status."""
+        assert _count_valid_task_created_records([record]) == 0
+
+    # -- malformed entries are skipped, never raise --------------------------
+
+    def test_non_dict_entries_interleaved_with_one_valid_record(self):
+        records = [
+            None,
+            'x',
+            ['a'],
+            {
+                'action': 'task_created',
+                'task_id': '3045',
+                'status': 'created',
+                'project_id': 'dark_factory',
+            },
+        ]
+        assert _count_valid_task_created_records(records) == 1
+
+    # -- dedup: keyed on (project_id, str(task_id)) --------------------------
+
+    def test_dedups_same_project_and_task_id(self):
+        records = [
+            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
+            {'task_id': '3045', 'status': 'combined', 'project_id': 'dark_factory'},
+        ]
+        assert _count_valid_task_created_records(records) == 1
+
+    def test_same_task_id_under_different_projects_counts_twice(self):
+        """Cross-project routing files genuinely distinct tasks — Taskmaster
+        ids are per-project, so the same numeric id under two different
+        project_ids is two distinct tasks, not a duplicate."""
+        records = [
+            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
+            {'task_id': '3045', 'status': 'created', 'project_id': 'autopilot_video'},
+        ]
+        assert _count_valid_task_created_records(records) == 2
+
+    def test_dedups_int_and_str_task_id_forms(self):
+        """task_id normalises to str before deduping — the repo's existing
+        str(task_id) exact-form convention."""
+        records = [
+            {'task_id': 3045, 'status': 'created', 'project_id': 'dark_factory'},
+            {'task_id': '3045', 'status': 'combined', 'project_id': 'dark_factory'},
+        ]
+        assert _count_valid_task_created_records(records) == 1
