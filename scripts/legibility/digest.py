@@ -932,10 +932,19 @@ _SECTION_RENDERERS: dict[str, Any] = {
 """(detector, item-renderer) pair per section key, keyed identically to
 SECTION_HEADINGS/SECTION_PRIORITY."""
 
-ITEM_TRUNCATION_MARKER = '... [item truncated]'
-"""Appended to a per-item line that exceeded its byte cap. Explicit and
-ASCII (so its own byte length equals its character length), keeping
-degradation legible rather than silently lossy."""
+ITEM_TRUNCATION_MARKER = '... [item truncated'
+"""Stable, greppable PREFIX of the tail appended to a per-item line that
+exceeded its byte cap; :func:`_truncation_suffix` completes it with the
+quantified loss. Explicit and ASCII (so its own byte length equals its
+character length), keeping degradation legible rather than silently lossy.
+
+Deliberately a PREFIX rather than the whole literal: a fixed opaque marker
+told a reader that something was dropped but never how much, so a 20KB
+pasted turn capped to 2KB looked identical to one capped by 40 bytes
+(confusion-census-2026-07-31 R1, and §3.4 "rendered surfaces that omit
+their own basis"). Keeping the constant a prefix preserves every existing
+``ITEM_TRUNCATION_MARKER in ...`` grep, test and scan -- including
+:func:`_count_truncated_items` -- while the tail carries the numbers."""
 
 MAX_ITEM_BYTES = 2048
 """Hard ceiling on a single rendered item's UTF-8 byte length, regardless
@@ -965,22 +974,61 @@ def _item_byte_cap(max_bytes: int) -> int:
     return max(MIN_ITEM_BYTES, min(MAX_ITEM_BYTES, max_bytes - FRONTMATTER_RESERVE_BYTES))
 
 
+def _truncation_suffix(dropped: int, original: int) -> str:
+    """Render the full item-truncation tail: the stable
+    :data:`ITEM_TRUNCATION_MARKER` prefix plus how much of the item was
+    discarded, so the degradation reports its own magnitude rather than
+    only its existence."""
+    return f'{ITEM_TRUNCATION_MARKER}: {dropped} of {original} bytes dropped]'
+
+
 def _cap_item(line: str, cap: int) -> str:
     """Return *line* unchanged when its UTF-8 byte length is within *cap*;
     otherwise byte-truncate (never splitting a multi-byte codepoint) and
-    append :data:`ITEM_TRUNCATION_MARKER`.
+    append a :func:`_truncation_suffix` quantifying the loss.
 
     Byte-wise because the whole digest budget is measured in UTF-8 bytes
     (:func:`_resolve_size_bytes`); ``decode(..., 'ignore')`` drops a
     partial trailing codepoint instead of emitting a U+FFFD replacement
     character, so a truncated item never introduces mojibake into text a
     downstream LLM coder reads verbatim.
+
+    The suffix is self-referential -- its own byte length depends on the
+    digit counts of the numbers it reports, which depend on how many bytes
+    the suffix leaves room for -- so it is resolved by the same short
+    bounded fixed point :func:`_resolve_size_bytes` already documents for
+    ``size_bytes``: render against a guess (dropped=0), measure, re-render.
+    Suffix length is monotone non-decreasing across passes (a longer suffix
+    retains fewer bytes, which drops more, whose digit count can only grow)
+    and is bounded by the digit count of *original*, so this converges in a
+    couple of passes; the loop bound is a defensive cap, not a claim that
+    more passes are ever needed.
+
+    The result is ``<= cap`` bytes for any ``cap >= len(suffix)``: the
+    retained slice is capped at ``cap - len(suffix)`` and decoding can only
+    shorten it. :data:`MIN_ITEM_BYTES` (the floor :func:`_item_byte_cap`
+    never returns below) comfortably exceeds the longest possible suffix,
+    which is what makes that precondition structural.
     """
     encoded = line.encode('utf-8')
-    if len(encoded) <= cap:
+    original = len(encoded)
+    if original <= cap:
         return line
-    keep = max(0, cap - len(ITEM_TRUNCATION_MARKER))
-    return encoded[:keep].decode('utf-8', 'ignore') + ITEM_TRUNCATION_MARKER
+
+    suffix = _truncation_suffix(0, original)
+    for _ in range(4):
+        keep = max(0, cap - len(suffix.encode('utf-8')))
+        kept = encoded[:keep].decode('utf-8', 'ignore')
+        resolved = _truncation_suffix(original - len(kept.encode('utf-8')), original)
+        if resolved == suffix:
+            return kept + suffix
+        suffix = resolved
+
+    # Unreached in practice (see the convergence argument above); recompute
+    # the retained slice against the final suffix so the `<= cap` bound
+    # holds even if the loop bound were somehow exhausted.
+    keep = max(0, cap - len(suffix.encode('utf-8')))
+    return encoded[:keep].decode('utf-8', 'ignore') + suffix
 
 
 def _build_sections(
