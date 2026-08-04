@@ -1898,22 +1898,20 @@ def test_override_endpoint_rejects_invalid_ttl_minutes(client, bad_ttl):
 
 
 # ---------------------------------------------------------------------------
-# step-23: index.html references new scheduler JSX files + cache-buster bumped
+# step-23: index.html references new scheduler JSX files + cache-buster floor
 # ---------------------------------------------------------------------------
 
 
 def test_index_html_references_new_scheduler_jsx_files(client):
     """index.html must include script tags for the three new scheduler JSX files.
 
-    Also asserts every ?v= cache-buster on /static/redux/* assets is at or
-    past this floor.
+    Also pins every ?v= cache-buster on /static/redux/* assets at or above the
+    floor the scheduler jsx registration landed at.
 
-    FLOOR only: whether the versions are UNIFORM is asserted once,
-    canonically, in test_index_html.py. It was replicated byte-identically
-    across five test modules, each with its own stale monotonic floor, so a
-    partial bump failed five tests with five different floors in the
-    message. `min(...)` is the strictly stronger floor claim under mixed
-    versions anyway — the OLDEST asset is the one that serves stale code.
+    That pin is ANTI-REVERT, not a live bump check: index.html is far past 10
+    today, so it fails only if someone rolls the cache-busters back below what
+    scheduler jsx registration needed. Whether the versions are UNIFORM, and
+    whether the newest bump landed, are both asserted in test_index_html.py.
     """
     import re
 

@@ -321,16 +321,16 @@ def test_index_html_registers_esc_flow_diagram_load_order(index_html_body: str) 
     )
 
 
-def test_index_html_cache_buster_bumped_for_esc_flow(index_html_body: str) -> None:
-    """Every /static/redux/* asset must be at or past the floor that
-    accompanies registering the two new esc_flow_* files.
+def test_index_html_cache_buster_not_reverted_below_esc_flow_floor(
+    index_html_body: str,
+) -> None:
+    """Every /static/redux/* asset must stay at or past the floor that
+    accompanied registering the two new esc_flow_* files.
 
-    FLOOR only: whether the versions are UNIFORM is asserted once,
-    canonically, in test_index_html.py. It was replicated byte-identically
-    across five test modules, each with its own stale monotonic floor, so a
-    partial bump failed five tests with five different floors in the
-    message. `min(...)` is the strictly stronger floor claim under mixed
-    versions anyway — the OLDEST asset is the one that serves stale code.
+    This is an ANTI-REVERT PIN, not a live bump check: index.html is far past
+    33 today, so it fails only if someone rolls the cache-busters back below
+    what esc_flow_* registration needed. Whether the versions are UNIFORM, and
+    whether the newest bump landed, are both asserted in test_index_html.py.
     """
     versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
     assert versions, (

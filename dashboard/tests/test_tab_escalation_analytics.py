@@ -692,13 +692,10 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     synchronous script (no defer/async/type=module); and every
     /static/redux/*?v= cache-buster must be at or past this tab's floor of 30.
 
-    Check (g) is the FLOOR only: whether the versions are UNIFORM is asserted
-    once, canonically, in test_index_html.py. It was replicated
-    byte-identically across five test modules, each with its own stale
-    monotonic floor, so a partial bump failed five tests with five different
-    floors in the message. `min(...)` is the strictly stronger floor claim
-    under mixed versions anyway — the OLDEST asset is the one that serves
-    stale code.
+    Check (g) is an ANTI-REVERT PIN, not a live bump check: index.html is far
+    past 30 today, so it fails only if someone rolls the cache-busters back
+    below what this tab needed. Whether the versions are UNIFORM, and whether
+    the newest bump landed, are both asserted in test_index_html.py.
 
     Checks:
     (a) tab_escalation_analytics.jsx script tag exists.
@@ -772,13 +769,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
         'tab_escalation_analytics.jsx must load before app.jsx so EscalationAnalyticsTab is set on window.DF_TABS.',
     )
 
-    # (g) every /static/redux/ cache-buster is at or past this tab's floor.
-    #     FLOOR only: whether the versions are UNIFORM is asserted once,
-    #     canonically, in test_index_html.py. It was replicated byte-identically
-    #     across five test modules, each with its own stale monotonic floor, so a
-    #     partial bump failed five tests with five different floors in the
-    #     message. `min(...)` is the strictly stronger floor claim under mixed
-    #     versions anyway — the OLDEST asset is the one that serves stale code.
+    # (g) floor only — uniformity lives in test_index_html.py (see docstring).
     versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
     assert versions, (
         'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
