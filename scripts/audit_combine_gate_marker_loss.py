@@ -206,6 +206,19 @@ def load_ticket_expectations(tickets_db_path: str, project_id: str) -> dict[str,
     malformed or decodes to a non-dict, or its ``metadata`` is absent or not a
     dict — one corrupt ticket cannot abort a sweep.
 
+    DUPLICATE CREATED-ROWS ARE RESOLVED EXPLICITLY, NEWEST WINS. Nothing in
+    the schema forbids two ``status='created'`` rows for one
+    ``(project_id, task_id)``, and measured read-only on the live store
+    (2026-08-04) 32 such groups exist across 4281 created rows — e.g.
+    ``autopilot_video/579`` and a long tail under ``reify`` (dark_factory
+    itself currently has none, but this script audits any root passed to
+    ``--project-root``). The winning row decides which keys get reported LOST,
+    so an unordered scan would make the finding list differ run-to-run.
+    ``ORDER BY created_at, ticket_id`` (both TEXT, ISO-8601 so lexicographic
+    order IS chronological; ticket_id breaks a same-timestamp tie) plus the
+    unconditional overwrite below means the NEWEST created row wins — it is
+    the closest surviving record of what the task was filed with.
+
     Returns ``{}`` rather than raising when the file is absent; the caller
     records that as a coverage fact, not as a clean result.
     """
@@ -217,7 +230,8 @@ def load_ticket_expectations(tickets_db_path: str, project_id: str) -> dict[str,
     try:
         cursor = conn.execute(
             "SELECT task_id, candidate_json FROM tickets "
-            "WHERE project_id = ? AND status = ?",
+            "WHERE project_id = ? AND status = ? "
+            "ORDER BY created_at, ticket_id",
             (project_id, TICKET_STATUS_CREATED),
         )
         for task_id, candidate_json in cursor:
@@ -247,7 +261,9 @@ def load_ticket_expectations(tickets_db_path: str, project_id: str) -> dict[str,
 #
 # Measured: 31 live manifests bind 250 task_ids with ZERO task_id bound by
 # more than one manifest, so the reverse index is unambiguous in practice. The
-# ambiguous case is still detected and flagged rather than silently first-wins.
+# ambiguous case is still detected and ACTED ON rather than silently
+# first-wins: see _expected_from_manifest (which withholds delivered_checks
+# from a contested binding) and AuditCoverage.ambiguous_manifest_bindings.
 # ---------------------------------------------------------------------------
 
 # Both manifest homes, swept in this order. Sorted within each glob so the
@@ -671,6 +687,14 @@ class AuditCoverage(NamedTuple):
     list is an OBSERVABLE SUBSET and never "the damaged population".
     Presenting it as complete would be a no-silent-fail-soft violation
     (docs/legibility/design-invariants.md).
+
+    ``manifest_parse_failure_details`` carries the ``"<path>: <error>"``
+    strings themselves, not just the count: an operator told only that "2
+    manifests failed to parse" cannot find out WHICH, which would swallow the
+    failures at exactly the reporting boundary no-silent-fail-soft is about.
+    ``ambiguous_manifest_bindings`` counts combine targets whose manifest
+    binding was contested (see :func:`_expected_from_manifest`). Both fields
+    are defaulted so they are purely additive to positional construction.
     """
 
     total_combine_targets: int
@@ -678,6 +702,8 @@ class AuditCoverage(NamedTuple):
     targets_with_manifest: int
     targets_without_comparison_source: int
     manifest_parse_failures: int
+    manifest_parse_failure_details: tuple[str, ...] = ()
+    ambiguous_manifest_bindings: int = 0
 
 
 class ProjectAudit(NamedTuple):
@@ -715,14 +741,32 @@ def _expected_from_manifest(expectation: ManifestExpectation) -> dict[str, objec
     when the mechanical list is empty (manifest_stamping.py's
     ``if not mechanical:`` guard). Contributing it unconditionally would
     manufacture a GATE-REMOVING false positive for every manual-only manifest.
+
+    AN AMBIGUOUS BINDING ALSO WITHHOLDS ``delivered_checks``. When two
+    manifests bind one task_id, the check names here come from whichever
+    manifest sorted first — i.e. they may belong to the OTHER PRD entirely.
+    Claiming a lost mark-done gate on that basis would emit the single
+    highest-severity row, and drive exit 1, off a coin flip. The contested
+    binding is instead surfaced as provenance (``prd_path`` /
+    ``prd_task_label``, which the reason string annotates with every binder)
+    and counted in :attr:`AuditCoverage.ambiguous_manifest_bindings`, so the
+    collision is visible without being asserted as damage.
     """
     expected: dict[str, object] = {
         "prd_path": expectation.prd_path,
         "prd_task_label": expectation.label,
     }
-    if expectation.delivered_check_names:
+    if expectation.delivered_check_names and not expectation.ambiguous:
         expected["delivered_checks"] = list(expectation.delivered_check_names)
     return expected
+
+
+_AMBIGUOUS_BINDING_NOTE = (
+    "CONTESTED MANIFEST BINDING -- this task_id is bound by more than one "
+    "capability manifest ({binders}), so the manifest-sourced values above "
+    "come from the first in sorted order and may belong to another PRD; "
+    "delivered_checks is withheld entirely rather than asserted"
+)
 
 
 def audit_project(project_root: str, project_id: str | None = None) -> ProjectAudit:
@@ -758,6 +802,7 @@ def audit_project(project_root: str, project_id: str | None = None) -> ProjectAu
     with_ticket = 0
     with_manifest = 0
     without_source = 0
+    ambiguous_bindings = 0
 
     for target in targets.values():
         key_id = str(target.task_id)
@@ -788,23 +833,45 @@ def audit_project(project_root: str, project_id: str | None = None) -> ProjectAu
         # Union with per-key provenance. Manifest first, then the ticket
         # overwrites the keys it also speaks for, then delivered_checks is
         # restored to the manifest — see this function's docstring.
+        #
+        # The restore reads back from `manifest_expected` rather than
+        # re-deriving from `manifest.delivered_check_names`, so
+        # _expected_from_manifest stays the SINGLE place that decides whether
+        # the manifest speaks for delivered_checks at all. Re-deriving here
+        # silently bypassed both of that helper's guards (the empty-mechanical
+        # one and the contested-binding one) and re-introduced exactly the
+        # gate_removing false positive they exist to prevent.
+        manifest_expected = (
+            _expected_from_manifest(manifest) if manifest is not None else {}
+        )
         expected: dict[str, object] = {}
         source_of: dict[str, str] = {}
-        if manifest is not None:
-            for key, value in _expected_from_manifest(manifest).items():
-                expected[key] = value
-                source_of[key] = SOURCE_MANIFEST
+        for key, value in manifest_expected.items():
+            expected[key] = value
+            source_of[key] = SOURCE_MANIFEST
         if ticket is not None:
             for key, value in ticket.items():
                 expected[key] = value
                 source_of[key] = SOURCE_TICKET
-        if manifest is not None and manifest.delivered_check_names:
-            expected["delivered_checks"] = list(manifest.delivered_check_names)
-            source_of["delivered_checks"] = SOURCE_MANIFEST
+        if _GATE_KEY in manifest_expected:
+            expected[_GATE_KEY] = manifest_expected[_GATE_KEY]
+            source_of[_GATE_KEY] = SOURCE_MANIFEST
+
+        # A contested binding annotates every MANIFEST-sourced reason with the
+        # binders, so the collision travels with the row an operator reads
+        # rather than being visible only as an aggregate count.
+        ambiguous_note = ""
+        if manifest is not None and manifest.ambiguous:
+            ambiguous_bindings += 1
+            ambiguous_note = _AMBIGUOUS_BINDING_NOTE.format(
+                binders=", ".join(sorted(manifest.bound_by))
+            )
 
         live = set(target.metadata_keys)
         for key in expected.keys() - live:
             severity, reason = classify_gap(key, expected[key])
+            if ambiguous_note and source_of[key] == SOURCE_MANIFEST:
+                reason = f"{reason}; {ambiguous_note}"
             findings.append(
                 Finding(
                     tag=target.tag,
@@ -832,6 +899,8 @@ def audit_project(project_root: str, project_id: str | None = None) -> ProjectAu
             targets_with_manifest=with_manifest,
             targets_without_comparison_source=without_source,
             manifest_parse_failures=len(parse_failures),
+            manifest_parse_failure_details=tuple(parse_failures),
+            ambiguous_manifest_bindings=ambiguous_bindings,
         ),
     )
 
@@ -852,7 +921,17 @@ _FIDELITY_CAVEAT = (
     "367/368 on task_kind and 368/368 on source, the single task_kind "
     "mismatch (task 3295) proving the field IS mutable post-creation. "
     "Manifest-sourced rows rest on the capability sidecar instead, and are "
-    "labelled source=manifest."
+    "labelled source=manifest -- they carry their OWN assumption: the sidecar "
+    "is stamped with task_id in manifest_stamping.py step 4, which COMMITS TO "
+    "DISK BEFORE step 5 copies delivered_checks onto the task, and step 5's "
+    "per-label body is individually guarded (it logs a warning and continues "
+    "on an exception, and again when update_task returns a structured "
+    "rejection). A label whose step-5 write failed therefore leaves a stamped "
+    "sidecar beside a task that NEVER carried delivered_checks, which is "
+    "indistinguishable here from a combine wipe. Before treating a "
+    "source=manifest delivered_checks row as combine damage, grep the "
+    "fused-memory log for 'failed to build/write delivered_checks' or "
+    "'rejected delivered_checks write' naming that label."
 )
 
 _COVERAGE_CAVEAT = (
@@ -878,14 +957,21 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
     point is that the finding list is an observable subset, and a reader must
     be told the size of the unobservable remainder.
     """
-    return [
+    lines = [
         _COVERAGE_CAVEAT,
         f"    combine targets scanned:            {coverage.total_combine_targets}",
         f"    with a creating ticket:             {coverage.targets_with_ticket}",
         f"    with a capability manifest:         {coverage.targets_with_manifest}",
         f"    with NO comparison source:          {coverage.targets_without_comparison_source}",
+        f"    contested manifest bindings:        {coverage.ambiguous_manifest_bindings}",
         f"    manifests that failed to parse:     {coverage.manifest_parse_failures}",
     ]
+    # NAME the unreadable sidecars, never just count them. A count alone tells
+    # an operator that coverage is incomplete but not where to look, which
+    # swallows the failure at the reporting boundary (no-silent-fail-soft).
+    for detail in coverage.manifest_parse_failure_details:
+        lines.append(f"      - {detail}")
+    return lines
 
 
 def _format_section(label: str, findings: list[Finding]) -> list[str]:
@@ -1026,7 +1112,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "Override the tickets.db project_id (default: %(default)s, i.e. "
             "derived from the project root's directory name with '-' mapped "
             "to '_'). A wrong id matches zero tickets and would make every "
-            "combine target look wiped, so a mismatch is reported loudly."
+            "combine target look wiped, so a mismatch is reported loudly. "
+            "INTENDED FOR SINGLE-ROOT RUNS: this is ONE id applied to EVERY "
+            "resolved root, and a project_id is inherently per-project, so "
+            "combining it with several roots is warned about on stderr."
         ),
     )
     parser.add_argument(
@@ -1064,10 +1153,33 @@ def main(argv: list[str] | None = None) -> int:
     A single unreadable project (a corrupt/locked tasks.db) does NOT abort the
     sweep: it is logged to stderr and skipped so every other project is still
     audited, and a trailing warning states that the results are incomplete.
+
+    ``--project-id`` is ONE id applied to EVERY resolved root, but a
+    project_id is inherently per-project, so pairing it with several roots
+    queries each root's tickets.db for another project's rows.
+    :func:`_project_id_mismatch` catches the loud version of that (an id
+    matching zero created-rows in a store that plainly holds others), but it
+    is deliberately INERT for a root with no tickets.db or no created-rows at
+    all -- there the misuse would otherwise degrade silently into "(no
+    comparison source)" rows that look like honest missing evidence. So the
+    combination is warned about on stderr up front. Warned, not rejected: the
+    override is legitimate for a multi-root sweep over same-id checkouts (a
+    main checkout plus its worktrees), which is a real use, and this script
+    reports rather than gatekeeps.
     """
     args = _build_parser().parse_args(argv)
 
     roots = discover_project_roots(project_roots=args.project_roots)
+    if len(roots) > 1 and args.project_id:
+        print(
+            f"warning: --project-id {args.project_id!r} is applied to ALL "
+            f"{len(roots)} resolved project roots, but a project_id is "
+            "per-project; any root whose real id differs will be audited "
+            "against the wrong tickets.db rows (and a root with no created "
+            "tickets will silently report '(no comparison source)' instead of "
+            "flagging the mismatch). Prefer one --project-id run per root.",
+            file=sys.stderr,
+        )
     if not roots:
         print(
             "no project root resolvable with a readable tasks.db (checked "

@@ -394,6 +394,56 @@ def test_load_ticket_expectations_skips_absent_or_wrong_typed_metadata(tmp_path)
     assert list(load_ticket_expectations(str(db), "dark_factory")) == ["4"]
 
 
+def test_load_ticket_expectations_duplicate_created_rows_resolve_newest_wins(tmp_path):
+    """Two created rows for ONE (project_id, task_id) resolve deterministically.
+
+    Nothing in the schema forbids the duplicate and it exists on the live
+    store (32 such groups across 4281 created rows, measured 2026-08-04), so
+    an unordered scan would let the reported LOST key set flip run-to-run.
+    ORDER BY created_at picks the NEWEST row.
+    """
+    db = _make_tickets_db(tmp_path, [
+        {"ticket_id": "tkt_old", "project_id": "dark_factory", "task_id": 500,
+         "metadata": {"source": "stale"}},
+        {"ticket_id": "tkt_new", "project_id": "dark_factory", "task_id": 500,
+         "metadata": {"source": "fresh", "task_kind": "deterministic"}},
+    ])
+    # _make_tickets_db stamps one created_at for every row, so force the
+    # ordering the real store carries.
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE tickets SET created_at = ? WHERE ticket_id = ?",
+                     ("2026-01-01T00:00:00+00:00", "tkt_old"))
+        conn.execute("UPDATE tickets SET created_at = ? WHERE ticket_id = ?",
+                     ("2026-08-01T00:00:00+00:00", "tkt_new"))
+        conn.commit()
+    finally:
+        conn.close()
+
+    expectations = load_ticket_expectations(str(db), "dark_factory")
+
+    assert expectations == {"500": {"source": "fresh", "task_kind": "deterministic"}}
+
+
+def test_load_ticket_expectations_duplicate_rows_are_stable_across_runs(tmp_path):
+    """Same store, repeated reads, identical answer — the determinism claim."""
+    db = _make_tickets_db(tmp_path, [
+        {"ticket_id": f"tkt_{i}", "project_id": "dark_factory", "task_id": 501,
+         "metadata": {"source": f"v{i}"}}
+        for i in range(6)
+    ])
+
+    answers = {
+        json.dumps(load_ticket_expectations(str(db), "dark_factory"), sort_keys=True)
+        for _ in range(5)
+    }
+
+    assert len(answers) == 1
+    # Same created_at across all six rows, so ticket_id breaks the tie and the
+    # LAST one in that order wins.
+    assert load_ticket_expectations(str(db), "dark_factory") == {"501": {"source": "v5"}}
+
+
 def test_load_ticket_expectations_absent_db_returns_empty(tmp_path):
     """A project with no tickets.db is honest 'no comparison source', not a crash."""
     assert load_ticket_expectations(str(tmp_path / "nope.db"), "dark_factory") == {}
@@ -709,50 +759,71 @@ def test_severity_constants_are_distinct_strings(tmp_path):
 # exclusions: terminal, non-actionable severity, and the UNKNOWN pseudo-row.
 # ---------------------------------------------------------------------------
 
-def _f(**kw):
-    """A Finding with actionable defaults, so each test overrides ONE axis."""
-    base = dict(tag="master", task_id=1, status="pending", key="delivered_checks",
-                severity=SEVERITY_GATE_REMOVING, expected_source=SOURCE_MANIFEST,
-                terminal=False, reason="r")
-    return Finding(**{**base, **kw})
+def _finding(
+    *,
+    tag: str = "master",
+    task_id: int = 1,
+    status: str = "pending",
+    key: str = "source",
+    severity: str = SEVERITY_INFORMATIONAL,
+    expected_source: str = SOURCE_TICKET,
+    terminal: bool = False,
+    reason: str = "because",
+) -> Finding:
+    """THE Finding factory for this module — one, not one per section.
+
+    Keyword-only so every call site names the axis it is varying, and defined
+    once here so a field added to :class:`Finding` is threaded through a
+    single place. The ``is_actionable`` tests below pass ``key=``/``severity=``
+    explicitly rather than leaning on gate-removing defaults, so what each
+    test actually exercises is readable at the call site.
+    """
+    return Finding(tag=tag, task_id=task_id, status=status, key=key,
+                   severity=severity, expected_source=expected_source,
+                   terminal=terminal, reason=reason)
 
 
 def test_is_actionable_true_for_every_consumer_bearing_severity():
     for severity in (SEVERITY_GATE_REMOVING, SEVERITY_PROVENANCE,
                      SEVERITY_DISPATCH):
-        assert is_actionable(_f(severity=severity)) is True, severity
+        assert is_actionable(
+            _finding(key="delivered_checks", severity=severity)) is True, severity
 
 
 def test_is_actionable_false_for_inert_severities():
     """These name no consumer that lost something it acts on."""
     for severity in (SEVERITY_INFORMATIONAL, SEVERITY_BENIGN):
-        assert is_actionable(_f(severity=severity)) is False, severity
+        assert is_actionable(
+            _finding(key="delivered_checks", severity=severity)) is False, severity
 
 
 def test_is_actionable_false_for_a_terminal_finding_however_severe():
     """Actionable severity is NOT sufficient: terminal still suppresses."""
     for status in TERMINAL_STATUSES:
-        assert is_actionable(_f(status=status, terminal=True)) is False, status
+        assert is_actionable(_finding(
+            key="delivered_checks", severity=SEVERITY_GATE_REMOVING,
+            status=status, terminal=True)) is False, status
 
 
 def test_is_actionable_false_for_the_no_comparison_source_row():
     """UNKNOWN is neither clean nor damaged, so it must not turn the exit red."""
-    assert is_actionable(_f(key=NO_COMPARISON_SOURCE_KEY,
-                            severity=SEVERITY_INFORMATIONAL,
-                            expected_source=SOURCE_NONE)) is False
+    assert is_actionable(_finding(key=NO_COMPARISON_SOURCE_KEY,
+                                  severity=SEVERITY_INFORMATIONAL,
+                                  expected_source=SOURCE_NONE)) is False
 
 
 def test_is_actionable_excludes_no_comparison_source_independently_of_severity():
     """Belt AND braces: the pseudo-row is excluded by KEY, so it stays inert
     even if a future change were to hand it an actionable severity."""
-    assert is_actionable(_f(key=NO_COMPARISON_SOURCE_KEY,
-                            severity=SEVERITY_GATE_REMOVING)) is False
+    assert is_actionable(_finding(key=NO_COMPARISON_SOURCE_KEY,
+                                  severity=SEVERITY_GATE_REMOVING)) is False
 
 
 def test_is_actionable_false_for_an_unknown_severity():
     """Fails CLOSED on a severity added later: an unrecognised value is not
     silently promoted into the exit code."""
-    assert is_actionable(_f(severity="severity-invented-tomorrow")) is False
+    assert is_actionable(_finding(key="delivered_checks",
+                                  severity="severity-invented-tomorrow")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1085,84 @@ def test_audit_project_coverage_counts_and_parse_failures(tmp_path, make_tasks_d
     assert coverage.manifest_parse_failures == 1
 
 
+def test_audit_project_coverage_names_the_manifests_that_failed_to_parse(
+        tmp_path, make_tasks_db):
+    """The parse-failure STRINGS survive to the caller, not just the count.
+
+    A count alone tells an operator coverage is incomplete but not WHICH
+    sidecar to look at, which swallows the failure at the reporting boundary
+    no-silent-fail-soft is about.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 1, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        manifests=[
+            ("plans/broken-prd.capability-manifest.yaml", "prd: [unclosed\n  - nope"),
+            ("docs/prds/alsobad-prd.capability-manifest.yaml", "prd: {oops\n"),
+        ],
+    )
+
+    coverage = audit_project(str(root), "dark_factory").coverage
+
+    assert coverage.manifest_parse_failures == 2
+    assert len(coverage.manifest_parse_failure_details) == 2
+    joined = "\n".join(coverage.manifest_parse_failure_details)
+    assert "broken-prd.capability-manifest.yaml" in joined
+    assert "alsobad-prd.capability-manifest.yaml" in joined
+
+
+def test_audit_project_contested_manifest_binding_withholds_delivered_checks(
+        tmp_path, make_tasks_db):
+    """AMBIGUOUS BINDINGS MUST NOT MANUFACTURE A GATE-REMOVING ROW.
+
+    When two manifests bind one task_id the check names come from whichever
+    sorted first, i.e. possibly the OTHER PRD's. Asserting a lost mark-done
+    gate on that basis would emit the highest severity class, and drive exit
+    1, off a coin flip.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 700, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        manifests=[
+            ("plans/aaa-prd.capability-manifest.yaml",
+             _manifest_doc(700, label="α", prd="plans/aaa-prd.md")),
+            ("plans/zzz-prd.capability-manifest.yaml",
+             _manifest_doc(700, label="ω", prd="plans/zzz-prd.md")),
+        ],
+    )
+
+    audit = audit_project(str(root), "dark_factory")
+    by_key = _by_key(audit)
+
+    assert "delivered_checks" not in by_key
+    assert audit.coverage.ambiguous_manifest_bindings == 1
+    # Provenance IS still reported, and every manifest-sourced reason names
+    # both binders so the collision travels with the row.
+    assert "prd_path" in by_key
+    reason = by_key["prd_path"].reason
+    assert "CONTESTED MANIFEST BINDING" in reason
+    assert "aaa-prd.capability-manifest.yaml" in reason
+    assert "zzz-prd.capability-manifest.yaml" in reason
+    # ...and therefore nothing here is exit-code-driving as gate_removing.
+    assert not any(f.severity == SEVERITY_GATE_REMOVING for f in audit.findings)
+
+
+def test_audit_project_unambiguous_binding_still_reports_delivered_checks(
+        tmp_path, make_tasks_db):
+    """The guard above is scoped to the contested case, not a blanket mute."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 701, "status": "pending", "metadata": _WIPE_SIGNATURE}],
+        manifests=[("plans/solo-prd.capability-manifest.yaml", _manifest_doc(701))],
+    )
+
+    audit = audit_project(str(root), "dark_factory")
+
+    assert audit.coverage.ambiguous_manifest_bindings == 0
+    assert _by_key(audit)["delivered_checks"].severity == SEVERITY_GATE_REMOVING
+    assert "CONTESTED" not in _by_key(audit)["prd_path"].reason
+
+
 def test_audit_project_tolerates_a_missing_tickets_db(tmp_path, make_tasks_db):
     """No tickets.db at all degrades to manifest-only, never a raise."""
     root = _make_project(
@@ -1048,22 +1197,6 @@ def _audit(findings=(), coverage=None, root="/tmp/proj", project_id="dark_factor
     )
 
 
-def _finding(
-    *,
-    tag: str = "master",
-    task_id: int = 1,
-    status: str = "pending",
-    key: str = "source",
-    severity: str = SEVERITY_INFORMATIONAL,
-    expected_source: str = SOURCE_TICKET,
-    terminal: bool = False,
-    reason: str = "because",
-) -> Finding:
-    return Finding(tag=tag, task_id=task_id, status=status, key=key,
-                   severity=severity, expected_source=expected_source,
-                   terminal=terminal, reason=reason)
-
-
 def test_format_report_always_emits_both_caveats_even_with_zero_findings():
     """The whole point: an empty finding list is NOT a clean bill of health."""
     report = format_report([_audit()])
@@ -1073,12 +1206,56 @@ def test_format_report_always_emits_both_caveats_even_with_zero_findings():
 
 
 def test_format_report_names_the_no_comparison_source_count():
-    """COVERAGE prints targets_without_comparison_source as a number."""
-    report = format_report([_audit(coverage=AuditCoverage(91, 66, 40, 25, 2))])
+    """COVERAGE prints every population count as a WHOLE LINE.
 
-    assert "25" in report
-    assert "91" in report
-    assert "2" in report
+    Asserted on the rendered line, not on the bare digits: `"2" in report` was
+    vacuous because "2" is a substring of the "25" on the line above it, so a
+    regression dropping the parse-failure line entirely still went green.
+    """
+    report = format_report([_audit(coverage=AuditCoverage(91, 66, 40, 25, 2))])
+    lines = report.splitlines()
+
+    assert "    combine targets scanned:            91" in lines
+    assert "    with a creating ticket:             66" in lines
+    assert "    with a capability manifest:         40" in lines
+    assert "    with NO comparison source:          25" in lines
+    assert "    manifests that failed to parse:     2" in lines
+
+
+def test_format_report_names_each_unreadable_manifest_under_coverage():
+    """The parse-failure strings are PRINTED, not just counted."""
+    report = format_report([_audit(coverage=AuditCoverage(
+        1, 0, 0, 1, 2,
+        manifest_parse_failure_details=(
+            "/p/plans/broken-prd.capability-manifest.yaml: while parsing a flow node",
+            "/p/docs/prds/other-prd.capability-manifest.yaml: 1 validation error",
+        ),
+    ))])
+
+    assert "    manifests that failed to parse:     2" in report.splitlines()
+    assert "broken-prd.capability-manifest.yaml: while parsing a flow node" in report
+    assert "other-prd.capability-manifest.yaml: 1 validation error" in report
+
+
+def test_format_report_coverage_names_contested_manifest_bindings():
+    report = format_report([_audit(coverage=AuditCoverage(
+        5, 0, 5, 0, 0, ambiguous_manifest_bindings=3))])
+
+    assert "    contested manifest bindings:        3" in report.splitlines()
+
+
+def test_format_json_carries_the_parse_failure_details(tmp_path):
+    """The JSON consumer gets the strings too, not a lossy count."""
+    payload = json.loads(format_json([_audit(coverage=AuditCoverage(
+        1, 0, 0, 1, 1,
+        manifest_parse_failure_details=("/p/plans/x.capability-manifest.yaml: boom",),
+        ambiguous_manifest_bindings=2,
+    ))]))
+    coverage = payload["projects"][0]["coverage"]
+
+    assert coverage["manifest_parse_failure_details"] == [
+        "/p/plans/x.capability-manifest.yaml: boom"]
+    assert coverage["ambiguous_manifest_bindings"] == 2
 
 
 def test_format_report_does_not_call_ticket_evidenced_on_manifest_findings():
@@ -1512,8 +1689,47 @@ def test_main_project_root_is_repeatable(tmp_path, make_tasks_db):
 
     result = _run_cli("--project-root", str(a), "--project-root", str(b), "--json")
 
+    # Both roots audited cleanly: every finding is terminal (status=done), so
+    # none is actionable. Pinned because the exit code is the headline
+    # contract, not an afterthought of the payload assertion below.
+    assert result.returncode == 0
     payload = json.loads(result.stdout)
     assert [p["project_root"] for p in payload["projects"]] == [str(a), str(b)]
+
+
+def test_main_warns_when_project_id_is_applied_to_several_roots(tmp_path, make_tasks_db):
+    """ONE --project-id across MANY roots is a misuse, and is stated loudly.
+
+    A project_id is inherently per-project. _project_id_mismatch catches the
+    loud version, but is deliberately inert for a root with no tickets.db at
+    all -- there the misuse degrades into '(no comparison source)' rows that
+    look like honest missing evidence. So the combination is warned about up
+    front. Warned, NOT rejected: the run still completes and still exits on
+    its findings.
+    """
+    a = _make_project(tmp_path, make_tasks_db, name="a",
+                      tasks=[{"id": 1, "status": "done", "metadata": _WIPE_SIGNATURE}])
+    b = _make_project(tmp_path, make_tasks_db, name="b",
+                      tasks=[{"id": 2, "status": "done", "metadata": _WIPE_SIGNATURE}])
+
+    result = _run_cli("--project-root", str(a), "--project-root", str(b),
+                      "--project-id", "dark_factory", "--json")
+
+    assert result.returncode == 0
+    assert "--project-id" in result.stderr
+    assert "ALL" in result.stderr
+    assert json.loads(result.stdout)          # stdout stays pure payload
+
+
+def test_main_single_root_project_id_emits_no_multi_root_warning(tmp_path, make_tasks_db):
+    """The warning is scoped to the misuse: the ordinary single-root run is quiet."""
+    root = _make_project(tmp_path, make_tasks_db,
+                         tasks=[{"id": 1, "status": "done", "metadata": _WIPE_SIGNATURE}])
+
+    result = _run_cli("--project-root", str(root), "--project-id", "dark_factory", "--json")
+
+    assert result.returncode == 0
+    assert "applied to ALL" not in result.stderr
 
 
 def test_main_project_id_overrides_derivation(tmp_path, make_tasks_db):
@@ -1542,6 +1758,11 @@ def test_main_report_on_stdout_warnings_on_stderr(tmp_path, make_tasks_db):
 
     result = _run_cli("--project-root", str(good), "--project-root", str(bad), "--json")
 
+    # THE PARTIAL-FAILURE EXIT PATH, pinned: 0, NOT 3. One root failed and one
+    # was audited, so something WAS scanned -- 3 is reserved for "every
+    # resolved root failed", and conflating the two would tell a CI consumer a
+    # total failure and a partial one are the same outcome.
+    assert result.returncode == 0
     assert json.loads(result.stdout)          # stdout is pure payload
     assert "warning" in result.stderr.lower()
 
