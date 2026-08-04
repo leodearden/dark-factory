@@ -739,7 +739,7 @@ def _yaml_dquote(value: Any) -> str:
 
 FRONTMATTER_KEYS: tuple[str, ...] = (
     'session', 'cwd', 'encoded_dir', 'agent_class', 'date', 'size_bytes', 'score',
-    'n_user_turns',
+    'n_user_turns', 'truncated_items',
 )
 """Top-level frontmatter keys in the exact PRD Sec 7.2 order (everything
 before ``signal_counts``, which is rendered as its own nested block).
@@ -754,10 +754,18 @@ pasted report showed ``score: 5.0`` beside an all-zero ``signal_counts``.
 It is deliberately NOT a sixth ``signal_counts`` entry: that block is
 specifically :func:`signal_counts`' five detector hit-counts (mirrored by
 ``sampling.SignalCounts``, and read by :func:`_warn_if_body_evicted`'s
-``any(counts.values())`` guard), and a user-turn tally is neither."""
+``any(counts.values())`` guard), and a user-turn tally is neither.
+
+``truncated_items`` follows it (confusion-census-2026-07-31 R1): the
+per-item :data:`ITEM_TRUNCATION_MARKER` is legible only to a reader who
+gets that far into the body, so the count is surfaced up front -- a reader
+weighing the digest knows how many of its items have had substance capped
+out of them. It is resolved over the POST-trim sections (see
+:func:`_truncate_sections`), so it describes the body that actually
+ships."""
 
 BARE_FRONTMATTER_KEYS: frozenset[str] = frozenset(
-    {'size_bytes', 'score', 'n_user_turns'}
+    {'size_bytes', 'score', 'n_user_turns', 'truncated_items'}
 )
 """Top-level frontmatter keys rendered as bare YAML scalars; every other
 key in FRONTMATTER_KEYS is double-quoted via :func:`_yaml_dquote`. Named
@@ -1086,6 +1094,18 @@ def _resolve_size_bytes(meta: dict[str, Any], body: str) -> str:
     return digest
 
 
+def _count_truncated_items(sections: dict[str, list[str]]) -> int:
+    """Number of rendered lines across all *sections* that :func:`_cap_item`
+    byte-capped, identified by the stable :data:`ITEM_TRUNCATION_MARKER`
+    prefix."""
+    return sum(
+        1
+        for lines in sections.values()
+        for line in lines
+        if ITEM_TRUNCATION_MARKER in line
+    )
+
+
 def _truncate_sections(
     meta: dict[str, Any], sections: dict[str, list[str]], max_bytes: int,
 ) -> tuple[str, dict[str, list[str]]]:
@@ -1104,20 +1124,36 @@ def _truncate_sections(
     the loop stops even if the (now section-free) digest is still over
     the cap -- a soft cap can't shrink the frontmatter itself.
 
+    ``truncated_items`` is recomputed from the CURRENT sections before
+    every render, so the emitted number always describes the body being
+    rendered rather than a pre-trim snapshot -- popping a truncated item
+    would otherwise leave the frontmatter claiming the shipped body
+    contains a truncated item it does not. This preserves the termination
+    argument: popping an item can only lower the count (never raise it), so
+    the frontmatter never grows across iterations and the digest still
+    shrinks monotonically.
+
     Returns the rendered digest AND the post-trim section dict, so a
     caller can inspect final section state (e.g. render_digest's
     :func:`_warn_if_body_evicted` consistency guard) without re-parsing
     the rendered markdown body.
     """
     sections = {key: list(lines) for key, lines in sections.items()}
-    digest = _resolve_size_bytes(meta, _render_body(sections))
+
+    def _render(current: dict[str, list[str]]) -> str:
+        return _resolve_size_bytes(
+            {**meta, 'truncated_items': _count_truncated_items(current)},
+            _render_body(current),
+        )
+
+    digest = _render(sections)
 
     while len(digest.encode('utf-8')) > max_bytes:
         target_key = next((key for key in SECTION_PRIORITY if sections.get(key)), None)
         if target_key is None:
             break
         sections[target_key].pop()
-        digest = _resolve_size_bytes(meta, _render_body(sections))
+        digest = _render(sections)
 
     return digest, sections
 
@@ -1184,6 +1220,10 @@ def render_digest(
         'date': _derive_date(records),
         'score': score_signals(counts, n_user_turns),
         'n_user_turns': n_user_turns,
+        # Seeded so render_frontmatter is never called on a meta missing
+        # the key; _truncate_sections resolves the real value against the
+        # POST-trim sections it is about to render.
+        'truncated_items': 0,
         'signal_counts': counts,
     }
 
