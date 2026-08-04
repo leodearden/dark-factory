@@ -659,6 +659,140 @@ class TestRequireLaneLockHolders:
         )
 
 
+# ---------------------------------------------------------------------------
+# `lane_is_free` must never pass on an UNKNOWN read (task 3604).
+#
+# Measured against the real kernel before this was written, with a leaked fd
+# and a real flock:
+#
+#   A. we genuinely hold it, lock file present     -> False   (correct)
+#   B. we genuinely hold it, lock file UNLINKED    -> True    (THE SILENT GREEN)
+#   C. we genuinely hold it, lock table unreadable -> False   (silent, not wrong)
+#
+# B is the defect in its sharpest form and needs no mocks: os.stat fails so the
+# attribution read yields [], then the probe's O_CREAT mints a FRESH inode and
+# succeeds — so both halves answer about an inode that is NOT the one being
+# held.  Wrapped in `wait_until` at the two B12 call sites, one such poll
+# short-circuits the wait and the leak assertion passes green while the lane is
+# genuinely orphaned.
+#
+# C does NOT change today's return value (the probe already catches it), which
+# is exactly why its case below asserts on a RAISE and not on `is False` — see
+# that test's docstring.
+# ---------------------------------------------------------------------------
+
+
+class TestLaneIsFreeNeverPassesOnAnUnknownRead:
+    """lane_is_free has THREE outcomes — free, held, and UNKNOWN (loud)."""
+
+    def test_a_held_but_unlinked_lane_is_never_reported_free(self, tmp_path: Path):
+        """THE headline case: a genuinely-held lane whose lock file is gone.
+
+        Staged entirely against a real kernel with no monkeypatching, because a
+        mock-free reproduction proves the two halves genuinely answer about
+        DIFFERENT inodes rather than merely proving that a stubbed ``[]``
+        propagates.
+
+        Measured today: this returns ``True``. ``os.stat`` fails on the
+        unlinked path so the attribution read yields ``[]``, and the probe's
+        ``O_CREAT`` then mints a fresh inode and acquires it happily. Both
+        halves pass vacuously, and the ``wait_until`` wrapper at the two B12
+        call sites short-circuits green on the first such poll — a leaked lane
+        reported clean, strictly worse than the red task 3598 removed.
+        """
+        lock_path = lane_lock_path(tmp_path / 'lane')
+        with leaked_lane_lock(lock_path):
+            lock_path.unlink()
+
+            with pytest.raises(pytest.fail.Exception):
+                lane_is_free(lock_path)
+
+    def test_the_probe_must_not_recreate_the_lock_file_it_was_asked_about(
+        self, tmp_path: Path
+    ):
+        """The unknown read must abort BEFORE the probe can resurrect the file.
+
+        Non-obvious and load-bearing. Attribution is checked before the probe
+        (the ordering ``lane_is_free`` already documents), so a correct
+        implementation fails while the lock file is still absent. Today's code
+        does not: the probe's ``O_CREAT`` recreates the very file whose absence
+        made the answer unknown, quietly repairing the evidence a human would
+        need to diagnose the leak.
+        """
+        lock_path = lane_lock_path(tmp_path / 'lane')
+        with leaked_lane_lock(lock_path):
+            lock_path.unlink()
+
+            with pytest.raises(pytest.fail.Exception):
+                lane_is_free(lock_path)
+
+            assert not lock_path.exists(), (
+                'the probe-acquire ran despite the attribution read being '
+                'unknown, recreating the lock file it was asked about — the '
+                'strict read must abort first'
+            )
+
+    def test_an_unreadable_lock_table_is_not_silently_no_holders(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """An unreadable kernel lock table is UNKNOWN, not "nobody holds it".
+
+        Why this asserts on the RAISE and not on ``lane_is_free(...) is
+        False``: measured, with the lane genuinely held, today's return is
+        ALREADY ``False`` — the probe-acquire half fails on the
+        same-process/different-fd flock conflict and masks the bad read. An
+        ``is False`` assertion would therefore be green from the start and pin
+        nothing. Asserting the raise is red today for the right reason (DID NOT
+        RAISE) and pins the property actually being added.
+
+        On the staging seam: the plan called for
+        ``monkeypatch.setattr(verify_cancel_mod, 'PROC_LOCKS_PATH', ...)``, but
+        that is INERT and was measured to be so — ``PROC_LOCKS_PATH`` is
+        consumed as a DEF-TIME DEFAULT (``locks_path: Path = PROC_LOCKS_PATH``)
+        in both reader variants, so rebinding the module attribute after import
+        never reaches them and the real ``/proc/locks`` is still read. The
+        working injection points are the ``locks_path=`` keyword (which
+        ``lane_is_free`` deliberately does not expose) and a module-attribute
+        stub on THIS module, which is the seam
+        ``require_lane_lock_holders`` resolves by bare name specifically to
+        support, and which this file already uses twice above. Recorded here so
+        a later reader does not re-attempt the inert one (esc-3604-1).
+        """
+        def _unreadable(_path: Path) -> list[int]:
+            raise OSError(errno.EACCES, 'Permission denied', '/proc/locks')
+
+        monkeypatch.setattr(
+            sys.modules[__name__], 'lane_lock_holder_pids_strict', _unreadable,
+        )
+
+        lock_path = lane_lock_path(tmp_path / 'lane')
+        with leaked_lane_lock(lock_path), pytest.raises(pytest.fail.Exception):
+            lane_is_free(lock_path)
+
+    def test_a_genuinely_free_lane_is_still_reported_free(self, tmp_path: Path):
+        """NON-VACUITY CONTROL: a fresh, unheld lane must still read as free.
+
+        Without this and its sibling below, the fix could satisfy every case
+        above by simply failing on everything — and both B12 consumers, whose
+        entire purpose is to observe a lane BECOMING free, would then be
+        loud but useless.
+        """
+        lock_path = lane_lock_path(tmp_path / 'lane')
+
+        assert lane_is_free(lock_path) is True
+
+    def test_a_genuinely_held_lane_is_still_reported_held(self, tmp_path: Path):
+        """NON-VACUITY CONTROL: a leaked lane must still read as held, not unknown.
+
+        The B13 signal itself. A held lane whose lock file is intact is a
+        KNOWN answer — ``False`` — and must not be escalated to a loud failure
+        just because the strict read now exists.
+        """
+        lock_path = lane_lock_path(tmp_path / 'lane')
+        with leaked_lane_lock(lock_path):
+            assert lane_is_free(lock_path) is False
+
+
 def test_scaffold_helpers_are_importable(tmp_path: Path):
     """Smoke pin: the shared helpers exist and the foreign holder really holds.
 
