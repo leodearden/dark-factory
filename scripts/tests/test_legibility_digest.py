@@ -25,6 +25,7 @@ import gzip
 import io
 import json
 import logging
+import re
 import zlib
 
 import pytest
@@ -1691,7 +1692,63 @@ class TestPerItemByteCap:
         capped = mod._cap_item(line, cap)
 
         assert len(capped.encode('utf-8')) <= cap
-        assert capped.endswith(mod.ITEM_TRUNCATION_MARKER)
+        # 'in', not endswith: the marker is a stable greppable PREFIX with
+        # a variable quantified tail (see the R1 tests below).
+        assert mod.ITEM_TRUNCATION_MARKER in capped
+
+    def test_truncation_marker_is_a_stable_greppable_prefix(self):
+        # confusion-census-2026-07-31 R1: the marker gains a quantified
+        # tail, but the constant itself stays a fixed ASCII PREFIX so every
+        # existing `MARKER in digest` grep/test keeps working unchanged.
+        assert mod.ITEM_TRUNCATION_MARKER == '... [item truncated'
+
+    def test_truncation_marker_reports_bytes_dropped_and_original_size(self):
+        # census §3.4, "rendered surfaces that omit their own basis": a
+        # fixed opaque marker says something was dropped but never how
+        # much, so a 20KB pasted turn capped to 2KB looks identical to one
+        # capped by 40 bytes. The two numbers must be internally
+        # consistent, not decorative.
+        line = '- (turn 0) ' + ('x' * 5000)
+        cap = 2048
+
+        capped = mod._cap_item(line, cap)
+
+        match = re.search(
+            r'\.\.\. \[item truncated: (\d+) of (\d+) bytes dropped\]$', capped,
+        )
+        assert match is not None, capped[-120:]
+
+        original_bytes = len(line.encode('utf-8'))
+        suffix_bytes = len(match.group(0).encode('utf-8'))
+        kept_bytes = len(capped.encode('utf-8')) - suffix_bytes
+
+        assert int(match.group(2)) == original_bytes
+        assert int(match.group(1)) == original_bytes - kept_bytes
+
+    def test_quantified_marker_still_respects_the_byte_cap(self):
+        # The suffix's own byte length depends on the digit counts of the
+        # numbers it reports, which depend on how many bytes the suffix
+        # leaves room for -- the cap must hold anyway, for ASCII and
+        # multi-byte alike, with no mojibake.
+        for line in (
+            '- (turn 0) ' + ('x' * 5000),
+            '- (turn 0) ' + ('é→' * 2000),
+        ):
+            for cap in (256, 500, 1024, 2048):
+                capped = mod._cap_item(line, cap)
+
+                assert len(capped.encode('utf-8')) <= cap, (cap, line[:20])
+                assert '�' not in capped
+                assert mod.ITEM_TRUNCATION_MARKER in capped
+
+    def test_truncation_suffix_fits_within_min_item_bytes(self):
+        # Makes the `<= cap` guarantee structural rather than incidental:
+        # _item_byte_cap never returns below MIN_ITEM_BYTES, so as long as
+        # the longest possible suffix fits inside MIN_ITEM_BYTES there is
+        # always room for it plus at least some retained content.
+        longest = mod._truncation_suffix(999_999_999_999, 999_999_999_999)
+
+        assert len(longest.encode('utf-8')) < mod.MIN_ITEM_BYTES
 
     def test_cap_item_truncates_multibyte_text_without_mojibake(self):
         # The cap is a BYTE cap -- naive slicing on a multi-byte-character
