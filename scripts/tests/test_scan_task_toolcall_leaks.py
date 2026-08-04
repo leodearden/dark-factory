@@ -429,3 +429,90 @@ def test_cli_continues_past_unreadable_db_and_warns_on_stderr(tmp_path, make_tas
     assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert "992" in result.stdout
     assert str(corrupt_db) in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Single-detector promotion (task 3083)
+#
+# This script's detector was promoted into fused_memory.utils.toolcall_xml_leak
+# so that the task-DB scanner, the live MCP write-boundary guard, and the Mem0
+# corpus sweep all share ONE definition of a leak. Everything above this line
+# is the pre-existing behavioural contract and must stay green UNMODIFIED —
+# that is the regression proof that the promotion changed nothing here.
+#
+# The assertions below are IDENTITY assertions on purpose. Equality would pass
+# against a second, independently-maintained copy of the regex, which is
+# exactly the drift the promotion exists to prevent.
+#
+# Sentinel literals use the \x3c escape for "<" (task 3083 plan pre-1): writing
+# one verbatim would force the authoring agent to emit that literal inside its
+# own tool-call XML, reproducing the bug under repair.
+# ---------------------------------------------------------------------------
+
+_CLOSE_CONTENT = "\x3c/content>"
+_CLOSE_INVOKE = "\x3c/invoke>"
+
+
+class TestDetectorIsTheSharedDefinition:
+    """The script must re-export the shared detector, not redefine it."""
+
+    def test_leak_tail_is_the_shared_pattern_object(self):
+        import scan_task_toolcall_leaks
+        from fused_memory.utils import toolcall_xml_leak
+
+        assert scan_task_toolcall_leaks.LEAK_TAIL is toolcall_xml_leak.LEAK_TAIL
+
+    def test_detect_leak_is_the_shared_function_object(self):
+        import scan_task_toolcall_leaks
+        from fused_memory.utils import toolcall_xml_leak
+
+        assert scan_task_toolcall_leaks.detect_leak is toolcall_xml_leak.detect_leak
+
+    def test_patching_the_shared_detector_changes_the_script_behaviour(self, monkeypatch, make_tasks_db):
+        """Delegation is real, not a same-valued copy captured at import."""
+        import scan_task_toolcall_leaks
+
+        monkeypatch.setattr(
+            scan_task_toolcall_leaks, "detect_leak", lambda text: "SENTINEL" if text else None
+        )
+        db_path = make_tasks_db([{"id": 7, "description": "totally clean prose"}])
+
+        matches = scan_db(str(db_path))
+
+        assert matches, "scan_db must call through the patched shared detector"
+        assert all(m.fragment == "SENTINEL" for m in matches)
+
+
+class TestGeneralizedShapesAreReportedByScanDb:
+    """The task DB is subject to the identical harness bug, so the two Mem0
+    generalizations must be visible through this script too."""
+
+    def test_closing_content_tag_leak_is_reported(self, make_tasks_db):
+        fragment = _CLOSE_CONTENT + '\n<parameter name="priority">high'
+        db_path = make_tasks_db([{"id": 3083, "description": "Body prose." + fragment}])
+
+        matches = scan_db(str(db_path))
+
+        assert [(m.task_id, m.column, m.fragment) for m in matches] == [
+            (3083, "description", fragment)
+        ]
+
+    def test_bare_closing_invoke_tail_leak_is_reported(self, make_tasks_db):
+        fragment = _CLOSE_CONTENT + "\n" + _CLOSE_INVOKE
+        db_path = make_tasks_db([{"id": 3084, "details": "Body prose." + fragment}])
+
+        matches = scan_db(str(db_path))
+
+        assert [(m.task_id, m.column, m.fragment) for m in matches] == [
+            (3084, "details", fragment)
+        ]
+
+    def test_generalization_does_not_weaken_the_whitespace_discriminator(self, make_tasks_db):
+        """Prose quoting the new shapes with an ESCAPED backslash-n stays clean."""
+        rows = [
+            {"id": 1, "description": "Quoted: `" + _CLOSE_CONTENT + "\\n" + _CLOSE_INVOKE + "` here."},
+            {"id": 2, "description": "Adjacent:" + _CLOSE_CONTENT + _CLOSE_INVOKE},
+        ]
+        db_path = make_tasks_db(rows)
+
+        assert scan_db(str(db_path)) == []

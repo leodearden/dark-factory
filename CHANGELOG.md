@@ -8,6 +8,82 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+#### Leaked tool-call XML: root cause, and the tooling to sweep the corpus (task 3083)
+
+**This task ships no write-time guard.** Live rejection at the MCP write
+boundary is delivered by `fused_memory/server/markup_tripwire.py` (task 3141 —
+see "MCP writes carrying raw envelope markup are now REJECTED" below), which is
+deliberately the only place in the package that enumerates the markup literals.
+An earlier revision of this task added a second, parallel guard; it was retired
+before merge as a duplicate enumeration of that invariant. If you need to write
+content that legitimately quotes a fragment, the override is 3141's
+`metadata={'allow_mcp_markup': True}` and the rejection is
+`error_type = 'McpEnvelopeMarkupWriteRejected'`.
+
+**What this task establishes: the fragments do not originate in this repo.**
+There is no XML parser anywhere in `fused-memory/src/`. They are evidence that
+the *harness's* tool-call parser terminated a string argument early at a literal
+closing tag inside that argument's value, which also **silently swallows the
+sibling arguments that followed**. A leaked fragment in `description` means
+`priority` may never have reached the MCP boundary at all, in which case
+`sqlite_task_backend.py`'s `priority or 'medium'` substituted a plausible wrong
+value with no log. That sibling-argument loss is the part of the failure that is
+otherwise invisible — a corrupted record looks merely untidy, not wrong.
+
+**Added:** `fused_memory/utils/toolcall_xml_leak.py`, the shared detector for
+*already-stored* content, now the single implementation behind the corpus sweep,
+`scan_memory_content`, the redaction path, and `scripts/scan_task_toolcall_leaks.py`
+(which previously carried its own inline copy of the pattern).
+
+It is calibrated in the **opposite** direction from 3141's tripwire, on purpose:
+the tripwire over-reports to maximise recall at write time, where a false
+positive costs one retry; this detector under-reports to stay precise, because
+it runs over already-stored content where a false positive would silently
+rewrite something a user wrote. That asymmetry is why both exist, and why this
+one must not adopt the tripwire's pattern list.
+
+**Also added:** `scan_memory_content` (read-only literal substring scan over
+Qdrant payload text — semantic `search` provably cannot find these),
+`redact_episode_content` (neutralise a leaked Graphiti episode without
+`delete_episode(cascade=True)` destroying its valid extracted edges), and
+`fused-memory/scripts/sweep_toolcall_xml_leak.py` (the corpus sweep; dry-run by
+default).
+
+**What the sweep's repair preserves.** The memory **text** in full, plus the
+**payload metadata** that is the record's only metadata-scoped retrieval axis —
+carry-over rule `payload keys - _MEM0_OWNED_KEYS`, with the scope identities
+threaded back as `agent_id=` / `session_id=` arguments and anything carried
+nowhere *named* per-record in the report's `metadata_dropped`. Without that,
+a repaired record would silently vanish from `get_memories_by_metadata` /
+`count_memories_by_metadata`, which match payload keys by equality.
+
+**The sweep verifies the re-add persisted** rather than trusting a non-raising
+`add_memory`: the service swallows a Mem0 write failure into
+`AddMemoryResponse.message` as `[mem0_error: ...]` and returns normally, so a
+returned response is not evidence of a write. Three per-record outcomes exit
+non-zero and need a human — `content_lost_in_flight` (the delete landed, the
+re-add did not persist; the original text now exists only in the printed report,
+restore it from there before re-running), `skipped_not_mem0_routed` (a
+repairable record whose category does not route to mem0, left entirely untouched
+because neither a plain re-add nor `dual_write=True` is safe), and
+`record_error` (that record's repair aborted on an unexpected error, so whether
+its delete landed is unknown).
+
+**The report always survives an abort**, since for a `content_lost_in_flight`
+record it is the only remaining copy of the original text. Each record enters
+the report *before* any store mutation is attempted and its repair runs under
+its own `try`, so one record's transport failure is recorded as `record_error`
+on that record and the sweep continues instead of unwinding and discarding every
+earlier entry. If anything escapes anyway, the CLI prints the **partial** report
+— same shape, plus `"aborted": true` — before exiting `2`.
+
+**Full root cause, evidence, and operator runbook:**
+[`docs/mcp-toolcall-xml-leak.md`](docs/mcp-toolcall-xml-leak.md). Run the sweep
+**before** any further large consolidation pass — consolidation deletes
+corrupted entries as a merge side effect and destroys the specimens.
+
 ### Changed (BREAKING)
 
 #### MCP writes carrying raw envelope markup are now REJECTED (task 3141)

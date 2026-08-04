@@ -32,6 +32,7 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
+from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
 from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
@@ -792,6 +793,109 @@ class GraphitiBackend:
             node.delete(driver),
             timeout=self._write_timeout,
         )
+
+    @_canonicalize_group_args
+    async def redact_episode_content(
+        self, episode_uuid: str, *, group_id: str, new_content: str,
+    ) -> dict[str, Any]:
+        """Replace ONE EpisodicNode's ``content`` in place, preserving everything else.
+
+        The remediation primitive for an episode whose raw text carries a
+        leaked serialized tool-call fragment (task 3083). Three design
+        commitments, each of which is why this method exists at all rather
+        than the caller reaching for an existing one:
+
+        1. **Redact, never cascade-delete.** ``delete_episode(cascade=True)``
+           would destroy the entities and edges exclusively sourced from this
+           episode — for the known residual
+           ``d12b0eb4-f027-4d0c-a26c-096ccd0e75c2`` that includes
+           demonstrably-VALID collateral such as edge ``ea4072dc``. Deleting
+           real knowledge to fix appearance is strictly worse than the leak.
+           So this issues exactly one scoped ``SET e.content`` and no removal
+           of any kind.
+        2. **No vector is invalidated.** EpisodicNodes carry no embedding
+           property of their own (graphiti_core's episode save query writes
+           none), so unlike the Mem0 sweep — which must delete and re-add so
+           the repaired text is re-embedded — an in-place content SET here
+           leaves nothing stale behind.
+        3. **The extracted edges are deliberately left untouched.** They were
+           extracted from the CLEAN portion of the text, before the harness
+           truncated it; the fragment contributed no facts. Rewriting them
+           would be a second mutation with no evidence behind it.
+
+        Both the before-read and the write are scoped by ``uuid`` AND
+        ``group_id``, so a uuid belonging to another project's graph can
+        neither be read nor redacted through this call.
+
+        NOT PROVIDED HERE: Graphiti-side DISCOVERY — enumerating which
+        episodes across a graph carry a leak. That needs a full episode scan
+        with no payload index to lean on, and is tracked as follow-up work.
+        This is the remediation primitive for an episode you have ALREADY
+        identified, by hand or from the Mem0 sweep's report.
+
+        Args:
+            episode_uuid: UUID of the EpisodicNode to redact.
+            group_id: Project graph to target.
+            new_content: Replacement text. Must be non-empty and must not
+                itself carry a leak per the shared detector.
+
+        Returns:
+            ``{uuid, group_id, old_content, new_content}`` so the caller can
+            audit exactly what was neutralised.
+
+        Raises:
+            ValueError: if *new_content* is blank, or still carries a leaked
+                tool-call fragment (a redaction that re-introduces the
+                fragment is not a redaction).
+            NodeNotFoundError: if no Episodic node with that UUID exists in
+                *group_id* — a typo can never be mistaken for a success.
+            RuntimeError: if the backend is not initialized.
+        """
+        if not new_content or not new_content.strip():
+            raise ValueError(
+                'redact_episode_content requires non-empty new_content — '
+                'redaction is content-preserving, not content-erasing'
+            )
+        if has_toolcall_xml_leak(new_content):
+            raise ValueError(
+                'redact_episode_content refuses new_content that still carries a '
+                'leaked tool-call XML fragment (a redaction that re-introduces '
+                'the leak is not a redaction)'
+            )
+
+        graph = self._graph_for(group_id)
+        result = await asyncio.wait_for(
+            graph.ro_query(
+                'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
+                'RETURN e.content',
+                {'uuid': episode_uuid, 'group_id': group_id},
+            ),
+            timeout=self._read_timeout,
+        )
+        if not result.result_set:
+            raise NodeNotFoundError(
+                f'Episodic node not found in group {group_id}: {episode_uuid}'
+            )
+        old_content = result.result_set[0][0] or ''
+
+        await asyncio.wait_for(
+            graph.query(
+                'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
+                'SET e.content = $content',
+                {'uuid': episode_uuid, 'group_id': group_id, 'content': new_content},
+            ),
+            timeout=self._write_timeout,
+        )
+        logger.info(
+            'redact_episode_content: episode=%s group=%s old_len=%d new_len=%d',
+            episode_uuid, group_id, len(old_content), len(new_content),
+        )
+        return {
+            'uuid': episode_uuid,
+            'group_id': group_id,
+            'old_content': old_content,
+            'new_content': new_content,
+        }
 
     @_canonicalize_group_args
     async def remove_edge(self, edge_uuid: str, *, group_id: str) -> None:

@@ -32,13 +32,35 @@ conditions hold (the closing-tag literal, then real whitespace), the
 capture group extends greedily to end-of-string (``.*$``); that greedy
 tail is simply where the fragment capture ends, not an independent
 discriminator in its own right.
+
+Single source of truth (task 3083): ``LEAK_TAIL`` and ``detect_leak`` are
+no longer defined here. They live in
+:mod:`fused_memory.utils.toolcall_xml_leak` and are re-exported by this
+module so its public surface is unchanged. That promotion is deliberate —
+the SAME detector also backs the Mem0/Qdrant corpus sweep
+(``fused-memory/scripts/sweep_toolcall_xml_leak.py``) and the
+``scan_memory_content`` read tool, so those consumers cannot drift apart on
+what counts as a leak. The shared module was also generalized for the Mem0
+specimens: a stray ``content`` closing tag now counts, as does a bare
+closing ``invoke`` tag as the continuation. The real-whitespace
+discriminator described above is unchanged.
+
+Note the division of labour with :mod:`fused_memory.server.markup_tripwire`,
+which owns the LIVE write-boundary rejection at the
+``submit_task``/``update_task``/``add_memory``/``add_episode`` MCP tools and
+is the authoritative enumeration of the envelope literals. That guard is
+deliberately broader (a bare substring scan, accepting over-reporting to
+maximise recall at write time). This detector is deliberately PRECISE,
+because it runs over an already-stored corpus where a false positive would
+provoke an unnecessary content rewrite. The two are not redundant and must
+not be collapsed into one another.
 """
 from __future__ import annotations
 
 import argparse
-import re
 import sqlite3
 import sys
+from pathlib import Path
 from typing import NamedTuple
 
 from _task_db_scan import (
@@ -49,38 +71,49 @@ from _task_db_scan import (
     truncate,
 )
 
-LEAK_TAIL = re.compile(
-    r'</(?:description|parameter|details)>\s+(<parameter\s+name="[^"]*">.*)$',
-    re.DOTALL,
+# THE detector lives in fused_memory.utils.toolcall_xml_leak and is re-exported
+# here (task 3083). It is deliberately NOT redefined locally: a second copy of
+# this regex would drift from the Mem0 corpus sweep, silently reopening the
+# ambiguity the promotion closed. See that module's docstring for the
+# discriminator's rationale and the root-cause finding. Fix any import problem
+# here rather than re-inlining the pattern.
+#
+# This is a standalone CLI: it must import cleanly when run by a bare
+# interpreter with no fused-memory venv active (the documented read-only sweep
+# is invoked straight from a shell), and it must resolve `fused_memory` to THIS
+# checkout rather than to whatever editable install happens to be on the path —
+# otherwise a worktree run silently tests the main checkout's copy of the
+# detector. Prepending our own src/ satisfies both: the fused-memory editable
+# install is an ordinary .pth path entry, so sys.path order decides the winner.
+# Mirrors the bootstrap convention in scripts/reviewer_redundancy_diagnostic.py.
+_FM_SRC = Path(__file__).resolve().parent.parent / "fused-memory" / "src"
+if str(_FM_SRC) not in sys.path:
+    sys.path.insert(0, str(_FM_SRC))
+
+from fused_memory.utils.toolcall_xml_leak import (  # noqa: E402
+    LEAK_TAIL,
+    detect_leak,
 )
+
+# LEAK_TAIL and detect_leak are re-exported deliberately: this module's public
+# surface predates the promotion of the detector into fused_memory, and callers
+# (plus the test suite's identity assertions) still reach for them here.
+__all__ = [
+    "LEAK_TAIL",
+    "LeakMatch",
+    "SCANNED_COLUMNS",
+    "detect_leak",
+    "format_json",
+    "format_report",
+    "main",
+    "scan_db",
+]
 
 # Task text columns scanned for leaks. `metadata` is deliberately excluded —
 # it legitimately stores remediation records (e.g. task 2865's
 # metadata.stage2_description_corruption_fix.stripped_fragment) that contain
 # this exact marker; scanning it would false-positive on already-fixed tasks.
 SCANNED_COLUMNS = ("title", "description", "details", "test_strategy")
-
-
-def detect_leak(text: object) -> str | None:
-    """Return the leaked fragment in *text*, or None if it is clean.
-
-    *text* is expected to be a task text column's value (str) or None (a
-    NULL column) — falsy input or anything that isn't a str returns None
-    without raising, so callers can pass a raw sqlite3 row value straight
-    through. The match starts at the stray closing tag
-    (``</description>``/``</parameter>``/``</details>``), requires one or
-    more real whitespace characters immediately after it (a closing tag with
-    ``<parameter`` adjacent and zero whitespace in between does not match),
-    and then runs to end-of-string (after ``text.rstrip()``, so trailing
-    whitespace tacked onto an otherwise-genuine leak does not defeat
-    detection).
-    """
-    if not text or not isinstance(text, str):
-        return None
-    match = LEAK_TAIL.search(text.rstrip())
-    if match is None:
-        return None
-    return match.group(0)
 
 
 class LeakMatch(NamedTuple):

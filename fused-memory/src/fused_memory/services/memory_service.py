@@ -3711,6 +3711,60 @@ class MemoryService:
         _normalize_task_id_metadata(filters)
         return await self.mem0.count_by_metadata(scope, filters)
 
+    async def scan_memory_content(
+        self,
+        project_id: str,
+        needles: list[str] | None = None,
+        *,
+        filters: dict | None = None,
+        exhaustive: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Literal substring scan over Mem0 payload TEXT (task 3083, WORK b).
+
+        Thin passthrough to ``Mem0Backend.scan_payload_text``. Neither semantic
+        (``search``) nor metadata equality
+        (``count_memories_by_metadata``/``get_memories_by_metadata``) — it
+        matches the memory TEXT itself, which is the capability whose absence
+        made the tool-call XML leak corpus unsweepable: a leaked serialized
+        fragment carries almost no semantic signal, so a live 2026-07-26
+        semantic probe for it returned zero.
+
+        *needles* and *filters* of ``None`` are passed through AS ``None``;
+        the backend supplies the default needle set from
+        ``fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`` so the
+        sentinels are defined in exactly one place. The caller's collections
+        are copied before use and never mutated.
+
+        A ``task_id`` filter is normalized to str on the COPY, exactly as
+        ``count_memories_by_metadata``/``get_memories_by_metadata`` do — see
+        ``_normalize_task_id_metadata``'s docstring. The backend turns every
+        filter entry into a ``MatchValue`` equality condition and Qdrant's
+        payload filter is TYPE-SENSITIVE, so without this an int ``task_id``
+        would match nothing and return an empty scan with no error: a
+        silently-wrong clean verdict, which is the exact failure class this
+        tool exists to eliminate.
+
+        Returns ``{'matches': [...], 'scanned': int, 'truncated': bool}``.
+
+        A Qdrant read-timeout is PROPAGATED (raises ``TimeoutError``), not
+        returned as an empty match list — a timed-out scan must never be
+        mistaken for a clean corpus — and is surfaced at the MCP boundary as
+        ``{'error', 'error_type': 'TimeoutError'}`` by ``@mcp_tool_errors``.
+        """
+        scope = Scope(project_id=project_id)
+        scan_filters = None
+        if filters is not None:
+            scan_filters = dict(filters)
+            _normalize_task_id_metadata(scan_filters)
+        return await self.mem0.scan_payload_text(
+            scope=scope,
+            needles=list(needles) if needles is not None else None,
+            filters=scan_filters,
+            exhaustive=exhaustive,
+            limit=limit,
+        )
+
     async def get_memories_by_metadata(
         self,
         project_id: str,
@@ -4693,6 +4747,70 @@ class MemoryService:
             )
 
         return {'status': 'deleted', 'episode_id': episode_id, 'cascade': cascade}
+
+    async def redact_episode_content(
+        self,
+        episode_uuid: str,
+        new_content: str,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Replace one Graphiti episode's raw content in place, preserving its edges.
+
+        The non-destructive counterpart to ``delete_episode`` for an episode
+        whose text carries a leaked serialized tool-call fragment (task 3083).
+        ``delete_episode(cascade=True)`` would destroy the entities and edges
+        exclusively sourced from that episode — which for the known residual
+        ``d12b0eb4`` includes demonstrably-valid collateral — so the leak is
+        neutralised in the raw text and the extracted knowledge is left alone.
+
+        See ``GraphitiBackend.redact_episode_content`` for the full rationale
+        and for the loud refusals (blank replacement, or a replacement that
+        still carries a leak, or an absent episode uuid).
+
+        Returns:
+            ``{status, store, uuid, old_content, new_content}``.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+
+        result_data = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            backend='graphiti',
+            operation='redact_episode_content',
+            payload={'episode_uuid': episode_uuid},
+            coro=self.graphiti.redact_episode_content(
+                episode_uuid, group_id=project_id, new_content=new_content,
+            ),
+        )
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='redact_episode_content',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                # Truncated copies for the journal only — the full strings are
+                # returned to the caller for audit.
+                params={
+                    'episode_uuid': episode_uuid,
+                    'new_content': new_content[:200],
+                },
+                result_summary={'status': 'redacted'},
+                success=True,
+            )
+
+        return {
+            'status': 'redacted',
+            'store': 'graphiti',
+            **(result_data or {}),
+        }
 
     async def refresh_entity_summary(
         self,

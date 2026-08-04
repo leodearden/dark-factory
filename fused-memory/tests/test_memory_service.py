@@ -9130,6 +9130,159 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
         )
 
 
+class TestScanMemoryContent:
+    """MemoryService.scan_memory_content delegates to mem0.scan_payload_text.
+
+    Task 3083, WORK (b): a LITERAL substring scan over Qdrant payload text.
+    Neither semantic (`search`) nor metadata equality (`scroll_by_metadata`) —
+    the gap that made the tool-call XML leak corpus unsweepable, since a
+    leaked fragment carries almost no semantic signal.
+
+    Sentinel literals use the \x3c escape for "<" (plan pre-1).
+    """
+
+    _CLOSE_CONTENT = '\x3c/content>'
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_scan_payload_text_with_scope(self, mock_config):
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 3, 'truncated': False}
+        )
+
+        await svc.scan_memory_content(
+            project_id='dark_factory',
+            needles=[self._CLOSE_CONTENT],
+            filters={'category': 'procedural_knowledge'},
+            exhaustive=True,
+            limit=500,
+        )
+
+        svc.mem0.scan_payload_text.assert_awaited_once()
+        call = svc.mem0.scan_payload_text.call_args
+        scope = call.kwargs.get('scope') or call.args[0]
+        assert isinstance(scope, Scope)
+        assert scope.project_id == 'dark_factory'
+        assert call.kwargs['needles'] == [self._CLOSE_CONTENT]
+        assert call.kwargs['filters'] == {'category': 'procedural_knowledge'}
+        assert call.kwargs['exhaustive'] is True
+        assert call.kwargs['limit'] == 500
+
+    @pytest.mark.asyncio
+    async def test_returns_the_backend_result_unchanged(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        expected = {
+            'matches': [{'id': 'a', 'created_at': None, 'matched_fragments': [],
+                         'excerpt': 'x', 'metadata': {}}],
+            'scanned': 19321,
+            'truncated': False,
+        }
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(return_value=expected)
+
+        assert await svc.scan_memory_content(project_id='dark_factory') == expected
+
+    @pytest.mark.asyncio
+    async def test_does_not_call_semantic_search(self, mock_config):
+        """This is deterministic detection, not similarity ranking. Falling back
+        to search would silently drop matches off the bottom of a top-N cut."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        svc.mem0.search = AsyncMock(return_value={'results': []})
+
+        await svc.scan_memory_content(project_id='dark_factory')
+
+        svc.mem0.search.assert_not_called()
+        svc.mem0.scroll_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_mutate_the_callers_collections(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        needles = [self._CLOSE_CONTENT]
+        filters = {'category': 'procedural_knowledge'}
+
+        await svc.scan_memory_content(
+            project_id='dark_factory', needles=needles, filters=filters
+        )
+
+        assert needles == [self._CLOSE_CONTENT]
+        assert filters == {'category': 'procedural_knowledge'}
+        assert svc.mem0.scan_payload_text.call_args.kwargs['needles'] is not needles
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] is not filters
+
+    @pytest.mark.asyncio
+    async def test_none_needles_and_filters_pass_through_as_none(self, mock_config):
+        """Defaulting belongs to the backend, which reads the shared sentinels —
+        the service must not invent a second default list."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+
+        await svc.scan_memory_content(project_id='dark_factory')
+
+        assert svc.mem0.scan_payload_text.call_args.kwargs['needles'] is None
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with pytest.raises(TimeoutError):
+            await svc.scan_memory_content(project_id='dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_an_int_task_id_filter_is_normalized_to_str(self, mock_config):
+        """Matches the sibling metadata-matching read paths
+        (count_memories_by_metadata / get_memories_by_metadata).
+
+        The backend turns each filter entry into a MatchValue equality
+        condition and Qdrant's payload filter is TYPE-SENSITIVE, while the
+        write paths store task_id normalized to str. Without this,
+        `filters={'task_id': 3083}` returns zero matches with no error — a
+        silently-wrong empty result, which is the exact failure class this tool
+        exists to eliminate.
+        """
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        filters = {'task_id': 3083}
+
+        await svc.scan_memory_content(project_id='dark_factory', filters=filters)
+
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] == {'task_id': '3083'}
+        # The normalization happens on the COPY, never the caller's dict.
+        assert filters == {'task_id': 3083}
+
+
 class TestGetMemoriesByMetadata:
     """MemoryService.get_memories_by_metadata delegates to mem0.scroll_by_metadata."""
 
