@@ -66,6 +66,7 @@ from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended, _run
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_holder_pids,
+    lane_lock_holder_pids_strict,
     lane_lock_path,
     read_lock_holder_pgid,
     release_merge_verify_flock,
@@ -84,6 +85,7 @@ __all__ = [
     'lane_lock_path',
     'leaked_lane_lock',
     'real_git_ops',
+    'require_lane_lock_holders',
     'wait_for_lane_lock_holder',
     'wait_until',
 ]
@@ -122,6 +124,16 @@ _FOREIGN_HOLDER_TEARDOWN_SECS = 5.0
 #: long a genuinely broken staging takes to fail — it can never make a broken
 #: staging pass.
 _FOREIGN_HOLDER_ATTRIBUTION_SECS = 30.0
+
+#: Bound on how long :func:`require_lane_lock_holders` retries an UNREADABLE
+#: kernel lock table before failing loudly.  Deliberately NOT the 30s
+#: spawn-latency class (_FOREIGN_HOLDER_*_SECS): this retries a procfs read,
+#: which either succeeds within microseconds or is structurally broken (a
+#: deleted lock file, a host with no /proc/locks), so a longer bound only
+#: delays a certain failure rather than buying safety margin.  It must also
+#: stay well inside the 10.0s `wait_until` timeout at both B12 call sites, or
+#: a single poll iteration would consume the whole outer wait.
+_LANE_LOCK_STRICT_READ_SECS = 2.0
 
 
 @contextlib.contextmanager
@@ -316,6 +328,62 @@ def wait_for_lane_lock_holder(
             return holders
         if time.monotonic() >= deadline:
             return holders
+        time.sleep(interval)
+
+
+def require_lane_lock_holders(
+    lock_path: Path,
+    timeout: float = _LANE_LOCK_STRICT_READ_SECS,
+    interval: float = 0.02,
+    read_holders: Callable[[Path], list[int]] | None = None,
+) -> list[int]:
+    """Read *lock_path*'s kernel FLOCK holders, failing loudly if it cannot be read.
+
+    The NEGATIVE-side counterpart of :func:`wait_for_lane_lock_holder`, and the
+    contrast is the point.  That helper polls to confirm a POSITIVE attribution
+    and, on timeout, RETURNS the last snapshot rather than raising — the
+    caller's own ``assert pid in holders`` then carries the kernel-observed
+    evidence.  Here the caller is asserting the OPPOSITE (that a lane is FREE),
+    and a fail-safe empty read is precisely the answer that SATISFIES it.  So
+    an unreadable table must raise: rendered as ``[]`` it would pass a B12 leak
+    assertion vacuously, which is strictly worse than the red task 3598 removed
+    — a silent green reports a leaked lane as clean.
+
+    Reads through :func:`~orchestrator.verify_cancel.lane_lock_holder_pids_strict`
+    (task 3604), which propagates the ``OSError`` from a missing lock file or an
+    unreadable ``/proc/locks`` instead of swallowing it.  A read that SUCCEEDS
+    and reports no holders is a real answer and is returned immediately — "the
+    kernel says nobody holds it" is exactly what the caller is entitled to
+    conclude from, and is not retried.
+
+    The bounded retry (:data:`_LANE_LOCK_STRICT_READ_SECS`) is what keeps this
+    from trading a silent green for a NEW flake class: a one-off transient
+    procfs hiccup — the class of event task 3598 measured under 16-worker xdist
+    load — is absorbed, while a structurally unreadable table still fails
+    within the bound.
+
+    *read_holders* defaults to ``None`` and is resolved to the module-global
+    ``lane_lock_holder_pids_strict`` at CALL time (a bare name lookup inside
+    the function body, not a def-time default), so a ``monkeypatch.setattr`` on
+    this module's attribute is honoured — the same seam
+    :func:`wait_for_lane_lock_holder` documents.
+    """
+    reader = read_holders if read_holders is not None else lane_lock_holder_pids_strict
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return reader(lock_path)
+        except OSError as exc:
+            last_error = exc
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f'could not read the kernel lock table for {lock_path} within '
+                f'{timeout}s — last error: {last_error!r}. This is UNKNOWN, not '
+                f'"the lane is free": an unreadable table means no rows were '
+                f'examined at all, so reading it as "no holders" would pass a '
+                f'B12 leak assertion vacuously while the lane is genuinely '
+                f'held (task 3604)'
+            )
         time.sleep(interval)
 
 
