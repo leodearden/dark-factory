@@ -601,16 +601,36 @@ async def _check_canonical_uniqueness(
     already failing the write, where its cost is irrelevant.
 
     WHY THE EXISTING ``enforce`` FLAG AND NOT A NEW ONE: measured, not
-    assumed.  At the time of writing the live ``dark_factory`` corpus holds
-    exactly ONE ``canonical: true`` record, and its ``topic`` is
+    assumed.  When this was written the live ``dark_factory`` corpus held
+    exactly ONE ``canonical: true`` record, and its ``topic`` was
     ``eval_worktree_plan_tools_missing`` — snake_case, which fails
     ``TOPIC_SLUG_RE``.  Enforcing uniqueness on day one over a topic key
     whose own live values still only warn would be the census-refuted-premise
     outage the warn default exists to prevent, and would make uniqueness the
     single fatal check that ignores the flag every sibling check honours.
-    THE PRECONDITION for flipping ``memory_metadata.enforce`` is leaf θ's
-    retro-stamping sweep normalizing those topics — check that has landed
-    before you flip it.
+
+    THAT SPECIFIC HAZARD IS NOW CLEARED, AND θ WAS NOT ACTUALLY THE GATE
+    (measured 2026-08-04).  Two corrections to the paragraph above, both
+    recorded because the original wording sent a reader to the wrong check:
+
+    * ``retro_stamp_topics.py`` has now been RUN (``--apply``), and the
+      residual records outside its id-bounded manifest were normalized too,
+      so ``legacy_topic_spelling_remains`` is empty and every live
+      ``canonical: true`` topic conforms in BOTH projects.  Note the trap
+      this sentence used to set: task 3201 was ``done`` for months meaning
+      the SCRIPT had landed, while the sweep had never been applied
+      (``stamped_total: 0``).  "Has θ landed?" is the wrong question —
+      re-run the script and read ``legacy_topic_spelling_remains``.
+    * θ was necessary bookkeeping but nearly irrelevant to blast radius.
+      ``enforce`` rejects WRITES and never re-validates the corpus, so
+      normalizing records at rest moved the measured false-rejection rate
+      by ~1/week (~20 → ~19).  Rejections come from NEW writes by writers
+      who were never told the rule: ``_MEMORY_INSTRUCTIONS`` still carries
+      no slug guidance.  THE REAL PRECONDITION is leaf ι (task 3202).
+
+    Task 3626 is the gate that re-measures and decides the flip; it carries
+    the full model and the re-measurement recipes.  Do not flip from this
+    docstring alone.
 
     RESIDUAL — this check is inherently TOCTOU-windowed: two concurrent
     first-canonical writes for one topic can both observe 0 and both
