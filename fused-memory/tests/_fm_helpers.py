@@ -7,12 +7,16 @@ module name so test files can `from _fm_helpers import X` without
 colliding with sibling subprojects' helpers.
 """
 
+import ast
 import asyncio
 import contextlib
 import functools
 import inspect
 import json
+import os
+import pathlib
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -635,6 +639,147 @@ def ensure_fresh_collection(
 
 
 # ---------------------------------------------------------------------------
+# Shared FalkorDB test scaffolding (task 3502)
+# ---------------------------------------------------------------------------
+#
+# Connection constants, reachability probe and skip-marker factory for tests
+# that drive a live FalkorDB. Placed directly after the Qdrant section above so
+# the two reachability-probe pairs (constants → probe → skipif factory) read as
+# one convention. tests/test_falkor_probe_routing_guard.py enforces that no
+# test module forks this scaffolding back into itself.
+# ---------------------------------------------------------------------------
+
+def _falkor_host_from_env() -> str:
+    """Derive the FalkorDB host from FALKOR_HOST, defaulting to localhost.
+
+    A named function rather than an expression inlined at the constant's
+    assignment, so the derivation is reachable at call time and can be tested
+    under a monkeypatched environment without ``importlib.reload``.
+    """
+    return os.environ.get('FALKOR_HOST', 'localhost')
+
+
+def _falkor_port_from_env() -> int:
+    """Derive the FalkorDB port from FALKOR_PORT, defaulting to 6379.
+
+    The ``int()`` is load-bearing, not cosmetic: ``os.environ`` yields str, and
+    ``FalkorDB(port='6379')`` fails or misbehaves on a str port.
+
+    Unset *or empty* takes the default. Empty is what a CI template like
+    ``FALKOR_PORT: ${FALKOR_PORT}`` produces when the variable is not set, and
+    it is the same shape ``known_project_roots_from_env`` (models/scope.py)
+    already treats as unset.
+
+    A non-empty, non-numeric value is an operator error and raises
+    ``RuntimeError`` naming the offending value.
+
+    That raise fires at *import* of this module, and conftest.py imports it on
+    every session — so a malformed FALKOR_PORT aborts the whole run, including
+    the unit lane, which never touches FalkorDB. This is intentional, and is
+    faithful to the behaviour it replaces: each of the six migrated modules
+    already did a bare ``int(os.environ.get('FALKOR_PORT', 6379))`` at its own
+    import, so a malformed value was always fatal. What changes is (a) the
+    message — actionable text naming the offending value, rather than a
+    ``ValueError`` traceback into a shared helper — and (b) the blast radius,
+    which widens from the six FalkorDB modules to every fused-memory module.
+    Deferring the raise into ``_falkor_available()`` would narrow (b), at the
+    cost of letting a typo'd port read as "FalkorDB not reachable" and silently
+    skip the live lane rather than reporting the typo. Failing loudly is the
+    better trade.
+    """
+    raw = os.environ.get('FALKOR_PORT', '').strip()
+    if not raw:
+        return 6379
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(
+            f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
+            f'default (6379), or set it to the port your FalkorDB listens on.'
+        ) from None
+
+
+# Evaluated once at import; consumers import the constants, not the helpers.
+FALKOR_HOST: str = _falkor_host_from_env()
+FALKOR_PORT: int = _falkor_port_from_env()
+
+
+def _falkor_available() -> bool:
+    """Probe whether a FalkorDB instance is reachable at FALKOR_HOST:FALKOR_PORT.
+
+    Returns False rather than raising for any failure — construct, query or
+    close — and is bounded by ``socket_connect_timeout=2``, so an unreachable
+    host costs ~2s at most.
+
+    Uses the falkordb-native sync client rather than ``redis``: redis is not a
+    declared dependency of fused-memory, only a transitive of
+    graphiti-core[falkordb], so a redis-based probe would break silently if
+    falkordb ever switched transport.
+
+    Imports FalkorDB lazily so (a) conftest.py's session-wide import of this
+    module does not drag falkordb into sessions that never touch it, and (b)
+    the name resolves at call time, which is what lets tests patch
+    ``falkordb.FalkorDB`` deterministically. Same convention as
+    ``_qdrant_available`` above.
+
+    Deliberately NOT cached: each consuming module pays its own probe at its
+    own collection time. Memoising would break the call-time tracking
+    ``falkor_skipif`` relies on, and test_integration_marker_real_service.py
+    budgets for the per-module cost explicitly.
+    """
+    from falkordb import FalkorDB
+
+    try:
+        client = FalkorDB(
+            host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2
+        )
+        try:
+            client.select_graph('_probe').query('RETURN 1')
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+        return True
+    except Exception:
+        return False
+
+
+def falkor_skipif(reason: str = 'FalkorDB not reachable'):
+    """Return a ``pytest.mark.skipif`` marker gated on `_falkor_available()`.
+
+    A factory rather than a module-level marker constant: conftest.py imports
+    this module on every session, so evaluating the probe at import time would
+    cost a bounded ~2s connection attempt even for sessions that never touch
+    FalkorDB. Called from a consuming module's ``pytestmark``, or as a
+    class/function decorator, the probe instead fires at that module's own
+    collection time.
+
+    Resolves ``_falkor_available`` through the module global at call time
+    rather than capturing it, so the marker tracks whatever the probe
+    currently reports.
+    """
+    return pytest.mark.skipif(not _falkor_available(), reason=reason)
+
+
+def unique_graph_name(slug: str) -> str:
+    """Return a fresh per-run FalkorDB graph name, ``_test_<slug>_<8 hex>``.
+
+    A fresh name is minted on every call so that concurrent test runs —
+    pytest-xdist ``-n auto``, or a CI matrix pointed at one shared FalkorDB —
+    never select the same graph and wipe each other's fixtures.
+
+    The caller still owns the rest of the lifecycle: the best-effort delete of
+    a stale graph left by a prior run, and the teardown ``graph.delete()`` /
+    ``client.aclose()`` pair.
+
+    Args:
+        slug: Should embed the owning task id, by convention (e.g.
+            ``2207_merge_entities``), so a graph orphaned by a killed run is
+            traceable back to the test module that created it.
+    """
+    return f'_test_{slug}_{uuid.uuid4().hex[:8]}'
+
+
+# ---------------------------------------------------------------------------
 # Shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
 #
@@ -1004,3 +1149,53 @@ async def reap_leaked_ticket_workers() -> int:
         if task.done():
             reaped += 1
     return reaped
+
+
+# ---------------------------------------------------------------------------
+# Shared AST migration-guard machinery (task 3502)
+# ---------------------------------------------------------------------------
+#
+# Migration guards (tests/test_falkor_probe_routing_guard.py;
+# tests/test_gather_idiom_helper_routing.py) assert over the source text of a
+# fixed set of migrated modules. Parsing is shared and memoised here so several
+# guards asserting over overlapping module sets pay one parse per file per
+# session rather than one each.
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _test_module_source(path: pathlib.Path) -> str:
+    return path.read_text()
+
+
+@functools.cache
+def parse_test_module(path: pathlib.Path) -> ast.Module:
+    """Parse *path* into an ``ast.Module``, memoised per session.
+
+    Test sources do not change mid-session, so several guards asserting over
+    overlapping module sets can share one parse per file.
+    """
+    assert path.exists(), f'{path} not found'
+    return ast.parse(_test_module_source(path), filename=str(path))
+
+
+def calls_named(node: ast.AST, name: str) -> list[ast.Call]:
+    """Every ``ast.Call`` under *node* whose callee is ``name(...)`` / ``….name(...)``.
+
+    AST, not string grep: prose that merely mentions the name — a docstring
+    describing the helper a guard enforces — must not satisfy or trip a check.
+
+    Takes any node, not only a module, so a guard can ask the narrower question
+    "is it called *here*" — inside a decorator, or inside the value assigned to
+    ``pytestmark`` — rather than only "is it called anywhere in the file".
+    """
+    found: list[ast.Call] = []
+    for descendant in ast.walk(node):
+        if not isinstance(descendant, ast.Call):
+            continue
+        func = descendant.func
+        if (isinstance(func, ast.Name) and func.id == name) or (
+            isinstance(func, ast.Attribute) and func.attr == name
+        ):
+            found.append(descendant)
+    return found

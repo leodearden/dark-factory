@@ -549,6 +549,241 @@ class TestQdrantHelpers:
 
 
 # ---------------------------------------------------------------------------
+# Tests for shared FalkorDB test scaffolding (task 3502)
+# ---------------------------------------------------------------------------
+# No real FalkorDB is used here — falkordb.FalkorDB is monkeypatched
+# throughout, so this suite runs in the default `-m 'not integration'` lane.
+
+class TestFalkorHelpers:
+    """Unit tests for FALKOR_HOST/FALKOR_PORT, _falkor_available(), falkor_skipif()."""
+
+    def test_falkor_host_from_env_default(self, monkeypatch):
+        """_falkor_host_from_env() falls back to the local-FalkorDB default.
+
+        The ``delenv`` is what makes the assertion deterministic under an
+        operator environment that sets FALKOR_HOST.
+        """
+        from _fm_helpers import _falkor_host_from_env
+
+        monkeypatch.delenv('FALKOR_HOST', raising=False)
+
+        assert _falkor_host_from_env() == 'localhost'
+
+    def test_falkor_host_from_env_override(self, monkeypatch):
+        """FALKOR_HOST is honoured — the normal shape when FalkorDB is not on loopback."""
+        from _fm_helpers import _falkor_host_from_env
+
+        monkeypatch.setenv('FALKOR_HOST', 'falkordb.internal')
+
+        assert _falkor_host_from_env() == 'falkordb.internal'
+
+    def test_falkor_port_from_env_default(self, monkeypatch):
+        """_falkor_port_from_env() falls back to 6379 *as an int*."""
+        from _fm_helpers import _falkor_port_from_env
+
+        monkeypatch.delenv('FALKOR_PORT', raising=False)
+
+        assert _falkor_port_from_env() == 6379
+        assert isinstance(_falkor_port_from_env(), int)
+
+    def test_falkor_port_from_env_coerces_to_int(self, monkeypatch):
+        """An overridden FALKOR_PORT is coerced from str to int.
+
+        The coercion is load-bearing: a str port silently breaks
+        ``FalkorDB(port=...)``. This is the assertion that fails if ``int()``
+        is ever dropped — ``'7000' == 7000`` is False.
+        """
+        from _fm_helpers import _falkor_port_from_env
+
+        monkeypatch.setenv('FALKOR_PORT', '7000')
+
+        assert _falkor_port_from_env() == 7000
+        assert isinstance(_falkor_port_from_env(), int)
+
+    def test_falkor_port_from_env_treats_empty_as_unset(self, monkeypatch):
+        """An empty FALKOR_PORT takes the default instead of exploding.
+
+        ``FALKOR_PORT: ${FALKOR_PORT}`` in a compose/CI template with the
+        variable unset produces exactly this shape. Since conftest.py imports
+        _fm_helpers on every session, a ValueError here would abort the entire
+        run — including the unit lane, which never touches FalkorDB.
+        """
+        from _fm_helpers import _falkor_port_from_env
+
+        monkeypatch.setenv('FALKOR_PORT', '')
+
+        assert _falkor_port_from_env() == 6379
+
+    def test_falkor_port_from_env_rejects_non_integer(self, monkeypatch):
+        """A malformed FALKOR_PORT fails loudly, naming the variable and value.
+
+        Not silently defaulted: a typo'd port must not be papered over into a
+        probe against 6379. The RuntimeError replaces a bare ``int()``
+        ValueError whose traceback pointed into a shared helper.
+        """
+        from _fm_helpers import _falkor_port_from_env
+
+        monkeypatch.setenv('FALKOR_PORT', 'notaport')
+
+        with pytest.raises(RuntimeError, match=r"FALKOR_PORT.*'notaport'"):
+            _falkor_port_from_env()
+
+    def test_falkor_constants_have_the_types_consumers_require(self):
+        """The module constants carry the types ``FalkorDB(...)`` requires.
+
+        Scoped deliberately to the types, which is the real hazard: ``os.environ``
+        yields str, and a str port silently breaks ``FalkorDB(port=...)``. This
+        holds under any environment and pins no literal default, which would
+        couple this lane to the operator's environment.
+
+        It does NOT pin that the constants are *derived* from the environment.
+        That cannot be asserted in-process without an ``importlib.reload`` of a
+        module the whole session already holds references into (it would hand
+        earlier-imported tests stale dataclass identities), and a subprocess
+        import costs a measured ~8.6s here. The derivation functions themselves
+        are covered directly by the tests above; what is untested is only the
+        two assignment lines that call them.
+        """
+        from _fm_helpers import FALKOR_HOST, FALKOR_PORT
+
+        assert isinstance(FALKOR_HOST, str)
+        assert isinstance(FALKOR_PORT, int)
+
+    def test_falkor_available_true_when_client_ok(self, monkeypatch):
+        """_falkor_available() returns True when construct, query, and close all succeed."""
+        from _fm_helpers import _falkor_available
+
+        fake_graph = MagicMock()
+        fake_graph.query.return_value = None
+        fake_client = MagicMock()
+        fake_client.select_graph.return_value = fake_graph
+        fake_client.close.return_value = None
+        monkeypatch.setattr('falkordb.FalkorDB', MagicMock(return_value=fake_client))
+
+        assert _falkor_available() is True
+        fake_client.close.assert_called_once()
+
+    def test_falkor_available_false_when_query_raises(self, monkeypatch):
+        """_falkor_available() returns False (never raises) when the probe query raises."""
+        from _fm_helpers import _falkor_available
+
+        fake_graph = MagicMock()
+        fake_graph.query.side_effect = Exception('boom')
+        fake_client = MagicMock()
+        fake_client.select_graph.return_value = fake_graph
+        monkeypatch.setattr('falkordb.FalkorDB', MagicMock(return_value=fake_client))
+
+        assert _falkor_available() is False
+        # The fork wraps close() in contextlib.suppress inside a `finally`, so a
+        # probe against a half-dead server must still not leak the connection.
+        fake_client.close.assert_called_once()
+
+    def test_falkor_available_false_when_construct_raises(self, monkeypatch):
+        """_falkor_available() returns False (never raises) when FalkorDB(...) itself raises."""
+        from _fm_helpers import _falkor_available
+
+        def _boom(*args, **kwargs):
+            raise Exception('connection refused')
+
+        monkeypatch.setattr('falkordb.FalkorDB', _boom)
+
+        assert _falkor_available() is False
+
+    def test_falkor_available_probe_wiring(self, monkeypatch):
+        """_falkor_available() probes with the same host/port/timeout and query the forks used.
+
+        Pins the behaviour-preserving contract: a bounded ~2s connect against
+        FALKOR_HOST/FALKOR_PORT, then ``select_graph('_probe').query('RETURN 1')``.
+        """
+        from _fm_helpers import FALKOR_HOST, FALKOR_PORT, _falkor_available
+
+        fake_graph = MagicMock()
+        fake_client = MagicMock()
+        fake_client.select_graph.return_value = fake_graph
+        fake_ctor = MagicMock(return_value=fake_client)
+        monkeypatch.setattr('falkordb.FalkorDB', fake_ctor)
+
+        assert _falkor_available() is True
+
+        fake_ctor.assert_called_once_with(
+            host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2
+        )
+        fake_client.select_graph.assert_called_once_with('_probe')
+        fake_graph.query.assert_called_once_with('RETURN 1')
+
+    def test_falkor_skipif_default_reason(self):
+        """falkor_skipif() returns a pytest.mark.skipif marker with a non-empty default reason.
+
+        The exact wording is deliberately not pinned — matching the Qdrant
+        sibling above. A reword is cosmetic and nothing depends on the prose.
+        """
+        from _fm_helpers import falkor_skipif
+
+        m = falkor_skipif()
+
+        assert m.name == 'skipif'
+        assert isinstance(m.kwargs['reason'], str) and m.kwargs['reason']
+
+    def test_falkor_skipif_custom_reason(self):
+        """falkor_skipif(reason=...) propagates a caller-supplied reason string."""
+        from _fm_helpers import falkor_skipif
+
+        assert falkor_skipif(reason='x').kwargs['reason'] == 'x'
+
+    def test_falkor_skipif_condition_tracks_probe(self, monkeypatch):
+        """falkor_skipif()'s condition is `not _falkor_available()`, evaluated at call time.
+
+        The load-bearing property: the factory resolves _falkor_available
+        through the module global rather than capturing it, so each consuming
+        module's probe fires at that module's own collection time.
+        """
+        import _fm_helpers
+
+        monkeypatch.setattr(_fm_helpers, '_falkor_available', lambda: False)
+        assert _fm_helpers.falkor_skipif().args[0] is True
+
+        monkeypatch.setattr(_fm_helpers, '_falkor_available', lambda: True)
+        assert _fm_helpers.falkor_skipif().args[0] is False
+
+    def test_unique_graph_name_shape(self):
+        """unique_graph_name(slug) is '_test_<slug>_<8 lowercase hex>'.
+
+        Asserted as a regex on the CONTRACT rather than a fixed string, since
+        the suffix is random; this pins the prefix, the slug placement and the
+        8-hex width all at once.
+        """
+        import re
+
+        from _fm_helpers import unique_graph_name
+
+        assert re.fullmatch(r'_test_myslug_[0-9a-f]{8}', unique_graph_name('myslug'))
+
+    def test_unique_graph_name_is_unique_per_call(self):
+        """Two calls with the same slug return different names.
+
+        This is the whole point of the idiom: concurrent runs (pytest-xdist
+        -n auto, a CI matrix against one shared FalkorDB) must never share a
+        graph and wipe each other's fixtures.
+        """
+        from _fm_helpers import unique_graph_name
+
+        assert unique_graph_name('myslug') != unique_graph_name('myslug')
+
+    def test_unique_graph_name_preserves_existing_namespace(self):
+        """The helper reproduces the migrated modules' existing graph-name namespace.
+
+        Byte-compatibility check: the migration must not silently rename live
+        graphs, and the 'task id in the graph name' convention (which makes an
+        orphaned graph from a killed run traceable to a module) must survive.
+        """
+        from _fm_helpers import unique_graph_name
+
+        assert unique_graph_name('530_list_indices_integration').startswith(
+            '_test_530_list_indices_integration_'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests for the shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
 # Converts fixed "sleep(N) then assert background work is done" sites (fragile
