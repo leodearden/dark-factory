@@ -22,7 +22,7 @@ Two defects live here:
 
 This module owns the new coverage for both.  It reuses the real-git fixtures of
 :mod:`test_merge_verify_lease_guard` wholesale (the suite's cross-module-helper
-convention) and adds four shared helpers used by the classes below:
+convention) and adds five shared helpers used by the classes below:
 
 * :func:`foreign_lane_lock_holder` — a GENUINELY foreign holder, since
   same-process fds are indistinguishable from the leak at kernel level;
@@ -30,7 +30,11 @@ convention) and adds four shared helpers used by the classes below:
   holder-pgid rendezvous, exactly what an orphaned acquire leaves behind;
 * :func:`wait_until` — a bounded async poll, so orphan-release callbacks settle
   deterministically instead of behind a fixed sleep;
-* :func:`lane_is_free` — the PRD's B12 signal: unheld AND unattributed to us.
+* :func:`require_lane_lock_holders` — a bounded-retry STRICT read of the kernel
+  lock table, so "I could not tell" is never rendered as "nobody holds it";
+* :func:`lane_is_free` — the PRD's B12 signal: unheld AND unattributed to us,
+  with a third outcome — an UNKNOWN kernel read fails loudly rather than
+  passing a leak assertion vacuously (task 3604).
 """
 from __future__ import annotations
 
@@ -398,8 +402,26 @@ def lane_is_free(lock_path: Path) -> bool:
     Note the ordering — the kernel attribution is checked BEFORE the probe
     acquire, because the probe itself briefly becomes a holder and would
     otherwise report on itself.
+
+    THREE outcomes, not two (task 3604): free, held, and UNKNOWN — where
+    unknown fails loudly via :func:`require_lane_lock_holders` rather than
+    returning a bool.  A fail-safe empty read cuts the OPPOSITE way here than
+    it does at the positive call sites task 3598 fixed: there a bad read
+    produced a spurious RED (``assert <pid> in []``), which is noisy but
+    self-announcing; here it produces a silent GREEN — a B12 leak assertion
+    passing vacuously — which is strictly worse, because a leaked lane is then
+    reported clean and nothing surfaces.
+
+    The measured case that motivated it: hold the lock and unlink the lock
+    file, and this returned ``True`` while the lane was genuinely orphaned.
+    ``os.stat`` failed so the attribution read yielded ``[]``, and the probe's
+    ``O_CREAT`` then minted a FRESH inode and acquired it happily — so both
+    halves answered about an inode that was not the one being held.  That is
+    why the strict read comes first and why neither it nor the ordering should
+    later be "simplified" back: the check must fail while the lock file is
+    still absent, before the probe can resurrect the evidence.
     """
-    if os.getpid() in lane_lock_holder_pids(lock_path):
+    if os.getpid() in require_lane_lock_holders(lock_path):
         return False
     probe = acquire_merge_verify_flock(lock_path, 0.0)
     if probe is None:
@@ -776,8 +798,20 @@ class TestLaneIsFreeNeverPassesOnAnUnknownRead:
         above by simply failing on everything — and both B12 consumers, whose
         entire purpose is to observe a lane BECOMING free, would then be
         loud but useless.
+
+        Staged on an UNTOUCHED REAL LOCK FILE — present, and nobody's — which
+        is the state at both B12 call sites (the ``flock(1)`` child and the
+        orphaned acquire's ``O_CREAT`` each leave the file behind). The
+        distinction matters and is not cosmetic: an ABSENT lock file is not
+        "free", it is UNKNOWN, because ``os.stat`` cannot tell a path that was
+        never created from one unlinked out from under a still-held fd — which
+        is precisely case (a) above. Reading absent as free is the defect this
+        class exists to close, so this control must not be re-staged on a
+        nonexistent path.
         """
         lock_path = lane_lock_path(tmp_path / 'lane')
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.touch()
 
         assert lane_is_free(lock_path) is True
 
