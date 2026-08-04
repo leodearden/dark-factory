@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import os
 import signal
 import subprocess
@@ -454,6 +455,139 @@ class TestWaitForLaneLockHolder:
         assert len(calls) == 1, (
             f'attribution was already settled on the first read — must not '
             f'poll again; reader was called {len(calls)} time(s)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# `require_lane_lock_holders` (task 3604) — the NEGATIVE-side counterpart of
+# `wait_for_lane_lock_holder` above.
+#
+# That helper polls to confirm a POSITIVE attribution and RETURNS the last
+# snapshot on timeout, because the caller's own assertion then carries the
+# kernel-observed evidence.  Here the caller is asserting the opposite — that
+# the lane is FREE — and a fail-safe empty read is precisely the answer that
+# SATISFIES it.  So this one must raise instead: an unknown read that returns
+# `[]` would pass a B12 leak assertion vacuously.
+#
+# Pinned here against an INJECTED reader, so these cases are deterministic and
+# touch no real lock and no real /proc/locks; the end-to-end real-kernel
+# behaviour is pinned separately below by
+# `TestLaneIsFreeNeverPassesOnAnUnknownRead`.
+# ---------------------------------------------------------------------------
+
+
+class TestRequireLaneLockHolders:
+    """Unit-pins for the bounded-retry strict read, `require_lane_lock_holders`."""
+
+    def test_no_cost_on_the_happy_path(self):
+        """A readable table on the FIRST read must cost exactly one read.
+
+        `lane_is_free` is called from inside a `wait_until` poll loop at both
+        B12 call sites, so anything this helper spends is paid once per poll.
+        Pinning that the strict read is free in the normal case is what keeps
+        the fix from taxing every healthy run.
+        """
+        calls: list[Path] = []
+
+        def _reader(path: Path) -> list[int]:
+            calls.append(path)
+            return [4242]
+
+        result = require_lane_lock_holders(
+            Path('/irrelevant'), timeout=5.0, interval=1.0, read_holders=_reader,
+        )
+
+        assert result == [4242]
+        # `len(calls) == 1` is the real pin: it alone proves no sleep ran (the
+        # loop's only sleep follows a failed read), so a separate wall-clock
+        # upper bound would be redundant — and a genuine one would just be a
+        # source of flake under xdist load for no added coverage.
+        assert len(calls) == 1, (
+            f'a readable table on the first read must not be re-read; the '
+            f'reader was called {len(calls)} time(s)'
+        )
+
+    def test_a_transient_unreadable_read_is_absorbed(self):
+        """ONE bad procfs read must be retried, not escalated to a test failure.
+
+        The anti-new-flake pin. Converting the silent green this task removes
+        into a hair-trigger red would just trade one bad failure mode for
+        another — and a one-off transient bad read is exactly the class of
+        event task 3598 measured under 16-worker xdist load.
+        """
+        calls: list[Path] = []
+
+        def _reader(path: Path) -> list[int]:
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError(errno.ENOENT, 'No such file or directory', '/proc/locks')
+            return [4242]
+
+        result = require_lane_lock_holders(
+            Path('/irrelevant'), timeout=5.0, interval=0.001, read_holders=_reader,
+        )
+
+        assert result == [4242]
+        assert len(calls) == 2, (
+            f'the first read raised and must have been retried rather than '
+            f'failing the test; the reader was called {len(calls)} time(s)'
+        )
+
+    def test_a_persistently_unreadable_table_fails_loudly_and_bounded(self):
+        """A table that NEVER reads must fail loudly — never return `[]` — and be bounded.
+
+        Returning `[]` is the whole defect: it is indistinguishable from "the
+        lane is free", which is what the caller is trying to establish. The
+        failure must also name the underlying error, or the diagnostic is
+        strictly worse than the fail-safe `[]` it replaces.
+        """
+        def _reader(_path: Path) -> list[int]:
+            raise OSError(errno.EACCES, 'Permission denied', '/proc/locks')
+
+        timeout = 0.1
+        start = time.monotonic()
+        with pytest.raises(pytest.fail.Exception, match='Permission denied'):
+            require_lane_lock_holders(
+                Path('/irrelevant'), timeout=timeout, interval=0.01,
+                read_holders=_reader,
+            )
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= timeout, (
+            f'must not give up before the bound elapses — a hair trigger would '
+            f'be its own flake class; elapsed={elapsed!r}'
+        )
+        assert elapsed < timeout + 5.0, (
+            f'must not overrun the bound by more than a comfortable slack '
+            f'margin — widened to tolerate scheduling delays under xdist '
+            f'load rather than the bound itself; elapsed={elapsed!r}'
+        )
+
+    def test_a_genuinely_empty_holder_list_is_returned_not_failed(self):
+        """"The kernel says nobody holds it" must be RETURNED, not retried or failed.
+
+        The entire distinction this task turns on. Without this pin, the fix
+        would make every genuinely-free lane fail — loud, but useless, and it
+        would break both B12 consumers, whose whole point is to observe a lane
+        becoming free.
+        """
+        calls: list[Path] = []
+
+        def _reader(path: Path) -> list[int]:
+            calls.append(path)
+            return []
+
+        result = require_lane_lock_holders(
+            Path('/irrelevant'), timeout=5.0, interval=1.0, read_holders=_reader,
+        )
+
+        assert result == [], (
+            f'a successful read reporting no holders is a real ANSWER, not an '
+            f'unknown one; got {result!r}'
+        )
+        assert len(calls) == 1, (
+            f'an empty-but-successful read must not be retried; the reader was '
+            f'called {len(calls)} time(s)'
         )
 
 
