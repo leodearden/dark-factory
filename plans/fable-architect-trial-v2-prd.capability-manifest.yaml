@@ -1,0 +1,117 @@
+# Machine-readable twin of fable-architect-trial-v2-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract
+# (shared/src/shared/capability_manifest.py). The instrument tasks ρ/σ/υ/φ are
+# eval-framework-revival lane tasks (its decision 11) — their entries live in
+# plans/eval-framework-revival-prd.capability-manifest.yaml, not here.
+prd: plans/fable-architect-trial-v2-prd.md
+schema_version: 1
+tasks:
+  - label: "β1"
+    task_id: null
+    title: "Mint the curated v2 hard fixture pool (tasks_hard_v2/)"
+    capabilities:
+      - name: "fixture-minting-fns-exist"
+        binding: "capability→producer (wired) — task_sampler.py:421 build_fixture_record, :512 capture_reference, :557 pin_eval_branch"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "max_architect_turns"
+          paths: ["orchestrator/src/orchestrator/evals/tasks_hard_v2/"]
+          expect: present
+      - name: "curation-table-committed"
+        binding: "end-to-end — committed include/exclude table accounting for all 41 census candidates + 2 cancelled"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "reify"
+          paths: ["orchestrator/src/orchestrator/evals/tasks_hard_v2/CURATION.md"]
+          expect: present
+      - name: "default-run-isolation"
+        binding: "structural — cli._load_fixture_dir globs *.json non-recursively; sibling dir cannot leak"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "isolation is structural (non-recursive glob), pinned by existing loader behavior"
+  - label: "β2"
+    task_id: null
+    title: "Committed v2 campaign driver (per-candidate cap_excluded + validity counts)"
+    capabilities:
+      - name: "driver-copy-source-exists"
+        binding: "capability→producer — data/eval-campaign/fable_architect_only.py (v1 driver, main checkout)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cap_excluded"
+          paths: ["scripts/"]
+          expect: present
+      - name: "per-candidate-cap-excluded-substrate"
+        binding: "capability→producer (wired) — report.py per-config accumulator plan_quality_cap_excluded (tasks 3118/3302/3379)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "judged_without_reference"
+          paths: ["scripts/"]
+          expect: present
+  - label: "γ1"
+    task_id: null
+    title: "Stage-1 calibration run gate (incumbent-only, 1 trial, production ceilings)"
+    capabilities:
+      - name: "planrate-is-judge-free"
+        binding: "field-population — plan_steps persisted per cell (runner.py:846 len(plan.get('steps') or []))"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fable-trial-v2-calibration"
+          paths: ["plans/"]
+          expect: present
+      - name: "q-ceiling-derivable"
+        binding: "numeric-floor — anchor population = v1 incumbent cells on validly-referenced fixtures (dumps reproduce digit-for-digit, decision-record §8); provisional, γ2-ratified"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "threshold is derived in the calibration report and ratified by the γ2 owner gate"
+  - label: "γ2"
+    task_id: null
+    title: "Banding ratification + comparison-regime ruling + stage-2 authorization gate"
+    capabilities:
+      - name: "owner-ruling-recorded"
+        binding: "deterministic pure gate (2864 shape) — born-at-L2 escalation; regime options (a)/(b)/(c) each carry a fully-specified recipe (PRD D5)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the deliverable is Leo's recorded resolution text; not mechanically expressible"
+  - label: "δ"
+    task_id: null
+    title: "Stage-2 screen run gate (fable-max vs opus-max, 3 trials, retained set)"
+    capabilities:
+      - name: "harness-bypasses-allowlist"
+        binding: "capability→producer (wired) — run_architect_eval calls invoke_agent directly with model=config.model; allowlist check only in routing_dispatch"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "results artifact is gitignored operator data (v1 precedent); per-candidate table lands in the gate resolution + ζ"
+      - name: "regime-is-pure-parameters"
+        binding: "capability→producer — EvalConfig.max_budget_usd per-config (default 20.0), max_architect_turns per-fixture; no runner edit under any ruling"
+        verdict: PASS
+  - label: "ζ"
+    task_id: null
+    title: "v2 decision record (planRate + validity-bounded plan_quality + cap symmetry)"
+    capabilities:
+      - name: "decision-record-committed"
+        binding: "end-to-end — committed plans/fable-architect-trial-v2-decision-<date>.md, the 2863 shape (raw observation separated from recommendation)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fable-architect-trial-v2-decision"
+          paths: ["plans/"]
+          expect: present
+  - label: "η"
+    task_id: null
+    title: "Admission re-ruling gate (ratify / decline / confirm pivot)"
+    capabilities:
+      - name: "owner-ruling-recorded"
+        binding: "deterministic pure gate naming ζ's record (τ3/2864 shape); on ADMIT the resolution instructs filing a NEW flip task (2544 never resurrected)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the deliverable is Leo's recorded resolution text; not mechanically expressible"

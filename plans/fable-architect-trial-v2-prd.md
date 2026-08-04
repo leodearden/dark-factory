@@ -332,12 +332,15 @@ born-at-L2 escalation carrying its recipe — no worktree, no code):
 - **δ — stage-2 screen run gate** (operator-executable; depends γ2, ι1, β2).
   Recipe parameterized by γ2's ruling: `architect-fable-max` vs
   `architect-opus-max`, 3 trials, over the retained fixtures, judge pinned to
-  incumbent. Output: committed raw results + per-candidate table including
-  cap_excluded symmetry. ~48 cells (retained-set dependent) ≈ $250–400+
-  (both-arms roughly doubles the fable side). Signal: committed results
-  artifact with zero unexplained cap-excluded asymmetry between candidates.
-- **ζ — v2 decision record** (analysis task, `metadata.execution_class`
-  no-code; depends δ; re-scoped by γ2's resolution on the pivot branch).
+  incumbent. Output: results artifact under `data/eval-campaign/` (raw dumps
+  stay gitignored, v1 precedent) + the per-candidate table including
+  cap_excluded symmetry recorded in the gate resolution. ~48 cells
+  (retained-set dependent) ≈ $250–400+ (both-arms roughly doubles the fable
+  side). Signal: gate resolution carrying the per-candidate table with zero
+  unexplained cap-excluded asymmetry between candidates.
+- **ζ — v2 decision record** (normal docs task — the 2863 shape: author and
+  commit the record through the standard pipeline; depends δ; re-scoped by
+  γ2's resolution on the pivot branch).
   Committed `plans/fable-architect-trial-v2-decision-<date>.md`: planRate on
   the no-plan band (judge-free), plan_quality bounded by
   judged_without_reference validity, paired per-fixture stats, $/usable-plan
