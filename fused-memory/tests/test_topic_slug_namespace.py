@@ -59,7 +59,7 @@ class TestTopicSlugLeafModule:
         unloadable).
         """
         clusters = _default_topic_guard_clusters()
-        assert len(clusters) == 5, 'seeded cluster set changed — re-verify the slug rule'
+        assert len(clusters) == 6, 'seeded cluster set changed — re-verify the slug rule'
         for cluster in clusters:
             assert is_valid_topic_slug(cluster.topic_id), (
                 f'seeded cluster id {cluster.topic_id!r} must be a valid topic slug'
