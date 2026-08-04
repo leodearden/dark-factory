@@ -410,7 +410,7 @@ class TestSessionCwd:
 
 
 class TestGzAwareReader:
-    """The single low-level reader (``_iter_json_lines``, via
+    """The single low-level reader (``iter_json_lines``, via
     ``_session_cwd_and_date`` / ``session_cwd``) transparently reads
     gzip-compressed ``.jsonl.gz`` transcripts — the archived fleet-transcript
     format (shared.transcript_archive) — keeping byte-parity for plain
@@ -451,16 +451,12 @@ class TestGzAwareReader:
 class TestPublicIterJsonLines:
     """``iter_json_lines`` is PUBLIC — the single low-level transcript reader.
 
-    Promoted from ``_iter_json_lines`` for task 3214: the memory-eval retro
-    corpus extractor (``fused-memory/scripts/memory_eval_transcript_corpus.py``)
-    consumes it from a DIFFERENT package, and a cross-package consumer of an
-    underscore name is a standing invitation for the next author to copy the
-    function instead — the outcome the reuse invariant exists to prevent.
-
-    The underscore name is retained as an alias so the existing in-package
-    callers (``sampling.py``, ``check_transcript_persistence.py``) need no edit;
-    these tests pin that they are the SAME object, so the alias cannot silently
-    drift into a second implementation.
+    The memory-eval retro corpus extractor
+    (``fused-memory/scripts/memory_eval_transcript_corpus.py``) consumes it
+    from a DIFFERENT package, which is why the name is public: a cross-package
+    consumer of an underscore name is a standing invitation for the next
+    author to copy the function instead — the outcome the reuse invariant
+    exists to prevent.
     """
 
     RECORDS = [
@@ -482,12 +478,6 @@ class TestPublicIterJsonLines:
 
     def test_public_name_exists(self):
         assert callable(mod.iter_json_lines)
-
-    def test_legacy_private_name_is_the_same_object(self):
-        # Not merely "both work" — the SAME function object, so the three
-        # existing callers keep the exact behaviour the public name is tested
-        # for, and no second copy can appear behind the old name.
-        assert mod._iter_json_lines is mod.iter_json_lines
 
     def test_plain_jsonl_skips_blank_and_corrupt_lines(self, tmp_path):
         path = tmp_path / 'session.jsonl'

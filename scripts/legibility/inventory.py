@@ -168,9 +168,6 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     in ``fused-memory/scripts/`` mines the archived fleet transcripts through
     it), and a consumer reaching for an underscore name across a package
     boundary is how a second copy of this function gets written instead.
-    ``_iter_json_lines`` is retained below as a module-level alias so the
-    in-package callers (``sampling``, ``check_transcript_persistence``) keep
-    working; it is the same object, not a second implementation.
 
     Streaming rather than slurping is the point of this one: callers walk
     thousands of multi-MB archived transcripts, so memory stays bounded by
@@ -236,30 +233,6 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
                     yield record
         except UNREADABLE_FILE_ERRORS as exc:
             raise as_unreadable_file_error(exc) from exc
-
-
-_iter_json_lines = iter_json_lines
-"""DEPRECATED alias for the pre-promotion private name. New code must not use it.
-
-The same object as :func:`iter_json_lines`, not a second implementation
-(asserted in ``test_legibility_inventory.TestPublicIterJsonLines``).
-
-**This alias is transitional and has a named removal condition**, so it does
-not become a permanent second name with no owner
-(reviewer_comprehensive/architecture, task 3214 amendment pass). It exists
-solely for two remaining in-package call sites that task 3214 could not edit
-— they are outside the modules that task holds locks for, so touching them
-would have widened its concurrency footprint:
-
-- ``sampling.py`` — ``from legibility.inventory import _iter_json_lines``
-  (plus docstring citations of the old name)
-- ``check_transcript_persistence.py`` — ``inventory._iter_json_lines(path)``
-
-Remove this alias once those two lines are switched to
-:func:`iter_json_lines`. Both are one-line changes in this repo; there are
-NO known out-of-repo callers, so nothing else gates the removal. Filed as a
-follow-up task rather than left implicit.
-"""
 
 
 def _session_cwd_and_date(path: Path) -> tuple[str | None, date | None]:

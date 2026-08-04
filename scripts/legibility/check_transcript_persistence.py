@@ -201,7 +201,7 @@ def _first_user_turn(path: Path) -> dict[str, Any] | None:
     ``except OSError`` contract.
     """
     try:
-        for record in inventory._iter_json_lines(path):
+        for record in inventory.iter_json_lines(path):
             if (
                 record.get('type') == 'user'
                 and not record.get('isSidechain')
