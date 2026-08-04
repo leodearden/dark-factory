@@ -151,7 +151,7 @@ def test_reify_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/reify/orchestrator.yaml"
+        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
         in content
     ), "ExecStart must invoke the orchestrator with the reify config, frozen"
     # --frozen: see the df structure test — unit start must never re-sync the
@@ -223,7 +223,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     }
     allowed_reify_fragments = {
         "Reify Orchestrator",
-        "/home/leo/src/reify/orchestrator.yaml",
+        "/home/leo/src/reify/dark-factory-orchestrator.yaml",
     }
     # The ORCH_UNIT line must match EXACTLY, not merely contain the unit's
     # basename — a fragment-only "in" check would also wave through an
@@ -296,7 +296,7 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         in content
     )
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/orchestrator-config.yaml"
+        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
         in content
     ), "ExecStart must invoke the orchestrator with the autopilot-video config, frozen"
     assert "uv run --frozen" in content
