@@ -683,6 +683,11 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     and it lands in infra_hold + escalate_to_human instead of the debugger
     — a human sees it, nothing is silently greened.
 
+    The opposite-direction case — an UNLISTED co-occurring load flake that
+    defeats this veto (esc-3514-2 / task 3514) — is deliberately NOT fixed
+    by broadening the allow-list; see ``_main_probe_failure_is_isolated_flake``
+    (task 3597) for the downstream confirm gate that catches it instead.
+
     Returns ``False`` for falsy *output* or when the crash signature itself
     is absent.
     """
@@ -6380,6 +6385,21 @@ async def verify_failure_is_preexisting_on_main(
           - ``git_ops.get_main_sha()`` fails or returns empty.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during probing.
+          - CONFIRM GATE (task 3597): the signature matched, but
+            ``_main_probe_failure_is_isolated_flake`` positively confirmed
+            every named failing test passes in isolation on the main
+            probe — a CPU-starvation load flake, not a real break.  See
+            that function's docstring for the full contract (what it
+            re-runs, the precondition that guards against a co-occurring
+            genuine lint/type break, the one-way-ratchet guarantee, and
+            why the downgrade is deliberately not cached).
+
+    CONFIRM GATE (task 3597): a signature match alone is not trusted
+    blindly — see ``_main_probe_failure_is_isolated_flake``'s docstring for
+    the full contract.  This gate is scoped to the signature-comparison
+    path only — the task-μ baseline-diff fork above
+    (``failing_result.failing_test_ids is not None``) returns before this
+    point and is untouched.
 
     A process-wide TTL cache (keyed by (main_sha, category, normalised cause_hint))
     avoids redundant probes from the same or sibling tasks against an unchanged main.
@@ -6509,6 +6529,55 @@ async def verify_failure_is_preexisting_on_main(
             branch_sig = (failing_result.category or '', _norm_hint)
             main_sig = (main_result.category or '', _normalize(main_result.cause_hint))
             is_preexisting = branch_sig == main_sig
+
+            if is_preexisting:
+                # CONFIRM GATE (task 3597): a signature match alone is not
+                # trusted blindly — see _main_probe_failure_is_isolated_flake's
+                # docstring for the full contract.
+                flake_ids = await _main_probe_failure_is_isolated_flake(
+                    tmp_path, config, module_configs, main_result,
+                )
+                if flake_ids is not None:
+                    # Repeat-count observability (reviewer_comprehensive
+                    # finding 4, task 3597 amendment): the downgrade below is
+                    # deliberately not cached (see comment further down), so
+                    # a sustained load-flake storm re-pays the full probe +
+                    # isolated-rerun cost on every sibling task that hits
+                    # this exact signature. That no-cache decision is
+                    # unchanged — caching would reintroduce the false-
+                    # negative risk it exists to avoid — but the repetition
+                    # itself is now named in the WARNING and recorded on the
+                    # audit entry instead of recurring silently.
+                    _repeat_count = _MAIN_PROBE_DOWNGRADE_REPEAT_COUNTS.get(_cache_key, 0) + 1
+                    _MAIN_PROBE_DOWNGRADE_REPEAT_COUNTS[_cache_key] = _repeat_count
+                    logger.warning(
+                        'verify_failure_is_preexisting_on_main: %s passed on '
+                        'isolated re-run on the main probe (sha=%.8s) — '
+                        'downgrading from preexisting-main-break to '
+                        'task-own (main is not red for these tests)%s',
+                        flake_ids, main_sha,
+                        (
+                            f' [repeat #{_repeat_count} for this exact '
+                            f'signature — the verdict is deliberately not '
+                            f'cached, so a persistent load-flake storm '
+                            f're-probes and re-downgrades every time]'
+                        ) if _repeat_count > 1 else '',
+                    )
+                    _suppressed_flake_records.append({
+                        'sha': main_sha,
+                        'node_ids': flake_ids,
+                        'first_pass_category': main_result.category,
+                        'first_pass_cause_hint': main_result.cause_hint,
+                        'suppressed_via': 'main_probe_isolated_rerun',
+                        'repeat_count': _repeat_count,
+                    })
+                    # Deliberately NOT cached: a load-flake verdict is a
+                    # statement about transient host state, not the main
+                    # tip, so caching it would mis-attribute a LATER genuine
+                    # red main (same signature) to every sibling task that
+                    # hits this cache key within the TTL.
+                    return False, ''
+
             _PROBE_CACHE[_cache_key] = (time.monotonic(), is_preexisting)
             return is_preexisting, (main_sha if is_preexisting else '')
 
@@ -7428,6 +7497,189 @@ async def confirm_merge_verify_flake_suppressible(
         logger.warning(
             'confirm_merge_verify_flake_suppressible: unexpected error — '
             'failing closed to red',
+            exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main-probe isolated-flake confirm gate (task 3597)
+# ---------------------------------------------------------------------------
+
+#: Generous per-test timeout (seconds) injected into the main-probe confirm
+#: gate's isolated re-run command via ``_with_pytest_timeout_str``. A
+#: SEPARATE constant from ``_SWEEP_CONFIRM_TIMEOUT_SECS`` /
+#: ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` so the three are retuned on their own
+#: signals. Same rationale as both: ``-o addopts=`` clears pyproject
+#: ``addopts`` but NOT the ``[tool.pytest.ini_options] timeout=60`` default,
+#: so without this explicit override a still-loaded host can starve the
+#: isolated confirm run into a false "still fails" verdict — and here that
+#: false verdict would mean a false red-main verdict (BLOCKED awaiting a
+#: hotfix for a main that is actually green) survives untouched.
+_MAIN_PROBE_CONFIRM_TIMEOUT_SECS: int = 300
+
+#: Per-signature repeat counter for the main-probe isolated-flake downgrade
+#: (reviewer_comprehensive finding 4, task 3597 amendment pass). The
+#: downgraded verdict is deliberately NOT written to ``_PROBE_CACHE`` (a
+#: load-flake verdict is a statement about transient host state, not a fact
+#: about the main tip — see the call site), so a sustained CPU-starvation
+#: storm makes every sibling task that hits the same (main_sha, category,
+#: hint) signature repeat the full probe + isolated-rerun cost. Caching the
+#: downgrade instead would reintroduce exactly the false-negative risk the
+#: no-cache decision exists to avoid, so this dict only makes the repetition
+#: OBSERVABLE (loud-over-silent-degradation norm) without changing the
+#: caching decision. Grows one entry per distinct downgraded signature for
+#: the life of the process — unpruned, mirroring ``_PROBE_CACHE``'s own
+#: unbounded-growth precedent (neither is actively pruned; both are small,
+#: bounded by the number of distinct signatures ever seen).
+_MAIN_PROBE_DOWNGRADE_REPEAT_COUNTS: dict[tuple[str, str, str], int] = {}
+
+
+async def _main_probe_failure_is_isolated_flake(
+    probe_worktree: Path,
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    main_result: VerifyResult,
+) -> list[str] | None:
+    """CONFIRM GATE: did *main_result*'s named failures pass on isolated re-run?
+
+    Called by ``verify_failure_is_preexisting_on_main`` immediately before it
+    would return ``(True, main_sha)`` — i.e. after the main probe's
+    (category, normalised cause_hint) signature has already matched the
+    branch's. A CPU-starvation load flake can starve the SAME
+    timing-sensitive test on both the task branch and the main probe,
+    matching signatures on a main that is actually green (ground truth:
+    esc-3514-2 / task 3514 — 12 named failures on an aborted xdist run, all
+    passing in isolation, main was not broken). This gate re-runs JUST the
+    node-ids named in *main_result*'s own failing output — scoped,
+    forced-serial (``-p no:xdist -o addopts=``), generous-timeout — inside
+    the ALREADY-OPEN *probe_worktree* pinned at main (SAME-TREE, no second
+    ``git worktree add``; the caller owns the worktree's lifecycle).
+
+    PRECONDITION — test-leg-only (reviewer_comprehensive finding 1):
+    ``run_verification``'s ``_summarize_checks``/``_worst_category`` picks
+    ONE ``category`` across up to three legs (test/lint/type), so a matched
+    (category, cause_hint) signature does NOT by itself guarantee the
+    lint/type legs were clean on main — a genuine, co-occurring lint/type
+    break can lose the "worst" contest to the test leg's category (e.g. it
+    classifies as the lower-priority ``unknown_test_failure``) and still be
+    real. Re-running just the named TEST node-ids would then wrongly
+    downgrade a genuinely red main. ``VerifyResult.lint_output``/
+    ``type_output`` are populated ONLY when that leg's return code is
+    non-zero (see ``run_verification``'s result construction), so a
+    non-empty value here is a precise, free signal that another leg is not
+    clean — this bails to ``None`` before doing any work.
+
+    Returns:
+        ``list[str]`` — every named failing test on THIS main tip
+        demonstrably PASSED on isolated re-run. The caller MAY downgrade its
+        verdict to ``(False, '')``, which is ``verify_failure_is_preexisting_on_main``'s
+        own documented fail-safe return.
+
+        ``None`` — every other (fail-safe) path; the caller keeps today's
+        ``(True, main_sha)`` verdict unchanged. Covers: a co-occurring
+        lint/type break on main (see PRECONDITION above); no recoverable
+        node-id in ``main_result.test_output`` (an opaque/lint/type-only
+        failure); a node-id that maps to no discovered subproject (or
+        *module_configs* is empty); an isolated re-run that still fails,
+        times out, or hits an infra-sentinel category
+        (``INFRA_TRANSIENT_CATEGORIES`` — never trusted as confirmation)
+        after ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` attempts; and any unexpected
+        exception (never raises).
+
+    ONE-WAY RATCHET: this gate can only downgrade a verdict that an isolated
+    re-run has POSITIVELY shown green. Every degraded path preserves today's
+    verdict, so nothing about a genuinely red main changes.
+
+    Node-id -> subproject mapping delegates to
+    ``_group_node_ids_by_subproject`` over ``{mc.prefix: mc for mc in
+    module_configs}`` — the FOURTH call site (after
+    ``confirm_main_tip_failure_is_real``,
+    ``_sweep_failure_reproduces_in_isolation``, and
+    ``confirm_merge_verify_flake_suppressible``). The isolated re-run engine
+    is ``_run_isolated_confirm_group`` (the bounded
+    ``_SWEEP_CONFIRM_MAX_ATTEMPTS``-attempt loop, ``role='task'`` by
+    default via ``run_verification``'s own default), unchanged.
+
+    *module_configs* SOURCE (reviewer_comprehensive finding 5): this is the
+    CALLER's snapshot — discovered on the task branch's worktree by
+    ``verify_failure_is_preexisting_on_main``'s own caller — reused as-is
+    rather than re-discovered on *probe_worktree*, unlike
+    ``confirm_main_tip_failure_is_real`` (which re-runs
+    ``_discover_module_configs`` against its own fresh probe tree). This is
+    consistent with, not a new departure from,
+    ``verify_failure_is_preexisting_on_main``'s own PRE-EXISTING behaviour:
+    it already runs ``run_scoped_verification(tmp_path, config,
+    module_configs, ...)`` — the same branch-side *module_configs* — against
+    this same main-pinned *probe_worktree* to produce *main_result* in the
+    first place, so reusing it again here for node-id mapping introduces no
+    tree/config mismatch beyond what that earlier call already accepts. A
+    task that renames/adds a subproject or changes a ``test_command``
+    between branch and main degrades fail-safe, not silently wrong: a stale
+    prefix yields either no recoverable node-id (early-out above), an
+    unmapped node-id (``_group_node_ids_by_subproject`` returns ``None``,
+    below), or a scoped command that errors/still-fails on the probe tree
+    (``_run_isolated_confirm_group`` returns ``False``) — every one of those
+    keeps today's verdict rather than producing a wrong downgrade.
+    """
+    try:
+        # PRECONDITION (finding 1 above): bail before any work when another
+        # leg is known non-clean on main.
+        if main_result.lint_output or main_result.type_output:
+            return None
+
+        node_ids = _extract_failing_test_ids(main_result.test_output)
+        if not node_ids:
+            return None
+
+        mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
+        groups = _group_node_ids_by_subproject(
+            probe_worktree, mc_by_prefix, node_ids,
+            log_label='verify_failure_is_preexisting_on_main confirm gate',
+        )
+        # `not groups`, NOT `is None`: both sentinels must keep today's
+        # verdict. Falling into the groups.items() loop with an empty dict
+        # would run ZERO isolated re-runs and then `return node_ids` — a
+        # full downgrade on zero evidence. Mirrors the same defensive guard
+        # in confirm_merge_verify_flake_suppressible /
+        # _sweep_failure_reproduces_in_isolation.
+        if not groups:
+            shown = node_ids[:10]
+            extra = len(node_ids) - len(shown)
+            logger.info(
+                'verify_failure_is_preexisting_on_main confirm gate: node-id '
+                '-> subproject mapping yielded nothing usable (%r) for %s%s '
+                'in %s — unconfirmable, keeping the preexisting verdict',
+                groups, shown, f' (+{extra} more)' if extra else '', probe_worktree,
+            )
+            return None
+
+        for prefix, group_node_ids in groups.items():
+            mc = mc_by_prefix[prefix]
+            scoped_cmd = _with_pytest_timeout_str(
+                _serial_pytest_str(
+                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                ),
+                _MAIN_PROBE_CONFIRM_TIMEOUT_SECS,
+            )
+            scoped_mc = replace(
+                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            )
+            if not await _run_isolated_confirm_group(probe_worktree, config, scoped_mc):
+                return None
+
+        logger.warning(
+            'verify_failure_is_preexisting_on_main confirm gate: %s passed on '
+            'isolated re-run on the main probe — main is not red for these '
+            'tests',
+            node_ids,
+        )
+        return node_ids
+
+    except Exception:
+        logger.warning(
+            'verify_failure_is_preexisting_on_main confirm gate: unexpected '
+            'error — keeping the preexisting verdict',
             exc_info=True,
         )
         return None
