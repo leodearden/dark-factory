@@ -23,12 +23,12 @@ tasks:
       kind: manual
       reason: dispatch-branch generality is exercised by π's test over ofat_candidates()
 - label: ρ
-  task_id: null
+  task_id: 3627
   title: architect-fable-max effort-matched candidate config
   capabilities:
   - name: architect-eval-configs-list
-    binding: capability→producer (wired) — ARCHITECT_EVAL_CONFIGS in configs.py,
-      searched by get_config_by_name; π precedent (2861)
+    binding: capability→producer (wired) — ARCHITECT_EVAL_CONFIGS in configs.py, searched
+      by get_config_by_name; π precedent (2861)
     verdict: PASS
     delivered_check:
       kind: grep
@@ -37,7 +37,7 @@ tasks:
       - orchestrator/src/orchestrator/evals/configs.py
       expect: present
 - label: σ
-  task_id: null
+  task_id: 3628
   title: reference back-fill + judged_without_reference marker
   capabilities:
   - name: backfill-source-shas-present
@@ -63,7 +63,7 @@ tasks:
       - orchestrator/src/orchestrator/evals/
       expect: present
 - label: υ
-  task_id: null
+  task_id: 3629
   title: record judge cost on architect cells
   capabilities:
   - name: judge-cost-field-populated
@@ -77,7 +77,7 @@ tasks:
       - orchestrator/src/orchestrator/evals/runner.py
       expect: present
 - label: φ
-  task_id: null
+  task_id: 3630
   title: UsageGate on run_architect_eval via invoke_with_cap_retry
   capabilities:
   - name: cap-retry-wrapper-exists
@@ -92,7 +92,8 @@ tasks:
       - orchestrator/src/orchestrator/evals/runner.py
       expect: present
   - name: tainted-predicate-byte-identical
-    binding: rejection-mechanism (must-not-touch pin) — the predicate survives the edit
+    binding: rejection-mechanism (must-not-touch pin) — the predicate survives the
+      edit
     verdict: PASS
     delivered_check:
       kind: grep
