@@ -1356,6 +1356,148 @@ class TestHarnessInjectedTurnFilter:
         assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
 
 
+# ---------------------------------------------------------------------------
+# is_pasted_report_turn / iter_user_turns exclusion -- R1 (confusion census
+# 2026-07-31 §1.1 facet (b), :81/:85): 5 sightings across 5 sessions where
+# the flagged "User Correction" is a full Reconciliation Run Review pasted
+# into a turn for review/discussion -- report output, not anyone correcting
+# the agent. The generator is a literal f-string,
+# fused-memory/src/fused_memory/reconciliation/judge.py:455-475
+# (``_build_prompt``), so the shape is greppable rather than guessed.
+#
+# This is a SEPARATE predicate from is_harness_injected_turn, not a widening
+# of it: a briefing preamble is injected BY the harness into a user-role
+# record (the human never typed it), whereas a pasted report IS a genuine
+# human turn -- the human really did paste it, it just is not a correction.
+# The census tracks the two as facet (a) vs facet (b) and §6 names "zero
+# facet-(a) sightings next cycle" as the discriminating fix-confirmed
+# measurement, which needs the two predicates individually testable.
+#
+# Exclusion is by line-anchored heading CO-OCCURRENCE (all(), not any()),
+# the same false-positive guard HARNESS_BRIEFING_HEADINGS and
+# ORCHESTRATED_TASK_MARKERS already use: user corrections are gold (PRD Sec
+# 5) and the highest-priority digest section, so over-excluding a genuine
+# human turn is strictly the worse error.
+# ---------------------------------------------------------------------------
+
+def _recon_run_review_text():
+    """Build the text of a pasted-reconciliation-run-review user turn -- the
+    literal shape ``ReconciliationJudge._build_prompt`` emits
+    (fused-memory/src/fused_memory/reconciliation/judge.py:455-475): a
+    '## Reconciliation Run Review' heading, a '### Run Metadata' block whose
+    first bullet is '- Run ID: {run.id}', a '### Stage Reports' block of
+    ``json.dumps`` output, and '### MCP Actions (N total)' / '### Journal
+    Entries (N total)' blocks. The run id matches the one the census quotes
+    verbatim at §1.1 (:85).
+
+    Deliberately free of every detector literal (NOT_FOUND_PATTERNS,
+    DF_GUARD_PATTERNS, INTERRUPT_PATTERN, SELF_CORRECTION_PATTERNS) so
+    test_signal_counts_unaffected_by_pasted_report_turn isolates the
+    iter_user_turns filter rather than an incidental pattern hit.
+    """
+    return (
+        '## Reconciliation Run Review\n\n'
+        '### Run Metadata\n'
+        '- Run ID: 84e6ce03-1f2a-4c7b-9d84-6b0f1a2e35cc\n'
+        '- Project: dark_factory\n'
+        '- Type: targeted\n'
+        '- Trigger: task_status_change\n'
+        '- Events processed: 12\n'
+        '- Status: completed\n\n'
+        '### Stage Reports\n'
+        '[\n  {\n    "stage": 1,\n    "status": "completed",\n'
+        '    "summary": "consolidated 4 memories"\n  }\n]\n\n'
+        '### MCP Actions (2 total)\n'
+        '[\n  {\n    "tool": "add_memory",\n    "created_at": "2026-07-31T09:00:00Z"\n  }\n]\n\n'
+        '### Journal Entries (5 total)\n'
+        '[\n  {\n    "kind": "stage_start",\n    "created_at": "2026-07-31T09:00:00Z"\n  }\n]\n\n'
+        'Review this run and provide your verdict as JSON.\n'
+    )
+
+
+class TestPastedReportTurnFilter:
+    def test_recon_run_review_turn_is_excluded(self):
+        records = [_user_text(_recon_run_review_text())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_ordinary_correction_after_pasted_report_retained_with_index(self):
+        records = [
+            _user_text(_recon_run_review_text()),
+            _user_text('This is wrong, please redo it.'),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [t['text'] for t in turns] == ['This is wrong, please redo it.']
+        assert [t['index'] for t in turns] == [1]
+
+    def test_single_report_heading_alone_is_not_excluded(self):
+        # Only ONE of the co-occurring headings, and the rest of the turn is
+        # a genuine human question -- must not alone trigger exclusion
+        # (all()-not-any(), mirroring test_single_heading_alone_is_not_excluded).
+        text = '## Reconciliation Run Review\n\nwhat happened in this run?'
+        records = [_user_text(text)]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == text
+
+    def test_report_heading_mentioned_mid_sentence_is_not_excluded(self):
+        # Line-anchored matching: the headings appearing mid-sentence (not
+        # each as its own stripped line) never count as headings, even when
+        # every one of them is mentioned.
+        records = [_user_text(
+            'The ## Reconciliation Run Review prompt emits ### Run Metadata '
+            'and ### Stage Reports — please document that in the runbook.'
+        )]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    def test_render_digest_excludes_pasted_report_from_body_and_n_user_turns(self):
+        records = [
+            _with_session_meta(_user_text(_recon_run_review_text())),
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert 'This is wrong, please redo it.' in body
+        assert 'Run ID:' not in body
+        assert '### Stage Reports' not in body
+        # Census §3.1: clusters 1.1(b) and 1.2 are one event seen from two
+        # surfaces, so the single iter_user_turns filter must fix the body
+        # AND the score together (today: n_user_turns would be 2).
+        assert meta['n_user_turns'] == 1
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
+
+    def test_signal_counts_unaffected_by_pasted_report_turn(self):
+        # The filter must not leak into _signal_text_sources: prepending a
+        # signal-free pasted report must not perturb any of the five counts.
+        base = _all_signals_records()
+        with_report = [_user_text(_recon_run_review_text())] + base
+
+        assert mod.signal_counts(with_report) == mod.signal_counts(base)
+
+    def test_pasted_report_is_not_classified_as_harness_injected(self):
+        # The two predicates stay semantically distinct: a pasted report is
+        # NOT harness-injected (a human really did paste it), which is why
+        # it is a separate predicate rather than a widening of the other.
+        # Keeping them individually testable is what lets a future census
+        # tell facet (a) from facet (b) (census §6).
+        text = _recon_run_review_text()
+
+        assert mod.is_harness_injected_turn(text) is False
+        assert mod.is_pasted_report_turn(text) is True
+        assert mod.is_pasted_report_turn(_briefing_text()) is False
+
+
 class TestRenderDigest:
     def test_includes_heading_for_each_present_signal_class(self):
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
