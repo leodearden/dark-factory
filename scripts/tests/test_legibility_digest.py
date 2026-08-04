@@ -1084,6 +1084,7 @@ def _frontmatter_meta():
         'size_bytes': 512,
         'score': 12.5,
         'n_user_turns': 3,
+        'truncated_items': 0,
         'signal_counts': {
             'tool_error': 1,
             'self_correct': 2,
@@ -1113,7 +1114,8 @@ class TestRenderFrontmatter:
 
         assert top_level_keys == [
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
-            'size_bytes', 'score', 'n_user_turns', 'signal_counts',
+            'size_bytes', 'score', 'n_user_turns', 'truncated_items',
+            'signal_counts',
         ]
 
     def test_signal_counts_nested_in_contract_order(self):
@@ -1151,6 +1153,17 @@ class TestRenderFrontmatter:
 
         assert loaded['n_user_turns'] == 3
         assert isinstance(loaded['n_user_turns'], int)
+
+    def test_truncated_items_renders_as_bare_numeric(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        assert 'truncated_items: 0' in block.splitlines()
+
+        inner = '\n'.join(block.splitlines()[1:-1])
+        loaded = yaml.safe_load(inner)
+
+        assert loaded['truncated_items'] == 0
+        assert isinstance(loaded['truncated_items'], int)
 
     def test_date_round_trips_as_string_not_a_yaml_date_object(self):
         # A bare unquoted 2026-07-14 is resolved by PyYAML's implicit
@@ -1793,6 +1806,95 @@ class TestPerItemByteCap:
         assert '## User Corrections' in digest
         assert '## Error Neighborhoods' in digest
         assert digest.index('## User Corrections') < digest.index('## Error Neighborhoods')
+
+
+# ---------------------------------------------------------------------------
+# truncated_items frontmatter key -- R1 (confusion census 2026-07-31, second
+# truncation-marking surface): the per-item marker makes a truncated item
+# legible only to someone reading that far into the body. The frontmatter
+# reports the count up front, so a reader (or the downstream trickle coder)
+# knows the body it is about to weigh has had substance capped out of it.
+#
+# The count describes the POST-trim body: _truncate_sections pops trailing
+# items until the digest fits, so a truncated item can be removed entirely
+# and a pre-trim count would claim the shipped body contains a truncated
+# item it does not -- a fresh instance of the very defect being fixed
+# (census §3.4).
+# ---------------------------------------------------------------------------
+
+def _multiple_oversized_items_records():
+    """One oversized gold user turn plus three oversized error
+    neighborhoods. Every rendered item exceeds the per-item cap, so all
+    four carry a truncation marker BEFORE trimming; at a small max_bytes
+    the three lower-priority error items (SECTION_PRIORITY index 2) are
+    popped while the gold turn (index 6, trimmed last) survives. That gap
+    is what makes test_truncated_items_never_counts_items_the_soft_cap_evicted
+    discriminating: a pre-trim count would report 4 for a body containing 1.
+    """
+    records = [
+        _with_session_meta(_user_text('This is wrong, please redo it properly. ' * 500)),
+    ]
+    for n in range(3):
+        records.append(_with_session_meta(
+            _assistant(_tool_use('Bash', {'command': 'false'}, id=f'tu-err-{n}')),
+        ))
+        records.append(_with_session_meta(
+            _tool_result(f'tu-err-{n}', 'Exit code 1: ' + ('e' * 4000), is_error=True),
+        ))
+    return records
+
+
+class TestTruncatedItemsFrontmatter:
+    def test_truncated_items_is_zero_when_nothing_was_truncated(self):
+        # _all_signals_records() is well under the 15360 default cap, so
+        # nothing is truncated and the key must say so rather than be absent.
+        digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['truncated_items'] == 0
+        assert mod.ITEM_TRUNCATION_MARKER not in digest
+
+    def test_truncated_items_matches_marker_count_in_final_body(self):
+        digest = mod.render_digest(
+            _oversized_user_correction_records(), agent_class='interactive',
+        )
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['truncated_items'] >= 1
+        assert meta['truncated_items'] == body.count(mod.ITEM_TRUNCATION_MARKER)
+
+    def test_truncated_items_never_counts_items_the_soft_cap_evicted(self):
+        # Four truncated items pre-trim; at max_bytes=1200 the three
+        # lower-priority ones are popped. The count must describe the body
+        # that actually ships, never over-report what was evicted.
+        max_bytes = 1200
+        records = _multiple_oversized_items_records()
+
+        digest = mod.render_digest(
+            records, agent_class='interactive', max_bytes=max_bytes,
+        )
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        pre_trim = sum(
+            line.count(mod.ITEM_TRUNCATION_MARKER)
+            for lines in mod._build_sections(
+                records, item_max_bytes=mod._item_byte_cap(max_bytes),
+            ).values()
+            for line in lines
+        )
+
+        assert pre_trim > meta['truncated_items'], (
+            'fixture must actually evict a truncated item for this test to '
+            f'discriminate (pre_trim={pre_trim})'
+        )
+        assert meta['truncated_items'] == body.count(mod.ITEM_TRUNCATION_MARKER)
+        assert len(digest.encode('utf-8')) <= max_bytes
 
 
 # ---------------------------------------------------------------------------
