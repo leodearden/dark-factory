@@ -693,6 +693,20 @@ def shape_escalations(
                         use the literal ``'reconciliation'`` key which is never in
                         ``task_maps``.
 
+    Each shaped subsection carries, alongside its ``escalations`` rows:
+
+    - ``skipped`` — list of ``{'path': str, 'error': str}`` records for the
+      queue ``*.json`` files ``load_queue_escalations`` could not parse.  Always
+      a list (a missing or ``None`` upstream value shapes to ``[]``), so the
+      client can iterate unconditionally.
+    - ``summary.skipped_count`` — ``len(skipped)`` for that subsection; the
+      top-level ``summary.skipped_count`` is the sum across all of them.  It
+      says how short the ``by_level``/``by_status`` counts beside it may be.
+
+    Both are the payload's statement that a queue holds escalations it could not
+    read — without them the loss is only a server-side WARNING line, and the tab
+    renders short with nothing saying so (INV-2, ``structured-facts-at-failure``).
+
     Returns:
         ``{'ESCALATIONS': {'subsections': [...], 'summary': {...}}}``
     """
@@ -762,6 +776,12 @@ def shape_escalations(
             'label': sub_label,
             'kind': sub_kind,
             'summary': dict(sub.get('summary') or {}),
+            # Degraded-state facts sit beside the counts they qualify.  `or []`
+            # handles both a missing key and an explicit None (a stale or partial
+            # upstream dict) so the JSX can iterate unconditionally; the per-entry
+            # dict(e) copy matches how `summary` is copied and keeps the shaped
+            # payload from aliasing the caller's list.
+            'skipped': [dict(e) for e in sub.get('skipped') or []],
             'escalations': rows,
         })
     return {
