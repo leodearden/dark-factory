@@ -1056,10 +1056,21 @@ class TestClassifyAgentClass:
 # ---------------------------------------------------------------------------
 # render_frontmatter — hand-rendered '---'-delimited YAML block, PRD Sec 7.2
 # key order verbatim (session, cwd, encoded_dir, agent_class, date,
-# size_bytes, score, signal_counts), signal_counts nested in order
-# (tool_error, self_correct, not_found, df_guard, interrupt). Must round-trip
-# via yaml.safe_load -- NOT yaml.safe_dump (design decision: fixed key order,
-# explicit formatting, deterministic byte-stable output).
+# size_bytes, score, n_user_turns, signal_counts), signal_counts nested in
+# order (tool_error, self_correct, not_found, df_guard, interrupt). Must
+# round-trip via yaml.safe_load -- NOT yaml.safe_dump (design decision: fixed
+# key order, explicit formatting, deterministic byte-stable output).
+#
+# n_user_turns is present because of confusion-census-2026-07-31 R2 / §1.2:
+# score_signals adds SIGNAL_WEIGHTS['user_turn'] * n_user_turns on top of the
+# weighted signal_counts, but the frontmatter used to render only the five
+# counts -- so a session whose single "user turn" was a pasted report showed
+# `score: 5.0` beside an all-zero `signal_counts` and a reader could not
+# reconstruct the score from the rendered fields. It is a top-level key, NOT
+# a sixth signal_counts entry: signal_counts is specifically signal_counts()'s
+# five detector hit-counts (mirrored by sampling.SignalCounts and read by
+# _warn_if_body_evicted's any(counts.values()) guard), and n_user_turns is
+# neither produced by that function nor a detector hit count.
 # ---------------------------------------------------------------------------
 
 def _frontmatter_meta():
@@ -1071,6 +1082,7 @@ def _frontmatter_meta():
         'date': '2026-07-14',
         'size_bytes': 512,
         'score': 12.5,
+        'n_user_turns': 3,
         'signal_counts': {
             'tool_error': 1,
             'self_correct': 2,
@@ -1100,7 +1112,7 @@ class TestRenderFrontmatter:
 
         assert top_level_keys == [
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
-            'size_bytes', 'score', 'signal_counts',
+            'size_bytes', 'score', 'n_user_turns', 'signal_counts',
         ]
 
     def test_signal_counts_nested_in_contract_order(self):
@@ -1123,6 +1135,21 @@ class TestRenderFrontmatter:
         loaded = yaml.safe_load(inner)
 
         assert loaded == meta
+
+    def test_n_user_turns_renders_as_bare_numeric(self):
+        # Mirrors the size_bytes/score treatment: numeric frontmatter fields
+        # are emitted as BARE YAML scalars (every other top-level key is
+        # double-quoted via _yaml_dquote), so they load back as numbers
+        # rather than strings.
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        assert 'n_user_turns: 3' in block.splitlines()
+
+        inner = '\n'.join(block.splitlines()[1:-1])
+        loaded = yaml.safe_load(inner)
+
+        assert loaded['n_user_turns'] == 3
+        assert isinstance(loaded['n_user_turns'], int)
 
     def test_date_round_trips_as_string_not_a_yaml_date_object(self):
         # A bare unquoted 2026-07-14 is resolved by PyYAML's implicit
@@ -1378,6 +1405,24 @@ class TestRenderDigest:
         meta = yaml.safe_load(frontmatter_yaml)
 
         assert meta['encoded_dir'] == 'custom-encoded-dir-name'
+
+    def test_frontmatter_score_is_reconstructible_from_rendered_fields(self):
+        # confusion-census-2026-07-31 R2 / §1.2: score_signals' dominant
+        # component is SIGNAL_WEIGHTS['user_turn'] * n_user_turns, which the
+        # frontmatter used to omit entirely -- so `score` could not be
+        # checked against `signal_counts` by a reader of the digest alone.
+        # With n_user_turns rendered, the score is fully reconstructible.
+        records = _all_signals_records()
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['n_user_turns'] == len(mod.iter_user_turns(records))
+        assert meta['score'] == mod.score_signals(
+            meta['signal_counts'], meta['n_user_turns'],
+        )
 
     def test_size_bytes_equals_actual_rendered_byte_length(self):
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
