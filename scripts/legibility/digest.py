@@ -602,6 +602,59 @@ def is_harness_injected_turn(text: str) -> bool:
     return any(marker in lowered for marker in HARNESS_PROMPT_MARKERS)
 
 
+RECON_RUN_REVIEW_HEADINGS: tuple[str, ...] = (
+    '## reconciliation run review', '### run metadata', '### stage reports',
+)
+"""Reconciliation run-review report heading literals
+(fused_memory/reconciliation/judge.py: ``ReconciliationJudge._build_prompt``
+emits '## Reconciliation Run Review', '### Run Metadata', '### Stage
+Reports', '### MCP Actions (N total)' and '### Journal Entries (N total)'
+as a single f-string report). The three parenthesis-free headings are used
+so the marker is an exact line match; all must co-occur as line-anchored
+headings (all(), not any() -- the same false-positive guard as
+HARNESS_BRIEFING_HEADINGS)."""
+
+PASTED_REPORT_HEADING_SETS: tuple[tuple[str, ...], ...] = (
+    RECON_RUN_REVIEW_HEADINGS,
+)
+"""Every known pasted-report heading set, matched independently: a turn is
+a pasted report when ALL headings of ANY one set co-occur. This is the
+documented extension point -- a future census sighting of another generator
+shape is a one-line tuple addition here, the same way HARNESS_PROMPT_MARKERS
+invites one-line additions."""
+
+
+def is_pasted_report_turn(text: str) -> bool:
+    """True when *text* is a generated report pasted into a genuine human
+    turn (e.g. a reconciliation run-review dump pasted for review) rather
+    than a correction of the agent.
+
+    This content is NOT harness-injected -- a human really did type or
+    paste the turn -- which is why this is a separate predicate rather than
+    a widening of :func:`is_harness_injected_turn`, whose name would
+    otherwise assert something false about every turn it newly excluded.
+    Keeping the two individually testable is also what lets a census tell
+    the two mislabeling sources apart (confusion-census-2026-07-31 tracks
+    them as §1.1 facet (a) vs facet (b), and §6 names "zero facet-(a)
+    sightings next cycle" as the discriminating fix-confirmed measurement).
+    :func:`iter_user_turns` composes the two with a single ``or``.
+
+    Matching requires ALL headings of ANY one :data:`PASTED_REPORT_HEADING_SETS`
+    entry to occur as their own stripped, lowercased lines. Deliberately
+    literal and line-anchored rather than a structural "looks like a
+    generated report" heuristic: user corrections are gold (PRD Sec 5) and
+    the highest-priority digest section, so over-excluding a genuine human
+    turn -- e.g. a long, well-formatted human bug report with headings and
+    a pasted log excerpt -- is strictly the worse error. A turn that quotes
+    one heading, or mentions all of them mid-prose, is never excluded.
+    """
+    lines = {line.strip() for line in text.lower().splitlines()}
+    return any(
+        all(heading in lines for heading in headings)
+        for headings in PASTED_REPORT_HEADING_SETS
+    )
+
+
 def classify_agent_class(
     records: list[dict[str, Any]], override: str | None = None,
 ) -> str:
@@ -640,14 +693,18 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
     isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, and harness-injected briefing/prompt turns
-    (see :func:`is_harness_injected_turn`) -- these are typed into the
-    transcript as ordinary user-role text (isMeta=False), so isMeta alone
-    cannot exclude them. This function is the SINGLE source for both the
-    gold user_corrections section and render_digest's n_user_turns score
-    component, so this one filter excludes a harness-injected turn from
-    both. User corrections are gold (PRD Sec 5) -- this is the
-    highest-priority digest section.
+    entirely tool_result blocks, harness-injected briefing/prompt turns
+    (see :func:`is_harness_injected_turn`), and pasted non-corrective report
+    content such as a reconciliation run-review dump (see
+    :func:`is_pasted_report_turn`). Both excluded content shapes are typed
+    into the transcript as ordinary user-role text (isMeta=False), so
+    isMeta alone cannot exclude either. This function is the SINGLE source
+    for both the gold user_corrections section and render_digest's
+    n_user_turns score component, so this one filter excludes such a turn
+    from the body AND the score together -- which is exactly what
+    confusion-census-2026-07-31 §3.1 asks for, its clusters 1.1(b) and 1.2
+    being one event observed from two surfaces. User corrections are gold
+    (PRD Sec 5) -- this is the highest-priority digest section.
     """
     turns = []
     for index, record in enumerate(records):
@@ -660,7 +717,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         text = _user_turn_text(_message_content(record))
         if text is None:
             continue
-        if is_harness_injected_turn(text):
+        if is_harness_injected_turn(text) or is_pasted_report_turn(text):
             continue
         turns.append({'index': index, 'text': text})
     return turns
