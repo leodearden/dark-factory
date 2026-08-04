@@ -682,9 +682,30 @@ def _yaml_dquote(value: Any) -> str:
 
 FRONTMATTER_KEYS: tuple[str, ...] = (
     'session', 'cwd', 'encoded_dir', 'agent_class', 'date', 'size_bytes', 'score',
+    'n_user_turns',
 )
 """Top-level frontmatter keys in the exact PRD Sec 7.2 order (everything
-before ``signal_counts``, which is rendered as its own nested block)."""
+before ``signal_counts``, which is rendered as its own nested block).
+
+``n_user_turns`` follows ``score`` so the block reads score -> its dominant
+5.0-weighted basis -> the remaining weighted counts. Rationale
+(confusion-census-2026-07-31 R2 / Sec 1.2): :func:`score_signals` adds
+``SIGNAL_WEIGHTS['user_turn'] * n_user_turns`` on top of the weighted
+``signal_counts``, so rendering only the counts left the score
+unreconstructible from the digest -- a session whose sole "user turn" was a
+pasted report showed ``score: 5.0`` beside an all-zero ``signal_counts``.
+It is deliberately NOT a sixth ``signal_counts`` entry: that block is
+specifically :func:`signal_counts`' five detector hit-counts (mirrored by
+``sampling.SignalCounts``, and read by :func:`_warn_if_body_evicted`'s
+``any(counts.values())`` guard), and a user-turn tally is neither."""
+
+BARE_FRONTMATTER_KEYS: frozenset[str] = frozenset(
+    {'size_bytes', 'score', 'n_user_turns'}
+)
+"""Top-level frontmatter keys rendered as bare YAML scalars; every other
+key in FRONTMATTER_KEYS is double-quoted via :func:`_yaml_dquote`. Named
+rather than inlined into :func:`render_frontmatter` so a further numeric
+key is a one-word addition here instead of a growing inline literal."""
 
 SIGNAL_COUNT_KEYS: tuple[str, ...] = (
     'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
@@ -700,12 +721,13 @@ def render_frontmatter(meta: dict[str, Any]) -> str:
     and stable downstream diffs, and avoids a dumper's default surprises
     (key sorting, quoting, anchors, float formatting). String-valued fields
     are explicitly double-quoted (see :func:`_yaml_dquote`); numeric fields
-    (size_bytes, score, and every signal_counts value) are emitted bare.
+    (:data:`BARE_FRONTMATTER_KEYS` and every signal_counts value) are
+    emitted bare.
     """
     lines = ['---']
     for key in FRONTMATTER_KEYS:
         value = meta[key]
-        if key in ('size_bytes', 'score'):
+        if key in BARE_FRONTMATTER_KEYS:
             lines.append(f'{key}: {value}')
         else:
             lines.append(f'{key}: {_yaml_dquote(value)}')
@@ -1045,13 +1067,18 @@ def render_digest(
     """
     cwd = _derive_cwd(records)
     counts = signal_counts(records)
+    # Bound ONCE and used for both the rendered key and the scored
+    # argument, so the frontmatter's stated basis and the score computed
+    # from it can never diverge (confusion-census-2026-07-31 R2).
+    n_user_turns = len(iter_user_turns(records))
     meta = {
         'session': _derive_session(records),
         'cwd': cwd,
         'encoded_dir': _derive_encoded_dir(records, cwd, path),
         'agent_class': agent_class,
         'date': _derive_date(records),
-        'score': score_signals(counts, len(iter_user_turns(records))),
+        'score': score_signals(counts, n_user_turns),
+        'n_user_turns': n_user_turns,
         'signal_counts': counts,
     }
 
