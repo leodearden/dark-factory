@@ -2075,6 +2075,99 @@ def test_run_census_without_verify_cap_passes_every_novel_cluster(tmp_path):
     assert "verify=3" in report_text.split("## Cost", 1)[1]
 
 
+def test_run_census_warns_and_escalates_when_every_cluster_is_rejected(tmp_path, caplog):
+    """Clusters offered, none verified, is the observable signature of a
+    SYSTEMIC verifier failure — say it out loud rather than reporting an
+    empty census in the same voice as an unremarkable one.
+
+    Scoping the subprocess cwd (2026-08-03) removed one CAUSE of that
+    silence, not the class: _build_default_verify_fn fails CLOSED per
+    cluster, so a model that goes unreachable mid-run, a different
+    permission denial, or persistently unparseable verdicts all still land
+    as ordinary rejections with nothing surfacing the pattern.
+    """
+    fake_escalate_fn = _make_fake_escalate_fn()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set()),  # every cluster rejects
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=fake_escalate_fn,
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    warnings = " ".join(r.message.lower() for r in caplog.records)
+    assert "systemic" in warnings, "the pattern must be NAMED, not left to be inferred"
+    assert "3" in warnings, "how many clusters were offered"
+
+    assert len(fake_escalate_fn.calls) == 1, fake_escalate_fn.calls
+    escalation = fake_escalate_fn.calls[0]
+    assert escalation["severity"] == "info"
+    assert "reject" in escalation["summary"].lower()
+
+    # A suspicious run is still a COMPLETED run: mining is already paid for,
+    # and an all-rejected census is legitimately possible. Detect, never fail.
+    assert outcome.status == "done"
+    assert kwargs["census_state_path"].exists()
+
+
+def test_run_census_does_not_warn_when_some_cluster_verifies(tmp_path, caplog):
+    """The detector must not fire on an ordinary run — a partial rejection
+    is the normal case and must stay quiet, or the warning is noise that
+    gets filtered out before the real incident."""
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),  # 2 of 3 rejected -> nothing to escalate
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        mod.run_census(**kwargs)
+
+    assert not any("systemic" in r.message.lower() for r in caplog.records)
+
+
+def test_run_census_mass_rejection_escalation_failure_is_not_fatal(tmp_path, caplog):
+    """A raising escalate_fn must not discard a run whose mining is already
+    paid for. Unlike the defer-path escalation (which returns immediately
+    afterwards), this one sits between the mining spend and the output
+    writes."""
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set()),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),  # raises on the detector's call
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert kwargs["report_path"].exists()
+    assert kwargs["census_state_path"].exists()
+    # Swallowed, but never silently: both the finding and the failed post log.
+    warnings = " ".join(r.message.lower() for r in caplog.records)
+    assert "systemic" in warnings
+    assert "escalation failed" in warnings
+
+
 @pytest.mark.parametrize(
     "bad_kwargs",
     [
@@ -2913,14 +3006,14 @@ def test_build_stage_invokes_threads_each_stage_timeout(monkeypatch):
     # Record the timeout every stage invoke threads to coder._invoke_cli.
     recorded = []
 
-    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None, cwd=None):
         recorded.append(timeout)
         return "dummy"
 
     monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
 
     cfg = _config_with_timeouts(111, 222, 333)
-    mining, verify, synth = mod._build_stage_invokes(cfg)
+    mining, verify, synth = mod._build_stage_invokes(cfg, project_root="/home/leo/src/dark-factory")
 
     # Drive each partial exactly as its census seam does: two positional
     # args, no kwargs (invoke(prompt, model)).
@@ -2947,7 +3040,7 @@ def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
 
     recorded = []
 
-    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None, cwd=None):
         recorded.append({"model": model, "timeout": timeout})
         return '{"verified": true}'
 
