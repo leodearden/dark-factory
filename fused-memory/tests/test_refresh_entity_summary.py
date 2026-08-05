@@ -1276,7 +1276,14 @@ class TestMemoryServiceRefreshEntitySummaryJournalFix:
 #       property tuple — as redirect_node_edges produces on the merge path —
 #       are both counted, not collapsed into one.
 # Skipped automatically when FalkorDB is not reachable, following the
-# established pattern in tests/test_list_indices_integration.py.
+# established pattern in tests/test_list_indices_integration.py. The
+# reachability probe, connection constants and per-run graph name are shared
+# via a plain import from _fm_helpers (task 3502), which lives outside
+# conftest.py precisely to avoid the sys.modules['conftest'] collision
+# documented in its own module docstring. Only the fixture body below (client
+# construction, stale-graph delete, teardown delete/aclose) remains
+# duplicated per module; do not re-fork the probe or the constants back into
+# this file.
 
 @pytest_asyncio.fixture
 async def edge_dedup_live_graph():

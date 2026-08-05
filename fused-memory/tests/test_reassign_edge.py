@@ -382,7 +382,8 @@ class TestReassignEdgePostMove:
 
 
 # ---------------------------------------------------------------------------
-# Live-FalkorDB integration harness (mirrors test_merge_entities.py:980-1132)
+# Live-FalkorDB integration harness (mirrors test_merge_entities.py's
+# merge_entities_live_graph fixture)
 # ---------------------------------------------------------------------------
 #
 # Pins the REAL topology move + lossless preservation + uuid-uniqueness that
@@ -392,10 +393,12 @@ class TestReassignEdgePostMove:
 # when FalkorDB is unreachable (the mock tests guarantee coverage then) and
 # deselected by the default `-m 'not integration'`; runs only under an explicit
 # `-m integration` with FalkorDB reachable. The reachability probe, connection
-# constants and per-run graph name come from _fm_helpers (task 3502) — which
-# sidesteps the sys.modules['conftest'] collision by not being conftest.py.
-# Only the fixture body below is per-module; do not re-fork the probe or the
-# constants back into this file.
+# constants and per-run graph name are shared via a plain import from
+# _fm_helpers (task 3502), which lives outside conftest.py precisely to avoid
+# the sys.modules['conftest'] collision documented in its own module
+# docstring. Only the fixture body below (client construction, stale-graph
+# delete, teardown delete/aclose) remains duplicated per module; do not
+# re-fork the probe or the constants back into this file.
 # ---------------------------------------------------------------------------
 
 @pytest_asyncio.fixture

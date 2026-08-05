@@ -46,10 +46,13 @@ from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantF
 # re-run, group_id exclusion of a task-2115 foreign clone) against a REAL
 # FalkorDB server -- the mock tests above can only pin the Cypher
 # string/params shape, not FalkorDB's actual grouping/count semantics.
-# The reachability probe, connection constants and per-run graph name come
-# from _fm_helpers (task 3502) — which sidesteps the `sys.modules['conftest']`
-# collision by not being conftest.py. Only the fixture body below is
-# per-module; do not re-fork the probe or the constants back into this file.
+# The reachability probe, connection constants and per-run graph name are
+# shared via a plain import from _fm_helpers (task 3502), which lives outside
+# conftest.py precisely to avoid the `sys.modules['conftest']` collision
+# documented in its own module docstring. Only the fixture body below (client
+# construction, stale-graph delete, teardown delete/aclose) remains
+# duplicated per module; do not re-fork the probe or the constants back into
+# this file.
 #
 # Skipped automatically when FalkorDB is not reachable; the mock tests above
 # guarantee coverage in that case.
