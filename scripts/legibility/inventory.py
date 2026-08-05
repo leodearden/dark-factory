@@ -19,10 +19,8 @@ Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
 import sys
-import zlib
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -93,19 +91,17 @@ def is_member(cwd: str, cwd_prefixes: Sequence[str]) -> bool:
     return any(cwd_path.is_relative_to(Path(prefix)) for prefix in cwd_prefixes)
 
 
-UNREADABLE_FILE_ERRORS = (EOFError, zlib.error, UnicodeDecodeError)
-"""The non-``OSError`` exceptions that mean "this transcript is unreadable".
+UNREADABLE_FILE_ERRORS = (UnicodeDecodeError,)
+"""Exception types an unreadable transcript can raise that are NOT ``OSError``.
 
-The catch tuple for :func:`as_unreadable_file_error`, named here so the two
-transcript readers cannot drift apart in WHICH shapes they normalize (see
-that function for WHY each one is on the list). ``gzip.BadGzipFile`` is
-absent deliberately: it is already an ``OSError``, so it needs no
-normalization and propagates untouched.
+With the archive stored plain (task 3618) exactly ONE such shape remains:
+``UnicodeDecodeError``. It is reachable on any transcript, since the reader
+opens under strict ``encoding='utf-8'``, and being a ``ValueError`` subclass
+it escapes an ``except OSError``-only handler entirely — so it still needs
+normalizing even though the gzip container shapes are gone.
 
-Public, for the same reason :func:`iter_json_lines` is: it crosses a module
-boundary (``digest.load_transcript`` catches on it), and a consumer reaching
-for an underscore name across that boundary is how a second, quietly
-different answer to "which exceptions mean an unreadable file" gets written.
+Exported deliberately: ``digest.load_transcript`` catches on THIS name rather
+than a copy, so the two readers cannot drift apart at that boundary.
 """
 
 
@@ -123,9 +119,6 @@ def as_unreadable_file_error(exc: BaseException) -> OSError:
     FOUR different exception types, only the first of which is already an
     ``OSError``::
 
-        bad magic         -> gzip.BadGzipFile     (an OSError subclass)
-        truncated stream  -> EOFError             (not an OSError)
-        corrupt body      -> zlib.error           (not an OSError)
         undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
 
     The last three are exactly what a fire-and-forget writer produces when a
@@ -157,7 +150,7 @@ def as_unreadable_file_error(exc: BaseException) -> OSError:
         return exc
     if isinstance(exc, UnicodeDecodeError):
         return OSError(f'undecodable transcript bytes: {exc}')
-    return OSError(f'corrupt or truncated gzip stream: {exc}')
+    return OSError(f'unreadable transcript: {exc}')
 
 
 def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
@@ -174,28 +167,19 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     the largest single record. ``digest.load_transcript`` is the slurping
     sibling for the single-file case, with a byte-identical parse contract.
 
-    Transparently reads gzip-compressed transcripts: a ``*.jsonl.gz`` path
-    (the archived fleet-transcript format written by
-    ``shared.transcript_archive``) is opened via ``gzip.open(..., 'rt')``,
-    while a plain path keeps the exact ``open(path, encoding='utf-8')`` call
-    for byte-parity. Either way the strip/skip-blank/``json.loads``/
-    dict-check body is identical, so :func:`_session_cwd_and_date` and its
-    callers (incl. ``sampling._score_and_find_first_turn``) become gz-aware
-    with no further change.
-
     Mirrors ``digest.load_transcript``'s graceful-degrade contract: a
     transcript is written fire-and-forget and can have a truncated or
     corrupt trailing line, which must not abort the whole read. Raises
-    ``OSError`` if *path* cannot be opened or decompressed at all.
+    ``OSError`` if *path* cannot be read at all.
 
     That split is a contract, not an implementation detail: a corrupt LINE
     degrades silently, an unreadable FILE raises. Callers that report
     coverage rely on it to count unreadable files without inflating the
     count with truncated trailing lines.
 
-    Making that ``OSError`` promise true takes explicit normalization: an
-    unreadable file surfaces as four different exception types, only one of
-    which is already an ``OSError``. :func:`as_unreadable_file_error` is the
+    Making that ``OSError`` promise true takes explicit normalization: the
+    decode shape is a ``ValueError`` subclass, not an ``OSError``.
+    :func:`as_unreadable_file_error` is the
     single place that says which ones and why, and ``digest.load_transcript``
     funnels through the same helper, so the two readers are interchangeable
     at this boundary by construction rather than by matching copies.
@@ -207,12 +191,8 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     replacement characters would let corrupt bytes enter the corpus as
     plausible-looking data.
     """
-    if str(path).endswith('.gz'):
-        f = gzip.open(path, 'rt', encoding='utf-8')
-    else:
-        f = open(path, encoding='utf-8')
-    with f:
-        # The wrap covers only the read/decompress iteration — decompression
+    with open(path, encoding='utf-8') as f:
+        # The wrap covers only the read iteration — decoding
         # happens lazily HERE, per chunk, not at open() — while the
         # JSONDecodeError skip stays inside the loop, so the file-level vs
         # line-level split above is preserved. The catch tuple is the shared
@@ -392,11 +372,11 @@ def _build_session_record(
 
 
 def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
-    """Yield every ``*.jsonl`` / ``*.jsonl.gz`` transcript under *root*, recursively.
+    """Yield every ``*.jsonl`` transcript under *root*, recursively.
 
     The archived fleet-transcript tree (``shared.transcript_archive``) nests
-    transcripts under ``<task_id>/<enc>/<sid>.jsonl.gz`` with an even-deeper
-    ``<sid>/subagents/agent-*.jsonl.gz`` variant, so — unlike the
+    transcripts under ``<task_id>/<enc>/<sid>.jsonl`` with an even-deeper
+    ``<sid>/subagents/agent-*.jsonl`` variant, so — unlike the
     ``~/.claude/projects`` pre-filter (:func:`iter_project_dirs`), whose
     top-level dir names ARE the encoded cwds — the archive is walked
     RECURSIVELY and membership is decided per-file downstream via
@@ -405,30 +385,20 @@ def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
     directory: an absent, not-yet-created archive root is normal (the tree
     is git-ignored and may not exist yet).
 
-    A SINGLE recursive walk (``rglob('*.jsonl*')``) filtered by suffix, not
-    two separate ``rglob`` passes for ``*.jsonl`` and ``*.jsonl.gz`` — the
-    combined glob is a strict superset of both, and the ``endswith`` filter
-    trims it back to exactly the two transcript classes, so the yielded set
-    (and its sort order) is byte-identical to the two-pass form while halving
-    the directory-tree traversal cost (reviewer_comprehensive/performance,
-    task 2730 amendment pass).
+    The archive holds ONE class of transcript (task 3618 dropped the gzipped
+    form), so this is a single ``rglob('*.jsonl')`` with no suffix filter.
     """
     if not root.is_dir():
         return
-    matches = [
-        p
-        for p in root.rglob('*.jsonl*')
-        if p.name.endswith('.jsonl') or p.name.endswith('.jsonl.gz')
-    ]
-    yield from sorted(matches)
+    yield from sorted(root.rglob('*.jsonl'))
 
 
 def _archive_enc(session_path: Path, archive_root: Path) -> str | None:
     """Return the encoded ``<enc>`` cwd dir of an archive transcript, or ``None``.
 
     The archived fleet-transcript tree nests transcripts under
-    ``<task_id>/<enc>/<sid>.jsonl.gz`` (main) and
-    ``<task_id>/<enc>/<sid>/subagents/agent-*.jsonl.gz`` (subagent), so the
+    ``<task_id>/<enc>/<sid>.jsonl`` (main) and
+    ``<task_id>/<enc>/<sid>/subagents/agent-*.jsonl`` (subagent), so the
     encoded cwd directory is ``parts[1]`` of the archive-root-relative path in
     BOTH layouts — NOT ``session_path.parent.name`` (which is ``'subagents'``
     for the subagent variant, and would make the pre-filter drop EVERY subagent
@@ -466,7 +436,7 @@ def _enumerate(
     *agent_transcript_roots* is an ADDITIONAL, opt-in list of archive roots
     (the ``shared.transcript_archive`` fleet-transcript tree, resolved via
     :func:`resolve_agent_transcript_roots`) walked recursively ALONGSIDE the
-    ``~/.claude/projects`` tree — each ``*.jsonl``/``*.jsonl.gz`` under a
+    ``~/.claude/projects`` tree — each ``*.jsonl`` under a
     root is admitted by the same per-file membership + date filter. A cheap
     encoded-``<enc>`` pre-filter — mirroring :func:`iter_project_dirs`'
     superset pre-filter for the projects tree — skips a proven-foreign
