@@ -738,6 +738,81 @@ class TestSubshellClauseIntegrity:
             f'{label}: flags leaked after the subshell close: {result!r}'
         )
 
+    def test_segmented_execution_path_is_also_repaired(self):
+        """GROUP A: the EXECUTION-layer splitter must not resurrect the bug.
+
+        RED at baseline for the same reason as
+        ``test_cockpit_subshell_stays_parseable`` above: at baseline
+        ``split_and_chain_segments`` still returns all 8 segments (it has no
+        reason to refuse — the chain itself is well-formed `&&`-separated
+        shell, just one segment's *content* happens to be unparseable), with
+        the cockpit segment individually failing ``bash -n``. So segmenting
+        the recovered command does NOT rescue this bug — both the
+        single-string and the segmented execution paths were broken, and
+        both must be fixed by the one shared-appender change (GREEN after
+        step-2, since ``split_and_chain_segments`` itself is untouched).
+        """
+        recovered = render(serial_pytest(parse_config_command(ROOT_TEST_COMMAND)))
+        segments = split_and_chain_segments(recovered)
+        assert segments is not None
+        assert len(segments) == 8
+        for segment in segments:
+            _assert_bash_parses(segment.command, what=f'segment {segment.label!r}')
+
+    # GROUP B — differentiator guards for the rejected alternative fix
+    # (widening `_PYTEST_INVOCATION_RE`'s excluded character class to
+    # `[^&|;)]*`). `bash -n` alone cannot distinguish the two candidate
+    # fixes on the first two inputs below: the widened-class output ALSO
+    # exits 0 while having spliced the recovery flags into the middle of a
+    # `-k` keyword expression or a `$(...)` command substitution — see
+    # `_PYTEST_INVOCATION_RE`'s comment and the recorded design decision.
+    # Only the exact rendered string tells the two fixes apart, which is why
+    # both assertions are required here, not `bash -n` alone.
+    #
+    # Given bare, the first two inputs parse to a single STRUCTURED pytest
+    # command (measured: `cmd.raw is None`), which would exercise the
+    # `base_flags` branch rather than the regex/raw-chain branch this task
+    # changes — a vacuous test. A leading `cd x && ` prefix does NOT force
+    # raw retention here (measured): it is exactly the one recognised
+    # "leading cd &&" structured form `_parse_single_segment` peels off
+    # (verify_cmd.py:978), after which no chain operator remains. Appending
+    # `&& true` instead genuinely forces the multi-segment chain path
+    # (measured: `cmd.raw is not None` for all three cases below).
+    #
+    # The third case is NOT a differentiator the way the first two are —
+    # measured RED at baseline (same underlying bug as GROUP A, just with no
+    # space before the closing paren), and both candidate fixes repair it
+    # identically. It earns its place here anyway as coverage of that
+    # tighter no-space shape for the real (paren-depth) fix.
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            (
+                'pytest -k "not (slow or integration)" tests/ && true',
+                'pytest -k "not (slow or integration)" tests/'
+                " -p no:xdist -o addopts='' && true",
+            ),
+            (
+                'pytest $(cat args.txt) tests/ && true',
+                "pytest $(cat args.txt) tests/ -p no:xdist -o addopts='' && true",
+            ),
+            (
+                '(cd x && pytest tests/)',
+                "(cd x && pytest tests/ -p no:xdist -o addopts='')",
+            ),
+        ],
+        ids=['keyword-expression', 'command-substitution', 'no-space-before-paren'],
+    )
+    def test_pytest_invocations_own_parens_are_preserved(self, raw, expected):
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.PYTEST
+        # Else the regex/raw-chain path this task changes isn't exercised.
+        assert cmd.raw is not None
+
+        result = render(serial_pytest(cmd))
+        _assert_bash_parses(result, what=raw)
+        assert result == expected
+
 
 class TestSeparateTokenValueFlagBinding:
     """A pytest separate-token value flag (-k/-m/-p/-o/-n/...) must bind to its
