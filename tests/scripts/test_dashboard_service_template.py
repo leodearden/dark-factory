@@ -51,12 +51,38 @@ HARDCODED_EXPECTED_ENV_LINE = (
 # design (it compares committed-vs-installed, where the directive's value can
 # legitimately diverge across hosts), so it does not guard the
 # template/hardcoded pair asserted below — that guard is
-# _assert_working_directory_line, an anchored check (not a substring check),
+# _assert_exact_unit_line, an anchored check (not a substring check),
 # so a repointed or commented-out directive still fails.
 TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE = "WorkingDirectory=__REPO_ROOT__"
 
 HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE = (
     "WorkingDirectory=/home/leo/src/dark-factory"
+)
+
+# DASHBOARD_PROJECT_ROOT is declared EXPLICITLY (task 3572) because
+# dashboard/src/dashboard/config.py's `project_root` field falls back to
+# Path.cwd() when the variable is unset (task 3503 chose that over a hardcoded
+# literal on purpose).  Without the line asserted below, the dashboard's entire
+# data root — burndown, metrics, runs, escalations and memory-evals databases —
+# was an undeclared SIDE EFFECT of WorkingDirectory=: correct only because that
+# directive happens to point at the repo root, with nothing in either file
+# naming the coupling.  A future edit to WorkingDirectory= would then silently
+# relocate every database.  Declaring the variable splits the two jobs;
+# WorkingDirectory= is retained and still load-bearing for `uv run --project
+# dashboard` (see the comment above), it just no longer does this second,
+# undeclared one.
+#
+# The two values must nonetheless stay EQUAL, which is a separate assertion
+# from the exact-line ones: see
+# test_project_root_env_matches_working_directory_in_both_unit_files below, and
+# scripts/check_dashboard_unit_parity.py's env_matches_directive for the same
+# relation checked against the INSTALLED copy.
+TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE = (
+    "Environment=DASHBOARD_PROJECT_ROOT=__REPO_ROOT__"
+)
+
+HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE = (
+    "Environment=DASHBOARD_PROJECT_ROOT=/home/leo/src/dark-factory"
 )
 
 # These are the literal paths baked into the committed hardcoded service file;
@@ -106,28 +132,91 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
     )
 
 
-def _assert_working_directory_line(path: pathlib.Path, expected_line: str) -> None:
+def _assert_exact_unit_line(path: pathlib.Path, expected_line: str) -> None:
     """Assert *expected_line* appears in *path* as a whole, anchored line.
+
+    Generic by construction — it asserts nothing about WHICH directive it is
+    given, so it serves every unit line whose exact value is load-bearing.  It
+    is used here for both ``WorkingDirectory=`` and
+    ``Environment=DASHBOARD_PROJECT_ROOT=``; see the module comments above
+    TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE and
+    TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE for why each of those is
+    load-bearing.
 
     A plain substring check (``expected_line in content``) is satisfied by a
     repointed value that merely starts with the expected text — e.g.
     ``WorkingDirectory=__REPO_ROOT__/dashboard`` still contains
     ``WorkingDirectory=__REPO_ROOT__`` — and by the same text sitting inside a
     ``#`` comment, which systemd never parses as a directive.  Both leave the
-    unit's real cwd wrong or unset while a substring check stays green.
-    Anchoring the full line with ``^...$`` under ``re.MULTILINE`` rejects
-    both: a suffix breaks the ``$`` boundary, and a leading ``#`` breaks the
-    ``^`` boundary.  See the module comment on
-    TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above for why the directive
-    itself is load-bearing.
+    unit's real cwd (or data root) wrong or unset while a substring check stays
+    green.  Anchoring the full line with ``^...$`` under ``re.MULTILINE``
+    rejects both: a suffix breaks the ``$`` boundary, and a leading ``#``
+    breaks the ``^`` boundary.
     """
     content = path.read_text(encoding="utf-8")
     pattern = re.compile(rf"^{re.escape(expected_line)}\s*$", re.MULTILINE)
     assert pattern.search(content) is not None, (
         f"No line matching {expected_line!r} found in {path}. See the "
-        "WorkingDirectory= rationale comment above "
-        "TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE for why this directive is "
+        "rationale comments above TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE and "
+        "TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE for why these directives are "
         "load-bearing."
+    )
+
+
+def _assert_project_root_env_matches_working_directory(path: pathlib.Path) -> None:
+    """Assert DASHBOARD_PROJECT_ROOT equals WorkingDirectory= WITHIN *path*.
+
+    This is the relation the two directives must satisfy, checked INSIDE a
+    single file rather than across the template/hardcoded pair.  The exact-line
+    assertions above already pin each file's literal value; what they cannot
+    catch is one of the two being repointed while the other stays put, since
+    each remains individually well-formed.
+
+    Checking the relation intra-file (rather than comparing one file's value to
+    the other's) is also what makes it host-invariant: the committed unit
+    hardcodes /home/leo/src/dark-factory while setup-host.sh renders the
+    installed copy with that host's real $REPO_ROOT, so the VALUES legitimately
+    differ per host while this EQUALITY holds on every one of them.
+    scripts/check_dashboard_unit_parity.py's env_matches_directive applies the
+    same relation to the installed copy for exactly that reason.
+
+    Both directives are matched anchored (``^...$`` under ``re.MULTILINE``), so
+    a commented-out or suffixed line does not satisfy either half — the same
+    property _assert_exact_unit_line's docstring records.
+    """
+    content = path.read_text(encoding="utf-8")
+
+    env_match = re.search(
+        r"^Environment=DASHBOARD_PROJECT_ROOT=(.*)$", content, re.MULTILINE
+    )
+    assert env_match is not None, (
+        f"No Environment=DASHBOARD_PROJECT_ROOT= line found in {path}. Without "
+        "it the dashboard's data root falls back to Path.cwd() and is an "
+        "undeclared side effect of WorkingDirectory= — see the comment above "
+        "TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE."
+    )
+    wd_match = re.search(r"^WorkingDirectory=(.*)$", content, re.MULTILINE)
+    assert wd_match is not None, (
+        f"No WorkingDirectory= line found in {path}; the DASHBOARD_PROJECT_ROOT "
+        "relation cannot be established without it."
+    )
+
+    project_root = env_match.group(1).strip()
+    working_directory = wd_match.group(1).strip()
+    assert project_root != "", (
+        f"DASHBOARD_PROJECT_ROOT is empty or whitespace-only in {path}. "
+        "config.py would then treat the empty string as the declared root "
+        "rather than falling back to cwd."
+    )
+    assert working_directory != "", (
+        f"WorkingDirectory= is empty or whitespace-only in {path}."
+    )
+    assert project_root == working_directory, (
+        f"DASHBOARD_PROJECT_ROOT ({project_root!r}) does not equal "
+        f"WorkingDirectory ({working_directory!r}) in {path}. The dashboard "
+        "would then read its databases from one directory while `uv run "
+        "--project dashboard` resolves relative paths against another. Repoint "
+        "whichever of the two moved."
     )
 
 
@@ -165,7 +254,7 @@ def test_working_directory_is_pinned_in_both_unit_files() -> None:
 
     See the module comment on TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above
     for why the directive is load-bearing, and
-    _assert_working_directory_line's docstring for why the check is anchored
+    _assert_exact_unit_line's docstring for why the check is anchored
     rather than a substring match.
 
     Kept for targeted diagnostics — this property is subsumed by
@@ -176,7 +265,42 @@ def test_working_directory_is_pinned_in_both_unit_files() -> None:
         (TEMPLATE, TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE),
         (HARDCODED, HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE),
     ):
-        _assert_working_directory_line(path, expected_line)
+        _assert_exact_unit_line(path, expected_line)
+
+
+def test_project_root_env_var_is_pinned_in_both_unit_files() -> None:
+    """Both unit files must declare DASHBOARD_PROJECT_ROOT explicitly (task 3572).
+
+    See the module comment on TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE above for
+    why the variable is declared rather than left to config.py's Path.cwd()
+    fallback, and _assert_exact_unit_line's docstring for why the check is
+    anchored rather than a substring match.
+
+    The template must carry the __REPO_ROOT__ sentinel, never a hardcoded path,
+    so setup-host.sh's `sed 's|__REPO_ROOT__|$REPO_ROOT|g'` makes the installed
+    value track the real checkout — the same treatment
+    DASHBOARD_KNOWN_PROJECT_ROOTS' self entry already gets.
+    """
+    for path, expected_line in (
+        (TEMPLATE, TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE),
+        (HARDCODED, HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE),
+    ):
+        _assert_exact_unit_line(path, expected_line)
+
+
+def test_project_root_env_matches_working_directory_in_both_unit_files() -> None:
+    """DASHBOARD_PROJECT_ROOT must equal WorkingDirectory= within each unit file.
+
+    Distinct from the exact-line tests above, which pin each directive's literal
+    value independently: this pins the RELATION between them, so repointing one
+    without the other fails even though both lines remain individually
+    well-formed.  See _assert_project_root_env_matches_working_directory's
+    docstring for why the relation is checked intra-file (it is host-invariant
+    that way), and scripts/check_dashboard_unit_parity.py's env_matches_directive
+    for the same relation applied to the installed copy.
+    """
+    for path in (TEMPLATE, HARDCODED):
+        _assert_project_root_env_matches_working_directory(path)
 
 
 def test_comma_separator_helper_rejects_empty_value(
@@ -246,7 +370,7 @@ def test_comma_separator_helper_detects_colon_in_any_position(
 def test_working_directory_helper_rejects_suffix_or_comment(
     tmp_path: pathlib.Path,
 ) -> None:
-    """_assert_working_directory_line must not be satisfied by a substring match.
+    """_assert_exact_unit_line must not be satisfied by a substring match.
 
     A plain ``expected in content`` check stays green if WorkingDirectory= is
     repointed to a subdirectory (``.../dashboard``) or survives only inside a
@@ -264,7 +388,7 @@ def test_working_directory_helper_rejects_suffix_or_comment(
         encoding="utf-8",
     )
     with pytest.raises(AssertionError):
-        _assert_working_directory_line(suffixed, expected_line)
+        _assert_exact_unit_line(suffixed, expected_line)
 
     # Bad: directive only present inside a comment — systemd never parses it.
     commented = tmp_path / "commented.service"
@@ -273,7 +397,7 @@ def test_working_directory_helper_rejects_suffix_or_comment(
         encoding="utf-8",
     )
     with pytest.raises(AssertionError):
-        _assert_working_directory_line(commented, expected_line)
+        _assert_exact_unit_line(commented, expected_line)
 
     # Good: exact, uncommented line — helper must not raise.
     good = tmp_path / "good.service"
@@ -281,7 +405,80 @@ def test_working_directory_helper_rejects_suffix_or_comment(
         "[Service]\nWorkingDirectory=/home/leo/src/dark-factory\n",
         encoding="utf-8",
     )
-    _assert_working_directory_line(good, expected_line)
+    _assert_exact_unit_line(good, expected_line)
+
+
+def test_project_root_env_helper_rejects_a_mismatch(tmp_path: pathlib.Path) -> None:
+    """_assert_project_root_env_matches_working_directory must not silently no-op.
+
+    Same convention as test_working_directory_helper_rejects_suffix_or_comment
+    above: a relational assertion helper earns its own negatives.  Without them
+    a helper whose regexes stopped matching — say after a directive was renamed
+    — would find nothing, assert nothing, and keep
+    test_project_root_env_matches_working_directory_in_both_unit_files green
+    forever against units that had actually drifted apart.  Every case pins its
+    own failure mode with ``match=`` so a bad case cannot "pass" by tripping a
+    different branch than the one it names.
+    """
+    # Bad: the two directives disagree — the dashboard would read its databases
+    # from one directory while uv resolves --project against another.
+    mismatched = tmp_path / "mismatched.service"
+    mismatched.write_text(
+        "[Service]\n"
+        "WorkingDirectory=/home/alice/src/dark-factory\n"
+        "Environment=DASHBOARD_PROJECT_ROOT=/tmp/wrong\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="does not equal"):
+        _assert_project_root_env_matches_working_directory(mismatched)
+
+    # Bad: the Environment= line is absent entirely — the relation cannot hold,
+    # and silence here would read as agreement.
+    missing_env = tmp_path / "missing_env.service"
+    missing_env.write_text(
+        "[Service]\nWorkingDirectory=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        AssertionError, match="No Environment=DASHBOARD_PROJECT_ROOT= line"
+    ):
+        _assert_project_root_env_matches_working_directory(missing_env)
+
+    # Bad: the Environment= line is present only inside a comment, which systemd
+    # never parses — the anchored match must reject it rather than reading the
+    # value out of the comment.
+    commented_env = tmp_path / "commented_env.service"
+    commented_env.write_text(
+        "[Service]\n"
+        "WorkingDirectory=/home/alice/src/dark-factory\n"
+        "# Environment=DASHBOARD_PROJECT_ROOT=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        AssertionError, match="No Environment=DASHBOARD_PROJECT_ROOT= line"
+    ):
+        _assert_project_root_env_matches_working_directory(commented_env)
+
+    # Bad: WorkingDirectory= absent — the other half of the relation.
+    missing_wd = tmp_path / "missing_wd.service"
+    missing_wd.write_text(
+        "[Service]\nEnvironment=DASHBOARD_PROJECT_ROOT=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="No WorkingDirectory= line"):
+        _assert_project_root_env_matches_working_directory(missing_wd)
+
+    # Good: the two agree at a path that is NOT this host's — the relation is
+    # host-invariant, so a correctly-configured foreign checkout must pass.
+    # This is what makes the check safe to apply to an installed copy.
+    good = tmp_path / "good.service"
+    good.write_text(
+        "[Service]\n"
+        "WorkingDirectory=/home/alice/src/dark-factory\n"
+        "Environment=DASHBOARD_PROJECT_ROOT=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    _assert_project_root_env_matches_working_directory(good)
 
 
 def test_known_project_roots_uses_comma_separator_not_colon() -> None:
