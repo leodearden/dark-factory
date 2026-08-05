@@ -361,6 +361,25 @@ class WriteJournal:
         async with db.execute(sql, params) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
+    async def get_write_op(self, write_op_id: str) -> dict | None:
+        """Return a single ``write_ops`` row by id, or ``None`` on a miss.
+
+        The no-join audit read. ``success`` answers "was the write ACCEPTED"
+        (the enqueue committed); ``terminal_status`` answers "did the write
+        LAND" (the durable queue reached ``completed`` / ``dead``). Reading
+        this row alone is now sufficient to tell those two facts apart — no
+        ``backend_ops`` join required, which matters because
+        ``backend_ops.operation`` is the literal ``'add_episode'`` for BOTH
+        the ``add_episode`` and ``add_memory_graphiti`` paths.
+        """
+        db = self._require_db()
+        async with db.execute(
+            'SELECT * FROM write_ops WHERE id = ?',
+            (write_op_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
     async def get_backend_ops_for_write_op(self, write_op_id: str) -> list[dict]:
         """Return all backend_ops linked to a write_op."""
         db = self._require_db()
