@@ -230,6 +230,7 @@ class TestWithPytestNumprocessesStr:
 
     def test_structured_pytest_gains_dash_n_and_keeps_its_flags(self):
         result = self._wrapper()('uv run pytest tests/ --timeout=300', '4')
+        assert result is not None
         assert '-n 4' in result
         assert '--timeout=300' in result
         assert 'tests/' in result
