@@ -82,14 +82,14 @@ def fake_systemctl(tmp_path, monkeypatch):
     monkeypatch.setenv('FAKE_SYSTEMCTL_STATE', str(state_path))
 
     class Shim:
-        bin_dir = bin_dir
-        state_path = state_path
+        def __init__(self, bin_dir, state_path):
+            self.bin_dir = bin_dir
+            self.state_path = state_path
 
-        @staticmethod
-        def calls():
-            return json.loads(state_path.read_text())['calls']
+        def calls(self):
+            return json.loads(self.state_path.read_text())['calls']
 
-    return Shim
+    return Shim(bin_dir, state_path)
 
 
 def _arm(**overrides):
