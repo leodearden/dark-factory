@@ -680,3 +680,13 @@ class TestQueueStats:
             message='timed out waiting for all 15 items to complete',
         )
         assert stats['counts'].get('completed', 0) == 15
+
+
+@pytest.mark.asyncio
+async def test_durable_queue_wired_with_terminal_hook(integrated_service):
+    """The construction site actually passes the terminal write-back hook."""
+    svc = integrated_service
+    assert (
+        svc.durable_queue._on_terminal
+        == svc._record_queue_terminal_outcome
+    )
