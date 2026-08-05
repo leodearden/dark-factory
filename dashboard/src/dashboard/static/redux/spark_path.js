@@ -375,6 +375,115 @@ function barFractions(values, max) {
   return { fractions: (values || []).map(v => (isPlottable(v) ? v / max : null)) };
 }
 
+// ── Stacked band builder (charts.jsx's `StackedAreaChart`) ─────────────────
+// Takes the component's own `stacks` ([{ key, color, values }]) and
+// `geom` = { x0, y0, width, height, count }, and returns { max, paths }: the
+// axis maximum the caller needs for its y-ticks, and one polygon string per
+// layer IN LAYER ORDER (empty string for a layer with nothing to draw). Unlike
+// the other builders this one derives its own value axis — min is 0 and range
+// is `max` — because a stack's height is a property of the whole stack, not of
+// any one layer.
+//
+// THE HOLE RULE IS PREFIX-SHAPED. Layer li is plottable at column i iff EVERY
+// layer 0..li is plottable there. A band's base is the sum of the layers below
+// it and its top adds its own value, so a hole in a LOWER layer makes every
+// band ABOVE it unknowable at that column — while the bands BELOW it stay
+// perfectly well-defined and keep drawing. The blunter alternative (a hole
+// holes the whole column for every layer) would erase truthful lower bands:
+// the same synthetic-data error in the opposite direction.
+//
+// THE HOLE-AS-ZERO SCRUB STAYS BANNED. charts.jsx wrote `(st.values[i] || 0)`
+// in three places — the column totals feeding the axis and both cumulative
+// folds. That is a PARTIAL SUM passed off as a column total: it fabricates a
+// zero-height band at the hole (indistinguishable from a measured zero) and
+// scales every other band against a maximum no column ever reached. A hole is
+// carried as `null` here and simply does not contribute.
+//
+// THE AXIS MAXIMUM folds the union of
+//   (a) the totals of FULLY-plottable columns, and
+//   (b) every DRAWN top — each plottable prefix sum actually rendered —
+// seeded with 1 exactly as the pre-fix code was. Clause (b) is load-bearing:
+// under the prefix rule a lower layer is still drawn at a column whose upper
+// layers are holed, so an axis folded over full-column totals ALONE can be
+// exceeded by a band it must contain. Measured on stacks a=[1,1,9],
+// b=[3,3,null] in a box spanning y 8..198: totals-only gives max=4 and puts a
+// drawn vertex at y=-229.5, 237.5px above the top of the chart (steward
+// adjudication esc-3489-1). Clause (a) is redundant for non-negative data — a
+// full column's topmost drawn top IS its total — and is stated anyway, at zero
+// cost, so "a partial sum is not a total" stays legible in the code.
+//
+// On hole-free input this reproduces the pre-fix polygons character-for-
+// character (the scrub never fires, and clause (b) introduces no new maximum);
+// spark_path.test.mjs pins that by exact string equality.
+function stackedAreaPaths(stacks, geom) {
+  const layers = (stacks || []).map(st => (st && st.values) || []);
+  const count = geom.count;
+  const stepX = geom.width / Math.max(count - 1, 1);
+
+  // Per layer, per column: the cumulative base/top pair, or null where the
+  // prefix rule says this band's position is unknowable.
+  const bases = layers.map(() => []);
+  const tops = layers.map(() => []);
+  const axisCandidates = [];
+
+  for (let i = 0; i < count; i++) {
+    let running = 0;
+    let plottable = true;
+
+    for (let li = 0; li < layers.length; li++) {
+      const v = layers[li][i];
+      // `plottable` latches false for the rest of the column: once a lower
+      // layer is missing, nothing above it has a known base.
+      if (plottable && isPlottable(v)) {
+        bases[li][i] = running;
+        running += v;
+        tops[li][i] = running;
+        axisCandidates.push(running); // (b) a DRAWN top
+      } else {
+        plottable = false;
+        bases[li][i] = null;
+        tops[li][i] = null;
+      }
+    }
+
+    // (a) a FULLY-plottable column's total. Subsumed by (b) for non-negative
+    // data — see the header — and kept explicit for legibility.
+    if (plottable) axisCandidates.push(running);
+  }
+
+  const max = plottableMax(axisCandidates, 1);
+  const valueGeom = { y0: geom.y0, height: geom.height, min: 0, range: max };
+
+  const paths = layers.map((_, li) => {
+    const points = [];
+    for (let i = 0; i < count; i++) {
+      const top = tops[li][i];
+      points.push(
+        top === null
+          ? null
+          : [geom.x0 + i * stepX, axisY(top, valueGeom), axisY(bases[li][i], valueGeom)],
+      );
+    }
+
+    const polygons = [];
+    for (const run of plottableRuns(points)) {
+      // Forward along the top, back along the base, closed — the same shape
+      // the pre-fix code built, but per RUN rather than once across the whole
+      // label row, so a band never spans a column it was not measured in. A
+      // run of one column emits a zero-width polygon at its own x (a thin tick
+      // under the component's stroke): an honest "measured here, unknown
+      // either side", deliberately not widened toward a neighbouring slot.
+      const forward = run.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`));
+      const back = run.slice().reverse().map(p => `L${p[0]},${p[2]}`);
+      polygons.push(`${forward.concat(back).join(' ')} Z`);
+    }
+
+    return polygons.join(' ');
+  });
+
+  return { max, paths };
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced by
 // dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
@@ -389,6 +498,7 @@ const SPARK_PATH_API = {
   axisY,
   axisPaths,
   barFractions,
+  stackedAreaPaths,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
