@@ -880,15 +880,18 @@ class TestClassifyDegenerateMetadata:
 # ---------------------------------------------------------------------------
 
 
-def _make_harness(tmp_path: Path):
+def _make_harness(tmp_path: Path, project_root: Path | None = None):
     """Build a bare Harness with mocked internals for cross-repo gate tests.
 
-    Copied from test_substrate_gate.py:777 (per-test-file helper convention).
+    Copied from test_substrate_gate.py:777 (per-test-file helper convention),
+    with ``project_root`` made overridable: the containment leg is meaningless
+    unless the harness's project_root and the task's declared paths can be
+    placed in a deliberate relationship.
     """
     from orchestrator.config import OrchestratorConfig
     from orchestrator.harness import Harness
 
-    config = OrchestratorConfig(project_root=tmp_path, max_per_module=1)
+    config = OrchestratorConfig(project_root=project_root or tmp_path, max_per_module=1)
     with (
         patch('orchestrator.harness.McpLifecycle'),
         patch('orchestrator.harness.OverrideStore'),
@@ -1224,12 +1227,12 @@ class TestRunCrossRepoGate:
 # ---------------------------------------------------------------------------
 
 
-def _make_slot_harness(tmp_path: Path):
+def _make_slot_harness(tmp_path: Path, project_root: Path | None = None):
     """Build a Harness whose _run_slot can be called directly in tests.
 
     Copied from test_substrate_gate.py:857.
     """
-    h = _make_harness(tmp_path)
+    h = _make_harness(tmp_path, project_root=project_root)
     h.scheduler.release = MagicMock()
     h.scheduler._dispatched = set()
     h._run_id = None
@@ -1431,3 +1434,154 @@ class TestRunSlotCrossRepoGateWiring:
             f'cross-repo gate must run first; got {order!r}'
         )
         mock_wf.run.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# step-17: the USER-OBSERVABLE SIGNAL, end to end through the real path
+# ---------------------------------------------------------------------------
+
+
+class TestCrossRepoAdmissionEndToEnd:
+    """The task's stated user-observable signal, with nothing stubbed but build_workflow.
+
+    Real ``carries_cross_repo_signal``, real ``classify_cross_repo``, real
+    ``_run_cross_repo_gate``, real ``_block_and_escalate_cross_repo``, real
+    ``EscalationQueue`` — only ``build_workflow`` is a spy, and only because it
+    IS the assertion: no workflow means no agent, no worktree, and no run row,
+    so "no architect invocation is recorded" is exactly "build_workflow was
+    never called".
+    """
+
+    @pytest.mark.asyncio
+    async def test_foreign_owned_task_is_blocked_before_any_agent(self, tmp_path: Path):
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.workflow import WorkflowOutcome
+
+        # The reify-5638 shape: this orchestrator serves 'reify', the task
+        # declares only files under the sibling 'dark-factory' checkout.
+        project_root = tmp_path / 'reify'
+        foreign_root = tmp_path / 'dark-factory'
+        project_root.mkdir()
+        foreign_root.mkdir()
+
+        h = _make_slot_harness(tmp_path, project_root=project_root)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        assignment = _make_assignment(
+            task_id='5638',
+            files=[
+                str(foreign_root / 'orchestrator/src/orchestrator/offline_lane.py'),
+                str(foreign_root / 'orchestrator/tests/test_offline_lane.py'),
+            ],
+            cross_repo_project='dark_factory',
+        )
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            MockWorkflow.return_value = _make_mock_workflow()
+            report = await h._run_slot(assignment, sem)
+
+        # (1) No architect invocation: no workflow was ever constructed, so no
+        #     agent spun up, no worktree was built, and no runs.db row exists.
+        assert not MockWorkflow.called, (
+            'build_workflow must never be called for a foreign-owned task'
+        )
+
+        # (2) The task reaches `blocked`.
+        h.scheduler.set_task_status.assert_awaited_once_with('5638', 'blocked')
+
+        # (3) Exactly one L1, naming the owning project.
+        l1s = [e for e in esc_queue.get_pending() if e.task_id == '5638' and e.level == 1]
+        assert len(l1s) == 1, f'expected exactly one L1; got {l1s!r}'
+        esc = l1s[0]
+        assert esc.category == 'scope_violation'
+        assert 'dark_factory' in esc.summary, (
+            f'the L1 summary must name the owning project; got {esc.summary!r}'
+        )
+        assert str(foreign_root / 'orchestrator/src/orchestrator/offline_lane.py') in esc.detail
+
+        # (4) The report names the cross-repo cause.
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.block_reason == 'cross_repo_misfile'
+
+    @pytest.mark.asyncio
+    async def test_negative_control_local_task_runs_normally(self, tmp_path: Path):
+        """The same shape with relative in-tree paths and no marker must dispatch."""
+        from escalation.queue import EscalationQueue
+
+        project_root = tmp_path / 'reify'
+        project_root.mkdir()
+
+        h = _make_slot_harness(tmp_path, project_root=project_root)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        assignment = _make_assignment(
+            task_id='5639',
+            files=[
+                'orchestrator/src/orchestrator/offline_lane.py',
+                'orchestrator/tests/test_offline_lane.py',
+            ],
+        )
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            mock_wf = _make_mock_workflow()
+            MockWorkflow.return_value = mock_wf
+            report = await h._run_slot(assignment, sem)
+
+        assert MockWorkflow.called, 'a local task must dispatch normally'
+        mock_wf.run.assert_awaited_once()
+        h.scheduler.set_task_status.assert_not_awaited()
+        assert not [e for e in esc_queue.get_pending() if e.task_id == '5639'], (
+            'a local task must file no escalation'
+        )
+        assert report is not None
+        assert report.block_reason != 'cross_repo_misfile'
+
+    @pytest.mark.asyncio
+    async def test_marker_stamped_after_creation_is_still_honoured(self, tmp_path: Path):
+        """The files_tagged_at shape a submit-time gate structurally cannot see.
+
+        This gate reads the task AS IT STANDS AT DISPATCH, so a marker (or a
+        files list) stamped after the task was created is caught all the same.
+        """
+        from escalation.queue import EscalationQueue
+
+        project_root = tmp_path / 'reify'
+        project_root.mkdir()
+
+        h = _make_slot_harness(tmp_path, project_root=project_root)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        assignment = _make_assignment(
+            task_id='5308',
+            # Relative foreign paths — only the submit-written marker can see
+            # these, which is exactly why leg A reads it.
+            files=['orchestrator/src/orchestrator/offline_lane.py'],
+            cross_repo=True,
+            cross_repo_project='dark_factory',
+            files_tagged_at='2026-08-05T12:00:00+00:00',
+        )
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            MockWorkflow.return_value = _make_mock_workflow()
+            report = await h._run_slot(assignment, sem)
+
+        assert not MockWorkflow.called
+        assert report is not None
+        assert report.block_reason == 'cross_repo_misfile'
+        l1s = [e for e in esc_queue.get_pending() if e.task_id == '5308']
+        assert len(l1s) == 1
+        assert 'dark_factory' in l1s[0].summary
