@@ -12262,6 +12262,7 @@ def _real_blocklist_curator(tmp_path):
     stubbed, to keep the test hermetic and off the network.
     """
     import yaml
+
     from fused_memory.middleware.task_curator import PreparedCandidate, TaskCurator
 
     blocklist = tmp_path / 'e2e_blocklist.yaml'
