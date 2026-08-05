@@ -630,9 +630,19 @@ class TestUnrepairedMutationsAreTracked:
                 'exist. The recovery payload is GONE — this is the deletion '
                 'this check is here to make loud.'
             )
-            assert resolved.name.endswith('-report.json'), (
-                f'{record["id"]}: payload_source_report {rel!r} is not a sweep '
-                'report; the payload must come from a validated capture.'
+            # Membership in the validated set, NOT merely a '-report.json'
+            # suffix: only the paths in _REPORT_PATHS are the ones every other
+            # class in this module actually checks (shape, provenance,
+            # detector reproduction). A file elsewhere in the repo could match
+            # the suffix while never having been validated at all, so the
+            # suffix test would assert something weaker than its own comment
+            # claimed.
+            assert resolved in {p.resolve() for p in _REPORT_PATHS}, (
+                f'{record["id"]}: payload_source_report {rel!r} is not one of '
+                'the validated captures under '
+                f'docs/{ARTIFACT_GLOB}/. The payload must live in a report '
+                'this module checks end to end, otherwise its integrity is '
+                'asserted nowhere.'
             )
             required = ['payload_content_sha256']
             if entry.get('classification') in REPAIRABLE_CLASSIFICATIONS:
@@ -802,6 +812,32 @@ class TestUnrepairedMutationsAreTracked:
                     f'{memory_id}: {count_field}={claimed_len} disagrees with '
                     f'the committed {payload_field!r} '
                     f'({len(payload.get(payload_field) or "")} chars).'
+                )
+            # Same principle for the two remaining self-describing fields.
+            # They restate facts the reports already carry, so a hand-edited
+            # or copy-pasted entry that misstates them would otherwise pass
+            # every check here — the exact fabrication class this module
+            # exists to close. Both are pure file reads.
+            claimed_classification = entry.get('classification')
+            if claimed_classification is not None:
+                assert claimed_classification == payload['classification'], (
+                    f'{memory_id}: entry claims classification '
+                    f'{claimed_classification!r}, but the payload committed '
+                    f'at {entry["payload_source_report"]} is classified '
+                    f'{payload["classification"]!r}. The entry decides from '
+                    'this field whether a repaired_content is required, so a '
+                    'wrong value silently weakens the recovery check.'
+                )
+            claimed_flag = entry.get('flag')
+            if claimed_flag is not None:
+                assert claimed_flag in DANGER_FLAGS, (
+                    f'{memory_id}: flag={claimed_flag!r} is not one of the '
+                    f'runbook danger flags {DANGER_FLAGS}.'
+                )
+                assert record.get(claimed_flag), (
+                    f'{memory_id}: entry names flag {claimed_flag!r}, but that '
+                    f'flag is not truthy on the record in {path.name}. The '
+                    'tracker describes a mutation the report does not.'
                 )
 
 
