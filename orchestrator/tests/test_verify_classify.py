@@ -767,6 +767,105 @@ class TestEnvironmentalGuardNegatives:
 
 
 # ---------------------------------------------------------------------------
+# task 3679: the SEMAPHORE_TIMEOUT arm must detect reify's REAL slot-
+# acquisition deadline event POSITIVELY, via a line-anchored marker emitted
+# by the wrapper itself — instead of inferring it from a whole-output
+# lock-token + timeout-token co-occurrence whose precondition holds for
+# essentially every verify log (this repo's own test_command carries
+# `--timeout=300` seven times against a tree containing `uv.lock`).
+#
+# Each fixture below is a VERBATIM shape read from its emitting reify script
+# — not an invented golden. That is the whole point: the two goldens this
+# section supersedes (`flock: timeout while waiting to acquire lock`,
+# `Timeout waiting for semaphore slot after 300s`) are emitted by no producer
+# anywhere, which is how a detector that fires on neither the real event nor
+# only the real event survived three rounds of veto patching.
+#
+# RED today (measured against the live module on this branch, not assumed):
+# all four positive fixtures classify `unknown_test_failure`, i.e. the
+# detector is BLIND to the exact event it exists to detect — none of them
+# contains a `\btimed?\s*out\b` token, so `_TIMEOUT_TOKEN_RE` cannot match and
+# the co-occurrence can never fire. The two anchoring negatives pass already
+# and are pinned here as regression guards for the new arm.
+# ---------------------------------------------------------------------------
+
+# reify scripts/lib_test_semaphore.sh:173 — emitted on `slot_acquire` rc 75.
+_SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT = (
+    'lib_test_semaphore.sh: failed to acquire test slot within 1800s '
+    '(LOCK=/tmp/reify-test-slot.lock, N=8)\n'
+)
+
+# reify scripts/cargo-test-occt-gated.sh:182 — note the `ERROR: ` prefix.
+_SLOT_TIMEOUT_OCCT_OUTPUT = (
+    'ERROR: cargo-test-occt-gated.sh: failed to acquire OCCT slot within 1800s '
+    '(LOCK=/tmp/reify-occt.lock, N=1)\n'
+)
+
+# reify scripts/lib_lane_x_flock.sh:138.
+_SLOT_TIMEOUT_LANE_X_OUTPUT = (
+    'lib_lane_x_flock.sh: failed to acquire Lane-X lock within 600s '
+    '(LOCK=/tmp/reify-lane-x.lock)\n'
+)
+
+# reify companion task — NOT emitted by reify today (verified by grep over
+# reify `scripts/` on 2026-08-05). Same column-0, first-token `@@REIFY_*@@`
+# emission contract as scripts/lib_clock_stop.sh:141, so DF can detect it the
+# moment reify starts emitting it. This asserts DF's OWN classifier behaviour
+# on an anchored line — a capability this task delivers and verifies
+# first-hand — NOT that reify emits the line; it is a COMPLEMENT to the three
+# grounded anchors above and never the sole positive.
+_SLOT_TIMEOUT_SENTINEL_OUTPUT = (
+    '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation waited=1800s pid=4711\n'
+)
+
+_GROUNDED_SLOT_TIMEOUT_OUTPUTS = [
+    _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT,
+    _SLOT_TIMEOUT_OCCT_OUTPUT,
+    _SLOT_TIMEOUT_LANE_X_OUTPUT,
+    _SLOT_TIMEOUT_SENTINEL_OUTPUT,
+]
+
+
+class TestGroundedSlotTimeoutMarkersAreDetected:
+    """task 3679: every REAL reify slot-acquisition deadline line classifies
+    SEMAPHORE_TIMEOUT, for every ToolKind — mirrors
+    TestEnvironmentalGuardsApplyToEveryToolKind's tool-blind style, since a
+    starved concurrency slot is a HOST condition regardless of which tool's
+    command was waiting on it (Invariant C1)."""
+
+    @pytest.mark.parametrize('output', _GROUNDED_SLOT_TIMEOUT_OUTPUTS)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_grounded_slot_timeout_line_is_semaphore_timeout(self, tool, output):
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    def test_midline_quotation_of_deadline_text_is_not_semaphore_timeout(self):
+        """Anchoring negative — the discipline `verify._match_clock_marker`
+        (verify.py:3383) establishes for the `@@REIFY_CLOCK_*@@` family, and
+        for the same measured reason (reify task 4998 / esc-4791-52): reify's
+        `run_all.sh --include-infra` runs infra tests that QUOTE these wrapper
+        lines mid-line in assertion prose. An infra test quoting the deadline
+        text is not the deadline event, so the marker must be matched
+        line-anchored, never substring-anywhere."""
+        output = (
+            'PASS: stderr contains lib_test_semaphore.sh: failed to acquire '
+            'test slot within 1800s\n'
+        )
+        result = _classify(ToolKind.OPAQUE, output, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a mid-line quotation of the wrapper deadline text must not '
+            f'classify semaphore_timeout, got {result!r}'
+        )
+
+    def test_plain_flock_contention_still_stays_flock_error(self):
+        """The new anchored arm must not shadow the pre-existing FLOCK_ERROR
+        pattern (duplicates the intent of
+        `test_flock_failed_to_acquire_lock_stays_flock_error`, pinned here so
+        the shadowing check travels with the arm it constrains)."""
+        output = 'flock: failed to acquire lock on /var/lock/mylock\n'
+        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.FLOCK_ERROR
+
+
+# ---------------------------------------------------------------------------
 # task 2748: SEMAPHORE_TIMEOUT deterministic-diagnostic veto. A genuine
 # flock/semaphore slot-acquisition timeout is raised by the concurrency-
 # limiter WRAPPER (reify lib_slot_acquire.sh / `flock -w`) BEFORE the wrapped
