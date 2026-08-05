@@ -165,30 +165,57 @@ def format_run_evidence(
       redaction.  A truncated cap message is what made the 3454 round ambiguous,
       and a cap phrasing the guard has never seen is the one remaining way a
       capped account can still masquerade as context loss.
-    - ``r2_success``, ``codeword_recalled``.
+    - ``r2_success``, ``r2_subtype``, ``codeword_recalled``.
     - ``control_passed`` — ``None`` when the same-account control did not run in
       this process (unknown is not the same as failed).
-    - ``verdict`` — ``'void_capped'`` when the cap guard matches r2, else
-      ``'preserved'`` / ``'not_preserved'`` from ``codeword_recalled``.
+    - ``verdict`` — one of ``'void_capped'`` / ``'void_error'`` / ``'preserved'``
+      / ``'not_preserved'``; see the precedence note below.
 
     ``r1_transcript_records`` is ``None`` (not ``0``) when the transcript is
     absent: "no transcript on disk" and "a transcript with no records" are
     different findings, and only the first would rule the run out on
     transcript-reachability grounds.
 
-    ``void_capped`` takes precedence over ``not_preserved`` deliberately — the
-    2026-08-01 cross-account run looked exactly like lost context and was really
-    a weekly cap with no model turn.  The classification delegates to
+    VERDICT PRECEDENCE, and why each step exists::
+
+        void_capped   r2 matches the cap guard
+        preserved     the codeword is present
+        void_error    r2 FAILED for some non-cap reason
+        not_preserved r2 SUCCEEDED and the codeword is absent
+
+    ``void_capped`` outranks ``not_preserved`` because the 2026-08-01
+    cross-account run looked exactly like lost context and was really a weekly
+    cap with no model turn.  The classification delegates to
     ``_capacity_skip.result_looks_like_capacity_failure``; do NOT grow a second
     cap-text matcher here.  Task 3483 single-homed that corpus and added a
     bidirectional drift guard against production's ``classify_invocation``
     precisely because a divergent marker list is what voided that attempt.
+
+    ``void_error`` closes the SAME trap one layer deeper (task 3484, steward
+    decision at iteration 1).  An ``error_max_budget_usd`` abort is not a
+    capacity failure, so the cap guard does not match it, and its output is
+    EMPTY, so no codeword is found either — which scored it ``not_preserved``,
+    i.e. a budget abort recorded as evidence of a production defect.  Measured
+    2026-08-05: at the old ``max_budget_usd`` of $0.01 one run aborted and
+    another spent $0.0083674 (84% of the ceiling), so this fired intermittently.
+    Any ``r2.success is False`` that is not a cap now voids the run, which
+    covers API errors, timeouts and empty output as well as budget.
+
+    ``preserved`` deliberately outranks ``void_error``: a recalled codeword
+    cannot be produced without the prior context, so it is positive evidence
+    even on an otherwise-failed r2.  The consequence is that ``not_preserved``
+    now requires r2 to have SUCCEEDED and still not recalled — which is exactly,
+    and only, the shape of the real production defect.
     """
     codeword_recalled = 'ZEPPELIN' in (r2.output or '').upper()
     if result_looks_like_capacity_failure(r2):
         verdict = 'void_capped'
+    elif codeword_recalled:
+        verdict = 'preserved'
+    elif not r2.success:
+        verdict = 'void_error'
     else:
-        verdict = 'preserved' if codeword_recalled else 'not_preserved'
+        verdict = 'not_preserved'
     return {
         'account_a': account_a,
         'account_b': account_b,
@@ -200,6 +227,11 @@ def format_run_evidence(
         'r2_output': r2.output,
         'r2_stderr': r2.stderr,
         'r2_success': r2.success,
+        # The discriminator for a void_error run ('error_max_budget_usd',
+        # 'error_max_turns', ...).  Recorded because it was previously visible
+        # only in the live pytest output, which is not what gets pasted into a
+        # verdict — leaving a reader unable to tell WHY a run was voided.
+        'r2_subtype': r2.subtype,
         'codeword_recalled': codeword_recalled,
         'control_passed': control_passed,
         'verdict': verdict,

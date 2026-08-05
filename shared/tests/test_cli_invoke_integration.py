@@ -43,25 +43,32 @@ hung invocation, so it reads as "everything is capped" and wastes the window.
 The same six tokens probed through ``invoke_claude_agent`` in the same minutes
 answered cleanly (1 healthy, 5 capped with verbatim limit messages).
 
-**Caveat on ``_INVOKE_DEFAULTS['max_budget_usd'] = 0.01``.** MEASURED
-2026-08-05 on the healthy account, same prompt/model/turns: two runs at that
-ceiling, one aborted with ``success=False``, ``subtype='error_max_budget_usd'``
-and an EMPTY output, the other passed having spent $0.0083674 — 84% of the
-ceiling.  A third run under a $0.50 ceiling cost $0.0020803.  So realized
-per-call cost sits close enough to $0.01 to trip it intermittently.
+**The budget-abort trap, and how it is now closed.** MEASURED 2026-08-05 on a
+healthy account, same prompt/model/turns, at the then-current
+``max_budget_usd`` of $0.01: two runs at that ceiling, one aborted with
+``success=False``, ``subtype='error_max_budget_usd'`` and an EMPTY output, the
+other passed having spent $0.0083674 — 84% of the ceiling.  A third run under a
+$0.50 ceiling cost $0.0020803.  So realized per-call cost sat close enough to
+$0.01 to trip it intermittently, and the cross-account test makes two such calls.
 
-That matters because an ``error_max_budget_usd`` abort is NOT a capacity
-failure and produces an EMPTY output.  The guards below therefore do not skip
-on it; ``codeword_recalled`` is False and the cap matcher finds nothing in the
-empty text, so the emitted record scores it ``verdict='not_preserved'`` — a
-budget abort recorded as evidence of context loss.  That is the same shape of
+That mattered because an ``error_max_budget_usd`` abort is NOT a capacity
+failure and produces an EMPTY output: the guards below did not skip on it, the
+cap matcher found nothing in the empty text, and ``codeword_recalled`` was
+False — so the emitted record scored it ``verdict='not_preserved'``, i.e. a
+budget abort recorded as evidence of a live production defect.  Same shape of
 trap that voided the 2026-08-01 attempt (a non-context failure dressed up as
-lost context), one layer deeper, and the record as currently specified does not
-model it: ``r2_success=False`` with an empty ``r2_output`` is the tell, and
-``subtype`` is visible only in the pytest output, not in the record.  **Do not
-read a ``not_preserved`` record with an empty ``r2_output`` as context loss.**
-Escalated for a decision on a third void class rather than widened here (task
-3484, iteration 1).
+lost context), one layer deeper.
+
+Fixed on BOTH layers (task 3484, steward decision at iteration 1), because
+either alone leaves a hole — raising the ceiling does not help an API error or
+a timeout, and a void class alone still burns a window on an avoidable abort:
+
+1. ``max_budget_usd`` is $0.05, ~6x the observed worst case (see the comment on
+   ``_INVOKE_DEFAULTS`` below).
+2. ``format_run_evidence`` scores ANY non-cap ``r2.success is False`` as
+   ``verdict='void_error'`` and records ``r2_subtype``.  ``not_preserved`` now
+   requires r2 to have SUCCEEDED and still not recalled the codeword — which is
+   exactly, and only, the shape of the real defect.
 
 **Mechanism.** A Claude CLI session is a LOCAL JSONL transcript at
 ``<config_dir>/projects/<cwd-slug>/<session_id>.jsonl`` — not a server-side,
@@ -181,7 +188,16 @@ _INVOKE_DEFAULTS: dict[str, Any] = {
     'cwd': Path('/tmp'),
     'model': 'haiku',
     'max_turns': 1,
-    'max_budget_usd': 0.01,
+    # RAISED from $0.01 (task 3484, steward decision at iteration 1).  MEASURED
+    # 2026-08-05 on a healthy account with this exact prompt/model/turns: one run
+    # aborted at the $0.01 ceiling (success=False, subtype='error_max_budget_usd',
+    # EMPTY output) and another passed having spent $0.0083674 — 84% of it.  The
+    # ceiling was close enough to realized cost to trip intermittently, and a
+    # budget abort is scored as a VOID run, not a measurement.  $0.05 clears the
+    # observed worst case ~6x while keeping a full run in the same cents-per-run
+    # range as the 2026-08-01 (task 3454) round it is compared against; the
+    # ceiling is a runaway backstop here, not a cost control.
+    'max_budget_usd': 0.05,
     'allowed_tools': [],
     'effort': 'low',
 }

@@ -202,10 +202,15 @@ class TestFormatRunEvidenceFields:
             'r2_output',
             'r2_stderr',
             'r2_success',
+            'r2_subtype',
             'codeword_recalled',
             'control_passed',
             'verdict',
         }
+
+    def test_records_r2_subtype_so_a_void_run_says_why(self):
+        record = _record(r2=_result('', success=False, subtype='error_max_budget_usd'))
+        assert record['r2_subtype'] == 'error_max_budget_usd'
 
     def test_records_which_accounts_were_actually_used(self):
         record = _record(
@@ -279,10 +284,40 @@ class TestFormatRunEvidenceVerdict:
         assert record['codeword_recalled'] is True
         assert record['verdict'] == 'preserved'
 
-    def test_missing_codeword_yields_not_preserved(self):
-        record = _record(r2=_result("I don't have any prior context."))
+    def test_missing_codeword_on_a_SUCCESSFUL_r2_yields_not_preserved(self):
+        record = _record(r2=_result("I don't have any prior context.", success=True))
         assert record['codeword_recalled'] is False
         assert record['verdict'] == 'not_preserved'
+
+    def test_budget_abort_yields_void_error_not_not_preserved(self):
+        """The trap this class exists to close (task 3484, steward decision).
+
+        An ``error_max_budget_usd`` abort is not a capacity failure and has an
+        EMPTY output, so neither the cap guard nor the codeword check fires and
+        it used to score ``not_preserved`` — a budget abort recorded as evidence
+        of a live production defect in the cap-retry path.
+        """
+        record = _record(r2=_result('', success=False, subtype='error_max_budget_usd'))
+        assert record['codeword_recalled'] is False
+        assert record['verdict'] == 'void_error'
+
+    def test_any_non_cap_failure_voids_the_run(self):
+        """Not budget-specific: API errors and timeouts are equally uninformative."""
+        for subtype in ('error_max_turns', 'error_during_execution', ''):
+            record = _record(r2=_result('', success=False, subtype=subtype))
+            assert record['verdict'] == 'void_error', subtype
+
+    def test_recalled_codeword_outranks_void_error(self):
+        """A codeword cannot be produced without the prior context, so it is
+        positive evidence even when r2 is otherwise marked failed."""
+        record = _record(r2=_result('ZEPPELIN', success=False, subtype='error_max_turns'))
+        assert record['verdict'] == 'preserved'
+
+    def test_void_capped_outranks_void_error(self):
+        record = _record(
+            r2=_result(REAL_CLI_CAP_MESSAGES[0], success=False, subtype='error')
+        )
+        assert record['verdict'] == 'void_capped'
 
     @pytest.mark.parametrize('cap_message', REAL_CLI_CAP_MESSAGES)
     def test_real_cap_messages_yield_void_capped(self, cap_message):
