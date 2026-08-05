@@ -1939,8 +1939,23 @@ def _build_default_verify_fn(
         claim really was unverifiable, and it rejects exactly as before --
         the fail-closed default is narrowed to non-cap causes, not removed.
 
-    Both are no-ops without a *headroom_probe*, so every existing call site
-    keeps its current behaviour exactly.
+    (c) every *probe_every* clusters, a backstop probe. Ordered LAST because
+        it is the weakest: it is the only detector that can miss the first
+        corrupted cluster, letting up to ``probe_every - 1`` clusters be
+        fail-closed rejected before the cap is noticed -- which is the defect
+        above reproduced in miniature. It earns its place by covering the one
+        residual case neither (a) nor (b) can see: a cap presenting as a
+        clean-but-wrong verdict, where the reply parses fine and nothing
+        raises. It is a BACKSTOP for (a) and (b), never the primary, and a
+        counter alone would not be an acceptable design.
+
+        The cost trade-off, stated plainly: one extra trickle-tier probe per
+        *probe_every* clusters, against up to ``probe_every - 1`` clusters of
+        misattributed verdicts in that residual case. No probe is spent after
+        the last cluster, where it would guard a stage already over.
+
+    All three are no-ops without a *headroom_probe*, so every existing call
+    site keeps its current behaviour exactly.
     """
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
@@ -1992,6 +2007,28 @@ def _build_default_verify_fn(
                 rejected.append(cluster)
                 continue
             (verified if verdict.get("verified") else rejected).append(cluster)
+
+            # (c) The backstop. Guarded on `remaining > 1` so no probe is
+            # spent after the last cluster, where it would guard a stage
+            # already over.
+            if (
+                headroom_probe is not None
+                and probe_every > 0
+                and (index + 1) % probe_every == 0
+                and remaining > 1
+            ):
+                probe = headroom_probe()
+                if not probe.ok:
+                    raise CensusHeadroomExhausted(
+                        stage="verify",
+                        reason=(
+                            "headroom backstop probe after "
+                            f"{index + 1} cluster(s) reports no capacity: "
+                            f"{probe.reason or 'no headroom'}"
+                        ),
+                        verified=len(verified),
+                        unverified=remaining - 1,
+                    )
         return {"verified": verified, "rejected": rejected, "fixed": []}
 
     return _verify_fn
