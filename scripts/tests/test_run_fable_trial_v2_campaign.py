@@ -1040,3 +1040,172 @@ def test_uniform_corpora_are_unchanged():
     assert part['by_fixture'] == {
         'f1': 'ceiling', 'f2': 'intermittent', 'f3': 'intermittent',
     }
+
+
+# ===== step 17: --results-dir must not silently absorb out-of-campaign cells =====
+#
+# Not hypothetical. ``save_result`` (runner.py:1370) writes into the SHARED
+# packaged ``RESULTS_DIR = Path(__file__).parent / 'results'`` (runner.py:50),
+# and the main checkout's copy already holds 586 persisted cells — 51 of them v1
+# ``architect-fable-high`` runs over the incumbent-biased standing corpus (e.g.
+# ``df_task_12__architect-fable-high__*.json``). The documented round-trip
+# (``--run`` persists, a later ``--results-dir`` re-reads) therefore points
+# straight at the contaminated pool.
+
+
+def _in_campaign_cell(stem='alpha'):
+    return _cell(stem, 'architect-opus-max', plan_quality=0.75, plan_steps=5)
+
+
+def _out_of_campaign_cell(stem='old_v1_fixture', config='architect-sonnet-high'):
+    """A v1-corpus cell: wrong candidate, wrong fixture pool, real persisted shape."""
+    return _cell(stem, config, plan_quality=0.90, plan_steps=6)
+
+
+def test_out_of_campaign_cells_are_dropped():
+    """Both axes filter INDEPENDENTLY — candidate name and fixture stem.
+
+    The fixture axis matters on its own: a right-candidate/wrong-fixture cell is
+    exactly the v1-corpus contamination case, since ``architect-fable-high`` ran
+    in v1 too. Filtering only on candidate name would let every v1 cell for a
+    reused candidate through, silently answering the v2 question over the
+    incumbent-success-biased pool the screen exists to escape.
+    """
+    keep = _in_campaign_cell('f1')
+    wrong_candidate = _cell('f1', 'architect-sonnet-high', plan_quality=0.9, plan_steps=5)
+    wrong_fixture = _cell('old_v1_fixture', 'architect-opus-max', plan_quality=0.9, plan_steps=5)
+
+    kept, dropped = mod.filter_campaign_results(
+        [keep, wrong_candidate, wrong_fixture], {'architect-opus-max'}, {'f1', 'f2'},
+    )
+
+    assert kept == [keep]
+    assert len(dropped) == 2
+    assert {(d.task_id, d.config_name) for d in dropped} == {
+        ('f1', 'architect-sonnet-high'), ('old_v1_fixture', 'architect-opus-max'),
+    }
+
+
+def test_results_dir_report_excludes_out_of_campaign_cells(tmp_path):
+    """End to end: a contaminated dir yields a report about THIS campaign only."""
+    results_dir = tmp_path / 'results'
+    results_dir.mkdir()
+    for cell in (_in_campaign_cell('alpha'), _out_of_campaign_cell()):
+        (results_dir / f'{cell.task_id}__{cell.config_name}.json').write_text(
+            json.dumps(cell.to_dict())
+        )
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+    out = tmp_path / 'r.json'
+
+    rc = mod.main([
+        '--results-dir', str(results_dir), '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max', '--out', str(out),
+        '--stage1', '--q-ceiling', '0.80',
+    ])
+
+    assert rc == 0
+    loaded = json.loads(out.read_text())
+    assert [c['config_name'] for c in loaded['candidates']] == ['architect-opus-max']
+    assert {c['task_id'] for c in loaded['cells']} == {'alpha'}
+    assert 'old_v1_fixture' not in loaded['bands']['by_fixture']
+    assert 'old_v1_fixture' not in loaded['bands']['retained']
+    assert 'old_v1_fixture' not in loaded['bands']['discarded']
+
+
+def test_dropped_cells_are_reported_loudly(tmp_path, capsys):
+    """Silent correctness is nearly as bad as no filtering — the drop is RECORDED.
+
+    The committed γ1 artifact must carry its own exclusion record so the
+    calibration is auditable, and an operator who pointed at the wrong directory
+    must be told rather than handed a plausible report.
+    """
+    results_dir = tmp_path / 'results'
+    results_dir.mkdir()
+    for cell in (_in_campaign_cell('alpha'), _out_of_campaign_cell()):
+        (results_dir / f'{cell.task_id}__{cell.config_name}.json').write_text(
+            json.dumps(cell.to_dict())
+        )
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+    out = tmp_path / 'r.json'
+
+    mod.main([
+        '--results-dir', str(results_dir), '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max', '--out', str(out),
+    ])
+
+    printed = capsys.readouterr().out
+    assert '1' in printed and 'drop' in printed.lower()
+    assert 'old_v1_fixture' in printed
+    loaded = json.loads(out.read_text())
+    assert loaded['filtered'] == {
+        'dropped': 1,
+        'dropped_config_names': ['architect-sonnet-high'],
+        'dropped_task_ids': ['old_v1_fixture'],
+    }
+
+
+def test_results_dir_with_no_in_campaign_cells_exits_loudly(tmp_path):
+    """Zero survivors EXITS — "we measured nothing" must not share a shape with a result.
+
+    This is the precise symptom of pointing at the wrong directory (or at the
+    shared packaged results dir before this campaign has ever run), and a report
+    over an empty pool would present it with exactly the shape of a real one.
+    """
+    results_dir = tmp_path / 'results'
+    results_dir.mkdir()
+    stray = _out_of_campaign_cell()
+    (results_dir / 'stray.json').write_text(json.dumps(stray.to_dict()))
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([
+            '--results-dir', str(results_dir), '--tasks-dir', str(d),
+            '--candidate', 'architect-opus-max',
+        ])
+
+    assert exc.value.code != 0
+    assert str(results_dir) in str(exc.value)
+    assert 'architect-opus-max' in str(exc.value)
+
+
+def test_build_campaign_report_rejects_an_unknown_config():
+    """Defense in depth: a row that cannot trace to a resolved EvalConfig RAISES.
+
+    Verified first-hand pre-fix: ``getattr(None, 'model', None)`` silently
+    yielded ``None``, so one stray ``architect-sonnet-high`` cell emitted a full
+    summary row reading ``model: null, effort: null, max_budget_usd: null`` —
+    which is what turned a wrong-pool load into a plausible-looking table. A
+    null-config row is a silent degradation, not a tolerable gap.
+    """
+    candidates = mod.resolve_candidates(['architect-opus-max'])
+
+    with pytest.raises(Exception) as exc:
+        mod.build_campaign_report([_out_of_campaign_cell()], candidates, [])
+
+    assert 'architect-sonnet-high' in str(exc.value)
+    assert 'architect-opus-max' in str(exc.value)
+
+
+def test_run_path_results_are_not_filtered(tmp_path, campaign_seam, monkeypatch):
+    """Only the UNTRUSTED --results-dir input is filtered; --run is not.
+
+    ``--run`` results are in-campaign by construction, so silently dropping an
+    unexpected one there would hide a real runner bug (e.g. a dispatch routing
+    the wrong config) behind a clean-looking report. An unexpected cell from the
+    seam must therefore surface LOUDLY through the unknown-config guard rather
+    than vanish.
+    """
+    from orchestrator.evals import runner as eval_runner
+
+    async def _returns_a_stray(task_paths, candidates, base_config=None, **kwargs):
+        return [_out_of_campaign_cell()]
+
+    monkeypatch.setattr(eval_runner, 'run_ofat_stage', _returns_a_stray)
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    with pytest.raises(Exception) as exc:
+        mod.main([
+            '--run', '--tasks-dir', str(d), '--candidate', 'architect-opus-max',
+        ])
+
+    assert 'architect-sonnet-high' in str(exc.value)
