@@ -601,9 +601,12 @@ class TestManifestScriptCoherence:
     `kind: script` check in every checked-in sidecar, and pinning it per
     capability leaves the others uncovered — the repo's only other one,
     `plans/agent-transcript-archival-prd.capability-manifest.yaml` ->
-    `scripts/gc_agent_transcripts.py`, is committed at mode 100644 and would
-    ERROR forever today. Generalizing this into the corpus sweep needs
-    `shared/tests/`, which is outside this task's locks; filed as a follow-up.
+    `scripts/gc_agent_transcripts.py`, is committed at mode 100644 (measured)
+    and would ERROR forever today. The corpus guard's stated reason for
+    excluding this ("n=1 in the corpus at planning time") no longer holds: n=2
+    as of this task. Generalizing it there needs `shared/tests/`, outside this
+    task's locks — filed as ticket `tkt_0RS3PJJZFSJRJERYB11FNNKF5W`
+    (escalation `esc-3364-2`), which also retires this class's copy.
     """
 
     def test_check_is_the_script_kind(self, delivered_check):
