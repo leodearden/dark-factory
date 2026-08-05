@@ -127,8 +127,10 @@ class TestTopicSlug:
 class TestNormalizeSupersedes:
     """PRD D2 — `supersedes` is a list; the helper accepts scalar/list/None.
 
-    Readers: ``reconciliation/targeted.py:1464`` and leaf 3112's closure
-    predicate. The scalar writer is ``reconciliation/harness.py:1167``.
+    Readers: ``reconciliation/targeted.py:1477`` and leaf 3112's closure
+    predicate. The writer at ``reconciliation/harness.py:1175`` emitted a
+    scalar until task 3196 migrated it to the canonical list shape; scalar
+    tolerance remains for the 81 un-migrated corpus records.
     """
 
     def test_none_becomes_empty_list(self):
@@ -764,9 +766,15 @@ class TestValidateMemoryMetadata:
     def test_scalar_supersedes_is_normalized_not_rejected(self):
         """The beta-before-gamma hazard fix.
 
-        harness.py:1167 writes a scalar today (81 live records). Beta lands
-        BEFORE gamma migrates it, so rejecting the scalar form here would
-        break the recon harness's own writes for the whole window between.
+        harness.py wrote a scalar (81 live records) until task 3196 (gamma)
+        migrated it to the canonical list shape at :1175. Beta landed BEFORE
+        gamma, so rejecting the scalar form here would have broken the recon
+        harness's own writes for the whole window between.
+
+        Post-3196 this guards the LEGACY CORPUS rather than a live in-repo
+        writer: gamma shipped no corpus rewrite, so the 81 pre-migration
+        records still carry scalars (PRD D2 defers retro normalization to leaf
+        theta's stamping sweep), and out-of-repo writers are unbound by it.
         """
         meta = {'supersedes': _UUID}
         assert self._validate(meta) == []

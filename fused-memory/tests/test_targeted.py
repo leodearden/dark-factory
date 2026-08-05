@@ -2504,7 +2504,7 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
 
     The legacy SCALAR params (`truthy_supersedes`,
     `falsy_supersedes_no_other_marker`) are the D2 read-tolerance contract, kept
-    verbatim: the writer at harness.py:1167 emits a list as of task 3196, but
+    verbatim: the writer at harness.py:1175 emits a list as of task 3196, but
     the ~81 pre-migration corpus records still carry scalars (no corpus rewrite
     in this leaf — PRD D2 defers retro normalization to leaf θ's stamping
     sweep), so the reader must keep accepting both shapes.
@@ -2781,7 +2781,7 @@ async def test_on_task_done_suppresses_stale_description_when_authoritative_memo
     and the write must be flagged so operators can query suppressed echoes.
 
     Parametrized over both `supersedes` shapes (PRD D2 / task 3196) so the
-    production write shape emitted by harness.py:1167 is exercised end-to-end
+    production write shape emitted by harness.py:1175 is exercised end-to-end
     through `reconcile_task`, not only through the pure classifier. Every
     assertion below must hold for BOTH ids. `canonical_list` passes even before
     the reader migration (a one-element non-empty list is already truthy) — its

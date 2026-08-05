@@ -10471,10 +10471,16 @@ class TestMemoryMetadataValidationAtSeam:
     ):
         """The observable that proves the β-before-γ hazard is closed.
 
-        harness.py:1167 writes a scalar today and γ (which migrates it) lands
-        AFTER β. If the seam rejected — or passed through — the scalar form,
-        the window between the two leaves would either break the recon
-        harness's own writes or leave the list contract unmet.
+        harness.py wrote a scalar until γ (task 3196) migrated it to a list at
+        :1175, and γ landed AFTER β. If the seam had rejected — or passed
+        through — the scalar form, the window between the two leaves would
+        either have broken the recon harness's own writes or left the list
+        contract unmet.
+
+        Post-3196 this guards the LEGACY CORPUS rather than a live in-repo
+        writer: γ shipped no corpus rewrite, so the 81 pre-migration records
+        still carry scalars (PRD D2 defers retro normalization to leaf θ's
+        stamping sweep), and out-of-repo writers are unbound by it.
         """
         await _mm_write(service, entry_point, metadata={'supersedes': _MM_UUID})
         assert _mm_backend_meta(service, entry_point)['supersedes'] == [_MM_UUID]
