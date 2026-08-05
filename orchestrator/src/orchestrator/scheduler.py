@@ -2037,6 +2037,19 @@ class Scheduler:
         A non-JSON or non-dict-shaped value collapses to ``{}`` — every
         consumer reads dict-keyed sub-fields, so a non-dict carries no
         information they can use.
+
+        The collapse is LOUD: a discarded value emits a WARNING naming the task
+        id, the discarded type and a truncated repr.  It warns rather than
+        raises because this runs per task inside the scheduler's task-list
+        normalisation, so one malformed task must not take down a whole tick.
+        Silence, not the coercion, was the hazard: the dispatch-time cross-repo
+        gate (``cross_repo_gate.classify_cross_repo``) depends on this signal to
+        distinguish "no markers" from "markers unreadable" — without it a task
+        whose metadata arrived as an unparseable string is waved through
+        looking marker-free, with no trace that anything was dropped.
+
+        Absent / ``None`` metadata is the NORMAL shape (most tasks carry none)
+        and stays silent — warning there would be pure noise, every tick.
         """
         raw = task.get('metadata')
         if isinstance(raw, dict):
@@ -2046,8 +2059,24 @@ class Scheduler:
                 parsed = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
                 parsed = None
-            task['metadata'] = parsed if isinstance(parsed, dict) else {}
+            if not isinstance(parsed, dict):
+                logger.warning(
+                    'Task %s metadata discarded: str did not decode to a dict '
+                    '(type=str, repr=%.200r) — collapsing to {}; any markers it '
+                    'carried are NOT visible to downstream gates',
+                    task.get('id'), raw,
+                )
+                task['metadata'] = {}
+                return
+            task['metadata'] = parsed
             return
+        if raw is not None:
+            logger.warning(
+                'Task %s metadata discarded: not a dict or JSON string '
+                '(type=%s, repr=%.200r) — collapsing to {}; any markers it '
+                'carried are NOT visible to downstream gates',
+                task.get('id'), type(raw).__name__, raw,
+            )
         task['metadata'] = {}
 
     @staticmethod
