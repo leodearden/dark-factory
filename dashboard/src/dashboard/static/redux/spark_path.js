@@ -121,7 +121,12 @@ function sparkScale(values, width, height) {
 // Each run is the contiguous stretch between holes, and becomes its own SVG
 // subpath. This is what makes the line genuinely DISCONTINUOUS across a hole
 // rather than drawn straight through it. Module-private: the exported surface
-// is deliberately just the four public functions.
+// is deliberately just the functions listed in SPARK_PATH_API, and
+// spark_path.test.mjs asserts that set EXHAUSTIVELY.
+//
+// Shared verbatim by all four builders (sparkPaths, stepPaths, axisPaths and
+// stackedAreaPaths), which is most of why task 3489's chart primitives were
+// added to this module rather than a second one.
 function plottableRuns(points) {
   const runs = [];
   let current = null;
@@ -156,11 +161,17 @@ function plottableRuns(points) {
 // `${linePath} L${width},${height} L0,${height} Z` close character-for-
 // character. The per-subpath form is a strict generalisation, not a restyle —
 // spark_path.test.mjs pins that by exact string equality.
-function closeRunArea(drawn, lineCommands, height) {
+//
+// `baselineY` is the pixel row the fill drops to. For the sparklines that is
+// the viewport height (they scale into a bare 0..height box); for the padded
+// chart primitives it is `y0 + height`. The parameter was named `height` until
+// task 3489 — a pure rename, since the sparkline callers were already passing
+// the baseline under that name, so no pinned string moved.
+function closeRunArea(drawn, lineCommands, baselineY) {
   const firstX = drawn[0][0];
   const lastX = drawn[drawn.length - 1][0];
   if (lastX === firstX) return null;
-  return `${lineCommands} L${lastX},${height} L${firstX},${height} Z`;
+  return `${lineCommands} L${lastX},${baselineY} L${firstX},${baselineY} Z`;
 }
 
 // ── Smooth sparkline path builder (charts.jsx's `Sparkline`) ───────────────
@@ -291,6 +302,56 @@ function axisY(value, geom) {
   return geom.y0 + geom.height - ((value - geom.min) / geom.range) * geom.height;
 }
 
+// ── Line + area path builder for a PADDED chart (charts.jsx's `LineChart`) ─
+// The padded/offset analogue of sparkPaths. `geom` is
+// { x0, y0, width, height, count, min, range }: the plot box starts at
+// (x0, y0) and is width x height, `count` is the LABEL count (which drives
+// stepX, so a series shorter than the label row stops at its own last x rather
+// than being stretched across the full width), and the value axis spans
+// min..min+range.
+//
+// Returns { line, area }, each a space-joined set of subpaths — one per run of
+// consecutive real samples — so the line is genuinely discontinuous across a
+// hole and no fill is painted over a slot that holds no measurement. The
+// pre-fix LineChart closed its area at the full chart width unconditionally,
+// so the fill spanned gaps even where the line did not.
+//
+// No plottable samples at all yields `{ line: '', area: '' }` rather than
+// throwing. Unlike Sparkline, the CALLER does not then render nothing: a
+// LineChart's axes, gridlines and tick labels are structural facts about the
+// requested window, not measurements, so they keep rendering and only the
+// series paths are skipped.
+function axisPaths(values, geom) {
+  const series = values || [];
+  const stepX = geom.width / Math.max(geom.count - 1, 1);
+  const baselineY = geom.y0 + geom.height;
+
+  // x comes from the ORIGINAL index, exactly as sparkScale does — compacting
+  // would silently redate every surviving sample.
+  const points = series.map((v, i) => {
+    const y = axisY(v, geom);
+    return y === null ? null : [geom.x0 + i * stepX, y];
+  });
+
+  const lines = [];
+  const areas = [];
+
+  for (const run of plottableRuns(points)) {
+    // A run of one emits a zero-length segment (`M x,y L x,y`) rather than a
+    // bare moveto, which renders NOTHING in SVG. Same rule as sparkPaths.
+    const drawn = run.length === 1 ? [run[0], run[0]] : run;
+    const lineCommands = drawn
+      .map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`))
+      .join(' ');
+
+    lines.push(lineCommands);
+    const areaCommands = closeRunArea(drawn, lineCommands, baselineY);
+    if (areaCommands !== null) areas.push(areaCommands);
+  }
+
+  return { line: lines.join(' '), area: areas.join(' ') };
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced by
 // dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
@@ -303,6 +364,7 @@ const SPARK_PATH_API = {
   stepPaths,
   plottableMax,
   axisY,
+  axisPaths,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
