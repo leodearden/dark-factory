@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import errno
-import gzip
 import logging
 import os
 from pathlib import Path
@@ -21,11 +20,6 @@ def _write(path: Path, data: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return path
-
-
-def _gunzip(path: Path) -> bytes:
-    with gzip.open(path, 'rb') as fh:
-        return fh.read()
 
 
 class TestCoreArchiveAndCredentialSafety:
@@ -56,12 +50,12 @@ class TestCoreArchiveAndCredentialSafety:
 
         assert count == 2
 
-        main_gz = root / task_id / ENC / f'{sid}.jsonl.gz'
-        sub_gz = root / task_id / ENC / sid / 'subagents' / 'agent-1.jsonl.gz'
-        assert main_gz.exists()
-        assert sub_gz.exists()
-        assert _gunzip(main_gz) == main_bytes
-        assert _gunzip(sub_gz) == sub_bytes
+        main_dest = root / task_id / ENC / f'{sid}.jsonl'
+        sub_dest = root / task_id / ENC / sid / 'subagents' / 'agent-1.jsonl'
+        assert main_dest.exists()
+        assert sub_dest.exists()
+        assert main_dest.read_bytes() == main_bytes
+        assert sub_dest.read_bytes() == sub_bytes
 
         # Credential-safety: nothing matching the credential or the non-jsonl
         # file appears anywhere under the archive root.
@@ -69,7 +63,6 @@ class TestCoreArchiveAndCredentialSafety:
         assert not any('credentials' in name for name in archived)
         assert not any(name.startswith('notes') for name in archived)
         assert not any(name.endswith('.txt') for name in archived)
-        assert not any(name.endswith('.txt.gz') for name in archived)
 
 
 class TestArchiveAll:
@@ -102,15 +95,15 @@ class TestArchiveAll:
 
         assert count == 3
 
-        a_gz = root / task_id / enc_a / f'{sid_a}.jsonl.gz'
-        b_gz = root / task_id / enc_b / f'{sid_b}.jsonl.gz'
-        sub_gz = root / task_id / enc_a / sid_a / 'subagents' / 'agent-1.jsonl.gz'
-        assert _gunzip(a_gz) == a_bytes
-        assert _gunzip(b_gz) == b_bytes
-        assert _gunzip(sub_gz) == sub_bytes
+        a_dest = root / task_id / enc_a / f'{sid_a}.jsonl'
+        b_dest = root / task_id / enc_b / f'{sid_b}.jsonl'
+        sub_dest = root / task_id / enc_a / sid_a / 'subagents' / 'agent-1.jsonl'
+        assert a_dest.read_bytes() == a_bytes
+        assert b_dest.read_bytes() == b_bytes
+        assert sub_dest.read_bytes() == sub_bytes
 
         archived = [p.name for p in root.rglob('*') if p.is_file()]
-        assert not any(name.endswith('.txt') or name.endswith('.txt.gz') for name in archived)
+        assert not any(name.endswith('.txt') for name in archived)
 
 
 class TestIdempotencyAndResume:
@@ -128,13 +121,14 @@ class TestIdempotencyAndResume:
 
         # First call writes the archive.
         assert archive_task_transcripts(config_dir, task_id, sid, archive_root=root) == 1
-        dest = root / task_id / ENC / f'{sid}.jsonl.gz'
-        assert _gunzip(dest) == orig
+        dest = root / task_id / ENC / f'{sid}.jsonl'
+        assert dest.read_bytes() == orig
 
         # Robustly prove "not rewritten": replace the archive bytes with a
         # sentinel and restore its mtime to the source's, so the skip predicate
         # (int(dest.mtime) == int(src.mtime)) still holds. A genuine skip leaves
-        # the sentinel intact; an unconditional rewrite replaces it with gzip.
+        # the sentinel intact; an unconditional rewrite replaces it with the
+        # source bytes.
         src_stat = src.stat()
         sentinel = b'SENTINEL-not-rewritten'
         dest.write_bytes(sentinel)
@@ -152,7 +146,7 @@ class TestIdempotencyAndResume:
         os.utime(src, (src_stat.st_atime + 10, src_stat.st_mtime + 10))
 
         assert archive_task_transcripts(config_dir, task_id, sid, archive_root=root) == 1
-        assert _gunzip(dest) == grown
+        assert dest.read_bytes() == grown
 
 
 class TestBestEffortLoud:
@@ -170,8 +164,8 @@ class TestBestEffortLoud:
         _write(bad, b'{"bad":1}\n')
 
         # Induce a per-file write failure: pre-create a DIRECTORY at the bad
-        # file's dest .gz path so gzip.open(dest, 'wb') raises IsADirectoryError.
-        bad_dest = root / task_id / ENC / 'sess-bad.jsonl.gz'
+        # file's dest path so the writer's copy raises IsADirectoryError.
+        bad_dest = root / task_id / ENC / 'sess-bad.jsonl'
         bad_dest.mkdir(parents=True)
         # Ensure the idempotency check does NOT skip it (dir mtime != src mtime).
         os.utime(bad_dest, (0, 0))
@@ -183,8 +177,8 @@ class TestBestEffortLoud:
 
         # Partial success — the good file archived, the bad one did not.
         assert count == 1
-        good_dest = root / task_id / ENC / 'sess-good.jsonl.gz'
-        assert _gunzip(good_dest) == good_bytes
+        good_dest = root / task_id / ENC / 'sess-good.jsonl'
+        assert good_dest.read_bytes() == good_bytes
 
         # Failure counted (loud-over-silent).
         assert transcript_archive_module._archival_failures() == 1
