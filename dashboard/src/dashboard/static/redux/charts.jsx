@@ -2,20 +2,30 @@
 
 const { useRef, useEffect, useState, useMemo } = React;
 
-// Sparkline/StepSpark scale+path math lives in the plain-JS sibling
-// /static/redux/spark_path.js, where it is behaviourally testable under
+// The scale+path math for every chart primitive here lives in the plain-JS
+// sibling /static/redux/spark_path.js, where it is behaviourally testable under
 // `node --test` (dashboard/tests/js/spark_path.test.mjs) — this file is JSX
 // behind CDN Babel with no node_modules, so nothing in it can be executed by a
 // test. spark_path.js is also what makes a MISSING sample stay missing instead
-// of being drawn as a measured zero (task 3436).
+// of being drawn as a measured zero: the two sparklines since task 3436, and
+// LineChart/StackedAreaChart/BarChart/HistBar since task 3489.
 //
 // Destructured, with no `|| {}` fallback, deliberately: if spark_path.js is
 // missing or 404s this throws at load with a clear message, rather than
 // deferring to a TypeError inside a render or silently degrading into charts
 // that draw nothing. Matches the DF_GRAPH_LAYOUT / DF_RUNTIME_FMT precedent.
 // index.html loads that classic script before this file; test_index_html.py
-// pins both the load order and that it is actually served.
-const { sparkPaths: sparkSmoothPaths, stepPaths: sparkStepPaths } = window.DF_SPARK_PATH;
+// pins both the load order and that it is actually served — and the shared
+// `?v=` cache-buster is bumped whenever this destructure reaches for a name a
+// cached copy of spark_path.js would not have.
+const {
+  sparkPaths: sparkSmoothPaths,
+  stepPaths: sparkStepPaths,
+  plottableMax,
+  axisY,
+  axisPaths,
+  stackedAreaPaths,
+} = window.DF_SPARK_PATH;
 
 const PALETTE = {
   accent:  'oklch(0.72 0.14 230)',
@@ -106,18 +116,29 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   const chartW = Math.max(w - padL - padR, 50);
   const chartH = height - padT - padB;
   const all = series.flatMap(s => s.values);
-  const maxV = Math.max(...all, 1);
+  // Hole-excluding fold (task 3489): one undefined/NaN sample used to poison
+  // maxV to NaN, `range = NaN - NaN || 1` silently fell back to 1, and every y
+  // became NaN — a single NaN token invalidates the whole `d` attribute, so SVG
+  // dropped the ENTIRE path. The `1` seed is preserved deliberately, as is
+  // minV = 0: switching to a `Math.min(...)` fold would newly bring negative
+  // samples in-range and silently re-frame every LineChart on the dashboard.
+  // This is a null-handling fix, not a re-scaling.
+  const maxV = plottableMax(all, 1);
   const minV = 0;
   const range = maxV - minV || 1;
   const n = labels.length;
   const stepX = chartW / Math.max(n - 1, 1);
+  // The plot box every value is scaled into. `count` is the LABEL count, so a
+  // series shorter than the label row stops at its own last x rather than being
+  // stretched across the full width.
+  const geom = { x0: padL, y0: padT, width: chartW, height: chartH, count: n, min: minV, range };
   const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => minV + (range * i) / ticks);
   return (
     <div ref={ref} style={{ width: '100%', height }}>
       <svg viewBox={`0 0 ${w} ${height}`} style={{ width: '100%', height: '100%', display: 'block' }}>
         {yTicks.map((t, i) => {
-          const y = padT + chartH - ((t - minV) / range) * chartH;
+          const y = axisY(t, geom);
           return (
             <g key={i}>
               <line x1={padL} y1={y} x2={padL + chartW} y2={y} stroke={PALETTE.line} strokeWidth={0.5} strokeDasharray={i === 0 ? '0' : '2 3'} />
@@ -134,17 +155,21 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
         })}
         {series.map((s, si) => {
           const color = s.color || PALETTE.accent;
-          const pts = s.values.map((v, i) => {
-            const x = padL + i * stepX;
-            const y = padT + chartH - ((v - minV) / range) * chartH;
-            return [x, y];
-          });
-          const linePath = pts.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ');
-          const areaPath = `${linePath} L${padL + chartW},${padT + chartH} L${padL},${padT + chartH} Z`;
+          // One subpath per run of consecutive real samples, so the line is
+          // genuinely discontinuous across a hole and no fill is painted under
+          // a slot that holds no measurement (the pre-fix area closed at the
+          // full chart width regardless).
+          const { line, area } = axisPaths(s.values, geom);
+          // Skips THIS SERIES only, when it has no plottable sample at all.
+          // The axes, gridlines and tick labels below are structural facts
+          // about the requested window rather than measurements, so they keep
+          // rendering — an empty frame reads as "no data in this window",
+          // where no chart at all reads as "nothing was asked for".
+          if (!line) return null;
           return (
             <g key={si}>
-              {s.fill !== false && <path d={areaPath} fill={color} fillOpacity={0.10} />}
-              <path d={linePath} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" />
+              {s.fill !== false && area && <path d={area} fill={color} fillOpacity={0.10} />}
+              <path d={line} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" />
             </g>
           );
         })}
@@ -167,18 +192,20 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   const chartH = height - padT - padB;
   const n = labels.length;
   const stepX = chartW / Math.max(n - 1, 1);
-  const totals = labels.map((_, i) => stacks.reduce((s, st) => s + (st.values[i] || 0), 0));
-  const maxV = Math.max(...totals, 1);
+  // One polygon per layer, plus the axis maximum they were all scaled against
+  // (task 3489). The cumulative folds used to scrub every sample through a
+  // `|| 0` fallback, which fabricated a zero-height band at a hole AND fed a
+  // hole-as-zero partial sum to the axis. (The exact pre-fix expression is not
+  // quoted here on purpose: test_charts_null_samples.py greps this body for it,
+  // and prose repeating it would trip that probe.) The builder instead carries
+  // a hole as unknown: layer li is drawn at column i only if every layer BELOW
+  // it is measured there — its base is their sum — while the bands below keep
+  // drawing truthfully.
+  const geom = { x0: padL, y0: padT, width: chartW, height: chartH, count: n };
+  const { max: maxV, paths } = stackedAreaPaths(stacks, geom);
 
-  // build cumulative stacks
-  const cumLayers = stacks.map((_, li) =>
-    labels.map((_, i) => stacks.slice(0, li + 1).reduce((s, st) => s + (st.values[i] || 0), 0))
-  );
-  const baseLayers = stacks.map((_, li) =>
-    labels.map((_, i) => stacks.slice(0, li).reduce((s, st) => s + (st.values[i] || 0), 0))
-  );
-
-  const yToPx = v => padT + chartH - (v / maxV) * chartH;
+  // The value axis the builder scaled every band against: 0..maxV.
+  const tickGeom = { y0: padT, height: chartH, min: 0, range: maxV };
 
   // Each tick is handed to formatY RAW (fractional), because a caller's own
   // formatter is the only thing that knows the axis UNITS. The Workflow panel
@@ -197,24 +224,25 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   return (
     <div ref={ref} style={{ width: '100%', height }}>
       <svg viewBox={`0 0 ${w} ${height}`} style={{ width: '100%', height: '100%', display: 'block' }}>
-        {yTicks.map((t, i) => (
-          <g key={i}>
-            <line x1={padL} y1={yToPx(t)} x2={padL + chartW} y2={yToPx(t)} stroke={PALETTE.line} strokeWidth={0.5} strokeDasharray={i === 0 ? '0' : '2 3'} />
-            <text x={padL - 6} y={yToPx(t) + 3} fontSize="9" fill={PALETTE.fg3} textAnchor="end" fontFamily="JetBrains Mono">{formatY(t)}</text>
-          </g>
-        ))}
+        {yTicks.map((t, i) => {
+          const y = axisY(t, tickGeom);
+          return (
+            <g key={i}>
+              <line x1={padL} y1={y} x2={padL + chartW} y2={y} stroke={PALETTE.line} strokeWidth={0.5} strokeDasharray={i === 0 ? '0' : '2 3'} />
+              <text x={padL - 6} y={y + 3} fontSize="9" fill={PALETTE.fg3} textAnchor="end" fontFamily="JetBrains Mono">{formatY(t)}</text>
+            </g>
+          );
+        })}
         {labels.map((lab, i) => {
           if (n > 8 && i % Math.ceil(n / 6) !== 0 && i !== n - 1) return null;
           const x = padL + i * stepX;
           return <text key={i} x={x} y={height - 6} fontSize="9" fill={PALETTE.fg3} textAnchor="middle" fontFamily="JetBrains Mono">{formatX(lab)}</text>;
         })}
         {stacks.map((st, li) => {
-          const top = cumLayers[li];
-          const base = baseLayers[li];
-          const points = [];
-          for (let i = 0; i < n; i++) points.push([padL + i * stepX, yToPx(top[i])]);
-          for (let i = n - 1; i >= 0; i--) points.push([padL + i * stepX, yToPx(base[i])]);
-          const d = points.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ') + ' Z';
+          const d = paths[li];
+          // A layer with nothing plottable draws nothing — not a band pinned to
+          // the floor. The axes and tick labels above still render.
+          if (!d) return null;
           return <path key={st.key} d={d} fill={st.color} fillOpacity={0.85} stroke={st.color} strokeWidth={0.5} />;
         })}
       </svg>
