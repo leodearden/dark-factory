@@ -647,6 +647,99 @@ class TestMergeGateL2ShortCircuits:
         )
 
 
+# ---------------------------------------------------------------------------
+# Boundary #3 — the wait expires (silent producer) → blocked + L1, no strand
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeGateWaitExpiry:
+    """Boundary #3: the gating L0 is never consumed within the idle window.
+
+    The EXISTING task-3170 give-up machinery does the cleanup — stop the
+    steward, emit ``escalation_resolved{outcome='steward_wait_timeout'}``,
+    dismiss the orphan L0(s) — and then ``_wait_for_resolution`` returns
+    normally, indistinguishable from a genuine resolution by its ``str``
+    return.  The merge-entry gate must NOT read that as an adjudication: an
+    expired wait means nobody DECIDED anything, and repend-PRD D4
+    stop-the-line forbids merging past the record.  The disposition is a
+    visible ``blocked`` park with an L1 for a human.
+
+    This is the failure mode the bound exists for at all — a producer that
+    went silent — so the assertions cover both halves: that the shared
+    machinery really ran (not some new merge-entry-only timeout path), and
+    that the merge-entry handler drew the right conclusion from it.
+    """
+
+    async def test_expired_wait_blocks_with_l1_instead_of_merging(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        store = _RecordingEventStore()
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree, event_store=store,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+        timing = _time_the_wait(wf)
+
+        gating = _submit_gating_l0(queue, task_id)
+        # Publishes nothing, dismisses nothing — the general "producer went
+        # silent" shape, deliberately not modelling any one known bug.
+        wf._steward_factory = _make_silent_steward()
+
+        # 10s backstop against a regression to an unbounded wait; the derived
+        # window is 0.5 + 0.5 = 1.0s, so the real path never approaches it.
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 10)
+
+        # ── the EXISTING give-up machinery ran ──────────────────────────
+        assert timing.get('elapsed', 0.0) < 5, (
+            f'the wait itself must be bounded by roughly one derived window '
+            f'(0.5 + 0.5 = 1.0s), not ride the test backstop; took '
+            f'{timing.get("elapsed")}s'
+        )
+        timeouts = _steward_wait_timeouts(store)
+        assert timeouts, (
+            'expiry must go through _wait_for_resolution\'s give-up branch — '
+            'the only emitter of escalation_resolved{outcome='
+            "'steward_wait_timeout'} — not through a merge-entry-only path"
+        )
+        assert gating.id in timeouts[0]['escalation_ids']
+        # Its orphan-dismissal ran, so the next entry cannot re-strand on the
+        # same record.
+        assert queue.get_by_task(task_id, status='pending', level=0) == []
+        archived = queue.get(gating.id)
+        assert archived is not None
+        assert archived.resolved_by == 'auto-dismissed'
+
+        # ── the merge-entry disposition ─────────────────────────────────
+        assert outcome is not None, (
+            'an expired wait means the gating record was never adjudicated — '
+            'the merge must not resume'
+        )
+        assert submit.await_count == 0, (
+            'D4 stop-the-line: merging past a never-adjudicated gating record '
+            'is exactly what the gate exists to prevent'
+        )
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked']
+        assert queue.has_open_l1(task_id), (
+            'a silent steward has proved it cannot help — the park must be '
+            'visible to a human as an L1, not a fresh L0 for the same steward'
+        )
+
+        # ── the no-strand shape, stated explicitly ──────────────────────
+        # harness._run_slot's finally (harness.py:7949-7972) clears the
+        # claimant unconditionally and writes NO status, so whatever run()
+        # left behind survives.  A status write happened here, so the row
+        # cannot be left `in-progress` with a nulled claimant.
+        assert scheduler.statuses.get(task_id), (
+            'no exit of the merge-entry gate may reach the harness slot-finally '
+            'without having written its successor status'
+        )
+
+
 __all__ = [
     'PLAN',
     '_build_workflow',
