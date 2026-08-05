@@ -63,6 +63,41 @@ function ageText(seconds) {
   return `${Math.round(h / 24)}d ago`;
 }
 
+// Count the deliberate holes in a trend series.  A `null` in `trend.values`
+// means that run produced no sample.
+//
+// The array is handed on UNMODIFIED — dropping a hole would shift this
+// metric's points against every other metric's, since all series share the
+// run_stamps x-axis.
+//
+// HISTORY: charts.jsx's primitives originally could not REPRESENT a hole.
+// `Sparkline` and `StepSpark` did their own arithmetic inline with no null
+// handling, coercing a `null` to 0, so a hole was drawn as a real data point
+// at value 0 connected by line segments to its neighbours — for a `proportion`
+// metric sitting at 0.95, a plunge to the chart floor and back, visually
+// identical to a genuine regression to zero.  That is fixed: the scale/path
+// math now lives in /static/redux/spark_path.js (task 3436), which excludes
+// non-finite samples from the extrema and breaks the path at every hole, and
+// is behaviourally tested under `node --test`
+// (dashboard/tests/js/spark_path.test.mjs).
+//
+// The local suppression below is nonetheless RETAINED for now: a holed series
+// is NOT DRAWN (see `plottable` in tab_memory_evals.jsx) and the gap count is
+// disclosed in text instead.  This is the same invariant `dash()` states for
+// scalars — a synthetic zero reads as a measured zero — applied to the trend
+// column.  Re-enabling this trend chart now that the primitive is hole-aware
+// is a product decision with its own test churn
+// (test_tab_memory_evals.py::test_trend_holes_are_never_handed_to_a_chart_primitive
+// pins the current behaviour), and is filed as separate follow-up work.
+function trendGaps(values) {
+  if (!values) return 0;
+  let gaps = 0;
+  for (let i = 0; i < values.length; i++) {
+    if (values[i] === null || values[i] === undefined) gaps += 1;
+  }
+  return gaps;
+}
+
 // ── Unmatched escalations ──
 //
 // Branched on `reason`, with distinct wording per value.  Collapsing the three
@@ -103,7 +138,7 @@ function chartForKind(kind) {
   return null;
 }
 
-const MEMORY_EVALS_FMT_API = { dash, ageText, unmatchedReasonText, chartForKind };
+const MEMORY_EVALS_FMT_API = { dash, ageText, trendGaps, unmatchedReasonText, chartForKind };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = MEMORY_EVALS_FMT_API;
