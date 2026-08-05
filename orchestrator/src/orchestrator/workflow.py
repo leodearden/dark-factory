@@ -3446,8 +3446,18 @@ class TaskWorkflow:
 
         # Tripwire (task 2505): plan.files must equal metadata.files by
         # construction (the scope-reconciliation choke point keeps them in
-        # lockstep) — a divergence here means some path bypassed it. Purely
-        # observational: logs + escalates, never blocks the merge.
+        # lockstep) — a divergence here means some path bypassed it. NOT
+        # observational: _escalate_scope_invariant_violation files a
+        # severity='blocking', level=0 record, which _is_gating_escalation
+        # classifies as GATING, so the bail 12 lines below stops this
+        # dispatch's merge. (This has been true since task 1619; the comment
+        # that claimed "never blocks the merge" was corrected in task 3536.)
+        # As of that task the gate is safe to trip: it is bounded (one derived
+        # steward-wait idle window) and recoverable (a steward that consumes
+        # the L0 lets the merge retry IN-SLOT without burning a re-dispatch; an
+        # unresolved or re-escalated gate parks the row as `blocked` with an L1
+        # instead of stranding it in-progress). See
+        # _handle_merge_gate_escalations.
         # The stamp above already read this task's backend metadata blob;
         # thread it in rather than issuing a second identical get_task on the
         # merge hot path (review amendment). A None/unreadable prefetch falls
@@ -13598,6 +13608,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         lockstep on every path that changes either. This surfaces a genuine
         divergence loudly (the project's loud-over-silent-degradation norm)
         rather than letting scope drift ship silently into a merge.
+
+        The escalation this files is a BLOCKING LEVEL-0 record
+        (:meth:`_escalate_scope_invariant_violation`), which
+        :func:`_is_gating_escalation` classifies as gating — so it GATES the
+        merge at the bail immediately below this call site, routing the task
+        into the bounded ESCALATED machinery
+        (:meth:`_handle_merge_gate_escalations`). A divergence therefore stops
+        the line for this dispatch; it is not merely observed. That hold is
+        bounded by one derived steward-wait window and always ends in either an
+        in-slot merge retry or a visible ``blocked`` park.
 
         Compared at MODULE (lock) granularity, NOT file granularity. Locks —
         the only thing ``metadata.files`` functionally drives — are
