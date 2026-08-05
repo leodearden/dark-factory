@@ -85,6 +85,31 @@ Unusable                      :class:`CorpusBuildError` naming the
 Non-``GRAPH.RO_QUERY``        :class:`CorpusBuildError` from the reader's
 command attempted             client-side guard.
 ============================  ============================================
+
+Verification (``--verify``) instead reports a status and exits on its code.
+Each failure has its own code because each has a different remedy, and a CI
+job reads the code without ever opening the report:
+
+====================  ====  ==================================================
+Status                Exit  Meaning and remedy
+====================  ====  ==================================================
+``ok``                   0  Every episode re-derived from the recorded
+                            criteria and every content hash matched.
+``id_mismatch``          2  Re-deriving produced a DIFFERENT corpus than the
+                            manifest records. The manifest no longer describes
+                            what its own criteria produce — re-derive, or
+                            investigate tampering.
+``hash_drift``           3  The selection is still correct, but episode
+                            content changed underneath it. Re-hash, and treat
+                            ε/ζ/θ results computed against the old bytes as
+                            suspect.
+``missing_episodes``     4  An id the manifest names is absent from the
+                            store. Reported, never silently skipped.
+``bad_manifest``         5  The artifact is structurally unusable — reported
+                            as a status rather than raised as a traceback, so
+                            a reader can tell a broken artifact from a broken
+                            checker.
+====================  ====  ==================================================
 """
 
 from __future__ import annotations
@@ -885,6 +910,187 @@ def write_manifest(manifest: dict, path: str | Path = DEFAULT_MANIFEST_PATH) -> 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(serialize_manifest(manifest), encoding='utf-8')
     return target
+
+
+# ---------------------------------------------------------------------------
+# Verification — the INV-2 / INV-4 seam
+# ---------------------------------------------------------------------------
+
+EXIT_CODES = {
+    'ok': 0,
+    'id_mismatch': 2,
+    'hash_drift': 3,
+    'missing_episodes': 4,
+    'bad_manifest': 5,
+}
+"""Process exit code per verification status; see the module docstring's table.
+
+Each failure gets its own code because each has a different remedy, and a
+wrapper or CI job reads the code without ever opening the report. Collapsing
+them into one non-zero would send a reader down the wrong path — see
+:class:`VerifyReport`.
+"""
+
+
+@dataclass(frozen=True)
+class VerifyReport:
+    """The outcome of :func:`verify_manifest`, structured rather than boolean.
+
+    A bare ``False`` tells a reviewer nothing about what to fix, so every
+    failure carries its diff: which ids are on which side, which contents
+    drifted from what to what, which ids vanished.
+    """
+
+    status: str
+    detail: str
+    checked: int = 0
+    rederived: list[str] = dataclasses.field(default_factory=list)
+    id_mismatch: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    hash_drift: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
+    missing: list[str] = dataclasses.field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.status == 'ok'
+
+    @property
+    def exit_code(self) -> int:
+        return EXIT_CODES[self.status]
+
+
+def _read_criteria(manifest: object) -> tuple[dict, list[dict]]:
+    """Extract and structurally validate the parts verification depends on.
+
+    Raises :class:`CorpusBuildError` rather than letting a malformed manifest
+    surface as a ``KeyError`` or ``TypeError`` traceback three frames down,
+    where a reader could not tell a broken artifact from a broken checker.
+    """
+    if not isinstance(manifest, dict):
+        raise CorpusBuildError(f'manifest must be a JSON object, got {type(manifest).__name__}')
+    criteria = manifest.get('criteria')
+    if not isinstance(criteria, dict):
+        raise CorpusBuildError('manifest has no "criteria" object to re-derive from')
+    for key in ('seed', 'n'):
+        if key not in criteria:
+            raise CorpusBuildError(f'manifest criteria is missing {key!r}')
+    if not isinstance(criteria['n'], int) or isinstance(criteria['n'], bool):
+        raise CorpusBuildError(f'manifest criteria n must be an int, got {criteria["n"]!r}')
+    if not isinstance(criteria['seed'], str):
+        raise CorpusBuildError(f'manifest criteria seed must be a str, got {criteria["seed"]!r}')
+    episodes = manifest.get('episodes')
+    if not isinstance(episodes, list) or not episodes:
+        raise CorpusBuildError('manifest has no non-empty "episodes" list')
+    for index, entry in enumerate(episodes):
+        if not isinstance(entry, dict) or 'uuid' not in entry or 'content_hash' not in entry:
+            raise CorpusBuildError(
+                f'episodes[{index}] must be an object with uuid and content_hash, '
+                f'got {entry!r}'
+            )
+    return criteria, episodes
+
+
+def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> VerifyReport:
+    """Re-derive *manifest*'s sample from its OWN recorded criteria and compare.
+
+    This is the deliverable's user-observable promise, mechanized: a reviewer
+    holding the artifact and a live store can confirm the corpus is what it
+    says it is.
+
+    .. important::
+
+       Verification re-runs :func:`select` from the recorded ``seed`` and ``n``
+       and compares the RESULT to the recorded ``episodes``. It must never read
+       ``episodes`` as the source of truth for what to select — that check
+       would be vacuous, passing on any manifest including a tampered one, and
+       a check that always says yes is worse than no check because it launders
+       the artifact.
+
+    Failures are reported in priority order — a broken manifest before a
+    missing episode, a missing episode before an id mismatch, an id mismatch
+    before hash drift — because each is a precondition for the next being
+    meaningful. Hashes cannot be compared against episodes that are not there,
+    and drift in a selection that is already wrong is not the reader's problem
+    yet.
+    """
+    try:
+        criteria, episodes = _read_criteria(manifest)
+    except CorpusBuildError as exc:
+        return VerifyReport(status='bad_manifest', detail=str(exc))
+
+    recorded_ids = [entry['uuid'] for entry in episodes]
+    present = {record.uuid: record for record in population}
+    missing = [uuid for uuid in recorded_ids if uuid not in present]
+    if missing:
+        return VerifyReport(
+            status='missing_episodes',
+            detail=(
+                f'{len(missing)} of {len(recorded_ids)} manifest episodes are absent '
+                f'from the population — the store no longer holds what the corpus '
+                f'names'
+            ),
+            checked=len(recorded_ids),
+            missing=missing,
+        )
+
+    try:
+        rederived = [
+            record.uuid
+            for record in select(population, criteria['n'], seed=criteria['seed']).selected
+        ]
+    except CorpusBuildError as exc:
+        return VerifyReport(
+            status='bad_manifest',
+            detail=f'cannot re-derive from the recorded criteria: {exc}',
+            checked=len(recorded_ids),
+        )
+
+    if rederived != recorded_ids:
+        return VerifyReport(
+            status='id_mismatch',
+            detail=(
+                f're-deriving from the recorded criteria (seed={criteria["seed"]!r}, '
+                f'n={criteria["n"]}) produced a different corpus than the manifest '
+                f'records'
+            ),
+            checked=len(recorded_ids),
+            rederived=rederived,
+            id_mismatch={
+                'only_in_manifest': sorted(set(recorded_ids) - set(rederived)),
+                'only_in_rederivation': sorted(set(rederived) - set(recorded_ids)),
+                'order_differs': sorted(set(recorded_ids)) == sorted(set(rederived)),
+            },  # type: ignore[dict-item]
+        )
+
+    drift = {
+        entry['uuid']: {
+            'expected': entry['content_hash'],
+            'actual': content_hash(present[entry['uuid']].content),
+        }
+        for entry in episodes
+        if content_hash(present[entry['uuid']].content) != entry['content_hash']
+    }
+    if drift:
+        return VerifyReport(
+            status='hash_drift',
+            detail=(
+                f'{len(drift)} of {len(episodes)} episodes have different content than '
+                f'when the manifest was built — the SELECTION is still correct, but '
+                f'replay results computed against the old bytes are suspect'
+            ),
+            checked=len(recorded_ids),
+            rederived=rederived,
+            hash_drift=drift,
+        )
+
+    return VerifyReport(
+        status='ok',
+        detail=(
+            f'{len(recorded_ids)} episodes re-derived from the recorded criteria and '
+            f'matched, with every content hash intact'
+        ),
+        checked=len(recorded_ids),
+        rederived=rederived,
+    )
 
 
 def record_field_names() -> tuple[str, ...]:
