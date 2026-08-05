@@ -7356,6 +7356,62 @@ class Harness:
             task_id,
         )
 
+    async def _run_cross_repo_gate(self, assignment) -> bool:
+        """Run the dispatch-time cross-repo admission gate (task 3121).
+
+        Classifies the task as foreign-owned (its declared work belongs to
+        another project) and either allows dispatch (True) or blocks +
+        escalates (False).
+
+        Unlike ``_run_substrate_gate`` this gate is PURE and in-process: no
+        worktree, no subprocess, no thread offload — classification is a
+        metadata read plus path containment.  That is why it runs FIRST: a
+        foreign-owned task that also carries a substrate probe never pays for
+        an ephemeral worktree it can only throw away.
+
+        Returns:
+            True   — ALLOW or SKIP (dispatch may proceed).  SKIP means the
+                     task's metadata was unreadable, i.e. "no evidence", not
+                     "verified clean"; classify_cross_repo already warned.
+            False  — BLOCK (task blocked + L1 filed inside the gate; caller must
+                     arm the requeue cooldown and skip workflow construction).
+        """
+        from orchestrator import cross_repo_gate  # noqa: PLC0415
+
+        task_id = assignment.task_id
+
+        try:
+            verdict = cross_repo_gate.classify_cross_repo(
+                task=assignment.task,
+                project_root=self.config.project_root,
+            )
+        except Exception as exc:
+            logger.warning(
+                'cross_repo_gate: classify_cross_repo raised for task %s: %s',
+                task_id, exc, exc_info=True,
+            )
+            # Fail CLOSED — an unverifiable classification is not a clean bill
+            # of health (mirrors _run_substrate_gate's except branch).
+            verdict = cross_repo_gate.CrossRepoVerdict(
+                verdict=cross_repo_gate.BLOCK,
+                owner_project=None,
+                signals=('classify_error',),
+                foreign_paths=(),
+                reason=f'cross-repo unverifiable / classify_cross_repo raised: {exc}',
+            )
+
+        logger.info(
+            'cross_repo_gate: task %s verdict=%s owner=%s signals=%r reason=%r',
+            task_id, verdict.verdict, verdict.owner_project or 'unresolved',
+            verdict.signals, verdict.reason,
+        )
+
+        if verdict.blocked:
+            await self._block_and_escalate_cross_repo(task_id, verdict=verdict)
+            return False
+
+        return True
+
     async def _run_substrate_gate(self, assignment) -> bool:
         """Run the dispatch-time substrate re-check gate (D4).
 
