@@ -1216,3 +1216,171 @@ def test_run_path_results_are_not_filtered(tmp_path, campaign_seam, monkeypatch)
     assert 'architect-sonnet-high' in str(exc.value)
     # It surfaced as an unknown-config error, NOT as a quiet drop.
     assert 'candidates' in str(exc.value)
+
+
+# ===== amendments: degenerate inputs fail at the flag, not in the artifact =====
+#
+# Every case below was a SILENT no-op before these guards: the driver accepted
+# the flags, computed something shaped like a result, and exited 0. That is the
+# one failure mode this module exists to make impossible, since γ1's calibration
+# is read off the artifact rather than off the terminal.
+
+
+def test_q_ceiling_without_stage1_exits(tmp_path):
+    """A typed-but-ignored threshold is worse than a missing one — it looks applied.
+
+    Verified pre-fix: ``--dry-run ... --q-ceiling 0.8 --out p`` wrote an artifact
+    with no ``bands`` key and printed zero diagnostics, so an operator who typed
+    the empirically-anchored number had no way to learn it did nothing. The
+    reverse direction (``--stage1`` with no ``--q-ceiling``) was already loud;
+    that asymmetry is what made this one dangerous.
+    """
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([
+            '--dry-run', '--tasks-dir', str(d),
+            '--candidate', 'architect-opus-max', '--q-ceiling', '0.8',
+        ])
+
+    assert exc.value.code != 0
+    message = str(exc.value)
+    assert '--q-ceiling' in message and '--stage1' in message
+
+
+def test_stage1_with_dry_run_exits(tmp_path):
+    """Banding a dry run would fabricate an all-zero partition over an empty pool.
+
+    Verified pre-fix, ``--dry-run --stage1 --q-ceiling 0.8`` emitted
+    ``{'by_fixture': {}, 'counts': {...all 0...}, 'discarded': [],
+    'marker_available': False, 'retained': []}`` — precisely the reading
+    ``build_campaign_report`` omits ``bands`` to prevent, re-entering through the
+    one mode where by construction nothing was measured. ``marker_available:
+    False`` is likewise asserted off an empty list.
+    """
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([
+            '--dry-run', '--tasks-dir', str(d),
+            '--candidate', 'architect-opus-max',
+            '--stage1', '--q-ceiling', '0.8',
+        ])
+
+    assert exc.value.code != 0
+    assert '--stage1' in str(exc.value) and '--dry-run' in str(exc.value)
+
+
+def test_dry_run_artifact_never_carries_bands(tmp_path):
+    """Belt and braces behind the flag rejection: no dry-run artifact is ever banded."""
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+    out = tmp_path / 'r.json'
+
+    mod.main([
+        '--dry-run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max', '--out', str(out),
+    ])
+
+    assert 'bands' not in json.loads(out.read_text())
+
+
+@pytest.mark.parametrize('flag,value', [
+    ('--trials', '0'),
+    ('--trials', '-1'),
+    ('--max-parallel', '0'),
+    ('--timeout', '0'),
+])
+def test_degenerate_int_flags_are_rejected(tmp_path, flag, value, capsys):
+    """``--trials 0`` etc. are silent no-ops, not smaller campaigns.
+
+    ``--trials 0`` yields ``range(1, 1)``, so ``enumerate_cells`` returns ``[]``,
+    ``run_ofat_stage`` builds zero thunks and ``_bounded_fanout`` short-circuits
+    on ``if not thunks: return []`` — a completed "campaign" that dispatched
+    nothing and returned 0. ``--max-parallel 0`` constructs
+    ``asyncio.Semaphore(0)`` and deadlocks the fan-out instead.
+    """
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([
+            '--dry-run', '--tasks-dir', str(d),
+            '--candidate', 'architect-opus-max', flag, value,
+        ])
+
+    assert exc.value.code != 0
+    # argparse renders the type error on stderr, naming the flag and the value.
+    printed = capsys.readouterr().err
+    assert flag in printed
+    assert '>= 1' in printed
+
+
+def test_nonexistent_results_dir_is_diagnosed_as_a_path_problem(tmp_path):
+    """A typo'd --results-dir must not be reported as contamination.
+
+    ``Path.glob`` returns EMPTY for a nonexistent dir rather than raising, so
+    pre-fix the load fell through to the zero-survivors branch and answered
+    "this usually means the dir predates this campaign or belongs to another
+    one" — actively misleading for a plain typo. ``resolve_fixture_paths``
+    already applies the ``is_dir()`` rule to the other input path.
+    """
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+    missing = tmp_path / 'no' / 'such' / 'dir'
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([
+            '--results-dir', str(missing), '--tasks-dir', str(d),
+            '--candidate', 'architect-opus-max',
+        ])
+
+    assert exc.value.code != 0
+    message = str(exc.value)
+    assert str(missing) in message
+    assert 'not found' in message
+    # It is NOT the empty-pool diagnosis: those are different problems with
+    # different fixes, and conflating them sends the operator hunting for a
+    # contaminated directory that does not exist.
+    assert 'out of campaign' not in message
+
+
+def test_malformed_result_json_names_the_offending_file(tmp_path):
+    """One truncated cell among hundreds must name ITSELF, not raise a bare traceback.
+
+    This path is aimed by default at the shared packaged results dir (586 cells
+    in the main checkout, written by many campaigns over time), so a single
+    partial write there would otherwise take down the whole re-analysis with a
+    ``JSONDecodeError`` naming neither the file nor the dir.
+    """
+    results_dir = tmp_path / 'results'
+    results_dir.mkdir()
+    good = _in_campaign_cell('alpha')
+    (results_dir / 'alpha.json').write_text(json.dumps(good.to_dict()))
+    truncated = results_dir / 'truncated.json'
+    truncated.write_text('{"task_id": "alpha", "config_nam')
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([
+            '--results-dir', str(results_dir), '--tasks-dir', str(d),
+            '--candidate', 'architect-opus-max',
+        ])
+
+    assert exc.value.code != 0
+    assert str(truncated) in str(exc.value)
+
+
+def test_non_dict_result_json_names_the_offending_file(tmp_path):
+    """A JSON list/string payload is named too, not surfaced as a bare AttributeError."""
+    results_dir = tmp_path / 'results'
+    results_dir.mkdir()
+    stray = results_dir / 'a_list.json'
+    stray.write_text('[1, 2, 3]')
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([
+            '--results-dir', str(results_dir), '--tasks-dir', str(d),
+            '--candidate', 'architect-opus-max',
+        ])
+
+    assert exc.value.code != 0
+    assert str(stray) in str(exc.value)

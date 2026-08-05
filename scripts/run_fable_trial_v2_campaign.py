@@ -712,14 +712,57 @@ def _load_results_from_dir(results_dir: Path) -> list[Any]:
     Filters each loaded dict to the known dataclass fields, mirroring
     ``runner.load_results``, so a cell persisted before a field existed still
     loads instead of raising on an unexpected keyword.
+
+    TWO LOUD FAILURES, both because this path is aimed by default at the SHARED
+    packaged results dir holding cells written by many campaigns over time:
+
+    * A MISSING DIR exits naming it. ``Path.glob`` returns EMPTY for a
+      nonexistent dir rather than raising, so without this check a plain typo
+      falls through to :func:`_load_campaign_results`'s zero-survivors branch and
+      gets diagnosed as contamination ("the dir predates this campaign or belongs
+      to another one") when the real problem is the path. Mirrors
+      :func:`resolve_fixture_paths`, which already applies exactly this rule to
+      the other input path.
+    * A MALFORMED FILE exits NAMING THE FILE. One truncated or partial write
+      among hundreds of cells would otherwise take down the whole re-analysis
+      with a bare ``JSONDecodeError`` traceback naming neither the offending file
+      nor the dir — unactionable. Failing loudly rather than skipping is
+      deliberate: a silently skipped cell shifts every count in the report, and
+      this driver's whole thesis is that γ1's calibration is COMPUTED from a
+      pool whose membership is known exactly.
+
+    KNOWN DUPLICATION (deliberate, recorded rather than hidden): the load-and-
+    filter body is a near-verbatim sibling of ``scripts/run_judge_ofat_pilot.py``
+    ``_load_results_from_dir``, which does NOT carry the hardening above. The two
+    copies can now drift. Extracting a shared ``scripts/`` helper would mean
+    editing that sibling script, which is outside this task's locked module set,
+    so it is filed as a follow-up instead of done here.
     """
     from orchestrator.evals.runner import EvalResult
 
+    results_dir = Path(results_dir)
+    if not results_dir.is_dir():
+        raise SystemExit(
+            f'Error: results dir not found (or is not a directory): {results_dir}\n'
+            '  This is a path problem, not a contamination problem: Path.glob returns '
+            'empty for a nonexistent dir rather than raising, so without this check the '
+            'typo would be reported downstream as "no in-campaign cells found".'
+        )
     known = {f.name for f in EvalResult.__dataclass_fields__.values()}
     results = []
-    for path in sorted(Path(results_dir).glob('*.json')):
-        data = json.loads(path.read_text())
-        results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
+    for path in sorted(results_dir.glob('*.json')):
+        try:
+            data = json.loads(path.read_text())
+            results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
+        except (ValueError, OSError, TypeError, AttributeError) as e:
+            raise SystemExit(
+                f'Error: could not load persisted eval cell {path}: '
+                f'{type(e).__name__}: {e}\n'
+                '  Expected a JSON object shaped like EvalResult.to_dict(). A truncated '
+                'or partial write in the shared packaged results dir is the usual cause. '
+                'The file is named rather than skipped: dropping a cell silently would '
+                'shift every count in the report.'
+            ) from e
     return results
 
 
@@ -768,6 +811,36 @@ def _load_campaign_results(
     return kept, filtered
 
 
+def _positive_int(raw: str) -> int:
+    """An ``int >= 1`` argparse type, or a loud parse-time rejection.
+
+    Every degenerate value here is a SILENT no-op rather than an error, which is
+    why it is rejected at the flag instead of discovered in the artifact:
+
+    * ``--trials 0`` makes :func:`enumerate_cells` return ``[]``, so
+      ``run_ofat_stage`` builds zero thunks and ``_bounded_fanout``
+      short-circuits — a "campaign" that dispatched nothing, printed an empty
+      table and exited 0. A negative value behaves identically.
+    * ``--max-parallel 0`` constructs ``asyncio.Semaphore(0)`` and DEADLOCKS the
+      fan-out: no cell can ever acquire a slot.
+    * ``--timeout 0`` would cap every cell at zero minutes.
+
+    argparse renders the flag name alongside this message, so the failure names
+    both the flag and the offending value.
+    """
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f'{raw!r} is not an integer') from e
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f'must be >= 1, got {value} — a zero or negative value here is a silent '
+            'no-op (zero cells dispatched, or a zero-slot semaphore that deadlocks '
+            'the fan-out), not a smaller campaign'
+        )
+    return value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='run_fable_trial_v2_campaign',
@@ -814,11 +887,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help='plan_quality at or above which a validly-referenced planned fixture is '
              'banded ceiling and DISCARDED. No default, deliberately — see --stage1.',
     )
-    parser.add_argument('--trials', type=int, default=1, help='Trials per (fixture, candidate) cell.')
-    parser.add_argument('--max-parallel', type=int, default=None, help='Max concurrent eval cells.')
+    parser.add_argument('--trials', type=_positive_int, default=1,
+                        help='Trials per (fixture, candidate) cell (>= 1).')
+    parser.add_argument('--max-parallel', type=_positive_int, default=None,
+                        help='Max concurrent eval cells (>= 1).')
     parser.add_argument('--config', dest='config_path', type=Path, default=None,
                         help='Orchestrator config YAML for --run.')
-    parser.add_argument('--timeout', type=int, default=None,
+    parser.add_argument('--timeout', type=_positive_int, default=None,
                         help='Per-cell timeout override (minutes) for --run.')
     parser.add_argument('--out', type=Path, default=None,
                         help='Write the campaign report as JSON to this path.')
@@ -856,7 +931,31 @@ def _resolve_q_ceiling(args: argparse.Namespace) -> float | None:
     adjusted by Leo at γ2. A default baked in here would silently become the de
     facto threshold and pre-empt that ruling — and it decides which fixtures are
     DISCARDED, the one direction D6 calls permanently lossy.
+
+    THREE rejections, because every way of asking for a banding that cannot be
+    computed must fail at the flag rather than in the artifact:
+
+    1. ``--stage1`` with ``--dry-run``: a dry run measures nothing, so banding an
+       empty result set would emit a fully-populated all-zero ``bands`` block —
+       exactly the reading :func:`build_campaign_report` omits ``bands`` to
+       prevent ("we banded the pool and found nothing" is a different claim from
+       "banding was not requested"), reintroduced through the one mode where by
+       construction nothing was measured.
+    2. ``--stage1`` without ``--q-ceiling``: no guessed threshold (above).
+    3. ``--q-ceiling`` without ``--stage1``: the threshold would be SILENTLY
+       IGNORED — no bands computed, no warning, a bands-free report — leaving an
+       operator who typed the empirically-anchored number no way to know why. The
+       reverse direction is already loud, and the asymmetry is what makes the
+       silent one dangerous.
     """
+    if args.stage1 and args.dry_run:
+        raise SystemExit(
+            'Error: --stage1 cannot be combined with --dry-run.\n'
+            '  A dry run enumerates the cell matrix and spends nothing, so there are no '
+            'measured cells to band: every band would read 0 over an empty pool, and '
+            'marker_available would report False having inspected nothing. That is a '
+            'fabricated measurement, not a preview. Run --run or --results-dir to band.'
+        )
     if args.stage1 and args.q_ceiling is None:
         raise SystemExit(
             'Error: --stage1 requires --q-ceiling, which has no default.\n'
@@ -865,6 +964,13 @@ def _resolve_q_ceiling(args: argparse.Namespace) -> float | None:
             'provisional, and ratified or adjusted by Leo at γ2. It decides which '
             'fixtures are DISCARDED, and misbanding-to-discard loses signal '
             'permanently, so it is never guessed here.'
+        )
+    if args.q_ceiling is not None and not args.stage1:
+        raise SystemExit(
+            f'Error: --q-ceiling {args.q_ceiling} was given without --stage1.\n'
+            '  Nothing would be banded and the threshold would be silently ignored, '
+            'handing back a bands-free report with no indication why. Pass --stage1 to '
+            'compute the PRD-D6 partition, or drop --q-ceiling.'
         )
     return args.q_ceiling if args.stage1 else None
 
