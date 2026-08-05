@@ -32,6 +32,7 @@ from __future__ import annotations
 import functools
 import importlib.util
 import types
+from collections.abc import Container
 from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
@@ -2323,7 +2324,7 @@ class TestDropCollectionsNeverAbandonsTheRemainingNames:
     """
 
     @staticmethod
-    def _fake_qdrant(monkeypatch, *, fails_on=frozenset()):
+    def _fake_qdrant(monkeypatch, *, fails_on: Container[str] = frozenset()):
         import qdrant_client  # noqa: PLC0415
 
         state = {'attempted': [], 'closed': 0}
