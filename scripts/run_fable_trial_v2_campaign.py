@@ -207,6 +207,60 @@ _SUMMARY_FIELDS = (
     'mean_plan_quality',
 )
 
+# The per-cell reference-validity marker. Producer is eval-revival σ (task
+# 3628); see :func:`marker_available` for why its ABSENCE is a measurable fact
+# rather than a guess.
+MARKER_KEY = 'judged_without_reference'
+
+# What an unmeasured marker renders as. Deliberately a WORD, never ``0`` and
+# never the ``-`` report.py uses for an empty mean: this one has to survive
+# being skimmed.
+UNMEASURED = 'unmeasured'
+
+
+def marker_available(results: list[Any]) -> bool:
+    """True iff ANY cell carries :data:`MARKER_KEY` — i.e. the instrument emits it.
+
+    This test is EXACT, not heuristic. ``EvalMetrics.to_dict()`` is an
+    ``asdict``, so it emits every DECLARED field regardless of value — which
+    means a cell whose reference WAS valid still carries the key, set ``False``.
+    "Key absent on every cell" therefore has exactly one cause: the instrument
+    predates eval-revival σ (task 3628) and never measured the question at all.
+    """
+    return any(MARKER_KEY in (r.metrics or {}) for r in results)
+
+
+def count_judged_without_reference(results: list[Any]) -> dict[str, int | None]:
+    """Per candidate: how many architect cells were judged without a valid reference.
+
+    ``None`` for EVERY candidate when the marker is unavailable — never ``0``.
+    The distinction is the point: ``0`` asserts that we looked and found none,
+    which would let ``plan_quality`` read as fully validity-bounded when in fact
+    nothing bounded it. ``None`` says we never measured. This mirrors
+    ``report.py``'s own ``mean_plan_quality=None`` convention, where "we
+    measured nothing" is likewise kept distinct from "it scored nothing".
+
+    ARCHITECT CELLS ONLY, matching ``build_plan_quality_report``'s aggregate: an
+    implementer run never invokes the plan judge, so it cannot have been judged
+    without a reference, and counting one would inflate the very number that
+    bounds how far ``plan_quality`` may be trusted.
+
+    No edit is needed here when σ lands. The key simply starts appearing on each
+    cell and these ``None``s become real counts.
+    """
+    available = marker_available(results)
+    counts: dict[str, int | None] = {}
+    for result in results:
+        metrics = result.metrics or {}
+        if metrics.get('role_under_test') != 'architect':
+            continue
+        name = result.config_name
+        if not available:
+            counts[name] = None
+            continue
+        counts[name] = (counts.get(name) or 0) + (1 if metrics.get(MARKER_KEY) else 0)
+    return counts
+
 
 def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     """Per-candidate rows, SURFACED from the report layer — never recomputed here.
@@ -232,12 +286,68 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     from orchestrator.evals.report import build_plan_quality_report
 
     report = build_plan_quality_report(results)
-    rows = [
-        {field: entry[field] for field in _SUMMARY_FIELDS}
-        for entry in report['configs']
-    ]
+    marker_counts = count_judged_without_reference(results)
+    rows = []
+    for entry in report['configs']:
+        row = {field: entry[field] for field in _SUMMARY_FIELDS}
+        row[MARKER_KEY] = marker_counts.get(entry['config_name'])
+        rows.append(row)
     rows.sort(key=lambda r: r['config_name'])
     return rows
+
+
+def _fmt(value: Any) -> str:
+    """Render one summary value: ``unmeasured`` for ``None``, else the number.
+
+    ``None`` NEVER renders as ``0``. Both ``mean_plan_quality`` and
+    :data:`MARKER_KEY` use ``None`` for "not measured", and the whole reason
+    those fields are nullable is that a zero would be read as a measurement.
+    """
+    if value is None:
+        return UNMEASURED
+    if isinstance(value, float):
+        return f'{value:.4f}'
+    return str(value)
+
+
+def format_campaign_report(report: dict[str, Any]) -> str:
+    """Render the campaign report as deterministic text.
+
+    No timestamps and no dict-iteration-order dependence: the same report
+    formats byte-identically every time, so a committed γ1 artifact diffs
+    cleanly.
+    """
+    lines = ['per-candidate summary:']
+    header = (
+        f'{"candidate":<26} {"n":>4} {"total":>6} {"cap_excl":>9} {"no_plan":>8} '
+        f'{"plan_rate":>10} {"mean_pq":>10} {MARKER_KEY:>26}'
+    )
+    lines.append(header)
+    lines.append('-' * len(header))
+    unmeasured_marker = False
+    for row in report.get('candidates', []):
+        if row.get(MARKER_KEY) is None:
+            unmeasured_marker = True
+        lines.append(
+            f'{row["config_name"]:<26} {_fmt(row["n"]):>4} {_fmt(row["total"]):>6} '
+            f'{_fmt(row["cap_excluded"]):>9} {_fmt(row["no_plan"]):>8} '
+            f'{_fmt(row["plan_rate"]):>10} {_fmt(row["mean_plan_quality"]):>10} '
+            f'{_fmt(row.get(MARKER_KEY)):>26}'
+        )
+    if unmeasured_marker:
+        lines += [
+            '',
+            f'LEGEND — {MARKER_KEY} = {UNMEASURED}: this instrument does not emit the '
+            'marker,',
+            '  so NO bound was placed on how far plan_quality may be trusted. It is NOT '
+            'a count of',
+            '  zero. The producer is eval-revival σ (task 3628); once it lands the key '
+            'appears on',
+            '  every cell and these read as real counts. Until then, treat every '
+            'plan_quality here',
+            '  as unvalidated against a reference diff.',
+        ]
+    return '\n'.join(lines)
 
 
 def _run_campaign(*args: Any, **kwargs: Any) -> list[Any]:
