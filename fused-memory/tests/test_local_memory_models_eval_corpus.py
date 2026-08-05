@@ -18,10 +18,12 @@ server-side on the live path.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import importlib.util
 import random
+import re
 import sys
 import types
 from pathlib import Path
@@ -566,3 +568,241 @@ class TestSelectionIsNotConditionedOnOutcome:
     def test_anchor_is_never_dispositioned_as_ineligible(self):
         result = _mod.select(self._population_with_anchor(), 50, seed='s')
         assert ANCHOR_UUID not in result.not_selected
+
+
+# ===========================================================================
+# The reader seam — read-only tripwires and the outcome-blind projection
+# ===========================================================================
+
+
+class _ReadOnlyViolation(AssertionError):
+    """Raised by the double when the reader touches a write-capable path."""
+
+
+class _FalkorDouble:
+    """A FalkorDB graph handle stand-in that cannot be written through.
+
+    A real class, never MagicMock (enforced repo-wide by
+    fused-memory/scripts/check_bare_magicmock_config.py) — a MagicMock would
+    cheerfully absorb ``graph.query('CREATE …')`` and report success, which is
+    precisely the failure this double exists to make impossible.
+
+    It records every Cypher string it is handed so the projection can be
+    asserted on rather than guessed at, and raises from ``query()`` — the
+    write-capable command path — and from any ``execute_command`` verb other
+    than ``GRAPH.RO_QUERY``.
+    """
+
+    def __init__(self, rows: list[list[object]] | None = None):
+        self.rows = rows if rows is not None else []
+        self.ro_queries: list[str] = []
+        self.violations: list[str] = []
+
+    async def ro_query(self, cypher, *args, **kwargs):
+        self.ro_queries.append(cypher)
+        return types.SimpleNamespace(result_set=[list(row) for row in self.rows])
+
+    # -- tripwires: every write-capable path -------------------------------
+    async def query(self, cypher, *args, **kwargs):
+        self.violations.append(f'query:{cypher}')
+        raise _ReadOnlyViolation(f'reader used the write-capable query() path: {cypher!r}')
+
+    async def execute_command(self, verb, *args, **kwargs):
+        if verb != 'GRAPH.RO_QUERY':
+            self.violations.append(f'execute_command:{verb}')
+            raise _ReadOnlyViolation(f'reader issued a non-read-only command: {verb!r}')
+        self.ro_queries.append(str(args[-1]) if args else '')
+        return [[], [list(row) for row in self.rows], []]
+
+    async def delete(self, *args, **kwargs):
+        self.violations.append('delete')
+        raise _ReadOnlyViolation('reader called delete()')
+
+    async def create_node(self, *args, **kwargs):
+        self.violations.append('create_node')
+        raise _ReadOnlyViolation('reader called create_node()')
+
+    async def merge(self, *args, **kwargs):
+        self.violations.append('merge')
+        raise _ReadOnlyViolation('reader called merge()')
+
+    async def create_index(self, *args, **kwargs):
+        self.violations.append('create_index')
+        raise _ReadOnlyViolation('reader called create_index()')
+
+    async def build_indices_and_constraints(self, *args, **kwargs):
+        self.violations.append('build_indices_and_constraints')
+        raise _ReadOnlyViolation(
+            'reader triggered index construction — this is the evidence-destroying '
+            'hazard owned by docs/prds/falkordb-index-provisioning.md'
+        )
+
+
+def _row(uuid: str, month: str = '2026-05', kind: str = 'temporal_facts') -> list[object]:
+    """One result_set row, in PROJECTED_FIELDS order."""
+    return [
+        uuid,
+        f'ep-{uuid[:8]}',
+        'dark_factory',
+        f'add_memory:{kind}',
+        f'{month}-16T12:00:00+00:00',
+        f'content of {uuid}',
+    ]
+
+
+def _fetch(double) -> list:
+    """Drive the reader against *double* and return the population."""
+    return asyncio.run(_mod.EpisodeReader(graph=double).fetch_population())
+
+
+class TestReaderProjectionCarriesNoOutcomeSignal:
+    """Hazard leg 1: the query cannot see the incumbent's output at all."""
+
+    def test_cypher_never_mentions_entity_edges(self):
+        double = _FalkorDouble([_row('u1')])
+        _fetch(double)
+        assert double.ro_queries
+        for cypher in double.ro_queries:
+            assert 'entity_edges' not in cypher, cypher
+
+    @pytest.mark.parametrize(
+        'signal',
+        ['entity_edges', 'edges', 'extracted', 'valid_at', 'score', 'confidence'],
+    )
+    def test_cypher_mentions_no_incumbent_success_signal(self, signal):
+        double = _FalkorDouble([_row('u1')])
+        _fetch(double)
+        assert signal not in ' '.join(double.ro_queries)
+
+    def test_return_list_is_exactly_the_allowed_field_set(self):
+        """The projection is closed, not merely 'does not currently include'."""
+        double = _FalkorDouble([_row('u1')])
+        _fetch(double)
+        cypher = double.ro_queries[0]
+        returned = re.findall(r'e\.([A-Za-z_]+)', cypher)
+        assert tuple(returned) == _mod.PROJECTED_FIELDS
+
+    def test_query_has_no_where_clause(self):
+        """No filter of any kind — the population is the whole population.
+
+        A WHERE clause is where outcome conditioning would live, so its
+        absence is asserted directly rather than inferred from the field list.
+        """
+        double = _FalkorDouble([_row('u1')])
+        _fetch(double)
+        for cypher in double.ro_queries:
+            assert 'WHERE' not in cypher.upper(), cypher
+
+    def test_query_has_no_limit(self):
+        """The FULL population is needed or the stratum denominators are wrong.
+
+        A LIMIT would silently bias the census toward whatever order the store
+        returned, and every proportional share computed from it would be wrong.
+        """
+        double = _FalkorDouble([_row('u1')])
+        _fetch(double)
+        for cypher in double.ro_queries:
+            assert 'LIMIT' not in cypher.upper(), cypher
+
+
+class TestOutcomeFailedEpisodesStayEligible:
+    """Hazard leg 2: the anchor survives a full fetch."""
+
+    def test_anchor_is_fetched(self):
+        """The one episode of 2770 the incumbent extracted ZERO edges from."""
+        double = _FalkorDouble([_row('u1'), _row(ANCHOR_UUID), _row('u2')])
+        population = _fetch(double)
+        assert ANCHOR_UUID in [r.uuid for r in population]
+
+    def test_anchor_is_selectable_after_a_real_fetch(self):
+        rows = [_row(f'u{i:04d}') for i in range(40)]
+        rows.append(_row(ANCHOR_UUID, '2026-08', 'procedural_knowledge'))
+        population = _fetch(_FalkorDouble(rows))
+        result = _mod.select(population, 20, seed='s')
+        assert ANCHOR_UUID in [r.uuid for r in result.selected]
+
+    def test_fetched_records_carry_no_outcome_attribute(self):
+        population = _fetch(_FalkorDouble([_row(ANCHOR_UUID)]))
+        assert not hasattr(population[0], 'entity_edges')
+
+
+class TestReaderIsReadOnly:
+    """Hazard leg 3: the read-only guarantee, and the tripwires that prove it."""
+
+    def test_full_fetch_trips_no_write_path(self):
+        double = _FalkorDouble([_row(f'u{i}') for i in range(20)])
+        population = _fetch(double)
+        assert len(population) == 20
+        assert double.violations == []
+        assert double.ro_queries
+
+    def test_the_double_would_have_caught_a_write(self):
+        """The guarantee is only worth what the tripwires are worth.
+
+        A tripwire nobody proved fires is not a guarantee. Precedent:
+        test_memory_eval_retrieval_probe.py::test_the_double_would_have_caught_a_write.
+        """
+        double = _FalkorDouble()
+        for name in (
+            'query',
+            'delete',
+            'create_node',
+            'merge',
+            'create_index',
+            'build_indices_and_constraints',
+        ):
+            with pytest.raises(_ReadOnlyViolation):
+                asyncio.run(getattr(double, name)('CREATE (n:Junk)'))
+        assert len(double.violations) == 6
+
+    def test_the_double_would_have_caught_a_non_ro_command(self):
+        double = _FalkorDouble()
+        with pytest.raises(_ReadOnlyViolation):
+            asyncio.run(double.execute_command('GRAPH.QUERY', 'g', 'CREATE (n:Junk)'))
+        assert double.violations == ['execute_command:GRAPH.QUERY']
+
+    def test_reader_rejects_a_non_ro_command_client_side(self):
+        """A client-side guard on top of the server-side one.
+
+        GRAPH.RO_QUERY is refused server-side, but the guard makes the
+        violation a typed CorpusBuildError at the seam rather than a redis
+        error surfacing from three layers down.
+        """
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod.EpisodeReader.assert_read_only_command('GRAPH.QUERY')
+        assert 'GRAPH.RO_QUERY' in str(exc.value)
+        _mod.EpisodeReader.assert_read_only_command('GRAPH.RO_QUERY')
+
+
+class TestNoGraphitiDriverIsConstructed:
+    """The evidence-destroying hazard, tested rather than promised."""
+
+    def test_fetch_succeeds_with_falkor_driver_init_booby_trapped(self, monkeypatch):
+        """FalkorDriver.__init__ fire-and-forgets build_indices_and_constraints().
+
+        Constructing one would create indices on dark_factory and destroy the
+        no-index evidence owned by docs/prds/falkordb-index-provisioning.md. So
+        the test makes construction fatal and asserts the fetch still succeeds.
+        """
+        from graphiti_core.driver import falkordb_driver  # noqa: PLC0415
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(
+                'build_corpus constructed a graphiti FalkorDriver — this fires '
+                'build_indices_and_constraints() and destroys the no-index evidence'
+            )
+
+        monkeypatch.setattr(falkordb_driver.FalkorDriver, '__init__', _boom)
+        population = _fetch(_FalkorDouble([_row('u1'), _row('u2')]))
+        assert len(population) == 2
+
+    def test_builder_source_never_names_the_graphiti_driver_as_an_import(self):
+        """A source-level guard: the import cannot creep back in unnoticed."""
+        source = SCRIPT_PATH.read_text(encoding='utf-8')
+        imports = [
+            line
+            for line in source.splitlines()
+            if line.strip().startswith(('import ', 'from '))
+        ]
+        assert not [ln for ln in imports if 'falkordb_driver' in ln or 'FalkorDriver' in ln]
+        assert not [ln for ln in imports if 'graphiti_core' in ln]
