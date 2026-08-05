@@ -1185,7 +1185,18 @@ async def _run_rp4_wrapper(
         stderr=asyncio.subprocess.STDOUT,
     )
     out, _ = await proc.communicate()
-    return proc.returncode, out.decode(errors='replace')
+    output = out.decode(errors='replace')
+    # `communicate()` has reaped the child, so returncode is always set — but it
+    # is typed `int | None`, so narrow it explicitly.  NOT `proc.returncode or
+    # 0`: that would silently report an unexited child as a clean exit 0, which
+    # is the exact value the success-path caller asserts on.  Same idiom as
+    # shared/tests/test_proc_group.py:524 and the sibling helper in
+    # test_deterministic_runner.py::_run_wrapper_payload.
+    rc = proc.returncode
+    assert rc is not None, (
+        f'communicate() returned but the child has no exit status; output: {output!r}'
+    )
+    return rc, output
 
 
 @pytest.mark.asyncio
