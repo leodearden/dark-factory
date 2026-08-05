@@ -1384,3 +1384,181 @@ def test_non_dict_result_json_names_the_offending_file(tmp_path):
 
     assert exc.value.code != 0
     assert str(stray) in str(exc.value)
+
+
+# ===== amendments: the enumerated matrix is COMPARED against what returned =====
+#
+# `cell_matrix` was shipped with the stated justification that "a cell that never
+# returned is visible as a gap rather than silently absent" — but nothing
+# performed the comparison. `run_ofat_stage` delegates to `_bounded_fanout`,
+# which logs a non-cancel cell failure and CONTINUES, so the failed cell is
+# simply absent from the returned list; `build_plan_quality_report` then derives
+# `configs` only from cells that returned.
+
+
+def test_missing_cells_are_detected_and_named(tmp_path, campaign_seam, monkeypatch):
+    """A short return surfaces as a first-class gap, not as a quietly low ``n``."""
+    from orchestrator.evals import runner as eval_runner
+
+    async def _drops_one(task_paths, candidates, base_config=None, **kwargs):
+        cells = [
+            _cell(path.stem, cfg.name, plan_quality=0.75, plan_steps=5)
+            for path in task_paths for cfg in candidates
+        ]
+        return cells[:-1]  # the last cell "failed" and was logged-and-skipped
+
+    monkeypatch.setattr(eval_runner, 'run_ofat_stage', _drops_one)
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+    out = tmp_path / 'r.json'
+
+    rc = mod.main([
+        '--run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max', '--out', str(out),
+    ])
+
+    # A partial shortfall weakens the comparison but does not destroy it, so it
+    # is loud rather than fatal.
+    assert rc == 0
+    missing = json.loads(out.read_text())['missing_cells']
+    assert missing['count'] == 1
+    assert missing['expected'] == 2
+    assert missing['cells'] == [
+        {'task_id': 'beta', 'config_name': 'architect-opus-max', 'trial': 1},
+    ]
+    assert missing['candidates_absent'] == []
+
+
+def test_missing_cells_are_rendered_loudly(tmp_path, campaign_seam, monkeypatch, capsys):
+    """The shortfall is printed, naming each absent (fixture, candidate, trial)."""
+    from orchestrator.evals import runner as eval_runner
+
+    async def _drops_one(task_paths, candidates, base_config=None, **kwargs):
+        return [_cell('alpha', 'architect-opus-max', plan_quality=0.75, plan_steps=5)]
+
+    monkeypatch.setattr(eval_runner, 'run_ofat_stage', _drops_one)
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+
+    mod.main(['--run', '--tasks-dir', str(d), '--candidate', 'architect-opus-max'])
+
+    printed = capsys.readouterr().out
+    assert 'MISSING CELLS' in printed
+    assert '1 of 2' in printed
+    assert 'beta' in printed
+
+
+def test_an_entirely_absent_candidate_arm_exits_non_zero(
+    tmp_path, campaign_seam, monkeypatch, capsys,
+):
+    """THE gap that most invalidates the screen: a vanished comparison arm.
+
+    Pre-fix, an auth error or model-not-found on one arm produced no row for it
+    at all — ``report['candidates']`` silently held one arm,
+    ``format_campaign_report`` printed a one-row table, and ``main`` returned 0.
+    A one-arm "comparison" is not a weaker result; it is no result.
+    """
+    from orchestrator.evals import runner as eval_runner
+
+    async def _one_arm_only(task_paths, candidates, base_config=None, **kwargs):
+        return [
+            _cell(path.stem, 'architect-opus-max', plan_quality=0.75, plan_steps=5)
+            for path in task_paths
+        ]
+
+    monkeypatch.setattr(eval_runner, 'run_ofat_stage', _one_arm_only)
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+    out = tmp_path / 'r.json'
+
+    rc = mod.main([
+        '--run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max',
+        '--candidate', 'architect-fable-high',
+        '--out', str(out),
+    ])
+
+    assert rc != 0
+    captured = capsys.readouterr()
+    assert 'ENTIRE CANDIDATE ARM ABSENT' in captured.out
+    assert 'architect-fable-high' in captured.err
+    # The artifact still lands: the diagnosis is the most valuable thing this
+    # run produced and must survive the failure signal rather than be replaced
+    # by it.
+    loaded = json.loads(out.read_text())
+    assert loaded['missing_cells']['candidates_absent'] == ['architect-fable-high']
+    assert [c['config_name'] for c in loaded['candidates']] == ['architect-opus-max']
+
+
+def test_missing_cells_absent_from_a_dry_run_artifact(tmp_path):
+    """A dry run dispatched nothing, so "every cell is missing" is not a finding.
+
+    Same rule as ``bands``: reporting an all-missing block for a mode that by
+    construction measured nothing would be as misleading as suppressing a real
+    shortfall.
+    """
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+    out = tmp_path / 'r.json'
+
+    mod.main([
+        '--dry-run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max', '--out', str(out),
+    ])
+
+    assert 'missing_cells' not in json.loads(out.read_text())
+
+
+def test_complete_run_reports_no_missing_cells(tmp_path, campaign_seam):
+    """The happy path records an explicit zero — "we compared and found no gaps"."""
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+    out = tmp_path / 'r.json'
+
+    rc = mod.main([
+        '--run', '--tasks-dir', str(d), '--candidate', 'architect-opus-max',
+        '--trials', '2', '--out', str(out),
+    ])
+
+    assert rc == 0
+    missing = json.loads(out.read_text())['missing_cells']
+    assert missing == {
+        'count': 0, 'expected': 4, 'cells': [], 'candidates_absent': [],
+    }
+
+
+def test_results_dir_shortfall_is_detected(tmp_path):
+    """The re-analysis path is diffed against the matrix too, not just ``--run``.
+
+    A dir holding only some of the campaign's cells re-analyzes to a report that
+    LOOKS complete; the matrix diff is what says otherwise.
+    """
+    results_dir = tmp_path / 'results'
+    results_dir.mkdir()
+    cell = _in_campaign_cell('alpha')
+    (results_dir / 'alpha.json').write_text(json.dumps(cell.to_dict()))
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+    out = tmp_path / 'r.json'
+
+    rc = mod.main([
+        '--results-dir', str(results_dir), '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max', '--out', str(out),
+    ])
+
+    assert rc == 0
+    missing = json.loads(out.read_text())['missing_cells']
+    assert missing['count'] == 1
+    assert missing['cells'][0]['task_id'] == 'beta'
+
+
+def test_find_missing_cells_is_pure_and_matches_on_trial(tmp_path):
+    """The diff key is (task_id, config_name, trial) — a missing trial is a gap."""
+    matrix = mod.enumerate_cells(
+        [Path('alpha.json')], ['architect-opus-max'], 2,
+    )
+    results = [_cell('alpha', 'architect-opus-max', trial=1, plan_steps=5)]
+    candidates = mod.resolve_candidates(['architect-opus-max'])
+
+    missing = mod.find_missing_cells(results, matrix, candidates)
+
+    assert missing['count'] == 1
+    assert missing['cells'] == [
+        {'task_id': 'alpha', 'config_name': 'architect-opus-max', 'trial': 2},
+    ]
+    # Trial 1 DID return, so the arm is present — the shortfall is partial.
+    assert missing['candidates_absent'] == []

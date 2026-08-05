@@ -363,11 +363,54 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
 _CELL_FIELDS = ('plan_quality', 'plan_steps', 'cost_usd', 'judge_cost_usd', 'cap_tainted')
 
 
+def find_missing_cells(
+    results: list[Any], cell_matrix: list[dict[str, Any]], candidates: list[Any],
+) -> dict[str, Any]:
+    """Diff the ENUMERATED matrix against the cells that actually came back.
+
+    WHY THE MATRIX IS NOT ENOUGH ON ITS OWN. ``cell_matrix`` is carried in the
+    report so a cell that never returned "is visible as a gap rather than
+    silently absent" — but visibility requires something to actually perform the
+    comparison, and nothing did. ``run_ofat_stage`` delegates to
+    ``_bounded_fanout``, which LOGS a non-cancel cell failure and CONTINUES: the
+    failed cell is simply absent from the returned list.
+    ``build_plan_quality_report`` then derives its ``configs`` from the cells
+    that returned, so a candidate whose every cell failed (an auth error or a
+    model-not-found on one arm, say) produces NO ROW AT ALL. The report shows one
+    arm, the table prints one row, and ``main`` returns 0 — a vanished comparison
+    arm being the single gap that most invalidates a screen whose entire thesis
+    is that γ1's calibration is COMPUTED rather than hand-derived. Partial
+    failures are equally invisible: ``n``/``total`` just read low, with nothing
+    saying how low they should have been.
+
+    ``candidates_absent`` is called out separately from the cell list because it
+    is a categorically worse failure: a partial shortfall weakens a comparison,
+    an absent arm means there is NO comparison, and :func:`main` exits non-zero
+    on it after writing the artifact so the gap is both signalled and recorded.
+    """
+    returned = {(r.task_id, r.config_name, r.trial) for r in results}
+    missing = [
+        cell for cell in cell_matrix
+        if (cell['task_id'], cell['config_name'], cell['trial']) not in returned
+    ]
+    missing.sort(key=lambda c: (c['task_id'], c['config_name'], c['trial']))
+    present_configs = {r.config_name for r in results}
+    return {
+        'count': len(missing),
+        'expected': len(cell_matrix),
+        'cells': missing,
+        'candidates_absent': sorted(
+            c.name for c in candidates if c.name not in present_configs
+        ),
+    }
+
+
 def build_campaign_report(
     results: list[Any],
     candidates: list[Any],
     cell_matrix: list[dict[str, Any]],
     q_ceiling: float | None = None,
+    expect_cells: bool = False,
 ) -> dict[str, Any]:
     """Assemble the campaign report: candidates, raw cells, matrix, optional bands.
 
@@ -377,7 +420,11 @@ def build_campaign_report(
 
     ``bands`` is OMITTED, not emptied, when *q_ceiling* is None: an empty band
     dict would read as "we banded the pool and found nothing", which is a
-    different claim from "banding was not requested".
+    different claim from "banding was not requested". ``missing_cells`` follows
+    the SAME rule under *expect_cells*: on a dry run nothing was dispatched, so
+    "every enumerated cell is missing" is not a finding, and reporting it would
+    be as misleading as suppressing a real one. Callers that actually ran (or
+    re-analyzed) cells pass ``expect_cells=True``.
 
     EVERY ROW MUST TRACE TO A RESOLVED ``EvalConfig``. A cell naming a config
     that is not among *candidates* RAISES rather than emitting a row with null
@@ -426,6 +473,8 @@ def build_campaign_report(
         'cells': cells,
         'cell_matrix': cell_matrix,
     }
+    if expect_cells:
+        report['missing_cells'] = find_missing_cells(results, cell_matrix, candidates)
     if q_ceiling is not None:
         report['bands'] = partition_bands(results, q_ceiling)
     return report
@@ -476,6 +525,36 @@ def format_campaign_report(report: dict[str, Any]) -> str:
             f'{_fmt(row["plan_rate"]):>10} {_fmt(row["mean_plan_quality"]):>10} '
             f'{marker:>26}'
         )
+    missing = report.get('missing_cells')
+    if missing and missing['count']:
+        # Every missing cell is listed, never truncated to a top-N: a silent cap
+        # would let a partial listing read as the complete gap.
+        lines += [
+            '',
+            f'MISSING CELLS: {missing["count"]} of {missing["expected"]} enumerated '
+            'cells never returned.',
+            '  A cell that fails is LOGGED AND SKIPPED by the runner\'s fan-out, so it '
+            'is absent from',
+            '  the results rather than reported — which makes n/total read low with no '
+            'indication of',
+            '  how low they should have been. Each gap below is (fixture, candidate, '
+            'trial):',
+        ]
+        lines += [
+            f'    {cell["task_id"]} / {cell["config_name"]} / trial {cell["trial"]}'
+            for cell in missing['cells']
+        ]
+        if missing['candidates_absent']:
+            absent = ', '.join(missing['candidates_absent'])
+            lines += [
+                f'  *** ENTIRE CANDIDATE ARM ABSENT: {absent} ***',
+                '  Not one cell returned for the arm(s) above, so they carry NO row in '
+                'the table and',
+                '  this campaign has no comparison to make. This is what an auth error '
+                'or a',
+                '  model-not-found on a single arm looks like. Exiting non-zero.',
+            ]
+
     bands = report.get('bands')
     if bands:
         lines += ['', f'PRD-D6 banding (q_ceiling={bands["q_ceiling"]}):']
@@ -1022,12 +1101,30 @@ def main(argv: list[str] | None = None) -> int:
             args.results_dir, candidates, fixture_paths,
         )
 
-    report = build_campaign_report(results, candidates, cell_matrix, q_ceiling=q_ceiling)
+    report = build_campaign_report(
+        results, candidates, cell_matrix,
+        q_ceiling=q_ceiling, expect_cells=not args.dry_run,
+    )
     if filtered is not None:
         report['filtered'] = filtered
     if not args.dry_run:
         print(format_campaign_report(report))
     _write_report(report, args.out)
+
+    # A vanished comparison arm exits NON-ZERO, but only AFTER the report is
+    # printed and the artifact written: the diagnosis is the most valuable thing
+    # this run produced, so it must survive the failure signal rather than be
+    # replaced by it. A partial shortfall stays exit 0 with a loud banner — it
+    # weakens the comparison; an absent arm means there is no comparison.
+    absent = (report.get('missing_cells') or {}).get('candidates_absent')
+    if absent:
+        print(
+            f'ERROR: no cells returned for candidate(s): {", ".join(absent)}. The '
+            'campaign produced no comparison; see MISSING CELLS above and the '
+            "report's missing_cells block.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
