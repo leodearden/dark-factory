@@ -89,6 +89,19 @@ are split by CLASS, because one rule cannot fit all of them:
   accidental drift it exists to catch with it.  Allowlisting is scoped to a
   variable NAME, not to Environment= as a whole, so blessing the nine-root
   value does not also bless the variable disappearing.
+- **Environment= vs a directive, WITHIN one copy** — the value half of a split
+  contract, for a variable whose value embeds a host path and is therefore
+  allowlisted out of the cross-copy value comparison above.
+  ``DASHBOARD_PROJECT_ROOT`` is the case: it is the dashboard's data root
+  (``config.py``'s ``project_root`` falls back to ``Path.cwd()`` when it is
+  unset), so leaving it unchecked would let ``=/tmp/wrong`` report parity, but
+  value-comparing it across copies would report drift on every correctly
+  configured host that is not this one — the committed unit hardcodes
+  ``/home/leo/src/dark-factory`` while ``setup-host.sh`` renders the installed
+  copy with that host's real ``$REPO_ROOT``.  It is compared instead against
+  the SAME copy's ``WorkingDirectory=``, a relation that is host-invariant by
+  construction.  Presence remains checked across copies by the Environment=
+  name-set branch, so the two halves together leave no gap.
 - **Override mechanisms** — a directive comparison only means anything if the
   installed unit FILE is what actually takes effect, and systemd offers two
   standard ways for it not to be.  A drop-in (``<unit>.d/*.conf``, what
@@ -364,6 +377,33 @@ class UnitSpec:
     # committed unit ever legitimately gains an EnvironmentFile, the installed
     # copy gains it too and the pair simply agrees.
     override_directives: tuple[tuple[str, str], ...] = ()
+    # (Environment variable NAME, directive KEY) pairs whose values must agree
+    # WITHIN each copy — repo against repo, installed against installed — never
+    # across the two.
+    #
+    # This is the same manoeuvre exec_start_flags uses: reach the meaningful
+    # content inside something that cannot be compared by string equality. The
+    # motivating case is DASHBOARD_PROJECT_ROOT vs WorkingDirectory. That
+    # variable's value embeds the repo root, so it belongs on
+    # DIVERGENCE_ALLOWLIST for the same reason WorkingDirectory itself sits on
+    # present_only: the committed unit hardcodes /home/leo/src/dark-factory
+    # while setup-host.sh renders the installed copy with that host's real
+    # $REPO_ROOT, so a cross-copy value compare fires on every correctly
+    # configured host that is not this one.
+    #
+    # But allowlisting ALONE would check nothing, and this value is the
+    # dashboard's entire data root (config.py's project_root falls back to
+    # Path.cwd() when it is unset), so DASHBOARD_PROJECT_ROOT=/tmp/wrong must
+    # not read as parity. The contract is therefore SPLIT: PRESENCE is checked
+    # across copies by the Environment= name-set comparison (a dropped variable
+    # is drift regardless of the allowlist), and VALUE is checked here, against
+    # a directive in the SAME file. That relation is host-invariant by
+    # construction, so it has teeth on every host without ever firing on one
+    # that is merely configured elsewhere.
+    #
+    # Reads the variable through environment_section, so a pair registered here
+    # needs that field set too.
+    env_matches_directive: tuple[tuple[str, str], ...] = ()
 
 
 def _render(values: list[str] | None) -> str:
@@ -544,6 +584,74 @@ def _compare_environment(
     return drifts
 
 
+def _compare_env_matches_directive(
+    spec: UnitSpec,
+    repo: dict[str, dict[str, list[str]]],
+    installed: dict[str, dict[str, list[str]]],
+) -> list[Drift]:
+    """Check each ``spec.env_matches_directive`` pair WITHIN each copy.
+
+    The value half of a split contract — see UnitSpec.env_matches_directive for
+    why it is intra-copy rather than a cross-copy value comparison.  Each side
+    is examined on its own: the repo copy's variable against the repo copy's
+    directive, the installed copy's against the installed copy's.
+
+    A side that does not declare the variable at all is SKIPPED, not reported.
+    _compare_environment's name-set branch already reports that case, with a
+    reason worded for exactly it; firing here as well would print two
+    differently-keyed lines for one defect and send the operator looking for two
+    problems.  Absence gets one unambiguous line, and this branch speaks only to
+    the value — and only when there is a value to relate.
+
+    A side that declares the variable but not the DIRECTIVE is reported: the
+    relation cannot be established there, and silence would read as agreement.
+
+    Drifts are keyed ``Environment=<VAR> vs <KEY>`` so the report names both
+    halves; keying it to the variable alone would leave the reader to work out
+    what it was supposed to agree with, and would collide with the name-set
+    branch's own key for the same variable.
+    """
+    drifts: list[Drift] = []
+    section = spec.environment_section
+
+    for var, key in spec.env_matches_directive:
+        observed: dict[str, str] = {}
+        offending: list[str] = []
+
+        for side_name, side in (("repo", repo), ("installed", installed)):
+            env = _environment_map(side, section) if section is not None else {}
+            directive = _render(side.get(section or "", {}).get(key))
+            if var not in env:
+                # Reported by the name-set branch; see the docstring.
+                observed[side_name] = _ABSENT
+                continue
+            observed[side_name] = f"{var}={env[var]} / {key}={directive}"
+            if directive != env[var]:
+                offending.append(side_name)
+
+        if not offending:
+            continue
+
+        sides = " and ".join(offending)
+        drifts.append(
+            Drift(
+                unit=spec.name,
+                section=section or "",
+                key=f"Environment={var} vs {key}",
+                repo_value=observed["repo"],
+                installed_value=observed["installed"],
+                reason=(
+                    f"{var} does not match {key} within the {sides} copy — the "
+                    "two must agree in each copy independently (their shared "
+                    "value legitimately differs per host, so only this "
+                    "intra-copy relation is checkable across hosts)"
+                ),
+            )
+        )
+
+    return drifts
+
+
 def compare_unit(
     spec: UnitSpec,
     repo_text: str,
@@ -563,6 +671,11 @@ def compare_unit(
     ``spec.present_only`` keys are checked for PRESENCE only: a drift is
     emitted when one copy declares the directive and the other does not, never
     on a value difference.  See UnitSpec.present_only for why.
+
+    ``spec.env_matches_directive`` is the one branch that is NOT a cross-copy
+    comparison: it relates an Environment= variable to a directive inside the
+    SAME copy, which is how a value whose host-specific spelling forbids a
+    cross-copy compare still gets checked.  See UnitSpec.env_matches_directive.
     """
     repo = parse_unit_directives(repo_text)
     installed = parse_unit_directives(installed_text)
@@ -635,6 +748,7 @@ def compare_unit(
 
     drifts.extend(_compare_exec_start_flags(spec, repo, installed))
     drifts.extend(_compare_environment(spec, repo, installed))
+    drifts.extend(_compare_env_matches_directive(spec, repo, installed))
 
     return drifts
 
