@@ -307,8 +307,7 @@ class TestBeforeInvoke:
         # Bind to a name (and await it below): a task with no strong
         # reference can be garbage-collected mid-execution (see the asyncio
         # docs on create_task), and awaiting it in `finally` reaps it
-        # deterministically instead of leaking a pending task into the loop
-        # if the assertions below fail first.
+        # deterministically so it can't outlive the test.
         uncap_task = asyncio.create_task(uncap_after_delay())
         try:
             # The background task's 0.05s uncap delay can be pushed well past
@@ -317,18 +316,20 @@ class TestBeforeInvoke:
             # signal, just scheduling latency. Use a generous, load-tolerant
             # budget so the assertion is effectively on the rotation OUTCOME
             # (token-b) rather than wall-clock timing; it still raises
-            # TimeoutError (failing the test) if the timer-reset rotation
-            # never fires at all. 5s is ~100x the 0.05s delay — load-tolerant
-            # while staying well clear of the 60s global pytest-timeout
-            # (orchestrator/pyproject.toml): that timeout's thread method
-            # os._exit()s the xdist worker on expiry rather than failing this
-            # test cleanly, so a ceiling closer to it would trade one flake
-            # class for a worse one. Matches the 5.0s precedent set for the
-            # same starved-loop rationale in
+            # TimeoutError (failing the test) if the background task's
+            # capped = False + _open.set() never runs. 5s is ~100x the 0.05s
+            # delay — load-tolerant while staying well clear of the 60s
+            # global pytest-timeout (orchestrator/pyproject.toml): that
+            # timeout's thread method os._exit()s the xdist worker on expiry
+            # rather than failing this test cleanly, so a ceiling closer to
+            # it would trade one flake class for a worse one. Matches the
+            # 5.0s precedent set for the same starved-loop rationale in
             # fused-memory/tests/test_event_queue.py's _wait_for.
             token = await asyncio.wait_for(gate.before_invoke(), timeout=5)
         finally:
-            await uncap_task
+            # return_exceptions=True: don't let driver cleanup mask a
+            # genuine TimeoutError/assertion failure raised above.
+            await asyncio.gather(uncap_task, return_exceptions=True)
 
         assert token is not None
         assert token.token == 'token-b'
