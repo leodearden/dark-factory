@@ -391,6 +391,40 @@ _HEADROOM_PROBE_PROMPT = "ping"
 call. Its content doesn't matter; only whether the reply carries a banner
 marker or raises."""
 
+_VERIFY_PROBE_EVERY = 5
+"""How many clusters the default verifier adjudicates between backstop
+headroom probes (``_build_default_verify_fn``'s third, weakest detector).
+
+The trade-off this number sets: one extra trickle-tier probe per N
+clusters, against up to N-1 clusters of misattributed verdicts in the one
+residual case the cheaper detectors cannot see (a cap presenting as a
+clean-but-wrong verdict). Verification is one agentic Sonnet call per
+cluster, so a probe per cluster would be cheap but not free, and pointless
+-- the two first-cluster-accurate detectors already cover the cases where
+a cap announces itself."""
+
+
+class CensusHeadroomExhausted(Exception):
+    """Raised when a headroom limit is detected DURING a census stage.
+
+    Not an error in the census -- an external condition that makes the
+    stage's output untrustworthy. It exists so an infra failure can never
+    be laundered into a verdict: ``run_census`` catches it and defers
+    before any persistence, instead of the cap-poisoned clusters landing
+    in the codebook as ordinary rejections.
+
+    Carries the counts an operator needs to size what was interrupted:
+    *verified* clusters adjudicated before the hit, *unverified* ones left
+    (the hitting cluster plus every one never attempted).
+    """
+
+    def __init__(self, *, stage: str, reason: str, verified: int = 0, unverified: int = 0):
+        super().__init__(f"census headroom exhausted during {stage}: {reason}")
+        self.stage = stage
+        self.reason = reason
+        self.verified = verified
+        self.unverified = unverified
+
 
 @dataclass
 class HeadroomResult:
@@ -1840,7 +1874,13 @@ def _synthesis_prompt(verified: list) -> str:
     )
 
 
-def _build_default_verify_fn(project_root: str, invoke):
+def _build_default_verify_fn(
+    project_root: str,
+    invoke,
+    *,
+    headroom_probe=None,
+    probe_every: int = _VERIFY_PROBE_EVERY,
+):
     """Build the real ``verify_fn(clusters, *, model)`` seam: one Sonnet
     call per cluster via *invoke* (default ``coder._invoke_cli`` --
     headless ``claude -p --model``), parsed via ``coder.parse_coder_output``.
@@ -1864,15 +1904,74 @@ def _build_default_verify_fn(project_root: str, invoke):
     unparseable verdicts all still land here as ordinary rejections. So
     ``run_census`` additionally DETECTS the signature -- clusters offered,
     none verified -- and says so loudly rather than quietly reporting an
-    empty census."""
+    empty census.
+
+    **The cap case is carved out of the fail-closed default.** A usage cap
+    is an infra failure, not a verdict about a claim, and must never be
+    laundered into one -- that is the same silent-mass-rejection class the
+    2026-08-03 incident above describes, arriving by a different route and
+    invisible to the all-rejected detector whenever a cap lands partway
+    through (some clusters verified, so the total-wipeout signature never
+    fires). When *headroom_probe* is supplied, two detectors fire at the
+    FIRST corrupted cluster:
+
+    (a) the raw reply itself carries a blocking banner -- checked BEFORE
+        ``parse_coder_output``, because the CLI printing its cap banner to
+        stdout would otherwise read as an ordinary parse failure and thus a
+        rejection. Costs nothing: the reply is already paid for.
+    (b) a per-cluster invocation exception triggers ONE re-probe. No
+        headroom means ``CensusHeadroomExhausted``, and the hitting cluster
+        is NOT recorded as rejected. Headroom still available means the
+        claim really was unverifiable, and it rejects exactly as before --
+        the fail-closed default is narrowed to non-cap causes, not removed.
+
+    Both are no-ops without a *headroom_probe*, so every existing call site
+    keeps its current behaviour exactly.
+    """
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
-        for cluster in clusters:
+        for index, cluster in enumerate(clusters):
+            # The hitting cluster plus everything never attempted. Computed
+            # identically at every raise site so the counts cannot disagree
+            # about what "unverified" means.
+            remaining = len(clusters) - index
             prompt = _verify_prompt(cluster, project_root=project_root)
             try:
                 raw = invoke(prompt, model)
-                verdict = coder.parse_coder_output(raw)
             except Exception as exc:  # noqa: BLE001 - an unverifiable claim rejects, never crashes
+                # (b) One re-probe, only on a path that has already failed.
+                if headroom_probe is not None:
+                    probe = headroom_probe()
+                    if not probe.ok:
+                        raise CensusHeadroomExhausted(
+                            stage="verify",
+                            reason=(
+                                "verify invocation failed and the headroom re-probe "
+                                f"reports no capacity: {probe.reason or 'no headroom'}"
+                            ),
+                            verified=len(verified),
+                            unverified=remaining,
+                        ) from exc
+                logger.warning(
+                    "census: verify failed for cluster %r: %s", cluster.get("title"), exc,
+                )
+                rejected.append(cluster)
+                continue
+
+            # (a) The free detector: scan the reply we already paid for,
+            # before trying to parse it as a verdict.
+            marker = looks_like_blocking_banner(raw or "")
+            if marker is not None:
+                raise CensusHeadroomExhausted(
+                    stage="verify",
+                    reason=f"verify reply carries a banner marker: {marker!r}",
+                    verified=len(verified),
+                    unverified=remaining,
+                )
+
+            try:
+                verdict = coder.parse_coder_output(raw)
+            except Exception as exc:  # noqa: BLE001 - an unparseable verdict rejects, never crashes
                 logger.warning(
                     "census: verify failed for cluster %r: %s", cluster.get("title"), exc,
                 )
