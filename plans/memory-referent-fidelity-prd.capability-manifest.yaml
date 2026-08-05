@@ -1,291 +1,353 @@
-# Machine-readable twin of memory-referent-fidelity-prd.capability-manifest.md
-# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc, schema_version 1).
-# task_id values are null at authoring; commit_planning stamps them and copies the
-# mechanical (grep/script) delivered_checks into each producer's metadata.delivered_checks.
-# manual checks stay sidecar-only and are excluded from the dispatch gate.
 prd: plans/memory-referent-fidelity-prd.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "Cherry-pick cross_project_refs + ensure_entity_node onto main"
-    capabilities:
-      - name: "cross-project-refs-module-on-main"
-        binding: "capability→producer — producer:α; four task/3335 commits re-verified zero-conflict against main tip 57ef5b4ead (829 insertions, 4 files, all parsing)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def find_cross_project_task_refs"
-          paths: ["fused-memory/src/fused_memory/utils/cross_project_refs.py"]
-          expect: present
-      - name: "ensure-entity-node-mint-primitive"
-        binding: "capability→producer — producer:α; delegates to _resolve_or_create_entity (graphiti_client.py:2251, on main), mints only on its None branch"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "async def ensure_entity_node"
-          paths: ["fused-memory/src/fused_memory/backends/graphiti_client.py"]
-          expect: present
-      - name: "no-dependency-on-unlanded-3335"
-        binding: "DAG-direction — takes only the two dependency-free primitives; _split_cross_project_task_nodes stays with 3335; no dep edge on task 3335 filed"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "_split_cross_project_task_nodes"
-          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
-          expect: absent
-
-  - label: "β"
-    task_id: null
-    title: "Extract one canonical-label vocabulary; refactor task_naming + cross_project_refs onto it"
-    capabilities:
-      - name: "canonical-labels-single-site"
-        binding: "capability→producer — producer:β; the single normative site per INV-5 / resolved decision 5"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def scan_content"
-          paths: ["fused-memory/src/fused_memory/utils/canonical_labels.py"]
-          expect: present
-      - name: "task-hash-1153-parses"
-        binding: "G6 branch 3 — today's anchored ^\\s*tasks?\\s+(\\d+)\\s*$ (task_naming.py:26) is structurally unable to match 'task #1153'; β delivers it"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "parse coverage of the 53 measured variant splits is a fixture property, not a grep"
-      - name: "no-second-copy-of-the-pattern"
-        binding: "INV-5 no-lockstep-duplication — task_naming must call canonical_labels, not keep its own compiled pattern"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "_TASK_NODE_NAME_PATTERN[[:space:]]*="
-          paths: ["fused-memory/src/fused_memory/utils/task_naming.py"]
-          expect: absent
-
-  - label: "γ"
-    task_id: null
-    title: "Deterministic referent scanner + resolve_referents precedence"
-    capabilities:
-      - name: "resolve-referents-precedence"
-        binding: "capability→producer — producer:γ; declared > metadata-bridged > derived, with .source/.conflicts/.ambiguous"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def resolve_referents"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-      - name: "scan-content-precision"
-        binding: "capability→producer — producer:γ; precision-over-recall, explicit blind list (resolved decision 8)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "non-matching of source locations / URL authorities / clock times is a negative fixture property"
-      - name: "referent-digits-verbatim"
-        binding: "capability→producer — producer:β upstream; Referent.number is str, never int-normalized"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "'Task 0132' vs 'Task 132' distinctness is pinned by β's fixtures"
-
-  - label: "δ"
-    task_id: null
-    title: "entities param on add_memory/add_episode + metadata.task_id bridge + _entities_gate"
-    capabilities:
-      - name: "entities-param-on-add-memory"
-        binding: "capability→producer — producer:δ; optional tri-state None/[]/[…] (resolved decision 2)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "_entities_gate"
-          paths: ["fused-memory/src/fused_memory/server/tools.py"]
-          expect: present
-      - name: "structured-conflict-rejection"
-        binding: "G6 branch 4 rejection-mechanism — joins add_memory's observed-firing ValidationError gate chain (tools.py:2001-2020: validate_project_id, _known_project_gate, _backlog_gate, _markup_gate)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "that the gate fires on a declared/prose conflict and suppresses the write is judged by δ's own boundary fixtures, not a grep"
-      - name: "metadata-task-id-bridge"
-        binding: "capability→producer — producer:δ; metadata.task_id is currently discarded outright by the Graphiti enqueue"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "bridge precedence below `declared` is a resolution-order property"
-      - name: "resolve-referents-available"
-        binding: "DAG-direction — producer:γ is upstream of δ"
-        verdict: PASS
-
-  - label: "ε"
-    task_id: null
-    title: "Thread the referent set through the queue payload into _execute_graphiti_write"
-    capabilities:
-      - name: "referents-ride-existing-payload"
-        binding: "capability→producer — producer:ε; additional key on add_memory_graphiti / add_episode (memory_service.py:2633,3130), no new operation, no payload_version"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "referents"
-          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
-          expect: present
-      - name: "old-row-executes-unchanged"
-        binding: "back-compat — an absent key reads as 'no referents', which is today's behaviour"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "old-format-row execution is a replay fixture, not a grep"
-      - name: "absent-path-counted"
-        binding: "INV-4 storm-escape-required (G7 resolution) — the absent-key fallback emits source='none' rather than degrading silently; ι surfaces a sustained 100% none rate"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "counter emission on the fallback path is pinned by ε's fixtures; the operator-visible half is ι's signal"
-
-  - label: "ζ"
-    task_id: null
-    title: "Verification sub-pass: set-membership + per-edge pairing, structured records"
-    capabilities:
-      - name: "verify-episode-referents-runs-last"
-        binding: "capability→producer — producer:ζ; ordering after _normalize_task_node_names (memory_service.py:1955) is load-bearing"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "_verify_episode_referents"
-          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
-          expect: present
-      - name: "set-membership-and-per-edge-pairing"
-        binding: "capability→producer — producer:ζ; both checks per resolved decision 7 (neither alone is sufficient); the C' veto folds in here"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "that mode (iii) is caught only by per-edge pairing is a boundary-matrix property"
-      - name: "structured-repair-records"
-        binding: "INV-2 structured-facts-at-failure — edge uuid, old/new endpoint uuid, referent set, which check fired; replaces the logger.debug-only ReconcileStats shape"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "record completeness is asserted field-by-field in ζ's fixtures"
-      - name: "identity-lock-critical-section"
-        binding: "capability→producer (wired) — _identity_lock_for on main (graphiti_client.py:438); the sub-pass runs inside the existing per-group lock so no wrongly-attached state is externally visible"
-        verdict: PASS
-
-  - label: "η"
-    task_id: null
-    title: "Repair path: ensure_entity_node → reassign_edge → refresh_entity_summary, + streak escalation"
-    capabilities:
-      - name: "ensure-entity-node-mint"
-        binding: "DAG-direction — producer:α is upstream of η"
-        verdict: PASS
-      - name: "reassign-edge-lossless"
-        binding: "capability→producer (wired) — reassign_edge on main (graphiti_client.py:989); atomic, stamps reassigned_from_node_uuid"
-        verdict: PASS
-      - name: "summary-drops-repointed-fact"
-        binding: "G6 branch 3, the batch's highest-risk premise — refresh_entity_summary (graphiti_client.py:2439) regenerates from CURRENTLY-VALID edges, so a repointed fact leaves the source node's summary by construction. Task 2057's residual case is the other one (stale sentence still carried by a valid edge), for which set_entity_summary (:2500) is the documented escape hatch"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "refresh_entity_summary"
-          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
-          expect: present
-      - name: "repair-streak-escalation"
-        binding: "INV-4 storm-escape-required — consecutive-streak gate shape from merge_liveness.py:446; base rate is ~0.22% so any sustained streak is anomalous (Open Question 1)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the threshold itself is Open Question 1, decided in η; only its presence is gate-relevant"
-      - name: "unrepairable-recorded-not-guessed"
-        binding: "capability→producer — producer:η; a unary fact with no correct target is recorded and left alone (the live Task 2520 / 2519 case)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the never-guess postcondition is a negative boundary-matrix row"
-
-  - label: "θ"
-    task_id: null
-    title: "Remediate the live conflations + refresh contaminated summaries; close esc-3375-1"
-    capabilities:
-      - name: "four-conflations-repairable"
-        binding: "G6 branch 3 — all four foreign facts observed live at decompose via read-only GRAPH.RO_QUERY: Task 2434←2435, Task 3220←3222, Task 1030←1031, Task 3074←3075"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "operational leaf; the observable is get_entity output, verified by θ's own before/after census"
-      - name: "fifth-conflation-recorded-not-repaired"
-        binding: "G6 finding 2 resolution — the fifth live conflation is a unary fact about Task 2519 attached to the Task 2520 node; the boundary sketch and ζ's postconditions require it be recorded and left alone, so the 5-conflation count reconciles with a 4-node signal"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "deliberate non-repair; observable is the flagged-unrepairable record"
-      - name: "repair-path-available"
-        binding: "DAG-direction — producer:η is upstream of θ"
-        verdict: PASS
-      - name: "pre-act-recensus"
-        binding: "INV-3 corroborate-before-acting (G7 resolution) — θ dispatches long after the 2026-08-05 snapshot; it must re-measure read-only immediately before acting, and the esc-3375-1 before/after must be θ's own measurement"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "re-census freshness is judged against θ's escalation resolution text"
-      - name: "gate-untouched-until-execution"
-        binding: "esc-3375-1 / task 3375 (blocked, operational_mode=gate, always_escalates=true) is NOT mutated at decompose time; θ closes it at execution with human approval"
-        verdict: PASS
-
-  - label: "ι"
-    task_id: null
-    title: "Declaration-rate telemetry surfaced through the read path"
-    capabilities:
-      - name: "source-field-on-resolution"
-        binding: "DAG-direction — producer:γ is upstream of ι (via ζ←ε←γ)"
-        verdict: PASS
-      - name: "declared-bucket-reachable"
-        binding: "G6 finding 1 resolution — the `declared` bucket is produced by δ's entities param, which was NOT in ι's PRD-declared closure {ζ}; ι depends_on δ is wired in addition, so the counter is not structurally pinned at zero"
-        verdict: PASS
-      - name: "write-ops-params-no-migration"
-        binding: "capability→producer (wired) — write_ops carries free-text operation + JSON params with idx_wo_project_time(project_id, created_at) (write_journal.py:18-36); per-project window counts need no migration (Open Question 2)"
-        verdict: PASS
-      - name: "per-project-window-query"
-        binding: "capability→producer — producer:ι; declared / metadata / derived / none counts per project over a window"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "operator-readability of the four buckets is the signal itself, judged end-to-end"
-
-  - label: "κ"
-    task_id: null
-    title: "Drive adoption: CLAUDE.md, /memory, /reflect, recon stage prompts, review-checkpoint template"
-    capabilities:
-      - name: "entities-param-exists-to-document"
-        binding: "DAG-direction — producer:δ is upstream of κ"
-        verdict: PASS
-      - name: "all-five-targets-in-repo"
-        binding: "G3 — every target is tracked in-repo: CLAUDE.md, .claude/commands/memory.md (where /memory actually resolves from — NOT ~/.claude, and skills/memory/ does not exist), skills/reflect/SKILL.md, reconciliation/prompts/{stage1,stage2,stage3,judge}.py, orchestrator/src/orchestrator/review_checkpoint.py"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "entities="
-          paths: ["CLAUDE.md", ".claude/commands/memory.md"]
-          expect: present
-      - name: "example-drift-pinned"
-        binding: "INV-5 no-lockstep-duplication (G7 resolution) — five hand-transcribed entities= examples must agree byte-for-byte with the live add_memory signature; κ ships a drift/pinning test (the task 2559 render-from-schema house pattern) instead"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the drift test's own coverage is judged by κ's fixtures; only its existence is gate-relevant"
-
-  - label: "λ"
-    task_id: null
-    title: "Dated undeclared-referent census (+7 days) → tightening decision"
-    capabilities:
-      - name: "telemetry-to-census"
-        binding: "DAG-direction — producer:ι is upstream of λ"
-        verdict: PASS
-      - name: "adoption-in-flight"
-        binding: "DAG-direction — producer:κ is upstream of λ"
-        verdict: PASS
-      - name: "delayed-milestone-shape"
-        binding: "capability→producer (wired) — metadata.milestone mode='delayed' + after_secs, validated by the shared Milestone model; `at` is FORBIDDEN in delayed mode (docs/task-authoring.md:509-529)"
-        verdict: PASS
-      - name: "seven-days-production-data"
-        binding: "G6 branch 3 — the after_secs bound is what makes '≥7 days of production data' true at dispatch rather than an unbacked assertion; INV-7 bound on resolved decision 4's transitional hold"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "operational/decision leaf; the observable is the census report and its tighten-or-hold recommendation"
+- label: α
+  task_id: 3666
+  title: Cherry-pick cross_project_refs + ensure_entity_node onto main
+  capabilities:
+  - name: cross-project-refs-module-on-main
+    binding: capability→producer — producer:α; four task/3335 commits re-verified
+      zero-conflict against main tip 57ef5b4ead (829 insertions, 4 files, all parsing)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def find_cross_project_task_refs
+      paths:
+      - fused-memory/src/fused_memory/utils/cross_project_refs.py
+      expect: present
+  - name: ensure-entity-node-mint-primitive
+    binding: capability→producer — producer:α; delegates to _resolve_or_create_entity
+      (graphiti_client.py:2251, on main), mints only on its None branch
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def ensure_entity_node
+      paths:
+      - fused-memory/src/fused_memory/backends/graphiti_client.py
+      expect: present
+  - name: no-dependency-on-unlanded-3335
+    binding: DAG-direction — takes only the two dependency-free primitives; _split_cross_project_task_nodes
+      stays with 3335; no dep edge on task 3335 filed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _split_cross_project_task_nodes
+      paths:
+      - fused-memory/src/fused_memory/services/memory_service.py
+      expect: absent
+- label: β
+  task_id: 3667
+  title: Extract one canonical-label vocabulary; refactor task_naming + cross_project_refs
+    onto it
+  capabilities:
+  - name: canonical-labels-single-site
+    binding: capability→producer — producer:β; the single normative site per INV-5
+      / resolved decision 5
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def scan_content
+      paths:
+      - fused-memory/src/fused_memory/utils/canonical_labels.py
+      expect: present
+  - name: task-hash-1153-parses
+    binding: 'G6 branch 3 — today''s anchored ^\s*tasks?\s+(\d+)\s*$ (task_naming.py:26)
+      is structurally unable to match ''task #1153''; β delivers it'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: parse coverage of the 53 measured variant splits is a fixture property,
+        not a grep
+  - name: no-second-copy-of-the-pattern
+    binding: INV-5 no-lockstep-duplication — task_naming must call canonical_labels,
+      not keep its own compiled pattern
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _TASK_NODE_NAME_PATTERN[[:space:]]*=
+      paths:
+      - fused-memory/src/fused_memory/utils/task_naming.py
+      expect: absent
+- label: γ
+  task_id: 3668
+  title: Deterministic referent scanner + resolve_referents precedence
+  capabilities:
+  - name: resolve-referents-precedence
+    binding: capability→producer — producer:γ; declared > metadata-bridged > derived,
+      with .source/.conflicts/.ambiguous
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def resolve_referents
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: scan-content-precision
+    binding: capability→producer — producer:γ; precision-over-recall, explicit blind
+      list (resolved decision 8)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: non-matching of source locations / URL authorities / clock times is
+        a negative fixture property
+  - name: referent-digits-verbatim
+    binding: capability→producer — producer:β upstream; Referent.number is str, never
+      int-normalized
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: '''Task 0132'' vs ''Task 132'' distinctness is pinned by β''s fixtures'
+- label: δ
+  task_id: 3669
+  title: entities param on add_memory/add_episode + metadata.task_id bridge + _entities_gate
+  capabilities:
+  - name: entities-param-on-add-memory
+    binding: capability→producer — producer:δ; optional tri-state None/[]/[…] (resolved
+      decision 2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _entities_gate
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: present
+  - name: structured-conflict-rejection
+    binding: 'G6 branch 4 rejection-mechanism — joins add_memory''s observed-firing
+      ValidationError gate chain (tools.py:2001-2020: validate_project_id, _known_project_gate,
+      _backlog_gate, _markup_gate)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: that the gate fires on a declared/prose conflict and suppresses the
+        write is judged by δ's own boundary fixtures, not a grep
+  - name: metadata-task-id-bridge
+    binding: capability→producer — producer:δ; metadata.task_id is currently discarded
+      outright by the Graphiti enqueue
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: bridge precedence below `declared` is a resolution-order property
+  - name: resolve-referents-available
+    binding: DAG-direction — producer:γ is upstream of δ
+    verdict: PASS
+- label: ε
+  task_id: 3670
+  title: Thread the referent set through the queue payload into _execute_graphiti_write
+  capabilities:
+  - name: referents-ride-existing-payload
+    binding: capability→producer — producer:ε; additional key on add_memory_graphiti
+      / add_episode (memory_service.py:2633,3130), no new operation, no payload_version
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: referents
+      paths:
+      - fused-memory/src/fused_memory/services/memory_service.py
+      expect: present
+  - name: old-row-executes-unchanged
+    binding: back-compat — an absent key reads as 'no referents', which is today's
+      behaviour
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: old-format-row execution is a replay fixture, not a grep
+  - name: absent-path-counted
+    binding: INV-4 storm-escape-required (G7 resolution) — the absent-key fallback
+      emits source='none' rather than degrading silently; ι surfaces a sustained 100%
+      none rate
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: counter emission on the fallback path is pinned by ε's fixtures; the
+        operator-visible half is ι's signal
+- label: ζ
+  task_id: 3671
+  title: 'Verification sub-pass: set-membership + per-edge pairing, structured records'
+  capabilities:
+  - name: verify-episode-referents-runs-last
+    binding: capability→producer — producer:ζ; ordering after _normalize_task_node_names
+      (memory_service.py:1955) is load-bearing
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _verify_episode_referents
+      paths:
+      - fused-memory/src/fused_memory/services/memory_service.py
+      expect: present
+  - name: set-membership-and-per-edge-pairing
+    binding: capability→producer — producer:ζ; both checks per resolved decision 7
+      (neither alone is sufficient); the C' veto folds in here
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: that mode (iii) is caught only by per-edge pairing is a boundary-matrix
+        property
+  - name: structured-repair-records
+    binding: INV-2 structured-facts-at-failure — edge uuid, old/new endpoint uuid,
+      referent set, which check fired; replaces the logger.debug-only ReconcileStats
+      shape
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: record completeness is asserted field-by-field in ζ's fixtures
+  - name: identity-lock-critical-section
+    binding: capability→producer (wired) — _identity_lock_for on main (graphiti_client.py:438);
+      the sub-pass runs inside the existing per-group lock so no wrongly-attached
+      state is externally visible
+    verdict: PASS
+- label: η
+  task_id: 3672
+  title: 'Repair path: ensure_entity_node → reassign_edge → refresh_entity_summary,
+    + streak escalation'
+  capabilities:
+  - name: ensure-entity-node-mint
+    binding: DAG-direction — producer:α is upstream of η
+    verdict: PASS
+  - name: reassign-edge-lossless
+    binding: capability→producer (wired) — reassign_edge on main (graphiti_client.py:989);
+      atomic, stamps reassigned_from_node_uuid
+    verdict: PASS
+  - name: summary-drops-repointed-fact
+    binding: G6 branch 3, the batch's highest-risk premise — refresh_entity_summary
+      (graphiti_client.py:2439) regenerates from CURRENTLY-VALID edges, so a repointed
+      fact leaves the source node's summary by construction. Task 2057's residual
+      case is the other one (stale sentence still carried by a valid edge), for which
+      set_entity_summary (:2500) is the documented escape hatch
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: refresh_entity_summary
+      paths:
+      - fused-memory/src/fused_memory/services/memory_service.py
+      expect: present
+  - name: repair-streak-escalation
+    binding: INV-4 storm-escape-required — consecutive-streak gate shape from merge_liveness.py:446;
+      base rate is ~0.22% so any sustained streak is anomalous (Open Question 1)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the threshold itself is Open Question 1, decided in η; only its presence
+        is gate-relevant
+  - name: unrepairable-recorded-not-guessed
+    binding: capability→producer — producer:η; a unary fact with no correct target
+      is recorded and left alone (the live Task 2520 / 2519 case)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the never-guess postcondition is a negative boundary-matrix row
+- label: θ
+  task_id: 3673
+  title: Remediate the live conflations + refresh contaminated summaries; close esc-3375-1
+  capabilities:
+  - name: four-conflations-repairable
+    binding: 'G6 branch 3 — all four foreign facts observed live at decompose via
+      read-only GRAPH.RO_QUERY: Task 2434←2435, Task 3220←3222, Task 1030←1031, Task
+      3074←3075'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operational leaf; the observable is get_entity output, verified by θ's
+        own before/after census
+  - name: fifth-conflation-recorded-not-repaired
+    binding: G6 finding 2 resolution — the fifth live conflation is a unary fact about
+      Task 2519 attached to the Task 2520 node; the boundary sketch and ζ's postconditions
+      require it be recorded and left alone, so the 5-conflation count reconciles
+      with a 4-node signal
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: deliberate non-repair; observable is the flagged-unrepairable record
+  - name: repair-path-available
+    binding: DAG-direction — producer:η is upstream of θ
+    verdict: PASS
+  - name: pre-act-recensus
+    binding: INV-3 corroborate-before-acting (G7 resolution) — θ dispatches long after
+      the 2026-08-05 snapshot; it must re-measure read-only immediately before acting,
+      and the esc-3375-1 before/after must be θ's own measurement
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: re-census freshness is judged against θ's escalation resolution text
+  - name: gate-untouched-until-execution
+    binding: esc-3375-1 / task 3375 (blocked, operational_mode=gate, always_escalates=true)
+      is NOT mutated at decompose time; θ closes it at execution with human approval
+    verdict: PASS
+- label: ι
+  task_id: 3674
+  title: Declaration-rate telemetry surfaced through the read path
+  capabilities:
+  - name: source-field-on-resolution
+    binding: DAG-direction — producer:γ is upstream of ι (via ζ←ε←γ)
+    verdict: PASS
+  - name: declared-bucket-reachable
+    binding: G6 finding 1 resolution — the `declared` bucket is produced by δ's entities
+      param, which was NOT in ι's PRD-declared closure {ζ}; ι depends_on δ is wired
+      in addition, so the counter is not structurally pinned at zero
+    verdict: PASS
+  - name: write-ops-params-no-migration
+    binding: capability→producer (wired) — write_ops carries free-text operation +
+      JSON params with idx_wo_project_time(project_id, created_at) (write_journal.py:18-36);
+      per-project window counts need no migration (Open Question 2)
+    verdict: PASS
+  - name: per-project-window-query
+    binding: capability→producer — producer:ι; declared / metadata / derived / none
+      counts per project over a window
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operator-readability of the four buckets is the signal itself, judged
+        end-to-end
+- label: κ
+  task_id: 3675
+  title: 'Drive adoption: CLAUDE.md, /memory, /reflect, recon stage prompts, review-checkpoint
+    template'
+  capabilities:
+  - name: entities-param-exists-to-document
+    binding: DAG-direction — producer:δ is upstream of κ
+    verdict: PASS
+  - name: all-five-targets-in-repo
+    binding: 'G3 — every target is tracked in-repo: CLAUDE.md, .claude/commands/memory.md
+      (where /memory actually resolves from — NOT ~/.claude, and skills/memory/ does
+      not exist), skills/reflect/SKILL.md, reconciliation/prompts/{stage1,stage2,stage3,judge}.py,
+      orchestrator/src/orchestrator/review_checkpoint.py'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: entities=
+      paths:
+      - CLAUDE.md
+      - .claude/commands/memory.md
+      expect: present
+  - name: example-drift-pinned
+    binding: INV-5 no-lockstep-duplication (G7 resolution) — five hand-transcribed
+      entities= examples must agree byte-for-byte with the live add_memory signature;
+      κ ships a drift/pinning test (the task 2559 render-from-schema house pattern)
+      instead
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the drift test's own coverage is judged by κ's fixtures; only its existence
+        is gate-relevant
+- label: λ
+  task_id: 3676
+  title: Dated undeclared-referent census (+7 days) → tightening decision
+  capabilities:
+  - name: telemetry-to-census
+    binding: DAG-direction — producer:ι is upstream of λ
+    verdict: PASS
+  - name: adoption-in-flight
+    binding: DAG-direction — producer:κ is upstream of λ
+    verdict: PASS
+  - name: delayed-milestone-shape
+    binding: capability→producer (wired) — metadata.milestone mode='delayed' + after_secs,
+      validated by the shared Milestone model; `at` is FORBIDDEN in delayed mode (docs/task-authoring.md:509-529)
+    verdict: PASS
+  - name: seven-days-production-data
+    binding: G6 branch 3 — the after_secs bound is what makes '≥7 days of production
+      data' true at dispatch rather than an unbacked assertion; INV-7 bound on resolved
+      decision 4's transitional hold
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operational/decision leaf; the observable is the census report and its
+        tighten-or-hold recommendation
