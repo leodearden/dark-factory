@@ -467,7 +467,9 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     return HeadroomResult(ok=True, reason=None)
 
 
-def _stage_headroom_gate(invoke, *, model: str, stage: str) -> HeadroomResult:
+def _stage_headroom_gate(
+    invoke, *, model: str, stage: str, probe_count: list | None = None,
+) -> HeadroomResult:
     """Re-probe headroom at a stage boundary, logging which stage asked.
 
     Deliberately NOT a second probe implementation -- it is a thin wrapper
@@ -475,6 +477,10 @@ def _stage_headroom_gate(invoke, *, model: str, stage: str) -> HeadroomResult:
     nothing else, so the "one tiny call, no usage API assumed" decision
     (PRD decision 5) and its fail-safe exception handling hold identically
     at every gate.
+
+    *probe_count* is a one-element mutable counter incremented for every
+    probe this gate spends, so the report's cost note can state what the
+    run ACTUALLY paid rather than a hardcoded literal.
 
     Gates exist only where an unnoticed cap CORRUPTS output, not at every
     stage transition. Today that means the preflight and this one, before
@@ -486,6 +492,8 @@ def _stage_headroom_gate(invoke, *, model: str, stage: str) -> HeadroomResult:
     genuinely paid for. Mining is the same: a storm batch is already
     detected and reported. Do not "complete the pattern" by adding them.
     """
+    if probe_count is not None:
+        probe_count[0] += 1
     result = preflight_headroom(invoke, model=model)
     if not result.ok:
         logger.warning(
@@ -1329,6 +1337,11 @@ def run_census(
             "than bounding it; omit it entirely to verify every novel cluster"
         )
 
+    # Real probe accounting for the report's cost note. A legibility tool
+    # that under-reports its own spend -- in the very artifact an operator
+    # reads to check --max-verify-clusters -- is the same defect class this
+    # pipeline exists to find.
+    probe_count = [1]
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
         return _defer(
@@ -1423,7 +1436,7 @@ def run_census(
     # nothing to verify spends no probe on a stage it is about to skip.
     if clusters_to_verify:
         stage_headroom = _stage_headroom_gate(
-            invoke, model=config.models.trickle, stage="verify",
+            invoke, model=config.models.trickle, stage="verify", probe_count=probe_count,
         )
         if not stage_headroom.ok:
             # The reason NAMES the stage. The preflight's reason is left
@@ -1635,7 +1648,7 @@ def run_census(
         f"{sum(s.total for s in mining_result.batch_stats)}, "
         f"{config.models.census_verify} verify={len(clusters_to_verify)}, "
         f"{config.models.census_synthesis} synthesis=1, "
-        f"{config.models.trickle} headroom-probe=1"
+        f"{config.models.trickle} headroom-probe={probe_count[0]}"
     )
     if storm_batch_indices:
         cost_note += (
