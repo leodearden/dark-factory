@@ -282,6 +282,116 @@ def stratum_key(record: EpisodeRecord) -> tuple[str, str]:
     return (month_bucket(record.created_at), payload_kind(record.source_description))
 
 
+ALLOCATION_RULE = 'min-1-floor + largest-remainder proportional, capped at cell size'
+"""Recorded verbatim in the manifest's criteria so a reviewer can re-derive.
+
+The string is the contract; :func:`allocate` is its implementation. A manifest
+that names a different rule than the builder applies is not re-derivable, so
+the two travel together.
+"""
+
+
+def allocate(cell_counts: dict[tuple[str, str], int], n: int) -> dict[tuple[str, str], int]:
+    """Split *n* seats across the cells of *cell_counts*, summing to exactly *n*.
+
+    The rule, in this order:
+
+    1. Reject an unsatisfiable request loudly — non-positive *n*, an empty
+       cell, ``n`` below the cell count, or ``n`` above the population.
+    2. Seat 1 in every cell (the floor).
+    3. Distribute the residual by largest remainder over each cell's
+       proportional share, capping at cell size and redistributing any capped
+       overflow until the total lands on *n* exactly.
+    4. Break remainder ties on the sorted cell key, so the result is fully
+       deterministic with no RNG and no dependence on dict iteration order.
+
+    **Why a floor at all.** Measured on 2026-08-05, the
+    ``('2026-04', 'procedural_knowledge')`` cell holds exactly ONE of the
+    store's 2770 episodes. Its proportional share at N=200 is 0.07 seats, so
+    pure proportional allocation rounds it to zero and silently deletes an
+    entire payload kind from the corpus — and therefore from every downstream
+    arm comparison in ε/ζ/θ. Nothing in the artifact would show the loss: the
+    stratification report would still reconcile, over a payload axis that had
+    quietly lost a value. The floor costs 16 of 200 seats and makes that
+    impossible.
+
+    **Why loud rejection rather than a best effort.** Shaving cells to fit a
+    too-small *n*, or returning fewer than *n* for a too-large one, would
+    reintroduce exactly the invisible coverage loss the floor prevents — only
+    now with the artifact claiming a corpus size it does not have.
+    """
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise CorpusBuildError(f'n must be an int, got {n!r}')
+    if n <= 0:
+        raise CorpusBuildError(f'n must be positive, got {n}')
+    if not cell_counts:
+        raise CorpusBuildError('cannot allocate over an empty stratification')
+
+    empty = sorted(cell for cell, count in cell_counts.items() if count <= 0)
+    if empty:
+        raise CorpusBuildError(
+            f'cell_counts contains {len(empty)} empty cell(s) {empty}; exclude them '
+            f'before allocating — a min-1 seat in an empty cell can never be filled '
+            f'and the allocation would not sum to n'
+        )
+
+    population = sum(cell_counts.values())
+    if n > population:
+        raise CorpusBuildError(
+            f'cannot draw n={n} episodes from a population of {population}'
+        )
+    if n < len(cell_counts):
+        raise CorpusBuildError(
+            f'n={n} is below the {len(cell_counts)} non-empty cells, so the min-1 '
+            f'floor is unsatisfiable; raise n to at least {len(cell_counts)} rather '
+            f'than dropping cells, which would silently lose coverage'
+        )
+
+    cells = sorted(cell_counts)
+    alloc = dict.fromkeys(cells, 1)
+    residual = n - len(cells)
+
+    # Largest remainder over the proportional share of the residual. Ranking
+    # on (-remainder, cell) rather than (-remainder,) alone is what makes ties
+    # deterministic; without it, equal remainders would resolve by whatever
+    # order the dict happened to have.
+    if residual:
+        shares = {c: cell_counts[c] * residual / population for c in cells}
+        ranked = sorted(cells, key=lambda c: (-(shares[c] % 1), c))
+        for cell in cells:
+            alloc[cell] += int(shares[cell])
+        leftover = residual - sum(int(shares[c]) for c in cells)
+        for cell in ranked[:leftover]:
+            alloc[cell] += 1
+
+    # Cap at cell size and redistribute the overflow. Loops because a
+    # redistribution can itself overfill another cell; it terminates because
+    # every pass either places all overflow or strictly shrinks the set of
+    # cells with room, and n <= population guarantees room exists.
+    while True:
+        overflow = 0
+        for cell in cells:
+            if alloc[cell] > cell_counts[cell]:
+                overflow += alloc[cell] - cell_counts[cell]
+                alloc[cell] = cell_counts[cell]
+        if not overflow:
+            break
+        room = [c for c in cells if alloc[c] < cell_counts[c]]
+        if not room:  # pragma: no cover — unreachable while n <= population
+            raise CorpusBuildError(
+                f'cannot place {overflow} seat(s): every cell is at capacity but '
+                f'the allocation totals {sum(alloc.values())}, not {n}'
+            )
+        ranked = sorted(room, key=lambda c: (-cell_counts[c], c))
+        for cell in (ranked * (overflow // len(ranked) + 1))[:overflow]:
+            alloc[cell] += 1
+
+    total = sum(alloc.values())
+    if total != n:  # pragma: no cover — an allocator bug, not a data condition
+        raise CorpusBuildError(f'allocation totals {total}, expected {n}')
+    return alloc
+
+
 def record_field_names() -> tuple[str, ...]:
     """Return :class:`EpisodeRecord`'s field names, in declaration order.
 
