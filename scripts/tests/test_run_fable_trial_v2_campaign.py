@@ -136,3 +136,118 @@ def test_empty_tasks_dir_exits_loudly(tmp_path):
 
     assert exc.value.code != 0
     assert str(empty) in str(exc.value)
+
+
+# ===== step 3: candidate resolution and per-candidate budget overrides =====
+
+
+def test_resolve_candidates_returns_architect_configs():
+    """A named architect candidate resolves to its ``EvalConfig``."""
+    cands = mod.resolve_candidates(['architect-opus-max'])
+
+    assert len(cands) == 1
+    assert cands[0].name == 'architect-opus-max'
+    assert cands[0].role == 'architect'
+
+
+def test_unknown_candidate_exits_naming_it():
+    """An unresolvable candidate name exits non-zero, naming the offender."""
+    with pytest.raises(SystemExit) as exc:
+        mod.resolve_candidates(['architect-nope'])
+
+    assert exc.value.code != 0
+    assert 'architect-nope' in str(exc.value)
+
+
+def test_non_architect_candidate_is_rejected():
+    """A RESOLVABLE implementer config is still rejected — structurally, not by comment.
+
+    ``claude-opus-max`` resolves fine through ``get_config_by_name`` but carries
+    ``role == 'implementer'``, and ``run_ofat_stage`` dispatches BY ROLE: it would
+    route this candidate through ``run_eval``, a FULL agentic workflow cell at
+    roughly 10x the cost of a plan-only architect cell. That is exactly the spend
+    the PRD forbids when it says "Do NOT use eval-ofat". Rejecting at resolution
+    time turns a one-character typo from hundreds of dollars of the wrong spend
+    into an immediate, named error.
+    """
+    from orchestrator.evals.configs import get_config_by_name
+
+    resolvable = get_config_by_name('claude-opus-max')
+    assert resolvable is not None and resolvable.role == 'implementer', (
+        'premise of this test: the name must RESOLVE and be non-architect'
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        mod.resolve_candidates(['claude-opus-max'])
+
+    assert exc.value.code != 0
+    assert 'claude-opus-max' in str(exc.value)
+    assert 'architect' in str(exc.value)
+
+
+def test_parse_budget_spec():
+    """``NAME=AMOUNT`` parses; a malformed spec exits naming itself."""
+    assert mod._parse_budget_spec('architect-opus-max=15') == ('architect-opus-max', 15.0)
+    assert mod._parse_budget_spec('architect-fable-high=7.5') == ('architect-fable-high', 7.5)
+
+    for bad in ('architect-opus-max', 'architect-opus-max=lots', '=15'):
+        with pytest.raises(SystemExit) as exc:
+            mod._parse_budget_spec(bad)
+        assert bad in str(exc.value)
+
+
+def test_apply_budgets_overrides_only_the_named_candidate():
+    """Only the named candidate's budget moves; the inputs are never mutated."""
+    cands = mod.resolve_candidates(['architect-opus-max', 'architect-fable-high'])
+    before = [(c.name, c.max_budget_usd) for c in cands]
+
+    out = mod.apply_budgets(cands, {'architect-opus-max': 15.0})
+
+    by_name = {c.name: c for c in out}
+    assert by_name['architect-opus-max'].max_budget_usd == 15.0
+    assert by_name['architect-fable-high'].max_budget_usd == 20.0, (
+        'an unnamed candidate must keep its declared default'
+    )
+    # dataclasses.replace, not in-place mutation: the module-level
+    # ARCHITECT_EVAL_CONFIGS entries stay byte-unchanged for every other caller.
+    assert [(c.name, c.max_budget_usd) for c in cands] == before
+    assert all(a is not b for a, b in zip(cands, out) if a.name == 'architect-opus-max')
+
+
+def test_budget_for_unselected_candidate_exits():
+    """A ``--budget`` naming a candidate that is not being run exits non-zero.
+
+    A silently-ignored budget would run a comparison arm at the WRONG price,
+    which invalidates the γ2 regime ruling the whole trial turns on.
+    """
+    cands = mod.resolve_candidates(['architect-opus-max'])
+
+    with pytest.raises(SystemExit) as exc:
+        mod.apply_budgets(cands, {'architect-fable-high': 15.0})
+
+    assert exc.value.code != 0
+    assert 'architect-fable-high' in str(exc.value)
+
+
+def test_dry_run_prints_the_comparison_regime(tmp_path, capsys, monkeypatch):
+    """Dry-run shows model / effort / budget per candidate — auditable BEFORE spend."""
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    def _boom(*args, **kwargs):
+        pytest.fail('--dry-run reached _run_campaign', pytrace=False)
+
+    monkeypatch.setattr(mod, '_run_campaign', _boom)
+
+    rc = mod.main([
+        '--dry-run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max',
+        '--candidate', 'architect-fable-high',
+        '--budget', 'architect-opus-max=15',
+        '--budget', 'architect-fable-high=15',
+    ])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert 'claude-fable-5' in out, 'candidate model not shown'
+    assert 'opus' in out
+    assert '15' in out, 'the overridden budget — the γ2 comparison regime — not shown'
