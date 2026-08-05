@@ -138,12 +138,65 @@ def _provenance_path(report_path: Path) -> Path:
 
 _SHA_RE = re.compile(r'\A[0-9a-f]{40}\Z')
 
+# The four per-record outcomes the runbook (docs/mcp-toolcall-xml-leak.md §5
+# remediation table) says a HUMAN must adjudicate. Lifted verbatim as a
+# vocabulary rather than re-derived, so this module's notion of "a mutation
+# somebody has to deal with" is the runbook's, not a fresh invention.
+DANGER_FLAGS = (
+    'record_error',
+    'content_lost_in_flight',
+    'skipped_not_mem0_routed',
+    'skipped_metadata_would_be_rejected',
+)
+
+# The two shapes repair_content() knows how to fix. Only these carry a
+# repaired_content, so only for these can the recovery payload be checked for
+# leak-freeness.
+REPAIRABLE_CLASSIFICATIONS = ('repairable_tail', 'repairable_duplicate')
+
+# NAMING: deliberately NOT '*-report.json'. _report_paths() globs that suffix,
+# so a tracking file named that way would be swept into _REPORT_PATHS and fail
+# every shape and provenance test in this module.
+RECOVERY_TRACKING_NAME = 'recovery-tracking.json'
+
+_DIGITS_RE = re.compile(r'\A[0-9]+\Z')
+
 
 def _ids(paths: list[Path]) -> list[str]:
     return [f'{p.parent.name}/{p.name}' for p in paths]
 
 
 _REPORT_PATHS = _report_paths()
+
+# One entry per dated capture directory. The converse tracking check is a
+# property of a DIRECTORY (its tracking file vs all its reports), not of a
+# single report, so it is parametrized over these instead.
+_ARTIFACT_DIRS = sorted({p.parent for p in _REPORT_PATHS})
+
+
+def _recovery_tracking_path(artifact_dir: Path) -> Path:
+    """The tracking file that belongs to a capture directory.
+
+    Derived from the directory rather than hard-coding the 2026-08-05 date, so
+    a future capture is held to exactly the same contract.
+    """
+    return artifact_dir / RECOVERY_TRACKING_NAME
+
+
+def _unrepaired_danger_records(report: dict) -> list[dict]:
+    """Records where the sweep ATTEMPTED a mutation and did not repair.
+
+    Dry runs are excluded by construction: they mutate nothing, so a flag on
+    one is not an outstanding live-corpus change.
+    """
+    if report.get('dry_run') is not False:
+        return []
+    return [
+        record
+        for record in report['records']
+        if any(record.get(flag) for flag in DANGER_FLAGS)
+        and record.get('repaired') is not True
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -459,4 +512,232 @@ class TestProvenanceSidecar:
         assert exit_code != 2, (
             'exit 2 means the run aborted partway and covered only part of the '
             'corpus; it is not an incidence measurement.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Unrepaired live-corpus mutations: named owner + still-recoverable payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('path', _REPORT_PATHS, ids=_ids(_REPORT_PATHS))
+class TestUnrepairedMutationsAreTracked:
+    """An unrepaired mutation of the LIVE corpus must not land on prose alone.
+
+    This class exists because of what actually happened on this task's first
+    ``--apply``: a record was deleted from live Qdrant and never re-added
+    (``record_error``, ``repaired: false``). The only things standing between
+    that and permanent data loss were a paragraph in ``investigation.md`` and
+    escalation ``esc-3567-2``, which was AUTO-DISMISSED on timeout rather than
+    adjudicated. Prose is not a tracker, and a dismissed escalation is not an
+    owner.
+
+    So the tracker becomes a machine-checked artifact. Two things are asserted
+    that prose can never assert:
+
+    1. every unrepaired mutation has a NAMED, durable owner (a Taskmaster id);
+    2. the recovery PAYLOAD is still present in a committed report and is still
+       judged leak-free by the production detector.
+
+    (2) is the part that keeps mattering after today. A future "tidy up these
+    big JSON artifacts" commit that drops the report holding the only surviving
+    copy of the deleted text turns this suite RED instead of quietly making the
+    loss permanent — the repo's loud-over-silent norm, applied to evidence.
+
+    Hermetic like the rest of the module: pure file reads plus the pure
+    detector, so it is green in VERIFY whether or not Qdrant is up.
+    """
+
+    def test_unrepaired_mutation_has_a_tracking_entry(self, path: Path) -> None:
+        report = _load(path)
+        outstanding = _unrepaired_danger_records(report)
+        if not outstanding:
+            return
+        tracking_path = _recovery_tracking_path(path.parent)
+        assert tracking_path.is_file(), (
+            f'{path.name} records {len(outstanding)} unrepaired live-corpus '
+            f'mutation(s) but {path.parent.name}/{RECOVERY_TRACKING_NAME} does '
+            'not exist. A mutation that changed the shared store and did not '
+            'complete needs a tracked owner, not a paragraph.'
+        )
+        tracking = _load(tracking_path)
+        assert isinstance(tracking, dict), (
+            f'{RECOVERY_TRACKING_NAME} must be a JSON object keyed by memory id'
+        )
+        missing = [r['id'] for r in outstanding if r['id'] not in tracking]
+        assert not missing, (
+            f'{path.name}: unrepaired mutation(s) {missing} have no entry in '
+            f'{RECOVERY_TRACKING_NAME}. This is precisely the failure this '
+            'check exists to catch — a real change to the live corpus with '
+            'nobody accountable for finishing it.'
+        )
+
+    def test_tracking_entry_names_a_durable_task_owner(self, path: Path) -> None:
+        """A Taskmaster id, asserted by SHAPE so it survives any id minted."""
+        report = _load(path)
+        outstanding = _unrepaired_danger_records(report)
+        if not outstanding:
+            return
+        tracking = _load(_recovery_tracking_path(path.parent))
+        for record in outstanding:
+            entry = tracking[record['id']]
+            owner = entry.get('tracked_as_task')
+            assert isinstance(owner, str) and _DIGITS_RE.match(owner), (
+                f'{record["id"]}: tracked_as_task={owner!r} is not a bare '
+                'all-digits task id. An escalation can auto-dismiss on '
+                'timeout; a task is the durable owner.'
+            )
+
+    def test_tracking_entry_points_at_a_committed_payload(self, path: Path) -> None:
+        report = _load(path)
+        outstanding = _unrepaired_danger_records(report)
+        if not outstanding:
+            return
+        tracking = _load(_recovery_tracking_path(path.parent))
+        repo_root = REPO_ROOT.resolve()
+        for record in outstanding:
+            entry = tracking[record['id']]
+            rel = entry.get('payload_source_report')
+            assert isinstance(rel, str) and rel, (
+                f'{record["id"]}: payload_source_report is missing; nothing '
+                'names where the recoverable text lives.'
+            )
+            assert not Path(rel).is_absolute(), (
+                f'{record["id"]}: payload_source_report {rel!r} is absolute; '
+                'it must be repo-relative so it survives a different checkout.'
+            )
+            resolved = (REPO_ROOT / rel).resolve()
+            assert resolved.is_relative_to(repo_root), (
+                f'{record["id"]}: payload_source_report {rel!r} escapes the '
+                'repo; the payload must be a committed artifact.'
+            )
+            assert resolved.is_file(), (
+                f'{record["id"]}: payload_source_report {rel!r} does not '
+                'exist. The recovery payload is GONE — this is the deletion '
+                'this check is here to make loud.'
+            )
+            assert resolved.name.endswith('-report.json'), (
+                f'{record["id"]}: payload_source_report {rel!r} is not a sweep '
+                'report; the payload must come from a validated capture.'
+            )
+            commit = entry.get('payload_source_commit')
+            assert isinstance(commit, str) and _SHA_RE.match(commit), (
+                f'{record["id"]}: payload_source_commit {commit!r} is not a '
+                '40-char lowercase hex sha. An abbreviated sha does not pin '
+                'the object holding the only surviving copy of the text.'
+            )
+
+    def test_recovered_flag_and_new_id_agree(self, path: Path) -> None:
+        """``recovered`` must never overstate what happened.
+
+        While it is False the entry carries no ``new_id`` (nothing was
+        re-added, so there is no id to carry). If a future session flips it to
+        True it MUST carry the id of the memory it re-added — otherwise
+        "recovered" is an unfalsifiable claim.
+        """
+        report = _load(path)
+        outstanding = _unrepaired_danger_records(report)
+        if not outstanding:
+            return
+        tracking = _load(_recovery_tracking_path(path.parent))
+        for record in outstanding:
+            entry = tracking[record['id']]
+            recovered = entry.get('recovered')
+            assert isinstance(recovered, bool), (
+                f'{record["id"]}: recovered={recovered!r} must be a bool'
+            )
+            if recovered:
+                new_id = entry.get('new_id')
+                assert isinstance(new_id, str) and new_id.strip(), (
+                    f'{record["id"]}: recovered=true but new_id={new_id!r}. '
+                    'A re-added memory necessarily gets a NEW id; without it '
+                    'the recovery claim cannot be checked against the store.'
+                )
+            else:
+                assert 'new_id' not in entry, (
+                    f'{record["id"]}: recovered=false but a new_id is present. '
+                    'Nothing has been re-added; the two disagree.'
+                )
+
+    def test_recovery_payload_is_still_present_and_leak_free(
+        self, path: Path
+    ) -> None:
+        """THE load-bearing assertion: the documented recovery is executable.
+
+        Tracking an unrepaired mutation is worthless if the text a human would
+        re-add has since been deleted, emptied, or is itself still leaking. So
+        the payload is opened, located by the SAME memory id, and — where the
+        record was repairable — its ``repaired_content`` is re-run through the
+        production detector. That re-derives from the real detector that the
+        text on the recovery path is genuinely clean, rather than trusting a
+        prose promise that it is.
+        """
+        report = _load(path)
+        outstanding = _unrepaired_danger_records(report)
+        if not outstanding:
+            return
+        tracking = _load(_recovery_tracking_path(path.parent))
+        for record in outstanding:
+            memory_id = record['id']
+            entry = tracking[memory_id]
+            payload_path = (REPO_ROOT / entry['payload_source_report']).resolve()
+            payload_report = _load(payload_path)
+            matches = [
+                r for r in payload_report['records'] if r.get('id') == memory_id
+            ]
+            assert matches, (
+                f'{memory_id}: payload_source_report '
+                f'{entry["payload_source_report"]} carries no record with that '
+                'id. The tracking entry points at a report that cannot recover '
+                'it.'
+            )
+            payload = matches[0]
+            assert payload.get('content'), (
+                f'{memory_id}: the payload record has empty content. The only '
+                'surviving copy of the deleted text is gone.'
+            )
+            if payload['classification'] in REPAIRABLE_CLASSIFICATIONS:
+                repaired = payload.get('repaired_content')
+                assert repaired, (
+                    f'{memory_id}: classified {payload["classification"]!r} '
+                    'but the payload carries no repaired_content, so there is '
+                    'nothing clean to re-add.'
+                )
+                derived = classify_record({'data': repaired})
+                assert derived == CLEAN, (
+                    f'{memory_id}: the repaired_content a human would re-add '
+                    f'is still classified {derived!r} by the production '
+                    f'detector, not {CLEAN!r}. Recovering it would re-introduce '
+                    'the leak.'
+                )
+
+
+@pytest.mark.parametrize(
+    'artifact_dir', _ARTIFACT_DIRS, ids=[d.name for d in _ARTIFACT_DIRS]
+)
+class TestRecoveryTrackingHasNoPhantomEntries:
+    """The converse: a tracking entry must correspond to a real mutation.
+
+    Without this, a fabricated or stale entry could stand in for a real one —
+    the tracker would look populated while the actual unrepaired mutation went
+    unowned, which is the same silent failure in a new costume.
+    """
+
+    def test_every_tracked_id_is_a_real_unrepaired_mutation(
+        self, artifact_dir: Path
+    ) -> None:
+        tracking_path = _recovery_tracking_path(artifact_dir)
+        if not tracking_path.is_file():
+            return
+        tracking = _load(tracking_path)
+        real: set[str] = set()
+        for report_path in sorted(artifact_dir.glob('*-report.json')):
+            for record in _unrepaired_danger_records(_load(report_path)):
+                real.add(record['id'])
+        phantom = sorted(set(tracking) - real)
+        assert not phantom, (
+            f'{artifact_dir.name}/{RECOVERY_TRACKING_NAME} tracks {phantom}, '
+            'which no committed apply report in that directory records as an '
+            'unrepaired mutation. A tracking file that does not describe real '
+            'store state reads as evidence while protecting nothing.'
         )
