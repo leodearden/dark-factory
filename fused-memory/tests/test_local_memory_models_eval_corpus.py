@@ -224,3 +224,135 @@ class TestEpisodeRecord:
     def test_stratum_key_propagates_parse_failure(self):
         with pytest.raises(_mod.CorpusBuildError):
             _mod.stratum_key(self._record(created_at='garbage'))
+
+
+# ===========================================================================
+# Allocation — min-1 floor + largest-remainder proportional
+# ===========================================================================
+
+# The REAL cross-tab, measured read-only from the live dark_factory graph on
+# 2026-08-05 via `docker exec docker-falkordb-1 redis-cli GRAPH.RO_QUERY`.
+# 16 non-empty cells of 20; 2770 episodes total. Frozen here as a test
+# constant deliberately: the allocator's hard cases are this census's shape
+# (a singleton cell, a 571-row cell, 4 empty cells), and a synthetic census
+# would not exercise them.
+CENSUS: dict[tuple[str, str], int] = {
+    ('2026-04', 'decisions_and_rationale'): 464,
+    ('2026-04', 'entities_and_relations'): 56,
+    ('2026-04', 'procedural_knowledge'): 1,
+    ('2026-04', 'temporal_facts'): 237,
+    ('2026-05', 'decisions_and_rationale'): 327,
+    ('2026-05', 'entities_and_relations'): 38,
+    ('2026-05', 'temporal_facts'): 391,
+    ('2026-06', 'decisions_and_rationale'): 171,
+    ('2026-06', 'entities_and_relations'): 10,
+    ('2026-06', 'temporal_facts'): 85,
+    ('2026-07', 'decisions_and_rationale'): 571,
+    ('2026-07', 'entities_and_relations'): 77,
+    ('2026-07', 'temporal_facts'): 163,
+    ('2026-08', 'decisions_and_rationale'): 153,
+    ('2026-08', 'entities_and_relations'): 9,
+    ('2026-08', 'temporal_facts'): 17,
+}
+
+CENSUS_POPULATION = 2770
+
+# The singleton cell. Its proportional share at N=200 is 1/2770 * 200 = 0.07,
+# so pure proportional allocation rounds it to zero and deletes an entire
+# payload kind from every downstream arm comparison.
+SINGLETON_CELL = ('2026-04', 'procedural_knowledge')
+
+
+class TestAllocate:
+    """``allocate`` splits N across the non-empty cells, exactly and deterministically."""
+
+    def test_census_constant_matches_its_stated_population(self):
+        """Guards the test's own premise — a typo'd census would test nothing."""
+        assert sum(CENSUS.values()) == CENSUS_POPULATION
+        assert len(CENSUS) == 16
+
+    @pytest.mark.parametrize('n', [150, 200, 300])
+    def test_sums_to_exactly_n(self, n):
+        """Across the whole PRD band (150-300), not just the default."""
+        assert sum(_mod.allocate(CENSUS, n).values()) == n
+
+    @pytest.mark.parametrize('n', [150, 200, 300])
+    def test_every_non_empty_cell_gets_at_least_one(self, n):
+        alloc = _mod.allocate(CENSUS, n)
+        assert set(alloc) == set(CENSUS)
+        assert all(v >= 1 for v in alloc.values()), {
+            cell: v for cell, v in alloc.items() if v < 1
+        }
+
+    @pytest.mark.parametrize('n', [150, 200, 300])
+    def test_singleton_cell_survives_the_floor(self, n):
+        """The whole reason a min-1 floor exists rather than pure proportional.
+
+        procedural_knowledge has exactly ONE episode in the entire store. Its
+        proportional share is 0.07 seats at N=200; without the floor the payload
+        kind vanishes from the corpus and no downstream arm comparison can ever
+        see it — an invisible coverage loss that would make the eval lie.
+        """
+        assert _mod.allocate(CENSUS, n)[SINGLETON_CELL] == 1
+
+    @pytest.mark.parametrize('n', [16, 20, 150, 200, 300, 1000, 2770])
+    def test_never_allocates_more_than_a_cell_holds(self, n):
+        """You cannot draw 5 episodes from a cell of 1."""
+        alloc = _mod.allocate(CENSUS, n)
+        over = {c: (alloc[c], CENSUS[c]) for c in alloc if alloc[c] > CENSUS[c]}
+        assert not over, over
+        assert sum(alloc.values()) == n
+
+    def test_allocation_is_broadly_proportional(self):
+        """The floor must not swamp the proportionality it is protecting.
+
+        The largest cell (2026-07 d_and_r, 20.6% of the store) should still
+        receive roughly its share, not be flattened toward the singleton.
+        """
+        alloc = _mod.allocate(CENSUS, 200)
+        biggest = ('2026-07', 'decisions_and_rationale')
+        share = CENSUS[biggest] / CENSUS_POPULATION
+        assert abs(alloc[biggest] - share * 200) <= 3
+
+    def test_is_deterministic_no_rng(self):
+        """Same input, same output — repeatedly, and independent of dict order."""
+        first = _mod.allocate(CENSUS, 200)
+        for _ in range(5):
+            assert _mod.allocate(CENSUS, 200) == first
+        reordered = dict(sorted(CENSUS.items(), reverse=True))
+        assert _mod.allocate(reordered, 200) == first
+
+    def test_n_greater_than_population_raises(self):
+        """Never silently return fewer than asked for."""
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod.allocate(CENSUS, CENSUS_POPULATION + 1)
+        assert str(CENSUS_POPULATION) in str(exc.value)
+
+    def test_n_equal_to_population_takes_everything(self):
+        alloc = _mod.allocate(CENSUS, CENSUS_POPULATION)
+        assert alloc == CENSUS
+
+    def test_n_below_cell_count_raises(self):
+        """The floor is not satisfiable, so the request is rejected, not shaved.
+
+        Silently dropping cells to fit would be exactly the invisible coverage
+        loss the floor exists to prevent.
+        """
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod.allocate(CENSUS, 15)
+        assert '16' in str(exc.value)
+
+    @pytest.mark.parametrize('n', [0, -1])
+    def test_non_positive_n_raises(self, n):
+        with pytest.raises(_mod.CorpusBuildError):
+            _mod.allocate(CENSUS, n)
+
+    def test_empty_cells_are_rejected_not_silently_seated(self):
+        """A zero-count cell cannot receive the min-1 floor.
+
+        It must be excluded before allocation, not floored into existence — a
+        seat in an empty cell is a seat that can never be filled, and the total
+        would then not sum to N.
+        """
+        with pytest.raises(_mod.CorpusBuildError):
+            _mod.allocate({**CENSUS, ('2026-09', 'temporal_facts'): 0}, 200)
