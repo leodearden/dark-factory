@@ -28,6 +28,7 @@ import digest as digest_mod
 import inventory
 import pytest
 from legibility import census_trigger
+from shared.cap_markers import REAL_CLI_CAP_MESSAGES
 
 import config as config_mod
 
@@ -621,6 +622,54 @@ def test_preflight_headroom_invocation_error_defers_fail_safe():
         )
 
     result = mod.preflight_headroom(raising_invoke, model="sonnet")
+    assert result.ok is False
+    assert result.reason
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / DEFECT 1: the probe's marker list must cover the cap text the
+# CLI ACTUALLY emits, not just the four strings this module happened to
+# start with.
+#
+# The corpus is IMPORTED from shared.cap_markers rather than restated here.
+# That is the whole point: the marker list is a CONTRACT checked against real
+# CLI transcripts at both consuming sites, so a future cap rewording is one
+# corpus edit that turns this suite AND shared/tests/test_cap_markers.py red
+# until the markers cover it — instead of the situation this task found, where
+# the same blind spot had to be discovered independently at two sites.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_preflight_headroom_defers_on_every_real_cli_cap_message(message):
+    """Every verbatim real-CLI cap message defers, naming the matched marker.
+
+    Fails today on the weekly-limit, "You've used all available credits" and
+    "You're out of extra usage" messages: none of them contains any of the
+    four original markers, so a weekly cap sailed through the preflight and
+    every subsequent verify call was fail-closed rejected as an ordinary
+    verdict.
+    """
+    fake_invoke = _make_fake_invoke(default=message)
+    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    assert result.ok is False, f"real CLI cap message passed the probe: {message!r}"
+    assert result.reason
+    # The reason must quote the marker that fired, so an operator reading the
+    # log can tell WHICH signal tripped rather than just that something did.
+    assert "banner marker" in result.reason
+
+
+def test_preflight_headroom_defers_on_ticket_weekly_limit_phrasing():
+    """The exact phrasing quoted in task 3645, with a hyphen separator.
+
+    The corpus carries the middot spelling (the first-hand transcript); the
+    ticket quotes the hyphen one.  Both are pinned because the separator is
+    incidental punctuation the CLI has already varied, and a guard that
+    depends on it is one release away from silence.
+    """
+    fake_invoke = _make_fake_invoke(
+        default="You've hit your weekly limit - resets Aug 5, 11am"
+    )
+    result = mod.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is False
     assert result.reason
 
