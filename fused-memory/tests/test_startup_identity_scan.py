@@ -46,13 +46,10 @@ from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantF
 # re-run, group_id exclusion of a task-2115 foreign clone) against a REAL
 # FalkorDB server -- the mock tests above can only pin the Cypher
 # string/params shape, not FalkorDB's actual grouping/count semantics.
-# The reachability probe, connection constants and per-run graph name are
-# shared via a plain import from _fm_helpers (task 3502), which lives outside
-# conftest.py precisely to avoid the `sys.modules['conftest']` collision
-# documented in its own module docstring. Only the fixture body below (client
-# construction, stale-graph delete, teardown delete/aclose) remains
-# duplicated per module; do not re-fork the probe or the constants back into
-# this file.
+# The reachability probe, connection constants and per-run graph name come
+# from _fm_helpers (task 3502) — see its module docstring for why it is not
+# conftest.py. Only the fixture body below is per-module; do not re-fork the
+# shared helpers back into this file.
 #
 # Skipped automatically when FalkorDB is not reachable; the mock tests above
 # guarantee coverage in that case.
@@ -424,8 +421,8 @@ class TestInitializeSkipMaintenance:
 # uniqueness, or whether ID(e) enumeration + `WHERE ID(e) = $eid` keying
 # genuinely rewrites the intended edge while leaving the rest untouched.
 # These tests pin the true B5/B6 semantics against a REAL FalkorDB server,
-# mirroring test_merge_entities.py:1021-1131 (task 2207 W6-δ's own live
-# pin for the sibling redirect_node_edges fix).
+# mirroring test_merge_entities.py's TestRedirectNodeEdgesLiveFalkorDB (task
+# 2207 W6-δ's own live pin for the sibling redirect_node_edges fix).
 # ---------------------------------------------------------------------------
 
 
