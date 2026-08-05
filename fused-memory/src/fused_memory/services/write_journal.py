@@ -29,7 +29,10 @@ CREATE TABLE IF NOT EXISTS write_ops (
     result_summary TEXT,
     success INTEGER DEFAULT 1,
     error TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    terminal_status TEXT,
+    terminal_at TEXT,
+    terminal_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_wo_causation ON write_ops(causation_id);
 CREATE INDEX IF NOT EXISTS idx_wo_project_time ON write_ops(project_id, created_at);
@@ -211,6 +214,26 @@ class WriteJournal:
                     "UPDATE write_ops SET kind = 'read' WHERE operation = 'search'"
                 )
                 logger.info('Migration: added kind column to write_ops, backfilled reads')
+
+            # terminal_* (task 3582): the durable queue's eventual outcome,
+            # written back onto the write_op row. NULLable with no
+            # `NOT NULL DEFAULT`, which keeps SQLite's ADD COLUMN O(1) on the
+            # 16.6M-row live journal (no table rewrite, no startup stall — see
+            # the idx_wo_created deployment note in SCHEMA_SQL above).
+            # Deliberately NOT backfilled (unlike `kind`): a pre-change row's
+            # terminal outcome is genuinely unknown and must stay NULL rather
+            # than be guessed.
+            if 'terminal_status' not in existing:
+                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_status TEXT')
+                logger.info('Migration: added terminal_status column to write_ops')
+
+            if 'terminal_at' not in existing:
+                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_at TEXT')
+                logger.info('Migration: added terminal_at column to write_ops')
+
+            if 'terminal_error' not in existing:
+                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_error TEXT')
+                logger.info('Migration: added terminal_error column to write_ops')
 
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
