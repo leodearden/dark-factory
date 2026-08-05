@@ -20,12 +20,12 @@ A `—` cell is **no measurement**, not a measured zero.
 
 | arm | claim recall@5 | claim recall@10 | canonical in top-5 | median canonical rank | tokens/query | guard candidate present | guard matched (replay) | pin changed window |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| status_quo | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3832.8 | 1.00 | 0.00 (n=12/15) | — |
-| status_quo+pin | 0.78 | 0.90 | 0.54 | 3.00 (n=171/236) | 3832.8 | 1.00 | 0.00 (n=12/15) | 0.00 |
-| c_peers | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1181.3 | 0.93 | 0.00 (n=12/15) | — |
-| c_peers+pin | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1181.3 | 0.93 | 0.00 (n=12/15) | 0.00 |
-| b_grouped | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1196.8 | 0.93 | 0.00 (n=12/15) | — |
-| b_grouped+pin | 0.98 | 0.99 | 0.97 | 1.00 (n=232/236) | 1203.3 | 0.93 | 0.00 (n=12/15) | 0.06 |
+| status_quo | 0.78 | 0.90 | 0.53 | 3.00 (n=172/236) | 3830.7 | 1.00 | 0.00 (n=12/15) | — |
+| status_quo+pin | 0.78 | 0.90 | 0.53 | 3.00 (n=172/236) | 3830.7 | 1.00 | 0.00 (n=12/15) | 0.00 |
+| c_peers | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1180.6 | 0.93 | 0.00 (n=12/15) | — |
+| c_peers+pin | 0.94 | 0.97 | 0.50 | 3.00 (n=154/236) | 1180.6 | 0.93 | 0.00 (n=12/15) | 0.00 |
+| b_grouped | 0.86 | 0.87 | 0.97 | 1.00 (n=232/236) | 1195.7 | 0.93 | 0.00 (n=12/15) | — |
+| b_grouped+pin | 0.86 | 0.87 | 0.97 | 1.00 (n=232/236) | 1202.0 | 0.93 | 0.00 (n=12/15) | 0.06 |
 
 Token counts come from the `char-proxy:4-chars-per-token` estimator (recorded because a substituted estimator would otherwise be indistinguishable from a measured one).  Guard threshold: 0.92.  Distractor slab: 300 records, identical in every arm.
 
@@ -45,10 +45,10 @@ eval-design §5 E2 names claim recall and canonical/topic discoverability as DIS
 
 | arm | kind | queries | claim recall@5 | claim recall@10 | canonical in top-5 | median canonical rank |
 | --- | --- | --- | --- | --- | --- | --- |
-| status_quo | claim | 176 | 0.80 | 0.90 | 0.47 | 3.00 (n=117/176) |
+| status_quo | claim | 176 | 0.80 | 0.90 | 0.47 | 3.00 (n=118/176) |
 | status_quo | topic_phrasing | 60 | 0.73 | 0.90 | 0.73 | 3.00 (n=54/60) |
 | status_quo | held_out | 20 | 0.65 | 0.85 | 0.65 | 4.00 (n=17/20) |
-| status_quo+pin | claim | 176 | 0.80 | 0.90 | 0.47 | 3.00 (n=117/176) |
+| status_quo+pin | claim | 176 | 0.80 | 0.90 | 0.47 | 3.00 (n=118/176) |
 | status_quo+pin | topic_phrasing | 60 | 0.73 | 0.90 | 0.73 | 3.00 (n=54/60) |
 | status_quo+pin | held_out | 20 | 0.65 | 0.85 | 0.65 | 4.00 (n=17/20) |
 | c_peers | claim | 176 | 0.99 | 1.00 | 0.41 | 3.00 (n=100/176) |
@@ -57,10 +57,10 @@ eval-design §5 E2 names claim recall and canonical/topic discoverability as DIS
 | c_peers+pin | claim | 176 | 0.99 | 1.00 | 0.41 | 3.00 (n=100/176) |
 | c_peers+pin | topic_phrasing | 60 | 0.77 | 0.90 | 0.77 | 2.00 (n=54/60) |
 | c_peers+pin | held_out | 20 | 0.60 | 0.80 | 0.60 | 1.50 (n=16/20) |
-| b_grouped | claim | 176 | 0.99 | 1.00 | 0.99 | 1.00 (n=174/176) |
+| b_grouped | claim | 176 | 0.84 | 0.84 | 0.99 | 1.00 (n=174/176) |
 | b_grouped | topic_phrasing | 60 | 0.93 | 0.97 | 0.93 | 1.00 (n=58/60) |
 | b_grouped | held_out | 20 | 0.85 | 0.90 | 0.85 | 1.00 (n=18/20) |
-| b_grouped+pin | claim | 176 | 0.99 | 1.00 | 0.99 | 1.00 (n=174/176) |
+| b_grouped+pin | claim | 176 | 0.84 | 0.84 | 0.99 | 1.00 (n=174/176) |
 | b_grouped+pin | topic_phrasing | 60 | 0.93 | 0.97 | 0.93 | 1.00 (n=58/60) |
 | b_grouped+pin | held_out | 20 | 0.85 | 0.90 | 0.85 | 1.00 (n=18/20) |
 

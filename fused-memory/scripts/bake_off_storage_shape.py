@@ -845,9 +845,13 @@ def apply_grouped_read(
     PRD **D6 (mandatory)**: a child hit resolves UPWARD, so a child's content
     is never unreachable — that unreachability is the whole objection to
     δ/Option B, and a grouped read that did not fix it would be arbitrating
-    a strawman.  Every claim the collapsed children realized is credited to
-    the group, or arm (b) would lose claim-recall precisely *for grouping
-    correctly*.
+    a strawman.  Every claim whose text the grouped document actually
+    RENDERS is credited to the group, or arm (b) would lose claim-recall
+    precisely *for grouping correctly*.  Sightings are the exception: they
+    collapse to a count, their bodies never reach the reader, and so their
+    claims are NOT credited — the crediting rule and the rendering rule are
+    held in agreement so arm (b) cannot bank recall and a token discount for
+    the same content at once.
 
     PRD **V2**: a ``contested`` child is NEVER suppressed.  It survives as
     its own hit alongside the grouped document and its body is kept out of
@@ -909,8 +913,20 @@ def apply_grouped_read(
             if m.metadata.get('kind') not in ('amendment', 'sighting')
         ]
 
-        claim_ids = list(canonical.claim_ids)
-        for member in members:
+        # Credit ONLY the claims whose text actually reaches the reader.
+        # Sightings are collapsed to a bare count by
+        # `_render_grouped_document`, so their bodies are NOT in the returned
+        # payload; crediting them would hand arm (b) claim-recall AND the
+        # token discount for the same content — a double advantage in exactly
+        # the two columns gate η reads the decision table on.  The D6
+        # justification above ("or arm (b) would lose claim-recall precisely
+        # for grouping correctly") holds for amendments and other kinds,
+        # whose text IS rendered; it does not hold for a counted sighting.
+        # If a sighting's claim is meant to be recallable, the fix is to
+        # render its body and pay the tokens — not to credit it unrendered.
+        credited = [canonical, *amendments, *others]
+        claim_ids: list[str] = []
+        for member in credited:
             for claim_id in member.claim_ids:
                 if claim_id not in claim_ids:
                     claim_ids.append(claim_id)

@@ -830,7 +830,53 @@ class TestGroupedReadUpwardResolution:
         )
 
         assert len(grouped) == 1
-        assert set(grouped[0].claim_ids) == {'k1', 'k2', 'k3'}
+        # k3 is the SIGHTING's claim: collapsed to a count, body never
+        # rendered, so it is not credited. See the sighting test below.
+        assert set(grouped[0].claim_ids) == {'k1', 'k2'}
+
+    def test_a_counted_sightings_claim_is_not_credited_to_the_group(self):
+        """Crediting must agree with rendering.
+
+        `_render_grouped_document` collapses sightings to `[sightings: N]` —
+        none of their text reaches the reader — while `tokens_returned`
+        charges arm (b) only for that count.  Crediting the sighting's claim
+        anyway gave arm (b) claim-recall AND the token discount for the same
+        content simultaneously, a double advantage in exactly the two columns
+        the η decision table is read on.  Material, not theoretical: 34 of the
+        176 fixture claims carry `b_arm_role='sighting'` with substantive
+        bodies, and 34 of the 236 queries expect one of them.
+        """
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        seen, _ = _hit('child-a', parent_id=PARENT, kind='sighting',
+                       content='THE SIGHTING BODY', claim_ids=['k-sighting'])
+        records_by_id = {PARENT: parent, 'child-a': seen}
+
+        grouped = mod.apply_grouped_read([seen], records_by_id, contested_ids=set())
+
+        assert len(grouped) == 1
+        # The body is genuinely absent from the payload ...
+        assert 'THE SIGHTING BODY' not in grouped[0].content
+        # ... so the claim must not be scored as realized.
+        assert set(grouped[0].claim_ids) == {'k1'}
+
+    def test_a_third_kinds_claim_is_still_credited_because_its_body_renders(self):
+        """The exclusion is scoped to sightings, not to every non-amendment.
+
+        `others` children ARE pasted into the document verbatim, so their
+        claims stay credited — otherwise the fix would swing the bias the
+        other way and penalise arm (b) for content it does return.
+        """
+        mod = _mod()
+        parent, _ = _hit(PARENT, canonical=True, content='CANON', claim_ids=['k1'])
+        other, _ = _hit('child-a', parent_id=PARENT, kind='retraction',
+                        content='THE RETRACTION TEXT', claim_ids=['k2'])
+        records_by_id = {PARENT: parent, 'child-a': other}
+
+        grouped = mod.apply_grouped_read([other], records_by_id, contested_ids=set())
+
+        assert 'THE RETRACTION TEXT' in grouped[0].content
+        assert set(grouped[0].claim_ids) == {'k1', 'k2'}
 
     def test_collapse_preserves_the_better_of_the_collapsed_ranks(self):
         """The group must land where its BEST member ranked.

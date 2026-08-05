@@ -52,9 +52,9 @@
         "at_10": 0.902542372881356
       },
       "discoverability": {
-        "canonical_in_top_5_rate": 0.538135593220339,
+        "canonical_in_top_5_rate": 0.5338983050847458,
         "median_canonical_rank": 3.0,
-        "canonical_found_count": 171,
+        "canonical_found_count": 172,
         "canonical_candidates": 236,
         "canonical_rank_window": 10
       },
@@ -66,9 +66,9 @@
             "at_10": 0.9034090909090909
           },
           "discoverability": {
-            "canonical_in_top_5_rate": 0.4715909090909091,
+            "canonical_in_top_5_rate": 0.4659090909090909,
             "median_canonical_rank": 3.0,
-            "canonical_found_count": 117,
+            "canonical_found_count": 118,
             "canonical_candidates": 176,
             "canonical_rank_window": 10
           }
@@ -103,7 +103,7 @@
         }
       },
       "tokens_per_query": {
-        "mean": 3832.8050847457625,
+        "mean": 3830.7033898305085,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -112,7 +112,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.89916354,
+        "max_observed_score": 0.89912236,
         "probes": 15,
         "guard_covered_probes": 12,
         "guard_covered_category": "procedural_knowledge"
@@ -128,9 +128,9 @@
         "at_10": 0.902542372881356
       },
       "discoverability": {
-        "canonical_in_top_5_rate": 0.538135593220339,
+        "canonical_in_top_5_rate": 0.5338983050847458,
         "median_canonical_rank": 3.0,
-        "canonical_found_count": 171,
+        "canonical_found_count": 172,
         "canonical_candidates": 236,
         "canonical_rank_window": 10
       },
@@ -142,9 +142,9 @@
             "at_10": 0.9034090909090909
           },
           "discoverability": {
-            "canonical_in_top_5_rate": 0.4715909090909091,
+            "canonical_in_top_5_rate": 0.4659090909090909,
             "median_canonical_rank": 3.0,
-            "canonical_found_count": 117,
+            "canonical_found_count": 118,
             "canonical_candidates": 176,
             "canonical_rank_window": 10
           }
@@ -179,7 +179,7 @@
         }
       },
       "tokens_per_query": {
-        "mean": 3832.8050847457625,
+        "mean": 3830.7033898305085,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -188,7 +188,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.89916354,
+        "max_observed_score": 0.89912236,
         "probes": 15,
         "guard_covered_probes": 12,
         "guard_covered_category": "procedural_knowledge"
@@ -255,7 +255,7 @@
         }
       },
       "tokens_per_query": {
-        "mean": 1181.2881355932204,
+        "mean": 1180.614406779661,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -264,7 +264,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.866318,
+        "max_observed_score": 0.8662588,
         "probes": 15,
         "guard_covered_probes": 12,
         "guard_covered_category": "procedural_knowledge"
@@ -331,7 +331,7 @@
         }
       },
       "tokens_per_query": {
-        "mean": 1181.2881355932204,
+        "mean": 1180.614406779661,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -340,7 +340,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.866318,
+        "max_observed_score": 0.8662588,
         "probes": 15,
         "guard_covered_probes": 12,
         "guard_covered_category": "procedural_knowledge"
@@ -352,8 +352,8 @@
         "window_changed_rate": null
       },
       "claim_recall": {
-        "at_5": 0.9788135593220338,
-        "at_10": 0.9915254237288136
+        "at_5": 0.8601694915254238,
+        "at_10": 0.8728813559322034
       },
       "discoverability": {
         "canonical_in_top_5_rate": 0.9745762711864406,
@@ -366,8 +366,8 @@
         "claim": {
           "queries": 176,
           "claim_recall": {
-            "at_5": 0.9943181818181818,
-            "at_10": 1.0
+            "at_5": 0.8352272727272727,
+            "at_10": 0.8409090909090909
           },
           "discoverability": {
             "canonical_in_top_5_rate": 0.9886363636363636,
@@ -407,7 +407,7 @@
         }
       },
       "tokens_per_query": {
-        "mean": 1196.7796610169491,
+        "mean": 1195.7415254237287,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -425,11 +425,11 @@
     "b_grouped+pin": {
       "pin": {
         "enabled": true,
-        "window_changed_rate": 0.061601642710472276
+        "window_changed_rate": 0.059548254620123205
       },
       "claim_recall": {
-        "at_5": 0.9788135593220338,
-        "at_10": 0.9915254237288136
+        "at_5": 0.8601694915254238,
+        "at_10": 0.8728813559322034
       },
       "discoverability": {
         "canonical_in_top_5_rate": 0.9745762711864406,
@@ -442,8 +442,8 @@
         "claim": {
           "queries": 176,
           "claim_recall": {
-            "at_5": 0.9943181818181818,
-            "at_10": 1.0
+            "at_5": 0.8352272727272727,
+            "at_10": 0.8409090909090909
           },
           "discoverability": {
             "canonical_in_top_5_rate": 0.9886363636363636,
@@ -483,7 +483,7 @@
         }
       },
       "tokens_per_query": {
-        "mean": 1203.2966101694915,
+        "mean": 1202.0211864406779,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
