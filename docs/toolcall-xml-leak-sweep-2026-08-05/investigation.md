@@ -233,9 +233,78 @@ discard.
 
 ---
 
-## 4. What was repaired
+## 4. What was repaired — **nothing, and one record was lost**
 
-<!-- APPLY -->
+> **Status: escalated as a blocker (`esc-3567-2`). Store state needs human
+> adjudication. Do not re-run the sweep to "fix" this.**
+
+The gate opened (`repairable_tail 0 + repairable_duplicate 1 = 1 ≥ 1`), so
+`--apply` ran, with the dry-run report and its sidecar already committed —
+`a1b77e3265` and `1b7906526b`. That ordering is the only reason this section
+can be written at all.
+
+```
+cd fused-memory
+uv run python scripts/sweep_toolcall_xml_leak.py --apply --exhaustive \
+  > ../docs/toolcall-xml-leak-sweep-2026-08-05/apply-report.json
+# exit 1 — see below; NOT the benign manual_review-only case
+```
+
+**Outcome: 0 repaired, 1 record deleted with no re-add.**
+
+| | |
+|---|---|
+| Record | `7d073281-4c5d-4ba3-a01c-3a167f4460f4` (the sole `repairable_duplicate`) |
+| Flag | `record_error` — *"attempt to write a readonly database"* |
+| `repaired` | `false`; no `new_id` recorded |
+| Qdrant state | **absent** — measured read-only after the run, 0 points returned for that id |
+| Point count | 21,089 → 21,088 (net −1) |
+| Surviving copy | **git only** — `dry-run-report.json` @ `a1b77e3265`: 867-char original + the intended 415-char `repaired_content` |
+
+### Why exit 1 here is *not* the benign case
+
+`resolve_exit_code` returns 1 for two independent reasons on this run. The
+first — 40 `manual_review` records left behind — is the expected disclosure the
+plan anticipated. The second is not: `record_error` is one of the four
+per-record outcomes the runbook says a human must adjudicate. Reading the exit
+code alone would have hidden this. The flag scan is what surfaced it.
+
+### What actually happened
+
+The traceback puts the failure **inside `delete_memory`**
+(`memory_service.py:4058` → `_journaled_backend_call:1294` →
+`sqlite3.OperationalError`), *not* in the re-add. So the Qdrant point removal
+had already succeeded and the exception aborted the repair before a re-add was
+ever attempted. This is the `content_lost_in_flight` situation in substance,
+arriving under the `record_error` flag.
+
+### Root cause — measured, not guessed
+
+**The agent sandbox denies file *creation* in `~/.mem0`.** A probe from the same
+environment shows `open('~/.mem0/.write-probe', 'w')` raises
+`PermissionError [Errno 13]`, while the existing `history.db` still accepts
+`BEGIN IMMEDIATE`. SQLite cannot create its rollback journal in that directory,
+so it reports *"attempt to write a readonly database"*. The db file itself is
+mode `0644`, uid 1000, `os.access(W_OK)=True` — this is **not** a filesystem
+permissions defect.
+
+### The operational lesson
+
+**`--apply` must not be run from inside a sandboxed agent session.** The Qdrant
+mutation is a network call to `localhost:6333` and succeeds; mem0's local SQLite
+history write is blocked. The sandbox splits delete-then-re-add exactly down the
+middle and produces partial mutations. That is a property of the *environment*,
+not of the sweep — which behaved correctly throughout: it recorded the error on
+the record, kept going rather than discarding the report, and refused all 40
+`manual_review` records.
+
+### Recovery
+
+The content is not lost, because it was committed first. To restore
+`7d073281`, re-add the 415-char `repaired_content` from `dry-run-report.json`
+(the clean, leak-free text) **from a non-sandboxed session**. Note the memory
+id will necessarily differ. Per the runbook, do **not** re-run the sweep to
+recover it.
 
 ---
 
