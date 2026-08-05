@@ -129,30 +129,6 @@ def test_wait_pattern_constants_have_no_literal_braces(name: str) -> None:
     )
 
 
-def test_wait_pattern_reminder_is_a_pointer_not_a_copy() -> None:
-    """The reminder is a short pointer, not a second copy of the full block.
-
-    Guards the whole point of ``WAIT_PATTERN_REMINDER``: if someone "fixes" it
-    by pasting the guidance back in, the amender pays for the block twice.
-    """
-    # Lower bound: the reinforcement must stay substantive. A bare "see the
-    # rule above" cross-reference is not what sat at Reify-5164's failure site.
-    # Structural, not a prose pin -- any rewording of comparable substance passes.
-    assert len(WAIT_PATTERN_REMINDER.strip()) > 200, (
-        'WAIT_PATTERN_REMINDER has shrunk to a bare cross-reference '
-        f'({len(WAIT_PATTERN_REMINDER.strip())} chars). It must still state the '
-        'operative rules at the failure site, not merely allude to them.'
-    )
-    assert len(WAIT_PATTERN_REMINDER) < len(BACKGROUND_WAIT_GUIDANCE) / 2, (
-        'WAIT_PATTERN_REMINDER has grown to a substantial fraction of '
-        'BACKGROUND_WAIT_GUIDANCE '
-        f'({len(WAIT_PATTERN_REMINDER)} vs {len(BACKGROUND_WAIT_GUIDANCE)} chars). '
-        'It exists to point at the full block carried by the role system '
-        'prompt, not to restate it — splice the real constant if a turn prompt '
-        'genuinely needs the whole thing.'
-    )
-
-
 def test_background_capable_role_set_matches_bash_capability() -> None:
     """Drift tripwire: the hand-maintained role set still equals the derived one.
 

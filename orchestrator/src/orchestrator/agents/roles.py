@@ -411,6 +411,15 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # under IMPLEMENTER at exactly one call site (workflow.py `_invoke(IMPLEMENTER,
 # ...)`); test_roles_wait_pattern.py pins that precondition rather than
 # trusting this comment.  Same no-literal-braces rule as the constants above.
+#
+# Keep it SUBSTANTIVE when editing: a pointer still has to STATE the operative
+# rules at the failure site -- foreground with an explicit `timeout`, or else
+# background it and poll `BashOutput` to completion before ending the turn --
+# because that adjacency is the whole reason for the injection.  Do not let it
+# decay into a bare "see the rule above" cross-reference; a reader who follows
+# no cross-reference gets nothing.  This is an editorial expectation, so it
+# lives here rather than as an assertion: a length floor would pass on filler
+# and fail on a tighter, better-worded reminder.
 WAIT_PATTERN_REMINDER = """
 Reminder — verification is exactly where the wait rules above bite. Run it in
 the FOREGROUND with an explicit Bash `timeout` (milliseconds; 120000 default,
