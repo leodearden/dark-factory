@@ -91,6 +91,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -539,6 +540,165 @@ def select(population: list[EpisodeRecord], n: int, *, seed: str) -> SelectionRe
         allocation=allocation,
         cell_counts=cell_counts,
     )
+
+
+# ---------------------------------------------------------------------------
+# The reader seam — GRAPH.RO_QUERY, no graphiti driver
+# ---------------------------------------------------------------------------
+
+DEFAULT_GRAPH = 'dark_factory'
+"""The graph this corpus is drawn from."""
+
+RO_COMMAND = 'GRAPH.RO_QUERY'
+"""The only FalkorDB command this builder is permitted to issue.
+
+Read-only here is **server-enforced**, not client-promised: a ``CREATE`` issued
+through this command path was refused in a live probe and materialized no
+graph. That is a strictly stronger guarantee than a client-side convention,
+and it is why this builder reads over Cypher rather than through the product
+read path.
+"""
+
+POPULATION_CYPHER = 'MATCH (e:Episodic) RETURN ' + ', '.join(
+    f'e.{field}' for field in PROJECTED_FIELDS
+)
+"""The single query this builder issues. Built from :data:`PROJECTED_FIELDS`.
+
+Note what is deliberately absent:
+
+* **No ``entity_edges``** and no other incumbent-success signal — the binding
+  hazard. The projection is derived from one constant that a test pins, so the
+  query and the manifest's claim about the query cannot drift apart.
+* **No ``WHERE``** — no filter of any kind. The population IS the population.
+* **No ``LIMIT``** — the full population is required or the stratum
+  denominators are wrong, and every proportional share computed from them
+  would be wrong with it.
+
+Why not the product ``get_episodes`` read path: ``MemoryService.get_episodes``
+projects six fields that do **not** include ``source_description`` — which is
+the payload-kind stratification dimension here — and the MCP tool clamps
+``last_n`` to 1000, well below the ~2770-row population.
+"""
+
+
+class EpisodeReader:
+    """Reads the ``Episodic`` population over ``GRAPH.RO_QUERY``.
+
+    Constructed either with an explicit *graph* handle (the tests pass a
+    double) or with host/port, in which case it opens a ``falkordb.asyncio``
+    client lazily.
+
+    ``falkordb.FalkorDB`` — the DB client — is categorically distinct from
+    ``graphiti_core.driver.falkordb_driver.FalkorDriver``, the graphiti driver
+    whose ``__init__`` fire-and-forgets ``build_indices_and_constraints()``.
+    This class must never construct the latter; see the module docstring's
+    warning and the in-tree precedent at
+    ``fused-memory/tests/test_list_indices_integration.py``.
+    """
+
+    def __init__(
+        self,
+        *,
+        graph: object | None = None,
+        graph_name: str = DEFAULT_GRAPH,
+        host: str | None = None,
+        port: int | None = None,
+    ) -> None:
+        self._graph = graph
+        self.graph_name = graph_name
+        self.host = host if host is not None else _falkor_host_from_env()
+        self.port = port if port is not None else _falkor_port_from_env()
+
+    @staticmethod
+    def assert_read_only_command(command: str) -> None:
+        """Raise unless *command* is :data:`RO_COMMAND`.
+
+        A client-side guard layered on top of the server-side one. The server
+        would refuse a write anyway; this makes the violation a typed
+        :class:`CorpusBuildError` at the seam that owns the guarantee, rather
+        than a redis error surfacing from three layers down where a reader
+        would not connect it to this module's read-only claim.
+        """
+        if command != RO_COMMAND:
+            raise CorpusBuildError(
+                f'build_corpus may only issue {RO_COMMAND}, refused {command!r} — '
+                f'this script is strictly read-only'
+            )
+
+    def _resolve_graph(self) -> object:
+        """Return the graph handle, opening a client on first use.
+
+        The import is local so that merely importing this module — which the
+        tests do, with a double in hand — never drags in the falkordb client.
+        """
+        if self._graph is None:
+            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
+
+            self._graph = FalkorDB(host=self.host, port=self.port).select_graph(
+                self.graph_name
+            )
+        return self._graph
+
+    async def fetch_population(self) -> list[EpisodeRecord]:
+        """Return every ``Episodic`` node, projected to :class:`EpisodeRecord`.
+
+        One query, no filter, no limit. A row whose ``created_at`` or
+        ``source_description`` cannot be parsed aborts the build via
+        :class:`CorpusBuildError` rather than being dropped — a silently
+        dropped row would shrink a stratum's denominator and skew every
+        proportional share computed from it.
+        """
+        self.assert_read_only_command(RO_COMMAND)
+        graph = self._resolve_graph()
+        response = await graph.ro_query(POPULATION_CYPHER)  # type: ignore[attr-defined]
+        rows = getattr(response, 'result_set', response)
+        population: list[EpisodeRecord] = []
+        for index, row in enumerate(rows):
+            if len(row) != len(PROJECTED_FIELDS):
+                raise CorpusBuildError(
+                    f'row {index} has {len(row)} columns, expected '
+                    f'{len(PROJECTED_FIELDS)} {PROJECTED_FIELDS}'
+                )
+            record = EpisodeRecord(**dict(zip(PROJECTED_FIELDS, row, strict=True)))
+            stratum_key(record)  # fail fast and loudly on an unplaceable row
+            population.append(record)
+        if not population:
+            raise CorpusBuildError(
+                f'graph {self.graph_name!r} returned no Episodic nodes — refusing to '
+                f'build a corpus from an empty population'
+            )
+        return population
+
+
+def _falkor_host_from_env() -> str:
+    """FalkorDB host from ``FALKOR_HOST``, defaulting to localhost.
+
+    Same env vars and defaults as ``fused-memory/tests/_fm_helpers.py``, so an
+    operator who has pointed the test suite at a FalkorDB has pointed this
+    script at the same one.
+    """
+    return os.environ.get('FALKOR_HOST', 'localhost')
+
+
+def _falkor_port_from_env() -> int:
+    """FalkorDB port from ``FALKOR_PORT``, defaulting to 6379.
+
+    The ``int()`` is load-bearing: ``os.environ`` yields str and
+    ``FalkorDB(port='6379')`` misbehaves. Unset *or empty* takes the default —
+    empty is what a CI template like ``FALKOR_PORT: ${FALKOR_PORT}`` produces
+    when the variable is not set. A non-empty non-numeric value is an operator
+    error and says so, rather than reading as "FalkorDB not reachable".
+    """
+    raw = os.environ.get('FALKOR_PORT', '').strip()
+    if not raw:
+        return 6379
+    try:
+        return int(raw)
+    except ValueError:
+        raise CorpusBuildError(
+            f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
+            f'default (6379), or set it to the port your FalkorDB listens on.'
+        ) from None
 
 
 def record_field_names() -> tuple[str, ...]:
