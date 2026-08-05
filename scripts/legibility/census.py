@@ -1439,7 +1439,21 @@ def run_census(
                 unverified=len(clusters_to_verify),
             )
 
-    verify_result = verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
+    # A cap detected INSIDE verification lands here. The except must sit so
+    # the abort returns BEFORE the mass-rejection detector, synthesize_fn,
+    # compute_matrix, the codebook merge and every write -- the whole point is
+    # that nothing is persisted, so no cap-poisoned cluster is ever recorded
+    # as a verdict and last_census_at never advances past a window that was
+    # not actually adjudicated.
+    try:
+        verify_result = verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
+    except CensusHeadroomExhausted as exc:
+        return _defer(
+            "verify",
+            f"headroom exhausted during verification: {exc.reason}",
+            escalate_fn=escalate_fn,
+            unverified=exc.unverified,
+        )
     verified = verify_result.get("verified") or []
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
@@ -2391,7 +2405,17 @@ def main(argv: list[str] | None = None) -> int:
                 cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
             ),
             invoke=mining_invoke,
-            verify_fn=_build_default_verify_fn(str(project_root), verify_invoke),
+            # The in-verify re-probe rides the SAME cwd-scoped invoke as the
+            # verifier it guards (so it fails exactly when the verifier would)
+            # but on the cheap trickle tier, matching every other headroom
+            # gate -- one probe implementation, one model tier, four sites.
+            verify_fn=_build_default_verify_fn(
+                str(project_root),
+                verify_invoke,
+                headroom_probe=functools.partial(
+                    preflight_headroom, verify_invoke, model=cfg.models.trickle,
+                ),
+            ),
             synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
             submit_fn=default_submit_fn,
             escalate_fn=escalate_fn,
