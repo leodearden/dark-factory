@@ -1519,3 +1519,248 @@ class TestTransientErrorRetryPolicy:
             assert call_count == 4
         finally:
             await q.close()
+
+
+# ------------------------------------------------------------------
+# Terminal hook (task 3582)
+#
+# The queue's two terminal transitions — _mark_completed and the dead branch of
+# _handle_failure — are the ONE seam through which every enqueue site's
+# terminal outcome can be written back to the write journal. Putting it here
+# (rather than in each producer) makes the property queue-wide by construction.
+# ------------------------------------------------------------------
+
+
+class TestTerminalHook:
+    @staticmethod
+    def _recorder():
+        calls: list[tuple] = []
+
+        async def hook(write_op_id, status, error):
+            calls.append((write_op_id, status, error))
+
+        return calls, hook
+
+    @pytest.mark.asyncio
+    async def test_completed_fires_terminal_hook(self, tmp_path):
+        calls, hook = self._recorder()
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W1'},
+            )
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert calls == [('W1', 'completed', None)]
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_fires_terminal_hook(self, tmp_path):
+        calls, hook = self._recorder()
+        # RuntimeError is NOT in DEFAULT_TRANSIENT_ERROR_NAMES, so this takes
+        # max_attempts (2), not transient_max_attempts (12).
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=RuntimeError('always fails')),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W2'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert len(calls) == 1
+            write_op_id, status, error = calls[0]
+            assert write_op_id == 'W2'
+            assert status == 'dead'
+            assert error is not None and 'always fails' in error
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_does_not_fire_terminal_hook(self, tmp_path):
+        """Never fired for an intermediate 'retry' — only terminal states."""
+        calls, hook = self._recorder()
+        attempts = {'n': 0}
+
+        async def flaky(_operation, _payload):
+            attempts['n'] += 1
+            if attempts['n'] <= 2:
+                raise RuntimeError('transient-ish failure')
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=flaky,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=5,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W3'},
+            )
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert calls == [('W3', 'completed', None)]
+            assert attempts['n'] == 3
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_payload_without_write_op_id_skips_hook(self, tmp_path):
+        """replay_from_store / mem0_classify_and_add carry no _write_op_id."""
+        calls, hook = self._recorder()
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'no join key here'},
+            )
+
+            async def _completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+            assert calls == []
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_terminal_hook_exception_does_not_affect_item(self, tmp_path):
+        """A journaling hiccup must never flip a landed write back to retry."""
+        seen: list[str] = []
+
+        async def exploding_hook(write_op_id, _status, _error):
+            seen.append(write_op_id)
+            raise RuntimeError('journal is on fire')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=exploding_hook,
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'a', '_write_op_id': 'W4'},
+            )
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'b', '_write_op_id': 'W5'},
+            )
+
+            async def _both_completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 2
+
+            # The worker keeps draining despite the hook raising on every item.
+            await poll_until(_both_completed, timeout=20.0, interval=0.05)
+            stats = await q.get_stats(group_id='proj1')
+            assert stats['counts'].get('retry', 0) == 0
+            assert stats['counts'].get('dead', 0) == 0
+            assert seen == ['W4', 'W5']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_terminal_hook_runs_after_commit(self, tmp_path):
+        """The queue's durable state never depends on the journal write-back."""
+        observed: list[str | None] = []
+        q_ref: dict = {}
+
+        async def hook(_write_op_id, _status, _error):
+            stats = await q_ref['q'].get_stats(group_id='proj1')
+            observed.append(
+                'completed' if stats['counts'].get('completed', 0) >= 1 else 'not-yet'
+            )
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q_ref['q'] = q
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W6'},
+            )
+            await poll_until(lambda: len(observed) >= 1, timeout=20.0, interval=0.05)
+            assert observed == ['completed']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_no_hook_configured_is_noop(self, tmp_path):
+        """on_terminal defaults to None — existing behaviour unchanged."""
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            assert q._on_terminal is None
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W7'},
+            )
+
+            async def _completed():
+                stats = await q.get_stats(group_id='proj1')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+        finally:
+            await q.close()
