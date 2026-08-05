@@ -1,9 +1,7 @@
 """Tests for scripts/check_method_param_wiring.py (task 3364).
 
-The script exists because ``orchestrator/delivered_checks.py::_run_grep_check``
-shells to ``git grep -E`` — single-line POSIX ERE — so a file-scoped pattern
-cannot be pinned to one multi-line ``def``. These tests pin the AST analyzer
-that replaces it for capability ``qdrant-vector-access-for-ann`` (task 3210).
+Why the script exists at all — and why each conjunct is load-bearing — is
+argued once, in that module's own docstring; this file does not restate it.
 
 Imports the module under test bare (``import check_method_param_wiring``);
 ``scripts/tests/conftest.py`` already puts ``scripts/`` on ``sys.path``. No
@@ -13,6 +11,7 @@ verify chain (see the conftest docstring).
 import ast
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -178,13 +177,7 @@ class TestDeclaresParamAnnotation:
 
 
 class TestForwardsParamTo:
-    """Declaration alone is NOT the capability.
-
-    `qdrant-vector-access-for-ann` is vector *access*, not a signature shape. A
-    stub `with_vectors: bool = False` that is accepted and then dropped would
-    satisfy a declaration-only check while delivering nothing — the same
-    hollow-DELIVERED failure mode as the file-scoped grep, one level in.
-    """
+    """Declaration alone is NOT the capability (see the script's docstring)."""
 
     def test_true_for_the_real_forward(self, real_tree):
         """`client.scroll(..., with_vectors=with_vectors, ...)` on main."""
@@ -270,6 +263,47 @@ class TestForwardsParamTo:
         fn = _resolved(tree, 'target')
         assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is False
 
+    def test_a_forward_from_a_nested_def_that_shadows_the_param_does_not_count(self):
+        """Same scoping rule, one shadowing level IN rather than one out.
+
+        `inner`'s `with_vectors` is a fresh binding, so its forward says
+        nothing about the outer parameter — which this body in fact drops.
+        Plain `ast.walk` descends into nested `def`s and would call this
+        DELIVERED.
+        """
+        tree = cmpw.parse_module(
+            'def target(with_vectors: bool = False):\n'
+            '    def inner(with_vectors):\n'
+            '        return client.scroll(with_vectors=with_vectors)\n'
+            '    return client.scroll(with_payload=True)\n'
+        )
+        fn = _resolved(tree, 'target')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is False
+
+    def test_a_forward_from_a_shadowing_lambda_does_not_count(self):
+        tree = cmpw.parse_module(
+            'def target(with_vectors: bool = False):\n'
+            '    fetch = lambda with_vectors: client.scroll(with_vectors=with_vectors)\n'
+            '    return fetch(True)\n'
+        )
+        fn = _resolved(tree, 'target')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is False
+
+    def test_a_nested_scope_that_closes_over_the_param_still_counts(self):
+        """Only a REBINDING nested scope is pruned.
+
+        `inner` declares no `with_vectors`, so the name it forwards IS the
+        outer parameter — a real forward, just deferred.
+        """
+        tree = cmpw.parse_module(
+            'def target(with_vectors: bool = False):\n'
+            '    def inner():\n'
+            '        return client.scroll(with_vectors=with_vectors)\n'
+            '    return inner()\n'
+        )
+        fn = _resolved(tree, 'target')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is True
+
 
 # The argv the manifest declares, minus --file (each test supplies its own).
 _ARGV_TAIL = [
@@ -281,15 +315,10 @@ _ARGV_TAIL = [
 
 
 class TestMainExitCodeContract:
-    """`_run_script_check` maps rc==0 -> DELIVERED and ANY non-zero -> FAILED.
+    """rc==0 -> DELIVERED, ANY non-zero -> FAILED; no rc means "cannot tell".
 
-    There is no exit code meaning "I could not evaluate this". FAILED is a
-    definitive-absence claim that `Scheduler._compute_delivered_check_cache`
-    renders as a `DEP_CAPABILITY_NOT_DELIVERED` escalation whose blocked
-    dependents are explicitly NOT auto-re-pended. So every non-zero return must
-    be one this script understands, and must name which conjunct failed — an
-    operator reading that escalation has to be able to tell "the capability
-    regressed" from "the check's own arguments are stale".
+    So every non-zero return must be one the script understands and must name
+    which conjunct failed — argued in full in the script's docstring.
     """
 
     def _write(self, tmp_path, source: str, name: str = 'mod.py'):
@@ -373,6 +402,64 @@ class TestMainExitCodeContract:
         assert rc != 0
         assert 'could not parse' in capsys.readouterr().err
 
+    def test_undecodable_file_is_distinguishable(self, tmp_path, capsys):
+        """Decoding is pinned to UTF-8, not to the ambient locale.
+
+        `_run_script_check` execs this via `git_ops._run`, which forces
+        LC_ALL=C/LANG=C in the child. A decode failure must still be a
+        self-describing diagnostic, never a bare traceback.
+        """
+        target = tmp_path / 'latin1.py'
+        target.write_bytes(b'# caf\xe9\ndef f(with_vectors: bool = False):\n    pass\n')
+        rc = cmpw.main(['--file', str(target), '--function', 'f',
+                        '--param', 'with_vectors'])
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'not valid UTF-8' in err
+        assert 'check_method_param_wiring:' in err
+
+    def test_non_utf8_source_is_decoded_under_a_c_locale(self, tmp_path):
+        """The positive half: real non-ASCII content still parses.
+
+        Run as a subprocess under a scrubbed C locale with PEP 540's UTF-8 mode
+        explicitly DISABLED, so the assertion rests on this script's own
+        `encoding='utf-8'` rather than on an interpreter default.
+        """
+        target = tmp_path / 'unicode_mod.py'
+        target.write_text(
+            '"""Docstring with a — em dash and a ✓ check."""\n'
+            'def f(with_vectors: bool = False):\n'
+            '    return client.scroll(with_vectors=with_vectors)\n',
+            encoding='utf-8',
+        )
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), '--file', str(target), '--function', 'f',
+             '--param', 'with_vectors', '--annotation', 'bool', '--forwards-to', 'scroll'],
+            capture_output=True,
+            text=True,
+            env={'PATH': os.environ.get('PATH', ''), 'LC_ALL': 'C', 'LANG': 'C',
+                 'PYTHONUTF8': '0', 'PYTHONCOERCECLOCALE': '0'},
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_unknown_flag_is_not_reported_as_a_regression(self, tmp_path, capsys):
+        """A drifted manifest `args` list must not read as "capability gone".
+
+        argparse would exit 2 on its own, which `_run_script_check` maps to
+        FAILED — a definitive-absence claim about the capability.
+        """
+        target = self._write(tmp_path, REAL_SHAPE)
+        rc = cmpw.main(['--file', str(target), *_ARGV_TAIL, '--no-such-flag', 'x'])
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'check_method_param_wiring: check arguments are invalid' in err
+
+    def test_help_does_not_report_delivered_without_running_a_check(self, capsys):
+        """`--help` exits 0 in argparse; 0 here would mean DELIVERED."""
+        rc = cmpw.main(['--help'])
+        assert rc != 0
+        assert 'check arguments are invalid' in capsys.readouterr().err
+
     def test_every_diagnostic_is_distinct(self, tmp_path, capsys):
         """No two failure modes may print the same message.
 
@@ -395,6 +482,8 @@ class TestMainExitCodeContract:
             'def dup(with_vectors: bool = False):\n    pass\n',
             'dup.py',
         )
+        latin1 = tmp_path / 'latin1.py'
+        latin1.write_bytes(b'# caf\xe9\ndef f(with_vectors: bool = False):\n    pass\n')
         cases = [
             ['--file', str(good), '--function', 'nope', '--param', 'with_vectors'],
             ['--file', str(dup), '--function', 'dup', '--param', 'with_vectors'],
@@ -404,6 +493,8 @@ class TestMainExitCodeContract:
             ['--file', str(dropped), *_ARGV_TAIL],
             ['--file', str(tmp_path / 'absent.py'), *_ARGV_TAIL],
             ['--file', str(broken), *_ARGV_TAIL],
+            ['--file', str(latin1), '--function', 'f', '--param', 'with_vectors'],
+            ['--file', str(good), *_ARGV_TAIL, '--no-such-flag'],
         ]
         messages = []
         for argv in cases:
@@ -434,53 +525,6 @@ class TestMainOptionalConjuncts:
         assert capsys.readouterr().err == ''
 
 
-class TestEndToEndAgainstTheRealRepo:
-    """Exec the script the way `_run_script_check` actually does.
-
-    It builds ``argv = [str(project_root / meta.script), *meta.args]`` and execs
-    it directly, so this is the only test that covers the shebang and the
-    executable bit as well as the assertion. A non-executable target raises
-    OSError, which `run_delivered_check`'s catch-all maps to ERRORED — a check
-    that can never pass and never fail, i.e. a capability that is silently
-    un-gated while looking configured.
-    """
-
-    def _run(self, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [str(SCRIPT), *args], cwd=REPO_ROOT, capture_output=True, text=True
-        )
-
-    def test_manifest_argv_passes_on_the_real_module(self):
-        """The positive case, with exactly the argv the manifest declares."""
-        result = self._run(
-            '--file', MEM0_CLIENT,
-            '--function', 'scroll_by_metadata',
-            '--param', 'with_vectors',
-            '--annotation', 'bool',
-            '--forwards-to', 'scroll',
-        )
-        assert result.returncode == 0, result.stderr
-
-    def test_the_mutation_the_whole_file_grep_would_have_missed_fails(self):
-        """`get_point_by_id` declares no `with_vectors` parameter.
-
-        Its `with_vectors=False` is a literal on `client.retrieve`. The
-        superseded whole-file grep `'with_vectors: bool'` would have reported
-        DELIVERED had the parameter landed here instead of on
-        `scroll_by_metadata`; this is the regression proof that the replacement
-        is method-scoped.
-        """
-        result = self._run(
-            '--file', MEM0_CLIENT,
-            '--function', 'get_point_by_id',
-            '--param', 'with_vectors',
-            '--annotation', 'bool',
-            '--forwards-to', 'retrieve',
-        )
-        assert result.returncode != 0
-        assert 'check_method_param_wiring:' in result.stderr
-
-
 MANIFEST = REPO_ROOT / 'docs' / 'prds' / 'memory-eval-program.capability-manifest.yaml'
 CAPABILITY = 'qdrant-vector-access-for-ann'
 
@@ -504,6 +548,46 @@ def delivered_check() -> dict:
     pytest.fail(f'{CAPABILITY} not found in {MANIFEST}')
 
 
+class TestEndToEndAgainstTheRealRepo:
+    """Exec the script the way `_run_script_check` actually does.
+
+    It builds ``argv = [str(project_root / meta.script), *meta.args]`` and execs
+    it directly, so this is the only test that covers the shebang and the
+    executable bit as well as the assertion. The argv comes from the SIDECAR,
+    not from a second hardcoded copy — a manifest that drifts must fail here
+    rather than pass against an argv nothing runs.
+    """
+
+    def _run(self, script: str, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(REPO_ROOT / script), *args], cwd=REPO_ROOT, capture_output=True, text=True
+        )
+
+    def test_manifest_argv_passes_on_the_real_module(self, delivered_check):
+        """The positive case, run with exactly what the manifest declares."""
+        result = self._run(delivered_check['script'], *delivered_check['args'])
+        assert result.returncode == 0, result.stderr
+
+    def test_the_mutation_the_whole_file_grep_would_have_missed_fails(self, delivered_check):
+        """`get_point_by_id` declares no `with_vectors` parameter.
+
+        Its `with_vectors=False` is a literal on `client.retrieve`. The
+        superseded whole-file grep `'with_vectors: bool'` would have reported
+        DELIVERED had the parameter landed here instead of on
+        `scroll_by_metadata`; this is the regression proof that the replacement
+        is method-scoped.
+
+        Built by mutating the manifest's OWN argv, so it cannot drift into
+        testing a shape the real check no longer has.
+        """
+        args = list(delivered_check['args'])
+        args[args.index('--function') + 1] = 'get_point_by_id'
+        args[args.index('--forwards-to') + 1] = 'retrieve'
+        result = self._run(delivered_check['script'], *args)
+        assert result.returncode != 0
+        assert 'check_method_param_wiring:' in result.stderr
+
+
 class TestManifestScriptCoherence:
     """A manifest naming a script that cannot be exec'd is ERRORED forever.
 
@@ -512,6 +596,14 @@ class TestManifestScriptCoherence:
     whose docstring states it deliberately "Does NOT assert delivered_check
     `script:` targets exist on disk". That exclusion is exactly the silent
     un-gating this task exists to remove, so it is the one thing worth pinning.
+
+    NOTE (task 3364 review): the exists+executable property is generic to EVERY
+    `kind: script` check in every checked-in sidecar, and pinning it per
+    capability leaves the others uncovered — the repo's only other one,
+    `plans/agent-transcript-archival-prd.capability-manifest.yaml` ->
+    `scripts/gc_agent_transcripts.py`, is committed at mode 100644 and would
+    ERROR forever today. Generalizing this into the corpus sweep needs
+    `shared/tests/`, which is outside this task's locks; filed as a follow-up.
     """
 
     def test_check_is_the_script_kind(self, delivered_check):
@@ -542,10 +634,15 @@ class TestManifestScriptCoherence:
         assert 'scroll_by_metadata' in args
         assert 'with_vectors' in args
 
-    def test_manifest_argv_is_the_argv_the_end_to_end_test_runs(self, delivered_check):
-        """Sidecar and script must not drift apart silently."""
-        args = delivered_check['args']
-        assert args[args.index('--file') + 1] == MEM0_CLIENT
-        assert args[args.index('--function') + 1] == 'scroll_by_metadata'
-        assert args[args.index('--param') + 1] == 'with_vectors'
+    def test_manifest_argv_is_exactly_the_argv_this_file_pins(self, delivered_check):
+        """Sidecar and tests must not drift apart silently.
+
+        The full list, not a subset: dropping `--forwards-to scroll` would
+        reduce the gate to a declaration-only check — the hollow-DELIVERED mode
+        the script exists to close — while every partial assertion stayed
+        green. `_ARGV_TAIL` is what `TestMainExitCodeContract` exercises and
+        `TestEndToEndAgainstTheRealRepo` execs, so equality here is what makes
+        those two tests statements about the REAL check.
+        """
         assert delivered_check['script'] == 'scripts/check_method_param_wiring.py'
+        assert delivered_check['args'] == ['--file', MEM0_CLIENT, *_ARGV_TAIL]

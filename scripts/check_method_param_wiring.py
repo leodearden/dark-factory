@@ -42,7 +42,11 @@ absence claim that ``Scheduler._compute_delivered_check_cache`` renders as a
 NOT auto-re-pended. So every non-zero return here must be one this script actually
 understands, and must name which conjunct failed — an operator reading that
 escalation has to be able to tell "the capability regressed" from "the check's own
-arguments are stale". For the same reason this reads the WORKING CHECKOUT only: no
+arguments are stale". That includes argparse's *own* exits — an unrecognized flag
+(rc 2) and ``--help`` (rc 0) are both funnelled through the same diagnostic, since
+the former would otherwise read as a regression and the latter would report
+DELIVERED without running a single assertion. For the same reason this reads the
+WORKING CHECKOUT only: no
 ``--ref`` / ``git show`` mode, whose ref-absent failure (a worktree, a CI sandbox)
 would exit non-zero and be misread as a regression. That working-checkout
 approximation is already DECIDED in ``_run_script_check``'s docstring (PRD Open-Q 2).
@@ -55,7 +59,12 @@ pass and never fail, i.e. a silently un-gated capability.
 import argparse
 import ast
 import sys
+from collections.abc import Iterator
 from pathlib import Path
+
+# Context placeholder for a failure raised BEFORE the arguments were parsed, so
+# the diagnostic still has the shape every other one has.
+_UNPARSED = '<unparsed>'
 
 
 class AmbiguousFunction(Exception):
@@ -95,7 +104,7 @@ def resolve_function(
 
 
 def declares_param(
-    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
     param: str,
     annotation: str | None = None,
 ) -> bool:
@@ -137,6 +146,31 @@ def _callee_name(func: ast.expr) -> str | None:
     return None
 
 
+def _walk_unshadowed(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef, param: str
+) -> Iterator[ast.AST]:
+    """Walk *fn*, pruning nested scopes whose own signature rebinds *param*.
+
+    ``ast.walk`` descends into nested ``def``/``lambda`` bodies, where *param*
+    may name a fresh binding. A forward found there is a forward of the INNER
+    name, not of *fn*'s parameter, so counting it would re-open the
+    hollow-DELIVERED case one shadowing level in. A nested scope that does NOT
+    rebind *param* closes over it, so it is walked normally — and nested
+    *expressions* (the ``await asyncio.wait_for(...)`` the real call sits in)
+    are always walked, which is why this cannot be a top-level-statement scan.
+    """
+    stack: list[ast.AST] = [fn]
+    while stack:
+        node = stack.pop()
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
+            ) and declares_param(child, param):
+                continue
+            stack.append(child)
+
+
 def forwards_param_to(
     fn: ast.FunctionDef | ast.AsyncFunctionDef, param: str, callee: str
 ) -> bool:
@@ -147,12 +181,11 @@ def forwards_param_to(
     exactly what separates ``scroll_by_metadata``'s ``with_vectors=with_vectors``
     from ``get_point_by_id``'s ``with_vectors=False``.
 
-    ``ast.walk(fn)`` covers calls nested in any expression — on main the real
-    call sits inside ``await asyncio.wait_for(client.scroll(...), timeout=...)``,
-    which a top-level-statement scan would miss. Walking *fn* rather than the
-    module is what keeps the assertion method-scoped.
+    Scanning *fn* (never the module), minus any nested scope that shadows
+    *param*, is what keeps the assertion method-scoped — see
+    :func:`_walk_unshadowed`.
     """
-    for node in ast.walk(fn):
+    for node in _walk_unshadowed(fn, param):
         if not isinstance(node, ast.Call) or _callee_name(node.func) != callee:
             continue
         for kw in node.keywords:
@@ -205,14 +238,35 @@ def main(argv: list[str] | None = None) -> int:
     non-zero and be misread as a definitive regression, blocking a dependent
     task on an evaluation error. See the module docstring.
     """
-    args = _build_parser().parse_args(argv)
+    try:
+        args = _build_parser().parse_args(argv)
+    except SystemExit as exc:
+        # argparse exits on its own: rc 2 for an unrecognized/missing flag, rc 0
+        # for --help. Neither is a statement about the CAPABILITY, but
+        # `_run_script_check` would read them as one — 2 as FAILED ("the
+        # capability regressed"), 0 as DELIVERED with not a single assertion
+        # run. The realistic trigger is a manifest `args` list that has drifted
+        # from this script's interface, so say exactly that.
+        return _fail(
+            f'check arguments are invalid (argparse exit {exc.code}); '
+            "the manifest's args list has drifted from this script's interface",
+            file=_UNPARSED,
+            function=_UNPARSED,
+            param=_UNPARSED,
+        )
     ctx = {'file': args.file, 'function': args.function, 'param': args.param}
 
     path = Path(args.file)
     try:
-        source = path.read_text()
+        # Explicit encoding: `_run_script_check` execs this via `git_ops._run`,
+        # which forces LC_ALL=C/LANG=C in the child env. Locale-default decoding
+        # would then rest on PEP 540's UTF-8-mode-under-C default rather than on
+        # a choice made here, and mem0_client.py holds non-ASCII bytes.
+        source = path.read_text(encoding='utf-8')
     except FileNotFoundError:
         return _fail('file not found', **ctx)
+    except UnicodeDecodeError as exc:
+        return _fail(f'file is not valid UTF-8: {exc.reason} at byte {exc.start}', **ctx)
     except OSError as exc:
         return _fail(f'file could not be read: {exc.strerror}', **ctx)
 
