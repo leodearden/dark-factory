@@ -10,6 +10,58 @@ and each of its ten rows was independently re-probed here. No fused-memory store
 escalation record or task was mutated while building this manifest; task 3083 was read
 via `get_task` only (see Finding 1).
 
+## Operator rulings, 2026-08-05 (post-decompose)
+
+Recorded **alongside** the findings below, which are left as written — their numbers are the
+decompose-time claim and stay the historical record.
+
+**Ruling 1 — η released.** Finding 1's hold is discharged: task **3697** was set `pending`.
+The manifest's single FAIL binding (`authority-to-mutate-task-3083`) is resolved by operator
+authorization, not by re-scoping. η's title and description were rewritten in place to drop
+the hold notice.
+
+**Ruling 2 — never permit duplicate tasks.** The three overlaps surfaced under G4 were
+resolved by cancelling the standalone follow-up in each pair, with `x_superseded_by` and
+`x_cancel_reason` stamped on each:
+
+| Cancelled | Superseded by | Territory |
+|---|---|---|
+| **3654** | 3688 (α) | the detector/repairer |
+| **3662** | 3691 (δ) | the `data/escalations/` sweep |
+| **3685** | 3692 (ε) | live `plan.json` repair |
+
+A **fourth** overlap was found while executing this ruling and is the most dangerous of the
+set: task **3643** (pending) listed `shared/src/shared/mcp_markup.py` in its `metadata.files`
+as a rival "single envelope-literal enumeration", plus a guard on the escalation write
+boundary and edits to `markup_tripwire.py` — colliding with α, γ **and** the narrow-file-lock
+model. Two pending tasks each building *the* single enumeration in `shared/` would **be** the
+INV-5 lockstep duplication this PRD exists to eliminate.
+
+3643 was **narrowed, not cancelled**: its mechanism half is superseded, but its verification
+question — *does the landed containment cover the `claude-task-3514-implementer` producer
+path?* — is owned by no one else, and PRD §5 D7 explicitly puts the producer/parser defect
+outside this repo. Its `metadata.files` was reduced to the escalation specimens and its own
+doc, and **`3643 depends_on 3690`** was wired so it runs against the final architecture
+instead of racing it.
+
+**Ruling 3 — `code_tdd` is correct for documentation.** Anything that mutates files is
+`code_tdd`, and editing documentation mutates files. Finding 2 below correctly identified that
+`'docs'` is invalid, but resolved it to `'operational'`, which was **also wrong** — and
+measurably so:
+
+> Filing ζ/η/θ/ι with `execution_class='operational'` **silently coerced** them to
+> `task_kind='deterministic'` + `always_escalates=true`. All four would have **escalated to a
+> human instead of editing the documentation**. This was not visible in the `submit_task`
+> response; it was found by reading the stored metadata back.
+
+All four (3693, 3695, 3696, 3697) were corrected in place to `execution_class='code_tdd'`,
+`task_kind='normal'`, `always_escalates=false`, and their descriptions rewritten to record the
+correction. `x_docs_only` was cleared. **PRD §9 should be amended** — its four
+`execution_class: docs` annotations are the upstream source of this error.
+
+Finding 5 (that `execution_class` is itself absent from `_BLESSED_METADATA_KEYS`) stands
+unchanged and is now folded into η/3697's docs half as optional scope.
+
 ## Substrate re-verification (G3)
 
 All ten of §6's rows hold at the cited locations. Line numbers re-derived, not copied.
