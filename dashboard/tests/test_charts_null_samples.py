@@ -142,6 +142,40 @@ _STACKED_AREA_BANNED = (
     ),
 )
 
+_BAR_CHART_BANNED = (
+    (
+        'Math.max(...values',
+        'folds the axis maximum over the RAW series, so one undefined/NaN '
+        'sample poisons max to NaN and EVERY bar is emitted as '
+        'height="NaN" — not just the missing one',
+    ),
+    (
+        '(v / max) * chartH',
+        'scales each RAW value directly, so a `null` becomes a zero-height bar '
+        'indistinguishable from a measured zero',
+    ),
+)
+
+_HIST_BAR_BANNED = (
+    (
+        'Math.max(...values',
+        'folds the axis maximum over the RAW series — same NaN-poisoning as '
+        'BarChart, straight into a CSS height',
+    ),
+    (
+        '(v / max) * 100',
+        'scales each RAW value directly into a height percentage, so a `null` '
+        'is indistinguishable from a measured zero',
+    ),
+    (
+        'minHeight: 1',
+        'floors every bar at 1px, so a MISSING sample renders as a visible '
+        'stub — a fabricated measurement, drawn at a fixed size no data '
+        'produced. A hole must render no bar at all, and a measured zero its '
+        'honest zero-height one',
+    ),
+)
+
 _CONTRACTS: dict[str, _Contract] = {
     'Sparkline': _Contract(builders=('sparkSmoothPaths',), banned=_SPARKLINE_BANNED),
     'StepSpark': _Contract(builders=('sparkStepPaths',), banned=_SPARKLINE_BANNED),
@@ -157,6 +191,19 @@ _CONTRACTS: dict[str, _Contract] = {
     'StackedAreaChart': _Contract(
         builders=('stackedAreaPaths', 'axisY'),
         banned=_STACKED_AREA_BANNED,
+    ),
+    # The two bar primitives share one helper: barFractions hands back `null`
+    # at a hole and a real fraction everywhere else, which BarChart multiplies
+    # by chartH pixels and HistBar by 100 percent.
+    'BarChart': _Contract(
+        builders=('plottableMax', 'barFractions'),
+        banned=_BAR_CHART_BANNED,
+    ),
+    # HistBar's `maxOverride ?? ...` precedence survives by passing the
+    # override through as barFractions' explicit max.
+    'HistBar': _Contract(
+        builders=('plottableMax', 'barFractions'),
+        banned=_HIST_BAR_BANNED,
     ),
 }
 
@@ -560,10 +607,65 @@ _PRE_FIX_STACKED_AREA = """{
   );
 }"""
 
+_PRE_FIX_BAR_CHART = """{
+  const ref = useRef(null);
+  const [w, setW] = useState(400);
+  useEffect(() => {
+    if (!ref.current) return;
+    const ro = new ResizeObserver(([e]) => setW(e.contentRect.width));
+    ro.observe(ref.current); return () => ro.disconnect();
+  }, []);
+  const padL = 30, padR = 8, padT = 8, padB = 22;
+  const chartW = Math.max(w - padL - padR, 50);
+  const chartH = height - padT - padB;
+  const max = Math.max(...values, 1);
+  const bw = chartW / values.length;
+  return (
+    <div ref={ref} style={{ width: '100%', height }}>
+      <svg viewBox={`0 0 ${w} ${height}`} style={{ width: '100%', height: '100%', display: 'block' }}>
+        {[0, 0.25, 0.5, 0.75, 1].map((f, i) => {
+          const y = padT + chartH * (1 - f);
+          const v = Math.round(max * f);
+          return (
+            <g key={i}>
+              <line x1={padL} y1={y} x2={padL + chartW} y2={y} stroke={PALETTE.line} strokeWidth={0.5} strokeDasharray={i === 0 ? '0' : '2 3'} />
+              {i % 2 === 0 && <text x={padL - 4} y={y + 3} fontSize="9" fill={PALETTE.fg3} textAnchor="end" fontFamily="JetBrains Mono">{formatY(v)}</text>}
+            </g>
+          );
+        })}
+        {values.map((v, i) => {
+          const h = (v / max) * chartH;
+          const x = padL + i * bw + 2;
+          const y = padT + chartH - h;
+          return (
+            <g key={i}>
+              <rect x={x} y={y} width={Math.max(bw - 4, 2)} height={h} fill={color} rx={2} />
+              <text x={padL + i * bw + bw / 2} y={height - 6} fontSize="9" fill={PALETTE.fg3} textAnchor="middle" fontFamily="JetBrains Mono">{labels[i]}</text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}"""
+
+_PRE_FIX_HIST_BAR = """{
+  const max = maxOverride ?? Math.max(...values, 1);
+  return (
+    <div style={{ display: 'flex', alignItems: 'flex-end', gap: 2, height }}>
+      {values.map((v, i) => (
+        <div key={i} style={{ flex: 1, height: `${(v / max) * 100}%`, background: color, borderRadius: '2px 2px 0 0', minHeight: 1 }} />
+      ))}
+    </div>
+  );
+}"""
+
 _PRE_FIX_BODIES: dict[str, str] = {
     'Sparkline': _PRE_FIX_SPARKLINE,
     'LineChart': _PRE_FIX_LINE_CHART,
     'StackedAreaChart': _PRE_FIX_STACKED_AREA,
+    'BarChart': _PRE_FIX_BAR_CHART,
+    'HistBar': _PRE_FIX_HIST_BAR,
 }
 
 
