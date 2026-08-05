@@ -114,3 +114,143 @@ def test_gunzip_one_migrates_the_nested_subagent_layout(tmp_path):
     assert plain.read_bytes() == payload
     assert int(plain.stat().st_mtime) == int(ARCHIVED_MTIME)
     assert not gz.exists()
+
+
+# ---------------------------------------------------------------------------
+# step-3: migrate_archive — idempotency and crash-resume (INV-7)
+#
+# The sweep must be safe to re-run. It walks ~4,554 files and an operator can
+# kill it part-way, so every intermediate state it can be interrupted in has to
+# be a state a later run recovers from correctly — including the nastiest one,
+# where a run died between writing a twin and unlinking its source, leaving a
+# HALF-WRITTEN twin next to a perfectly good .gz.
+# ---------------------------------------------------------------------------
+
+def _mtimes(root: Path) -> dict[Path, float]:
+    """Snapshot every file's mtime under *root* — for proving a re-run is inert."""
+    return {p: p.stat().st_mtime for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def test_existing_good_twin_is_skipped_and_its_gz_unlinked(tmp_path):
+    """(a) The resume case: a run killed between writing the twin and unlinking
+    the source. The twin reads back cleanly, so it is trusted — classified
+    `skipped`, NOT re-decompressed — and the redundant .gz is unlinked so the
+    archive still converges to zero .gz."""
+    payload = _payload()
+    gz = _write_gz(tmp_path / "3618" / "enc" / "sess-a.jsonl.gz", payload)
+    twin = tmp_path / "3618" / "enc" / "sess-a.jsonl"
+    twin.write_bytes(payload)
+    os.utime(twin, (ARCHIVED_MTIME, ARCHIVED_MTIME))
+    before = twin.stat().st_mtime_ns
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert summary["skipped"] == 1
+    assert summary["migrated"] == 0
+    assert summary["failed"] == 0
+    # Not re-decompressed: an untouched mtime proves the good twin was trusted
+    # rather than silently rewritten.
+    assert twin.stat().st_mtime_ns == before
+    assert twin.read_bytes() == payload
+    assert not gz.exists()
+
+
+def test_existing_unreadable_twin_is_re_gunzipped_from_the_authoritative_gz(tmp_path):
+    """(b) A half-written twin must NEVER be trusted on mere existence. The .gz
+    is the authoritative copy until corroborated, so an undecodable/partial twin
+    is overwritten from it and only then is the source unlinked."""
+    payload = _payload()
+    gz = _write_gz(tmp_path / "3618" / "enc" / "sess-b.jsonl.gz", payload)
+    twin = tmp_path / "3618" / "enc" / "sess-b.jsonl"
+    # A partial prefix of the real payload, ending in a raw 0xFF — the shape a
+    # killed write leaves behind: plausible-looking, but neither complete nor
+    # decodable.
+    twin.write_bytes(payload[: len(payload) // 2] + b"\xff")
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert summary["migrated"] == 1
+    assert summary["skipped"] == 0
+    assert summary["failed"] == 0
+    assert twin.read_bytes() == payload, "the bad twin was not rebuilt from the .gz"
+    assert int(twin.stat().st_mtime) == int(ARCHIVED_MTIME)
+    assert not gz.exists()
+
+
+def test_second_run_over_a_migrated_tree_is_a_clean_no_op(tmp_path):
+    """(c) Idempotency proper: re-running over a fully migrated tree migrates
+    nothing, fails nothing, and does not touch a single file's mtime."""
+    _write_gz(tmp_path / "3618" / "enc" / "sess-c.jsonl.gz", _payload())
+    _write_gz(
+        tmp_path / "3618" / "enc" / "sess-c" / "subagents" / "agent-1.jsonl.gz",
+        _payload(3),
+    )
+
+    first = mig.migrate_archive(tmp_path, apply=True)
+    assert first["migrated"] == 2
+
+    before = _mtimes(tmp_path)
+    second = mig.migrate_archive(tmp_path, apply=True)
+
+    assert second["scanned"] == 0
+    assert second["migrated"] == 0
+    assert second["skipped"] == 0
+    assert second["failed"] == 0
+    assert _mtimes(tmp_path) == before, "a no-op re-run must not touch any file"
+
+
+def test_plain_jsonl_without_a_gz_is_left_untouched(tmp_path):
+    """(d) An already-plain transcript with no .gz at all is not the sweep's
+    business — it is neither scanned, rewritten, nor re-stamped."""
+    plain = tmp_path / "3618" / "enc" / "sess-d.jsonl"
+    plain.parent.mkdir(parents=True)
+    plain.write_bytes(_payload())
+    os.utime(plain, (ARCHIVED_MTIME, ARCHIVED_MTIME))
+    before = _mtimes(tmp_path)
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert summary["scanned"] == 0
+    assert summary["migrated"] == 0
+    assert summary["skipped"] == 0
+    assert _mtimes(tmp_path) == before
+
+
+def test_summary_carries_distinct_counters_not_one_conflated_total(tmp_path):
+    """The report separates CLASSIFICATION from ACTION (mirroring
+    gc_agent_transcripts.build_gc_report): a run that skipped 1 and migrated 1
+    must be distinguishable from one that migrated 2."""
+    payload = _payload()
+    _write_gz(tmp_path / "3618" / "enc" / "fresh.jsonl.gz", payload)
+    _write_gz(tmp_path / "3618" / "enc" / "resumed.jsonl.gz", payload)
+    twin = tmp_path / "3618" / "enc" / "resumed.jsonl"
+    twin.write_bytes(payload)
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert summary["scanned"] == 2
+    assert summary["migrated"] == 1
+    assert summary["skipped"] == 1
+    assert summary["failed"] == 0
+    assert summary["failed_paths"] == []
+
+
+def test_absent_root_is_a_clean_empty_no_op(tmp_path):
+    """An absent root is an empty sweep, not a crash."""
+    summary = mig.migrate_archive(tmp_path / "does-not-exist", apply=True)
+
+    assert summary["scanned"] == 0
+    assert summary["migrated"] == 0
+    assert summary["failed"] == 0
+
+
+def test_non_directory_root_is_a_clean_empty_no_op(tmp_path):
+    """A root that exists but is a FILE is an empty sweep, not a crash."""
+    root = tmp_path / "not-a-dir"
+    root.write_text("x")
+
+    summary = mig.migrate_archive(root, apply=True)
+
+    assert summary["scanned"] == 0
+    assert summary["migrated"] == 0
+    assert summary["failed"] == 0
