@@ -573,7 +573,11 @@ class TestDistractorSlabIsSharedAndInert:
         for records in slabs.values():
             assert len(records) == 300
         reference = [(r.record_id, r.content) for r in slabs['status_quo']]
-        for shape, records in slabs.items():
+        # Compared against the OTHER shapes only: including 'status_quo' would
+        # compare the reference against itself, a tautology among the three.
+        others = {s: r for s, r in slabs.items() if s != 'status_quo'}
+        assert others, 'no arm left to compare the slab against'
+        for shape, records in others.items():
             assert [(r.record_id, r.content) for r in records] == reference, shape
 
     def test_distractors_are_never_topic_anchorable(self):
@@ -669,16 +673,14 @@ class TestCategoryIsPreservedAcrossArms:
         Deriving category per-cluster instead of per-source-record would
         silently edit the corpus — so assert the mixing survives.
         """
-        mixed = 0
         for shape in _mod().ARM_SHAPES:
             per_cluster: dict[str, set] = {}
             for record in _knowledge(_arm(shape)):
                 per_cluster.setdefault(record.cluster_id, set()).add(
                     record.metadata['category']
                 )
-            mixed = max(mixed, sum(1 for v in per_cluster.values() if len(v) > 1))
-            assert sum(1 for v in per_cluster.values() if len(v) > 1) == 2, shape
-        assert mixed == 2
+            mixed = sum(1 for v in per_cluster.values() if len(v) > 1)
+            assert mixed == 2, shape
 
 
 class TestBetaVocabularyConformance:
@@ -2853,6 +2855,25 @@ class TestBuildReportRefusesAPartialTable:
                 arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
             )
 
+    @pytest.mark.parametrize('kind', ['claim', 'topic_phrasing', 'held_out'])
+    def test_a_missing_by_query_kind_subset_raises(self, kind):
+        """The same nested case as `claim_recall`, on the block that carries
+        the ONLY claim-vs-topic split in the report.  `by_query_kind` is in
+        `_REQUIRED_ARM_METRICS` but had no refusal test, so a subset dropped
+        by a bad split would publish a by-kind table with a silently absent
+        row rather than refusing."""
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped']['by_query_kind'][kind]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'b_grouped' in str(excinfo.value)
+        assert 'by_query_kind' in str(excinfo.value)
+
     def test_an_unknown_arm_name_raises(self):
         """A typo would otherwise drop a real arm AND add a phantom one, and
         the table would still look complete."""
@@ -3025,7 +3046,10 @@ class TestTheTwoArtifactsAreWrittenAsAPair:
 
         assert written == (json_path, md_path)
         assert json.loads(json_path.read_text(encoding='utf-8'))['arms']
-        assert md_path.read_text(encoding='utf-8').startswith('# E2 storage')
+        # `# ` only: that markdown was written, not what it is titled. The
+        # sibling test below asserts md == render_markdown(json), which
+        # constrains the content without pinning the title prose.
+        assert md_path.read_text(encoding='utf-8').startswith('# ')
 
     def test_the_markdown_on_disk_is_what_the_committed_json_renders_to(
         self, tmp_path
@@ -3920,15 +3944,16 @@ def _full_window_arm(shape='c_peers', *, n=12, topic='t'):
     return seeded, hits
 
 
-def _query(query_id='q1', *, topic='t', expects=('k0',), cluster_id='c1'):
+def _query(query_id='q1', *, topic='t', expects=('k0',), cluster_id='c1',
+           kind='claim', held_out=False):
     return _mod().Query(
         query_id=query_id,
-        kind='claim',
+        kind=kind,
         text='does the pin change the window?',
         topic=topic,
         cluster_id=cluster_id,
         expects_claim_ids=list(expects),
-        held_out=False,
+        held_out=held_out,
     )
 
 
@@ -3947,6 +3972,79 @@ def _measure(seeded, hits, *, pin, queries=None, probes=(), limit=10):
         guard_threshold=0.92,
         limit=limit,
     )
+
+
+class TestByQueryKindSplitsTheQueriesItClaimsToSplit:
+    """`by_query_kind` is a REQUIRED report block that had no behavioral test.
+
+    It is why the report can say anything at all about the distinction
+    eval-design §5 E2 draws: pooled into one mean, a shape that wins on claim
+    queries while losing on topic phrasings is indistinguishable from one that
+    ties on both.  It is required (`_REQUIRED_ARM_METRICS`), rendered as its
+    own markdown table, and computed by a real split in `measure_arm` — but
+    it appeared in this file only inside the synthetic `_arm_measurement()`
+    builder, where it was constructed and never asserted on.
+    """
+
+    @staticmethod
+    def _by_kind(queries):
+        seeded, hits = _full_window_arm('status_quo')
+        return _mod().measure_arm(
+            seeded,
+            {'queries': {q.query_id: hits for q in queries}, 'probes': {'c1': hits}},
+            pin=False,
+            queries=list(queries),
+            probes=[],
+            estimator=_CHARS,
+            guard_threshold=0.92,
+            limit=10,
+        )['by_query_kind']
+
+    def test_each_kinds_query_count_is_the_input_split(self):
+        by_kind = self._by_kind([
+            _query('q1', kind='claim'),
+            _query('q2', kind='claim'),
+            _query('q3', kind='topic_phrasing'),
+            _query('q4', kind='topic_phrasing', held_out=True),
+        ])
+
+        assert by_kind['claim']['queries'] == 2
+        assert by_kind['topic_phrasing']['queries'] == 2
+        assert by_kind['held_out']['queries'] == 1
+
+    def test_held_out_is_a_subset_of_its_kind_and_not_a_third_kind(self):
+        """The markdown states this in prose, and the split has to honour it.
+
+        A held-out query is still a `topic_phrasing` query: if the split
+        moved it out of its kind instead of also counting it under
+        `held_out`, the topic row would silently shed the very phrasings that
+        measure generalisation, and the two rows would no longer sum to
+        anything a reader could reason about.
+        """
+        held_out_only = self._by_kind([
+            _query('q1', kind='topic_phrasing', held_out=True),
+        ])
+
+        assert held_out_only['topic_phrasing']['queries'] == 1
+        assert held_out_only['held_out']['queries'] == 1
+        # Same single query on both rows, so the metrics must agree exactly.
+        assert held_out_only['held_out'] == held_out_only['topic_phrasing']
+
+    def test_an_unasked_subset_reports_none_rather_than_a_measured_zero(self):
+        """`queries: 0` with `0.0` beside it would read as "measured, scored
+        nothing" — the same lie the `—` cell exists to prevent in the table."""
+        by_kind = self._by_kind([_query('q1', kind='claim')])
+
+        empty = by_kind['topic_phrasing']
+        assert empty['queries'] == 0
+        assert empty['claim_recall']['at_5'] is None
+        assert empty['claim_recall']['at_10'] is None
+        assert empty['discoverability']['canonical_in_top_5_rate'] is None
+        assert empty['discoverability']['median_canonical_rank'] is None
+        # The kind that WAS asked is scored, so the None above is the empty
+        # subset talking and not the whole block failing to compute.
+        assert by_kind['claim']['queries'] == 1
+        assert by_kind['claim']['claim_recall']['at_5'] is not None
 
 
 class TestReadPathHoldsTheWindowBudget:
@@ -4769,6 +4867,27 @@ class TestCommittedReportJson:
             for key in keys:
                 assert measurement[metric][key] is not None, f'{arm}.{metric}.{key}'
 
+    def test_every_arm_measured_every_query_kind(self):
+        """The by-kind table is the block above split the way eval-design §5
+        E2 says the metrics differ, so an unasked subset there is the same
+        defect as an unasked metric — and in the committed run all three
+        subsets are non-empty (176 claim / 60 topic_phrasing / 20 held_out),
+        so `queries: 0` means the split broke, not that a subset was empty."""
+        report = _committed_report()
+
+        for arm, measurement in report['arms'].items():
+            by_kind = measurement['by_query_kind']
+            for kind in ('claim', 'topic_phrasing', 'held_out'):
+                assert by_kind[kind]['queries'] > 0, f'{arm}.{kind}'
+                for key in ('at_5', 'at_10'):
+                    assert by_kind[kind]['claim_recall'][key] is not None, (
+                        f'{arm}.{kind}.claim_recall.{key}'
+                    )
+            # held_out is a SUBSET of topic_phrasing, never a third kind, and
+            # a strict one — the whole point is that some phrasings WERE the
+            # registry's derivation input and so cannot measure generalisation.
+            assert by_kind['held_out']['queries'] < by_kind['topic_phrasing']['queries']
+
     def test_every_arm_carries_the_pin_diagnostic(self):
         """Both keys on all six rows. A `+pin` row identical to its twin is
         unreadable without it: "the pin never fired" and "the pin does not
@@ -4801,22 +4920,33 @@ class TestCommittedReportJson:
 
         Pins no value, rate or bound (G6/D10) — only the two-way agreement
         between the diagnostic and the metrics it explains.
+
+        Stated as ONE unconditional implication rather than as a branch per
+        case, deliberately: `rate > 0` beside identical blocks is a state the
+        artifact's own reading guide calls a legitimate third finding ("it
+        fired and moved nothing these metrics measure"), so a guarded form
+        executes zero assertions on exactly that input and passes vacuously.
+        Here every parametrized shape runs both assertions whatever the data
+        does, so the test cannot silently degrade to a no-op.
         """
         arms = _committed_report()['arms']
         off, on = arms[shape], arms[f'{shape}+pin']
         blocks = ('claim_recall', 'discoverability', 'tokens_per_query',
                   'guard_adequacy')
-        identical = all(on[block] == off[block] for block in blocks)
+        differing = [block for block in blocks if on[block] != off[block]]
         rate = on['pin']['window_changed_rate']
 
-        if rate == 0.0:
-            for block in blocks:
-                assert on[block] == off[block], f'{shape}+pin.{block}'
-        if not identical:
-            assert rate is not None and rate > 0, (
-                f'{shape}+pin differs from its twin while the pin changed no '
-                f'window — the difference is an unequal measurement, not a result'
-            )
+        # A `+pin` arm always measured the pin, so the diagnostic that makes
+        # its row readable is never absent.
+        assert rate is not None, f'{shape}+pin carries no pin diagnostic'
+        # The invariant itself: a column may differ ONLY where the pin fired.
+        # (The converse is NOT asserted — a pin that fired and moved nothing
+        # measurable is a real finding, not a failure.)
+        assert not (differing and rate == 0.0), (
+            f'{shape}+pin differs from its twin in {differing} while the pin '
+            f'changed no window — the difference is an unequal measurement, '
+            f'not a result'
+        )
 
     def test_the_guard_column_is_flagged_as_a_threshold_replay_on_every_arm(self):
         """Carried per-arm so a reader who copies one row out of the table
