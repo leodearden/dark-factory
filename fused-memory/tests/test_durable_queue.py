@@ -1593,6 +1593,107 @@ class TestTerminalHook:
             assert write_op_id == 'W2'
             assert status == 'dead'
             assert error is not None and 'always fails' in error
+            # _execute_write itself failed, so the write did NOT land — this
+            # one is safe to replay and must not carry the post-execute flag.
+            assert not error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_post_execute_dead_is_flagged_in_the_reported_error(self, tmp_path):
+        """'dead' does NOT imply the backend write never happened.
+
+        _process_item runs the registered callback AFTER _execute_write has
+        already returned, so a callback that keeps failing dead-letters an item
+        whose write DID land. Blind-replaying that duplicates the write, so the
+        two cases must be separable in whatever the hook journals.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W8'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert len(calls) == 1
+            write_op_id, status, error = calls[0]
+            assert write_op_id == 'W8'
+            assert status == 'dead'
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+            assert 'callback keeps failing' in error
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_callback_still_sees_journal_metadata_popped_by_execute(
+        self, tmp_path
+    ):
+        """_process_item parses once but must not hand that dict to the callback.
+
+        _execute_graphiti_write pops '_causation_id' / 'temporal_context' off
+        the payload it is given, and _dual_write_callback reads both back out
+        to propagate causation onto the facts it enqueues. Sharing one parsed
+        dict between the two would silently sever that.
+        """
+        calls, hook = self._recorder()
+        seen: list[dict] = []
+
+        async def popping_execute(_operation, payload):
+            payload.pop('_causation_id', None)
+            payload.pop('_write_op_id', None)
+            payload.pop('temporal_context', None)
+            return {'ok': True}
+
+        async def recording_callback(_ctype, _result, payload):
+            seen.append(payload)
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=popping_execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', recording_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={
+                    'content': 'x',
+                    '_write_op_id': 'W9',
+                    '_causation_id': 'C9',
+                    'temporal_context': 'planning',
+                },
+                callback_type='dual_write_episode',
+            )
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert seen and seen[0]['_causation_id'] == 'C9'
+            assert seen[0]['temporal_context'] == 'planning'
+            # ...and the hook still got the join key captured before the pop.
+            assert calls == [('W9', 'completed', None)]
         finally:
             await q.close()
 

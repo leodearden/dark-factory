@@ -125,6 +125,16 @@ CallbackFn = Callable[[str, Any, dict[str, Any]], Coroutine[Any, Any, None]]
 # this module's deliberate independence from fused-memory-specific components.
 TerminalHookFn = Callable[[str, str, str | None], Coroutine[Any, Any, None]]
 
+# Prefix applied to the reported error when an item dead-letters AFTER
+# _execute_write already returned — i.e. the registered callback (or the
+# completion commit) is what kept failing, not the backend write. 'dead' alone
+# means only "the queue exhausted its attempts"; it does NOT imply the write
+# never happened, and blind-replaying such an item DUPLICATES it. Reported so
+# the two cases are separable in whatever the hook writes them to.
+POST_EXECUTE_DEAD_PREFIX = (
+    'post-execute failure (the backend write LANDED; do not blind-replay): '
+)
+
 
 class DurableWriteQueue:
     """SQLite WAL-backed write queue with per-group workers and global semaphore."""
@@ -355,13 +365,29 @@ class DurableWriteQueue:
         OUTSIDE the semaphore — see ``_notify_terminal``.
         """
         terminal: tuple[str, str | None] | None = None
+        write_op_id: str | None = None
+        executed = False
         async with self._semaphore:
             try:
+                # Parsed ONCE, and the join key captured BEFORE dispatch:
+                # _execute_write pops '_write_op_id' (and '_causation_id' /
+                # 'temporal_context') off the dict it is handed. Parsing inside
+                # the try keeps a malformed payload routed to _handle_failure
+                # exactly as before, with write_op_id left None so the hook is
+                # skipped.
+                payload = item.parsed_payload()
+                write_op_id = payload.get('_write_op_id')
                 result = await asyncio.wait_for(
-                    self._execute_write(item.operation, item.parsed_payload()),
+                    self._execute_write(item.operation, payload),
                     timeout=self._write_timeout_seconds,
                 )
-                # Fire callback before marking completed — failure retries item
+                # The backend write LANDED. Anything that fails below is a
+                # post-execute failure, which is a materially different fact
+                # for anyone deciding whether a dead item is safe to replay.
+                executed = True
+                # Fire callback before marking completed — failure retries item.
+                # A FRESH parse, deliberately not `payload`: _execute_write pops
+                # journal metadata that the callbacks read back out.
                 if item.callback_type and item.callback_type in self._callbacks:
                     await self._callbacks[item.callback_type](
                         item.callback_type, result, item.parsed_payload()
@@ -372,10 +398,17 @@ class DurableWriteQueue:
                 terminal = await self._handle_failure(item, exc)
 
         if terminal is not None:
-            await self._notify_terminal(item, *terminal)
+            status, error = terminal
+            if status == 'dead' and executed:
+                error = f'{POST_EXECUTE_DEAD_PREFIX}{error}'
+            await self._notify_terminal(item.id, write_op_id, status, error)
 
     async def _notify_terminal(
-        self, item: QueueItem, status: str, error: str | None
+        self,
+        item_id: int,
+        write_op_id: str | None,
+        status: str,
+        error: str | None,
     ) -> None:
         """Report a terminal outcome to the injected ``on_terminal`` hook.
 
@@ -383,35 +416,22 @@ class DurableWriteQueue:
         outside ``self._semaphore``: the queue's correctness must NEVER depend
         on the hook succeeding (a raising hook would otherwise flip a landed
         write back to retry, turning an audit-trail improvement into a
-        correctness regression), and the hook's own retry path must not hold a
-        slot in a pool shared across every group.
+        correctness regression), and the hook's own work must not hold a slot
+        in a pool shared across every group.
 
-        Every failure — an unparseable payload, a raising hook — is logged and
-        swallowed. A payload with no ``_write_op_id`` (``replay_from_store``,
-        ``mem0_classify_and_add``) is skipped silently: there is nothing to
-        join back to.
+        A raising hook is logged and swallowed. A payload with no
+        ``_write_op_id`` (``replay_from_store``, ``mem0_classify_and_add``) or
+        one that would not parse is skipped silently: there is nothing to join
+        back to.
         """
-        if self._on_terminal is None:
-            return
-        try:
-            # parsed_payload() re-parses the raw row TEXT on every call, so a
-            # consumer's `payload.pop('_write_op_id')` does not consume the key
-            # here.
-            write_op_id = item.parsed_payload().get('_write_op_id')
-        except Exception:
-            logger.warning(
-                'Item %d: could not parse payload for terminal notification',
-                item.id, exc_info=True,
-            )
-            return
-        if not write_op_id:
+        if self._on_terminal is None or not write_op_id:
             return
         try:
             await self._on_terminal(write_op_id, status, error)
         except Exception:
             logger.warning(
                 'Item %d: on_terminal hook failed for write_op %s (%s)',
-                item.id, write_op_id, status, exc_info=True,
+                item_id, write_op_id, status, exc_info=True,
             )
 
     async def _mark_completed(self, item: QueueItem) -> None:
