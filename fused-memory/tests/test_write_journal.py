@@ -918,3 +918,104 @@ async def test_existing_db_gains_idx_wo_created_on_initialize(tmp_path):
         await _assert_created_at_seekable(db_inner, context='legacy upgrade')
     finally:
         await j.close()
+
+
+# ------------------------------------------------------------------
+# Terminal queue outcome (task 3582)
+#
+# `write_ops.success` records that the ENQUEUE was accepted; the durable
+# queue's eventual terminal state (completed / dead) was never written back,
+# so a row for a write with a 0% landing rate was byte-for-byte
+# indistinguishable from a row for a write that landed.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_write_ops_has_terminal_columns(journal):
+    """A fresh DB carries the terminal_* columns, NULL at Layer-1 log time."""
+    db = journal._require_db()
+    async with db.execute('PRAGMA table_info(write_ops)') as cursor:
+        cols = {row[1] for row in await cursor.fetchall()}
+    assert 'terminal_status' in cols
+    assert 'terminal_at' in cols
+    assert 'terminal_error' in cols
+
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(
+        write_op_id=op_id,
+        operation='add_episode',
+        project_id='test-project',
+    )
+    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    row = next(o for o in ops if o['id'] == op_id)
+    # Terminal state is UNKNOWN at log time — NULL, not False.
+    assert row['terminal_status'] is None
+    assert row['terminal_at'] is None
+    assert row['terminal_error'] is None
+    # ...while `success` keeps its existing meaning: the enqueue was accepted.
+    assert row['success'] == 1
+
+
+@pytest.mark.asyncio
+async def test_existing_db_gains_terminal_columns_on_initialize(tmp_path):
+    """An existing journal gains terminal_* via ALTER, with no backfill."""
+    import aiosqlite
+
+    data_dir = tmp_path / 'terminal_migrate'
+    data_dir.mkdir()
+    db_path = data_dir / 'write_journal.db'
+
+    pre_change_schema = """
+    CREATE TABLE write_ops (
+        id TEXT PRIMARY KEY,
+        causation_id TEXT,
+        source TEXT,
+        provenance TEXT DEFAULT 'original',
+        operation TEXT,
+        project_id TEXT,
+        agent_id TEXT,
+        session_id TEXT,
+        kind TEXT NOT NULL DEFAULT 'write',
+        params TEXT DEFAULT '{}',
+        result_summary TEXT,
+        success INTEGER DEFAULT 1,
+        error TEXT,
+        created_at TEXT NOT NULL
+    );
+    """
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.executescript(pre_change_schema)
+        await db.execute(
+            'INSERT INTO write_ops (id, operation, success, created_at) '
+            'VALUES (?, ?, ?, ?)',
+            ('legacy-terminal-1', 'add_episode', 1, '2026-07-29T12:00:00+00:00'),
+        )
+        await db.commit()
+
+    j = WriteJournal(data_dir)
+    await j.initialize()
+    # Migration must be idempotent — a second initialize() must not blow up on
+    # a duplicate ALTER TABLE ADD COLUMN.
+    await j.initialize()
+    try:
+        db_inner = j._require_db()
+        async with db_inner.execute('PRAGMA table_info(write_ops)') as cursor:
+            cols = {row[1] for row in await cursor.fetchall()}
+        assert 'terminal_status' in cols
+        assert 'terminal_at' in cols
+        assert 'terminal_error' in cols
+
+        async with db_inner.execute(
+            'SELECT operation, success, terminal_status, terminal_at, terminal_error '
+            "FROM write_ops WHERE id = 'legacy-terminal-1'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None, 'pre-existing row must survive the migration'
+        assert row[0] == 'add_episode'
+        assert row[1] == 1
+        # No backfill: a historical row's terminal outcome is genuinely unknown.
+        assert row[2] is None
+        assert row[3] is None
+        assert row[4] is None
+    finally:
+        await j.close()
