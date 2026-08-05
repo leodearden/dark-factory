@@ -32,28 +32,19 @@ ExecStart=__UV_PATH__ run --project dashboard \
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__
 
 # Data root for the dashboard's own databases (burndown, metrics, runs,
-# escalations, memory-evals). Declared explicitly (task 3572) because
-# dashboard/src/dashboard/config.py's project_root falls back to Path.cwd()
-# when this variable is unset — task 3503 chose that fallback over a hardcoded
-# literal on purpose, and it stands. But before this line the data root was an
-# undeclared SIDE EFFECT of WorkingDirectory=: correct only because that
-# directive happens to point at the repo root, with nothing in this file naming
-# the coupling, so a later edit to WorkingDirectory= would have silently
-# relocated every database.
+# escalations, memory-evals). Declared explicitly (task 3572) rather than left
+# to the Path.cwd() fallback in dashboard/src/dashboard/config.py, which made
+# the data root an undeclared SIDE EFFECT of WorkingDirectory= — correct only
+# by coincidence, so an edit to that directive silently relocated every DB.
 #
-# This does NOT replace WorkingDirectory=, which remains load-bearing on its own
-# terms: ExecStart runs `uv run --project dashboard`, and that RELATIVE --project
-# path is resolved against the process cwd, which systemd sets only from
-# WorkingDirectory=. This line stops that directive doing a second, undeclared
-# job; it does not retire it.
+# This does NOT retire WorkingDirectory=: ExecStart's RELATIVE
+# `--project dashboard` still resolves against the cwd systemd sets from it.
 #
-# The two values must therefore stay EQUAL. Enforced repo-side by
+# KEEP THIS VALUE EQUAL TO WorkingDirectory=. Enforced by
 # tests/scripts/test_dashboard_service_template.py::
-# test_project_root_env_matches_working_directory_in_both_unit_files, and
-# installed-side by scripts/check_dashboard_unit_parity.py's
-# env_matches_directive, which compares them WITHIN each copy — the values
-# legitimately differ per host, so only that intra-copy relation is checkable
-# everywhere.
+# test_project_root_env_matches_working_directory_in_both_unit_files and, for
+# the installed copy, by scripts/check_dashboard_unit_parity.py — see
+# UnitSpec.env_matches_directive there for the full rationale.
 Environment=DASHBOARD_PROJECT_ROOT=__REPO_ROOT__
 
 # Restart policy: always restart on failure, back off up to 60s.

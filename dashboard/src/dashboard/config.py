@@ -132,30 +132,22 @@ class DashboardConfig:
     # silently pointed every un-configured consumer on every other host at one
     # developer's checkout.  That reason still stands, and this default stays.
     #
-    # The canonical deployment no longer RELIES on it, though.  Both
+    # The canonical deployment no longer RELIES on it, though: both
     # dashboard/dark-factory-dashboard.service and scripts/dashboard.service.template
     # now set Environment=DASHBOARD_PROJECT_ROOT=<repo root> explicitly (task 3572),
     # so from_env() takes the env branch there and the data root is DECLARED rather
-    # than inferred.  Before that it was an undeclared side effect of the units'
-    # WorkingDirectory= pinning: correct only because that directive happened to
-    # point at the repo root, so an edit to it silently relocated every derived DB
-    # path (burndown, metrics, runs, escalations, memory-evals) with nothing naming
-    # the coupling.
+    # than inferred from those units' WorkingDirectory= pinning.  Why, and what
+    # keeps the two in step, is recorded once — on that Environment= line in the
+    # units, and on UnitSpec.env_matches_directive in
+    # scripts/check_dashboard_unit_parity.py.
     #
-    # The cwd fallback is retained for NON-systemd invocations — a bare
+    # This fallback is what still applies to NON-systemd invocations — a bare
     # `python -m dashboard` from a checkout, a test, a container without the unit —
-    # and is what would apply again if that Environment= line were ever dropped.
-    # WorkingDirectory= is retained too and remains load-bearing in its own right:
-    # ExecStart runs `uv run --project dashboard`, whose relative --project path is
-    # resolved against the cwd systemd sets from it.  It is pinned by
-    # tests/scripts/test_dashboard_service_template.py::
+    # and what would apply again if that Environment= line were ever dropped.
+    # WorkingDirectory= is retained too and load-bearing in its own right (ExecStart's
+    # relative `--project dashboard` resolves against the cwd systemd sets from it);
+    # it is pinned by tests/scripts/test_dashboard_service_template.py::
     # test_working_directory_is_pinned_in_both_unit_files.
-    #
-    # The new contract's own guards: the two values must stay EQUAL, checked
-    # repo-side by that module's
-    # test_project_root_env_matches_working_directory_in_both_unit_files and
-    # installed-side by scripts/check_dashboard_unit_parity.py's
-    # env_matches_directive.
     project_root: Path = field(default_factory=Path.cwd)
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
     known_project_roots: list[Path] = field(default_factory=list)
@@ -273,12 +265,10 @@ class DashboardConfig:
         CONSTRUCTED config, so the journal always names the root the databases
         actually hang off — instead of being an invisible default.
 
-        Since task 3572 the canonical deployment SETS the variable (both systemd
-        units declare ``Environment=DASHBOARD_PROJECT_ROOT=<repo root>``), so
-        this line no longer fires there at all.  When it does fire it marks a
-        genuinely un-configured invocation — a bare ``python -m dashboard`` from
-        a checkout, a test, a container without the unit — which is exactly the
-        case worth naming the root for.
+        Since task 3572 the canonical deployment SETS the variable, so this line
+        no longer fires there at all; when it does fire it marks a genuinely
+        un-configured invocation — a bare ``python -m dashboard`` from a
+        checkout, a test, a container without the unit.
 
         The level stays INFO all the same, and that is a considered choice
         rather than an oversight: changing it is outside task 3572's scope, and

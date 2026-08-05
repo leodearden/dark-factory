@@ -60,23 +60,18 @@ HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE = (
 )
 
 # DASHBOARD_PROJECT_ROOT is declared EXPLICITLY (task 3572) because
-# dashboard/src/dashboard/config.py's `project_root` field falls back to
-# Path.cwd() when the variable is unset (task 3503 chose that over a hardcoded
-# literal on purpose).  Without the line asserted below, the dashboard's entire
-# data root — burndown, metrics, runs, escalations and memory-evals databases —
-# was an undeclared SIDE EFFECT of WorkingDirectory=: correct only because that
-# directive happens to point at the repo root, with nothing in either file
-# naming the coupling.  A future edit to WorkingDirectory= would then silently
-# relocate every database.  Declaring the variable splits the two jobs;
-# WorkingDirectory= is retained and still load-bearing for `uv run --project
-# dashboard` (see the comment above), it just no longer does this second,
-# undeclared one.
+# dashboard/src/dashboard/config.py's `project_root` falls back to Path.cwd()
+# when it is unset — so without the line asserted below the dashboard's entire
+# data root is an undeclared SIDE EFFECT of WorkingDirectory=.  The units carry
+# that rationale on the line itself; the full version, including why the
+# installed copy cannot be value-compared, is on
+# scripts/check_dashboard_unit_parity.py's UnitSpec.env_matches_directive.
 #
-# The two values must nonetheless stay EQUAL, which is a separate assertion
-# from the exact-line ones: see
-# test_project_root_env_matches_working_directory_in_both_unit_files below, and
-# scripts/check_dashboard_unit_parity.py's env_matches_directive for the same
-# relation checked against the INSTALLED copy.
+# What is pinned HERE is the two-part shape: each file declares the line
+# verbatim (these constants), AND the value equals WorkingDirectory= — a
+# separate assertion, since both lines can be individually well-formed while
+# one has been repointed.  See
+# test_project_root_env_matches_working_directory_in_both_unit_files below.
 TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE = (
     "Environment=DASHBOARD_PROJECT_ROOT=__REPO_ROOT__"
 )

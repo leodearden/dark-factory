@@ -609,14 +609,11 @@ def test_environment_not_compared_when_spec_omits_the_section():
 # ---------------------------------------------------------------------------
 # compare_unit — intra-copy Environment=/directive agreement
 #
-# DASHBOARD_PROJECT_ROOT is the dashboard's data root (config.py's project_root
-# falls back to Path.cwd() when it is unset), and its value embeds the repo
-# root — so it CANNOT be value-compared across copies: the committed unit
-# hardcodes /home/leo/src/dark-factory while setup-host.sh renders the installed
-# copy with that host's real $REPO_ROOT.  The contract is therefore split.
-# PRESENCE is checked across copies by the Environment= name-set branch above;
-# VALUE is checked WITHIN each copy against that copy's WorkingDirectory=, a
-# relation that holds identically on every host.
+# DASHBOARD_PROJECT_ROOT's value embeds the repo root, so it cannot be
+# value-compared across copies; the contract is split instead — PRESENCE across
+# copies via the Environment= name-set branch above, VALUE within each copy
+# against that copy's WorkingDirectory=.  The rationale lives on the checker's
+# UnitSpec.env_matches_directive; what follows tests it.
 #
 # Assertions below are scoped to the drifts the NEW branch emits (keyed
 # _RELATION_KEY) rather than to the whole list, so each test measures the branch

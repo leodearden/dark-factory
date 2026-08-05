@@ -89,19 +89,14 @@ are split by CLASS, because one rule cannot fit all of them:
   accidental drift it exists to catch with it.  Allowlisting is scoped to a
   variable NAME, not to Environment= as a whole, so blessing the nine-root
   value does not also bless the variable disappearing.
-- **Environment= vs a directive, WITHIN one copy** — the value half of a split
-  contract, for a variable whose value embeds a host path and is therefore
-  allowlisted out of the cross-copy value comparison above.
-  ``DASHBOARD_PROJECT_ROOT`` is the case: it is the dashboard's data root
-  (``config.py``'s ``project_root`` falls back to ``Path.cwd()`` when it is
-  unset), so leaving it unchecked would let ``=/tmp/wrong`` report parity, but
-  value-comparing it across copies would report drift on every correctly
-  configured host that is not this one — the committed unit hardcodes
-  ``/home/leo/src/dark-factory`` while ``setup-host.sh`` renders the installed
-  copy with that host's real ``$REPO_ROOT``.  It is compared instead against
-  the SAME copy's ``WorkingDirectory=``, a relation that is host-invariant by
-  construction.  Presence remains checked across copies by the Environment=
-  name-set branch, so the two halves together leave no gap.
+- **Environment= vs a directive, WITHIN one copy** — the VALUE half of a split
+  contract, for a variable allowlisted out of the cross-copy comparison above
+  because its value embeds a host path.  ``DASHBOARD_PROJECT_ROOT`` is the
+  case: it is related to the SAME copy's ``WorkingDirectory=``, which is
+  host-invariant by construction, while PRESENCE stays checked across copies by
+  the Environment= name-set branch.  ``UnitSpec.env_matches_directive`` carries
+  the full rationale — why intra-copy, why an empty value is never parity, and
+  what guards the registry entry.
 - **Override mechanisms** — a directive comparison only means anything if the
   installed unit FILE is what actually takes effect, and systemd offers two
   standard ways for it not to be.  A drop-in (``<unit>.d/*.conf``, what
@@ -202,12 +197,10 @@ DIVERGENCE_ALLOWLIST: dict[str, str] = {
         "$REPO_ROOT — so a cross-copy value comparison reports drift on every "
         "correctly-configured host that is not this one. "
         "NOT A HOLE, unlike the entry above: the value is still checked, just "
-        "not across copies. UnitSpec.env_matches_directive compares it against "
-        "the SAME copy's WorkingDirectory=, a relation that is host-invariant "
-        "and catches a repointed or stale value on either side, and the "
-        "Environment= name-set branch still makes a dropped variable drift. "
-        "The two entries are a PAIR — removing either one silently gives back "
-        "the failure the other prevents."
+        "not across copies. UnitSpec.env_matches_directive relates it to the "
+        "SAME copy's WorkingDirectory= (see there for why), and the name-set "
+        "branch still makes a dropped variable drift. The two entries are a "
+        "PAIR — removing either gives back the failure the other prevents."
     ),
 }
 
@@ -933,17 +926,11 @@ UNITS: dict[str, UnitSpec] = {
         override_directives=(("Service", "EnvironmentFile"),),
         environment_section="Service",
         env_matches_directive=(
-            # DASHBOARD_PROJECT_ROOT is the dashboard's DATA ROOT — burndown,
-            # metrics, runs, escalations and memory-evals all resolve under it,
-            # because config.py's project_root falls back to Path.cwd() when the
-            # variable is unset (task 3503), and task 3572 made the unit declare
-            # it rather than leave it an undeclared side effect of
-            # WorkingDirectory=. Its value legitimately differs per host, so it
-            # is allowlisted out of the cross-copy value comparison below and
-            # checked HERE instead, against the SAME copy's WorkingDirectory=.
-            # That relation is host-invariant, so it still catches a repointed
-            # or stale value on either side — which a bare allowlist entry
-            # would not: =/tmp/wrong would otherwise read as parity.
+            # The dashboard's DATA ROOT (config.py's project_root falls back to
+            # Path.cwd() when it is unset), so =/tmp/wrong must not read as
+            # parity — but the value differs per host, so it is allowlisted out
+            # of the cross-copy compare and related to THIS copy's
+            # WorkingDirectory= instead. See UnitSpec.env_matches_directive.
             ("DASHBOARD_PROJECT_ROOT", "WorkingDirectory"),
         ),
         exec_start_flags=(
