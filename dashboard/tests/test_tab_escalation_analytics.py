@@ -1225,6 +1225,74 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
     )
 
 
+def test_esc_per_done_chart_does_not_compact_its_series(tab_analytics_jsx_body: str) -> None:
+    """A null-ratio day keeps its x-axis slot instead of being dropped (task 3489).
+
+    ``esc_per_done_daily[].ratio`` is null on days where done == 0 — the ONLY
+    consumer in the dashboard that originates a real hole.  This panel used to
+    drop those rows entirely::
+
+        const epdRows = escPerDoneDaily.filter(row => row.ratio != null);
+        const epdDates = epdRows.map(row => row.date);
+
+    which is worse than it looks: the filter removes the day from the LABEL row
+    as well as from the values, so the series is COMPACTED and every surviving
+    sample is silently redated — a Tuesday reading slides into Monday's slot.
+    That is the precise hazard spark_path.js's header names, and it was only
+    ever a workaround for LineChart having no gap support.  LineChart now
+    breaks its line across a hole (task 3489), so the workaround is obsolete
+    AND actively wrong.
+
+    Asserted structurally rather than by comment wording: the dates and the
+    values must come from the SAME row list, and that list must be the windowed
+    rows themselves, not a filtered copy.
+    """
+    workflow_body = _extract_function_body(tab_analytics_jsx_body, 'WorkflowPanel')
+    assert workflow_body, 'Could not locate the WorkflowPanel( function body.'
+
+    filter_on_ratio = re.search(r'\.filter\([^)]*\bratio\b[^)]*\bnull\b', workflow_body)
+    assert filter_on_ratio is None, (
+        'WorkflowPanel still filters rows on a null `ratio`: '
+        f'`{filter_on_ratio.group(0) if filter_on_ratio else ""}`. Dropping the '
+        'row removes its date from the label row too, compacting the x-axis and '
+        'redating every surviving sample. Pass the null through instead — '
+        'LineChart draws it as a gap.'
+    )
+
+    date_sources = set(
+        re.findall(r'(\w+)\s*\.map\(\s*\(?\s*\w+\s*\)?\s*=>\s*\w+\.date\b', workflow_body)
+    )
+    ratio_sources = set(
+        re.findall(r'(\w+)\s*\.map\(\s*\(?\s*\w+\s*\)?\s*=>\s*\w+\.ratio\b', workflow_body)
+    )
+    assert date_sources, (
+        'WorkflowPanel derives no `.date` label row via a `.map(row => row.date)` '
+        '— the esc-per-done chart needs one label per row.'
+    )
+    assert ratio_sources, (
+        'WorkflowPanel derives no `.ratio` series via a `.map(row => row.ratio)` '
+        '— the esc-per-done chart must plot the ratios.'
+    )
+    assert date_sources == ratio_sources, (
+        f'the esc-per-done labels come from {sorted(date_sources)} but the values '
+        f'from {sorted(ratio_sources)}. Both must be derived from the SAME row '
+        f'list, or a dropped/added row shifts the labels out of step with the '
+        f'samples and silently redates the series.'
+    )
+
+    source = next(iter(ratio_sources))
+    assignment = re.search(rf'\b(?:const|let|var)\s+{re.escape(source)}\s*=\s*([^;]+);', workflow_body)
+    assert assignment is not None, (
+        f'could not find where `{source}` (the row list feeding the esc-per-done '
+        f'chart) is assigned in WorkflowPanel.'
+    )
+    assert '.filter(' not in assignment.group(1), (
+        f'`{source}` is assigned from a filtered list: `{assignment.group(1).strip()}`. '
+        f'The esc-per-done chart must be fed the windowed rows themselves, so a '
+        f'day with no measurement keeps its slot and renders as a gap.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # amendment: pin charts.jsx's chart padding to the value RegimeMarkers assumes
 # ---------------------------------------------------------------------------
