@@ -250,10 +250,16 @@ class TestDerivedRegistriesByteIdentity:
         ]
 
     def test_archive_deny_list_matches_legacy_set(self):
+        """The legacy set MINUS semaphore_timeout, removed deliberately by
+        task 3679 (that category terminates in a blocking human escalation,
+        so its log is the only triage artifact — see
+        TestSemaphoreTimeoutArchivesForHumanTriage). Every other member is
+        still the legacy value; this stays a byte-for-byte pin so an
+        UNINTENDED archive-policy change still reds here."""
         from orchestrator.verify_categories import ARCHIVE_DENY_LIST
         assert frozenset({
             'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
-            'pytest_internalerror', 'env_transient', 'disk_full', 'semaphore_timeout',
+            'pytest_internalerror', 'env_transient', 'disk_full',
         }) == ARCHIVE_DENY_LIST
 
     def test_preexisting_break_skip_categories_matches_legacy_set(self):
@@ -514,9 +520,15 @@ class TestCrossModulePreexistingSingleSourced:
 # (flock/semaphore slot-acquisition timeout) — that previously had no
 # category at all and fell through to whichever code-fault category the
 # classifier matched first. Both are env_transient-family policy rows
-# (is_infra_transient=True, archive=False, preexisting_probe=False,
-# retry_kind=NONE — a serial re-run cannot fix a host condition) ranked
-# just below INFRA_TIMEOUT and above every code-fault category.
+# (is_infra_transient=True, preexisting_probe=False, retry_kind=NONE — a
+# serial re-run cannot fix a host condition) ranked just below INFRA_TIMEOUT
+# and above every code-fault category.
+#
+# The pair no longer shares an ARCHIVE policy (task 3679): DISK_FULL keeps
+# archive=False, SEMAPHORE_TIMEOUT is now archive=True. See
+# TestSemaphoreTimeoutArchivesForHumanTriage for the grounding — with
+# retry_kind=NONE, SEMAPHORE_TIMEOUT surfaces to a human rather than
+# self-clearing, and the archived log is that human's only triage artifact.
 #
 # RED today: neither member/row exists yet, so every test below fails on
 # the local ``from orchestrator.verify_categories import FailureCategory``
@@ -527,7 +539,11 @@ class TestCrossModulePreexistingSingleSourced:
 
 class TestEnvironmentalCategoriesExistWithInfraTransientPolicy:
     """DISK_FULL / SEMAPHORE_TIMEOUT are new FailureCategory members with an
-    env_transient-family CATEGORY_POLICY row."""
+    env_transient-family CATEGORY_POLICY row.
+
+    The two rows are identical EXCEPT for ``archive`` (task 3679):
+    SEMAPHORE_TIMEOUT is archive=True, DISK_FULL remains archive=False.
+    """
 
     def test_disk_full_value_and_policy(self):
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
@@ -539,11 +555,13 @@ class TestEnvironmentalCategoriesExistWithInfraTransientPolicy:
         assert row.retry_kind == RetryKind.NONE
 
     def test_semaphore_timeout_value_and_policy(self):
+        """archive=True since task 3679 — the one field where this row no
+        longer matches its DISK_FULL sibling (see the class docstring)."""
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
         assert FailureCategory.SEMAPHORE_TIMEOUT.value == 'semaphore_timeout'
         row = CATEGORY_POLICY[FailureCategory.SEMAPHORE_TIMEOUT]
         assert row.is_infra_transient is True
-        assert row.archive is False
+        assert row.archive is True
         assert row.preexisting_probe is False
         assert row.retry_kind == RetryKind.NONE
 
