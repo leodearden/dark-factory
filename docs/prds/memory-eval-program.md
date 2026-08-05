@@ -129,7 +129,8 @@ No other novel substrate; everything else is delivered by the leaves themselves.
 | Search-result provenance payload fields | **3137** | complementary: 3137 = what agents see; ζ = what the journal records; ζ notes 3137's fields in `result_summary` when both land |
 | Triage ack shape | **3127** (write-path PRD) | ζ logs today's ack; 3127's `routed`/`canonical_id` join the row when it lands (seam note in ζ) |
 | E2 fixture / labeled dataset reuse | **3130** (α-writepath) / **3199** | δ's measured fixture pair drawn from 3130's dataset; no new labeling here |
-| Briefing `mcp_call` + `_MEMORY_INSTRUCTIONS` text | orchestrator (ζ edits both) | 3131/ι-vocab edit different sentences — sequence note; ζ's edit is additive (caller params) |
+| Briefing `mcp_call` + `_MEMORY_INSTRUCTIONS` text | `_MEMORY_INSTRUCTIONS` + server params: **ζ (3212)**; ALL briefing.py edits: **memory-briefing-and-fusion β (3659)** | *Re-carved 2026-08-05:* ζ amended to server-side scope; 3659 rewrites `_get_memory_context`/`_mcp_search` and threads caller identity (dep 3659→3212). 3131/ι-vocab edit different roles.py sentences — sequence note; ζ's roles.py edit is additive |
+| E1 registry briefing topics | **memory-briefing-and-fusion γ (3660)** | β's registry (3208) collapsed all four briefing queries into one topic; 3660 re-keys to per-template topics and **gates ε (3211)** so the grandfather snapshot baselines the rescoped queries |
 
 ## 9. Open questions (tactical, implementation-time)
 
@@ -138,4 +139,5 @@ No other novel substrate; everything else is delivered by the leaves themselves.
 - Per-result "size" unit in ζ (chars vs tokenizer estimate) — cheap approximation acceptable, name it in the schema.
 - Whether ε's wrapper also ships a read-only `--check` predicate (flag-marker `-check.sh` precedent) for a future deterministic gate task.
 - Registry file format/location for β (lean: `fused-memory/tests/fixtures/` beside α-writepath's fixture, loaded by path from config).
+- *Added 2026-08-05, from E1's first live run:* three instrument-quality gaps to fix in a follow-up leaf — contamination-share counts only registry-topic-foreign results (489/490 scored results were un-topiced and excluded, so 0% is near-vacuous; report the un-topiced share separately), the canonical matcher matched only 6/196 trials by content-hash (needs a fuzzy content-prefix fallback), and superseded-above-successor went unmeasured (0 comparable pairs — registry needs supersedes_pairs populated). Measurement provenance: `fused-memory/data/memory-evals/e1-retrieval-health/*-20260805T093831Z.*`.
 - θ corpus location under `data/memory-evals/` vs `fused-memory/data/` (lean: former, it's an eval artifact).

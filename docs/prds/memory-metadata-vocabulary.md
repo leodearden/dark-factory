@@ -117,7 +117,7 @@ No novel substrate is assumed beyond what the leaves themselves produce.
 - The wider eval program (E1 retrieval-health monitor, E3 golden set, E4 sweep-as-metric, E6 ANN upgrade, E7 telemetry/shadow-replay, E8/E9) — future eval-program PRD over `plans/memory-subsystem-eval-design.md`. ζ implements E2 only (+ D10's audit-recall measurement).
 - Graphiti write-time guard / vocabulary alignment (§2 decision).
 - Full-corpus retro re-categorization or unbounded stamping sweeps (θ is bounded to known clusters).
-- The `memory_hints` dead channel and briefing-query redesign (eval-doc §4/§9.6 finding — measurement first).
+- The `memory_hints` dead channel (task 3254) and briefing-query redesign (eval-doc §4/§9.6 finding — measurement first). *[Briefing-query redesign DISCHARGED 2026-08-05: the measurement happened (esc-3253-1 evidence session + first live E1 run), and the redesign is owned by `docs/prds/memory-briefing-and-fusion.md` (tasks 3658-3660). `memory_hints` remains 3254's.]*
 - `update_memory` itself (3088), citation repointing (3108), XML-leak cure (3083), `reexamine_when` (3139/ν) — existing owners.
 
 ## 8. Cross-PRD / seam ownership (G4)
