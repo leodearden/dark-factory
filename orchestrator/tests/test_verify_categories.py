@@ -548,6 +548,50 @@ class TestEnvironmentalCategoriesExistWithInfraTransientPolicy:
         assert row.retry_kind == RetryKind.NONE
 
 
+class TestSemaphoreTimeoutArchivesForHumanTriage:
+    """task 3679 / esc-5848-2 / esc-5893-3: SEMAPHORE_TIMEOUT must archive
+    its verify log.
+
+    A SEMAPHORE_TIMEOUT is infra-transient but NOT self-clearing:
+    ``retry_kind=NONE`` means no serial re-run is attempted, so the category
+    can and does terminate in a BLOCKING human escalation — both live
+    incidents did, each holding its lane ~5h. ``archive=False`` meant the one
+    artifact a human needs to triage that block was discarded by the same
+    wrong label that caused the block: reify ``data/verify-logs/5848`` and
+    ``/5893`` do not exist, while 553 sibling task dirs do.
+
+    Also pins the invariant that should survive a future policy edit: a
+    category that is infra-transient but can still surface to a human must
+    not be in ``ARCHIVE_DENY_LIST``. Asserted for SEMAPHORE_TIMEOUT
+    specifically and deliberately NOT broadened to every infra-transient
+    category — DISK_FULL, PYTEST_INTERNALERROR and ENV_TRANSIENT keep their
+    current rows, which this task does not adjudicate.
+
+    RED today: the row is ``archive=False``, so all four assertions fail.
+    """
+
+    def test_policy_row_archives(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
+        assert CATEGORY_POLICY[FailureCategory.SEMAPHORE_TIMEOUT].archive is True
+
+    def test_not_in_archive_deny_list(self):
+        """ARCHIVE_DENY_LIST is DERIVED from the row, so this pins that the
+        derivation actually followed the row rather than a stale hand-synced
+        copy — the drift hazard verify_categories was built to close."""
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST, FailureCategory
+        assert FailureCategory.SEMAPHORE_TIMEOUT not in ARCHIVE_DENY_LIST
+
+    def test_should_archive_returns_true(self):
+        from orchestrator.verify_categories import should_archive
+        assert should_archive('semaphore_timeout') is True
+
+    def test_verify_delegation_path_archives(self):
+        """The call site that actually decides whether the log survives —
+        mirrors TestShouldArchiveCategoryDelegatesToTable's style."""
+        from orchestrator import verify
+        assert verify._should_archive_category('semaphore_timeout') is True
+
+
 class TestEnvironmentalCategoriesOutrankCodeFaults:
     """_worst_category must pick the infra root cause over a co-occurring
     downstream code-fault category — DISK_FULL/SEMAPHORE_TIMEOUT are ranked
