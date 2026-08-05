@@ -605,6 +605,272 @@ def test_environment_not_compared_when_spec_omits_the_section():
 
 
 # ---------------------------------------------------------------------------
+# compare_unit — intra-copy Environment=/directive agreement
+#
+# DASHBOARD_PROJECT_ROOT is the dashboard's data root (config.py's project_root
+# falls back to Path.cwd() when it is unset), and its value embeds the repo
+# root — so it CANNOT be value-compared across copies: the committed unit
+# hardcodes /home/leo/src/dark-factory while setup-host.sh renders the installed
+# copy with that host's real $REPO_ROOT.  The contract is therefore split.
+# PRESENCE is checked across copies by the Environment= name-set branch above;
+# VALUE is checked WITHIN each copy against that copy's WorkingDirectory=, a
+# relation that holds identically on every host.
+#
+# Assertions below are scoped to the drifts the NEW branch emits (keyed
+# _RELATION_KEY) rather than to the whole list, so each test measures the branch
+# it names and nothing else.  That scoping matters concretely: until
+# DASHBOARD_PROJECT_ROOT joins DIVERGENCE_ALLOWLIST, the name-set branch ALSO
+# fires on a cross-host value difference, and an unscoped assertion here would
+# be measuring the allowlist rather than this relation.  The one test that is
+# genuinely about the interaction between the two branches
+# (..._missing_variable_is_not_double_reported) asserts on the full list, by
+# design.
+# ---------------------------------------------------------------------------
+
+# The key _compare_env_matches_directive gives its Drift records. Named rather
+# than restated per test so that renaming it fails once, loudly, instead of
+# silently reducing every filtered assertion below to an empty-list tautology —
+# which is exactly how this whole section could rot into a no-op.
+_RELATION_KEY = "Environment=DASHBOARD_PROJECT_ROOT vs WorkingDirectory"
+
+
+def _relation_drifts(drifts):
+    """Return only the drifts emitted by the intra-copy relation branch."""
+    return [d for d in drifts if d.key == _RELATION_KEY]
+
+
+def _env_match_spec(mod: types.ModuleType):
+    """A minimal UnitSpec relating DASHBOARD_PROJECT_ROOT to WorkingDirectory=.
+
+    ``environment_section`` is registered as well, mirroring the real
+    dark-factory-dashboard.service entry: both halves of the split contract are
+    live on the real unit, so a fixture that switched one off would not exercise
+    the interaction the double-report test below turns on.
+    """
+    return mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        environment_section="Service",
+        env_matches_directive=(("DASHBOARD_PROJECT_ROOT", "WorkingDirectory"),),
+    )
+
+
+def _root_unit(working_directory: str | None, project_root: str | None) -> str:
+    """A synthetic [Service] copy declaring either, both or neither directive.
+
+    Pass None to OMIT that line entirely.  Every fixture in this section is an
+    in-memory string: the module docstring's standing rule is that drift-logic
+    tests never read the host's real ~/.config/systemd/user/, and it binds
+    doubly here — the installed dashboard unit legitimately lacks
+    DASHBOARD_PROJECT_ROOT until setup-host.sh is re-run, so a host-touching
+    test would encode that transient state as if it were checker behaviour.
+    """
+    lines = ["[Service]"]
+    if working_directory is not None:
+        lines.append(f"WorkingDirectory={working_directory}")
+    if project_root is not None:
+        lines.append(f"Environment=DASHBOARD_PROJECT_ROOT={project_root}")
+    return "\n".join(lines) + "\n"
+
+
+def test_env_matches_directive_agreeing_on_both_copies_is_not_drift():
+    """Both copies self-consistent at the same root → the relation holds."""
+    mod = _load_checker()
+    spec = _env_match_spec(mod)
+    root = "/home/leo/src/dark-factory"
+
+    drifts = mod.compare_unit(spec, _root_unit(root, root), _root_unit(root, root))
+
+    assert _relation_drifts(drifts) == [], (
+        f"Both copies agree internally at {root}; the relation holds. Got: {drifts}"
+    )
+
+
+def test_env_matches_directive_different_host_paths_are_not_drift():
+    """THE CROSS-HOST FALSE-POSITIVE GUARD: each copy self-consistent, at its own root.
+
+    This is the case that decides the SHAPE of the check.  A plain cross-copy
+    value compare on DASHBOARD_PROJECT_ROOT reports drift here — on a host that
+    is configured perfectly correctly, on every run — and the checker's own
+    module docstring spends two paragraphs on where that ends: a gate that is
+    always red gets switched off, taking the accidental drift it exists to catch
+    with it.  The intra-copy relation is host-invariant by construction, so it
+    stays silent here while still having teeth in the two tests below.
+
+    Without this test, a later "simplification" of
+    _compare_env_matches_directive into a value compare would look correct and
+    pass every other case in this section.
+    """
+    mod = _load_checker()
+    spec = _env_match_spec(mod)
+    leo = "/home/leo/src/dark-factory"
+    alice = "/home/alice/src/dark-factory"
+
+    drifts = mod.compare_unit(spec, _root_unit(leo, leo), _root_unit(alice, alice))
+
+    assert _relation_drifts(drifts) == [], (
+        "Each copy is internally consistent; only the HOST differs, which is "
+        f"exactly what setup-host.sh renders. Got: {drifts}"
+    )
+
+
+def test_env_matches_directive_mismatch_on_the_installed_copy_is_drift():
+    """TEETH: an installed copy whose data root disagrees with its cwd is drift.
+
+    DASHBOARD_PROJECT_ROOT=/tmp/wrong is the failure the allowlist alone would
+    wave through, and it is not a cosmetic one: that value IS the dashboard's
+    entire data root, so the databases would be read from somewhere other than
+    the checkout `uv run --project dashboard` resolves against.
+    """
+    mod = _load_checker()
+    spec = _env_match_spec(mod)
+    alice = "/home/alice/src/dark-factory"
+
+    drifts = _relation_drifts(
+        mod.compare_unit(
+            spec,
+            _root_unit("/home/leo/src/dark-factory", "/home/leo/src/dark-factory"),
+            _root_unit(alice, "/tmp/wrong"),
+        )
+    )
+
+    assert len(drifts) == 1, f"Expected exactly one relation drift. Got: {drifts}"
+    drift = drifts[0]
+    # Keyed to the RELATION, not to either directive alone: naming only
+    # 'Environment=DASHBOARD_PROJECT_ROOT' would leave the operator to work out
+    # what it was supposed to agree with.
+    assert drift.key == _RELATION_KEY
+    assert drift.unit == "fixture.service"
+    assert drift.section == "Service"
+    # Both halves as OBSERVED on each side, so the report is readable without a
+    # manual diff of the two files.
+    assert "/tmp/wrong" in drift.installed_value
+    assert alice in drift.installed_value
+    assert "installed" in drift.reason, (
+        f"The reason must name the side that disagrees. Got: {drift.reason!r}"
+    )
+    assert "DASHBOARD_PROJECT_ROOT" in drift.reason
+    assert "WorkingDirectory" in drift.reason
+
+
+def test_env_matches_directive_mismatch_on_the_repo_copy_is_drift():
+    """The symmetric case: the committed copy is not silently trusted.
+
+    It is the source of truth for VALUES, but not exempt from a relation it is
+    itself supposed to satisfy — a committed unit whose two directives disagree
+    is a defect that would otherwise be rendered straight onto every host by
+    setup-host.sh, with this checker reporting parity on the result.
+    """
+    mod = _load_checker()
+    spec = _env_match_spec(mod)
+    leo = "/home/leo/src/dark-factory"
+    alice = "/home/alice/src/dark-factory"
+
+    drifts = _relation_drifts(
+        mod.compare_unit(spec, _root_unit(leo, "/tmp/wrong"), _root_unit(alice, alice))
+    )
+
+    assert len(drifts) == 1, f"Expected exactly one relation drift. Got: {drifts}"
+    drift = drifts[0]
+    assert drift.key == _RELATION_KEY
+    assert "/tmp/wrong" in drift.repo_value
+    assert leo in drift.repo_value
+    assert "repo" in drift.reason, (
+        f"The reason must name the side that disagrees. Got: {drift.reason!r}"
+    )
+
+
+def test_env_matches_directive_missing_variable_is_not_double_reported():
+    """A copy that omits the variable gets ONE report, from the name-set branch.
+
+    Asserts on the FULL drift list, unlike its neighbours, because the property
+    IS the interaction between the two branches.  Absence is already reported by
+    _compare_environment with a reason worded for exactly that case; the new
+    branch firing as well would print two differently-keyed lines for one
+    defect, sending the operator looking for two problems.  The relation branch
+    therefore speaks only to the value, and only when there is a value to
+    relate.
+    """
+    mod = _load_checker()
+    spec = _env_match_spec(mod)
+    leo = "/home/leo/src/dark-factory"
+    alice = "/home/alice/src/dark-factory"
+
+    drifts = mod.compare_unit(
+        spec,
+        _root_unit(leo, leo),
+        _root_unit(alice, None),  # installed copy never declares the variable
+    )
+
+    assert len(drifts) == 1, (
+        "A variable absent from the installed copy is ONE defect and must get "
+        f"one report line. Got: {drifts}"
+    )
+    assert drifts[0].key == "Environment=DASHBOARD_PROJECT_ROOT", (
+        "The single report must come from the Environment= name-set branch, "
+        f"whose wording is written for absence. Got: {drifts[0]}"
+    )
+    assert _relation_drifts(drifts) == []
+
+
+def test_env_matches_directive_missing_directive_is_drift():
+    """The variable present but WorkingDirectory= absent is drift, not silence.
+
+    The relation cannot be established at all in that copy, and staying quiet
+    would read as agreement — the one failure direction this branch cannot
+    afford, since it is what the value half of the contract rests on.  (It is
+    also not double-reported: WorkingDirectory is on present_only, which fires
+    only when the two copies DISAGREE about presence; here both would have to
+    lose it for that branch to stay silent, and this fixture is exactly that
+    case.)
+    """
+    mod = _load_checker()
+    spec = _env_match_spec(mod)
+    leo = "/home/leo/src/dark-factory"
+
+    drifts = _relation_drifts(
+        mod.compare_unit(spec, _root_unit(leo, leo), _root_unit(None, leo))
+    )
+
+    assert len(drifts) == 1, (
+        f"An unestablishable relation must be reported. Got: {drifts}"
+    )
+    assert drifts[0].key == _RELATION_KEY
+    assert "WorkingDirectory" in drifts[0].reason
+    assert mod._ABSENT in drifts[0].installed_value, (
+        "The absent half must be rendered as _ABSENT so the report shows which "
+        f"of the two is missing. Got: {drifts[0].installed_value!r}"
+    )
+
+
+def test_env_matches_directive_not_compared_when_spec_omits_it():
+    """A spec with no env_matches_directive runs the branch not at all.
+
+    Mirrors test_environment_not_compared_when_spec_omits_the_section above:
+    the two watchdog units declare no Environment= at all, so the branch must
+    stay off for them rather than inventing comparisons.
+    """
+    mod = _load_checker()
+    spec = mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        environment_section="Service",
+    )
+
+    drifts = _relation_drifts(
+        mod.compare_unit(
+            spec,
+            _root_unit("/home/leo/src/dark-factory", "/tmp/wrong"),
+            _root_unit("/home/alice/src/dark-factory", "/tmp/also-wrong"),
+        )
+    )
+
+    assert drifts == [], (
+        f"env_matches_directive is empty; the branch must not run. Got: {drifts}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # compare_unit — uvicorn ExecStart flag comparison  (step-9 / step-10)
 # ---------------------------------------------------------------------------
 
