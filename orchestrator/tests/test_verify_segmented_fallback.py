@@ -678,8 +678,24 @@ class TestRunVerificationSegmentChainedTestWiring:
         )
 
     @staticmethod
-    async def _run(tmp_path, test_command: str, **kwargs):
-        """Drive run_verification with _run_cmd stubbed; return (result, calls)."""
+    async def _run(
+        tmp_path,
+        test_command: str,
+        *,
+        config_overrides: dict | None = None,
+        **kwargs,
+    ):
+        """Drive run_verification with _run_cmd stubbed; return (result, calls).
+
+        *config_overrides* is merged over this harness's inline
+        ``OrchestratorConfig`` construction, overrides winning. The default
+        ``None`` leaves the constructed config — and therefore every existing
+        caller — byte-identical; it exists because the admission-gated knobs
+        (``verify_admission_enabled``, ``verify_admission_pytest_n``,
+        ``verify_admission_slots_dir``) are otherwise unreachable through this
+        driver, which hardcodes admission OFF. Task 3478's per-segment ``-n``
+        tests need admission ON with a numeric cap.
+        """
         from unittest.mock import patch  # noqa: PLC0415
 
         from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
@@ -692,7 +708,9 @@ class TestRunVerificationSegmentChainedTestWiring:
             calls.append({'cmd': cmd, 'cwd': cwd, 'timeout': timeout, 'log_path': log_path})
             return 0, 'ok', False
 
-        config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False)
+        config_kwargs: dict = {'project_root': tmp_path, 'verify_admission_enabled': False}
+        config_kwargs.update(config_overrides or {})
+        config = OrchestratorConfig(**config_kwargs)
         runs_capture: list = []
 
         def spy_persist(*args, **kwargs):
