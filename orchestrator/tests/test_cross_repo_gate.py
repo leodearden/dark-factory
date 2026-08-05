@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 # Sentinel: distinguishes "metadata key absent" from "metadata is None".
 _UNSET = object()
 
@@ -221,3 +223,195 @@ class TestCarriesCrossRepoSignal:
 
         for bad in (None, [], 0, '', '{}', '[]', {'metadata': object()}):
             carries_cross_repo_signal(make_cross_repo_task(metadata=bad))
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED: classify_cross_repo leg (A) — the metadata.cross_repo marker
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyMarkerLeg:
+    """Leg (A): a truthy ``metadata.cross_repo`` marker blocks, and names an owner.
+
+    The markers observed in the wild are caller-authored and unvalidated, so
+    every spelling below is a real shape this leg must handle, and the owner
+    resolution must never INVENT a project name it cannot source.
+    """
+
+    # ---- the marker blocks, in every observed spelling -------------------
+
+    def test_boolean_marker_blocks(self, tmp_path):
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(cross_repo=True), project_root=tmp_path
+        )
+        assert verdict.verdict == BLOCK
+        assert 'cross_repo_marker' in verdict.signals
+
+    def test_bare_project_name_marker_blocks(self, tmp_path):
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(cross_repo='dark-factory'), project_root=tmp_path
+        )
+        assert verdict.verdict == BLOCK
+        assert 'cross_repo_marker' in verdict.signals
+
+    def test_project_colon_path_marker_blocks(self, tmp_path):
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                cross_repo='dark-factory:orchestrator/src/orchestrator/offline_lane.py'
+            ),
+            project_root=tmp_path,
+        )
+        assert verdict.verdict == BLOCK
+        assert 'cross_repo_marker' in verdict.signals
+
+    def test_marker_blocks_through_json_string_metadata(self, tmp_path):
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(cross_repo=True, metadata_as_json_string=True),
+            project_root=tmp_path,
+        )
+        assert verdict.verdict == BLOCK
+
+    # ---- owner resolution precedence ------------------------------------
+
+    def test_cross_repo_project_wins_over_string_marker(self, tmp_path):
+        """The typed companion is authoritative when both are present."""
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                cross_repo='dark-factory', cross_repo_project='dark_factory'
+            ),
+            project_root=tmp_path,
+        )
+        assert verdict.owner_project == 'dark_factory'
+
+    def test_string_marker_used_when_no_companion(self, tmp_path):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(cross_repo='dark-factory'), project_root=tmp_path
+        )
+        assert verdict.owner_project == 'dark-factory'
+
+    def test_string_marker_takes_pre_colon_field(self, tmp_path):
+        """'project:path' spellings must yield the project, not the whole string."""
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                cross_repo='dark-factory:orchestrator/src/orchestrator/offline_lane.py'
+            ),
+            project_root=tmp_path,
+        )
+        assert verdict.owner_project == 'dark-factory'
+
+    def test_scope_mismatch_suggested_project_is_last_fallback(self, tmp_path):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                cross_repo=True,
+                possible_scope_mismatch={'suggested_project': 'dark_factory'},
+            ),
+            project_root=tmp_path,
+        )
+        assert verdict.owner_project == 'dark_factory'
+
+    def test_companion_wins_over_scope_mismatch_suggestion(self, tmp_path):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                cross_repo=True,
+                cross_repo_project='reify',
+                possible_scope_mismatch={'suggested_project': 'dark_factory'},
+            ),
+            project_root=tmp_path,
+        )
+        assert verdict.owner_project == 'reify'
+
+    def test_boolean_marker_alone_leaves_owner_unresolved(self, tmp_path):
+        """Must NOT invent a name — an unresolved owner is reported as None."""
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(cross_repo=True), project_root=tmp_path
+        )
+        assert verdict.verdict == BLOCK, 'still blocks — the marker is the evidence'
+        assert verdict.owner_project is None, (
+            f'owner must be None when nothing names it; got {verdict.owner_project!r}'
+        )
+
+    def test_empty_and_non_string_companions_do_not_resolve_an_owner(self, tmp_path):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        for companion in ('', '   ', 42, [], {}, None):
+            verdict = classify_cross_repo(
+                task=make_cross_repo_task(cross_repo=True, cross_repo_project=companion),
+                project_root=tmp_path,
+            )
+            assert verdict.owner_project is None, (
+                f'cross_repo_project={companion!r} names no project; got '
+                f'{verdict.owner_project!r} — a placeholder owner is worse than None'
+            )
+
+    # ---- a falsy marker is not evidence ---------------------------------
+
+    def test_falsy_marker_does_not_block_on_leg_a_alone(self, tmp_path):
+        """Key-presence gets it INTO the gate; only a truthy value blocks."""
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        for falsy in (False, 0, '', None):
+            verdict = classify_cross_repo(
+                task=make_cross_repo_task(cross_repo=falsy), project_root=tmp_path
+            )
+            assert verdict.verdict != BLOCK, (
+                f'cross_repo={falsy!r} is not evidence of foreign ownership'
+            )
+            assert 'cross_repo_marker' not in verdict.signals
+
+    # ---- verdict shape ---------------------------------------------------
+
+    def test_verdict_is_frozen(self, tmp_path):
+        import dataclasses
+
+        from orchestrator.cross_repo_gate import CrossRepoVerdict, classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(cross_repo=True), project_root=tmp_path
+        )
+        assert isinstance(verdict, CrossRepoVerdict)
+        assert dataclasses.is_dataclass(verdict)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            verdict.verdict = 'allow'  # type: ignore[misc]
+
+    def test_blocked_property_tracks_verdict(self):
+        from orchestrator.cross_repo_gate import ALLOW, BLOCK, SKIP, CrossRepoVerdict
+
+        for value, expected in ((BLOCK, True), (ALLOW, False), (SKIP, False)):
+            verdict = CrossRepoVerdict(
+                verdict=value,
+                owner_project=None,
+                signals=(),
+                foreign_paths=(),
+                reason='',
+            )
+            assert verdict.blocked is expected, f'{value!r}.blocked should be {expected}'
+
+    def test_allow_when_no_marker_and_no_other_evidence(self, tmp_path):
+        from orchestrator.cross_repo_gate import ALLOW, classify_cross_repo
+
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(task_kind='deterministic'), project_root=tmp_path
+        )
+        assert verdict.verdict == ALLOW
+        assert verdict.signals == ()
+        assert verdict.blocked is False
