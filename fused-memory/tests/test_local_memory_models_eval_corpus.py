@@ -1233,3 +1233,318 @@ class TestVerifyStatusSemantics:
         assert _mod.verify_manifest({}, population).exit_code == (
             _mod.EXIT_CODES['bad_manifest']
         )
+
+
+# ===========================================================================
+# CLI — flat flags, build and verify modes, driven in-process
+# ===========================================================================
+
+# Captured BEFORE any monkeypatching, so the stub factory can construct the
+# real reader without recursing into itself.
+_REAL_READER = _mod.EpisodeReader
+
+
+class _StubReaderFactory:
+    """Stands in for the module-level ``EpisodeReader`` so main() opens no socket.
+
+    Hands back a REAL reader bound to the offline ``_FalkorDouble`` rather than
+    a fake reader: the CLI tests then exercise the actual fetch path — and its
+    read-only tripwires — instead of a parallel re-implementation of it that
+    could pass while the real one writes.
+    """
+
+    def __init__(self, double: _FalkorDouble):
+        self.double = double
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return _REAL_READER(graph=self.double, **kwargs)
+
+
+def _cli_rows(population=None) -> list[list[object]]:
+    """Result-set rows for a population, in PROJECTED_FIELDS order."""
+    population = population if population is not None else _population(SYNTHETIC_CELLS)
+    return [
+        [r.uuid, r.name, r.group_id, r.source_description, r.created_at, r.content]
+        for r in population
+    ]
+
+
+def _run_cli(monkeypatch, *argv, rows=None) -> tuple[int, _StubReaderFactory]:
+    """Drive ``main()`` in-process against the offline double.
+
+    Precedent: ``_run_cli`` in test_memory_eval_transcript_corpus.py. Returns
+    the exit code plus the factory, so a test can assert on what the CLI asked
+    the reader for as well as what it produced.
+    """
+    factory = _StubReaderFactory(_FalkorDouble(rows if rows is not None else _cli_rows()))
+    monkeypatch.setattr(_mod, 'EpisodeReader', factory)
+    return _mod.main(list(argv)), factory
+
+
+class TestCliFlagSurface:
+    """Flat mode flags, no subcommands — the memory_eval_transcript_corpus shape."""
+
+    def test_flag_set_is_pinned_by_equality(self):
+        """By EQUALITY, so a flag cannot appear without a test saying so.
+
+        Same treatment as memory_eval_retrieval_probe's no-mutating-flag test:
+        this script is read-only against the store, and the CLI is the surface
+        where a write band would be added.
+        """
+        parser = _mod._build_parser()
+        flags = {opt for action in parser._actions for opt in action.option_strings}
+        assert flags == {
+            '-h', '--help',
+            '--verify', '--n', '--seed', '--graph', '--out', '--dry-run',
+        }
+
+    def test_there_are_no_subcommands_and_no_positionals(self):
+        """Mode is a flag, not a verb — `--verify` selects it, build is default."""
+        parser = _mod._build_parser()
+        assert [a.dest for a in parser._actions if not a.option_strings] == []
+
+    def test_defaults(self):
+        args = _mod._build_parser().parse_args([])
+        assert args.verify is False
+        assert args.dry_run is False
+        assert args.n == _mod.DEFAULT_N == 200
+        assert args.graph == _mod.DEFAULT_GRAPH == 'dark_factory'
+        assert args.out == _mod.DEFAULT_MANIFEST_PATH
+        assert args.seed == _mod.DEFAULT_SEED
+
+    def test_n_is_parsed_as_an_int_not_a_string(self):
+        """`allocate` rejects a non-int n, so argparse must do the conversion."""
+        assert _mod._build_parser().parse_args(['--n', '150']).n == 150
+
+    def test_every_flag_has_help_text(self):
+        """Each help names the failure mode its flag guards."""
+        parser = _mod._build_parser()
+        assert all(
+            a.help for a in parser._actions if a.dest not in ('help',)
+        ), [a.dest for a in parser._actions if not a.help]
+
+    def test_parser_description_is_trimmed_not_the_whole_rst_docstring(self):
+        """argparse reflows the docstring's RST tables into rubble.
+
+        Precedent: memory_eval_retrieval_probe.build_parser passes a trimmed
+        description for exactly this reason.
+        """
+        description = _mod._build_parser().description or ''
+        assert description
+        assert '====' not in description
+        assert len(description.splitlines()) < 12
+
+
+class TestCliBuildMode:
+    """Build is the default mode and writes the committed artifact."""
+
+    def test_writes_the_manifest_and_exits_zero(self, monkeypatch, tmp_path):
+        out = tmp_path / 'corpus_manifest.json'
+        code, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        assert code == 0
+        manifest = json.loads(out.read_text(encoding='utf-8'))
+        assert len(manifest['episodes']) == 20
+        assert manifest['criteria']['seed'] == 's'
+
+    def test_written_manifest_carries_the_marker(self, monkeypatch, tmp_path):
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        assert MARKER in out.read_text(encoding='utf-8')
+
+    def test_a_second_build_over_an_unchanged_population_is_byte_identical(
+        self, monkeypatch, tmp_path
+    ):
+        """Re-running must diff cleanly, or a real change is unreadable in noise."""
+        out = tmp_path / 'corpus_manifest.json'
+        args = ('--n', '20', '--seed', 's', '--out', str(out))
+        _run_cli(monkeypatch, *args)
+        first = out.read_bytes()
+        _run_cli(monkeypatch, *args)
+        assert out.read_bytes() == first
+
+    def test_row_order_from_the_store_does_not_change_the_artifact(
+        self, monkeypatch, tmp_path
+    ):
+        """FalkorDB does not guarantee a stable row order between runs."""
+        out = tmp_path / 'a.json'
+        rows = _cli_rows()
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), rows=rows)
+        shuffled = list(rows)
+        random.Random(7).shuffle(shuffled)
+        other = tmp_path / 'b.json'
+        _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(other), rows=shuffled
+        )
+        assert other.read_bytes() == out.read_bytes()
+
+    def test_n_flag_is_honoured(self, monkeypatch, tmp_path):
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '30', '--seed', 's', '--out', str(out))
+        manifest = json.loads(out.read_text(encoding='utf-8'))
+        assert len(manifest['episodes']) == 30 == manifest['criteria']['n']
+
+    def test_seed_flag_changes_the_corpus(self, monkeypatch, tmp_path):
+        first, second = tmp_path / 'a.json', tmp_path / 'b.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 'one', '--out', str(first))
+        _run_cli(monkeypatch, '--n', '20', '--seed', 'two', '--out', str(second))
+        ids = [
+            [e['uuid'] for e in json.loads(p.read_text(encoding='utf-8'))['episodes']]
+            for p in (first, second)
+        ]
+        assert set(ids[0]) != set(ids[1])
+
+    def test_graph_flag_reaches_the_reader(self, monkeypatch, tmp_path):
+        out = tmp_path / 'corpus_manifest.json'
+        _, factory = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--graph', 'other_graph',
+            '--out', str(out),
+        )
+        assert factory.calls == [{'graph_name': 'other_graph'}]
+
+    def test_build_prints_the_stratification_report(self, monkeypatch, tmp_path, capsys):
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        printed = capsys.readouterr().out
+        assert '2026-04|procedural_knowledge' in printed
+        assert str(out) in printed
+
+    def test_build_trips_no_write_path(self, monkeypatch, tmp_path):
+        out = tmp_path / 'corpus_manifest.json'
+        _, factory = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        assert factory.double.violations == []
+        assert factory.double.ro_queries
+
+    def test_an_unsatisfiable_n_exits_non_zero_and_writes_nothing(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """A too-large n is a loud usage error, never a quietly shorter corpus."""
+        out = tmp_path / 'corpus_manifest.json'
+        code, _ = _run_cli(monkeypatch, '--n', '99999', '--out', str(out))
+        assert code != 0
+        assert not out.exists()
+        assert capsys.readouterr().err.strip()
+
+
+class TestCliDryRun:
+    """`--dry-run` reports and writes nothing."""
+
+    def test_writes_no_file(self, monkeypatch, tmp_path):
+        out = tmp_path / 'corpus_manifest.json'
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run'
+        )
+        assert code == 0
+        assert not out.exists()
+
+    def test_prints_the_stratification_report(self, monkeypatch, tmp_path, capsys):
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run')
+        printed = capsys.readouterr().out
+        for cell in SYNTHETIC_CELLS:
+            assert f'{cell[0]}|{cell[1]}' in printed
+        assert 'dry-run' in printed.lower()
+
+    def test_does_not_overwrite_an_existing_manifest(self, monkeypatch, tmp_path):
+        out = tmp_path / 'corpus_manifest.json'
+        out.write_text('{"sentinel": true}\n', encoding='utf-8')
+        _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run'
+        )
+        assert json.loads(out.read_text(encoding='utf-8')) == {'sentinel': True}
+
+
+class TestCliVerifyMode:
+    """`--verify` re-derives the committed artifact and exits on its status code."""
+
+    def _built_manifest(self, monkeypatch, tmp_path) -> Path:
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        return out
+
+    def test_a_good_manifest_exits_zero(self, monkeypatch, tmp_path):
+        out = self._built_manifest(monkeypatch, tmp_path)
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out))
+        assert code == 0
+
+    def test_a_good_manifest_says_so(self, monkeypatch, tmp_path, capsys):
+        out = self._built_manifest(monkeypatch, tmp_path)
+        capsys.readouterr()
+        _run_cli(monkeypatch, '--verify', '--out', str(out))
+        assert 'ok' in capsys.readouterr().out.lower()
+
+    def test_a_tampered_seed_exits_id_mismatch(self, monkeypatch, tmp_path):
+        out = self._built_manifest(monkeypatch, tmp_path)
+        manifest = json.loads(out.read_text(encoding='utf-8'))
+        manifest['criteria']['seed'] = 'tampered'
+        out.write_text(json.dumps(manifest), encoding='utf-8')
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out))
+        assert code == _mod.EXIT_CODES['id_mismatch'] != 0
+
+    def test_content_drift_exits_hash_drift(self, monkeypatch, tmp_path):
+        out = self._built_manifest(monkeypatch, tmp_path)
+        population = _population(SYNTHETIC_CELLS)
+        manifest = json.loads(out.read_text(encoding='utf-8'))
+        drifted_uuid = manifest['episodes'][0]['uuid']
+        rows = _cli_rows(
+            [
+                dataclasses.replace(r, content='rewritten') if r.uuid == drifted_uuid else r
+                for r in population
+            ]
+        )
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out), rows=rows)
+        assert code == _mod.EXIT_CODES['hash_drift']
+
+    def test_a_vanished_episode_exits_missing_episodes(self, monkeypatch, tmp_path):
+        out = self._built_manifest(monkeypatch, tmp_path)
+        manifest = json.loads(out.read_text(encoding='utf-8'))
+        gone = manifest['episodes'][0]['uuid']
+        rows = [row for row in _cli_rows() if row[0] != gone]
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out), rows=rows)
+        assert code == _mod.EXIT_CODES['missing_episodes']
+
+    def test_an_absent_manifest_is_bad_manifest_not_a_traceback(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        code, _ = _run_cli(
+            monkeypatch, '--verify', '--out', str(tmp_path / 'nope.json')
+        )
+        assert code == _mod.EXIT_CODES['bad_manifest']
+        assert capsys.readouterr().err.strip()
+
+    def test_unparseable_json_is_bad_manifest(self, monkeypatch, tmp_path):
+        out = tmp_path / 'corpus_manifest.json'
+        out.write_text('{not json', encoding='utf-8')
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out))
+        assert code == _mod.EXIT_CODES['bad_manifest']
+
+    def test_verify_writes_nothing(self, monkeypatch, tmp_path):
+        """Verification is a read of the artifact, not a re-write of it."""
+        out = self._built_manifest(monkeypatch, tmp_path)
+        before = out.read_bytes()
+        _run_cli(monkeypatch, '--verify', '--out', str(out))
+        assert out.read_bytes() == before
+
+
+class TestBuilderScriptSatisfiesTheDeliveredCheck:
+    """The delivered_check greps fused-memory/scripts/ on the COMMITTED tree."""
+
+    def test_module_source_carries_the_literal_marker(self):
+        assert MARKER in SCRIPT_PATH.read_text(encoding='utf-8')
+
+    def test_marker_is_a_line_of_its_own(self):
+        """`git grep -E` matches a line; a marker buried mid-sentence is fragile."""
+        source = SCRIPT_PATH.read_text(encoding='utf-8')
+        assert any(line.strip() == MARKER for line in source.splitlines())
+
+    def test_module_is_runnable_as_a_script(self):
+        source = SCRIPT_PATH.read_text(encoding='utf-8').rstrip()
+        assert source.endswith("if __name__ == '__main__':\n    sys.exit(main())")
+
+    def test_main_returns_an_int_exit_code(self, monkeypatch, tmp_path):
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's',
+            '--out', str(tmp_path / 'corpus_manifest.json'),
+        )
+        assert isinstance(code, int) and not isinstance(code, bool)
