@@ -675,6 +675,80 @@ class TestSerialPytest:
         assert serial_pytest(cmd) == cmd
 
 
+# Module level (not class level) so the cross-product comprehension below
+# can see both names from its nested `for` clause — a comprehension nested
+# inside a class body cannot see other class-body names except through the
+# OUTERMOST iterable, so this table lives here instead of as class attributes.
+#
+# The two raw-chain mutators sharing `_append_to_raw_pytest_invocations`,
+# each with its own suffix. Kept separate from
+# `TestSubshellClauseIntegrity.test_cockpit_subshell_stays_parseable`'s own
+# inline parametrize list (which additionally carries a `corrupt_marker` per
+# row) rather than unifying the two, to avoid touching that already-passing
+# test for an unrelated finding.
+_SUBSHELL_MUTATORS = [
+    ('serial', lambda cmd: serial_pytest(cmd), " -p no:xdist -o addopts=''"),
+    ('numprocesses', lambda cmd: apply_pytest_numprocesses(cmd, '4'), ' -n 4'),
+]
+
+# (case_label, raw, expected_template) — `{suffix}` in the template is
+# substituted per mutator in `_SUBSHELL_MUTATORS` above. Every `raw` must
+# force the raw-chain (regex/`_append_to_raw_pytest_invocations`) appender
+# path this task changes, i.e. `cmd.raw is not None` — verified by the test
+# itself rather than assumed, since a bare `cd x && ` prefix does NOT do
+# that for the first two cases (measured: `_parse_single_segment` peels off
+# exactly that "leading cd &&" structured form, after which no chain
+# operator remains), whereas appending `&& true` does force the chain path.
+_PAREN_PRESERVING_CASES = [
+    (
+        'keyword-expression',
+        'pytest -k "not (slow or integration)" tests/ && true',
+        'pytest -k "not (slow or integration)" tests/{suffix} && true',
+    ),
+    (
+        'command-substitution',
+        'pytest $(cat args.txt) tests/ && true',
+        'pytest $(cat args.txt) tests/{suffix} && true',
+    ),
+    (
+        'no-space-before-paren',
+        '(cd x && pytest tests/)',
+        '(cd x && pytest tests/{suffix})',
+    ),
+    (
+        # A ')' at depth 0 INSIDE a quoted -k expression — not a subshell
+        # closer. Regression pin for the finding recorded in
+        # `_split_at_unbalanced_close`'s docstring: a quote-BLIND scanner
+        # mistakes this for an unbalanced close and splices the recovery
+        # flags inside the quotes, orphaning `tests/` outside the
+        # invocation — `bash -n` still exits 0, i.e. a SILENT wrong-tests-run
+        # rather than the loud syntax error this whole task exists to fix.
+        'quoted-close-paren',
+        'pytest -k "a)" tests/ && true',
+        'pytest -k "a)" tests/{suffix} && true',
+    ),
+    (
+        # Two independently-parenthesised pytest invocations in one chain —
+        # `_PYTEST_INVOCATION_RE.sub` rewrites each match independently, so
+        # both must land inside their OWN parens, not just the first.
+        'two-subshells',
+        '( cd a && pytest t1 ) && ( cd b && pytest t2 )',
+        '( cd a && pytest t1{suffix} ) && ( cd b && pytest t2{suffix} )',
+    ),
+]
+
+_PAREN_PRESERVING_PARAMS = [
+    pytest.param(
+        mutate,
+        raw,
+        template.format(suffix=suffix),
+        id=f'{mutator_label}-{case_label}',
+    )
+    for mutator_label, mutate, suffix in _SUBSHELL_MUTATORS
+    for case_label, raw, template in _PAREN_PRESERVING_CASES
+]
+
+
 class TestSubshellClauseIntegrity:
     """A mutator that appends flags to a raw-retained pytest chain must place
 
@@ -762,54 +836,46 @@ class TestSubshellClauseIntegrity:
     # GROUP B — differentiator guards for the rejected alternative fix
     # (widening `_PYTEST_INVOCATION_RE`'s excluded character class to
     # `[^&|;)]*`). `bash -n` alone cannot distinguish the two candidate
-    # fixes on the first two inputs below: the widened-class output ALSO
-    # exits 0 while having spliced the recovery flags into the middle of a
-    # `-k` keyword expression or a `$(...)` command substitution — see
-    # `_PYTEST_INVOCATION_RE`'s comment and the recorded design decision.
-    # Only the exact rendered string tells the two fixes apart, which is why
-    # both assertions are required here, not `bash -n` alone.
+    # fixes on the keyword-expression and command-substitution cases below:
+    # the widened-class output ALSO exits 0 while having spliced the
+    # recovery flags into the middle of a `-k` keyword expression or a
+    # `$(...)` command substitution — see `_PYTEST_INVOCATION_RE`'s comment
+    # and the recorded design decision. Only the exact rendered string tells
+    # the two fixes apart, which is why both assertions are required here,
+    # not `bash -n` alone.
     #
-    # Given bare, the first two inputs parse to a single STRUCTURED pytest
-    # command (measured: `cmd.raw is None`), which would exercise the
-    # `base_flags` branch rather than the regex/raw-chain branch this task
-    # changes — a vacuous test. A leading `cd x && ` prefix does NOT force
-    # raw retention here (measured): it is exactly the one recognised
-    # "leading cd &&" structured form `_parse_single_segment` peels off
-    # (verify_cmd.py:978), after which no chain operator remains. Appending
-    # `&& true` instead genuinely forces the multi-segment chain path
-    # (measured: `cmd.raw is not None` for all three cases below).
+    # Given bare, the keyword-expression and command-substitution inputs
+    # parse to a single STRUCTURED pytest command (measured: `cmd.raw is
+    # None`), which would exercise the `base_flags` branch rather than the
+    # regex/raw-chain branch this task changes — a vacuous test. A leading
+    # `cd x && ` prefix does NOT force raw retention here (measured): it is
+    # exactly the one recognised "leading cd &&" structured form
+    # `_parse_single_segment` peels off (verify_cmd.py:978), after which no
+    # chain operator remains. Appending `&& true` instead genuinely forces
+    # the multi-segment chain path (measured: `cmd.raw is not None` for
+    # every case in `_PAREN_PRESERVING_CASES`).
     #
-    # The third case is NOT a differentiator the way the first two are —
-    # measured RED at baseline (same underlying bug as GROUP A, just with no
-    # space before the closing paren), and both candidate fixes repair it
-    # identically. It earns its place here anyway as coverage of that
-    # tighter no-space shape for the real (paren-depth) fix.
-    @pytest.mark.parametrize(
-        ('raw', 'expected'),
-        [
-            (
-                'pytest -k "not (slow or integration)" tests/ && true',
-                'pytest -k "not (slow or integration)" tests/'
-                " -p no:xdist -o addopts='' && true",
-            ),
-            (
-                'pytest $(cat args.txt) tests/ && true',
-                "pytest $(cat args.txt) tests/ -p no:xdist -o addopts='' && true",
-            ),
-            (
-                '(cd x && pytest tests/)',
-                "(cd x && pytest tests/ -p no:xdist -o addopts='')",
-            ),
-        ],
-        ids=['keyword-expression', 'command-substitution', 'no-space-before-paren'],
-    )
-    def test_pytest_invocations_own_parens_are_preserved(self, raw, expected):
+    # The no-space-before-paren, quoted-close-paren and two-subshells cases
+    # are NOT differentiators the way the first two are — all three are
+    # green under BOTH candidate fixes (or, for quoted-close-paren, are
+    # exactly the NEW regression the quote-blind first cut of this fix
+    # introduced — see `_split_at_unbalanced_close`'s docstring). They earn
+    # their place here anyway as coverage of those shapes for the real
+    # (quote-aware, paren-depth) fix.
+    #
+    # Parametrized over BOTH raw-chain mutators (not just `serial_pytest`):
+    # `apply_pytest_numprocesses`'s `-n 4` suffix has different splicing
+    # consequences than `serial_pytest`'s multi-flag suffix, and shares the
+    # same appender, so a placement regression scoped to only one of them
+    # would otherwise slip past this suite.
+    @pytest.mark.parametrize(('mutate', 'raw', 'expected'), _PAREN_PRESERVING_PARAMS)
+    def test_pytest_invocations_own_parens_are_preserved(self, mutate, raw, expected):
         cmd = parse_config_command(raw)
         assert cmd.tool is ToolKind.PYTEST
         # Else the regex/raw-chain path this task changes isn't exercised.
         assert cmd.raw is not None
 
-        result = render(serial_pytest(cmd))
+        result = render(mutate(cmd))
         _assert_bash_parses(result, what=raw)
         assert result == expected
 
