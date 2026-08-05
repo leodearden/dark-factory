@@ -415,9 +415,37 @@ class UnitSpec:
     # construction, so it has teeth on every host without ever firing on one
     # that is merely configured elsewhere.
     #
-    # Reads the variable through environment_section, so a pair registered here
-    # needs that field set too.
+    # BOTH halves are read out of environment_section — the variable through
+    # _environment_map, the directive through that same section's parsed keys.
+    # A pair whose directive lives ELSEWHERE (('SOME_VAR', 'WantedBy'), which
+    # is in [Install]) would therefore compare against <absent> in both copies
+    # forever: permanent, unexplainable drift, which is the always-red-gate
+    # failure this module's docstring warns about twice. Two guards, because
+    # the two ways of getting it wrong fail differently — __post_init__ below
+    # rejects a pair registered with NO environment_section (the branch would
+    # silently compare nothing), and
+    # test_registry_env_matches_directive_entries_are_declared_in_the_committed_units
+    # rejects a variable or directive name that section does not declare.
     env_matches_directive: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        """Reject a registry entry whose relation branch could never run.
+
+        ``env_matches_directive`` reads both halves out of
+        ``environment_section``, so registering a pair without setting that
+        field makes the branch a silent no-op: the spec reads as though the
+        value were checked while nothing is compared at all — the one failure
+        mode a gate must not have, and the one its own report cannot reveal.
+        Raising here turns it into an import-time error on the registry, where
+        it is unmissable, instead of a green run that checked less than it says.
+        """
+        if self.env_matches_directive and self.environment_section is None:
+            raise ValueError(
+                f"{self.name}: env_matches_directive="
+                f"{self.env_matches_directive!r} requires environment_section to "
+                "be set — both the variable and the directive are read from that "
+                "section, so the comparison would silently check nothing"
+            )
 
 
 def _render(values: list[str] | None) -> str:
@@ -620,6 +648,19 @@ def _compare_env_matches_directive(
     A side that declares the variable but not the DIRECTIVE is reported: the
     relation cannot be established there, and silence would read as agreement.
 
+    An EMPTY (or whitespace-only) value on either half is reported even though
+    two empty strings compare equal — equality is not the property being
+    checked, usability is.  The case is reachable rather than theoretical:
+    setup-host.sh renders the installed copy with
+    ``sed 's|__REPO_ROOT__|$REPO_ROOT|g'``, so an unset ``$REPO_ROOT`` empties
+    ``WorkingDirectory=`` and ``Environment=DASHBOARD_PROJECT_ROOT=`` at once,
+    and a bare equality test would report parity on a unit whose data root is
+    unusable.  The repo-side check
+    (test_dashboard_service_template.py's
+    _assert_project_root_env_matches_working_directory) already requires
+    non-empty for this reason; this is the half that sees RENDERED output, so it
+    needs the rule more, not less.
+
     Drifts are keyed ``Environment=<VAR> vs <KEY>`` so the report names both
     halves; keying it to the variable alone would leave the reader to work out
     what it was supposed to agree with, and would collide with the name-set
@@ -630,7 +671,8 @@ def _compare_env_matches_directive(
 
     for var, key in spec.env_matches_directive:
         observed: dict[str, str] = {}
-        offending: list[str] = []
+        empty_sides: list[str] = []
+        mismatched_sides: list[str] = []
 
         for side_name, side in (("repo", repo), ("installed", installed)):
             env = _environment_map(side, section) if section is not None else {}
@@ -640,13 +682,28 @@ def _compare_env_matches_directive(
                 observed[side_name] = _ABSENT
                 continue
             observed[side_name] = f"{var}={env[var]} / {key}={directive}"
-            if directive != env[var]:
-                offending.append(side_name)
+            if not env[var].strip() or not directive.strip():
+                # Checked BEFORE equality: two empty halves are equal, and
+                # would otherwise pass. See the docstring.
+                empty_sides.append(side_name)
+            elif directive != env[var]:
+                mismatched_sides.append(side_name)
 
-        if not offending:
+        if not (empty_sides or mismatched_sides):
             continue
 
-        sides = " and ".join(offending)
+        clauses: list[str] = []
+        if empty_sides:
+            clauses.append(
+                f"{var} and/or {key} is EMPTY in the {' and '.join(empty_sides)} "
+                "copy (an empty value is not a usable root, and two empty halves "
+                "must not pass by comparing equal to each other)"
+            )
+        if mismatched_sides:
+            clauses.append(
+                f"{var} does not match {key} within the "
+                f"{' and '.join(mismatched_sides)} copy"
+            )
         drifts.append(
             Drift(
                 unit=spec.name,
@@ -655,10 +712,11 @@ def _compare_env_matches_directive(
                 repo_value=observed["repo"],
                 installed_value=observed["installed"],
                 reason=(
-                    f"{var} does not match {key} within the {sides} copy — the "
-                    "two must agree in each copy independently (their shared "
-                    "value legitimately differs per host, so only this "
-                    "intra-copy relation is checkable across hosts)"
+                    "; ".join(clauses)
+                    + " — the two must agree, and be non-empty, in each copy "
+                    "independently (their shared value legitimately differs per "
+                    "host, so only this intra-copy relation is checkable across "
+                    "hosts)"
                 ),
             )
         )

@@ -28,6 +28,8 @@ import subprocess
 import sys
 import types
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
 
@@ -658,7 +660,9 @@ def _env_match_spec(mod: types.ModuleType):
 def _root_unit(working_directory: str | None, project_root: str | None) -> str:
     """A synthetic [Service] copy declaring either, both or neither directive.
 
-    Pass None to OMIT that line entirely.  Every fixture in this section is an
+    Pass None to OMIT that line entirely; pass "" to declare it with an EMPTY
+    value, which is what setup-host.sh's sed renders from an unset $REPO_ROOT
+    and is a distinct case from omission.  Every fixture in this section is an
     in-memory string: the module docstring's standing rule is that drift-logic
     tests never read the host's real ~/.config/systemd/user/, and it binds
     doubly here — the installed dashboard unit legitimately lacks
@@ -840,6 +844,120 @@ def test_env_matches_directive_missing_directive_is_drift():
     assert mod._ABSENT in drifts[0].installed_value, (
         "The absent half must be rendered as _ABSENT so the report shows which "
         f"of the two is missing. Got: {drifts[0].installed_value!r}"
+    )
+
+
+def test_env_matches_directive_mismatch_on_both_copies_names_both_sides():
+    """BOTH copies internally inconsistent is ONE drift naming both sides.
+
+    The only path that joins two side names into the reason, and the case a
+    per-side Drift record would report twice for what is one contract being
+    broken.  Reachable in practice: the committed unit is what setup-host.sh
+    renders FROM, so a repo-side repoint is normally reproduced on the installed
+    side the moment the host is re-provisioned — the copies are not independent.
+    """
+    mod = _load_checker()
+    spec = _env_match_spec(mod)
+
+    drifts = _relation_drifts(
+        mod.compare_unit(
+            spec,
+            _root_unit("/home/leo/src/dark-factory", "/tmp/wrong"),
+            _root_unit("/home/alice/src/dark-factory", "/tmp/also-wrong"),
+        )
+    )
+
+    assert len(drifts) == 1, (
+        f"One broken relation is one report line, not two. Got: {drifts}"
+    )
+    assert "repo and installed" in drifts[0].reason, (
+        "Both offending sides must be named — an operator told only 'installed' "
+        f"would fix the host and re-render the same defect. Got: {drifts[0].reason!r}"
+    )
+
+
+def test_env_matches_directive_empty_on_both_copies_is_drift():
+    """Two EMPTY halves must not pass by comparing equal to each other.
+
+    Equality is not the property being checked, usability is — and this is not
+    a theoretical input.  setup-host.sh renders the installed unit with
+    `sed 's|__REPO_ROOT__|$REPO_ROOT|g'`, so an unset or empty $REPO_ROOT
+    empties WorkingDirectory= and Environment=DASHBOARD_PROJECT_ROOT= in the
+    SAME pass.  A bare `directive != env[var]` test then reports parity on a
+    unit whose data root is unusable — the gate's single worst outcome, since
+    green here is what licenses believing every other line of the report.
+
+    The repo-side helper
+    (test_dashboard_service_template.py::_assert_project_root_env_matches_working_directory)
+    asserts non-empty for exactly this reason; the checker is the half that sees
+    RENDERED output, so it needs the rule more, not less.
+    """
+    mod = _load_checker()
+    spec = _env_match_spec(mod)
+
+    drifts = _relation_drifts(mod.compare_unit(spec, _root_unit("", ""), _root_unit("", "")))
+
+    assert len(drifts) == 1, (
+        f"Empty-vs-empty is drift, not parity. Got: {drifts}"
+    )
+    assert "EMPTY" in drifts[0].reason, (
+        "The reason must say the value is empty rather than merely mismatched — "
+        f"the two send an operator to different places. Got: {drifts[0].reason!r}"
+    )
+    assert "repo and installed" in drifts[0].reason, (
+        f"Both empty sides must be named. Got: {drifts[0].reason!r}"
+    )
+
+
+def test_env_matches_directive_absent_from_both_copies_is_silent_here():
+    """Neither branch fires when NO copy declares the variable — by design.
+
+    compare_unit reports parity for this input, and that is correct at its
+    altitude: it compares two copies, and two copies that agree about declaring
+    nothing have not DRIFTED.  Recording the layering explicitly because the
+    silence looks like a gap: what catches a variable the registry names and no
+    unit declares is
+    test_registry_env_matches_directive_entries_are_declared_in_the_committed_units,
+    a staleness guard on the REGISTRY, not a drift check.  Deleting that guard
+    would leave this case unowned, and this test is where that shows up.
+    """
+    mod = _load_checker()
+    spec = _env_match_spec(mod)
+
+    drifts = mod.compare_unit(
+        spec,
+        _root_unit("/home/leo/src/dark-factory", None),
+        _root_unit("/home/alice/src/dark-factory", None),
+    )
+
+    assert drifts == [], (
+        "Two copies that both omit the variable have not drifted from each "
+        f"other; the registry staleness guard owns this case. Got: {drifts}"
+    )
+
+
+def test_env_matches_directive_without_an_environment_section_is_rejected():
+    """The combination that would silently check nothing raises at construction.
+
+    Both halves of the pair are read out of ``environment_section``, so a spec
+    registering a pair without it runs the branch over an empty env map and
+    reports parity forever while claiming the value is checked.  That is
+    unobservable from the report — the run is green and says so — which is why
+    it is rejected at import time on the registry rather than left to a test to
+    notice later.
+    """
+    mod = _load_checker()
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.UnitSpec(
+            name="fixture.service",
+            repo_relpath="dashboard/fixture.service",
+            environment_section=None,
+            env_matches_directive=(("DASHBOARD_PROJECT_ROOT", "WorkingDirectory"),),
+        )
+
+    assert "environment_section" in str(excinfo.value), (
+        f"The error must name the field to set. Got: {excinfo.value!r}"
     )
 
 
