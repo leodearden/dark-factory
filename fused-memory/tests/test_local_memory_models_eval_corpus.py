@@ -18,10 +18,14 @@ server-side on the live path.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import importlib.util
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'local_memory_models_eval' / 'build_corpus.py'
@@ -52,3 +56,171 @@ def _load_module() -> types.ModuleType:
 
 
 _mod = _load_module()
+
+
+# ===========================================================================
+# Parsing core — month bucket, payload kind, content hash
+# ===========================================================================
+
+
+class TestMonthBucket:
+    """``month_bucket`` derives the time stratum from ``created_at``."""
+
+    def test_iso_offset_timestamp(self):
+        """The shape FalkorDB actually returns for dark_factory episodes."""
+        assert _mod.month_bucket('2026-04-06T00:19:33.967261+00:00') == '2026-04'
+
+    def test_naive_and_z_suffixed_normalize_identically(self):
+        """A 'Z' suffix, a '+00:00' offset and a naive stamp are the same instant.
+
+        The store has been written by several code paths over its life; a
+        bucket that depended on which spelling was persisted would silently
+        split one month into two strata.
+        """
+        buckets = {
+            _mod.month_bucket('2026-05-16T12:00:00Z'),
+            _mod.month_bucket('2026-05-16T12:00:00+00:00'),
+            _mod.month_bucket('2026-05-16T12:00:00'),
+        }
+        assert buckets == {'2026-05'}
+
+    def test_sub_second_and_space_separator(self):
+        assert _mod.month_bucket('2026-08-05 21:17:57.123456+00:00') == '2026-08'
+
+    @pytest.mark.parametrize(
+        'bad',
+        ['', 'not-a-timestamp', '2026-13-01T00:00:00Z', None, 17],
+    )
+    def test_malformed_raises_rather_than_bucketing_to_unknown(self, bad):
+        """Loud over silent degradation: never a catch-all 'unknown' bucket.
+
+        An 'unknown' bucket would quietly become a 17th stratum and the
+        stratification report would look complete while describing a corpus
+        whose time axis had partially collapsed.
+        """
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod.month_bucket(bad)
+        assert 'created_at' in str(exc.value)
+
+
+class TestPayloadKind:
+    """``payload_kind`` derives the payload stratum from ``source_description``."""
+
+    def test_add_memory_shape(self):
+        """The shape all 2770 dark_factory episodes carry today."""
+        assert _mod.payload_kind('add_memory:decisions_and_rationale') == (
+            'decisions_and_rationale'
+        )
+
+    @pytest.mark.parametrize(
+        'kind',
+        [
+            'decisions_and_rationale',
+            'temporal_facts',
+            'entities_and_relations',
+            'procedural_knowledge',
+        ],
+    )
+    def test_every_observed_kind(self, kind):
+        assert _mod.payload_kind(f'add_memory:{kind}') == kind
+
+    def test_replay_from_mem0_shape(self):
+        """The second in-tree episode writer (memory_service replay path)."""
+        assert _mod.payload_kind('replay_from_mem0:temporal_facts') == 'temporal_facts'
+
+    def test_add_episode_caller_supplied_description(self):
+        """Real add_episode ingestion carries an arbitrary caller string.
+
+        It is not one of the six categories, so it buckets under a single
+        explicit ``add_episode`` kind rather than fanning the payload axis out
+        into one stratum per caller.
+        """
+        assert _mod.payload_kind('interactive session recap') == 'add_episode'
+
+    def test_temporal_context_prefix_is_stripped(self):
+        """``graphiti_client`` prepends ``[temporal:<ctx>] `` when set.
+
+        Verified absent from dark_factory today — all rows are bare
+        ``add_memory:*`` — but the parser must not mis-bucket it if it appears.
+        """
+        assert _mod.payload_kind('[temporal:2026-05-16] add_memory:temporal_facts') == (
+            'temporal_facts'
+        )
+
+    @pytest.mark.parametrize('bad', ['', None, 17, '   '])
+    def test_unusable_value_raises_naming_the_offender(self, bad):
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod.payload_kind(bad)
+        assert 'source_description' in str(exc.value)
+        assert repr(bad) in str(exc.value)
+
+
+class TestContentHash:
+    """``content_hash`` is the drift detector for replay inputs."""
+
+    def test_is_full_length_sha256_of_utf8_bytes(self):
+        text = 'a decision was made because of X'
+        assert _mod.content_hash(text) == hashlib.sha256(text.encode('utf-8')).hexdigest()
+        assert len(_mod.content_hash(text)) == 64
+
+    def test_is_byte_exact_not_whitespace_normalized(self):
+        """Deliberately NOT ``content_key()``'s whitespace-collapsing digest.
+
+        For epsilon/zeta/theta the bytes fed to the extraction pipeline are the
+        experiment's independent variable, so a whitespace change IS a change
+        and must fail verification.
+        """
+        assert _mod.content_hash('a b') != _mod.content_hash('a  b')
+        assert _mod.content_hash('a b') != _mod.content_hash('a\nb')
+
+    def test_non_ascii_is_hashed_as_utf8(self):
+        assert _mod.content_hash('δ') == hashlib.sha256('δ'.encode()).hexdigest()
+
+
+class TestEpisodeRecord:
+    """The record type — and the outcome field it deliberately does not have."""
+
+    def _record(self, **over):
+        fields = {
+            'uuid': 'e622a9bf-f1c8-431b-ad36-92762d69436d',
+            'name': 'ep',
+            'group_id': 'dark_factory',
+            'source_description': 'add_memory:temporal_facts',
+            'created_at': '2026-05-16T12:00:00+00:00',
+            'content': 'some episode text',
+        }
+        fields.update(over)
+        return _mod.EpisodeRecord(**fields)
+
+    def test_is_frozen(self):
+        record = self._record()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            record.uuid = 'other'  # type: ignore[misc]
+
+    def test_exposes_no_outcome_field(self):
+        """The no-outcome-filter hazard, enforced at the type level.
+
+        ``entity_edges`` is the per-episode record of what the INCUMBENT
+        extraction pipeline produced. If the record cannot carry it, no
+        sampling rule downstream can condition on it — the guarantee holds by
+        construction rather than by promise.
+        """
+        names = {f.name for f in dataclasses.fields(_mod.EpisodeRecord)}
+        assert names == {
+            'uuid',
+            'name',
+            'group_id',
+            'source_description',
+            'created_at',
+            'content',
+        }
+        assert not hasattr(self._record(), 'entity_edges')
+        forbidden = ('entity_edges', 'edges', 'extracted', 'outcome', 'score', 'success')
+        assert not [n for n in names if any(f in n for f in forbidden)]
+
+    def test_stratum_key_is_month_by_payload_kind(self):
+        assert _mod.stratum_key(self._record()) == ('2026-05', 'temporal_facts')
+
+    def test_stratum_key_propagates_parse_failure(self):
+        with pytest.raises(_mod.CorpusBuildError):
+            _mod.stratum_key(self._record(created_at='garbage'))
