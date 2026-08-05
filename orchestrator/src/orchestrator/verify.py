@@ -4499,6 +4499,17 @@ async def run_verification(
     every module_configs run. When the segmenter REFUSES, this is a no-op
     and the chain runs exactly as it does today.
 
+    Each segment is its own subprocess, so the per-execution details are
+    re-applied per segment rather than once for the chain: cpu-governance,
+    the admission nice prefix, its own streamed log path (keyed off the
+    index-suffixed ``ChainSegment.label``, so two segments sharing a cwd
+    cannot collide) and — since task 3478 — the ``verify_admission_pytest_n``
+    ``-n`` worker cap. ``CheckRun.cmd`` stays the operator's configured
+    chain throughout; all of the above are execution details layered onto
+    the segment, not rewrites of what was configured. Per-segment junitxml
+    is deliberately NOT among them: see the guard and the CheckRun comment
+    at the construction site.
+
     When *module_config* is provided, a ``None`` command means "skip that check"
     (the subproject doesn't define it).  When *module_config* is ``None``,
     global config commands are used for every check.
@@ -4902,12 +4913,30 @@ async def run_verification(
             # _summarize_checks, so preserving it keeps every persisted
             # artifact and every failure classification identical. Task 3338
             # changes execution TOPOLOGY and REPORTING, not what any command
-            # is. For the same reason the junitxml and apply_pytest_numprocesses
-            # branches above stay the no-ops they already are on an OPAQUE
-            # chain — both are recorded follow-ups, not smuggled in here: one
-            # junit path shared by 8 pytest runs is last-writer-wins (worse
-            # than today's no-op), and a per-segment `-n` would silently change
-            # verify parallelism for task/background roles.
+            # is. The per-segment `-n` cap below is layered onto the SEGMENT
+            # for the same reason the nice prefix and cpu-governance are: an
+            # execution detail, not the persisted config command.
+            #
+            # Task 3478 settled the two dispositions task 3338 recorded here
+            # as follow-ups:
+            #
+            # - junitxml is NOT wired per segment, and not because it is a
+            #   harmless no-op: junit_path requires role=='merge' while
+            #   segmentation requires role!='merge', so it is unreachable by
+            #   construction — dead code with no writer and no consumer
+            #   (_extract_failing_test_ids_from_junit runs only `if junit_path
+            #   is not None`). Node-id attribution here comes from
+            #   _extract_failing_test_ids over the aggregated segment stdout.
+            #   The guard above warns if either gate ever relaxes.
+            #
+            # - apply_pytest_numprocesses IS now applied per segment, inside
+            #   _run_one_segment. Its gate's roles ({'task','background'}) are
+            #   exactly the segmented-path roles, so it was never exempt —
+            #   just silently dropped, the rewrite landing on `cmd` while
+            #   segments are built from `config_cmd`. Segments run
+            #   sequentially, so a per-segment `-n N` keeps its single-command
+            #   meaning (N workers at any instant) rather than multiplying
+            #   parallelism by the segment count.
             cmd=config_cmd,
             rc=rc,
             output=out,
