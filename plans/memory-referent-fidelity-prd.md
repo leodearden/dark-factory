@@ -191,6 +191,13 @@ out-of-scope triple-write path would need.)
 
 - **α (in this batch)** — `cross_project_refs.py` and `GraphitiBackend.ensure_entity_node`
   cherry-picked onto main. Everything downstream of the repair path depends on it.
+  The four constituent commits on `task/3335`, in order:
+  `104ce86ded` (RED: cross_project_refs tests) · `a930dc7111` (GREEN: cross_project_refs.py)
+  · `c5629b3e65` (RED: ensure_entity_node tests) · `3432e0e284` (GREEN: ensure_entity_node).
+  Verified 2026-08-05 against main tip `52e27ff13f`: all four apply with **zero conflicts**
+  (one clean auto-merge in `graphiti_client.py`), 829 net inserted lines across 4 files,
+  all parsing. Re-verify before applying — main moves. Do **not** take the branch's fifth
+  concern (`_split_cross_project_task_nodes` in `memory_service.py`); that stays with 3335.
 - Verified present on main, no prerequisite needed: `reassign_edge`
   (`graphiti_client.py:989`), `_resolve_or_create_entity` (`:2251`),
   `get_nodes_by_exact_name` (`:2043`), `find_duplicate_entity_nodes` (`:2087`),
