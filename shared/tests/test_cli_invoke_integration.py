@@ -22,16 +22,46 @@ this measurement has twice produced 0 valid runs (2026-08-01, task 3454; again
   (visible under ``-s``, prefixed ``CROSS_ACCOUNT_RESUME_EVIDENCE``), including
   for runs that fail or skip.
 
-Probe which accounts are healthy BEFORE spending, and pick the pair from it:
-
-    for v in B C D E F G; do tok_var="CLAUDE_OAUTH_TOKEN_$v"; tok="${!tok_var}"; \\
-      out=$(cd /tmp && CLAUDE_CODE_OAUTH_TOKEN="$tok" timeout 60 claude \\
-        -p "Say exactly: PONG" --model haiku --max-turns 1 2>&1 | head -c 200); \\
-      echo "TOKEN_$v: $out"; done
-
-An account is healthy iff it answers PONG; any "You've hit your weekly/session
-limit" text means capped.  A cross-account resume needs TWO simultaneously
+**Probe which accounts are healthy BEFORE spending — through THIS code path.**
+An account is healthy iff it answers PONG; a "You've hit your weekly/session
+limit" message means capped.  A cross-account resume needs TWO simultaneously
 healthy accounts, and a probe older than ~15 minutes is stale.
+
+Probe via ``invoke_claude_agent`` (what these tests call), e.g. by aiming
+account A at the letter under test and running the single-account case:
+
+    CROSS_ACCOUNT_RESUME_TOKENS='F,C' uv run --project shared --directory shared \\
+        pytest tests/test_cli_invoke_integration.py -m integration -q \\
+        -k test_invoke_returns_session_id
+
+Do NOT probe with a bare ``claude -p '...' --model haiku --max-turns 1``
+one-liner.  MEASURED 2026-08-05T16:04-16:29Z, CLI 2.1.222: that command hung
+until killed on all six tokens (``timeout`` rc=124 at both 90s and 180s), with
+only ``Execution error`` on stdout — both under the ambient CLAUDE_CONFIG_DIR
+and under a fresh isolated one.  It cannot distinguish a capped account from a
+hung invocation, so it reads as "everything is capped" and wastes the window.
+The same six tokens probed through ``invoke_claude_agent`` in the same minutes
+answered cleanly (1 healthy, 5 capped with verbatim limit messages).
+
+**Caveat on ``_INVOKE_DEFAULTS['max_budget_usd'] = 0.01``.** MEASURED
+2026-08-05 on the healthy account, same prompt/model/turns: two runs at that
+ceiling, one aborted with ``success=False``, ``subtype='error_max_budget_usd'``
+and an EMPTY output, the other passed having spent $0.0083674 — 84% of the
+ceiling.  A third run under a $0.50 ceiling cost $0.0020803.  So realized
+per-call cost sits close enough to $0.01 to trip it intermittently.
+
+That matters because an ``error_max_budget_usd`` abort is NOT a capacity
+failure and produces an EMPTY output.  The guards below therefore do not skip
+on it; ``codeword_recalled`` is False and the cap matcher finds nothing in the
+empty text, so the emitted record scores it ``verdict='not_preserved'`` — a
+budget abort recorded as evidence of context loss.  That is the same shape of
+trap that voided the 2026-08-01 attempt (a non-context failure dressed up as
+lost context), one layer deeper, and the record as currently specified does not
+model it: ``r2_success=False`` with an empty ``r2_output`` is the tell, and
+``subtype`` is visible only in the pytest output, not in the record.  **Do not
+read a ``not_preserved`` record with an empty ``r2_output`` as context loss.**
+Escalated for a decision on a third void class rather than widened here (task
+3484, iteration 1).
 
 **Mechanism.** A Claude CLI session is a LOCAL JSONL transcript at
 ``<config_dir>/projects/<cwd-slug>/<session_id>.jsonl`` — not a server-side,
