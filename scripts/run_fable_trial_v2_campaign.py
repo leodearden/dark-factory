@@ -249,25 +249,34 @@ def marker_available(results: list[Any]) -> bool:
     return any(MARKER_KEY in (r.metrics or {}) for r in results)
 
 
-def _architect_cells(results: list[Any]) -> list[tuple[str, dict[str, Any]]]:
-    """``(config_name, metrics)`` for architect cells only.
+def _architect_cells(results: list[Any]) -> list[tuple[str, str, dict[str, Any]]]:
+    """``(task_id, config_name, metrics)`` for architect cells only.
 
-    THE ROLE FILTER RUNS FIRST, everywhere. An implementer run never invokes the
-    plan judge, so it is out of scope by construction — and if it were filtered
-    after the marker check instead, a single implementer cell riding along under
-    the same config name (carrying no marker key, because it never could) would
-    erase a candidate's genuine, complete measurement.
+    THE ROLE FILTER RUNS FIRST, everywhere — and it is single-sourced HERE so
+    that "everywhere" is checkable rather than aspirational. An implementer run
+    never invokes the plan judge, so it is out of scope by construction; and if
+    the filter ran after the marker check instead, a single implementer cell
+    riding along under the same config name (carrying no marker key, because it
+    never could) would erase a candidate's genuine, complete measurement.
+
+    ``task_id`` rides along so :func:`partition_bands` consumes this same filter
+    rather than re-implementing the ``role_under_test`` test inline. Two copies
+    of a filter documented as load-bearing is one copy too many: a change to what
+    counts as an architect cell would otherwise have to be made twice, with only
+    one of the sites carrying the argument for why it matters.
     """
     cells = []
     for result in results:
         metrics = result.metrics or {}
         if metrics.get('role_under_test') != 'architect':
             continue
-        cells.append((result.config_name, metrics))
+        cells.append((result.task_id, result.config_name, metrics))
     return cells
 
 
-def count_judged_without_reference(results: list[Any]) -> dict[str, int | None]:
+def count_judged_without_reference(
+    results: list[Any], unmeasured: dict[str, int] | None = None,
+) -> dict[str, int | None]:
     """Per candidate: how many architect cells were judged without a valid reference.
 
     ``None`` — never ``0`` — for any candidate with even ONE architect cell
@@ -287,10 +296,16 @@ def count_judged_without_reference(results: list[Any]) -> dict[str, int | None]:
 
     No edit is needed here when σ lands. The key simply starts appearing on each
     cell and these ``None``s become real counts.
+
+    *unmeasured* accepts an already-computed
+    :func:`count_unmeasured_marker_cells` map so a caller needing both (as
+    :func:`summarize_candidates` does) scans the cells once instead of three
+    times. It is an optimisation only: omitting it computes the same map here.
     """
     counts: dict[str, int | None] = {}
-    unmeasured = count_unmeasured_marker_cells(results)
-    for name, metrics in _architect_cells(results):
+    if unmeasured is None:
+        unmeasured = count_unmeasured_marker_cells(results)
+    for _task_id, name, metrics in _architect_cells(results):
         if unmeasured.get(name):
             counts[name] = None
             continue
@@ -312,7 +327,7 @@ def count_unmeasured_marker_cells(results: list[Any]) -> dict[str, int]:
     the key alongside older ones that never could.
     """
     counts: dict[str, int] = {}
-    for name, metrics in _architect_cells(results):
+    for _task_id, name, metrics in _architect_cells(results):
         counts[name] = counts.get(name, 0) + (0 if MARKER_KEY in metrics else 1)
     return counts
 
@@ -341,8 +356,11 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     from orchestrator.evals.report import build_plan_quality_report
 
     report = build_plan_quality_report(results)
-    marker_counts = count_judged_without_reference(results)
+    # Scanned ONCE and handed to both consumers: count_judged_without_reference
+    # needs exactly this map to decide unmeasured-vs-counted, and the renderer
+    # needs it to say "unmeasured (N of M cells)".
     unmeasured_counts = count_unmeasured_marker_cells(results)
+    marker_counts = count_judged_without_reference(results, unmeasured_counts)
     rows = []
     for entry in report['configs']:
         row = {field: entry[field] for field in _SUMMARY_FIELDS}
@@ -684,15 +702,15 @@ def partition_bands(results: list[Any], q_ceiling: float) -> dict[str, Any]:
     again be consulted to decide a per-cell question — doing exactly that is
     what let one post-σ sibling discard a never-measured fixture. Banding reads
     :data:`MARKER_KEY` off each cell, via :func:`band_for_cell`.
+
+    The architect-only filter comes from :func:`_architect_cells` rather than
+    being repeated inline, so the rule that it must run first has exactly one
+    implementation.
     """
     ranked: dict[str, int] = {}
-    for result in results:
-        metrics = result.metrics or {}
-        if metrics.get('role_under_test') != 'architect':
-            continue
+    for task_id, _config_name, metrics in _architect_cells(results):
         band = band_for_cell(metrics, q_ceiling)
         rank = _BAND_PRECEDENCE.index(band)
-        task_id = result.task_id
         ranked[task_id] = min(rank, ranked.get(task_id, rank))
 
     by_fixture = {task_id: _BAND_PRECEDENCE[rank] for task_id, rank in sorted(ranked.items())}
@@ -732,6 +750,13 @@ def _run_campaign(
     instrument edits from this lane. ``ofat_candidates()`` is never called: the
     candidate list is exactly what :func:`resolve_candidates` returned, every
     entry already checked to be an architect.
+
+    ``timeout`` passes through as ``timeout_override``, whose unit is MINUTES —
+    verified against the consumer rather than assumed: ``run_architect_eval``
+    does ``timeout_minutes = timeout_override or task.get('timeout_minutes', 60)``
+    and then ``timeout=timeout_minutes * 60`` (``runner.py:598-647``). A unit
+    mismatch here would silently make every cell's bound 60x wrong in one
+    direction or the other.
     """
     import asyncio
 

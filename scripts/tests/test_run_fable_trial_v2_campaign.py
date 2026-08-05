@@ -1562,3 +1562,88 @@ def test_find_missing_cells_is_pure_and_matches_on_trial(tmp_path):
     ]
     # Trial 1 DID return, so the arm is present — the shortfall is partial.
     assert missing['candidates_absent'] == []
+
+
+# ===== amendments: the last two uncovered seams on the live --run path =====
+
+
+def test_run_passes_the_timeout_override(tmp_path, campaign_seam):
+    """``--timeout`` reaches ``run_ofat_stage`` as ``timeout_override``.
+
+    Asserted alongside the other pass-throughs because a rename or a dropped
+    kwarg here would silently un-bound every cell's runtime with no test failing
+    — and this is the only flag on the live path whose absence changes nothing
+    observable in the report.
+    """
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    mod.main([
+        '--run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max', '--timeout', '7',
+    ])
+
+    assert campaign_seam['ofat'][0]['timeout_override'] == 7
+
+
+def test_missing_config_exits_naming_the_flag(tmp_path, monkeypatch):
+    """The one error path inside the live-spend seam is covered.
+
+    ``campaign_seam`` stubs ``load_config`` to always succeed, so this branch —
+    the only way ``_run_campaign`` fails before spending — needs its own test.
+    It must name the remedy (``--config`` / ``ORCH_CONFIG_PATH``) rather than
+    surfacing a raw ``ConfigRequiredError``.
+    """
+    import orchestrator.config as orch_config
+    from orchestrator.config import ConfigRequiredError
+    from orchestrator.evals import runner as eval_runner
+
+    def _raises(*args, **kwargs):
+        raise ConfigRequiredError('no orchestrator config found')
+
+    async def _never(*args, **kwargs):
+        pytest.fail('reached run_ofat_stage despite an unresolvable config',
+                    pytrace=False)
+
+    monkeypatch.setattr(orch_config, 'load_config', _raises)
+    monkeypatch.setattr(eval_runner, 'run_ofat_stage', _never)
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main(['--run', '--tasks-dir', str(d), '--candidate', 'architect-opus-max'])
+
+    assert exc.value.code != 0
+    assert '--config' in str(exc.value)
+    assert 'ORCH_CONFIG_PATH' in str(exc.value)
+
+
+def test_architect_cells_is_the_single_source_of_the_role_filter():
+    """Both the counting and the banding paths consume ONE role filter.
+
+    The filter's docstring argues at length that it must run first everywhere;
+    keeping a second inline copy in ``partition_bands`` would mean a change to
+    what counts as an architect cell had to be made twice, with only one site
+    carrying the argument for why it matters.
+    """
+    architect = _cell('f1', 'A', plan_steps=5, plan_quality=0.95,
+                      extra_metrics={'judged_without_reference': False})
+    implementer = _cell('f2', 'A', plan_steps=5, plan_quality=0.95,
+                        role_under_test='implementer',
+                        extra_metrics={'judged_without_reference': False})
+
+    cells = mod._architect_cells([architect, implementer])
+
+    assert cells == [('f1', 'A', architect.metrics)]
+    # And the banding path agrees: the implementer fixture is not banded at all.
+    assert mod.partition_bands([architect, implementer], 0.80)['by_fixture'] == {
+        'f1': 'ceiling',
+    }
+
+
+def test_count_judged_without_reference_accepts_a_precomputed_map():
+    """Passing the map is an optimisation, never a behaviour change."""
+    results = _mixed_marker_results()
+
+    unmeasured = mod.count_unmeasured_marker_cells(results)
+
+    assert mod.count_judged_without_reference(results, unmeasured) == \
+        mod.count_judged_without_reference(results)
