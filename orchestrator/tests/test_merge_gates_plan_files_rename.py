@@ -342,3 +342,114 @@ class TestRenamedOnMainResolvesViaDeletingCommit:
         assert result.not_touched == []
         assert result.missing_from_tree == []
         assert result.resolved_renames == {declared: new}
+
+
+# ---------------------------------------------------------------------------
+# Mechanism 2 — unique-basename fallback
+# ---------------------------------------------------------------------------
+
+
+async def _relocate_as_delete_then_add(
+    git_ops: GitOps,
+    repo: Path,
+    old: str,
+    new: str,
+) -> None:
+    """Relocate *old* → *new* on main as SEPARATE delete and add commits.
+
+    ``git show --name-status -M`` pairs renames only WITHIN a commit, so
+    this shape yields no ``R`` pair for the deleting commit and mechanism 1
+    is unrecoverable — which is exactly how the reify harness-consolidation
+    programme staged its moves.
+    """
+    rc, _, err = await _run(['git', 'rm', '--quiet', old], cwd=repo)
+    assert rc == 0, f'git rm {old} failed: {err}'
+    await _commit_on_main(git_ops, repo, {}, f'remove {old}')
+    await _commit_on_main(
+        git_ops, repo,
+        {new: '// relocated + rewritten\nfn topo() { assert_eq!(1, 1); }\n'},
+        f'add {new}',
+    )
+
+
+@pytest.mark.asyncio
+class TestUniqueBasenameFallback:
+    """When git cannot recover a rename PAIR, a UNIQUE basename match in the
+    branch tree resolves the declared path — bounded by the requirement that
+    the resolved path additionally be in the touched set."""
+
+    async def test_delete_then_add_resolves_by_unique_basename(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        old = 'crates/tests/topo_e2e.rs'
+        new = 'crates/tests/harness_topo/topo_e2e.rs'
+
+        await _commit_on_main(
+            git_ops, git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _relocate_as_delete_then_add(git_ops, git_repo, old, new)
+
+        wt = (await git_ops.create_worktree('basename-fallback')).path
+        base = await _head_of(wt)
+        (wt / new).write_text('// branch edit\nfn topo() { assert_eq!(2, 2); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [old], base, head, git_ops, task_id='basename-5196',
+            )
+
+        assert result.not_touched == []
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {old: new}
+
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'basename' in msg.lower(), (
+            'the resolution log must name the mechanism that resolved it, so a '
+            f'heuristic pass is auditable; got: {msg!r}'
+        )
+        assert old in msg
+        assert new in msg
+
+    async def test_two_stale_paths_share_one_tree_listing(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The literal reify-5196 two-file shape.
+
+        Both declared paths were relocated the same way and both new paths
+        are touched, so BOTH must resolve off the single tree listing the
+        gate computes lazily once per invocation.
+        """
+        old_a = 'crates/tests/a_e2e.rs'
+        old_b = 'crates/tests/b_e2e.rs'
+        new_a = 'crates/tests/harness_topo/a_e2e.rs'
+        new_b = 'crates/tests/harness_topo/b_e2e.rs'
+
+        await _commit_on_main(
+            git_ops, git_repo,
+            {old_a: 'fn a() {}\n', old_b: 'fn b() {}\n'},
+            'add a_e2e + b_e2e',
+        )
+        await _relocate_as_delete_then_add(git_ops, git_repo, old_a, new_a)
+        await _relocate_as_delete_then_add(git_ops, git_repo, old_b, new_b)
+
+        wt = (await git_ops.create_worktree('basename-fallback-two')).path
+        base = await _head_of(wt)
+        (wt / new_a).write_text('// branch edit a\n')
+        (wt / new_b).write_text('// branch edit b\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [old_a, old_b], base, head, git_ops, task_id='basename-two',
+        )
+
+        assert result.not_touched == []
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {old_a: new_a, old_b: new_b}
