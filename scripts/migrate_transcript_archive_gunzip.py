@@ -258,6 +258,23 @@ def _twin_is_trustworthy(gz_path: Path, twin: Path) -> bool:
     return True
 
 
+def verify_source_readable(gz_path: Path) -> None:
+    """Stream *gz_path* through decompression and discard it, raising on damage.
+
+    The dry-run counterpart of :func:`gunzip_one`: it exercises the exact same
+    read path (decompress + strict UTF-8 decode) while writing nothing at all.
+
+    This is what makes ``--apply``-less runs REAL validation rather than a file
+    count. A dry run that only counted ``.gz`` entries would report
+    ``failed == 0`` structurally — just as happily over a tree of corrupt files
+    as a healthy one — and the operator's only full-scale rehearsal before
+    deleting thousands of live sources would prove nothing.
+    """
+    with gzip.open(gz_path, 'rt', encoding='utf-8') as handle:
+        while handle.read(_CHUNK_BYTES):
+            pass
+
+
 def migrate_archive(root: Path, *, apply: bool) -> dict:
     """Sweep *root*, migrating every ``.jsonl.gz`` to its plain sibling.
 
@@ -272,8 +289,10 @@ def migrate_archive(root: Path, *, apply: bool) -> dict:
 
     ``apply=False`` is a pure projection: it classifies and counts without
     touching a single byte, so an operator can see exactly what a real run
-    would do first. An absent or non-directory *root* is a clean empty sweep,
-    not a crash.
+    would do first. It still READS every source through
+    :func:`verify_source_readable`, so a projected ``failed`` count is real
+    evidence about the archive rather than a structural zero. An absent or
+    non-directory *root* is a clean empty sweep, not a crash.
 
     Returns a summary keeping CLASSIFICATION distinct from ACTION (mirroring
     :func:`gc_agent_transcripts.build_gc_report`), so "skipped 1, migrated 1" is
@@ -304,6 +323,8 @@ def migrate_archive(root: Path, *, apply: bool) -> dict:
 
             if apply:
                 gunzip_one(gz_path)
+            else:
+                verify_source_readable(gz_path)
             summary['migrated'] += 1
         except _UNREADABLE_SOURCE_ERRORS as err:
             # Never re-raise: one bad file must not abort a sweep over ~4,554

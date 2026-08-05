@@ -558,3 +558,45 @@ def test_cli_absent_root_is_a_clean_no_op(tmp_path):
 
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert json.loads(result.stdout)["scanned"] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-9: the dry run must be REAL validation, not a file count
+#
+# The dry run is the ONLY full-scale rehearsal an operator gets before being
+# asked to run --apply against ~4,554 live files. If it merely counts .gz
+# entries without reading them, "projected failed == 0" is structurally
+# guaranteed and proves nothing about whether the archive is actually
+# migratable — it would pass just as happily over a tree of corrupt files.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("build_corrupt", CORRUPTION_SHAPES)
+def test_dry_run_detects_unreadable_sources(tmp_path, build_corrupt):
+    """A dry run reads each source through, so real corruption is reported
+    BEFORE a human is asked to pull the trigger — while still changing
+    nothing."""
+    gz = build_corrupt(tmp_path / "3618" / "enc" / "broken.jsonl.gz")
+    _write_gz(tmp_path / "3618" / "enc" / "healthy.jsonl.gz", _payload())
+    before = _mtimes(tmp_path)
+
+    summary = mig.migrate_archive(tmp_path, apply=False)
+
+    assert summary["scanned"] == 2
+    assert summary["failed"] == 1
+    assert str(gz) in summary["failed_paths"]
+    assert summary["migrated"] == 1  # only the healthy one is projected
+    # Still a pure projection: not one byte changed.
+    assert _mtimes(tmp_path) == before
+
+
+def test_dry_run_over_a_healthy_archive_projects_zero_failures(tmp_path):
+    """The converse: a genuinely healthy archive projects failed == 0, so the
+    gate distinguishes 'validated' from 'never looked'."""
+    _write_gz(tmp_path / "3618" / "enc" / "a.jsonl.gz", _payload())
+    _write_gz(tmp_path / "3618" / "enc" / "b" / "subagents" / "c.jsonl.gz", _payload(3))
+
+    summary = mig.migrate_archive(tmp_path, apply=False)
+
+    assert summary["scanned"] == 2
+    assert summary["migrated"] == 2
+    assert summary["failed"] == 0

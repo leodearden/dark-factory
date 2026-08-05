@@ -1083,6 +1083,89 @@ type on that line). Requests are left in place either way.
 
 ---
 
+## 13. One-off: transcript archive gunzip migration
+
+`scripts/migrate_transcript_archive_gunzip.py` converts the agent-transcript
+archive (`data/orchestrator/agent-transcripts/`) from `.jsonl.gz` to one
+plain, greppable `.jsonl` corpus. Task 3618, leaf α of
+`plans/transcript-preservation-seam-prd.md`.
+
+**This is a HUMAN-OPERATED step.** The task's implementer deliberately did not
+run `--apply`: an autonomous agent must not delete thousands of live files
+(the norm from task 1500, with precedents 1939/1945). The repo change and the
+live migration are separate acts, and the second one is yours.
+
+### The contract
+
+| | |
+|---|---|
+| Default | **Dry-run.** A bare invocation changes nothing. |
+| `--apply` | Opts into mutation. Without it, nothing is written or deleted. |
+| `--root` | Archive root (default `data/orchestrator/agent-transcripts`). |
+| Exit 0 | Every file migrated (or was already migrated). |
+| Exit 1 | **At least one file failed** — act on it. Unlike the `gc_agent_transcripts` sweep, which always exits 0 so a watchdog does not alarm, this is a one-off whose failures need a human. |
+
+stdout is a single JSON summary (`scanned` / `migrated` / `skipped` /
+`failed` / `failed_paths`); the LOUD lines go to stderr, so
+`... --apply | jq` works while failures stay visible.
+
+Per file it decompresses to the sibling `.jsonl`, **reads the result back**,
+mirrors the `.gz` mtime, and only then unlinks the source. A file it cannot
+corroborate is never destroyed — it is retained, counted and named. The mtime
+mirror matters: `gc_agent_transcripts` derives each task dir's retention age
+from its newest descendant mtime, so stamping `now` would silently reset the
+whole 90-day retention window.
+
+It is **idempotent and re-runnable**. A `.gz` whose `.jsonl` twin already
+reads back cleanly is skipped and its source dropped, so a run you kill
+half-way resumes correctly — and so you can re-sweep later residue (see
+below).
+
+### The operator sequence
+
+```bash
+cd /home/leo/src/dark-factory
+
+# 1. Baseline.
+find data/orchestrator/agent-transcripts -name '*.gz' | wc -l
+
+# 2. Dry-run first — READ-ONLY, and real validation: it decompresses and
+#    UTF-8-decodes every source without writing anything.
+python3 scripts/migrate_transcript_archive_gunzip.py | jq
+
+#    Gate: `scanned` should equal the baseline count and `failed` MUST be 0.
+#    A non-zero `failed` names the offending files in `failed_paths` —
+#    investigate those before going further.
+
+# 3. Migrate.
+python3 scripts/migrate_transcript_archive_gunzip.py --apply | jq
+
+# 4. Confirm.
+find data/orchestrator/agent-transcripts -name '*.gz' | wc -l   # expect 0
+```
+
+**Run this only AFTER the fleet has redeployed** past the task-3618 merge
+(§8). Until every orchestrator restarts, live units keep writing `.gz`, so a
+migration run before then leaves transition-window residue. Re-run step 3
+after the redeploy to sweep it — that is exactly what idempotency buys.
+
+Expect roughly a 4x expansion (≈485 MB → ≈1.9 GB at the sampled 3.93x ratio),
+a one-off cost against ~2.1 TB free.
+
+### The accepted gap between merge and your run
+
+The reader-side changes in task 3618 land at merge, but this migration runs
+later. In that window the legibility toolchain **under-reports** the archive:
+`_iter_archive_transcripts` now walks `rglob('*.jsonl')`, so a residual `.gz`
+is not enumerated at all — silently skipped rather than loudly failed.
+
+This is a known, accepted cost of not letting an agent delete live data, not
+a defect. It closes when you complete the sequence above. Validation for the
+migration itself was done at full scale: a dry run over all 4,574 live files
+decompressed and decoded every one of them with zero failures.
+
+---
+
 ## See also
 
 - [README.md](README.md) — what Dark Factory is, quick start
