@@ -63,7 +63,47 @@ function ageText(seconds) {
   return `${Math.round(h / 24)}d ago`;
 }
 
-const MEMORY_EVALS_FMT_API = { dash, ageText };
+// ── Unmatched escalations ──
+//
+// Branched on `reason`, with distinct wording per value.  Collapsing the three
+// into one undifferentiated "unexplained" list would fire on escalations that
+// are in fact fully explained and train operators to ignore the one signal
+// that catches a real parity orphan (memory_evals._unmatched_projection()).
+function unmatchedReasonText(reason) {
+  if (reason === 'no_matching_verdict') return 'no metric row explains this';
+  if (reason === 'storm_suppressed') return "explained, but this run's links are collapsed into the aggregate";
+  if (reason === 'no_fingerprint') return 'producer emitted no dedupe_fingerprint';
+  return `unrecognised reason: ${String(reason)}`;
+}
+
+// ── Chart primitive per metric kind (PRD open question 1) ──
+//
+// RETURNS A TAG, NOT A COMPONENT.  The name is unchanged from the .jsx version
+// but the return type is not, so a reader who assumes "component" is silently
+// wrong.  This function used to return the `MEStep` / `MESpark` React component
+// references destructured from `window.DF_CHARTS` — a browser global node
+// cannot resolve, which is precisely what pinned this vocabulary inside a .jsx
+// and out of reach of any runner (task 3481, DD-1).  It now returns a
+// closed-vocabulary tag string and the tag→component mapping is the CALLER's
+// job: tab_memory_evals.jsx holds a two-entry `ME_CHART_BY_TAG` lookup at its
+// single call site.  That split is what lets node execute the vocabulary at all.
+//
+// The payload's kind vocabulary is exactly {tripwire, proportion, count,
+// scalar}.  A kind outside that set is a RENDERING gap, not a data error: the
+// builder passes the value through verbatim and files an `unknown_kind` issue
+// for it.  So the fallback is `null` — value only, NO chart.  Guessing a
+// primitive would render an unvalidated shape as though it were understood.
+// The `null` tag also preserves the caller's `plottable` truthiness gate: an
+// unknown kind resolves to a null Chart there exactly as it did before.
+function chartForKind(kind) {
+  if (kind === 'tripwire') return 'step';   // step-shaped item counts
+  if (kind === 'proportion') return 'spark';
+  if (kind === 'count') return 'spark';
+  if (kind === 'scalar') return 'spark';
+  return null;
+}
+
+const MEMORY_EVALS_FMT_API = { dash, ageText, unmatchedReasonText, chartForKind };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = MEMORY_EVALS_FMT_API;
