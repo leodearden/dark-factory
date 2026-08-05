@@ -2129,8 +2129,11 @@ async def test_collect_metrics_snapshot_persists_the_refusal_count(tmp_path: Pat
     # The centiles row must still be written — the two inserts commit
     # independently so neither can roll the other back.
     async with metrics_conn.execute('SELECT COUNT(*) FROM curator_snapshots') as cur:
-        centile_count = (await cur.fetchone())[0]
+        centile_row = await cur.fetchone()
     await metrics_conn.close()
+
+    assert centile_row is not None
+    centile_count = centile_row[0]
 
     assert len(refusal_rows) == 1
     assert refusal_rows[0][0] == 2
