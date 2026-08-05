@@ -45,7 +45,7 @@ import { createRequire } from 'node:module';
 
 import mef from '../../src/dashboard/static/redux/memory_evals_fmt.js';
 
-const { dash, ageText, unmatchedReasonText, chartForKind } = mef;
+const { dash, ageText, unmatchedReasonText, chartForKind, trendGaps } = mef;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/memory_evals_fmt.js';
 
@@ -54,7 +54,13 @@ const MODULE_SPECIFIER = '../../src/dashboard/static/redux/memory_evals_fmt.js';
 // enumerate the real vocabulary instead of pinning a copy). Asserted
 // EXHAUSTIVELY below as the union of the two lists: an accidental export would
 // otherwise quietly widen the contract tab_memory_evals.jsx depends on.
-const EXPECTED_FUNCTION_NAMES = ['ageText', 'chartForKind', 'dash', 'unmatchedReasonText'];
+const EXPECTED_FUNCTION_NAMES = [
+  'ageText',
+  'chartForKind',
+  'dash',
+  'trendGaps',
+  'unmatchedReasonText',
+];
 const EXPECTED_DATA_NAMES = [];
 
 function expectedSurface() {
@@ -328,4 +334,72 @@ test('chartForKind: the tag vocabulary is exactly {step, spark, null}', () => {
   // no diagnosis.
   const tags = ['tripwire', 'proportion', 'count', 'scalar'].map(chartForKind);
   assert.deepEqual([...new Set(tags)].sort(), ['spark', 'step']);
+});
+
+// ---------------------------------------------------------------------------
+// trendGaps — count the deliberate holes in a trend series. A `null` (or
+// `undefined`) in `trend.values` means that run produced no sample.
+//
+// DETECT WITHOUT DROPPING is the load-bearing property. The array is handed on
+// UNMODIFIED: all metrics share one `run_stamps` x-axis, so compacting one
+// series would shift its points against every other's. The Python suite could
+// only approach this negatively (grep for the absence of `.filter(Boolean)`);
+// here it is asserted directly — the return is a NUMBER, and the input array is
+// deep-equal to a pristine copy afterwards. That is what a `.filter(Boolean)`,
+// an in-place `splice`, or a "helpfully" compacting rewrite would break.
+//
+// It matters because charts.jsx's primitives coerce a null to 0, and a dropped
+// hole would be drawn as a real measured point at the chart floor.
+// ---------------------------------------------------------------------------
+
+test('trendGaps: a clean series has no gaps', () => {
+  assert.equal(trendGaps([1, 2, 3, 0, -4]), 0);
+});
+
+test('trendGaps: both null and undefined count as holes', () => {
+  assert.equal(trendGaps([1, null, 3, undefined, 5]), 2);
+});
+
+test('trendGaps: an empty series has no gaps', () => {
+  // Note an empty series is NOT the same state as a holed one: `trendGaps([])`
+  // is 0, so the caller gates the chart on the point count separately.
+  assert.equal(trendGaps([]), 0);
+});
+
+test('trendGaps: an all-holes series reports every slot', () => {
+  const values = [null, null, undefined, null];
+  assert.equal(trendGaps(values), values.length);
+});
+
+test('trendGaps: a measured zero is not a hole', () => {
+  // The same null-vs-zero invariant dash() states for scalars, applied to the
+  // trend column: a run that measured 0 took a measurement.
+  assert.equal(trendGaps([0, 0, 0]), 0);
+});
+
+test('trendGaps: an absent series is not an error', () => {
+  // The `if (!values) return 0` guard — a payload with no trend at all must
+  // render as "no runs", not throw through the row.
+  assert.equal(trendGaps(undefined), 0);
+  assert.equal(trendGaps(null), 0);
+});
+
+test('trendGaps: counts holes WITHOUT dropping them from the series', () => {
+  const values = [1, null, 3, undefined, 5];
+  const pristine = values.slice();
+
+  const gaps = trendGaps(values);
+
+  // (a) The result is a COUNT, not a compacted series — a function that
+  // returned an array would have become a filter.
+  assert.equal(typeof gaps, 'number', 'trendGaps must return a count, not a series');
+  assert.equal(gaps, 2);
+
+  // (b) The caller's array is untouched. Holes stay at their own indices
+  // because every metric's series is indexed against one shared run_stamps
+  // x-axis; compacting this one would shift its points against every other's.
+  assert.deepEqual(values, pristine, 'the input series must not be mutated');
+  assert.equal(values.length, pristine.length, 'the series length must not change');
+  assert.equal(values[1], null, 'the null hole must stay at its own index');
+  assert.equal(values[3], undefined, 'the undefined hole must stay at its own index');
 });
