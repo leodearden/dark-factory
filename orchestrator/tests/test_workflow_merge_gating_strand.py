@@ -464,10 +464,19 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
     synthetic edge case: ``TaskSteward`` routinely chains a follow-on
     ``infra_issue`` while resolving a ``task_failure``.
 
-    The resolve fires the queue's resolve callback and wakes the waiter, so by
-    the time the merge-entry handler re-checks the gate there is a NEW gating
-    record open that it never waited on.  That is the shape the single-shot
-    bound (spec S5) exists to cap.
+    The resolve fires the queue's resolve callback and wakes the waiter, which
+    then finds a NEW gating record in place of the one it was waiting on.  A
+    fresh level-0 is still within the WAIT's reach — its loop re-polls level-0
+    on every wake, inside the SAME deadline — so this shape costs exactly one
+    window and then parks via the expiry branch.  Contrast
+    :func:`_make_chained_l2_steward`, whose follow-on is invisible to the wait
+    entirely.  Between them they cover both halves of the single-shot bound
+    (spec S5).
+
+    Runs in the background after a short delay for the same reason
+    :func:`_make_chained_l2_steward` does: a synchronous ``start()`` would
+    leave the chained record already pending at wait entry, so the waiter
+    would never block and the production wake path would go unexercised.
     """
 
     class _FakeSteward:
@@ -477,6 +486,7 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
             self._outcome_channel = None
             self._wip_probe = None
             self.started = False
+            self.chain_task: asyncio.Task | None = None
             type(self).instances.append(self)
 
         def set_outcome_channel(self, channel) -> None:
@@ -485,8 +495,8 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
         def set_wip_probe(self, probe) -> None:
             self._wip_probe = probe
 
-        async def start(self) -> None:
-            self.started = True
+        async def _chain(self) -> None:
+            await asyncio.sleep(0.05)
             pending = queue.get_by_task(task_id, status='pending', level=0)
             assert pending, 'expected a pending L0 to chain off'
             for esc in pending:
@@ -494,7 +504,7 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
                     esc.id, 'Resolved by chained FakeSteward',
                     resolved_by='fake-steward',
                 )
-            chained = Escalation(
+            queue.submit(Escalation(
                 id=queue.make_id(task_id),
                 task_id=task_id,
                 agent_role='steward',
@@ -503,11 +513,99 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
                 summary='Chained follow-on L0 from steward',
                 detail='steward found a follow-on infra issue while resolving',
                 level=0,
-            )
-            queue.submit(chained)
+            ))
+
+        async def start(self) -> None:
+            self.started = True
+            self.chain_task = asyncio.create_task(self._chain())
 
         async def stop(self) -> None:
-            pass
+            if self.chain_task is not None:
+                await self.chain_task
+
+    _FakeSteward.instances = []
+    return _FakeSteward
+
+
+def _make_chained_l2_steward(queue: EscalationQueue, task_id: str) -> type:
+    """A steward that resolves its own L0 then files a fresh born-at-L2.
+
+    The same chained shape as :func:`_make_chained_gating_steward`, but the
+    follow-on record is one the WAIT provably never waits on — which is what
+    makes it the load-bearing case for the post-wait re-check:
+
+    * ``_wait_for_resolution``'s loop polls ``get_by_task(..., level=0)``, so a
+      level-2 record is invisible to it;
+    * its entry-time ``pending_high_sev`` stop-the-line check already ran,
+      before this record existed;
+    * its tail's ``has_open_l1`` matches level-1 only.
+
+    So the wait returns NORMALLY with no expiry, and without a re-check the
+    handler resumes the merge straight past an open, human-gated record — a D4
+    stop-the-line violation.  (A chained plain-blocking L0, by contrast, IS
+    caught by the wait loop, which re-polls it inside the SAME deadline; see
+    :func:`_make_chained_gating_steward`.)
+
+    Mirrors ``TaskSteward._auto_escalate_to_human``'s real behaviour of filing
+    a human-facing record while handing off.
+
+    The chain runs as a BACKGROUND task after a short delay, not inside
+    ``start()``: a real steward works while the workflow waits, so a record it
+    files lands AFTER ``_wait_for_resolution``'s entry-time checks have already
+    run.  A synchronous ``start()`` would file it before the wait is even
+    entered, where the stop-the-line check catches it and the post-wait gap is
+    never exercised at all.  (Same reasoning, and the same delay-then-wake
+    shape, as ``_make_dismiss_and_publish_steward`` in
+    test_workflow_escalated_steward_stall.py.)
+    """
+
+    class _FakeSteward:
+        instances: list[_FakeSteward] = []
+
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+            self.started = False
+            self.chain_task: asyncio.Task | None = None
+            type(self).instances.append(self)
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def _chain(self) -> None:
+            await asyncio.sleep(0.05)
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            assert pending, 'expected a pending L0 to chain off'
+            # resolve-then-submit with NO await between: the waiter cannot
+            # resume in the gap, so by the time it runs again the L0 is gone
+            # and the L2 is open — exactly the state a real steward hand-off
+            # leaves behind.
+            for esc in pending:
+                queue.resolve(
+                    esc.id, 'Resolved by chained-L2 FakeSteward',
+                    resolved_by='fake-steward',
+                )
+            queue.submit(Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='steward',
+                severity='critical',
+                category='risk_identified',
+                summary='Chained born-at-L2 filed while resolving',
+                detail='steward escalated straight to a human mid-resolution',
+                level=2,
+            ))
+
+        async def start(self) -> None:
+            self.started = True
+            self.chain_task = asyncio.create_task(self._chain())
+
+        async def stop(self) -> None:
+            if self.chain_task is not None:
+                await self.chain_task
 
     _FakeSteward.instances = []
     return _FakeSteward
@@ -737,6 +835,226 @@ class TestMergeGateWaitExpiry:
         assert scheduler.statuses.get(task_id), (
             'no exit of the merge-entry gate may reach the harness slot-finally '
             'without having written its successor status'
+        )
+
+
+# ---------------------------------------------------------------------------
+# The no-strand exit property, across every disposition
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'disposition', ['resolving_steward', 'born_at_l2', 'silent_steward'],
+)
+class TestNoStrandExitProperty:
+    """Spec S1, stated as one property over all three boundaries:
+
+        ``_run_merge_phase`` either returns ``None`` — it fell through to the
+        in-slot merge with the slot still held and the claimant still live —
+        or its successor status was WRITTEN before the terminal return.
+
+    Never a terminal return with the row left at ``in-progress``.  That pair
+    is the strand: ``harness._run_slot``'s ``finally``
+    (harness.py:7949-7972) clears the claimant unconditionally and writes NO
+    status, so whatever ``run()`` left behind survives — and a steward-less
+    ESCALATED left ``in-progress``.  (That harness test's parametrize list
+    covers DONE/CANCELLED/BLOCKED/REQUEUED but not ESCALATED, which is why
+    the property is pinned workflow-side rather than by extending it.)
+
+    Deliberately phrased as "a status write precedes every terminal return"
+    and NOT as "``WorkflowOutcome.ESCALATED`` is never returned":
+    ``_mark_blocked`` legitimately returns ESCALATED on its
+    ``StewardReescalatedL1`` branch (workflow.py:14077) AFTER
+    ``_enter_phase(BLOCKED)`` and ``set_task_status('blocked')`` have run, and
+    spec §5 explicitly sanctions that shape ("a run() exit with ESCALATED
+    means the wait concluded in re-escalation → ``_mark_blocked`` ran").  A
+    test that banned the outcome outright would fight a correct path.
+    """
+
+    async def test_status_write_precedes_every_terminal_return(
+        self, disposition, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        _stub_merge_internals(wf, monkeypatch)
+
+        if disposition == 'born_at_l2':
+            _submit_born_at_l2(queue, task_id)
+            wf._steward_factory = _make_silent_steward()
+        else:
+            _submit_gating_l0(queue, task_id)
+            wf._steward_factory = (
+                _make_resolving_steward(queue, task_id)
+                if disposition == 'resolving_steward'
+                else _make_silent_steward()
+            )
+
+        before = list(scheduler.statuses.get(task_id, []))
+        assert before == [], 'precondition: nothing written yet'
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+        after = scheduler.statuses.get(task_id, [])
+
+        if outcome is None:
+            # Fell through to the in-slot merge: the slot is still held and the
+            # claimant is still live, so there is nothing for the harness
+            # slot-finally to strand.
+            assert 'blocked' not in after
+        else:
+            assert after, (
+                f'{disposition}: terminal return {outcome} with NO status ever '
+                f'written — the harness slot-finally would null the claimant '
+                f'and leave the row in-progress (spec E1 strand)'
+            )
+            assert after[-1] == 'blocked', (
+                f'{disposition}: a terminal exit must land on a park status; '
+                f'got {after}'
+            )
+
+        # The exact defect, named as a negative: ESCALATED + no status write is
+        # the strand shape spec E1 describes, and it must be unreachable.
+        assert not (outcome == WorkflowOutcome.ESCALATED and not after), (
+            f'{disposition}: returned ESCALATED with no status write — the '
+            f'steward-less ESCALATED exit is back'
+        )
+
+        # A surviving orphan L0 re-strands the NEXT entry on the same record
+        # for another full window, so no exit may leave one pending.
+        assert queue.get_by_task(task_id, status='pending', level=0) == [], (
+            f'{disposition}: a pending level-0 record survived the exit'
+        )
+
+
+# ---------------------------------------------------------------------------
+# The gate re-fire is SINGLE-SHOT, not a loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGateReFireIsBounded:
+    """A gating record filed WHILE the steward resolves must park the task,
+    not buy another idle window.
+
+    ``_make_chained_gating_steward`` models a real observed steward behaviour:
+    ``TaskSteward`` routinely resolves the escalation it was given and chains
+    a follow-on ``infra_issue`` of its own.  The resolve wakes the waiter, so
+    by the time the merge-entry handler looks again there is a NEW gating
+    record open that nothing has waited on.
+
+    Both properties matter:
+
+    * D4 stop-the-line still holds — nothing merges past an open gating
+      record, INCLUDING one filed during the resolution.
+    * Spec S5 boundedness — the whole merge-entry gate path costs at most ONE
+      derived idle window.  Looping back into the machinery would let a
+      steward that keeps chaining fresh L0s hold the workflow slot for an
+      unbounded number of windows, which is exactly the unbounded-hold defect
+      this task exists to remove.  ``run()``'s ESCALATED branch legitimately
+      loops because each pass re-invokes the implementer and can make
+      progress; the merge-entry gate does no work between passes, so a second
+      wait is pure latency with no new information.
+    """
+
+    async def test_chained_l2_is_not_merged_past(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """The load-bearing case: a chained record the WAIT never waits on.
+
+        ``_wait_for_resolution`` polls level-0 records only, ran its
+        stop-the-line check before this record existed, and matches level-1 in
+        its ``has_open_l1`` tail — so a level-2 filed mid-resolution slips
+        through all three and the wait returns normally with no expiry.  Only
+        a post-wait re-check of the SAME ``_is_gating_escalation`` predicate
+        catches it.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+        timing = _time_the_wait(wf)
+
+        _submit_gating_l0(queue, task_id)
+        chained = _make_chained_l2_steward(queue, task_id)
+        wf._steward_factory = chained
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        assert submit.await_count == 0, (
+            'D4 stop-the-line: a born-at-L2 filed during the resolution is an '
+            'open gating record — the merge must not proceed past it'
+        )
+        assert outcome is not None
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked'], (
+            f'the task must park visibly for the human the L2 is addressed to; '
+            f'got {scheduler.statuses.get(task_id)}'
+        )
+        # The human's record survives — the re-check parks, it does not consume.
+        assert len(queue.get_by_task(task_id, status='pending', level=2)) == 1
+        # Single-shot: the re-check parks rather than buying a second window.
+        assert timing.get('calls') == 1, (
+            f'the merge-entry gate must be single-shot; entered the steward '
+            f'wait {timing.get("calls")} time(s)'
+        )
+        assert len(chained.instances) <= 1
+
+    async def test_chained_gating_record_parks_instead_of_re_waiting(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """The plain-L0 chain: caught by the wait loop's own re-poll, inside
+        the SAME deadline, then parked by the expiry branch.  Pinned here so
+        the two chained shapes stay legibly distinct — this one costs one
+        window and needs no re-check; the L2 one above needs the re-check and
+        costs none."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+        timing = _time_the_wait(wf)
+
+        _submit_gating_l0(queue, task_id)
+        chained = _make_chained_gating_steward(queue, task_id)
+        wf._steward_factory = chained
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        assert submit.await_count == 0, (
+            'D4 stop-the-line: a gating record filed during the resolution '
+            'still gates — nothing merges past it'
+        )
+        assert outcome is not None
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked'], (
+            f'the task must park visibly rather than merge; got '
+            f'{scheduler.statuses.get(task_id)}'
+        )
+
+        # Boundedness: exactly ONE wait was entered.  _time_the_wait sums
+        # elapsed across calls precisely so a second wait cannot hide behind a
+        # short first one.
+        assert timing.get('calls') == 1, (
+            f'the merge-entry gate must be single-shot; entered the steward '
+            f'wait {timing.get("calls")} time(s)'
+        )
+        assert timing.get('elapsed', 0.0) < 5, (
+            f'cumulative wait must stay inside one derived window (0.5 + 0.5 '
+            f'= 1.0s); got {timing.get("elapsed")}s'
+        )
+        assert len(chained.instances) <= 1, (
+            f'the handler must not loop back into the machinery and build a '
+            f'second steward; built {len(chained.instances)}'
         )
 
 
