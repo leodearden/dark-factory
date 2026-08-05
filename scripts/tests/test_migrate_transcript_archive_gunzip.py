@@ -14,9 +14,14 @@ migration that stamped `now` on all 4,554 files would silently reset the whole
 from __future__ import annotations
 
 import gzip
+import io
 import json
+import logging
 import os
+import zlib
 from pathlib import Path
+
+import pytest
 
 import migrate_transcript_archive_gunzip as mig
 
@@ -254,3 +259,172 @@ def test_non_directory_root_is_a_clean_empty_no_op(tmp_path):
     assert summary["scanned"] == 0
     assert summary["migrated"] == 0
     assert summary["failed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-5: LOUD failure, source RETAINED (INV-3 / INV-4)
+#
+# The three corrupt-gzip builders below are RELOCATED from
+# scripts/tests/test_legibility_inventory.py:101-136 (and its deliberate
+# near-copy in test_legibility_digest.py), where step-16 deletes them. After
+# this task the migration script is the ONLY component that still reads real
+# gzip streams, so this module becomes the one place these shapes stay
+# reachable — a move, not a net loss of coverage. That is also precisely what
+# licenses the reader-side UNREADABLE_FILE_ERRORS tuple to narrow.
+# ---------------------------------------------------------------------------
+
+def _write_bad_magic_gz(path: Path) -> Path:
+    """Write a file that is not gzip at all — decompression fails immediately
+    with ``gzip.BadGzipFile`` (already an ``OSError``)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"this is not gzip at all\n")
+    return path
+
+
+def _write_truncated_gz(path: Path) -> Path:
+    """Write the first half of a valid gz stream — the interrupted-write shape.
+
+    Decompression reaches the end of the bytes before the end-of-stream marker
+    and raises ``EOFError``, which is NOT an ``OSError``.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = gzip.compress(_payload(200))
+    path.write_bytes(blob[: len(blob) // 2])
+    return path
+
+
+def _write_corrupt_body_gz(path: Path) -> Path:
+    """Write a gz whose DEFLATE body is damaged, so decompression raises
+    ``zlib.error`` — a THIRD distinct shape, and also not an ``OSError``.
+
+    Where a flipped byte lands decides which failure gzip reports: many flips
+    still decode and only trip the trailing checksum (``gzip.BadGzipFile``,
+    already an ``OSError``), a few truncate the bit stream (``EOFError``), and
+    only a flip that makes the DEFLATE stream itself unparseable raises
+    ``zlib.error``. So this probes for the first flip position that produces
+    that shape rather than assuming any particular byte does. The probe runs
+    against STDLIB ``gzip`` — never the code under test — so the helper stays
+    valid regardless of how the migration normalizes its exceptions.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = gzip.compress(_payload(200))
+    for index in range(10, len(blob)):
+        candidate = bytearray(blob)
+        candidate[index] ^= 0xFF
+        try:
+            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
+        except zlib.error:
+            path.write_bytes(bytes(candidate))
+            return path
+        except Exception:
+            continue  # a different corruption shape — keep probing
+    raise AssertionError("no single-byte flip produced a zlib.error body")
+
+
+CORRUPTION_SHAPES = [
+    pytest.param(_write_bad_magic_gz, id="bad-magic"),
+    pytest.param(_write_truncated_gz, id="truncated"),
+    pytest.param(_write_corrupt_body_gz, id="corrupt-body"),
+]
+
+
+@pytest.mark.parametrize("build_corrupt", CORRUPTION_SHAPES)
+def test_uncorroborated_source_is_retained_not_destroyed(tmp_path, build_corrupt):
+    """(a) The load-bearing half of INV-3: a file we could not read back is
+    NEVER unlinked. Losing an unreadable archive entry is still data loss — the
+    bytes may be partially recoverable by hand, and they are certainly not
+    recoverable once deleted."""
+    gz = build_corrupt(tmp_path / "3618" / "enc" / "broken.jsonl.gz")
+
+    mig.migrate_archive(tmp_path, apply=True)
+
+    assert gz.exists(), "an un-corroborated source .gz must survive the sweep"
+
+
+@pytest.mark.parametrize("build_corrupt", CORRUPTION_SHAPES)
+def test_failure_is_counted_and_named(tmp_path, build_corrupt):
+    """(b) The machine-readable signal: counted in `failed` AND named in
+    `failed_paths`, so an operator can act on the specific files."""
+    gz = build_corrupt(tmp_path / "3618" / "enc" / "broken.jsonl.gz")
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    assert summary["failed"] == 1
+    assert summary["migrated"] == 0
+    assert str(gz) in summary["failed_paths"]
+
+
+@pytest.mark.parametrize("build_corrupt", CORRUPTION_SHAPES)
+def test_failure_emits_a_structured_loud_warning(tmp_path, caplog, build_corrupt):
+    """(c) INV-4 loud-over-silent: one greppable WARNING naming the path, so a
+    failure is discoverable in the log and not merely a count."""
+    caplog.set_level(logging.WARNING, logger="migrate_transcript_archive_gunzip")
+    gz = build_corrupt(tmp_path / "3618" / "enc" / "broken.jsonl.gz")
+
+    mig.migrate_archive(tmp_path, apply=True)
+
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        LOG_PREFIX in m and str(gz) in m for m in warn_msgs
+    ), f"missing LOUD WARNING for the unreadable source; got {warn_msgs}"
+
+
+@pytest.mark.parametrize("build_corrupt", CORRUPTION_SHAPES)
+def test_one_bad_file_does_not_cost_its_healthy_siblings(tmp_path, build_corrupt):
+    """(d) Best-effort: the sweep walks ~4,554 files, so a single unreadable
+    entry must never abort the run and strand the rest."""
+    payload = _payload()
+    build_corrupt(tmp_path / "3618" / "enc" / "broken.jsonl.gz")
+    before = _write_gz(tmp_path / "3618" / "enc" / "aaa-healthy.jsonl.gz", payload)
+    after = _write_gz(tmp_path / "3618" / "enc" / "zzz-healthy.jsonl.gz", payload)
+
+    summary = mig.migrate_archive(tmp_path, apply=True)
+
+    # Healthy siblings on BOTH sides of the bad file in sorted-walk order, so
+    # this fails whether the sweep aborts or merely skips the remainder.
+    assert summary["migrated"] == 2
+    assert summary["failed"] == 1
+    for gz in (before, after):
+        assert not gz.exists()
+        assert mig.plain_sibling(gz).read_bytes() == payload
+
+
+def test_partial_twin_is_removed_so_a_later_run_cannot_trust_it(tmp_path):
+    """A failure must not leave debris a RESUME would mistake for a good twin.
+
+    The corrupt-body shape fails part-way through decompression, so bytes are
+    already on disk when it raises. Left behind, a later run's existence check
+    would find a plausible twin — the exact half-written-file trap step-3(b)
+    guards, reached here from the failure path instead."""
+    gz = _write_corrupt_body_gz(tmp_path / "3618" / "enc" / "broken.jsonl.gz")
+
+    mig.migrate_archive(tmp_path, apply=True)
+
+    assert gz.exists()
+    assert not mig.plain_sibling(gz).exists(), (
+        "a partially-written .jsonl must be cleaned up, or a later resume run "
+        "would trust it and unlink the authoritative .gz"
+    )
+
+
+def test_unwritable_destination_directory_retains_the_source(tmp_path):
+    """A fourth, non-corruption failure shape: the source is perfectly good but
+    the destination cannot be written (read-only dir / EACCES). The .gz must
+    still survive and the failure must still be counted.
+
+    PermissionError stands in for the whole OSError class here for the same
+    reason gc_agent_transcripts' scan tests use it: it is a failure the guard
+    genuinely has to survive rather than one swallowed earlier by an existence
+    check."""
+    enc = tmp_path / "3618" / "enc"
+    gz = _write_gz(enc / "sess-a.jsonl.gz", _payload())
+    enc.chmod(0o500)  # r-x: entries readable, but nothing new can be created
+    try:
+        summary = mig.migrate_archive(tmp_path, apply=True)
+
+        assert summary["failed"] == 1
+        assert summary["migrated"] == 0
+        assert str(gz) in summary["failed_paths"]
+        assert gz.exists()
+    finally:
+        enc.chmod(0o700)  # restore so tmp_path teardown can clean up
