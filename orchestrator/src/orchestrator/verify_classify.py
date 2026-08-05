@@ -125,6 +125,61 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 _LOCK_TOKEN_RE = re.compile(r'\b(?:flock|lock|slot|semaphore)\b', re.IGNORECASE)
 _TIMEOUT_TOKEN_RE = re.compile(r'\btimed?\s*out\b', re.IGNORECASE)
 
+# task 3679: LINE-ANCHORED, producer-grounded slot-timeout markers — the
+# POSITIVE detector for the SEMAPHORE_TIMEOUT arm, replacing the whole-output
+# token co-occurrence above (deleted in the follow-up step).
+#
+# ANCHORING CONTRACT: `^` + re.MULTILINE, tolerating LEADING HORIZONTAL
+# WHITESPACE ONLY — deliberately NOT an arbitrary leading log/harness prefix.
+# This is exactly the discipline `verify._match_clock_marker` (verify.py:3383)
+# applies to the `@@REIFY_CLOCK_*@@` family, adopted here for the same
+# MEASURED reason (reify task 4998 / esc-4791-52): reify's `run_all.sh
+# --include-infra` runs infra tests that capture and re-print these wrapper
+# lines, quoting them MID-LINE in assertion prose. A substring-anywhere match
+# would classify such a test's output as a slot timeout; a line-anchored one
+# cannot.
+#
+# EMITTER ALLOWLIST — the anchor, carrying `_CARGO_CLI_ERROR_RE`'s
+# extend-only-on-a-grounded-sample discipline (see the shared primitives
+# above). Each name is grounded in a line reify emits TODAY:
+#   lib_test_semaphore    → 'lib_test_semaphore.sh: failed to acquire test slot
+#                            within 1800s (LOCK=…, N=8)'
+#                           (reify scripts/lib_test_semaphore.sh:173, on
+#                            `slot_acquire` rc 75)
+#   cargo-test-occt-gated → 'ERROR: cargo-test-occt-gated.sh: failed to acquire
+#                            OCCT slot within 1800s (LOCK=…, N=1)'
+#                           (reify scripts/cargo-test-occt-gated.sh:182 — the
+#                            sole grounded source of the optional `ERROR: `
+#                            prefix)
+#   lib_lane_x_flock      → 'lib_lane_x_flock.sh: failed to acquire Lane-X lock
+#                            within 600s (LOCK=…)'
+#                           (reify scripts/lib_lane_x_flock.sh:138)
+# Add a fourth name ONLY when a real emitted sample is observed. A generic
+# 'failed to acquire … within Ns' shape is deliberately NOT used: any shell
+# script anywhere in a verify chain could emit it, which would re-introduce
+# precisely the ungrounded looseness this task exists to delete.
+#
+# `\S+s\b` rather than `\d+s`: reify renders `within unlimiteds` when
+# REIFY_TEST_SEMAPHORE_WAIT=unlimited (lib_test_semaphore.sh:170-173), and
+# that wart is a real emitted shape, so the pattern must cover it.
+#
+# `@@REIFY_SLOT_TIMEOUT@@` is NOT emitted by reify today — verified by grep
+# over reify `scripts/` on 2026-08-05. It is the forward-compatible anchor for
+# reify's companion task (same column-0, first-token `@@REIFY_*@@` emission
+# contract as scripts/lib_clock_stop.sh:141), and a harmless no-op until that
+# lands. It is therefore a COMPLEMENT to the three grounded anchors and never
+# the sole positive — the category is detectable the moment this lands, rather
+# than waiting on another repo. It also serves as the project-portable escape
+# hatch: a future producer that wants detection without a DF code change emits
+# the sentinel instead of being added to the allowlist above.
+_SLOT_TIMEOUT_SENTINEL_RE = re.compile(r'^[ \t]*@@REIFY_SLOT_TIMEOUT@@', re.MULTILINE)
+_SLOT_ACQUIRE_DEADLINE_RE = re.compile(
+    r'^[ \t]*(?:ERROR: )?'
+    r'(?:lib_test_semaphore|cargo-test-occt-gated|lib_lane_x_flock)\.sh: '
+    r'failed to acquire .{1,40}? within \S+s\b',
+    re.MULTILINE,
+)
+
 # task 2748: deterministic-diagnostic veto for the SEMAPHORE_TIMEOUT arm. A
 # genuine flock/semaphore slot-acquisition timeout is emitted by the
 # concurrency-limiter WRAPPER (reify lib_slot_acquire.sh / `flock -w`) BEFORE
@@ -582,7 +637,9 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         return FailureCategory.ENV_TRANSIENT
     if is_interpreter_missing_workspace_packages(output):
         return FailureCategory.ENV_TRANSIENT
-    if (
+    if _SLOT_TIMEOUT_SENTINEL_RE.search(output) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
+        return FailureCategory.SEMAPHORE_TIMEOUT
+    if (  # task 3679 step-2: legacy co-occurrence — scheduled for deletion in step-4
         _LOCK_TOKEN_RE.search(output)
         and _TIMEOUT_TOKEN_RE.search(output)
         and _CLIPPY_LINT_MARKER not in output
