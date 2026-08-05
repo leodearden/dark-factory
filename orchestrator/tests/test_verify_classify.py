@@ -833,11 +833,31 @@ _SLOT_TIMEOUT_SENTINEL_OUTPUT = (
     '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation waited=1800s pid=4711\n'
 )
 
+# reify scripts/lib_test_semaphore.sh:170-173 — when REIFY_TEST_SEMAPHORE_WAIT
+# is `unlimited`, `_wait_desc` is set to the WORD "unlimited" and interpolated
+# into the same `within ${_wait_desc}s` template, so the emitted line reads
+# `within unlimiteds`. That wart is why the pattern's duration token is
+# `\S+s\b` and not `\d+s`; without this fixture, narrowing it back to `\d+s`
+# would silently re-open the hole the source comment says it exists to cover.
+_SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT = (
+    'lib_test_semaphore.sh: failed to acquire test slot within unlimiteds '
+    '(LOCK=/tmp/reify-test-slot.lock, N=8)\n'
+)
+
+# Same producer line, INDENTED. Pins the `^[ \t]*` leading-horizontal-
+# whitespace tolerance the anchoring contract deliberately allows (verify
+# output is aggregated from wrappers that routinely indent captured
+# sub-output). Without this, replacing `^[ \t]*` with a bare `^` would red
+# nothing, even though the anchoring is the heart of task 3679.
+_SLOT_TIMEOUT_INDENTED_OUTPUT = '    ' + _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT
+
 _GROUNDED_SLOT_TIMEOUT_OUTPUTS = [
     _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT,
     _SLOT_TIMEOUT_OCCT_OUTPUT,
     _SLOT_TIMEOUT_LANE_X_OUTPUT,
     _SLOT_TIMEOUT_SENTINEL_OUTPUT,
+    _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT,
+    _SLOT_TIMEOUT_INDENTED_OUTPUT,
 ]
 
 
@@ -846,7 +866,14 @@ class TestGroundedSlotTimeoutMarkersAreDetected:
     SEMAPHORE_TIMEOUT, for every ToolKind — mirrors
     TestEnvironmentalGuardsApplyToEveryToolKind's tool-blind style, since a
     starved concurrency slot is a HOST condition regardless of which tool's
-    command was waiting on it (Invariant C1)."""
+    command was waiting on it (Invariant C1).
+
+    The corpus also carries the two shapes that pin the pattern's deliberate
+    tolerances — the `within unlimiteds` rendering and an indented copy (see
+    each fixture's comment for the mutation it kills). That the new arm does
+    not shadow the pre-existing FLOCK_ERROR pattern is pinned once, by
+    ``TestEnvironmentalGuardNegatives.
+    test_flock_failed_to_acquire_lock_stays_flock_error`` above."""
 
     @pytest.mark.parametrize('output', _GROUNDED_SLOT_TIMEOUT_OUTPUTS)
     @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
@@ -870,14 +897,6 @@ class TestGroundedSlotTimeoutMarkersAreDetected:
             f'a mid-line quotation of the wrapper deadline text must not '
             f'classify semaphore_timeout, got {result!r}'
         )
-
-    def test_plain_flock_contention_still_stays_flock_error(self):
-        """The new anchored arm must not shadow the pre-existing FLOCK_ERROR
-        pattern (duplicates the intent of
-        `test_flock_failed_to_acquire_lock_stays_flock_error`, pinned here so
-        the shadowing check travels with the arm it constrains)."""
-        output = 'flock: failed to acquire lock on /var/lock/mylock\n'
-        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.FLOCK_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -945,10 +964,92 @@ _DF_SHAPED_DETERMINISTIC_FAILURE_OUTPUT = (
     'tests/test_scheduler.py:88: AssertionError\n'
 )
 
+# --- historical incidental-token corpus (tasks 2748 / 2821), folded in here
+# by task 3679's review amendment -------------------------------------------
+#
+# Each golden below was authored to exercise one VETO regex — task 2748's
+# clippy/rustc diagnostic markers, task 2821's test-verdict markers — that
+# subtracted one shape of false positive from the loose lock+timeout
+# co-occurrence. Every one of those regexes is now DELETED: with the positive
+# line-anchored on a producer-emitted marker there is nothing left to veto.
+#
+# The goldens survive because they are still distinct real-world shapes of the
+# property this class defends — a deterministic fault whose text incidentally
+# mentions a lock and a timeout — so they are folded into the corpus below and
+# inherit its stronger `not in INFRA_TRANSIENT_CATEGORIES` assertion across
+# every ToolKind. What did NOT survive is their per-veto isolation tests and
+# the three goldens that existed solely to isolate a deleted matcher's
+# alternation branches (`..._PYTEST_ZERO_PASS_OUTPUT`,
+# `..._VERDICT_PAIR_ONLY_{FAILED,PASSED}_FIRST_OUTPUT`): a test that "isolates
+# the failed-before-passed count-pair alternation" cannot mean anything once
+# no count-pair matcher exists, and its fixture would pass identically with
+# every count and FAILED token stripped out.
+#
+# The reason all four pass now is the single structural one: no anchored
+# marker begins any line, so `_classify_environmental` returns None and
+# per-tool dispatch decides (see TestIncidentalTokenFaultsDispatchByTool for
+# the exact categories that dispatch produces).
+
+# clippy golden (2748): quotes lock/slot/semaphore source and mentions
+# "timed out" in a note, carrying clippy's own `clippy::` lint-name token.
+_SEMAPHORE_TIMEOUT_CLIPPY_DIAGNOSTIC_OUTPUT = (
+    'error: this `.lock()` call is held across an `.await` point\n'
+    '  --> src/worker/pool.rs:42:19\n'
+    '   |\n'
+    '42 |         let _slot = self.semaphore.lock().await;\n'
+    '   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '   |\n'
+    "   = note: `-D clippy::await-holding-lock` implied by `-D warnings`\n"
+    '   = help: for further information visit '
+    'https://rust-lang.github.io/rust-clippy/master/index.html#await_holding_lock\n'
+    '   = note: a peer that timed out waiting for the slot may hold the lock '
+    'indefinitely\n'
+    '\n'
+    'error: aborting due to previous error\n'
+)
+
+# rustc golden (2748): the same incidental tokens behind a rustc error CODE
+# (error[E0308]:) and no `clippy::` token — a second diagnostic shape.
+_SEMAPHORE_TIMEOUT_RUSTC_DIAGNOSTIC_OUTPUT = (
+    'error[E0308]: mismatched types\n'
+    '  --> src/worker/pool.rs:42:20\n'
+    '   |\n'
+    "42 |         let guard: MutexGuard<'_, Slot> = self.semaphore.lock();\n"
+    "   |                    ^^^^^^^^^^^^^^^^^^^^ expected `Slot`, found "
+    "`MutexGuard<'_, Slot>`\n"
+    '   |\n'
+    '   = note: a peer that timed out waiting for the lock may have left the '
+    'semaphore in an inconsistent state\n'
+    '\n'
+    'error: aborting due to previous error\n'
+)
+
+# pytest golden (2821, gate-hole #1 of the reify 2026-07-19 red-main incident,
+# /deb deb-reify-964887): leading-form FAILED line, a note about a "slot" that
+# "timed out", and pytest's bracketed short-summary.
+_SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT = (
+    'FAILED tests/test_registry_drift.py::test_registry_pin - AssertionError\n'
+    'note: a stale peer that timed out may hold the slot\n'
+    '===== 6 failed, 48 passed in 12.34s =====\n'
+)
+
+# cargo golden (2821): trailing-form FAILED line and cargo's own
+# "test result: FAILED. 48 passed; 6 failed" verdict — the incident's literal
+# counts, in cargo's passed-before-failed order.
+_SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT = (
+    'test families::non_geometry_families_disjoint ... FAILED\n'
+    'note: a peer holding the semaphore slot had timed out\n'
+    'test result: FAILED. 48 passed; 6 failed; 0 ignored\n'
+)
+
 _DETERMINISTIC_FAULT_OUTPUTS = [
     _DENIED_LINT_DEAD_CODE_OUTPUT,
     _DENIED_LINT_UNUSED_IMPORTS_OUTPUT,
     _DF_SHAPED_DETERMINISTIC_FAILURE_OUTPUT,
+    _SEMAPHORE_TIMEOUT_CLIPPY_DIAGNOSTIC_OUTPUT,
+    _SEMAPHORE_TIMEOUT_RUSTC_DIAGNOSTIC_OUTPUT,
+    _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT,
+    _SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT,
 ]
 
 
@@ -981,209 +1082,25 @@ class TestDeterministicLintFailureIsNotSemaphoreTimeout:
         )
 
 
-# ---------------------------------------------------------------------------
-# task 2748: SEMAPHORE_TIMEOUT deterministic-diagnostic veto (HISTORICAL —
-# the veto it describes is deleted by task 3679; these tests survive as
-# regression pins on the OUTCOME, which the anchored positive now delivers
-# structurally rather than by subtraction).
-# The premise recorded here was that a genuine slot-acquisition timeout is
-# raised by a concurrency-limiter wrapper BEFORE the wrapped tool runs, so its
-# output cannot ALSO carry a compiler/lint diagnostic. Under the old detector
-# the lock half and the timeout half were two independent whole-output
-# searches, so a deterministic cargo clippy/rustc diagnostic that happened to
-# quote lock/slot/semaphore source and mention "timed out" in a note satisfied
-# both and was misclassified SEMAPHORE_TIMEOUT — an
-# INFRA_TRANSIENT_CATEGORIES member — which sends a deterministic lint/type
-# regression through the bounded infra-retry loop instead of the debugger.
-# Mirrors TestEnvironmentalGuardsApplyToEveryToolKind's tool-blind coverage.
-#
-# RED today: no deterministic-diagnostic veto exists yet, so both goldens
-# below still satisfy the loose lock+timeout co-occurrence heuristic and
-# classify SEMAPHORE_TIMEOUT (a member of INFRA_TRANSIENT_CATEGORIES).
-# ---------------------------------------------------------------------------
+class TestIncidentalTokenFaultsDispatchByTool:
+    """The exact category the corpus above lands in, for the shapes where
+    per-tool dispatch has something to match.
 
-_SEMAPHORE_TIMEOUT_CLIPPY_DIAGNOSTIC_OUTPUT = (
-    'error: this `.lock()` call is held across an `.await` point\n'
-    '  --> src/worker/pool.rs:42:19\n'
-    '   |\n'
-    '42 |         let _slot = self.semaphore.lock().await;\n'
-    '   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
-    '   |\n'
-    "   = note: `-D clippy::await-holding-lock` implied by `-D warnings`\n"
-    '   = help: for further information visit '
-    'https://rust-lang.github.io/rust-clippy/master/index.html#await_holding_lock\n'
-    '   = note: a peer that timed out waiting for the slot may hold the lock '
-    'indefinitely\n'
-    '\n'
-    'error: aborting due to previous error\n'
-)
-
-# rustc compile-error golden: starts with a rustc error code (error[E0308]:),
-# quotes lock/slot/semaphore source and mentions "timed out" in a note, but
-# carries NO `clippy::` token — proves the veto must also recognize a bare
-# rustc diagnostic marker, not just clippy's.
-_SEMAPHORE_TIMEOUT_RUSTC_DIAGNOSTIC_OUTPUT = (
-    'error[E0308]: mismatched types\n'
-    '  --> src/worker/pool.rs:42:20\n'
-    '   |\n'
-    "42 |         let guard: MutexGuard<'_, Slot> = self.semaphore.lock();\n"
-    "   |                    ^^^^^^^^^^^^^^^^^^^^ expected `Slot`, found "
-    "`MutexGuard<'_, Slot>`\n"
-    '   |\n'
-    '   = note: a peer that timed out waiting for the lock may have left the '
-    'semaphore in an inconsistent state\n'
-    '\n'
-    'error: aborting due to previous error\n'
-)
-
-
-class TestSemaphoreTimeoutDeterministicDiagnosticVeto:
-    """task 2748: a deterministic Rust compiler/clippy diagnostic must veto
-    the loose lock+timeout co-occurrence heuristic — the lock/slot/semaphore
-    and "timed out" tokens are incidental to a deterministic lint/compile
-    failure, not evidence of a genuine slot-acquisition timeout (which is
-    raised by the wrapper BEFORE the wrapped tool runs, so it can never carry
-    a diagnostic marker)."""
-
-    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
-    def test_clippy_lint_diagnostic_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
-        self, tool
-    ):
-        result = _classify(tool, _SEMAPHORE_TIMEOUT_CLIPPY_DIAGNOSTIC_OUTPUT, 1, False)
-        assert result not in INFRA_TRANSIENT_CATEGORIES, (
-            f'a deterministic clippy lint diagnostic (clippy:: marker present) '
-            f'with incidental lock/slot/semaphore + "timed out" tokens must not '
-            f'classify infra-transient, got {result!r}'
-        )
-
-    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
-    def test_rustc_compile_error_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
-        self, tool
-    ):
-        result = _classify(tool, _SEMAPHORE_TIMEOUT_RUSTC_DIAGNOSTIC_OUTPUT, 1, False)
-        assert result not in INFRA_TRANSIENT_CATEGORIES, (
-            f'a deterministic rustc compile-error diagnostic (rustc error-code '
-            f'marker present, no clippy:: marker) with incidental '
-            f'lock/slot/semaphore + "timed out" tokens must not classify '
-            f'infra-transient, got {result!r}'
-        )
+    ``TestDeterministicLintFailureIsNotSemaphoreTimeout`` pins the
+    operationally meaningful property (never infra-transient, so never
+    silently retried). These pin the positive half — that with
+    ``_classify_environmental`` returning None, the per-tool table reached the
+    right code-fault verdict rather than merely some non-infra one. Retained
+    from tasks 2748/2821, whose per-veto isolation tests were deleted by task
+    3679 along with the regexes they isolated."""
 
     @pytest.mark.parametrize(
         'tool', [ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY, ToolKind.OPAQUE]
     )
-    def test_rustc_compile_error_with_incidental_lock_and_timeout_tokens_is_compile_error(
-        self, tool
-    ):
+    def test_rustc_diagnostic_is_compile_error(self, tool):
         assert (
             _classify(tool, _SEMAPHORE_TIMEOUT_RUSTC_DIAGNOSTIC_OUTPUT, 1, False)
             == FailureCategory.COMPILE_ERROR
-        )
-
-
-# ---------------------------------------------------------------------------
-# task 2821: SEMAPHORE_TIMEOUT deterministic-TEST-VERDICT veto (gate-hole #1
-# of the reify 2026-07-19 red-main incident, /deb deb-reify-964887).
-# Generalizes the task-2748 Rust-diagnostic veto directly above: a genuine
-# flock/semaphore slot-acquisition timeout is raised by the concurrency-
-# limiter WRAPPER (reify lib_slot_acquire.sh / `flock -w`) BEFORE the wrapped
-# tool ever runs, so its output cannot ALSO carry a pytest/cargo test-runner
-# VERDICT (a "N passed, M failed" count-pair, or a FAILED line). Under the old
-# detector the lock half and the timeout half were two independent
-# whole-output searches, so a deterministic test failure that happened to
-# quote lock/slot/semaphore source and mention "timed out" in a note satisfied
-# both and was misclassified SEMAPHORE_TIMEOUT — an INFRA_TRANSIENT_CATEGORIES
-# member — sending a deterministic test regression through the bounded
-# infra-retry loop (silently re-verified against a deterministically-red
-# gate) instead of surfacing to the debugger. Mirrors
-# TestSemaphoreTimeoutDeterministicDiagnosticVeto's shape, generalized from
-# Rust compiler/clippy diagnostics to any test-runner verdict.
-#
-# RED today: no test-verdict veto exists yet, so both goldens below still
-# satisfy the loose lock+timeout co-occurrence heuristic and classify
-# SEMAPHORE_TIMEOUT (a member of INFRA_TRANSIENT_CATEGORIES).
-# ---------------------------------------------------------------------------
-
-# pytest-shaped golden: leading-form FAILED line (pytest-report-shaped only),
-# a note mentioning the "slot" that "timed out", and pytest's bracketed
-# short-summary with the failed-before-passed order pytest actually uses.
-_SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT = (
-    'FAILED tests/test_registry_drift.py::test_registry_pin - AssertionError\n'
-    'note: a stale peer that timed out may hold the slot\n'
-    '===== 6 failed, 48 passed in 12.34s =====\n'
-)
-
-# cargo-shaped golden: trailing-form FAILED line (cargo's own test-runner
-# shape), a note mentioning the "semaphore" slot that "timed out", and
-# cargo's literal "test result: FAILED. 48 passed; 6 failed; 0 ignored"
-# verdict line (passed-before-failed order — the reverse of the pytest
-# golden above, so both count-pair orders are grounded, matching the
-# incident's literal "48 passed, 6 failed").
-_SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT = (
-    'test families::non_geometry_families_disjoint ... FAILED\n'
-    'note: a peer holding the semaphore slot had timed out\n'
-    'test result: FAILED. 48 passed; 6 failed; 0 ignored\n'
-)
-
-# ZERO-PASS pytest shape: when every collected test fails, pytest omits the
-# "0 passed" token entirely, so the ONLY verdict is the bracketed
-# failure-count short-summary ("===== 6 failed in 1.20s ====="). Deliberately
-# carries NO leading/trailing FAILED line and NO "N passed"/"M failed" count
-# PAIR (no "passed" token anywhere), so step-2's `_has_deterministic_test_
-# verdict` (count-pair + FAILED-line markers only) does not yet recognize it
-# as a verdict — RED until step-4 adds a dedicated bracketed-summary marker.
-_SEMAPHORE_TIMEOUT_PYTEST_ZERO_PASS_OUTPUT = (
-    'note: a stale peer that timed out may hold the slot\n'
-    '===== 6 failed in 1.20s =====\n'
-)
-
-# Count-pair-ONLY goldens (task 2821 review follow-up): both grounded verdict
-# goldens above ALSO contain a FAILED line, so the FAILED-line markers already
-# accounted for the veto on their own — the "N passed, M failed" count-pair
-# matcher (the flagship marker task 2821 added) was never independently
-# exercised by them; it could have been deleted, or either alternation order
-# broken, and every existing test would still have passed. These two goldens
-# carry ONLY a bare count pair — no FAILED line, no `=====` banner, no
-# " in <float>s" timing suffix — so only the count pair could account for the
-# veto, covering both alternation orders.
-_SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_FAILED_FIRST_OUTPUT = (
-    'note: a stale peer that timed out may hold the slot\n'
-    'summary: 6 failed, 48 passed\n'
-)
-
-_SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_PASSED_FIRST_OUTPUT = (
-    'note: a peer holding the semaphore slot had timed out\n'
-    'test result: FAILED. 48 passed; 6 failed; 0 ignored\n'
-)
-
-
-class TestSemaphoreTimeoutDeterministicTestVerdictVeto:
-    """task 2821: a deterministic pytest/cargo test-runner VERDICT must veto
-    the loose lock+timeout co-occurrence heuristic exactly like task 2748's
-    Rust-diagnostic veto — the lock/slot/semaphore and "timed out" tokens are
-    incidental to a deterministic test failure, not evidence of a genuine
-    slot-acquisition timeout (which is raised by the wrapper BEFORE the
-    wrapped tool runs, so it can never carry a pass/fail verdict)."""
-
-    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
-    def test_pytest_verdict_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
-        self, tool
-    ):
-        result = _classify(tool, _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT, 1, False)
-        assert result not in INFRA_TRANSIENT_CATEGORIES, (
-            f'a deterministic pytest test-verdict ("N failed, M passed" summary '
-            f'present) with incidental lock/slot/semaphore + "timed out" tokens '
-            f'must not classify infra-transient, got {result!r}'
-        )
-
-    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
-    def test_cargo_verdict_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
-        self, tool
-    ):
-        result = _classify(tool, _SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT, 1, False)
-        assert result not in INFRA_TRANSIENT_CATEGORIES, (
-            f'a deterministic cargo test-verdict ("N passed; M failed" summary '
-            f'present) with incidental lock/slot/semaphore + "timed out" tokens '
-            f'must not classify infra-transient, got {result!r}'
         )
 
     @pytest.mark.parametrize('tool', [ToolKind.PYTEST, ToolKind.OPAQUE])
@@ -1203,70 +1120,6 @@ class TestSemaphoreTimeoutDeterministicTestVerdictVeto:
             == FailureCategory.TEST_FAILURE
         )
 
-    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
-    def test_pytest_zero_pass_verdict_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
-        self, tool
-    ):
-        result = _classify(tool, _SEMAPHORE_TIMEOUT_PYTEST_ZERO_PASS_OUTPUT, 1, False)
-        assert result not in INFRA_TRANSIENT_CATEGORIES, (
-            f'a deterministic pytest zero-pass verdict (bracketed "N failed in '
-            f'Ts" short-summary present, no "passed" token) with incidental '
-            f'lock/slot/semaphore + "timed out" tokens must not classify '
-            f'infra-transient, got {result!r}'
-        )
-
-    @pytest.mark.parametrize('tool', [ToolKind.PYTEST, ToolKind.OPAQUE])
-    def test_pytest_zero_pass_verdict_is_unknown_test_failure(self, tool):
-        assert (
-            _classify(tool, _SEMAPHORE_TIMEOUT_PYTEST_ZERO_PASS_OUTPUT, 1, False)
-            == FailureCategory.UNKNOWN_TEST_FAILURE
-        )
-
-    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
-    def test_verdict_pair_only_failed_first_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
-        self, tool
-    ):
-        """Isolates the failed-before-passed count-pair alternation: no
-        FAILED line, no bracketed banner, no timing suffix — only the bare
-        count pair can account for the outcome."""
-        result = _classify(
-            tool, _SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_FAILED_FIRST_OUTPUT, 1, False
-        )
-        assert result not in INFRA_TRANSIENT_CATEGORIES, (
-            f'a bare "N failed, M passed" count pair (no FAILED line, no '
-            f'banner) with incidental lock/slot/semaphore + "timed out" '
-            f'tokens must not classify infra-transient, got {result!r}'
-        )
-
-    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
-    def test_verdict_pair_only_passed_first_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
-        self, tool
-    ):
-        """Isolates the passed-before-failed count-pair alternation (cargo's
-        own summary order): no per-test FAILED line, no bracketed banner —
-        only the bare count pair can account for the outcome."""
-        result = _classify(
-            tool, _SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_PASSED_FIRST_OUTPUT, 1, False
-        )
-        assert result not in INFRA_TRANSIENT_CATEGORIES, (
-            f'a bare "N passed; M failed" count pair (no FAILED line, no '
-            f'banner) with incidental lock/slot/semaphore + "timed out" '
-            f'tokens must not classify infra-transient, got {result!r}'
-        )
-
-    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
-    def test_verdict_pair_only_goldens_are_unknown_test_failure(self, tool):
-        """Pins the exact category too, not just "not infra-transient": with
-        no FAILED line present, per-tool dispatch has nothing else to match,
-        so both isolated-pair goldens fall through to UNKNOWN_TEST_FAILURE."""
-        assert (
-            _classify(tool, _SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_FAILED_FIRST_OUTPUT, 1, False)
-            == FailureCategory.UNKNOWN_TEST_FAILURE
-        )
-        assert (
-            _classify(tool, _SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_PASSED_FIRST_OUTPUT, 1, False)
-            == FailureCategory.UNKNOWN_TEST_FAILURE
-        )
 
 
 class TestSemaphoreTimeoutDeterministicTestVerdictVetoNegatives:

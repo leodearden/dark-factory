@@ -161,9 +161,22 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # contract as scripts/lib_clock_stop.sh:141), and a harmless no-op until that
 # lands. It is therefore a COMPLEMENT to the three grounded anchors and never
 # the sole positive — the category is detectable the moment this lands, rather
-# than waiting on another repo. It also serves as the project-portable escape
-# hatch: a future producer that wants detection without a DF code change emits
-# the sentinel instead of being added to the allowlist above.
+# than waiting on another repo.
+#
+# PORTABILITY (task 3679 review). The allowlist above hardcodes three reify
+# script basenames into an otherwise project-generic classifier, which makes
+# SEMAPHORE_TIMEOUT effectively reify-only detection: a new emitter — in reify
+# or in any other project the orchestrator drives — needs a DF source change
+# plus a fleet redeploy to be seen. That coupling is accepted here, matching
+# the precedent already set by `_MERGE_VERIFY_COLLATERAL`/`_VERIFY_ENV_BROKEN_RE`
+# (both encode reify-shaped strings), because three grounded emitters do not
+# justify a config surface. The sentinel is the deliberate escape hatch, so
+# PREFER IT TO A FOURTH BASENAME: a producer that wants detection without a DF
+# release emits `@@REIFY_SLOT_TIMEOUT@@` and is matched by the line above with
+# no code change at all. If the allowlist ever does need to grow past three,
+# that is the signal to promote the sentinel to the primary contract (or to
+# lift the marker list into per-project `verify_env` config) rather than to
+# extend the alternation again.
 _SLOT_TIMEOUT_SENTINEL_RE = re.compile(r'^[ \t]*@@REIFY_SLOT_TIMEOUT@@', re.MULTILINE)
 _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
     r'^[ \t]*(?:ERROR: )?'
@@ -353,16 +366,33 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ``test_enospc_with_collateral_stays_disk_full``).
 
     SEMAPHORE_TIMEOUT's last position is retained from task 2831's reorder,
-    but since task 3679 the REASON is different and much weaker: the arm's
-    marker and the worktree-collateral shapes are now disjoint BY
-    CONSTRUCTION, so the order between them no longer decides any outcome. A
-    replayed wrapper line quoted inside collateral output cannot reach the
-    semaphore arm anyway — it is not line-anchored at column 0 — so
-    ``TestReplayedMergeVerifyCollateralWinsOverSemaphore`` now passes
-    structurally rather than by ordering. Before task 2831 the
-    broken-worktree checks ran AFTER the semaphore arm and the order DID
-    decide the outcome, because the arm was a loose co-occurrence that
-    collateral output routinely satisfied; that is no longer the case.
+    and that ordering REMAINS LOAD-BEARING (task 3679 review). Both signals
+    are line-scoped and both can appear in ONE aggregated leg output — verify
+    merges stderr into stdout verbatim, and a single ``bash -c`` chain can
+    miss a slot deadline in an early step and lose its worktree in a later
+    one. Measured on this branch: an anchored ``lib_test_semaphore.sh: failed
+    to acquire …`` line concatenated with a ``getcwd`` collateral line
+    classifies ENV_TRANSIENT in EITHER concatenation order, decided entirely
+    by the collateral branch being evaluated first below.
+
+    ENV_TRANSIENT is the intended winner there, for the same reason DISK_FULL
+    outranks both: the removed worktree is the more specific root cause, and
+    of the two it is the only one with a recovery path
+    (``RetryKind.ENV_SERIAL`` versus SEMAPHORE_TIMEOUT's ``RetryKind.NONE``,
+    which surfaces to a human). Reading collateral as a slot timeout would
+    convert a self-recovering host condition into a blocking escalation.
+    Pinned by ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``.
+
+    What task 3679 changed is not whether the order matters but WHICH inputs
+    reach the tie: before, the arm was a loose co-occurrence that collateral
+    output satisfied routinely (any output merely mentioning a lock and a
+    timeout), so the ordering was load-bearing for incidental token overlap.
+    Now only a genuine anchored producer line can reach the arm, so it is
+    load-bearing only for a real co-occurrence of two real host events. Note
+    that ``TestReplayedMergeVerifyCollateralWinsOverSemaphore``'s replayed
+    5164/5071 fixtures no longer contain any anchored marker, so those two
+    now pass structurally and pin nothing about this tie — which is exactly
+    why the dedicated co-occurrence test above exists alongside them.
 
     SEMAPHORE_TIMEOUT — LINE-ANCHORED, producer-grounded marker (task 3679,
     esc-5848-2 / esc-5893-3). The arm fires when *output* contains, AT THE
@@ -474,10 +504,11 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     discriminator (a baseline sentinel module AND >=5 distinct unresolved
     top-level modules) is documented on the predicate itself. Checked after the
     broken-worktree shapes and before the SEMAPHORE_TIMEOUT arm, the same
-    placement as those (which mattered when that arm was a loose co-occurrence;
-    since task 3679 anchored it, the placement is no longer load-bearing —
-    a pyright import-resolution failure carries no anchored slot-timeout
-    marker, so neither check can shadow the other). Like them, it
+    placement as those — and, like theirs, that placement stays load-bearing
+    on co-occurrence (see the ORDERING note above). Neither signal IMPLIES the
+    other, so on the single-signal shapes each is grounded in the order is
+    immaterial; on an aggregated output carrying both, this earlier position
+    is what makes the recoverable ENV_TRANSIENT label win. Like them, it
     is tool-blind by design — the fleet chain ``cd fused-memory && npx pyright
     && ...`` resolves ``ToolKind.OPAQUE`` while the per-module commands resolve
     ``ToolKind.PYRIGHT``, and one guard-3 branch covers both without any
