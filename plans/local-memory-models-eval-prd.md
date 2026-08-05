@@ -1,0 +1,328 @@
+# Local memory-models eval — local LLM and local embedder for fused-memory's memory operations
+
+**Project:** dark-factory (fused-memory Graphiti/Mem0 backends). **Status:** active, authored
+2026-08-05. **Approach:** B+H-lite (contract + boundary-test sketch on the eval-harness seam).
+**Packaging (Leo, 2026-08-05):** this PRD is *eval-only* — it ends in two committed decision
+records. Production cutover (LLM) and the embedding backfill/migration are **follow-up PRDs
+authored only after — and gated on — the verdicts.** They are deliberately unfiled today and are
+not counted as G1 consumers of anything here.
+
+## Goal
+
+Two evidence-backed, pre-registered verdicts, each observable as a committed decision record plus
+a `decisions_and_rationale` memory write, ruled on by Leo through the standard operator gate:
+
+1. **LLM axis** — should fused-memory's Graphiti write-path LLM calls (entity extraction, node
+   dedupe, edge extraction, per-edge dedupe/invalidation, summaries — today `gpt-4o-mini`) move to
+   a locally-served model on the RTX 3090?
+2. **Embedding axis** — should fused-memory's embedder (today `text-embedding-3-small` @ 1536d,
+   serving both Graphiti node/edge embeddings and Mem0/Qdrant vectors, write *and* interactive
+   query paths) move to a local embedding model?
+
+An operator reading `plans/` after this PRD completes sees, per axis: the pre-registered decision
+rule, the measured comparison against it, and the ruling.
+
+## Background — verified substrate (all file:line checked 2026-08-05)
+
+**Current configuration.** `fused-memory/config/config.yaml:12-15` — LLM `gpt-4o-mini`,
+`max_tokens: 4096`, `small_model` pinned to the same model (`graphiti_client.py:505`), temperature
+defaults to 0.0 (`graphiti_client.py:506`). `config.yaml:26-29` — embedder
+`text-embedding-3-small`, `dimensions: 1536`. Both provider blocks carry an `api_url` leaf but
+default to the **same** `${OPENAI_API_URL}` env var (`config.yaml:20,34`) — independent LLM/embedder
+endpoints require per-block YAML values, not the env var.
+
+**The LLM swap is a client-class change, not only a base_url change.** fused-memory instantiates
+`graphiti_core.llm_client.OpenAIClient` (`graphiti_client.py:28,509`), whose structured calls all go
+through the OpenAI **Responses API** (`responses.parse`, `openai_client.py:65-97` in the installed
+0.28.2 wheel); startup hard-fails without SDK Responses support (`graphiti_client.py:67-123`). Local
+OpenAI-compatible servers implement `/v1/chat/completions`, generally not `/v1/responses`. The swap
+path is graphiti's `OpenAIGenericClient` (chat.completions + `json_schema` response_format, with a
+`json_object` prompt-injection fallback mode) — upstream's own escape hatch for local servers.
+Additionally, `base_url` is **not plumbed** today for: (a) the graphiti LLM client
+(`graphiti_client.py:502-509` omits it), (c) Mem0's LLM (`mem0_client.py:138-147`), (d) Mem0's
+embedder (`mem0_client.py:160-167`), and the standalone reindex tool (`maintenance/reindex.py:160-165`).
+It IS plumbed for (b) the graphiti embedder (`graphiti_client.py:533-539`). All `llm.*`/`embedder.*`
+config is restart-tier (absent from `RELOADABLE_FIELDS`, `config/reload.py:29-99`).
+
+**Call profile and concurrency.** With fused-memory's real config (no `entity_types`/`edge_types`
+forwarded, so attribute-extraction call sites are dead), an episode costs ~3 fixed LLM calls + 1 per
+surviving extracted edge + 0–few batched summary calls ≈ **6–10 calls/episode**. Per-episode
+fan-outs inside `node_operations.py`/`edge_operations.py` are bounded by graphiti's env-derived
+`SEMAPHORE_LIMIT` (default **20**) — `max_coroutines=5` covers only a few `graphiti.py` call sites.
+The `SEMAPHORE_LIMIT` env var name **collides** with fused-memory's queue-worker knob
+(`config.yaml:53`); setting one silently sets both. Burst concurrency to a local server: up to ~20.
+
+**Volume and cost (measured, read-only, from the live runtime DBs under
+`/home/leo/src/dark-factory/data/`).** `add_memory_graphiti` (the operation that triggers the full
+extraction pipeline) runs **~26–96/day** (31-day window). ≈300–900 gpt-4o-mini calls/day ⇒ order
+**$15–25/month**. Query-time embedding traffic dwarfs writes: ~414k lifetime `search` ops vs ~63k
+memory writes — both stores embed the query inline on the interactive path
+(`search.py:105-107` in graphiti_core; `mem0/memory/main.py:2206-2210`). Embedding spend at
+$0.02/1M tokens is negligible. **No durable token or latency telemetry exists** — graphiti's
+in-process `TokenUsageTracker` is discarded, `backend_ops` has no duration column, and graphiti's
+OTel spans are no-ops here (no tracer configured).
+
+**Honest motivation.** The write queue shows 10,153 completed writes, **0 dead letters** — the
+OpenAI path is not currently failing. The documented memory-path freezes (account caps, 529 storms)
+were on the **Anthropic-side** `claude_cli` recon/consolidator stages, which this PRD does not
+touch. The case for local is therefore: **(1) availability/independence** — removing a cloud
+dependency, its rate limits, and its outage modes from the memory write+query path entirely
+(prophylactic, not remedial); **(2) privacy** (secondary); **(3) cost** (minor, ~$15–25/mo,
+quantified precisely by this eval). Cost alone does not justify the work.
+
+**Mem0 LLM scope.** Mem0 write paths pin `infer=False` (`mem0_client.py:207,248`) — zero LLM calls.
+The LLM axis is Graphiti-only. The embedding axis covers **both** stores.
+
+**Prior art.** April 2026: first successful vLLM local-model eval in this project (coding-agent
+subject, rented 96GB GPU) — vLLM ops experience exists. The memory-eval program
+(`docs/prds/memory-eval-program.md`) owns a metrics-artifact schema (`shared/memory_eval_metrics`),
+the E1 retrieval probe (`fused-memory/scripts/memory_eval_retrieval_probe.py`), and a mined corpus
+of real search queries (`memory_eval_transcript_corpus.py`) — reused here, not reinvented.
+
+## Sketch of approach
+
+Two eval axes, strictly isolated, all replay on **throwaway scratch graphs** (never live graphs),
+funnel-shaped to keep Leo's full candidate slate affordable:
+
+**LLM axis** (embedder held fixed at the incumbent): replay a committed episode corpus per arm
+through the real `GraphitiBackend` construction path onto scratch graphs. Funnel: all four
+candidates pass a cheap **screening** stage (schema-conformance smoke, VRAM fit beside
+whisper-writer, prompt-length fit, throughput floor); at most three advance to **full corpus
+replay** under realistic concurrency on the busy box. Client-class parity: **every** arm — incumbent
+included — runs via `OpenAIGenericClient`, and a one-off control quantifies the
+`OpenAIClient → OpenAIGenericClient` delta on the incumbent itself, so the client-class change is
+measured, not confounded.
+
+**Embedding axis** (no LLM in the loop): designate one incumbent control-replay graph as the
+**frozen reference graph**; per arm, re-embed its node/edge texts (plus a replica of one Mem0
+collection) with the candidate — identical topology, only vectors/dims differ. Retrieval quality is
+probed in **two configurations**: *with indices built on the scratch graph* (primary — future
+production, per `docs/prds/falkordb-index-provisioning.md`) and *embedding-only* (secondary —
+today's production, where the BM25 leg silently returns nothing). Probes use replay-derived
+known-item queries plus real queries from the transcript corpus. All embedding arms run in full —
+re-embedding ~28k short texts is minutes, not hours.
+
+**Pre-registration before candidate arms.** Incumbent-vs-incumbent control runs measure run-to-run
+variance; the non-inferiority margins are **derived from that measured variance by a committed
+formula**, never hand-picked. The decision rule (Leo, 2026-08-05: non-inferiority — quality within
+margin AND latency inside the timeout envelope ⇒ availability decides) is committed *before* any
+candidate arm runs, and every candidate-arm artifact embeds the pre-registration doc's git SHA.
+
+**Instrument validation** (the fable-trial lessons, encoded): control-population run before any arm
+comparison; explicit checks for arm-config symmetry, non-empty reference artifacts, and non-zero
+token/cost accounting; corpus **never filtered on incumbent success**; all arms of a comparison
+pinned to one code SHA (the referent-fidelity PRD, tasks 3666-3676, will change the dedupe call
+profile mid-flight — a SHA mismatch between arms invalidates the comparison).
+
+### Candidate slate (researched 2026-08-05; Leo selected all)
+
+LLM arms (serving: vLLM ≥0.26 structured outputs / xgrammar, OpenAI-compatible; MoE arm via
+llama.cpp only, see hazard):
+
+| Arm | Size / quant | Est. VRAM | Basis (cited in research appendix) |
+|---|---|---|---|
+| Qwen3.5-9B | dense, Q4/AWQ | ~6GB | IFEval 91.5, BFCL-V4 66.1 (official card) — best published conformance-adjacent scores; huge KV headroom |
+| Mistral-Small-3.2-24B | dense, AWQ | ~14GB | mature quant ecosystem; release targeted stronger function calling |
+| Phi-4 14B | dense, Q4 | ~9GB | SOB Value Accuracy 0.798 (top small model); **16K ctx — screening must verify graphiti's longest prompts fit** |
+| MoE stretch: Qwen3.6-35B-A3B or Gemma-4-26B-A4B | GGUF IQ4/Q4 | ~17GB | 115–133 tok/s on a 3090 (6× dense-on-vLLM) — but llama.cpp silently falls back to *unconstrained* output on Pydantic `$ref`/`$defs` schemas (llama.cpp #21228), so this arm runs `json_object` mode + a hard client-side validator; tightest VRAM |
+
+Embedding arms (serving: TEI or vLLM-pooling, OpenAI-compatible `/v1/embeddings` — screening picks;
+incumbent `text-embedding-3-small` runs as its own arm):
+
+| Arm | Params | Dims | Basis |
+|---|---|---|---|
+| Qwen3-Embedding-0.6B | 0.6B | 1024 (MRL) | MTEB(eng,v2) 70.70; Apache 2.0; ~1.2GB; query-side instruct prefix required |
+| granite-embedding-english-r2 | 149M | 768 (MRL) | IBM 6-benchmark composite 59.5 (top of its tested group); fastest mid-size; no prefix |
+| Qwen3-Embedding-4B | 4B | 2560 (MRL, can emit 1536) | MTEB(eng,v2) 74.60 — quality ceiling. **No 2B variant exists** (family is 0.6B/4B/8B, verified 2026-08-05); if 4B squeezes, use its GGUF Q4 (~2.5GB). Eval runs it as a batch job (LLM server stopped) — residency only matters at cutover |
+| gte-modernbert-base | 149M | 768 | second small-model pole; no prefix |
+
+External-anchor caveat (carried into the report): the incumbent's 62.3 MTEB is a 2024 v1-era score
+not comparable to the candidates' MTEB-v2 numbers, and no apples-to-apples retrieval-only column
+exists across candidates — which is exactly why **our own replay-based known-item retrieval eval on
+the real corpus is the primary instrument** and public benchmarks are a sanity anchor only.
+
+## Resolved design decisions
+
+1. **Eval-only PRD; follow-ups gated on verdicts** (Leo). No cutover or migration tasks here.
+2. **Pre-registered non-inferiority** (Leo). Margins derived from measured control variance by a
+   committed formula; latency envelope anchored to the config-verified 120s write timeouts
+   (`config.yaml:59,61`) with the arm's p95 required inside it with headroom.
+3. **Client-class parity**: all LLM arms via `OpenAIGenericClient`; the client-class delta measured
+   on the incumbent (OpenAIClient vs GenericClient control pair). A production cutover would also
+   mean adopting GenericClient — the eval measures the production configuration.
+4. **Axis isolation**: LLM axis fixes the embedder; embedding axis re-embeds one frozen graph, no
+   LLM involved.
+5. **Two retrieval configurations** on the embedding axis; *with-indices is primary* (future prod);
+   the current-prod embedding-only configuration is reported alongside, with the confound stated.
+6. **Funnel**: LLM axis screens all 4, replays ≤3. Embedding axis runs all arms in full.
+7. **Dims are a free variable**: the backfill is forced regardless, so candidates are compared at
+   their native/MRL-best dims, not forced to 1536. (Mixed dims break cosine — but cutover atomicity
+   is the follow-up PRD's problem; this eval only quantifies re-embed throughput to inform it.)
+8. **Telemetry lands in the product, not just the harness**: `duration_ms` on `backend_ops` and
+   surfaced token counts are permanent operator-visible instrumentation added by this PRD.
+9. **Scratch-graph guard is a hard rejection**: harness writes only to `evalmem_`-prefixed
+   group_ids; anything else raises a typed error, and the boundary test observes the rejection fire.
+10. **whisper-writer stays resident** (Leo): all capacity math against ~19–20GB, not 24GB.
+11. **Long runs in transient `systemd --user` units**, never bare background shells.
+12. **No conflation-rate metric** — that number is owned (and about to be zeroed) by the
+    referent-fidelity PRD; using it would confound both directions.
+
+## Hazards (binding on every task in this PRD)
+
+- **Evidence-destroying:** upstream `FalkorDriver.__init__` fire-and-forgets
+  `build_indices_and_constraints()` whenever an event loop runs
+  (`.venv/.../graphiti_core/driver/falkordb_driver.py:161-169`). Constructing one in an async
+  script against a real graph **creates indices and destroys the protected no-index evidence**
+  owned by `docs/prds/falkordb-index-provisioning.md`. Never construct upstream drivers against
+  real graphs. Never create indices on any real graph. Protected graphs: `dark_factory`, `reify`,
+  `know_live`, `solar_challenge_platform`, `autopilot_video`, `pump_web_ui`, `my_solar_challenge`,
+  `probe_e1_master`, `_probe`.
+- Live-graph probes are read-only via `docker exec docker-falkordb-1 redis-cli GRAPH.RO_QUERY`.
+- Scratch graphs use throwaway `evalmem_*` names; indices may be built freely **there only**.
+- Corpus sampling must not condition on incumbent outcome (fixture-filtering lesson, 2026-08-04).
+- Never `git stash` in any dark-factory checkout.
+
+## Pre-conditions for activating (G3)
+
+Verified-existing substrate: vLLM structured outputs via OpenAI-compatible `json_schema`
+(research-verified against current docs, 2026-08-05); `OpenAIGenericClient` with
+`structured_output_mode` in installed graphiti_core 0.28.2 wheel; embedder `base_url` plumbing
+(`graphiti_client.py:533-539`); `shared/memory_eval_metrics` schema home; transcript-query corpus
+tooling; `maintenance/reindex.py` re-embed machinery; episode store (~2,635 dark_factory episodes)
+readable; GPU headroom measured (24GB − ~4GB whisper-writer).
+
+Gaps that are **prerequisite tasks in this batch** (not assumed): LLM `base_url` + client-class
+plumbing (β); Mem0 LLM/embedder `base_url` + `embedding_model_dims` plumbing (β); duration/token
+telemetry (γ); serving units (α). Nothing else novel is assumed.
+
+## Cross-PRD relationship (G4)
+
+| Other PRD / owner | Direction | Seam mechanism | Owner | Status |
+|---|---|---|---|---|
+| `docs/prds/falkordb-index-provisioning.md` | consumes its finding; must not disturb its evidence | index state on real graphs; index-build recipe reused on scratch graphs | index remediation: **that PRD**; scratch-graph index usage + confound framing: **this PRD** | wired (hazard block) |
+| `plans/memory-referent-fidelity-prd.md` (3666-3676) | timing interaction only | Graphiti dedupe call profile (its γ removes LLM dedupe for `Task N` refs) | each PRD owns its own tasks; **this PRD pins one code SHA per comparison** to stay valid either side of its landing | wired (D-item 12, instrument checks) |
+| `docs/prds/memory-eval-program.md` | consumes | `shared.memory_eval_metrics` M1 artifact schema; transcript-query corpus artifacts; E1 probe metric math (imported, not copied — INV-5) | schema + probe: **that PRD**; this PRD's arm-comparison runner: **this PRD**. If reuse requires splitting the probe file (a split its own docstring already plans), that edit belongs to the eval-program lane — coordinate, don't fork | wired |
+| `docs/prds/memory-briefing-and-fusion` (3658-3660) | none | it rewrites *fused* ranking/briefing; this PRD measures *per-store* retrieval below that layer | n/a | noted |
+| Orchestrator model routing (`OPERATIONS.md` §7) | none | `routing.allowed_models` governs claude-backend agent roles only; the memory-path model is not routed through it | n/a — admission of local models as *agent* models is explicitly out of scope | verified N/A |
+
+## Contract (B+H-lite)
+
+**ArmSpec** (pydantic, in the harness package; validated at run start):
+`{arm_id, axis: llm|embedding, model_id, serving: {stack: vllm|llamacpp|tei|openai, base_url, quant,
+unit_name}, client_class: openai|openai_generic, structured_output_mode: json_schema|json_object,
+params: {temperature, max_tokens}, code_sha, corpus_sha, preregistration_sha|null,
+scratch_group_id}` — `scratch_group_id` MUST match `^evalmem_[a-z0-9_]+$`; the constructor raises
+otherwise (the protected-list is unreachable by construction, and the guard is tested by observed
+rejection).
+
+**MetricsRecord**: one artifact per (arm, metric), conforming to `shared.memory_eval_metrics`'s M1
+series conventions (schema imported, not restated), carrying `arm_id`, `metric_id`, value, n,
+`measured_at`, and the three SHAs. Primary metric ids —
+LLM axis: `conformance-rate` (schema-valid responses / calls, retries counted),
+`episode-failure-rate` (terminal failure or >120s), `episode-latency-p50/p95` (under concurrent
+replay), `graph-sameness` (per-episode entity/edge counts + normalized-name Jaccard vs incumbent
+reference), `retrieval-utility` (known-item recall@k on the arm's graph, incumbent embedder),
+`tokens-per-episode` / `usd-per-episode`.
+Embedding axis: `known-item-recall@5/10` and `mrr` (per index configuration), `query-embed-latency-p95`,
+`reembed-throughput` (vectors/s → projected full-backfill wall-clock), plus the public-benchmark
+anchor row.
+
+**Pre-registration artifact**: `plans/local-memory-models-eval-preregistration.md`, committed by ζ
+BEFORE any candidate arm runs. Contains: the margin-derivation formula bound to named control-run
+artifacts (e.g. margin_m = max(2·σ_control(m), floor_m) with each floor justified or absent), the
+per-metric pass/fail direction, the latency envelope (p95 < 120s with stated headroom factor), the
+decision rule per axis, and the survivor rule for the screening funnel. Candidate-arm artifacts
+missing a matching `preregistration_sha` are invalid by schema.
+
+**Failure/storm rule (INV-4)**: the replay engine aborts an arm run after 5 consecutive item
+failures with a structured error record (arm, item ids, error class) — no silent absorb-and-continue;
+partial artifacts carry `incomplete: true`.
+
+**Teardown**: scratch graphs and Qdrant replica collections are deleted only by a harness helper
+that re-validates the `evalmem_` prefix at deletion time.
+
+## Boundary-test sketch (integration-gate signals for ε)
+
+| Scenario | Preconditions | Postconditions |
+|---|---|---|
+| Endpoint conformance smoke | serving unit up for arm X | `json_schema`-constrained request returns schema-valid JSON; a deliberately-invalid schema response path is detected as failure, not silently accepted |
+| Scratch-guard rejection | ArmSpec with `group_id="dark_factory"` | typed rejection raised at construction; no driver built, no write occurs |
+| Client-class parity control | incumbent key valid | OpenAIClient and GenericClient runs over the same 20-episode subset both complete; delta recorded as a MetricsRecord |
+| Control variance → margins | two incumbent GenericClient replays complete | margin formula yields finite margins; instrument checks pass (symmetric params, non-empty reference artifacts, token counts > 0) |
+| Frozen-graph re-embed integrity | reference graph frozen | per-arm re-embedded graph has identical topology hash (nodes+edges), differing only in vectors/dims |
+| Index-configuration reality | one arm's scratch graph, indices built | fulltext leg returns >0 rows for a seeded query (proving the with-indices config differs from embedding-only in fact, not in name) |
+| Telemetry presence | γ landed; one replayed episode | journal row carries `duration_ms > 0` and token counts > 0 |
+
+## Decomposition plan
+
+Greek labels are PRD-local; IDs assigned at decompose. All tasks carry the Hazards block as binding
+constraints. Signals are the G2 candidates; capability bindings drafted here get mechanized in the
+manifest at decompose time.
+
+| # | Task | Modules | Kind | Signal (user-observable) | Prereqs |
+|---|---|---|---|---|---|
+| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` within the 19–20GB budget | — |
+| **β** | Config + client plumbing: `llm.client_class` knob (`openai`\|`openai_generic`), LLM `base_url` honored (`graphiti_client.py:502-509`), Mem0 LLM/embedder `openai_base_url` + `embedding_model_dims` plumbed (`mem0_client.py:138-167`), reindex tool `base_url` (`reindex.py:160-165`); default config byte-identical behavior | `fused-memory/src/fused_memory` | normal | integration test: a config naming a local base_url + generic client constructs clients that hit a local mock server; with the shipped config, construction is behaviorally unchanged (existing tests green) | — |
+| **γ** | Durable write telemetry: `duration_ms` on `backend_ops` rows (`_journaled_backend_call`, `memory_service.py:1302-1337`) + per-write token usage surfaced from graphiti's `TokenUsageTracker` into the journal `result_summary` | `fused-memory/src/fused_memory` | normal | after any live memory write, the documented read-only sqlite query shows the new row carrying `duration_ms` and token counts — permanent operator observability, consumed by ε and by operators | — |
+| **δ** | Corpus builder: stratified sample (~150–300, size finalized in-task from control-variance needs) of real dark_factory episodes across time and payload kind, explicitly **not** conditioned on incumbent outcome; committed manifest (ids + content hashes + stratification report + the no-outcome-filter statement) | `fused-memory/scripts` (read-only against episode store) | normal | committed corpus manifest; a reviewer can re-derive the sample from the manifest's recorded criteria | — |
+| **ε** | Arm-runner harness: ArmSpec + scratch-guard, replay engine over the real `GraphitiBackend` construction path onto `evalmem_*` graphs, MetricsRecord emission (importing `shared.memory_eval_metrics`), instrument-validation checks, INV-4 abort rule; boundary tests above | `fused-memory/scripts` + harness module, tests | normal | all boundary-test rows green in CI, including the observed scratch-guard rejection | β, γ, δ |
+| **ζ** | Controls + pre-registration: incumbent GenericClient replay ×2 (one graph frozen as the embedding reference), OpenAIClient control pair, margin derivation, commit `plans/local-memory-models-eval-preregistration.md` | harness runs + `plans/` | normal | pre-registration doc committed with finite derived margins AND control MetricsRecords committed; git history shows it predates every candidate-arm artifact | ε |
+| **η** | LLM screening: all 4 candidates × small subset — conformance smoke, VRAM fit, prompt-length fit (Phi-4's 16K vs measured longest graphiti prompt), throughput floor; survivor selection per the pre-registered rule | harness runs | normal | committed screening report naming survivors (≤3) with per-candidate evidence | α, ε, ζ |
+| **θ** | LLM full arm runs + comparison report: survivors × full corpus, realistic concurrency (fan-out ≤20) on the busy box in transient units; report vs pre-registered margins incl. cost/availability quantification | harness runs + `plans/` | normal | committed LLM-axis comparison report; every arm artifact embeds preregistration_sha + code_sha (schema-enforced) | ζ, η |
+| **ι** | Embedding arms: re-embed the frozen reference graph + one Mem0 replica collection per candidate (and incumbent-as-arm), build with-indices and embedding-only variants, run known-item + transcript-query probes, measure query-latency and re-embed throughput; report | harness runs + `plans/` | normal | committed embedding-axis comparison report covering both index configurations, with the current-prod confound stated | α, β, ζ |
+| **λ** | Synthesis: apply pre-registered rules; write two decision records (committed to `plans/` + `add_memory` `decisions_and_rationale`); raise the operator gate for Leo's ruling; name the follow-up PRD(s) the verdicts warrant | `plans/`, memory | normal | **leaf** — two committed decision records; the operator-gate escalation resolved by Leo referencing them | θ, ι |
+
+G1 note: λ's consumer is the operator ruling surface (the project's standing decision-record
+pattern); β's and γ's consumers are ε *in this batch* plus a named permanent surface (γ: the
+documented operator query; β: the config surface any later cutover uses — but β is justified by ε
+alone, no reliance on unfiled PRDs). G7 walk (advisory, author mode): INV-1 → contracts are pydantic
+schemas + a schema-enforced preregistration_sha, not prose; INV-2 → structured MetricsRecords and
+structured abort records, no log-scraping; INV-3 → scratch-guard revalidates at write and teardown;
+INV-4 → the 5-consecutive-failure abort rule; INV-5 → metrics schema and probe math imported from the
+eval program, construction path reused from fused-memory; INV-6/7 → runs live in supervised transient
+units, the single human hold is the λ operator gate on the standard age-surfaced queue.
+
+## Out of scope
+
+- **Production cutover of the LLM** and **the embedding backfill/migration** (collections rebuild,
+  FalkorDB vector-index rebuild, `calibrate_write_triage` re-run — its `t_high`/`t_low` are
+  embedder-space-dependent, `config.yaml:249-263`; `maintenance/reindex.py` is the substrate).
+  Follow-up PRDs, authored after the verdicts.
+- Index remediation on real graphs (`docs/prds/falkordb-index-provisioning.md`).
+- The `claude_cli` LLM paths (reconciliation agent/judge, curator, consolidator) — different
+  provider, different failure domain.
+- The `Task N` conflation defect and its metrics (referent-fidelity PRD).
+- Admitting local models as orchestrator *agent* models (`routing.allowed_models`).
+- SGLang — revisit only if vLLM fails the pre-registered throughput floor at screening.
+
+## Open questions (tactical, decided in-task)
+
+1. **Embedding serving stack** (TEI vs vLLM-pooling vs in-process for batch re-embeds). Suggested:
+   whatever screening shows serving query-latency best; batch re-embeds may run in-process. Decide in α/ι.
+2. **Phi-4 context fit** — measure graphiti's longest real prompt at screening; drop the arm if it
+   doesn't fit with margin. Decide in η.
+3. **MoE stretch-arm engine details** (which of the two models, GGUF quant level, client-side
+   validator placement). Decide in α/η.
+4. **Corpus size N** (~150–300) from control-variance and wall-clock measured in ζ. Decide in δ/ζ.
+5. **Qwen3-Embedding-4B production-residency estimate** (quantized footprint next to the winning
+   LLM) — only needed if 4B wins on quality. Decide in ι/λ.
+
+## Research appendix (sources, retrieved 2026-08-05)
+
+Serving: vLLM structured outputs (xgrammar/llguidance backends, OpenAI-compatible `json_schema`) —
+vllm docs + SqueezeBits guided-decoding benchmark (conformance 81–100% with guided decoding);
+llama.cpp silent unconstrained-fallback on `$ref`/`$defs` schemas — ggml-org/llama.cpp#21228 (plus
+#25746, #22072); Ollama constrained decoding weaker/less verifiable for concurrent production;
+graphiti `OpenAIGenericClient` + `structured_output_mode` — getzep/graphiti PR#1227; graphiti
+local-endpoint rough edges — issues #912, #1116 (api_base ignored → silent fallback to
+api.openai.com; re-verified against our own plumbing in β), #868, #1074.
+LLM candidates: Qwen3.5-9B official HF card (IFEval 91.5, BFCL-V4 66.1); Mistral-Small-3.2 release
+notes; Phi-4 SOB score arXiv:2604.25359; gpt-oss-20b model card arXiv:2508.10925 (screened out only
+if slate must shrink — Leo selected the four above); 3090 throughput: tfriedel/qwen3.6-rtx3090-lab
+(single-source, treated as directional).
+Embedders: Qwen3-Embedding family (0.6B/4B/8B — **no 2B**) QwenLM GitHub + HF cards, MTEB(eng,v2)
+70.70/74.60; granite-embedding-english-r2 arXiv:2508.21085 (Fig.1 composite 59.5; 144 docs/s H100);
+gte-modernbert-base HF card; incumbent anchor: OpenAI announcement (62.3 MTEB v1-era, $0.02/1M).
+Unverified-claims lists from both research passes are preserved in the session transcript; every
+number above that drives a design decision was either primary-sourced or is re-measured by this
+eval before use.
