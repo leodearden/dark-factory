@@ -1060,6 +1060,7 @@ async def _resolve_renamed_plan_path(
     norm: str,
     branch_head: str,
     git_ops: GitOps,
+    tree_paths: Callable[[], Awaitable[list[str] | None]],
     *,
     task_id: str | None = None,
 ) -> tuple[str, str] | None:
@@ -1075,6 +1076,24 @@ async def _resolve_renamed_plan_path(
     with rename detection on (``git show --name-status -M``) and look for
     an ``R<score>\\t<old>\\t<new>`` pair whose old side is *norm*.
 
+    Mechanism 2 (heuristic fallback, tried only when mechanism 1 finds
+    nothing): a UNIQUE basename match against the branch tree listing
+    supplied by *tree_paths*.  Mechanism 1 cannot see a relocation staged
+    as SEPARATE delete and add commits (git pairs renames only within one
+    commit), which is exactly how the reify harness-consolidation
+    programme staged its moves.  The fallback is deliberately conservative
+    and bounded three ways: it requires EXACTLY ONE candidate; it only
+    runs for a path that exists nowhere in the branch tree; and a
+    resolution never passes the gate on its own — the caller additionally
+    requires the resolved path to be in the touched set.  So an ambiguous
+    or coincidental basename cannot silently satisfy the gate.
+
+    *tree_paths* is an async provider, not a list, so the (single) tree
+    listing is shelled out at most ONCE per gate invocation, shared across
+    every stale entry, and never computed at all when mechanism 1 resolves
+    or when no entry is stale.  It returns ``None`` on a git error, which
+    fails this resolver closed.
+
     Anchored on *branch_head* rather than main's live HEAD deliberately:
     this gate has no ``main_sha`` parameter, and reading ``HEAD`` in
     ``project_root`` would make a merge gate depend on a ref the merge
@@ -1089,6 +1108,7 @@ async def _resolve_renamed_plan_path(
     error there would block every plan entry at once, whereas a per-entry
     probe failure can only leave one already-suspect entry flagged.)
     """
+    # ── Mechanism 1: the deleting commit's own rename pair ──────────────
     rc, del_out, del_err = await _run(
         ['git', 'log', '--diff-filter=D', '-1', '--format=%H', branch_head, '--', norm],
         cwd=git_ops.project_root,
@@ -1104,33 +1124,43 @@ async def _resolve_renamed_plan_path(
         return None
 
     del_sha = del_out.strip().splitlines()[0].strip() if del_out.strip() else ''
-    if not del_sha:
-        # No commit reachable from branch_head ever deleted this path — it
-        # was never created, or the relocation was staged as separate
-        # delete+add commits in a shape git's -M cannot pair.  Not an error.
-        return None
-
-    rc, show_out, show_err = await _run(
-        ['git', 'show', '--name-status', '-M', '--format=', del_sha],
-        cwd=git_ops.project_root,
-    )
-    if rc != 0:
-        logger.warning(
-            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
-            'cmd=%r rc=%s stderr=%s',
-            task_id or '<unknown>', norm,
-            f'git show --name-status -M --format= {del_sha[:12]}',
-            rc, (show_err or '').strip()[:400],
+    if del_sha:
+        rc, show_out, show_err = await _run(
+            ['git', 'show', '--name-status', '-M', '--format=', del_sha],
+            cwd=git_ops.project_root,
         )
+        if rc != 0:
+            logger.warning(
+                'plan-files-touched: rename-probe git error task_id=%s entry=%s '
+                'cmd=%r rc=%s stderr=%s',
+                task_id or '<unknown>', norm,
+                f'git show --name-status -M --format= {del_sha[:12]}',
+                rc, (show_err or '').strip()[:400],
+            )
+            return None
+
+        for line in show_out.splitlines():
+            fields = line.split('\t')
+            if len(fields) < 3:
+                continue
+            status, old_path, new_path = fields[0], fields[1], fields[2]
+            if status.startswith('R') and old_path == norm and new_path:
+                return new_path, f'rename in {del_sha[:12]}'
+
+    # ── Mechanism 2: unique basename match in the branch tree ───────────
+    # Reached when no commit deleted the path (never created, or the
+    # relocation predates any reachable delete) or when the deleting
+    # commit carried no pairable rename (separate delete+add commits).
+    paths = await tree_paths()
+    if paths is None:
         return None
 
-    for line in show_out.splitlines():
-        fields = line.split('\t')
-        if len(fields) < 3:
-            continue
-        status, old_path, new_path = fields[0], fields[1], fields[2]
-        if status.startswith('R') and old_path == norm and new_path:
-            return new_path, f'rename in {del_sha[:12]}'
+    basename = posixpath.basename(norm)
+    if not basename:
+        return None
+    candidates = [p for p in paths if posixpath.basename(p) == basename]
+    if len(candidates) == 1:
+        return candidates[0], 'unique basename match'
 
     return None
 
@@ -1178,6 +1208,36 @@ async def _check_plan_files_touched_in_branch(
 
     touched = await git_ops.get_files_touched_in_branch(base_sha, branch_head)
     touched_set = set(touched)
+
+    # Lazily-computed, once-per-invocation listing of every path in the
+    # branch tree, used only by the rename resolver's basename fallback.
+    # It is reached only on the already-failing absent-path arm, so the
+    # cost is off the hot path — and it is paid at most once even when
+    # several declared entries are stale (the reify-5196 shape had two).
+    tree_listing: list[str] | None = None
+    tree_listing_failed = False
+
+    async def _tree_paths() -> list[str] | None:
+        nonlocal tree_listing, tree_listing_failed
+        if tree_listing is not None or tree_listing_failed:
+            return tree_listing
+        rc, out, err = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', branch_head],
+            cwd=git_ops.project_root,
+        )
+        if rc != 0:
+            # Fail closed: without a tree listing we cannot bound the
+            # basename heuristic, so no entry resolves through it.
+            tree_listing_failed = True
+            logger.warning(
+                'plan-files-touched: tree-listing failed task_id=%s head=%s '
+                'rc=%s stderr=%s',
+                task_id or '<unknown>', branch_head, rc,
+                (err or '').strip()[:400],
+            )
+            return None
+        tree_listing = [line for line in out.splitlines() if line]
+        return tree_listing
 
     not_touched: list[str] = []
     resolved_renames: dict[str, str] = {}
@@ -1231,7 +1291,7 @@ async def _check_plan_files_touched_in_branch(
         # so the touched set can say nothing about it.  Try to resolve the
         # rename before blaming the branch (task 3110).
         resolution = await _resolve_renamed_plan_path(
-            norm, branch_head, git_ops, task_id=task_id,
+            norm, branch_head, git_ops, _tree_paths, task_id=task_id,
         )
         if resolution is not None:
             resolved, mechanism = resolution
