@@ -675,6 +675,70 @@ class TestSerialPytest:
         assert serial_pytest(cmd) == cmd
 
 
+class TestSubshellClauseIntegrity:
+    """A mutator that appends flags to a raw-retained pytest chain must place
+
+    them INSIDE the pytest invocation's own arguments — never after a
+    subshell-closing ``)`` — so the rewritten chain is still a parseable
+    shell command. Regression coverage for task 3650: the committed fleet
+    ``test_command``'s cockpit clause (``dark-factory-orchestrator.yaml``'s
+    ``( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/
+    --timeout=300 )``) was corrupted by both raw-chain mutators into
+    ``... --timeout=300 ) -p no:xdist ...`` / ``... --timeout=300 ) -n 4
+    ...`` — a bash syntax error (``bash -n`` exit 2) on the ENV_TRANSIENT
+    verify recovery path (verify.py:4945-4956).
+    """
+
+    # The cockpit clause's fixed portion, shared by both parametrized cases —
+    # only the appended suffix (and its position relative to the closing
+    # ')') differs between serial_pytest and apply_pytest_numprocesses.
+    _COCKPIT_CLAUSE_PREFIX = (
+        '( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300'
+    )
+
+    @pytest.mark.parametrize(
+        ('label', 'mutate', 'suffix', 'corrupt_marker'),
+        [
+            (
+                'serial',
+                lambda cmd: serial_pytest(cmd),
+                " -p no:xdist -o addopts=''",
+                ') -p no:xdist',
+            ),
+            (
+                'numprocesses',
+                lambda cmd: apply_pytest_numprocesses(cmd, '4'),
+                ' -n 4',
+                ') -n 4',
+            ),
+        ],
+        ids=['serial', 'numprocesses'],
+    )
+    def test_cockpit_subshell_stays_parseable(self, label, mutate, suffix, corrupt_marker):
+        cmd = parse_config_command(ROOT_TEST_COMMAND)
+        # Guards that this fixture still exercises the raw-retained (chain)
+        # branch rather than silently drifting to the structured branch,
+        # which would make the rest of this test vacuous.
+        assert cmd.tool is ToolKind.PYTEST
+        assert cmd.raw is not None
+
+        result = render(mutate(cmd))
+        _assert_bash_parses(result, what=f'{label} on ROOT_TEST_COMMAND')
+
+        # The suffix must land INSIDE the subshell, before its closing ')' —
+        # anchored on an exact substring of the repaired cockpit clause, not
+        # a loose `in` check on the flags alone, so this distinguishes
+        # "flags present somewhere" from "flags in the right place".
+        repaired_clause = f'{self._COCKPIT_CLAUSE_PREFIX}{suffix} )'
+        assert repaired_clause in result, (
+            f"{label}: expected the cockpit clause's flags before its "
+            f'closing paren, got: {result!r}'
+        )
+        assert corrupt_marker not in result, (
+            f'{label}: flags leaked after the subshell close: {result!r}'
+        )
+
+
 class TestSeparateTokenValueFlagBinding:
     """A pytest separate-token value flag (-k/-m/-p/-o/-n/...) must bind to its
 
