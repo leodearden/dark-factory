@@ -3489,3 +3489,57 @@ def test_default_verify_fn_backstop_does_not_probe_after_the_last_cluster():
     verify_fn(_clusters(5), model="sonnet")
 
     assert probe.calls == [], "cluster 5 is the last one; there is nothing left to guard"
+
+
+def test_report_cost_note_counts_real_headroom_probes(tmp_path):
+    """The cost note reports the probes this run ACTUALLY made, not a literal 1.
+
+    A legibility tool that under-reports its own spend, in the very artifact
+    an operator reads to check --max-verify-clusters, is the same defect class
+    this pipeline exists to find.
+
+    A run with clusters to verify pays the preflight probe AND the
+    stage-boundary gate, so the honest count is at least 2.
+    """
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set(_THREE_NOVEL_TITLES)),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    mod.run_census(**kwargs)
+
+    cost_line = kwargs["report_path"].read_text(encoding="utf-8").split("## Cost", 1)[1]
+    assert "headroom-probe=1" not in cost_line, "the hardcoded literal must be gone"
+    assert "headroom-probe=2" in cost_line, "preflight + the pre-verify stage gate"
+
+
+def test_report_cost_note_reports_one_probe_when_nothing_is_verified(tmp_path):
+    """No clusters to verify -> the stage gate is skipped -> genuinely 1 probe.
+
+    The count must track what happened, in both directions: reading 2 here
+    would be over-reporting, which is the same dishonesty as under-reporting.
+    """
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    mod.run_census(**kwargs)
+
+    cost_line = kwargs["report_path"].read_text(encoding="utf-8").split("## Cost", 1)[1]
+    assert "verify=0" in cost_line
+    assert "headroom-probe=1" in cost_line
