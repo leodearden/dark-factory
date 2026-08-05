@@ -1217,3 +1217,217 @@ class TestRunCrossRepoGate:
         message = ' '.join(r.getMessage() for r in caplog.records)
         assert '4242' in message, f'gate must log the task id; got {message!r}'
         assert 'allow' in message.lower(), f'gate must log the verdict; got {message!r}'
+
+
+# ---------------------------------------------------------------------------
+# step-13 RED: dispatch-level wiring through _run_slot
+# ---------------------------------------------------------------------------
+
+
+def _make_slot_harness(tmp_path: Path):
+    """Build a Harness whose _run_slot can be called directly in tests.
+
+    Copied from test_substrate_gate.py:857.
+    """
+    h = _make_harness(tmp_path)
+    h.scheduler.release = MagicMock()
+    h.scheduler._dispatched = set()
+    h._run_id = None
+    h.event_store = None
+    return h
+
+
+def _make_mock_workflow():
+    """Return a minimal AsyncMock workflow whose run() is awaitable."""
+    from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
+
+    wf = AsyncMock()
+    wf.run = AsyncMock(return_value=TerminalReport(
+        outcome=WorkflowOutcome.DONE, reason='', phase=WorkflowState.DONE,
+        detail='', category=None,
+    ))
+    wf.metrics = MagicMock(
+        total_cost_usd=0.0,
+        total_duration_ms=0,
+        agent_invocations=0,
+        execute_iterations=0,
+        verify_attempts=0,
+        review_cycles=0,
+    )
+    wf._steward = None
+    return wf
+
+
+_PROBE = {'checker': ['python', '-m', 'checker'], 'probe_set': 'probes/p.json'}
+
+
+class TestRunSlotCrossRepoGateWiring:
+    """_run_slot wiring for the cross-repo gate.
+
+    (a) BLOCK  → build_workflow never called, cooldown armed, BLOCKED report.
+    (b) ALLOW  → build_workflow IS called and workflow.run awaited.
+    (c) no signal → gate never invoked; dispatch unaffected.
+    (d) ORDERING → the cheap terminal gate runs BEFORE the substrate gate.
+    (e) probe-only task still reaches the substrate gate (no regression).
+    """
+
+    @pytest.mark.asyncio
+    async def test_block_prevents_workflow_construction(self, tmp_path: Path):
+        """(a) No agent spins up: build_workflow is never called."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(cross_repo=True)
+        h._run_cross_repo_gate = AsyncMock(return_value=False)
+        h._block_and_escalate_cross_repo = AsyncMock()
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            MockWorkflow.return_value = _make_mock_workflow()
+            report = await h._run_slot(assignment, sem)
+
+        assert not MockWorkflow.called, (
+            'TaskWorkflow must NOT be constructed for a foreign-owned task — '
+            'no agent, no worktree, no run row'
+        )
+        h._run_cross_repo_gate.assert_awaited_once()
+
+        assert report is not None
+        from orchestrator.workflow import WorkflowOutcome
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.block_reason == 'cross_repo_misfile'
+
+    @pytest.mark.asyncio
+    async def test_block_arms_requeue_cooldown(self, tmp_path: Path):
+        """(a) scheduler.release(requeued=True) so the task is not re-dispatched at once."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(cross_repo=True)
+        h._run_cross_repo_gate = AsyncMock(return_value=False)
+        h._block_and_escalate_cross_repo = AsyncMock()
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            MockWorkflow.return_value = _make_mock_workflow()
+            await h._run_slot(assignment, sem)
+
+        h.scheduler.release.assert_called_once()
+        requeued = h.scheduler.release.call_args.kwargs.get('requeued', None)
+        assert requeued is True, (
+            f'scheduler.release must be called with requeued=True; got '
+            f'{h.scheduler.release.call_args!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_allow_permits_workflow_construction(self, tmp_path: Path):
+        """(b) A gate that allows must not disturb normal dispatch."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(cross_repo=True)
+        h._run_cross_repo_gate = AsyncMock(return_value=True)
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            mock_wf = _make_mock_workflow()
+            MockWorkflow.return_value = mock_wf
+            await h._run_slot(assignment, sem)
+
+        assert MockWorkflow.called
+        mock_wf.run.assert_awaited_once()
+        h._run_cross_repo_gate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_signal_skips_the_gate(self, tmp_path: Path):
+        """(c) A task with no cross-repo signal pays nothing."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(task_kind='implementation')
+        gate = AsyncMock(return_value=True)
+        h._run_cross_repo_gate = gate
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            mock_wf = _make_mock_workflow()
+            MockWorkflow.return_value = mock_wf
+            await h._run_slot(assignment, sem)
+
+        gate.assert_not_awaited()
+        mock_wf.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cross_repo_gate_runs_before_substrate_gate(self, tmp_path: Path):
+        """(d) The cheap terminal gate runs FIRST — no worktree for a doomed task."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(cross_repo=True, substrate_probe=_PROBE)
+        h._run_cross_repo_gate = AsyncMock(return_value=False)
+        h._block_and_escalate_cross_repo = AsyncMock()
+        substrate_gate_mock = AsyncMock(return_value=True)
+        h._run_substrate_gate = substrate_gate_mock
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            MockWorkflow.return_value = _make_mock_workflow()
+            report = await h._run_slot(assignment, sem)
+
+        # The substrate gate builds an ephemeral worktree + runs a checker
+        # subprocess; a task the cross-repo gate already blocked must never
+        # pay for it.
+        substrate_gate_mock.assert_not_awaited()
+        assert report is not None
+        assert report.block_reason == 'cross_repo_misfile'
+        assert not MockWorkflow.called
+
+    @pytest.mark.asyncio
+    async def test_probe_only_task_still_reaches_substrate_gate(self, tmp_path: Path):
+        """(e) The insertion must not break the existing D4 gate."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(substrate_probe=_PROBE)
+        cross_repo_gate_mock = AsyncMock(return_value=True)
+        h._run_cross_repo_gate = cross_repo_gate_mock
+        substrate_gate_mock = AsyncMock(return_value=False)
+        h._run_substrate_gate = substrate_gate_mock
+        h._block_and_escalate_substrate_flip = AsyncMock()
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            MockWorkflow.return_value = _make_mock_workflow()
+            report = await h._run_slot(assignment, sem)
+
+        cross_repo_gate_mock.assert_not_awaited()
+        substrate_gate_mock.assert_awaited_once()
+        assert report is not None
+        assert report.block_reason == 'substrate_flip'
+
+    @pytest.mark.asyncio
+    async def test_both_gates_run_when_neither_blocks(self, tmp_path: Path):
+        """A task carrying both signals passes through both gates, in order."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(cross_repo=False, substrate_probe=_PROBE)
+        order: list[str] = []
+        h._run_cross_repo_gate = AsyncMock(
+            side_effect=lambda _a: order.append('cross_repo') or True
+        )
+        h._run_substrate_gate = AsyncMock(
+            side_effect=lambda _a: order.append('substrate') or True
+        )
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            mock_wf = _make_mock_workflow()
+            MockWorkflow.return_value = mock_wf
+            await h._run_slot(assignment, sem)
+
+        assert order == ['cross_repo', 'substrate'], (
+            f'cross-repo gate must run first; got {order!r}'
+        )
+        mock_wf.run.assert_awaited_once()
