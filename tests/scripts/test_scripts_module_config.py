@@ -74,10 +74,10 @@ from orchestrator.module_charter import derive_modules
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 # This worktree's own top-level orchestrator config — the repo-root fleet chain
-# `_root_scripts_suites_pytest_targets` reads. `dark-factory-orchestrator.yaml`
-# is the canonical, REQUIRED filename for a project's top-level config (it is
-# what the dashboard's escalation-URL discovery keys on); the legacy spellings
-# are a discovery fallback for unmigrated projects, not a choice this repo has.
+# `_root_config` reads. `dark-factory-orchestrator.yaml` is the canonical,
+# REQUIRED filename for a project's top-level config (it is what the
+# dashboard's escalation-URL discovery keys on); the legacy spellings are a
+# discovery fallback for unmigrated projects, not a choice this repo has.
 # Anchored to REPO_ROOT rather than taken from the ambient ORCH_CONFIG_PATH for
 # the reason that helper's docstring records at length.
 ROOT_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
@@ -216,6 +216,60 @@ def _executed_for_touched(files: list[str]):
         f'{[e.prefix for e in executed]!r}'
     )
     return executed[0]
+
+
+def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
+    """Load the repo-root config through the PRODUCTION loader, anchored at ROOT_CONFIG_PATH.
+
+    Shared by every guard in this file that needs to compare against the
+    repo-root fleet chain (task 3458's amendment pass extracted this from
+    three near-identical copies — see git history for the pre-extraction
+    shape).
+
+    ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene, and an earlier
+    draft omitted it on the false premise that ``project_root=REPO_ROOT``
+    selects which yaml is read. It does not: ``project_root`` is only a model
+    FIELD, and ``OrchestratorConfig.settings_customise_sources`` builds its
+    ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
+    falling back to a CWD-relative ``config.yaml``. Both ambient states are
+    wrong here, in opposite directions:
+
+      * UNSET — which is the state INSIDE VERIFY, because
+        ``verify._target_subprocess_env`` deliberately scrubs the whole
+        ``ORCH_`` prefix (task 2957) — finds no file, so every value collapses
+        to the pydantic defaults, where e.g. ``test_command`` is the bare
+        literal ``'pytest'``. A caller would then fail with a message about
+        the fleet chain having dropped a suite, when the chain is in fact
+        correct and was simply never read.
+      * SET, as an operator's shell has it, points at whichever checkout that
+        orchestrator serves — typically the MAIN one, not this worktree. A
+        caller would then assert about a different checkout's yaml and report
+        GREEN on a worktree that had actually regressed: the exact
+        reports-green-while-checking-something-else failure this file exists
+        to prevent, one env var over.
+
+    Setting the env var IS the production load path (``config.load_config``
+    stamps ``os.environ['ORCH_CONFIG_PATH']`` before constructing), so this
+    stays a read through the real loader — pinned to THIS worktree's committed
+    yaml rather than left to the ambient environment. Same remedy, same
+    reason, as ``tests/scripts/test_orchestrator_watchdog.py``'s
+    ``test_orch_restart_min_interval_secs_matches_config_default``.
+
+    Fails LOUDLY on a missing file rather than silently: ``YamlSettingsSource``
+    skips a non-existent ``config_path`` instead of raising, so a bad path
+    would silently yield the pydantic DEFAULTS — a config this repo does not
+    declare — rather than an error.
+    """
+    assert ROOT_CONFIG_PATH.is_file(), (
+        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
+        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
+        'skips a non-existent path rather than raising), and every value read '
+        'from the returned config would be about a config this repo does not '
+        'declare. dark-factory-orchestrator.yaml is the canonical, required '
+        "filename for a project's top-level orchestrator config"
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
+    return OrchestratorConfig(project_root=REPO_ROOT)
 
 
 # The two checker spellings these helpers understand, keyed by the phrase that
@@ -1038,39 +1092,11 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
 def _root_scripts_suites_pytest_targets(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Positional targets of the fleet chain's pytest segment for the scripts suites.
 
-    Read through the PRODUCTION loader — the ``test_command`` an
+    Read through the PRODUCTION loader (``_root_config`` — see its docstring
+    for why anchoring ``ORCH_CONFIG_PATH`` is load-bearing here, not hygiene)
+    rather than by ``yaml.safe_load``: the ``test_command`` an
     ``OrchestratorConfig`` carries is the same value
-    ``verify._build_fallback_config`` receives as its ``config`` — rather than
-    by ``yaml.safe_load``, for the reason the module docstring records.
-
-    ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene, and an earlier
-    draft omitted it on the false premise that ``project_root=REPO_ROOT``
-    selects which yaml is read. It does not: ``project_root`` is only a model
-    FIELD, and ``OrchestratorConfig.settings_customise_sources`` builds its
-    ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
-    falling back to a CWD-relative ``config.yaml``. Both ambient states are
-    wrong here, in opposite directions:
-
-      * UNSET — which is the state INSIDE VERIFY, because
-        ``verify._target_subprocess_env`` deliberately scrubs the whole
-        ``ORCH_`` prefix (task 2957) — finds no file, so every value collapses
-        to the pydantic defaults, where ``test_command`` is the bare literal
-        ``'pytest'``. The guard then fails with a message about the fleet chain
-        having dropped both scripts trees, when the chain is in fact correct
-        and was simply never read.
-      * SET, as an operator's shell has it, points at whichever checkout that
-        orchestrator serves — typically the MAIN one, not this worktree. The
-        guard would then assert about a different checkout's yaml and report
-        GREEN on a worktree that had dropped ``scripts/tests/`` from its own
-        chain: the exact reports-green-while-checking-something-else failure
-        this file exists to prevent, one env var over.
-
-    Setting the env var IS the production load path (``config.load_config``
-    stamps ``os.environ['ORCH_CONFIG_PATH']`` before constructing), so this
-    stays a read through the real loader — it is pinned to THIS worktree's
-    committed yaml rather than left to the ambient environment. Same remedy,
-    same reason, as ``tests/scripts/test_orchestrator_watchdog.py``'s
-    ``test_orch_restart_min_interval_secs_matches_config_default``.
+    ``verify._build_fallback_config`` receives as its ``config``.
 
     The segment is selected by CONTENT (the one pytest segment whose targets
     name either scripts test tree) and not by POSITION ("the trailing
@@ -1079,20 +1105,7 @@ def _root_scripts_suites_pytest_targets(monkeypatch: pytest.MonkeyPatch) -> list
     checking something else entirely while still reporting green — the same
     reports-green failure mode this whole file exists to prevent.
     """
-    # Fail LOUDLY on a missing file. YamlSettingsSource.__call__ guards its read
-    # with `if self.config_path.exists()`, so a bad path is not an error — it
-    # silently yields the defaults, i.e. the `'pytest'` string above, and the
-    # anchoring this docstring just justified would be undone without a word.
-    assert ROOT_CONFIG_PATH.is_file(), (
-        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
-        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
-        'skips a non-existent path rather than raising), and every assertion '
-        'below would be about a config this repo does not declare. '
-        'dark-factory-orchestrator.yaml is the canonical, required filename for '
-        'a project\'s top-level orchestrator config'
-    )
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
-    root_cmd = OrchestratorConfig(project_root=REPO_ROOT).test_command
+    root_cmd = _root_config(monkeypatch).test_command
     assert root_cmd, (
         f'the repo-root orchestrator config declares test_command={root_cmd!r}, '
         'so the fleet chain gates nothing and the comparison below would be '
@@ -1207,7 +1220,16 @@ def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(
 # real but not the common case, so a mean or a fresh-only measurement would
 # both have under-sized the floor.
 MEASURED_SUITE_WORST_SECS = 930.59
-MIN_MODULE_BUDGET_SECS = 1800
+# DERIVED from MEASURED_SUITE_WORST_SECS, not hand-set, so the two cannot
+# silently diverge — this exact pair has already rotted once: the sibling
+# tests/scripts/test_tests_scripts_module_config.py still hard-codes its
+# MIN_MODULE_BUDGET_SECS against a 127.0s worst run while its
+# tests/scripts/orchestrator.yaml has since recorded 233.50s as the worst
+# measured run, and nothing caught the drift (task 3458 amendment pass,
+# reviewer-flagged; the sibling file is out of this task's locked scope, so
+# it is filed as a follow-up rather than fixed here). ~2x the worst observed
+# run, rounded DOWN to the nearest 100s: 2 * 930.59 -> 1861.18 -> 1800.
+MIN_MODULE_BUDGET_SECS = (int(2 * MEASURED_SUITE_WORST_SECS) // 100) * 100
 
 
 def test_scripts_module_carries_its_own_measured_verify_budget(
@@ -1268,18 +1290,9 @@ def test_scripts_module_carries_its_own_measured_verify_budget(
     )
 
     # (c) Strictly tighter than the repo-root ceiling: a real narrowing. Read
-    # through the PRODUCTION loader — the precedent this file already
-    # establishes in `_root_scripts_suites_pytest_targets` above (ORCH_CONFIG_PATH
-    # anchoring is load-bearing, not hygiene; see that helper's docstring for
-    # why `project_root` alone does not select which yaml is read).
-    assert ROOT_CONFIG_PATH.is_file(), (
-        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
-        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
-        'skips a non-existent path rather than raising), and root_warm below '
-        'would be the wrong number to compare against'
-    )
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
-    cfg = OrchestratorConfig(project_root=REPO_ROOT)
+    # through the PRODUCTION loader (`_root_config` — see its docstring for
+    # why ORCH_CONFIG_PATH anchoring is load-bearing here, not hygiene).
+    cfg = _root_config(monkeypatch)
     root_warm = cfg.verify_command_timeout_secs
     assert mc.verify_command_timeout_secs < root_warm, (
         f'{MODULE_PREFIX} verify_command_timeout_secs='
@@ -1296,9 +1309,34 @@ def test_scripts_module_carries_its_own_measured_verify_budget(
         f'the module budget {mc.verify_command_timeout_secs} (task 3458) — the '
         'per-module override is not reaching the code path that enforces it'
     )
+    # Redundant by construction with the equality just asserted plus (c)'s
+    # `mc.verify_command_timeout_secs < root_warm` above — cannot fail
+    # independently of those two. Kept anyway for a message that names the
+    # specific failure mode (module override not reaching the resolver)
+    # rather than making a reader re-derive it from (c).
     assert resolved != root_warm, (
         f'_resolve_verify_timeout returned the repo-root global {root_warm} '
         f'rather than the module budget for {MODULE_PREFIX}'
+    )
+
+    # (e) Survives the PRODUCTION plan -> execution bridge
+    # (verify._executed_module_configs_from_plan), not just the resolver in
+    # isolation. That bridge uses dataclasses.replace, so every ModuleConfig
+    # field carries over today — but verify._apply_cargo_scope (applied to
+    # cargo-scoped modules on the same bridge) instead reconstructs
+    # ModuleConfig by hand-listing every field, precisely the shape where a
+    # per-module budget could be silently dropped by a future field addition
+    # or refactor. This module is not cargo-scoped, but the bridge itself is
+    # real production code this budget must survive, not just the resolver
+    # exercised in isolation above.
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE])
+    assert executed.verify_command_timeout_secs == mc.verify_command_timeout_secs, (
+        'the production plan->execution bridge '
+        '(verify._executed_module_configs_from_plan) rendered '
+        f'verify_command_timeout_secs={executed.verify_command_timeout_secs} for a '
+        f'{MODULE_PREFIX}-scoped run, not the declared module budget '
+        f'{mc.verify_command_timeout_secs} (task 3458) — the per-module override '
+        'is dropped somewhere between discovery and execution'
     )
 
 
@@ -1341,17 +1379,9 @@ def test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling(
         'assertions below must be updated together, not just this line'
     )
 
-    # Read the root cold ceilings through the PRODUCTION loader, same
-    # anchoring precedent as the warm-budget guard above and
-    # `_root_scripts_suites_pytest_targets`.
-    assert ROOT_CONFIG_PATH.is_file(), (
-        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
-        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
-        'skips a non-existent path rather than raising), and the cold ceilings '
-        'below would be the wrong numbers to compare against'
-    )
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
-    cfg = OrchestratorConfig(project_root=REPO_ROOT)
+    # Read the root cold ceilings through the PRODUCTION loader (`_root_config`
+    # — same anchoring precedent as the warm-budget guard above).
+    cfg = _root_config(monkeypatch)
 
     # (b) Warm (non-merge) cold verify falls through to the ROOT cold ceiling,
     # NOT the new warm value.
@@ -1366,6 +1396,14 @@ def test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling(
         'UNSET deliberately, so a cold verify must fall through to the root '
         'ceiling'
     )
+    # NOT redundant with (b) above: nothing before this line bounds root_cold
+    # against the module's own warm budget, so this independently catches the
+    # root cold ceiling ever being configured down to (or below)
+    # verify_command_timeout_secs — a real, if currently slack (5400 vs 2400),
+    # cross-file misconfiguration nothing else in this file checks for. (It
+    # would follow from the warm-budget test's (c) — module warm < root warm
+    # — only if root_cold >= root_warm is also assumed, which is true on this
+    # config but is not itself asserted anywhere.)
     assert resolved_cold != mc.verify_command_timeout_secs, (
         f'_resolve_verify_timeout(is_cold=True) returned the module\'s WARM '
         f'budget ({mc.verify_command_timeout_secs}) rather than falling '
