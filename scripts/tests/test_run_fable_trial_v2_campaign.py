@@ -20,6 +20,7 @@ instrument as it exists rather than as it will exist.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -611,3 +612,103 @@ def test_banding_without_q_ceiling_exits(tmp_path, monkeypatch):
 
     assert exc.value.code != 0
     assert 'q-ceiling' in str(exc.value)
+
+
+# ===== step 11: the output schema and the --out JSON artifact =====
+
+
+def _report(q_ceiling=None):
+    """A campaign report over the mixed result set, both candidates resolved."""
+    candidates = mod.resolve_candidates(['architect-opus-max', 'architect-fable-high'])
+    cell_matrix = mod.enumerate_cells(
+        [Path(f'{stem}.json') for stem in ('f1', 'f2', 'f3')],
+        [c.name for c in candidates], 1,
+    )
+    return mod.build_campaign_report(
+        _mixed_results(), candidates, cell_matrix, q_ceiling=q_ceiling,
+    )
+
+
+def test_output_schema_carries_the_four_required_per_candidate_fields():
+    """THE signal this task exists to produce, mechanically and per candidate.
+
+    planRate, plan_quality, cap_excluded and judged_without_reference — emitted
+    by the driver rather than reconstructed by an operator from a log, which is
+    what makes γ1's calibration report COMPUTED instead of hand-derived.
+    """
+    report = _report()
+
+    assert report['candidates']
+    for entry in report['candidates']:
+        assert set(entry) == {
+            'config_name', 'model', 'effort', 'max_budget_usd',
+            'n', 'total', 'plan_rate', 'mean_plan_quality',
+            'cap_excluded', 'no_plan', 'judged_without_reference',
+        }
+    by_name = {e['config_name']: e for e in report['candidates']}
+    assert by_name['architect-fable-high']['model'] == 'claude-fable-5'
+    assert by_name['architect-opus-max']['effort'] == 'max'
+
+
+def test_report_carries_cells_and_cell_matrix():
+    """The raw per-cell dump makes the verdict recomputable without a log."""
+    report = _report()
+
+    assert len(report['cells']) == len(_mixed_results())
+    for cell in report['cells']:
+        assert set(cell) == {
+            'task_id', 'config_name', 'trial', 'outcome', 'plan_quality',
+            'plan_steps', 'cost_usd', 'judge_cost_usd', 'cap_tainted',
+        }
+    # The ENUMERATED expected matrix rides along, so a cell that never returned
+    # is visible as a gap rather than silently absent.
+    assert report['cell_matrix'] == mod.enumerate_cells(
+        [Path(f'{stem}.json') for stem in ('f1', 'f2', 'f3')],
+        ['architect-opus-max', 'architect-fable-high'], 1,
+    )
+
+
+def test_bands_present_only_when_q_ceiling_given():
+    """No q_ceiling -> no ``bands`` key at all, never a dict of fabricated bands."""
+    assert 'bands' not in _report()
+
+    banded = _report(q_ceiling=0.80)
+    assert banded['bands']['q_ceiling'] == 0.80
+    assert set(banded['bands']) == {
+        'q_ceiling', 'marker_available', 'by_fixture', 'counts', 'retained', 'discarded',
+    }
+
+
+def test_out_writes_json_and_is_reloadable(tmp_path, capsys):
+    """``--out`` writes an artifact that round-trips through ``json.loads``."""
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+    out = tmp_path / 'nested' / 'r.json'
+
+    rc = mod.main([
+        '--dry-run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max',
+        '--trials', '2', '--out', str(out),
+    ])
+
+    assert rc == 0
+    assert out.exists(), '--out did not create its parent dirs'
+    loaded = json.loads(out.read_text())
+    assert loaded['cell_matrix'] == mod.enumerate_cells(
+        sorted(d.glob('*.json')), ['architect-opus-max'], 2,
+    )
+    assert json.loads(json.dumps(loaded)) == loaded
+
+
+def test_rendering_is_deterministic():
+    """Formatting the same report twice is byte-identical.
+
+    No wall-clock stamp and no dict-iteration-order dependence, so a committed
+    γ1 artifact diffs cleanly against its successor.
+    """
+    report = _report(q_ceiling=0.80)
+
+    first = mod.format_campaign_report(report)
+    second = mod.format_campaign_report(report)
+
+    assert first == second
+    assert 'ceiling' in first, 'the band summary is not rendered'
