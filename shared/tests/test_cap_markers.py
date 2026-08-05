@@ -19,8 +19,10 @@ tests/``.
 
 from __future__ import annotations
 
+import _capacity_skip
 import pytest
 
+from shared import cap_markers
 from shared.cap_markers import (
     AUTH_BANNER_MARKERS,
     BLOCKING_BANNER_MARKERS,
@@ -183,3 +185,49 @@ class TestLooksLikeBlockingBanner:
     @pytest.mark.parametrize('text', _NEGATIVES)
     def test_ordinary_failures_do_not_match(self, text):
         assert looks_like_blocking_banner(text) is None
+
+
+class TestCapacitySkipIsSingleSourced:
+    """``_capacity_skip`` owns no policy of its own — only a calling convention.
+
+    This is the second independent site found carrying its own copy of this
+    list, so the single-sourcing is pinned rather than assumed.
+    """
+
+    def test_markers_are_the_same_object(self):
+        """IDENTITY, not equality.
+
+        Equality is exactly what a re-copied list would also satisfy on the
+        day it was copied — and a copy that drifts afterwards is the defect
+        this consolidation exists to close.  ``is`` is the only assertion that
+        catches a future re-inlining at the moment it happens rather than at
+        the moment it diverges.
+        """
+        assert _capacity_skip.CAPACITY_FAILURE_MARKERS is cap_markers.CAPACITY_BANNER_MARKERS
+
+    @pytest.mark.parametrize(
+        'name',
+        [
+            'REAL_CLI_CAP_HIT_MESSAGES',
+            'REAL_CLI_NEAR_CAP_MESSAGES',
+            'REAL_CLI_CAP_MESSAGES',
+        ],
+    )
+    def test_corpus_tuples_are_the_same_object(self, name):
+        """The verbatim transcripts have exactly one home, for the same reason."""
+        assert getattr(_capacity_skip, name) is getattr(cap_markers, name)
+
+    @pytest.mark.parametrize(
+        'text',
+        [*REAL_CLI_CAP_MESSAGES, *_NEGATIVES, *_AUTH_ONLY],
+    )
+    def test_shim_agrees_with_canonical_matcher(self, text):
+        """The bool calling convention is preserved, the policy is not duplicated.
+
+        ``looks_like_capacity_failure`` keeps returning a bool because its
+        ``pytest.skip`` call sites want one, but every decision it makes must
+        be ``looks_like_capacity_banner``'s decision.
+        """
+        assert _capacity_skip.looks_like_capacity_failure(text) is (
+            cap_markers.looks_like_capacity_banner(text) is not None
+        )
