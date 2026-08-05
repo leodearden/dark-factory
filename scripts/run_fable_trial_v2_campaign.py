@@ -45,6 +45,7 @@ exists to escape.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -296,6 +297,61 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     return rows
 
 
+# The raw per-cell dump. v1's discipline (task_id / config_name / outcome /
+# trial / plan_quality / plan_steps / cost_usd) extended with judge_cost_usd and
+# cap_tainted, so the verdict is recomputable without re-parsing a log.
+_CELL_FIELDS = ('plan_quality', 'plan_steps', 'cost_usd', 'judge_cost_usd', 'cap_tainted')
+
+
+def build_campaign_report(
+    results: list[Any],
+    candidates: list[Any],
+    cell_matrix: list[dict[str, Any]],
+    q_ceiling: float | None = None,
+) -> dict[str, Any]:
+    """Assemble the campaign report: candidates, raw cells, matrix, optional bands.
+
+    Every per-cell field is read with ``.get`` off the metrics dict — the
+    ``build_plan_quality_report`` convention — so a result persisted before a
+    field existed loads rather than raising.
+
+    ``bands`` is OMITTED, not emptied, when *q_ceiling* is None: an empty band
+    dict would read as "we banded the pool and found nothing", which is a
+    different claim from "banding was not requested".
+    """
+    config_by_name = {c.name: c for c in candidates}
+    rows = []
+    for row in summarize_candidates(results):
+        cfg = config_by_name.get(row['config_name'])
+        rows.append({
+            **row,
+            'model': getattr(cfg, 'model', None),
+            'effort': getattr(cfg, 'effort', None),
+            'max_budget_usd': getattr(cfg, 'max_budget_usd', None),
+        })
+
+    cells = [
+        {
+            'task_id': r.task_id,
+            'config_name': r.config_name,
+            'trial': r.trial,
+            'outcome': r.outcome,
+            **{field: (r.metrics or {}).get(field) for field in _CELL_FIELDS},
+        }
+        for r in results
+    ]
+    cells.sort(key=lambda c: (c['task_id'], c['config_name'], c['trial']))
+
+    report: dict[str, Any] = {
+        'candidates': rows,
+        'cells': cells,
+        'cell_matrix': cell_matrix,
+    }
+    if q_ceiling is not None:
+        report['bands'] = partition_bands(results, q_ceiling)
+    return report
+
+
 def _fmt(value: Any) -> str:
     """Render one summary value: ``unmeasured`` for ``None``, else the number.
 
@@ -334,6 +390,21 @@ def format_campaign_report(report: dict[str, Any]) -> str:
             f'{_fmt(row["plan_rate"]):>10} {_fmt(row["mean_plan_quality"]):>10} '
             f'{_fmt(row.get(MARKER_KEY)):>26}'
         )
+    bands = report.get('bands')
+    if bands:
+        lines += ['', f'PRD-D6 banding (q_ceiling={bands["q_ceiling"]}):']
+        for band in BANDS:
+            lines.append(f'  {band:<14} {bands["counts"][band]}')
+        lines += [
+            f'  retained  ({len(bands["retained"])}): {", ".join(bands["retained"]) or "-"}',
+            f'  discarded ({len(bands["discarded"])}): {", ".join(bands["discarded"]) or "-"}',
+        ]
+        if not bands['marker_available']:
+            lines.append(
+                '  NOTE: reference validity is UNMEASURED, so the ceiling band is '
+                'unsatisfiable and nothing can be discarded (D6: ambiguity -> retain).'
+            )
+
     if unmeasured_marker:
         lines += [
             '',
@@ -554,23 +625,44 @@ def _resolve_q_ceiling(args: argparse.Namespace) -> float | None:
     return args.q_ceiling if args.stage1 else None
 
 
+def _write_report(report: dict[str, Any], out: Path | None) -> None:
+    """Write the report JSON to *out*, creating parent dirs. No-op when unset.
+
+    ``sort_keys`` so the artifact is byte-stable for the same report, which is
+    what lets a committed γ1 result diff cleanly against its successor.
+    """
+    if out is None:
+        return
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+    print(f'campaign report written to {out}')
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
     # Validated FIRST, before fixture resolution and long before any spend: a
     # campaign that would end in an un-computable banding must not be launched.
-    _resolve_q_ceiling(args)
+    q_ceiling = _resolve_q_ceiling(args)
     fixture_paths = resolve_fixture_paths(args.tasks_dir)
     candidates = resolve_candidates(list(args.candidate))
     budgets = dict(_parse_budget_spec(s) for s in (args.budget or []))
     candidates = apply_budgets(candidates, budgets)
-    cells = enumerate_cells(fixture_paths, [c.name for c in candidates], args.trials)
+    cell_matrix = enumerate_cells(fixture_paths, [c.name for c in candidates], args.trials)
 
     if args.dry_run:
-        print(_format_dry_run(fixture_paths, candidates, args.trials, cells))
-        return 0
+        print(_format_dry_run(fixture_paths, candidates, args.trials, cell_matrix))
+        results: list[Any] = []
+    else:
+        raise NotImplementedError(
+            '--run / --results-dir are wired by a later step of task 3632'
+        )
 
-    raise NotImplementedError('--run / --results-dir are wired by a later step of task 3632')
+    report = build_campaign_report(results, candidates, cell_matrix, q_ceiling=q_ceiling)
+    if not args.dry_run:
+        print(format_campaign_report(report))
+    _write_report(report, args.out)
+    return 0
 
 
 if __name__ == '__main__':
