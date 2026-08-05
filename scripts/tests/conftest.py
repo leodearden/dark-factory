@@ -216,7 +216,13 @@ def install_fake_httpx(monkeypatch):
     Uses ``monkeypatch.setitem`` (never a bare ``sys.modules[...] = ...``) so
     the real module is restored at teardown and cannot leak into later tests.
 
-    The stub exposes only ``post`` — all four consumers use nothing else today.
+    The stub exposes ``post``, and ``get`` when a caller supplies one (task
+    3713: readiness polling hits GET ``/health`` and GET ``/v1/models``, which
+    a POST-only stub cannot express).  ``get`` stays OPT-IN rather than a
+    no-arg default, so a module that starts issuing GETs without its test
+    saying so still lands in the loud-miss path below instead of silently
+    receiving a stub response nobody wrote.
+
     Any OTHER attribute is a loud ``pytest.fail`` rather than an
     ``AttributeError``, because ``default_status_fetcher`` funnels every
     ``Exception`` into ``StatusFetchUnavailable``: a future production change
@@ -226,9 +232,11 @@ def install_fake_httpx(monkeypatch):
     stay ordinary ``AttributeError``s so import machinery and introspection can
     still probe the module.
     """
-    def _make(post):
+    def _make(post, get=None):
         fake = type(sys)('httpx')
         fake.post = post
+        if get is not None:
+            fake.get = get
 
         def _missing(name: str):
             if name.startswith('__') and name.endswith('__'):
