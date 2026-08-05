@@ -4831,13 +4831,14 @@ async def run_verification(
                     # happens for role != 'merge'), so ordering it first is
                     # defence in depth against a future change to that gate
                     # rather than a live dependency.
+                    capped = segment_cmd
                     if pytest_n_capped:
-                        segment_cmd = _with_pytest_numprocesses_str(
+                        capped = _with_pytest_numprocesses_str(
                             segment_cmd, config.verify_admission_pytest_n,
                         )
-                        assert segment_cmd is not None  # None only for a None input
+                        assert capped is not None  # None only for a None input
                     governed = _govern_cpu_str(
-                        segment_cmd, _resolve_governed_exec_path(config, worktree, role),
+                        capped, _resolve_governed_exec_path(config, worktree, role),
                     )
                     assert governed is not None  # None only for a None input
                     if admission:
