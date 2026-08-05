@@ -2445,6 +2445,18 @@ class TestShouldWithholdProposedResolutionAcceptsScope:
         ),
         pytest.param({}, False, id='empty_metadata'),
         pytest.param({'supersedes': ''}, False, id='falsy_supersedes_no_other_marker'),
+        pytest.param({'supersedes': ['959b8497']}, True, id='list_shaped_supersedes'),
+        pytest.param(
+            {'supersedes': ['959b8497', 'cd09e261']}, True, id='multi_member_supersedes',
+        ),
+        pytest.param({'supersedes': []}, False, id='empty_list_supersedes'),
+        pytest.param(
+            {'supersedes': ['']}, False, id='list_of_empty_member_not_authoritative',
+        ),
+        pytest.param(
+            {'supersedes': [None]}, False, id='list_of_none_member_not_authoritative',
+        ),
+        pytest.param({'supersedes': None}, False, id='explicit_none_supersedes'),
     ],
 )
 def test_is_authoritative_resolution_truth_table(metadata, expected):
@@ -2478,10 +2490,45 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     self-echo must stay non-authoritative to this pre-check — otherwise a
     task's own prior echo would suppress its next completion description,
     regressing the task-1984 invariant above.
+
+    The `supersedes` discriminator is ANY TRUTHY MEMBER of the normalized list
+    — `any(normalize_supersedes(...))`, PRD D2 / task 3196 — not the truthiness
+    of the container. The distinction is load-bearing, not cosmetic:
+    `normalize_supersedes('')` returns `['']`, which is container-truthy, so a
+    `bool(normalize_supersedes(...))` implementation would silently flip
+    `falsy_supersedes_no_other_marker` above from False to True. `any(...)`
+    reproduces the pre-3196 `bool(metadata.get('supersedes'))` result on every
+    shape pinned here and additionally treats `['']`/`[None]` as
+    non-authoritative — a list whose only member is empty is not a supersession
+    edge.
+
+    The legacy SCALAR params (`truthy_supersedes`,
+    `falsy_supersedes_no_other_marker`) are the D2 read-tolerance contract, kept
+    verbatim: the writer at harness.py:1167 emits a list as of task 3196, but
+    the ~81 pre-migration corpus records still carry scalars (no corpus rewrite
+    in this leaf — PRD D2 defers retro normalization to leaf θ's stamping
+    sweep), so the reader must keep accepting both shapes.
     """
     from fused_memory.reconciliation.targeted import _is_authoritative_resolution
 
     assert _is_authoritative_resolution(metadata) is expected
+
+
+def test_targeted_uses_the_shared_supersedes_parser():
+    """INV-5 single-home lock: there is never a SECOND supersedes parser.
+
+    Deliverable (3) of task 3196 — the export contract task 3112's closure
+    predicate and the eval-program E4 sweep hard-depend on — pinned from the
+    CONSUMER side rather than by restating 3195's `TestNormalizeSupersedes`
+    unit tests. The identity assertion fails both if targeted.py grows a local
+    parser and if the shared symbol is renamed or re-homed, neither of which
+    helper-level testing would catch.
+    """
+    from fused_memory import memory_metadata
+    from fused_memory.reconciliation import targeted
+
+    assert targeted.normalize_supersedes is memory_metadata.normalize_supersedes
+    assert 'normalize_supersedes' in memory_metadata.__all__
 
 
 # ---------------------------------------------------------------------------
@@ -2722,15 +2769,30 @@ def test_format_outcome_echo_no_mid_number_splice_regression():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'supersedes_value', ['cd09e261', ['cd09e261']], ids=['legacy_scalar', 'canonical_list'],
+)
 async def test_on_task_done_suppresses_stale_description_when_authoritative_memory_exists(
-    reconciler, mock_memory_service,
+    reconciler, mock_memory_service, supersedes_value,
 ):
     """When an authoritative resolution/superseding memory already exists for the
     task, the fast-path completion echo must NOT re-append the (possibly stale,
     re-scoped) raw description/details — only the title-only completion fact —
-    and the write must be flagged so operators can query suppressed echoes."""
+    and the write must be flagged so operators can query suppressed echoes.
+
+    Parametrized over both `supersedes` shapes (PRD D2 / task 3196) so the
+    production write shape emitted by harness.py:1167 is exercised end-to-end
+    through `reconcile_task`, not only through the pure classifier. Every
+    assertion below must hold for BOTH ids. `canonical_list` passes even before
+    the reader migration (a one-element non-empty list is already truthy) — its
+    value is as a durable regression guard for the post-3196 corpus, failing
+    loudly if a later change narrows the reader back to a string-only test.
+    """
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
-        {'id': '959b8497', 'metadata': {'task_id': '361', 'supersedes': 'cd09e261'}},
+        {
+            'id': '959b8497',
+            'metadata': {'task_id': '361', 'supersedes': supersedes_value},
+        },
     ])
 
     result = await reconciler.reconcile_task(
