@@ -554,6 +554,55 @@ class WriteJournal:
                 f'Failed to resolve mem0_intent {intent_id} -> {status}: {e}'
             )
 
+    async def record_terminal_outcome(
+        self,
+        *,
+        write_op_id: str,
+        terminal_status: str,
+        terminal_error: str | None = None,
+    ) -> bool:
+        """Stamp the durable queue's terminal outcome back onto a write_op.
+
+        ``terminal_status`` is ``'completed'`` or ``'dead'``. Returns whether a
+        row was actually stamped.
+
+        ``success`` is deliberately LEFT UNTOUCHED: it means "the enqueue was
+        accepted", and its readers (``reconciliation/stage_stats.py``, which
+        gates on ``op.get('success', 1)``) keep their current meaning. This
+        method records a second, different fact — "the write landed" — rather
+        than redefining the first one under readers who never asked.
+
+        All three terminal fields are always written, so a replayed dead-letter
+        that later lands clears its stale ``terminal_error`` (last-write-wins).
+
+        ``WHERE id = ?`` is a PRIMARY KEY seek and needs no new index — which
+        matters, because building one on the live 16.6M-row journal costs ~47 s
+        of startup DDL (see the ``idx_wo_created`` note in ``SCHEMA_SQL``).
+
+        Fire-and-forget per the journal's never-block discipline: logs loudly
+        and returns ``False`` on failure, never raises — a journaling hiccup
+        must not propagate into the queue worker that calls it.
+        """
+        try:
+            async with self._txn() as db:
+                cursor = await db.execute(
+                    'UPDATE write_ops SET terminal_status = ?, terminal_at = ?, '
+                    'terminal_error = ? WHERE id = ?',
+                    (
+                        terminal_status,
+                        datetime.now(UTC).isoformat(),
+                        terminal_error,
+                        write_op_id,
+                    ),
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(
+                f'Failed to record terminal outcome {terminal_status} '
+                f'for write_op {write_op_id}: {e}'
+            )
+            return False
+
     async def get_incomplete_mem0_intents(self) -> list[dict]:
         """Return mem0_intents still ``pending``.
 
