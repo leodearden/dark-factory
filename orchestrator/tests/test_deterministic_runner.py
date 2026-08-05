@@ -7,6 +7,7 @@ Step-7: RED — idempotent resume + quiescence (I2/B3/B4/B11)
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import subprocess
 import sys
@@ -345,15 +346,23 @@ _CHILD_SRC_ROOTS = (
 )
 
 
+# Every child this module spawns is bounded.  30s, NOT the 60s a reviewer
+# suggested, because orchestrator/pyproject.toml sets a 60s per-test
+# pytest-timeout with `timeout_method = "thread"` — at parity the two would
+# race, and pytest-timeout's thread method resolves a hit by `os._exit()`-ing
+# the xdist worker, which produces no diagnosis at all.  Firing strictly inside
+# that budget guarantees the named AssertionError below wins the race.
+_CHILD_TIMEOUT_SECS = 30
+
+
 def _child_env() -> dict[str, str]:
     """os.environ plus the repo src roots prepended to PYTHONPATH.
 
-    One definition, shared by `_run_wrapper_payload` and
-    `_assert_submit_cli_invokable`, so the preflight probes a child
-    environment identical to the one the wrapper actually runs in.  The
-    injected roots take precedence; any inherited PYTHONPATH is appended
-    rather than dropped.  See `_run_wrapper_payload` for why the injection is
-    needed at all.
+    One definition, shared by `_run_wrapper_payload` and `_probe_submit_cli`,
+    so the preflight probes a child environment identical to the one the
+    wrapper actually runs in.  The injected roots take precedence; any
+    inherited PYTHONPATH is appended rather than dropped.  See
+    `_run_wrapper_payload` for why the injection is needed at all.
     """
     env = {**os.environ}
     inherited = env.get('PYTHONPATH')
@@ -363,43 +372,88 @@ def _child_env() -> dict[str, str]:
     return env
 
 
-def _assert_submit_cli_invokable(python_exe: str) -> None:
-    """Fail loudly, and specifically, if *python_exe* cannot run the submit CLI.
+@functools.cache
+def _probe_submit_cli(python_exe: str) -> tuple[int, str]:
+    """Run ``<python_exe> -m escalation submit --help``; return (rc, output).
 
-    The probe argv is taken from ``EscalationSpec.to_submit_argv``
-    (proc_supervision.py:117-133) — the very function the RP-4 wrapper's
-    on-failure branch uses — truncated to its interpreter/module prefix and
-    given ``--help``, so the preflight cannot drift from the real invocation.
-
-    Raises ``AssertionError`` naming the interpreter and quoting the child's
-    output.  Without this preflight a non-invokable CLI surfaces only as
-    "exactly one L2 must be filed on failure, got 0" — a message that
-    misdirects the reader at production filing logic (task 3404).
+    Memoized per interpreter path: spawning a fresh CPython costs ~0.3-0.7s and
+    the answer is deterministic for the life of a suite run, while
+    `_assert_submit_cli_invokable` runs on every wrapper-exec test.  The cache
+    key omits the ambient PYTHONPATH deliberately — `_child_env` *prepends* the
+    repo src roots, so an inherited value (appended, lower precedence) cannot
+    change whether the import resolves.  Failures are cached as VALUES, not
+    raised in here, so a broken interpreter still re-reports its full diagnosis
+    at every call site.
     """
     from orchestrator.proc_supervision import EscalationSpec
 
     argv = EscalationSpec(
         queue_dir='', task_id='0', summary='preflight',
     ).to_submit_argv(python_exe)
-    # [python_exe, '-m', 'escalation', 'submit'] + '--help' — the option list
-    # is dropped so the probe stays side-effect-free (files nothing).
+    # The slice below is the ONLY thing keeping this probe honest, so pin the
+    # shape it assumes.  If `to_submit_argv` ever grows a leading interpreter
+    # flag (`-X faulthandler`, `-P`) or an option before the subcommand,
+    # argv[:4] would drop the `submit` token and `--help` would then be handled
+    # by escalation/submit.py's TOP-LEVEL parser — which also exits 0 (its
+    # subparsers are declared with dest='command' and are not required).  The
+    # probe would pass vacuously: exactly the silent-pass class it exists to
+    # eliminate.  Re-derive the prefix rather than widening the slice.
+    expected_prefix = [python_exe, '-m', 'escalation', 'submit']
+    assert argv[:4] == expected_prefix, (
+        f'submit argv prefix drifted from {expected_prefix!r}: got {argv[:5]!r}. '
+        f'The preflight probe slices argv[:4] and appends --help; with `submit` '
+        f'no longer 4th the probe degrades into a top-level --help that exits 0 '
+        f'unconditionally, i.e. it would pass vacuously.'
+    )
+    # The option list is dropped so the probe stays side-effect-free (it parses
+    # `--help` and exits; it files nothing and touches no queue dir).
     probe = [*argv[:4], '--help']
 
-    result = subprocess.run(
-        probe,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=_child_env(),
-    )
-    if result.returncode != 0:
+    try:
+        result = subprocess.run(
+            probe,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=_child_env(),
+            timeout=_CHILD_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = (exc.output or b'').decode(errors='replace')
+        # Reported as a non-zero rc so the caller handles it on its single
+        # failure path; the text carries the distinction.  A wedged probe (a
+        # stuck queue lock, an interpreter waiting on stdin) must name itself,
+        # not hang the whole run.
+        return -1, (
+            f'probe timed out after {_CHILD_TIMEOUT_SECS}s and was killed; '
+            f'partial output: {partial!r}'
+        )
+    return result.returncode, result.stdout.decode(errors='replace')
+
+
+def _assert_submit_cli_invokable(python_exe: str) -> None:
+    """Fail loudly, and specifically, if *python_exe* cannot run the submit CLI.
+
+    The probe argv is taken from ``EscalationSpec.to_submit_argv``
+    (proc_supervision.py:117-133) — the very function the RP-4 wrapper's
+    on-failure branch uses — truncated to its interpreter/module prefix and
+    given ``--help``, with that prefix shape asserted in `_probe_submit_cli`
+    so the preflight cannot silently drift from the real invocation.
+
+    Raises ``AssertionError`` naming the interpreter and quoting the child's
+    output.  Without this preflight a non-invokable CLI surfaces only as
+    "exactly one L2 must be filed on failure, got 0" — a message that
+    misdirects the reader at production filing logic (task 3404).
+    """
+    rc, out = _probe_submit_cli(python_exe)
+    if rc != 0:
         from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
 
         raise AssertionError(
             f'the escalation submit CLI is not invokable by {python_exe!r} '
-            f'(exit {result.returncode}): '
-            f'{result.stdout.decode(errors="replace").strip()!r}. '
+            f'(exit {rc}): {out.strip()!r}. '
             f'The RP-4 wrapper files its on-failure L2 by exec-ing '
-            f'{" ".join(probe[:4])!r}, so this environment would file NOTHING. '
+            f'{" ".join([python_exe, "-m", "escalation", "submit"])!r}, so this '
+            f'environment would file NOTHING. '
             f'Remedy: this venv most likely lacks the `escalation` editable '
             f'install — run `uv sync` at the repo root. '
             f'In PRODUCTION, an interpreter that cannot run this makes a fired '
@@ -458,7 +512,25 @@ async def _run_wrapper_payload(wrapped: str) -> tuple[int, str]:
         stderr=asyncio.subprocess.STDOUT,
         env=_child_env(),
     )
-    out, _ = await proc.communicate()
+    # Bounded: the wrapper's on-failure branch really invokes the submit CLI,
+    # which writes into a queue dir under an EscalationQueue lock.  A child that
+    # blocks — stuck lock, an interpreter waiting on stdin, a payload that never
+    # exits — would otherwise wedge the run with no diagnosis, the exact
+    # opposite of this harness's purpose.
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_CHILD_TIMEOUT_SECS)
+    except TimeoutError:
+        proc.kill()
+        try:
+            # Reap so the killed child cannot leak as a zombie / unawaited pipe.
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except TimeoutError:
+            out = b''
+        raise AssertionError(
+            f'the wrapper payload did not exit within {_CHILD_TIMEOUT_SECS}s and '
+            f'was killed. Payload: {wrapped!r}. Output captured before the kill: '
+            f'{out.decode(errors="replace")!r}'
+        ) from None
     output = out.decode(errors='replace')
     # `communicate()` has reaped the child, so returncode is always set — but it
     # is typed `int | None`, so narrow it explicitly.  NOT `proc.returncode or
