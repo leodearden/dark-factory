@@ -18,6 +18,7 @@ per-test-file helper convention.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -634,3 +635,239 @@ class TestClassifyFilesLeg:
                 task=make_cross_repo_task(files=bad), project_root=project_root
             )
             assert verdict.blocked is False, f'files={bad!r} should not block leg B'
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: leg (C) — a CONTAINMENT-CONFIRMED possible_scope_mismatch stamp
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyScopeMismatchLeg:
+    """Leg (C): the advisory stamp blocks ONLY when path evidence confirms it.
+
+    ``possible_scope_mismatch`` is written by the fused-memory prose matcher
+    (``'source': 'prose'``) and is documented to over-fire — task 3120 landed a
+    right-boundary fix for exactly that and records a KNOWN FAIL-OPEN residue.
+    Blocking dispatch on unconfirmed prose would convert a false-positive
+    advisory into a stalled task PLUS a spurious L1: strictly worse than today.
+    Requiring containment confirmation makes leg C a genuine second evidence
+    source rather than a restatement of the heuristic.
+    """
+
+    def test_confirmed_stamp_blocks(self, two_roots):
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                possible_scope_mismatch={
+                    'source': 'prose',
+                    'suggested_project': 'dark_factory',
+                    'matched_paths': [
+                        str(foreign_root / 'orchestrator/src/orchestrator/offline_lane.py'),
+                    ],
+                }
+            ),
+            project_root=project_root,
+        )
+
+        assert verdict.verdict == BLOCK
+        assert 'scope_mismatch_confirmed' in verdict.signals
+        assert verdict.owner_project == 'dark_factory'
+
+    def test_confirmed_stamp_reports_the_matched_paths(self, two_roots):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        paths = [str(foreign_root / 'a.py'), str(foreign_root / 'b.py')]
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                possible_scope_mismatch={'matched_paths': paths}
+            ),
+            project_root=project_root,
+        )
+        assert verdict.blocked is True
+        for path in paths:
+            assert path in verdict.foreign_paths
+
+    def test_prose_shaped_relative_matched_paths_do_not_block(self, two_roots):
+        """The over-firing case: an UNCONFIRMED prose advisory must not block."""
+        from orchestrator.cross_repo_gate import ALLOW, classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                possible_scope_mismatch={
+                    'source': 'prose',
+                    'suggested_project': 'dark_factory',
+                    'matched_paths': ['orchestrator/src/orchestrator/offline_lane.py'],
+                }
+            ),
+            project_root=project_root,
+        )
+        assert verdict.verdict == ALLOW, (
+            'an unconfirmed prose advisory must not strand a legitimate task'
+        )
+        assert verdict.blocked is False
+
+    def test_prose_noise_matched_paths_do_not_block(self, two_roots):
+        """The literal task-3120 over-fire strings must not be read as evidence."""
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                possible_scope_mismatch={
+                    'matched_paths': ['tools/call', 'archive/pause', 'and/or'],
+                }
+            ),
+            project_root=project_root,
+        )
+        assert verdict.blocked is False
+
+    def test_in_tree_matched_paths_do_not_block(self, two_roots):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                possible_scope_mismatch={'matched_paths': [str(project_root / 'a.py')]}
+            ),
+            project_root=project_root,
+        )
+        assert verdict.blocked is False
+
+    def test_mixed_matched_paths_do_not_block(self, two_roots):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                possible_scope_mismatch={
+                    'matched_paths': [str(foreign_root / 'a.py'), 'local/b.py'],
+                }
+            ),
+            project_root=project_root,
+        )
+        assert verdict.blocked is False
+
+    def test_non_dict_stamp_does_not_block_or_crash(self, two_roots):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, _ = two_roots
+        for stamp in (None, True, 'dark_factory', ['a'], 42):
+            verdict = classify_cross_repo(
+                task=make_cross_repo_task(possible_scope_mismatch=stamp),
+                project_root=project_root,
+            )
+            assert verdict.blocked is False, f'stamp={stamp!r} is not confirmable'
+
+    def test_stamp_without_matched_paths_does_not_block(self, two_roots):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, _ = two_roots
+        for stamp in ({}, {'source': 'prose'}, {'matched_paths': []},
+                      {'matched_paths': None}, {'matched_paths': 'a/b.py'}):
+            verdict = classify_cross_repo(
+                task=make_cross_repo_task(possible_scope_mismatch=stamp),
+                project_root=project_root,
+            )
+            assert verdict.blocked is False, f'stamp={stamp!r} carries no path evidence'
+
+    def test_unconfirmed_stamp_does_not_veto_the_marker(self, two_roots):
+        """Leg C being unconfirmed must not suppress an independent leg-A block."""
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                cross_repo='dark-factory',
+                possible_scope_mismatch={'matched_paths': ['tools/call']},
+            ),
+            project_root=project_root,
+        )
+        assert verdict.verdict == BLOCK
+        assert 'cross_repo_marker' in verdict.signals
+        assert 'scope_mismatch_confirmed' not in verdict.signals
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: degenerate metadata is a LOUD SKIP, never a silent ALLOW
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyDegenerateMetadata:
+    """Unreadable metadata yields SKIP + a WARNING.
+
+    SKIP means "no evidence readable", NEVER "verified clean".  Collapsing it
+    into a silent ALLOW is the no-silent-fail-soft violation this gate exists
+    to avoid — a task whose markers could not be parsed would be waved through
+    with no trace that anything was skipped.
+    """
+
+    @pytest.mark.parametrize('bad', [[], ['cross_repo'], 42, 3.5, True, '{not valid json', '[1,2]', '"x"', 'null'])
+    def test_degenerate_metadata_is_skip(self, bad, two_roots):
+        from orchestrator.cross_repo_gate import SKIP, classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(metadata=bad), project_root=project_root
+        )
+        assert verdict.verdict == SKIP, (
+            f'metadata={bad!r} is unreadable — SKIP, never a silent ALLOW'
+        )
+        assert verdict.blocked is False, 'SKIP must not block dispatch'
+
+    @pytest.mark.parametrize('bad', [[], 42, '{not valid json', '[1,2]'])
+    def test_degenerate_metadata_warns(self, bad, two_roots, caplog):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, _ = two_roots
+        caplog.set_level(logging.WARNING, logger='orchestrator.cross_repo_gate')
+        classify_cross_repo(
+            task=make_cross_repo_task(task_id='9001', metadata=bad),
+            project_root=project_root,
+        )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, f'metadata={bad!r} must warn, not degrade silently'
+        message = ' '.join(r.getMessage() for r in warnings)
+        assert '9001' in message, f'warning must name the task id; got {message!r}'
+        assert type(bad).__name__ in message, (
+            f'warning must name the discarded type; got {message!r}'
+        )
+
+    def test_absent_metadata_is_skip(self, two_roots):
+        """Unreachable in production — carries_cross_repo_signal gates this out.
+
+        Pinned so the behaviour is deliberate rather than accidental: with no
+        metadata there is genuinely nothing to read, which is SKIP's meaning.
+        """
+        from orchestrator.cross_repo_gate import SKIP, classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(), project_root=project_root
+        )
+        assert verdict.verdict == SKIP
+        assert verdict.blocked is False
+
+    def test_never_raises_on_any_metadata_shape(self, two_roots):
+        """classify runs on the dispatch path — it must never take down a slot."""
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        shapes: list[Any] = [
+            None, [], {}, 42, '', '{}', '[]', 'null',
+            {'cross_repo': object()},
+            {'files': object()},
+            {'files': [object()]},
+            {'possible_scope_mismatch': {'matched_paths': [object()]}},
+            {'cross_repo': True, 'cross_repo_project': object()},
+            {'files': [str(foreign_root / 'a.py')], 'possible_scope_mismatch': object()},
+        ]
+        for shape in shapes:
+            verdict = classify_cross_repo(
+                task=make_cross_repo_task(metadata=shape), project_root=project_root
+            )
+            assert verdict.verdict in ('block', 'allow', 'skip')
