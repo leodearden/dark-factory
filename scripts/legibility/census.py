@@ -93,6 +93,10 @@ import digest  # noqa: E402
 import inventory  # noqa: E402
 import sampling  # noqa: E402
 from legibility import census_trigger  # noqa: E402
+from shared.cap_markers import (  # noqa: E402
+    BLOCKING_BANNER_MARKERS,
+    looks_like_blocking_banner,
+)
 
 import config  # noqa: E402
 
@@ -362,14 +366,25 @@ def render_matrix(matrix: dict[str, dict[str, int]]) -> str:
 # usage API assumed -- one tiny call, scan its reply for a banner)
 # ---------------------------------------------------------------------------
 
-_HEADROOM_BANNER_MARKERS = (
-    "usage limit",
-    "rate limit",
-    "please run /login",
-    "invalid api key",
-)
+_HEADROOM_BANNER_MARKERS = BLOCKING_BANNER_MARKERS
 """Case-insensitive substrings that mark a usage-limit/auth banner reply
-from the headless `claude` CLI, rather than a genuine model response."""
+from the headless `claude` CLI, rather than a genuine model response.
+
+A CONTRACT owned by ``shared.cap_markers``, not a literal to be edited
+here. This name is kept only as an alias so a reader following the old
+spelling still lands somewhere real; the list itself is validated against
+verbatim real-CLI transcripts (``REAL_CLI_CAP_MESSAGES``) by both
+``shared/tests/test_cap_markers.py`` and this module's own tests.
+
+It used to be a four-entry literal here -- 'usage limit', 'rate limit',
+'please run /login', 'invalid api key' -- which missed
+"You've hit your weekly limit · resets Aug 5, 11am" entirely, so a weekly
+cap passed this probe and every verify call after it was fail-closed
+rejected as an ordinary verdict (task 3645). A near-identical list already
+existed in shared/tests/_capacity_skip.py with the right coverage, but it
+was test-only and unreachable from here. Add a newly-observed cap phrasing
+to the corpus in ``shared.cap_markers``, with a transcript to cite, and
+both suites go red until the markers cover it."""
 
 _HEADROOM_PROBE_PROMPT = "ping"
 """The tiny probe prompt -- a cheap single round trip, not a real mining
@@ -394,8 +409,10 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
 
     No usage API is assumed to exist (PRD decision 5) -- this is a cheap
     preflight probe, not a quota lookup. The reply is scanned
-    case-insensitively for a known usage-limit/auth banner marker
-    (``_HEADROOM_BANNER_MARKERS``); a match defers. An invocation error
+    case-insensitively for a known usage-limit/auth banner marker via
+    ``shared.cap_markers.looks_like_blocking_banner`` (capacity OR auth --
+    either means no useful model output is coming); a match defers, and
+    the reason quotes the marker that fired. An invocation error
     raised by *invoke* (e.g. a ``CoderInvocationError``-shaped failure)
     is also treated as a deferral -- fail-safe, never a crash, since a
     probe failure is exactly the kind of "the model isn't reachable right
@@ -407,12 +424,11 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     except Exception as exc:  # noqa: BLE001 - any probe failure must fail safe
         return HeadroomResult(ok=False, reason=f"headroom probe invocation failed: {exc}")
 
-    lowered = (reply or "").lower()
-    for marker in _HEADROOM_BANNER_MARKERS:
-        if marker in lowered:
-            return HeadroomResult(
-                ok=False, reason=f"headroom probe reply carries a banner marker: {marker!r}",
-            )
+    marker = looks_like_blocking_banner(reply or "")
+    if marker is not None:
+        return HeadroomResult(
+            ok=False, reason=f"headroom probe reply carries a banner marker: {marker!r}",
+        )
 
     return HeadroomResult(ok=True, reason=None)
 
