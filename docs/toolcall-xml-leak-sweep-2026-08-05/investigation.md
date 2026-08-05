@@ -14,7 +14,12 @@ uv run python scripts/sweep_toolcall_xml_leak.py --exhaustive \
 
 Raw evidence lives beside this file and is committed verbatim — `dry-run-report.json`
 is byte-for-byte the script's stdout, not pretty-printed or hand-edited.
-`dry-run-provenance.json` records the run's own metadata out-of-band.
+`dry-run-provenance.json` records the run's own metadata out-of-band. The gated
+`--apply` run that followed is captured the same way in `apply-report.json` and
+`apply-provenance.json`. `recovery-tracking.json` carries one entry per
+unrepaired live-corpus mutation — its owning task and the committed report
+holding the recoverable payload — and is machine-checked on every test run (§4,
+§6).
 
 > **Notation.** Every leak marker below spells `<` as `\x3c`. Writing one verbatim
 > makes the authoring tool call terminate early — reproducing the very bug under
@@ -235,11 +240,16 @@ discard.
 
 ## 4. What was repaired — **nothing, and one record was lost**
 
-> **Status: OUTSTANDING. Escalated as a blocker (`esc-3567-2`); that escalation
-> was subsequently AUTO-DISMISSED on timeout — "steward did not resolve within
-> the ESCALATED wait window" — not adjudicated by a human. Recovery of
-> `7d073281` has therefore not happened and is still owed. Do not re-run the
-> sweep to "fix" this.**
+> **Status: OPEN, and TRACKED AS TASK 3686.** Escalated as a blocker
+> (`esc-3567-2`); that escalation was subsequently AUTO-DISMISSED on timeout —
+> "steward did not resolve within the ESCALATED wait window" — not adjudicated
+> by a human. That dismissal is precisely why a task had to be filed: an
+> escalation that can time out is not an owner. Recovery of `7d073281` has not
+> happened; **task 3686** owns it, along with the sandbox-policy decision it
+> depends on. The machine-readable half of that tracker is
+> `recovery-tracking.json` in this directory, asserted on every test run by
+> `fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py`. Do not re-run
+> the sweep to "fix" this.
 
 The gate opened (`repairable_tail 0 + repairable_duplicate 1 = 1 ≥ 1`), so
 `--apply` ran, with the dry-run report and its sidecar already committed —
@@ -309,14 +319,26 @@ The content is not lost, because it was committed first. To restore
 id will necessarily differ. Per the runbook, do **not** re-run the sweep to
 recover it.
 
-**This has not been done.** It was left for a human deliberately — re-adding
-text to the shared corpus mints a new id and is a mutation whose authorisation
-is not this task's to assume — and the escalation that asked for that decision
-was auto-dismissed on timeout rather than answered. Two decisions remain open:
-the recovery above, and whether `--apply`-class operations should be blocked
-from sandboxed sessions outright or the sandbox permit writes under `~/.mem0`.
+**Not yet done — tracked as task 3686.** It was left for a human deliberately —
+re-adding text to the shared corpus mints a new id and is a mutation whose
+authorisation is not this task's to assume — and the escalation that asked for
+that decision (`esc-3567-2`) was auto-dismissed on timeout rather than answered,
+which is why the ask was converted into a task rather than left as prose. Task
+3686 carries both open decisions together, because they share a root cause and
+whoever performs the re-add must already have settled the second one — a
+recovery attempted from a still-sandboxed session fails identically:
+
+1. the recovery above; and
+2. whether `--apply`-class operations should be blocked from sandboxed sessions
+   outright, or the sandbox permit file creation under `~/.mem0`.
+
 Until one lands, no agent session should run this sweep — or any
 `delete_memory` — with `--apply`.
+
+When the re-add happens, flip `recovered` to `true` in `recovery-tracking.json`
+and record the new memory id there. The artifact test asserts that pairing
+(`recovered: false` forbids a `new_id`; `true` requires one), so the tracker
+cannot drift out of step with the store.
 
 ---
 
@@ -361,5 +383,16 @@ without touching production memory.
 - Escalation `esc-3567-1` — this sweep's findings, filed as disclosure
   (**auto-dismissed on timeout**, so the class-3 dispositions were never ruled on)
 - Escalation `esc-3567-2` — the partial-mutation blocker of §4
-  (**auto-dismissed on timeout**; recovery of `7d073281` still owed)
+  (**auto-dismissed on timeout**, which is why the ask below was filed as a task)
+- **Task 3686 — the live owner of §4**: re-add `7d073281` from a non-sandboxed
+  session, and decide whether mutating operations should be blocked from
+  sandboxed sessions or `~/.mem0` writes permitted. Filed high priority
+- `recovery-tracking.json` (this directory) — the machine-checked half of that
+  tracker: one entry per unrepaired live-corpus mutation, naming its owning task
+  and the committed report holding the recoverable payload.
+  `test_toolcall_xml_leak_sweep_artifacts.py` asserts every entry has a task
+  owner and re-runs the production detector over the payload to prove the
+  documented recovery is still executable — so deleting the artifact that holds
+  the only surviving copy turns the suite RED instead of silently making the
+  loss permanent
 - Ticket `tkt_0RS3HSVVY7CGSQSMNM8P5KH184` — follow-up: a third repairable shape

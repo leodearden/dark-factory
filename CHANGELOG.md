@@ -124,14 +124,19 @@ safety net fired on its first real use. Two lessons now in the runbook: read the
 per-record flags rather than the exit code (exit 1 was overdetermined here, and
 the exit code alone would have hidden the mutation), and run `--apply` from an
 ordinary interactive shell. Recovery of `7d073281` from the committed report is
-**still outstanding** — the blocking escalation was auto-dismissed on timeout,
-not adjudicated.
+**tracked as task 3686**, together with the sandbox-policy decision it depends
+on; the blocking escalation was auto-dismissed on timeout rather than
+adjudicated, which is why the ask was converted into a task.
 
 `fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py` guards any
 committed sweep artifact against fabrication: it re-runs the production
 `classify_record` over each record's own stored content and requires a provenance
-sidecar naming the collection, sha, argv and bracketing point counts. Hermetic —
-no live store — so it stays green whether or not Qdrant is up.
+sidecar naming the collection, sha, argv and bracketing point counts. It also
+requires every unrepaired live-corpus mutation to carry a `recovery-tracking.json`
+entry naming a task owner — and re-runs the detector over the recoverable payload
+to prove the documented recovery is still executable, so deleting the artifact
+holding the only surviving copy fails loudly instead of silently. Hermetic — no
+live store — so it stays green whether or not Qdrant is up.
 
 ### Changed (BREAKING)
 
