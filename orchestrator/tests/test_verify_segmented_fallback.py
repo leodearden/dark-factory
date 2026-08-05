@@ -817,6 +817,170 @@ class TestRunVerificationSegmentChainedTestWiring:
         assert len([c for c in calls if 'pyright' in c['cmd']]) == 1
 
 
+class TestSegmentsAreDashNCapped:
+    """An operator's configured `-n` cap must reach each SEGMENT (task 3478).
+
+    Task 2394 T6's `-n` gate is ``admission and role in {'task','background'}
+    and verify_admission_pytest_n not in {'', 'auto'}`` — and those roles are
+    EXACTLY the segmented-path roles, since ``run_scoped_verification`` opts
+    in with ``segment_chained_test=role != 'merge'``. So unlike junitxml (see
+    TestPerSegmentJunitIsDeliberatelyUnwired) the cap is not structurally
+    excluded here; it is live and silently DROPPED, because the rewrite lands
+    on `cmd` while the segmented branch builds its segments from `config_cmd`.
+
+    Task 3338's comment framed wiring this as a risk — "a per-segment `-n`
+    would silently change verify parallelism". That inverts on inspection:
+    ``_run_segmented`` runs segments SEQUENTIALLY, so a per-segment `-n N`
+    caps N workers at any instant, which is exactly what `-n N` means for a
+    single pytest command — not N times the parallelism. Silently discarding
+    a cap the operator configured is the degradation; honouring it is the fix.
+
+    Blast radius on this repo is zero: ``verify_admission_pytest_n`` ships as
+    'auto', which ``apply_pytest_numprocesses`` already no-ops, and the
+    committed YAML does not override it. Only a project that deliberately set
+    a numeric cap — i.e. one currently being ignored — is affected. The last
+    two tests pin that zero, so a future change cannot start rewriting
+    commands at the default.
+    """
+
+    _CAPPED_OVERRIDES = {
+        'verify_admission_enabled': True,
+        'verify_admission_pytest_n': '4',
+    }
+
+    @staticmethod
+    async def _run_capped(tmp_path, **overrides):
+        """Drive the shared harness with admission really ON and a numeric cap.
+
+        ``verify_admission_slots_dir`` goes under tmp_path so these tests do
+        not contend on the shared ``/tmp/df-verify-slots-<uid>`` directory
+        across xdist workers, matching what
+        test_verify_admission_pytest_n.py::TestPytestNWiring already does.
+        """
+        config_overrides = {
+            **TestSegmentsAreDashNCapped._CAPPED_OVERRIDES,
+            'verify_admission_slots_dir': str(tmp_path / 'slots'),
+            **overrides,
+        }
+        return await TestRunVerificationSegmentChainedTestWiring._run(
+            tmp_path,
+            _FLEET_TEST_COMMAND,
+            config_overrides=config_overrides,
+            segment_chained_test=True,
+            role='task',
+        )
+
+    @staticmethod
+    def _unwrap_nice(cmd: str) -> str:
+        """Strip the per-segment admission nice wrap, returning the real command.
+
+        With admission genuinely ON (these tests carry
+        ``real_verify_admission``), ``_run_one_segment`` wraps each segment as
+        ``nice -n 15 ionice -c2 -n7 /bin/bash -c <shlex.quote(segment)>``
+        (task 2390 T2). That wrap is pre-existing and orthogonal to the `-n`
+        cap, but it hides the command inside a quoted argument — so a
+        substring assertion would still pass on a mis-rewritten segment, and
+        a ``bash -n`` check would pass on ANY inner text at all. Unwrapping
+        first is what keeps those assertions about the command that actually
+        runs.
+        """
+        import shlex  # noqa: PLC0415
+
+        tokens = shlex.split(cmd)
+        if len(tokens) >= 3 and tokens[-3].endswith('bash') and tokens[-2] == '-c':
+            return tokens[-1]
+        return cmd
+
+    @classmethod
+    def _segment_cmds(cls, calls: list) -> list[str]:
+        return [cls._unwrap_nice(c['cmd']) for c in calls if 'pytest' in c['cmd']]
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_every_structured_segment_carries_the_cap(self, tmp_path):
+        _result, calls, _runs = await self._run_capped(tmp_path)
+
+        cmds = self._segment_cmds(calls)
+        assert len(cmds) == 8
+        for cmd in cmds:
+            assert '-n 4' in cmd, f'segment was not -n capped: {cmd}'
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_the_cockpit_subshell_is_capped_inside_its_parens(self, tmp_path):
+        """The mixed-chain segment degrades CORRECTLY, not merely gracefully.
+
+        This clause — ``( [ -d cockpit ] || exit 0; cd cockpit && uv run
+        pytest tests/ --timeout=300 )`` — parses PYTEST raw-retained, NOT
+        opaque, so it does get rewritten. Task 3478 step-0b is what makes
+        that safe: the raw rewrite used to append after the closing paren,
+        producing a command bash refuses to parse. Assert the flag lands
+        INSIDE the subshell and the result is still valid bash.
+        """
+        import subprocess  # noqa: PLC0415
+
+        _result, calls, _runs = await self._run_capped(tmp_path)
+
+        cockpit = next(c for c in self._segment_cmds(calls) if 'cockpit' in c)
+        assert cockpit.rstrip().endswith(')'), f'subshell must close last: {cockpit}'
+        assert '-n 4' in cockpit
+        syntax = subprocess.run(
+            ['bash', '-n', '-c', cockpit], capture_output=True, text=True, check=False,
+        )
+        assert syntax.returncode == 0, f'segment is not valid bash:\n{cockpit}\n{syntax.stderr}'
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_the_3338_segmentation_contract_is_untouched(self, tmp_path):
+        """Capping must not disturb segment count, order or per-segment cwd."""
+        _result, calls, _runs = await self._run_capped(tmp_path)
+        segments = _fleet_segments()
+
+        test_calls = [c for c in calls if 'pytest' in c['cmd']]
+        assert len(test_calls) == 8
+        assert [c['cwd'] for c in test_calls] == [tmp_path / s.cwd_rel for s in segments]
+        assert len({c['log_path'] for c in test_calls}) == 8
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_check_run_cmd_is_still_the_unrewritten_chain(self, tmp_path):
+        """CheckRun.cmd stays the operator's configured chain, uncapped.
+
+        Same treatment the nice prefix and cpu-governance already get: an
+        execution detail layered onto the segment, not the persisted config
+        command that feeds _persist_attempt_logs/_build_summary_payload/
+        _summarize_checks.
+        """
+        _result, _calls, runs = await self._run_capped(tmp_path)
+
+        assert _test_run_entry(runs)['cmd'] == _FLEET_TEST_COMMAND
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_the_shipped_auto_default_rewrites_nothing(self, tmp_path):
+        """Blast-radius guard: this repo's live value must stay byte-identical."""
+        _result, calls, _runs = await self._run_capped(
+            tmp_path, verify_admission_pytest_n='auto',
+        )
+
+        assert self._segment_cmds(calls) == [s.command for s in _fleet_segments()]
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_admission_disabled_rewrites_nothing(self, tmp_path):
+        """The other half of the gate: no admission, no cap, even with '4'.
+
+        Carries the marker like its siblings so the gate is driven by the
+        CONFIG value under test, not by conftest's autouse neutraliser —
+        which would force admission off and make the assertion vacuous.
+        """
+        _result, calls, _runs = await self._run_capped(
+            tmp_path, verify_admission_enabled=False,
+        )
+
+        assert self._segment_cmds(calls) == [s.command for s in _fleet_segments()]
+
+
 class _SegmentedBudgetClock:
     """A monotonic clock that blows ``_run_segmented``'s budget after N segments.
 
