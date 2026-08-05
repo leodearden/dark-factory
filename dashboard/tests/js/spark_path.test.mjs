@@ -39,14 +39,27 @@ import { createRequire } from 'node:module';
 
 import sp from '../../src/dashboard/static/redux/spark_path.js';
 
-const { isPlottable, sparkScale, sparkPaths, stepPaths } = sp;
+const { isPlottable, sparkScale, sparkPaths, stepPaths, plottableMax, axisY } = sp;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 
 // The module's complete public surface. Asserted EXHAUSTIVELY below: the
 // run-splitting and area-closing helpers are deliberately module-private, and
 // an accidental export would quietly widen the contract charts.jsx depends on.
-const EXPECTED_FUNCTION_NAMES = ['isPlottable', 'sparkPaths', 'sparkScale', 'stepPaths'];
+//
+// The `plottableMax`/`axisY` entries onward are the padded/offset chart
+// primitives added by task 3489, which extended this module from the two
+// sparklines to charts.jsx's LineChart/StackedAreaChart/BarChart/HistBar. They
+// live here rather than in a second module because they share this file's hole
+// predicate and its two private helpers.
+const EXPECTED_FUNCTION_NAMES = [
+  'isPlottable',
+  'sparkPaths',
+  'sparkScale',
+  'stepPaths',
+  'plottableMax',
+  'axisY',
+];
 
 // Float tolerance for any y that is not exactly representable. The x
 // coordinates and the extrema below are all exact at these inputs (width=100
@@ -153,8 +166,8 @@ test('default-imported module exposes exactly the spark-path functions', () => {
   assert.deepEqual(
     Object.keys(sp).sort(),
     EXPECTED_FUNCTION_NAMES.slice().sort(),
-    'the public surface must be exactly these four — the run-splitting and ' +
-      'area-closing helpers stay module-private',
+    'the public surface must be exactly EXPECTED_FUNCTION_NAMES — the ' +
+      'run-splitting and area-closing helpers stay module-private',
   );
   for (const name of EXPECTED_FUNCTION_NAMES) {
     assert.equal(typeof sp[name], 'function', `sp.${name} should be a function`);
@@ -637,4 +650,140 @@ test('stepPaths: does not mutate its input array', () => {
   const before = values.slice();
   stepPaths(values, 100, 28);
   assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
+});
+
+// ---------------------------------------------------------------------------
+// plottableMax — a NaN-proof `Math.max` over finite samples only (task 3489)
+//
+// charts.jsx's LineChart/BarChart/HistBar each folded their axis maximum with a
+// bare `Math.max(...values, 1)`. One `undefined` or `NaN` in the series makes
+// that fold NaN, and every downstream division then yields NaN — which in
+// LineChart's case invalidates the whole `d` attribute (SVG drops the entire
+// path) and in BarChart's case emits literal `height="NaN"` rects. Excluding
+// holes from the fold is the fix; the seed is deliberately kept.
+// ---------------------------------------------------------------------------
+
+test('plottableMax: an undefined or NaN hole no longer poisons the fold to NaN', () => {
+  // THE RED SIGNAL. Pre-fix `Math.max(1, undefined, 3, 1)` is NaN.
+  assert.equal(plottableMax([1, undefined, 3], 1), 3);
+  assert.equal(plottableMax([1, NaN, 3], 1), 3);
+});
+
+test('plottableMax: a null does not lower the result', () => {
+  // A bare null coerces to 0 under Math.max, which cannot lower a max already
+  // seeded at 1 — but it CAN mask a genuine maximum below 0, and it is a hole
+  // regardless of whether the arithmetic happens to survive it.
+  assert.equal(plottableMax([5, null, 2], 1), 5);
+  assert.equal(plottableMax([null], 1), 1);
+});
+
+test('plottableMax: the seed is honoured for empty and all-hole series', () => {
+  assert.equal(plottableMax([], 1), 1);
+  assert.equal(plottableMax([null, undefined, NaN], 1), 1);
+  assert.equal(plottableMax(null, 1), 1, 'a missing series must not throw');
+  assert.equal(plottableMax(undefined, 1), 1);
+  assert.equal(plottableMax([], 7), 7, 'the caller chooses the seed');
+});
+
+test('plottableMax: a measured 0 is admitted as a real sample', () => {
+  // The seed still floors the result at 1, exactly as the pre-fix code did —
+  // this asserts the 0s ENTER the fold rather than being screened out as holes,
+  // which is the distinction the whole module exists to preserve.
+  assert.equal(plottableMax([0, 0], 1), 1);
+  assert.equal(plottableMax([0, 0], 0), 0);
+  assert.equal(plottableMax([0, -5], -10), 0, 'a measured 0 beats a negative seed');
+});
+
+test('plottableMax: Infinity is rejected as garbage, not taken as the maximum', () => {
+  // ±Infinity would blow the axis out so far that every real sample collapses
+  // onto the floor — the same class of chart-destroying garbage as NaN.
+  assert.equal(plottableMax([1, Infinity, 3], 1), 3);
+  assert.equal(plottableMax([1, -Infinity, 3], 1), 3);
+});
+
+test('plottableMax: matches Math.max(...values, seed) exactly on hole-free input', () => {
+  // The guarantee that this refactor did not quietly re-scale every existing
+  // chart: on the dense series the dashboard actually serves today, the new
+  // fold is the old fold.
+  for (const values of [[0, 1, 2, 3, 4], [5], [0, 0, 0], [-3, -1], [0.95, 0.9], [1000, 2]]) {
+    for (const seed of [0, 1]) {
+      assert.equal(
+        plottableMax(values, seed),
+        Math.max(...values, seed),
+        `plottableMax(${JSON.stringify(values)}, ${seed}) must equal the legacy fold`,
+      );
+    }
+  }
+});
+
+test('plottableMax: does not mutate its input array', () => {
+  const values = [1, null, 3];
+  const before = values.slice();
+  plottableMax(values, 1);
+  assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
+});
+
+// ---------------------------------------------------------------------------
+// axisY — value -> pixel y inside a PADDED box (task 3489)
+//
+// The sparkline builders scale into a bare 0..height box; the four chart
+// primitives scale into a box offset by the axis gutter, so the y expression is
+// `y0 + height - ((v - min) / range) * height`. Holes come back as null so the
+// caller can decline to plot them instead of drawing a fabricated point at the
+// chart floor.
+//
+// The fixture below is charts.jsx's real geometry at w=150/height=220
+// (padT=8, chartH=190) and is EXACTLY representable — every expected y is an
+// exact binary fraction, so these assertions need no float tolerance.
+// ---------------------------------------------------------------------------
+
+const AXIS_GEOM = { y0: 8, height: 190, min: 0, range: 4 };
+
+test('axisY: maps a plottable value to its exact pixel y in the padded box', () => {
+  assert.equal(axisY(0, AXIS_GEOM), 198, 'value 0 sits on the chart floor');
+  assert.equal(axisY(1, AXIS_GEOM), 150.5);
+  assert.equal(axisY(2, AXIS_GEOM), 103, 'the midpoint');
+  assert.equal(axisY(3, AXIS_GEOM), 55.5);
+  assert.equal(axisY(4, AXIS_GEOM), 8, 'the maximum sits at the top padding');
+});
+
+test('axisY: a measured 0 maps to the floor rather than being treated as a hole', () => {
+  // The distinction that matters: a real zero IS a measurement and belongs on
+  // the baseline; a missing sample must not be drawn there.
+  assert.equal(axisY(0, AXIS_GEOM), 198);
+  assert.equal(axisY(null, AXIS_GEOM), null);
+  assert.notEqual(axisY(0, AXIS_GEOM), axisY(null, AXIS_GEOM));
+});
+
+test('axisY: every hole flavour returns null instead of a fabricated pixel', () => {
+  for (const hole of [null, undefined, NaN, Infinity, -Infinity, '3', [], {}, true]) {
+    assert.equal(
+      axisY(hole, AXIS_GEOM),
+      null,
+      `${JSON.stringify(hole) ?? String(hole)} must not produce a plotted y`,
+    );
+  }
+});
+
+test('axisY: reproduces the legacy padded y expression on hole-free input', () => {
+  // charts.jsx's pre-fix LineChart y was
+  //   padT + chartH - ((v - minV) / range) * chartH
+  // and StackedAreaChart's yToPx was the same with min 0. Identical arithmetic
+  // produces identical doubles, so this is an exact comparison.
+  const geom = { y0: 8, height: 190, min: 0, range: 7 };
+  for (const v of [0, 1, 2.5, 6, 7]) {
+    assert.equal(
+      axisY(v, geom),
+      geom.y0 + geom.height - ((v - geom.min) / geom.range) * geom.height,
+    );
+  }
+});
+
+test('axisY: honours a non-zero min', () => {
+  // Not used by charts.jsx today (LineChart hard-codes minV = 0 and that is
+  // deliberately preserved), but the parameter is part of the contract and a
+  // silent disregard would be a trap for the next caller.
+  const geom = { y0: 8, height: 190, min: 2, range: 2 };
+  assert.equal(axisY(2, geom), 198, 'the min sits on the floor');
+  assert.equal(axisY(4, geom), 8, 'min + range sits at the top');
 });
