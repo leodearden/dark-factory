@@ -1338,6 +1338,45 @@ def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
     return render(rewritten)
 
 
+def _with_pytest_numprocesses_str(cmd: str | None, n: str) -> str | None:
+    """Inject a ``-n <n>`` pytest-xdist worker cap into *cmd*, via VerifyCmd.
+
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``apply_pytest_numprocesses`` -> ``render`` (mirrors
+    ``_with_pytest_timeout_str`` / ``_with_junitxml_str``). Returns *cmd*
+    unchanged — BYTE-identically, via the ``is`` identity check, since a
+    from-scratch render of an untouched parse is only argv-equivalent — when
+    it is ``None`` or when the mutation is a no-op.
+
+    All three of ``apply_pytest_numprocesses``' fail-safe guards ride along
+    unchanged: a non-PYTEST tool (which covers OPAQUE), *n* in ``{'',
+    'auto'}`` (the shipped default, so this is inert until an operator
+    configures a numeric cap), and an already-serial-forced command (``-p
+    no:xdist`` — injecting ``-n`` there would fail the run with
+    ``unrecognized arguments: -n`` and defeat the serial-recovery safety
+    net).
+
+    Unlike ``_with_junitxml_str`` this does NOT log its no-op. A suppressed
+    junit injection means an expected report will not be written, degrading
+    named downstream capabilities; a suppressed ``-n`` just leaves the
+    command at its configured worker count, which is the pre-cap status quo
+    and not a lost capability.
+
+    Task 3478 extracted this so the cap has ONE rewrite site with two
+    callers — ``_run_or_skip_timed``'s non-segmented branch and the
+    per-segment application inside ``_run_one_segment``. Two copies of the
+    parse/mutate/identity/render dance would be free to drift (INV-5
+    no-lockstep-duplication).
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = apply_pytest_numprocesses(parsed, n)
+    if rewritten is parsed:
+        return cmd
+    return render(rewritten)
+
+
 def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
     """Inject ``--junitxml <junit_path>`` into a structured ``pytest`` command, via VerifyCmd.
 
@@ -4657,16 +4696,23 @@ async def run_verification(
         # intentionally stays un-rewritten (same treatment as the nice
         # prefix: an execution detail layered onto cmd, not the persisted
         # config command).
-        # Identity-check the mutation before rendering (mirrors
-        # _govern_cpu_str's `governed is parsed` guard above): a non-pytest
-        # test leg (cmd.tool is not PYTEST) makes apply_pytest_numprocesses
-        # return the same object, so skip the parse->render round-trip
-        # entirely rather than reformatting a command that wasn't actually
-        # touched.
-        if admission and role in {'task', 'background'} and config.verify_admission_pytest_n not in {'', 'auto'}:
-            parsed = parse_config_command(cmd)
-            mutated = apply_pytest_numprocesses(parsed, config.verify_admission_pytest_n)
-            cmd = cmd if mutated is parsed else render(mutated)
+        #
+        # Hoisted into ONE local (task 3478) because the segmented branch
+        # below applies the same cap per segment: a second copy of this
+        # predicate could drift, letting role/admission/knob eligibility
+        # disagree between the segmented and unsegmented paths.
+        pytest_n_capped = (
+            admission
+            and role in {'task', 'background'}
+            and config.verify_admission_pytest_n not in {'', 'auto'}
+        )
+        # _with_pytest_numprocesses_str identity-checks the mutation before
+        # rendering (mirrors _govern_cpu_str's `governed is parsed` guard
+        # above), so a no-op leaves cmd byte-identical rather than
+        # reformatting a command that wasn't actually touched.
+        if pytest_n_capped:
+            cmd = _with_pytest_numprocesses_str(cmd, config.verify_admission_pytest_n)
+            assert cmd is not None  # None only when the input is None; guarded above
         if admission:
             prefix = _resolve_nice_prefix(config, role)
             if prefix:
