@@ -17,8 +17,18 @@ pinnable here rather than only observable during live spend.
 
 from __future__ import annotations
 
+import io
+import json
+
 import pytest
-from _cross_account_evidence import select_token_pair
+from _capacity_skip import REAL_CLI_CAP_MESSAGES
+from _cross_account_evidence import (
+    emit_run_evidence,
+    format_run_evidence,
+    select_token_pair,
+)
+
+from shared.cli_invoke import AgentResult
 
 
 def _env(*letters: str, **extra: str) -> dict[str, str]:
@@ -26,6 +36,25 @@ def _env(*letters: str, **extra: str) -> dict[str, str]:
     environ = {f'CLAUDE_OAUTH_TOKEN_{ch}': f'tok-{ch.lower()}' for ch in letters}
     environ.update(extra)
     return environ
+
+
+def _result(output: str = '', *, success: bool = True, **kwargs) -> AgentResult:
+    return AgentResult(success=success, output=output, **kwargs)
+
+
+def _record(**overrides) -> dict:
+    """A ``format_run_evidence`` call with sane defaults, overridable per-test."""
+    kwargs: dict = {
+        'account_a': 'CLAUDE_OAUTH_TOKEN_F',
+        'account_b': 'CLAUDE_OAUTH_TOKEN_C',
+        'r1': _result('OK', session_id='sid-1'),
+        'r2': _result('ZEPPELIN'),
+        'r1_transcript_present': True,
+        'r1_transcript_records': 12,
+        'control_passed': True,
+    }
+    kwargs.update(overrides)
+    return format_run_evidence(**kwargs)
 
 
 class TestSelectTokenPairDefault:
@@ -157,3 +186,185 @@ class TestSelectTokenPairOverride:
             'CLAUDE_OAUTH_TOKEN_G',
             'CLAUDE_OAUTH_TOKEN_F',
         ]
+
+
+class TestFormatRunEvidenceFields:
+    """The record must carry exactly the fields task 3484 has to record."""
+
+    def test_carries_every_required_field(self):
+        record = _record()
+        assert set(record) == {
+            'account_a',
+            'account_b',
+            'r1_session_id',
+            'r1_transcript_present',
+            'r1_transcript_records',
+            'r2_output',
+            'r2_stderr',
+            'r2_success',
+            'codeword_recalled',
+            'control_passed',
+            'verdict',
+        }
+
+    def test_records_which_accounts_were_actually_used(self):
+        record = _record(
+            account_a='CLAUDE_OAUTH_TOKEN_G', account_b='CLAUDE_OAUTH_TOKEN_E'
+        )
+        assert record['account_a'] == 'CLAUDE_OAUTH_TOKEN_G'
+        assert record['account_b'] == 'CLAUDE_OAUTH_TOKEN_E'
+
+    def test_records_r1_session_id_and_r2_streams(self):
+        record = _record(
+            r1=_result('OK', session_id='eeec059e-be5d-413d-bae7-15274dd758c3'),
+            r2=_result('ZEPPELIN', stderr='some warning', success=True),
+        )
+        assert record['r1_session_id'] == 'eeec059e-be5d-413d-bae7-15274dd758c3'
+        assert record['r2_stderr'] == 'some warning'
+        assert record['r2_success'] is True
+
+    def test_round_trips_through_json(self):
+        record = _record()
+        assert json.loads(json.dumps(record)) == record
+
+
+class TestFormatRunEvidenceVerbatim:
+    """Outputs are stored VERBATIM — truncation is how a cap message hides."""
+
+    def test_long_output_is_not_truncated(self):
+        long_output = 'ZEPPELIN ' + ('x' * 20_000)
+        record = _record(r2=_result(long_output))
+        assert record['r2_output'] == long_output
+
+    def test_surrounding_whitespace_is_not_stripped(self):
+        record = _record(r2=_result('\n  ZEPPELIN  \n'))
+        assert record['r2_output'] == '\n  ZEPPELIN  \n'
+
+    def test_stderr_is_not_truncated_or_redacted(self):
+        stderr = 'boom ' + ('y' * 20_000)
+        record = _record(r2=_result('ZEPPELIN', stderr=stderr))
+        assert record['r2_stderr'] == stderr
+
+
+class TestFormatRunEvidenceTranscript:
+    """Absent and empty are different findings, so they get different values."""
+
+    def test_absent_transcript_yields_none_not_zero(self):
+        record = _record(r1_transcript_present=False, r1_transcript_records=0)
+        assert record['r1_transcript_present'] is False
+        assert record['r1_transcript_records'] is None
+
+    def test_absent_transcript_with_none_count_stays_none(self):
+        record = _record(r1_transcript_present=False, r1_transcript_records=None)
+        assert record['r1_transcript_records'] is None
+
+    def test_present_but_empty_transcript_keeps_zero(self):
+        record = _record(r1_transcript_present=True, r1_transcript_records=0)
+        assert record['r1_transcript_present'] is True
+        assert record['r1_transcript_records'] == 0
+
+    def test_present_transcript_keeps_its_count(self):
+        record = _record(r1_transcript_present=True, r1_transcript_records=12)
+        assert record['r1_transcript_records'] == 12
+
+
+class TestFormatRunEvidenceVerdict:
+    """The verdict encodes how a run must be READ, including 'do not read it'."""
+
+    def test_codeword_recalled_is_case_insensitive(self):
+        assert _record(r2=_result('the codeword was zeppelin'))['codeword_recalled'] is True
+
+    def test_recalled_codeword_yields_preserved(self):
+        record = _record(r2=_result('ZEPPELIN'))
+        assert record['codeword_recalled'] is True
+        assert record['verdict'] == 'preserved'
+
+    def test_missing_codeword_yields_not_preserved(self):
+        record = _record(r2=_result("I don't have any prior context."))
+        assert record['codeword_recalled'] is False
+        assert record['verdict'] == 'not_preserved'
+
+    @pytest.mark.parametrize('cap_message', REAL_CLI_CAP_MESSAGES)
+    def test_real_cap_messages_yield_void_capped(self, cap_message):
+        """A capped account is NOT evidence of context loss — it is a void run.
+
+        Parametrised over the single-homed corpus in ``_capacity_skip`` (task
+        3483) rather than a local copy of the strings: a second hand-maintained
+        copy of a verbatim transcript is the drift that voided the 3454 attempt.
+        """
+        record = _record(r2=_result(cap_message, success=False))
+        assert record['verdict'] == 'void_capped'
+
+    def test_cap_message_on_stderr_also_yields_void_capped(self):
+        record = _record(r2=_result('', stderr=REAL_CLI_CAP_MESSAGES[0], success=False))
+        assert record['verdict'] == 'void_capped'
+
+    def test_void_capped_wins_over_not_preserved(self):
+        """This precedence is the whole point: the 2026-08-01 run looked like
+        lost context and was really a weekly cap."""
+        record = _record(
+            r2=_result(
+                "You've hit your weekly limit · resets Aug 5, 11am", success=False
+            )
+        )
+        assert record['codeword_recalled'] is False
+        assert record['verdict'] == 'void_capped'
+
+    def test_control_passed_tracks_none_false_true_distinctly(self):
+        assert _record(control_passed=None)['control_passed'] is None
+        assert _record(control_passed=False)['control_passed'] is False
+        assert _record(control_passed=True)['control_passed'] is True
+
+
+class TestEmitRunEvidence:
+    """One JSON line to the stream; also to the evidence file when asked."""
+
+    def test_writes_one_json_line_to_stream(self):
+        stream = io.StringIO()
+        record = _record()
+        emit_run_evidence(record, {}, stream)
+        payloads = [
+            line for line in stream.getvalue().splitlines() if line.strip()
+        ]
+        assert len(payloads) == 1
+        assert json.loads(payloads[0].split(' ', 1)[1]) == record
+
+    def test_returns_the_json_line(self):
+        record = _record()
+        line = emit_run_evidence(record, {}, io.StringIO())
+        assert json.loads(line) == record
+        assert '\n' not in line
+
+    def test_appends_to_evidence_path_when_set(self, tmp_path):
+        path = tmp_path / 'nested' / 'evidence.jsonl'
+        environ = {'CROSS_ACCOUNT_EVIDENCE_PATH': str(path)}
+        first = _record(r1=_result('OK', session_id='sid-1'))
+        second = _record(r1=_result('OK', session_id='sid-2'))
+        emit_run_evidence(first, environ, io.StringIO())
+        emit_run_evidence(second, environ, io.StringIO())
+        lines = path.read_text(encoding='utf-8').strip().splitlines()
+        assert [json.loads(line)['r1_session_id'] for line in lines] == [
+            'sid-1',
+            'sid-2',
+        ]
+
+    def test_does_not_touch_filesystem_when_path_unset(self, tmp_path):
+        emit_run_evidence(_record(), {}, io.StringIO())
+        assert list(tmp_path.iterdir()) == []
+
+    def test_blank_evidence_path_is_treated_as_unset(self, tmp_path):
+        emit_run_evidence(
+            _record(), {'CROSS_ACCOUNT_EVIDENCE_PATH': ''}, io.StringIO()
+        )
+        assert list(tmp_path.iterdir()) == []
+
+    def test_verbatim_multiline_output_stays_on_one_line_in_the_file(self, tmp_path):
+        """A record whose r2_output contains newlines must not split the JSONL."""
+        path = tmp_path / 'evidence.jsonl'
+        record = _record(r2=_result('line one\nline two\nZEPPELIN'))
+        emit_run_evidence(
+            record, {'CROSS_ACCOUNT_EVIDENCE_PATH': str(path)}, io.StringIO()
+        )
+        lines = path.read_text(encoding='utf-8').strip().splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0])['r2_output'] == 'line one\nline two\nZEPPELIN'
