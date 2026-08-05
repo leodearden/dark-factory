@@ -1331,3 +1331,26 @@ def calls_named(node: ast.AST, name: str) -> list[ast.Call]:
         ):
             found.append(descendant)
     return found
+
+
+def imported_names_from(node: ast.AST, module: str) -> set[str]:
+    """Every name a ``from <module> import …`` under *node* brings in.
+
+    Reports the SOURCE-side name, so ``from m import x as y`` is reported as
+    ``x``. Guards compare the result against the name as the helper module
+    exports it, so an aliased import must not read as a missing one.
+
+    Only ``from <module> import …`` counts: a plain ``import <module>`` binds
+    the module and never a name from it, so it cannot satisfy a guard demanding
+    a specific helper be imported. Returns an empty set — never None — when
+    nothing is imported from *module*, which callers rely on both for set
+    algebra and to render ``imported or 'nothing'`` in a failure message.
+
+    Takes any node rather than only a module, for symmetry with
+    :func:`calls_named`.
+    """
+    names: set[str] = set()
+    for descendant in ast.walk(node):
+        if isinstance(descendant, ast.ImportFrom) and descendant.module == module:
+            names.update(alias.name for alias in descendant.names)
+    return names
