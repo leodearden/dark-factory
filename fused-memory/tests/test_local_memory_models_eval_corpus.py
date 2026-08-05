@@ -28,8 +28,10 @@ import re
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
+from _fm_helpers import falkor_skipif
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'local_memory_models_eval' / 'build_corpus.py'
@@ -1548,3 +1550,119 @@ class TestBuilderScriptSatisfiesTheDeliveredCheck:
             '--out', str(tmp_path / 'corpus_manifest.json'),
         )
         assert isinstance(code, int) and not isinstance(code, bool)
+
+
+# ===========================================================================
+# Live smoke — ONE read-only query against the real dark_factory graph
+# ===========================================================================
+#
+# Marked @pytest.mark.integration PER-TEST, never as a module-level pytestmark:
+# fused-memory/pyproject.toml sets `addopts = -m 'not integration'`, so a
+# module-wide marker would deselect every offline test above and this file
+# would silently stop running in the default lane.
+
+# Drift-tolerant floors, never equalities. The store grows continuously — the
+# PRD measured ~2,635 episodes at authoring and this task measured 2,770 two
+# months later — so `assert len(population) == 2770` would be a guaranteed
+# future red that says nothing about correctness.
+LIVE_MIN_POPULATION = 2000
+LIVE_MIN_MONTH_BUCKETS = 5
+LIVE_WINDOW_STARTS_BY = '2026-04-06'
+
+# The payload axis IS asserted by equality, unlike the counts. A new kind
+# appearing is not drift to tolerate: it adds a row to the cross-tab, changes
+# every stratum denominator, and means delta's census needs re-measuring
+# before the next corpus build. A red here is information, not noise.
+LIVE_PAYLOAD_KINDS = {
+    'decisions_and_rationale',
+    'temporal_facts',
+    'entities_and_relations',
+    'procedural_knowledge',
+}
+
+
+class _RecordingLiveGraph:
+    """Wraps a REAL FalkorDB graph handle: forwards ``ro_query``, trips on the rest.
+
+    Lets the live smoke MEASURE the read-only claim on the real path rather
+    than infer it from the source. ``__getattr__`` raises for every other
+    attribute, so any write-capable call — ``query``, ``delete``,
+    ``create_node_range_index`` — fails the test instead of reaching the store.
+    """
+
+    def __init__(self, graph: Any):
+        self._graph = graph
+        self.commands: list[str] = []
+
+    async def ro_query(self, cypher, *args, **kwargs):
+        self.commands.append('ro_query')
+        return await self._graph.ro_query(cypher, *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        raise _ReadOnlyViolation(
+            f'the live smoke reached a non-read-only path on the real graph: {name!r}'
+        )
+
+
+@pytest.mark.integration
+@falkor_skipif()
+@pytest.mark.timeout(120)
+def test_live_dark_factory_population_smoke(monkeypatch):
+    """One GRAPH.RO_QUERY against the live graph; nothing is written.
+
+    Asserts the premises the whole builder rests on are still true of the real
+    store — the two stratification dimensions actually discriminate, and the
+    population is big enough for a 150-300 corpus to mean anything — plus the
+    two hazards, measured rather than promised: only the read-only command path
+    was used, and no graphiti FalkorDriver was constructed (its ``__init__``
+    fire-and-forgets ``build_indices_and_constraints()``, which would create
+    indices on dark_factory and destroy the no-index evidence owned by
+    docs/prds/falkordb-index-provisioning.md).
+    """
+    from graphiti_core.driver import falkordb_driver  # noqa: PLC0415
+
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            'the live smoke constructed a graphiti FalkorDriver — this fires '
+            'build_indices_and_constraints() against dark_factory'
+        )
+
+    monkeypatch.setattr(falkordb_driver.FalkorDriver, '__init__', _boom)
+
+    recorders: list[_RecordingLiveGraph] = []
+
+    async def _run() -> list:
+        reader = _mod.EpisodeReader(graph_name=_mod.DEFAULT_GRAPH)
+        # Resolve through the reader's OWN lazy client construction, so the
+        # host/port env wiring is exercised live rather than bypassed by an
+        # injected handle; then wrap it to record the command path.
+        live: Any = reader._resolve_graph()
+        recorder = _RecordingLiveGraph(live)
+        recorders.append(recorder)
+        reader._graph = recorder
+        try:
+            return await reader.fetch_population()
+        finally:
+            await live.client.aclose()
+
+    population = asyncio.run(_run())
+
+    assert len(population) > LIVE_MIN_POPULATION, (
+        f'only {len(population)} episodes — too few for a 150-300 corpus to be a '
+        f'sample rather than a census'
+    )
+
+    kinds = {_mod.payload_kind(r.source_description) for r in population}
+    assert kinds == LIVE_PAYLOAD_KINDS, (
+        f'the payload axis changed: {kinds ^ LIVE_PAYLOAD_KINDS} — re-measure the '
+        f'census before building the next corpus'
+    )
+
+    months = {_mod.month_bucket(r.created_at) for r in population}
+    assert len(months) >= LIVE_MIN_MONTH_BUCKETS, months
+
+    window_start = min(r.created_at for r in population)
+    assert window_start[:10] <= LIVE_WINDOW_STARTS_BY, window_start
+
+    # The hazards, measured: exactly one query, on the read-only path only.
+    assert [r.commands for r in recorders] == [['ro_query']]
