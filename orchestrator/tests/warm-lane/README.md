@@ -252,32 +252,91 @@ ambient environment.
 
 ## Measured wall-clock
 
-Measured on an unloaded host, each `.sh` run directly and sequentially:
+Measured sequentially on **2026-08-05**, each `.sh` run directly, in ONE sitting
+of 82s (10:47:08→10:48:30 BST) at **loadavg 12.98–15.33 on a 32-core host**.
+The band is a 1.18x spread, so these eight figures are comparable *to each
+other* — the property this table needs, and the one it previously lacked.
 
-| Ported test | asserts | wall-clock |
-|---|---|---|
-| `test_thin_warm_lane.sh` | 45 | 0.46s |
-| `test_warm_lane_disk_guard.sh` | 62 | 1.04s |
-| `test_warm_lane_sizing_lifecycle.sh` | 65 | 1.07s |
-| `test_warm_lane_degenerate_ref.sh` | 70 | 1.23s |
-| `test_provision_warm_lane_fs.sh` | 111 | 1.49s |
-| `test_warm_lane_gc_sweep.sh` | 86 | 6.73s |
-| `test_warm_lane_audit.sh` | 228 | 12.93s |
-| `test_warm_lane_gc.sh` | 214 | 16.95s (stale — timed at 198 asserts; see below) |
-| **total** | **881** | **≈42s (stale)** |
+**On the word "unloaded", which this caption used to claim.** No unloaded
+reading of this host is obtainable: it is its own load source. Median 1-min
+loadavg on the four uncapped days before the cap began (Jul 31 – Aug 3) was
+104, 121, 121, 120 (`/var/log/sysstat`, 10-min samples), and fewer than 1.5%
+of those samples fell below 20 — on two of the days, none did. The sitting
+above was only possible because all four fleet accounts were simultaneously
+usage-capped, which is the sole condition under which this box goes quiet.
+Every figure here is therefore load-qualified, not idle-baseline — and so is
+the 2026-07-30 column, taken during a comparable brief quiet window on a day
+whose median was 92. Do not expect to reproduce either without a cap.
+
+| Ported test | asserts | wall-clock | 2026-07-30 | ratio |
+|---|---|---|---|---|
+| `test_thin_warm_lane.sh` | 45 | 0.57s | 0.46s | 1.24x |
+| `test_warm_lane_disk_guard.sh` | 62 | 1.04s | 1.04s | 1.00x |
+| `test_warm_lane_sizing_lifecycle.sh` | 65 | 1.38s | 1.07s | 1.29x |
+| `test_warm_lane_degenerate_ref.sh` | 70 | 1.73s | 1.23s | 1.41x |
+| `test_provision_warm_lane_fs.sh` | 111 | 1.89s | 1.49s | 1.27x |
+| `test_warm_lane_gc_sweep.sh` | 86 | 15.01s | 6.73s | **2.23x** |
+| `test_warm_lane_audit.sh` | 228 | 14.34s | 12.93s | 1.11x |
+| `test_warm_lane_gc.sh` | 214 | 46.37s | 16.95s (at 198 asserts) | **2.74x** |
+| **total** | **881** | **82.33s** | **≈42s** | **1.96x** |
 
 `test_warm_lane_gc.sh` dominates: 34 `git worktree add` calls, 33 `flock`
-acquisitions and `/proc/<pid>/{exe,cwd,fd,maps}` liveness walks. Under
-concurrent load these figures roughly double; the full driver module
-(12 pytest items, all co-located on one xdist worker) measured 47s.
+acquisitions and `/proc/<pid>/{exe,cwd,fd,maps}` liveness walks.
 
-**"Roughly double" is the unloaded-host reading and it does NOT hold on a
-dark-factory verify host** — the correction is measured, not argued. This
-machine runs its own concurrent lane fleet at **loadavg ~120 on 32 cores**, and
+### The two gc-driving suites have regressed ~2x, and it is not load
+
+Six of the eight rows reproduce their 2026-07-30 figures within 1.00–1.41x at
+comparable load — `test_warm_lane_disk_guard.sh` lands on 1.04s both times.
+The two that drive `warm-lane-gc.sh` do not: **gc-sweep is 2.23x its baseline
+at an UNCHANGED 86 assertions**, and gc.sh is 2.74x on an 8% assert growth
+(198→214). Load cannot explain a divergence measured inside a single sitting,
+and three confounds were checked and eliminated:
+
+- **Cold FS cache** — ruled out. Warm-cache re-runs minutes later reproduced:
+  gc.sh 46.01s, gc-sweep 13.89s, audit 13.85s.
+- **The registry-render bridge** (task 3292, below) — ruled out. `strace -f -e
+  trace=execve` over a whole gc-sweep run counts **exactly one**
+  `.venv/bin/python3` exec, and one render measured 0.41–0.48s over 5 samples
+  at this load. The mitigation described below is working; it accounts for
+  ~0.45s of an 8.3s gain.
+- **Assertion growth** — ruled out for gc-sweep, whose assert count did not move.
+
+**It is attributable to task 3292, by a pair of measurements this README already
+contained.** The `test_warm_lane_gc_sweep.sh` before/after pair recorded below
+(59.5s at loadavg 203→184, then 124.0s at 212→189) brackets exactly 3292's four
+commits — `git log e1c04cf316..04b2dd82d5` is 464b085e7a, a62db712d8,
+2e1927c6bf, 04b2dd82d5 and nothing else. That pair was dismissed below as load
+noise ("same caveat, same reason"). It was not noise:
+
+| `gc_sweep` | loadavg | pre-3292 | post-3292 | ratio |
+|---|---|---|---|---|
+| 2026-08-01 pair | ~200 | 59.5s | 124.0s | 2.08x |
+| 2026-07-30 → 2026-08-05 | ~14 | 6.73s | 15.01s | 2.23x |
+
+**A ratio that holds at 2.1x across a 14x difference in host load is the
+signature of added work, not of dilation** — dilation would scale with load and
+does not. Two independent measurements at opposite ends of the load range agree,
+and both bracket the same change.
+
+The **mechanism** is still unidentified, and it is NOT the render bridge (5
+renders ≈ 2.3s in the gc suite, 1 ≈ 0.45s in gc-sweep, both strace-verified).
+The hypothesis worth testing first is that a62db712d8 added per-invocation cost
+to `warm-lane-gc.sh` itself — e.g. sourcing `lib_lane_state.sh` — which every
+invocation pays even when the `PROTECT_GLOB` pin short-circuits the render, and
+which would scale with each suite's gc.sh invocation count while touching no
+other suite. That is a hypothesis, not a finding; it has not been tested.
+
+This is the first honest same-load comparison the table has ever supported, and
+it overturned a conclusion recorded in this same file on its first use. That is
+the argument for keeping the table rather than retiring it.
+
+**α2 predicted these figures would "roughly double" under concurrent load. That
+prediction is wrong, and the correction is measured, not argued.** This machine
+runs its own concurrent lane fleet at **loadavg ~120 on 32 cores**, and
 re-measured there on 2026-07-30 at **loadavg 124**, with the two largest suites
 run concurrently against each other, the dilation is **~10-15x**, not 2x:
 
-| Ported test | unloaded | at loadavg 124 | dilation |
+| Ported test | quiet window (07-30) | at loadavg 124 | dilation |
 |---|---|---|---|
 | `test_warm_lane_audit.sh` | 12.93s | 190.2s (228 passed, 0 failed) | ~14.7x |
 | `test_warm_lane_gc.sh` | 16.95s | 128.3s (198 passed, 0 failed) | ~7.6x |
@@ -295,10 +354,13 @@ nominal block sequence, a ~3.5x and ~3.1x further dilation extrapolating to
 ~450s and ~580s to completion. `SUBPROC_TIMEOUT`/`@pytest.mark.timeout` were
 therefore re-calibrated 300/360 → **900/960** (task 3075 debug leg); the
 arithmetic is recorded on `SUBPROC_TIMEOUT` in the driver. Note the ranking
-inversion this table's unloaded column does not predict: under fleet load
+inversion the quiet-window column does not predict: under fleet load
 `test_warm_lane_audit.sh`, not `test_warm_lane_gc.sh`, is the binding suite.
+(As of the 2026-08-05 sitting the quiet-window ranking has itself inverted —
+gc.sh at 46.37s now exceeds audit.sh at 14.34s even quiet, per the regression
+noted above.)
 
-### The registry-render bridge, and why its cost could not be measured here
+### The registry-render bridge: the A/B is unmeasurable, but both factors now are
 
 Task 3292 wired `warm-lane-gc.sh`'s `PROTECT_GLOB` default to
 `lib_lane_state.sh`'s `lane_protect_glob`, which starts a python3 and imports
@@ -313,12 +375,26 @@ mitigation is the reason no `SUBPROC_TIMEOUT` change was needed:
   `run_helper_live_default`: **M, N-default, O** (both sub-cases) and **X-band**.
   5 of the gc suite's 37 invocations pay a render; the gc-sweep suite's four
   real-gc sites (G4, G5, two U) pay none, and nothing there inspects the glob.
+  **Both counts verified 2026-08-05 by `strace -f -e trace=execve` over whole
+  suite runs**, counting `.venv/bin/python3` in executable position: gc suite
+  **5**, exactly as claimed; gc-sweep **1**, which is 3292's own bridge-cost pin
+  block, not a real-gc site — so "the four real-gc sites pay none" holds. The
+  mitigation does what this section says it does.
 - **A future block that asserts default content must use
   `run_helper_live_default`, or it silently tests the pin instead of the
   default.**
 
-**The mitigation's wall-clock saving is NOT stated here, because this host could
-not measure it.** A three-run sandwich (mitigated / unmitigated / mitigated) was
+**The mitigation's wall-clock saving is still NOT stated here as a measurement,
+because the A/B that would establish it could not be run on this host.** What
+2026-08-05 added is that both of its *factors* are now measured rather than
+asserted: the render count by strace (above), and the per-render cost at
+**0.41 / 0.48 / 0.46 / 0.43 / 0.45s** over five samples at loadavg ~16 — versus
+0.97–3.75s measured at loadavg 189, the same ~4x dilation everything else on
+this host shows. Their product remains a derivation and is still not written
+into the table. For scale: 5 renders × ~0.45s ≈ 2.3s of the gc suite's 46.37s,
+so the bridge is **not** where the ~2x regression noted above comes from.
+
+A three-run sandwich (mitigated / unmitigated / mitigated) was
 run back-to-back on 2026-08-01 at commit `04b2dd82d5` specifically to isolate it,
 with the unmitigated leg produced by a throwaway copy of the suite whose pin
 branch was made dead. All three reported **214 passed, 0 failed**:
@@ -342,29 +418,78 @@ wall-clock, and is deliberately not written into the table as one.
 
 The `test_warm_lane_gc_sweep.sh` pair from the same session, for the record:
 **59.5s / 86 passed** at loadavg 203.61→183.87 before the change (commit
-`e1c04cf316`), **124.0s / 86 passed** at loadavg 212.09→189.41 after. Same
-caveat, same reason.
+`e1c04cf316`), **124.0s / 86 passed** at loadavg 212.09→189.41 after.
 
-**The `test_warm_lane_gc.sh` wall-clock is OWED a re-measurement (task 3075,
-re-attributed to task 3292 and still open).**
+**This pair was originally written off here as the same between-run variance
+that spoiled the sandwich above. That reading is RETRACTED (2026-08-05).**
+Unlike the sandwich legs, these two runs are at *comparable* load (~194 and
+~201 mean) and differ by 2.08x — and the 2026-08-05 quiet-window sitting
+reproduces the same 2.23x ratio at loadavg ~14. Between-run variance does not
+survive a 14x change in load; added work does. See the regression subsection
+above, which this pair is now the earliest evidence for.
+
+**The `test_warm_lane_gc.sh` re-measurement owed by task 3075 (re-attributed to
+3292) is DISCHARGED — measured 2026-08-05, 46.37s at 214 asserts, in the
+one-sitting table above.** The debt stood open because the old table claimed an
+unloaded baseline nobody could reproduce; it is settled by re-captioning every
+figure with the load it was taken under, not by finally finding an idle host.
+
 Its assert count moved 170 → 198 when leaf γ added Block S and A10 (four new
 `run_helper reclaim` invocations, shaped to keep at most two `/proc`-walking
-lanes each), then **198 → 214** when task 3292 added Block X. Four measurements
-now exist, all on a heavily loaded host and so none comparable to this table's
-unloaded baseline: **79.3s at loadavg 109.67**, **128.3s at loadavg 124** (the
-latter with `test_warm_lane_audit.sh` running concurrently), and the 213.8s /
-298.3s sandwich pair above. They are recorded here as observations and
-deliberately NOT promoted into the table — and their spread, 79.3s to 298.3s
-for a suite that grew by 16 asserts, is itself the reason a loaded figure
-cannot stand in for an unloaded one. Writing any of them in as the new unloaded figure, or writing
-in an estimate dressed as a measurement, would put a false number on main —
-which is what this table exists to prevent, since its stated purpose is that
-the *measured* cost is what justified answering PRD §11 q4 with "the default
-orchestrator suite". Re-measure on an unloaded host and replace both the row
-and the total.
+lanes each), then **198 → 214** when task 3292 added Block X. Four loaded
+measurements were taken while the debt was open: **79.3s at loadavg 109.67**,
+**128.3s at loadavg 124** (the latter with `test_warm_lane_audit.sh` running
+concurrently), and the 213.8s / 298.3s sandwich pair above. They remain
+recorded as load-qualified observations and are still NOT promoted into the
+table — their spread, 79.3s to 298.3s for a suite that grew by 16 asserts, is
+why a single loaded figure cannot stand in for a comparable one. Note that the
+quiet-window figure now in the table (46.37s) sits *below* all four, which is
+consistent with them being dilated rather than with any of them being the
+suite's true cost.
+
+The rule that governed this debt still governs the table: never write an
+estimated, interpolated or extrapolated number in as a measurement. An honest
+gap beats a fabricated number.
 
 For reference, the whole orchestrator suite with these included is ~253s for
 ~13,100 tests.
+
+### The live cost signal is the offline lane, not this table
+
+Since task 3349 moved the bucket to `git.offline_lane_commands`, the lane has
+been timing it on **every merge advance** and logging the figure —
+`orchestrator/src/orchestrator/offline_lane.py`, `offline-lane: warm-lane-bash
+sub-run head=<sha> status=<PASS|FAIL> duration=<N>s`. That is a continuous,
+free, per-commit time series, and it is a strictly better cost instrument than
+any single sitting: it yields a distribution rather than one number, and each
+point is joinable against `sar -q` for the load it ran under.
+
+119 records over 2026-08-01→05 (whole 12-item bucket, so not comparable to the
+per-suite rows above), split by regime:
+
+| regime | n | min | p25 | median | p75 | max |
+|---|---|---|---|---|---|---|
+| fleet dispatching (Aug 2 – Aug 4 04:05) | 97 | 169.4s | 533.6s | **808.5s** | 1087.5s | 2141.2s |
+| accounts capped (Aug 4 11:00 →) | 11 | 131.2s | 134.0s | **141.1s** | 176.8s | 258.3s |
+
+Loaded median / quiet median is **5.7x**, independently corroborating the 6.2x
+task 3349 measured for the same bucket. Note the loaded column spans **12.6x**
+end to end, and 2.0x across its own interquartile range — which is why "a
+loaded-host baseline" cannot be a single band, and why a regression is better
+detected as a shift in this distribution's median (~30 samples/day) than by
+comparing any one run against any one row.
+
+**A caveat on the "47s module baseline" that PRD §11 q4 quotes.** The lane's
+quiet-window runs of the same 12 items land at 131–258s, ~3–5x that figure at
+comparable load. The comparison is not clean — a lane run also pays pytest
+startup, collection and the `_offline-deep` worktree — so the 47s is not
+asserted here to be wrong, but it should not be leaned on again without a
+fresh measurement.
+
+**11 of the 119 runs are FAIL** (9.2%), four of them in the 1685–2008s range.
+That is a live signal on the lane's red path, unexamined here and not part of
+this table's scope; it is flagged because a reader trending these durations
+will meet it.
 
 ## PRD §11 q4 — re-decided: the offline lane (the escape is taken)
 
