@@ -1,0 +1,19 @@
+{
+  "7d073281-4c5d-4ba3-a01c-3a167f4460f4": {
+    "tracked_as_task": "3686",
+    "flag": "record_error",
+    "error": "attempt to write a readonly database",
+    "classification": "repairable_duplicate",
+    "source_report": "docs/toolcall-xml-leak-sweep-2026-08-05/apply-report.json",
+    "source_provenance": "docs/toolcall-xml-leak-sweep-2026-08-05/apply-provenance.json",
+    "payload_source_report": "docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json",
+    "payload_source_commit": "3e926d27449f70394c93a9865681f865e19ea95c",
+    "payload_content_chars": 867,
+    "payload_repaired_content_chars": 415,
+    "points_before": 21089,
+    "points_after": 21088,
+    "qdrant_state": "absent",
+    "recovered": false,
+    "recovery": "Re-add the repaired_content for this id from payload_source_report, FROM A NON-SANDBOXED SESSION -- the sandbox denies file creation under ~/.mem0, so mem0's SQLite history write fails while the Qdrant delete (a network call) succeeds, splitting delete-then-re-add in half. The re-added memory necessarily gets a NEW id; set recovered=true and record it as new_id here. Do NOT re-run the sweep to recover this record (docs/mcp-toolcall-xml-leak.md)."
+  }
+}
