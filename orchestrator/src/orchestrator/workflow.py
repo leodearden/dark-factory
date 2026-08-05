@@ -1192,6 +1192,17 @@ class TaskWorkflow:
 
         self._steward_factory = steward_factory
         self._steward: Any | None = None
+        # Give-up signal of the MOST RECENT _wait_for_resolution call (task
+        # 3536): True when that wait ended by expiring its idle window rather
+        # than by the L0s clearing.  The two are indistinguishable from the
+        # wait's `str` return — on expiry it dismisses the orphans and, finding
+        # no open L1, returns the collected resolutions exactly as a successful
+        # wait does — but they mean opposite things to a caller that must not
+        # proceed past an UNADJUDICATED gating record.  Only the merge-entry
+        # gate (_handle_merge_gate_escalations) consumes it today; run()'s
+        # ESCALATED branch deliberately ignores it and keeps resuming the
+        # implementer on expiry.
+        self._steward_wait_expired: bool = False
         # In-process StewardOutcome channel (task 2248 / W9-delta): created
         # lazily in _ensure_steward_started and registered on the steward via
         # set_outcome_channel — replaces the escalation-queue forensic re-read
@@ -3707,6 +3718,43 @@ class TaskWorkflow:
                 'Steward re-escalated to human',
                 detail=_format_reescalation_detail(reesc.escalations),
                 skip_escalation=True,
+            )
+        if self._steward_wait_expired:
+            # The wait ended by expiring, not by anyone adjudicating the gating
+            # record — the backstop auto-dismissed the orphan L0(s) to unblock
+            # the waiter.  DELIBERATELY diverges from run()'s ESCALATED branch,
+            # which resumes the implementer on this same expiry: there, more
+            # implementer work is safe and the pipeline re-gates afterwards; at
+            # MERGE entry there is no later gate, so resuming means merging
+            # past an unadjudicated blocking record — repend-PRD D4
+            # stop-the-line forbids it.
+            #
+            # escalate_to_human=True rather than the default L0-then-steward
+            # route: the steward has just demonstrably gone silent on this very
+            # task, so filing a fresh L0 for it would buy a second full grace
+            # window from a producer that is not answering.
+            window = (
+                self.config.timeouts.steward + self.config.steward_completion_timeout
+            )
+            return await self._mark_blocked(
+                f'Merge-entry gate: {len(gating)} gating escalation(s) '
+                f'unresolved when the steward wait expired',
+                detail=(
+                    f'The MERGE-entry gate waited {window:.0f}s '
+                    f'(timeouts.steward {self.config.timeouts.steward:.0f}s + '
+                    f'steward_completion_timeout '
+                    f'{self.config.steward_completion_timeout:.0f}s) and the '
+                    f'steward never resolved the gating record(s); the backstop '
+                    f'auto-dismissed the orphan level-0(s) to unblock the wait. '
+                    f'Nothing adjudicated the gate, so the merge was NOT '
+                    f'attempted (stop-the-line). Gating records at entry:\n'
+                    + '\n'.join(
+                        f'  {e.id} (severity={e.severity}, level={e.level}, '
+                        f'category={e.category}): {e.summary}'
+                        for e in gating
+                    )
+                ),
+                escalate_to_human=True,
             )
         # Gate cleared — resume the merge in this same slot.  BLOCKED →
         # IN_PROGRESS is likewise legal for ActorClass.ORCHESTRATOR.
@@ -12275,6 +12323,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             return ''
 
+        # Reset once per wait, AFTER the no-queue early return, so each wait
+        # reports its OWN outcome and a stale True from an earlier wait can
+        # never leak into a later one (task 3536).
+        self._steward_wait_expired = False
+
         if self._escalation_event is None:
             self._escalation_event = asyncio.Event()
 
@@ -12391,6 +12444,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # that can never publish.  Suppressed because this is cleanup on
                 # an already-degraded path: a failing stop() must not convert a
                 # wait-timeout into a workflow crash.
+                #
+                # Task 3536: record the give-up for callers that must tell it
+                # apart from a genuine resolution.  They cannot do so from this
+                # method's return value — the tail below dismisses the orphans
+                # and, with no open L1, returns the collected resolutions
+                # exactly as a successful wait does.  run()'s ESCALATED branch
+                # deliberately ignores the flag (resuming the implementer on
+                # expiry is safe there: it does more work and the pipeline
+                # re-gates later).  The merge-entry gate must NOT — there is no
+                # later gate, and merging past a record that a backstop
+                # auto-dismissed rather than anyone ADJUDICATING would violate
+                # repend-PRD D4 stop-the-line.
+                self._steward_wait_expired = True
                 if self._steward is not None:
                     with contextlib.suppress(Exception):
                         await self._steward.stop()
