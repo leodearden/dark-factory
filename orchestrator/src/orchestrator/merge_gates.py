@@ -1056,6 +1056,85 @@ def _normalize_plan_path(entry: str) -> str:
     return entry if norm == '.' else norm
 
 
+async def _resolve_renamed_plan_path(
+    norm: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> tuple[str, str] | None:
+    """Resolve a declared path that is ABSENT from the branch tree to its
+    current name, or ``None`` when no resolution is recoverable.
+
+    Returns ``(resolved_path, mechanism)`` where *mechanism* is a short
+    human-readable description for the audit log.
+
+    Mechanism 1 (authoritative — git's own rename detection): find the
+    commit reachable from *branch_head* that DELETED *norm*
+    (``git log --diff-filter=D -1``), then ask git to re-read that commit
+    with rename detection on (``git show --name-status -M``) and look for
+    an ``R<score>\\t<old>\\t<new>`` pair whose old side is *norm*.
+
+    Anchored on *branch_head* rather than main's live HEAD deliberately:
+    this gate has no ``main_sha`` parameter, and reading ``HEAD`` in
+    ``project_root`` would make a merge gate depend on a ref the merge
+    worker itself advances concurrently — a nondeterministic gate.
+    ``branch_head`` is deterministic and strictly sufficient for this
+    false-positive class: the branch touched the POST-rename paths, so the
+    renaming commit is necessarily an ancestor of ``branch_head``.
+
+    Fails CLOSED — any git error, missing deleting commit, or unmatched
+    rename pair returns ``None`` and the caller still blocks.  (Contrast
+    with the whole-gate fail-OPEN on the touched-set fetch: a transient
+    error there would block every plan entry at once, whereas a per-entry
+    probe failure can only leave one already-suspect entry flagged.)
+    """
+    rc, del_out, del_err = await _run(
+        ['git', 'log', '--diff-filter=D', '-1', '--format=%H', branch_head, '--', norm],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
+            'cmd=%r rc=%s stderr=%s',
+            task_id or '<unknown>', norm,
+            'git log --diff-filter=D -1 --format=%H <head> -- <entry>',
+            rc, (del_err or '').strip()[:400],
+        )
+        return None
+
+    del_sha = del_out.strip().splitlines()[0].strip() if del_out.strip() else ''
+    if not del_sha:
+        # No commit reachable from branch_head ever deleted this path — it
+        # was never created, or the relocation was staged as separate
+        # delete+add commits in a shape git's -M cannot pair.  Not an error.
+        return None
+
+    rc, show_out, show_err = await _run(
+        ['git', 'show', '--name-status', '-M', '--format=', del_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
+            'cmd=%r rc=%s stderr=%s',
+            task_id or '<unknown>', norm,
+            f'git show --name-status -M --format= {del_sha[:12]}',
+            rc, (show_err or '').strip()[:400],
+        )
+        return None
+
+    for line in show_out.splitlines():
+        fields = line.split('\t')
+        if len(fields) < 3:
+            continue
+        status, old_path, new_path = fields[0], fields[1], fields[2]
+        if status.startswith('R') and old_path == norm and new_path:
+            return new_path, f'rename in {del_sha[:12]}'
+
+    return None
+
+
 async def _check_plan_files_touched_in_branch(
     plan_files: list[str],
     base_sha: str,
@@ -1072,7 +1151,21 @@ async def _check_plan_files_touched_in_branch(
         (b) the entry resolves to a directory in the branch tree (via
             ``git ls-tree``) and at least one touched file path has it as
             a path-prefix (directory entries are valid plan targets when
-            an agent stages multiple files inside).
+            an agent stages multiple files inside), OR
+        (c) the entry is ABSENT from the branch tree entirely and
+            :func:`_resolve_renamed_plan_path` maps it to a current path
+            that IS in the touched set — i.e. the declared path was
+            renamed on main after the architect declared it, and the
+            branch delivered against the file's current name (task 3110,
+            measured on reify-5196 / esc-5196-22).
+
+    The ``git ls-tree`` call is read as a three-way existence probe:
+    ``rc == 0`` with non-empty output means the path EXISTS at
+    ``branch_head`` (as a tree, which takes arm (b), or as a blob);
+    ``rc == 0`` with EMPTY output means the path is genuinely ABSENT,
+    which takes arm (c); ``rc != 0`` means git could not tell us, so the
+    entry is flagged UNCLASSIFIED — never claim an absence we did not
+    measure.
 
     Empty ``plan_files`` returns no entries — vacuously satisfied.
 
@@ -1087,6 +1180,7 @@ async def _check_plan_files_touched_in_branch(
     touched_set = set(touched)
 
     not_touched: list[str] = []
+    resolved_renames: dict[str, str] = {}
     for entry in plan_files:
         if not entry:
             continue
@@ -1098,17 +1192,63 @@ async def _check_plan_files_touched_in_branch(
         if norm in touched_set:
             continue
 
-        # Directory match: ask the branch tree what kind of object the
+        # Existence probe: ask the branch tree what kind of object the
         # entry names.  ``git ls-tree`` prints "<mode> tree <sha>\t<path>"
-        # for directories and "<mode> blob <sha>\t<path>" for files.
+        # for directories and "<mode> blob <sha>\t<path>" for files, and
+        # exits 0 with EMPTY output when the path is absent from the tree
+        # (rc != 0 is reserved for a real git error, e.g. an unresolvable
+        # rev) — which is why this call, and not `git cat-file -e`, is the
+        # existence oracle: cat-file returns 128 for BOTH a missing path
+        # and a bad rev, so it cannot distinguish "the declared path is
+        # stale" from "we could not measure anything".
         rc, ls_out, ls_err = await _run(
             ['git', 'ls-tree', branch_head, '--', norm],
             cwd=git_ops.project_root,
         )
-        if rc == 0 and ls_out.strip() and ' tree ' in ls_out:
-            # Directory: prefix-match against the touched set.
-            prefix = norm.rstrip('/') + '/'
-            if any(t.startswith(prefix) for t in touched_set):
+        if rc != 0:
+            # Could not measure existence — flag UNCLASSIFIED rather than
+            # asserting an absence we never established.
+            logger.warning(
+                'plan-files-touched: ls-tree probe failed task_id=%s entry=%s '
+                'head=%s rc=%s stderr=%s',
+                task_id or '<unknown>', entry, branch_head, rc,
+                (ls_err or '').strip()[:400],
+            )
+            not_touched.append(entry)
+            continue
+
+        if ls_out.strip():
+            # Path EXISTS at branch_head.
+            if ' tree ' in ls_out:
+                # Directory: prefix-match against the touched set.
+                prefix = norm.rstrip('/') + '/'
+                if any(t.startswith(prefix) for t in touched_set):
+                    continue
+            not_touched.append(entry)
+            continue
+
+        # Path is ABSENT from the branch tree: the declared path is stale,
+        # so the touched set can say nothing about it.  Try to resolve the
+        # rename before blaming the branch (task 3110).
+        resolution = await _resolve_renamed_plan_path(
+            norm, branch_head, git_ops, task_id=task_id,
+        )
+        if resolution is not None:
+            resolved, mechanism = resolution
+            # Key on the ORIGINAL declared string so the diagnostic names
+            # exactly what plan.json says (composes with task 1587's
+            # ./-prefix normalization instead of re-solving it).
+            resolved_renames[entry] = resolved
+            if resolved in touched_set:
+                # A resolved rename means the task's declared metadata.files
+                # is stale — a real data-quality signal on a path that
+                # otherwise produces no output at all.  Log it LOUD even
+                # though the gate passes (no-silent-fail-soft).
+                logger.warning(
+                    'plan-files-touched: declared %s resolved to %s via %s; '
+                    'branch touched the resolved path — gate PASSES. task_id=%s',
+                    entry, resolved, mechanism, task_id or '<unknown>',
+                )
                 continue
 
         not_touched.append(entry)
@@ -1119,7 +1259,10 @@ async def _check_plan_files_touched_in_branch(
             'base=%s head=%s entries=%r',
             task_id or '<unknown>', base_sha, branch_head, not_touched,
         )
-    return PlanFilesTouchedResult(not_touched=not_touched)
+    return PlanFilesTouchedResult(
+        not_touched=not_touched,
+        resolved_renames=resolved_renames,
+    )
 
 
 async def _check_post_merge_equivalence(
