@@ -65,8 +65,19 @@ class Mem0Client:
 
 
 @pytest.fixture
-def real_tree():
+def real_tree() -> ast.Module:
     return cmpw.parse_module(REAL_SHAPE)
+
+
+def _resolved(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """Resolve *name*, failing loudly when the fixture does not declare it.
+
+    Also narrows away `resolve_function`'s `| None` for pyright, which
+    `scripts/orchestrator.yaml` runs over this directory.
+    """
+    fn = cmpw.resolve_function(tree, name)
+    assert fn is not None, f'fixture module declares no function {name!r}'
+    return fn
 
 
 class TestResolveFunction:
@@ -111,7 +122,7 @@ class TestDeclaresParam:
     """`declares_param` inspects the resolved function's own signature."""
 
     def test_true_for_keyword_only_declaration(self, real_tree):
-        fn = cmpw.resolve_function(real_tree, 'scroll_by_metadata')
+        fn = _resolved(real_tree, 'scroll_by_metadata')
         assert cmpw.declares_param(fn, 'with_vectors') is True
 
     def test_false_for_the_method_that_does_not_declare_it(self, real_tree):
@@ -120,18 +131,18 @@ class TestDeclaresParam:
         Its `with_vectors=False` is a literal keyword on `client.retrieve`.
         The superseded whole-file grep could not tell these two apart.
         """
-        fn = cmpw.resolve_function(real_tree, 'get_point_by_id')
+        fn = _resolved(real_tree, 'get_point_by_id')
         assert cmpw.declares_param(fn, 'with_vectors') is False
 
     def test_finds_positional_or_keyword_param(self):
         """Must not silently depend on the `*` in today's signature."""
         tree = cmpw.parse_module('def f(self, with_vectors: bool = False):\n    pass\n')
-        fn = cmpw.resolve_function(tree, 'f')
+        fn = _resolved(tree, 'f')
         assert cmpw.declares_param(fn, 'with_vectors') is True
 
     def test_finds_positional_only_param(self):
         tree = cmpw.parse_module('def f(with_vectors: bool = False, /):\n    pass\n')
-        fn = cmpw.resolve_function(tree, 'f')
+        fn = _resolved(tree, 'f')
         assert cmpw.declares_param(fn, 'with_vectors') is True
 
 
@@ -139,19 +150,19 @@ class TestDeclaresParamAnnotation:
     """Annotation matching preserves what the grep pattern asserted."""
 
     def test_matching_annotation_is_true(self, real_tree):
-        fn = cmpw.resolve_function(real_tree, 'scroll_by_metadata')
+        fn = _resolved(real_tree, 'scroll_by_metadata')
         assert cmpw.declares_param(fn, 'with_vectors', annotation='bool') is True
 
     def test_mismatched_annotation_is_false(self, real_tree):
-        fn = cmpw.resolve_function(real_tree, 'scroll_by_metadata')
+        fn = _resolved(real_tree, 'scroll_by_metadata')
         assert cmpw.declares_param(fn, 'with_vectors', annotation='int') is False
 
     def test_unannotated_param_fails_a_required_annotation(self):
         tree = cmpw.parse_module('def f(self, with_vectors=False):\n    pass\n')
-        fn = cmpw.resolve_function(tree, 'f')
+        fn = _resolved(tree, 'f')
         assert cmpw.declares_param(fn, 'with_vectors', annotation='bool') is False
 
     def test_unannotated_param_passes_when_no_annotation_required(self):
         tree = cmpw.parse_module('def f(self, with_vectors=False):\n    pass\n')
-        fn = cmpw.resolve_function(tree, 'f')
+        fn = _resolved(tree, 'f')
         assert cmpw.declares_param(fn, 'with_vectors', annotation=None) is True
