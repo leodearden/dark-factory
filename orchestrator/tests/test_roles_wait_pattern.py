@@ -15,11 +15,18 @@ file pins that STRUCTURALLY rather than editorially: ``BACKGROUND_WAIT_GUIDANCE`
 is the single splice unit, and it is asserted to contain both halves, so no
 future prompt refactor can splice one without the other.
 
+Turn prompts whose role already carries the full block inject the short
+``WAIT_PATTERN_REMINDER`` pointer instead, so no session receives the same
+~3.2 kB twice; the tests below pin both the pointer AND the precondition that
+makes it sound (its receiving role really does carry the block).
+
 Its real effect is on model behaviour and is not unit-testable, but silent
 removal during a prompt refactor is a genuine safety regression — the repo
 sanctions exactly this kind of "mandated token present in each role prompt"
-guard. Each assertion is a one-line existence / containment / ordering check
-against a named constant, not a prose or regex pin.
+guard. Each assertion is an existence / containment / ordering / count check
+against a named constant, not a prose or regex pin — including the placement
+check, which compares against the prompt's first ``##`` heading rather than any
+particular heading's text.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from orchestrator.agents.roles import (
     BACKGROUND_WAIT_GUIDANCE,
     ROLES,
     WAIT_PATTERN_GUIDANCE,
+    WAIT_PATTERN_REMINDER,
 )
 from orchestrator.config import GitConfig, OrchestratorConfig
 
@@ -54,18 +62,21 @@ _BACKGROUND_CAPABLE_ROLES = frozenset({
     'simple_task',
 })
 
-# "Up front" == within the first kilobyte of the system prompt. Every target
-# role's opening identity paragraph is under ~450 chars (``simple_task``'s
-# ~6-line opener is the longest at ~420), so this pins "immediately after the
-# identity paragraph, before the first ``##`` heading" without pinning any
-# prose. The census-R3 defect was precisely that task 2761's guard sat at the
-# TAIL of an 11 kB prompt, behind the escalation/memory/follow-up blocks.
-_UP_FRONT_CHAR_BUDGET = 1000
+# Secondary, deliberately LOOSE bound on how much identity paragraph may
+# precede the block. The real invariant is the structural one below (the
+# guidance's own heading must be the prompt's FIRST ``##`` heading); this only
+# catches a pathologically long preamble that is technically heading-free.
+# Widest current margin is ``simple_task`` at 417 chars, so this leaves ~3x
+# headroom and will not fire merely because someone added a sentence.
+_UP_FRONT_CHAR_BUDGET = 1500
 
-# Every target role's system_prompt ends with ``_ESCALATION_INSTRUCTIONS``, so
-# this heading is a stable ordering landmark for "ahead of the appended tail
-# blocks" that does not depend on any block's own wording.
-_TAIL_BLOCK_LANDMARK = '## Escalation'
+# ``BACKGROUND_WAIT_GUIDANCE`` opens with its own ``\n## `` heading, so
+# "spliced between the identity paragraph and the role's first real section"
+# is exactly "its heading IS the first ``##`` heading in the prompt". That is a
+# structural property of the splice, not a prose pin: it keeps holding when
+# every heading in the file is renamed. It replaces an earlier ``'## Escalation'``
+# landmark that silently no-opped when the heading was not found.
+_MARKDOWN_HEADING = '\n## '
 
 
 def test_wait_pattern_guidance_is_nonempty() -> None:
@@ -94,17 +105,51 @@ def test_combined_guidance_composes_both_rules() -> None:
     )
 
 
-def test_wait_pattern_guidance_has_no_literal_braces() -> None:
+@pytest.mark.parametrize(
+    'name',
+    ['WAIT_PATTERN_GUIDANCE', 'WAIT_PATTERN_REMINDER'],
+)
+def test_wait_pattern_constants_have_no_literal_braces(name: str) -> None:
     """No literal ``{``/``}`` — same invariant ``BACKGROUND_TASK_WARNING`` holds.
 
-    The constant is interpolated into ``build_amender_prompt``'s f-string, so a
-    literal brace would raise at import/format time or silently mangle the
+    Both constants reach an f-string: ``WAIT_PATTERN_REMINDER`` is interpolated
+    into ``build_amender_prompt`` directly, and ``WAIT_PATTERN_GUIDANCE`` is
+    concatenated into ``BACKGROUND_WAIT_GUIDANCE``, which is spliced into role
+    prompts. A literal brace would raise at format time or silently mangle the
     rendered prompt.
     """
-    assert '{' not in WAIT_PATTERN_GUIDANCE and '}' not in WAIT_PATTERN_GUIDANCE, (
-        'WAIT_PATTERN_GUIDANCE contains a literal brace. It is interpolated into '
-        "build_amender_prompt's f-string (briefing.py) — braces must be removed or "
-        'the prompt breaks at runtime.'
+    value = {
+        'WAIT_PATTERN_GUIDANCE': WAIT_PATTERN_GUIDANCE,
+        'WAIT_PATTERN_REMINDER': WAIT_PATTERN_REMINDER,
+    }[name]
+
+    assert '{' not in value and '}' not in value, (
+        f'{name} contains a literal brace. It reaches an f-string in '
+        'briefing.py — braces must be removed or the prompt breaks at runtime.'
+    )
+
+
+def test_wait_pattern_reminder_is_a_pointer_not_a_copy() -> None:
+    """The reminder is a short pointer, not a second copy of the full block.
+
+    Guards the whole point of ``WAIT_PATTERN_REMINDER``: if someone "fixes" it
+    by pasting the guidance back in, the amender pays for the block twice.
+    """
+    # Lower bound: the reinforcement must stay substantive. A bare "see the
+    # rule above" cross-reference is not what sat at Reify-5164's failure site.
+    # Structural, not a prose pin -- any rewording of comparable substance passes.
+    assert len(WAIT_PATTERN_REMINDER.strip()) > 200, (
+        'WAIT_PATTERN_REMINDER has shrunk to a bare cross-reference '
+        f'({len(WAIT_PATTERN_REMINDER.strip())} chars). It must still state the '
+        'operative rules at the failure site, not merely allude to them.'
+    )
+    assert len(WAIT_PATTERN_REMINDER) < len(BACKGROUND_WAIT_GUIDANCE) / 2, (
+        'WAIT_PATTERN_REMINDER has grown to a substantial fraction of '
+        'BACKGROUND_WAIT_GUIDANCE '
+        f'({len(WAIT_PATTERN_REMINDER)} vs {len(BACKGROUND_WAIT_GUIDANCE)} chars). '
+        'It exists to point at the full block carried by the role system '
+        'prompt, not to restate it — splice the real constant if a turn prompt '
+        'genuinely needs the whole thing.'
     )
 
 
@@ -177,6 +222,11 @@ def test_combined_guidance_is_stated_up_front() -> None:
     This is the census-R3 defect itself: task 2761's guard was appended at the
     very end of an 11 kB prompt (and ``_FOLLOWUP_FILING_INSTRUCTIONS`` after it),
     where it does not read as an operating rule.
+
+    "Up front" is asserted STRUCTURALLY: the block's own ``##`` heading must be
+    the first ``##`` heading in the prompt, i.e. nothing but the opening
+    identity paragraph precedes it. No heading text is pinned, so renaming any
+    section in ``roles.py`` cannot silently turn this check into a no-op.
     """
     offenders = {}
     for name in sorted(_BACKGROUND_CAPABLE_ROLES):
@@ -187,15 +237,16 @@ def test_combined_guidance_is_stated_up_front() -> None:
             # pass vacuously on a role that dropped the block.
             offenders[name] = {'offset': 'ABSENT'}
             continue
-        landmark = prompt.find(_TAIL_BLOCK_LANDMARK)
-        if idx >= _UP_FRONT_CHAR_BUDGET or (landmark != -1 and idx >= landmark):
-            offenders[name] = {'offset': idx, _TAIL_BLOCK_LANDMARK: landmark}
+        first_heading = prompt.find(_MARKDOWN_HEADING)
+        if idx != first_heading or idx >= _UP_FRONT_CHAR_BUDGET:
+            offenders[name] = {'offset': idx, 'first_heading': first_heading}
 
     assert offenders == {}, (
-        f'Roles stating the guidance too late: {offenders} '
-        f'(budget={_UP_FRONT_CHAR_BUDGET} chars, and it must precede '
-        f'{_TAIL_BLOCK_LANDMARK!r}). Splice BACKGROUND_WAIT_GUIDANCE immediately '
-        'after the opening identity paragraph, before the first `##` heading.'
+        f'Roles stating the guidance too late: {offenders}. The block must be '
+        "spliced immediately after the opening identity paragraph, so that its "
+        'own `##` heading is the FIRST `##` heading in the prompt (offset == '
+        f'first_heading) and lands within {_UP_FRONT_CHAR_BUDGET} chars. A '
+        'first_heading BELOW offset means some other section now precedes it.'
     )
 
 
@@ -215,19 +266,43 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
     return BriefingAssembler(config)
 
 
+def test_amender_reminder_cannot_dangle() -> None:
+    """The pointer's precondition: its receiving role carries the full block.
+
+    ``build_amender_prompt`` injects the short ``WAIT_PATTERN_REMINDER`` rather
+    than restating all of ``BACKGROUND_WAIT_GUIDANCE``, which is only sound
+    because the amender is invoked under IMPLEMENTER (``workflow.py``, the sole
+    ``_invoke(IMPLEMENTER, ...)`` amendment call site) and IMPLEMENTER carries
+    the full block up front. Pin that precondition here: if IMPLEMENTER ever
+    loses the block, the pointer refers to rules the amender was never given.
+    """
+    assert BACKGROUND_WAIT_GUIDANCE in ROLES['implementer'].system_prompt, (
+        "IMPLEMENTER lost BACKGROUND_WAIT_GUIDANCE, so build_amender_prompt's "
+        'WAIT_PATTERN_REMINDER now points at rules the amender never receives. '
+        'Either restore the block to IMPLEMENTER, or inline the full '
+        'BACKGROUND_WAIT_GUIDANCE into the amender turn-prompt again.'
+    )
+
+
 @pytest.mark.asyncio
-async def test_amender_prompt_carries_combined_guidance(
+async def test_amender_prompt_reinforces_the_wait_rules(
     briefing: BriefingAssembler,
 ) -> None:
-    """The built amender turn-prompt reinforces BOTH rules, not just 2761's half.
+    """The built amender turn-prompt reinforces the rules at the failure site.
 
     The amender has no dedicated role — it runs under IMPLEMENTER's system
-    prompt, which now carries the block up front. The turn-prompt injection is
-    the deliberate at-the-failure-site reinforcement: Reify-5164's amender
+    prompt, which carries the combined block up front. This injection is the
+    deliberate at-the-failure-site reinforcement: Reify-5164's amender
     backgrounded a 2700s verify and ended its turn at exactly the "Run
-    verification before finishing" step this block sits under. An amender told
-    only "don't end your turn" and not "here is how to wait" is the case this
-    task exists to close.
+    verification before finishing" step the reminder sits under.
+
+    It asserts the POINTER, not the whole block: interpolating
+    ``BACKGROUND_WAIT_GUIDANCE`` verbatim here would hand the amender the same
+    ~3.2 kB twice in one session (once via IMPLEMENTER's system prompt, once
+    here) — the cross-prompt twin of the double-splice that
+    ``test_combined_guidance_appears_exactly_once_per_role`` forbids within a
+    single prompt. The no-duplication half is asserted explicitly so a future
+    edit cannot quietly reintroduce it.
 
     ``_get_memory_context`` is patched to a stub so no real fused-memory HTTP
     call fires (mirrors the resume golden test).
@@ -243,9 +318,15 @@ async def test_amender_prompt_carries_combined_guidance(
             task_id='1',
         )
 
-    assert BACKGROUND_WAIT_GUIDANCE in prompt, (
-        'The amender turn-prompt does not carry BACKGROUND_WAIT_GUIDANCE. '
-        'build_amender_prompt must interpolate the combined unit, not '
-        'BACKGROUND_TASK_WARNING alone — the wait-pattern half is what tells the '
-        'amender how to run a long verify without abandoning it.'
+    assert WAIT_PATTERN_REMINDER in prompt, (
+        'The amender turn-prompt does not carry WAIT_PATTERN_REMINDER. The '
+        '"run verification before finishing" step is Reify-5164 exact failure '
+        'site — it must restate the wait rules there, not rely solely on the '
+        'system prompt.'
+    )
+    assert BACKGROUND_WAIT_GUIDANCE not in prompt, (
+        'The amender turn-prompt inlines the full BACKGROUND_WAIT_GUIDANCE. '
+        "IMPLEMENTER's system prompt already carries it up front, so this "
+        'duplicates ~3.2 kB verbatim in every amendment pass. Use the short '
+        'WAIT_PATTERN_REMINDER pointer instead.'
     )

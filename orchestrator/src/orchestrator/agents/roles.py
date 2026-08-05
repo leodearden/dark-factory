@@ -329,6 +329,20 @@ leaving a half-done tree that is falsely recorded as a completed, successful run
 #       the exact footgun-trade the composition mandate exists to prevent: the
 #       prohibition without the pattern breeds busy-loops, the pattern without
 #       the prohibition breeds abandoned background work.
+#
+# TOOL AVAILABILITY -- measured 2026-08-05, do NOT re-derive.  The tools named
+# below (`BashOutput`, `Monitor`, `ToolSearch`, `ScheduleWakeup`) are absent
+# from every role's `allowed_tools`, and that is CORRECT, not a bug: the
+# `--allowed-tools` flag cli_invoke passes (cli_invoke.py:1830) is a PERMISSION
+# allowlist -- what may run without a prompt -- not a tool-registry filter.
+# Built-in harness tools remain present and callable regardless.  Verified from
+# inside a dispatched implementer session whose cmdline was exactly
+# `--allowed-tools Read Edit Write Bash Glob Grep mcp__...`: `ToolSearch` and
+# `ScheduleWakeup` were live in that session's tool list, and
+# `ToolSearch("select:Monitor,TaskOutput")` returned both schemas.  The same
+# holds for the `BashOutput`/`KillShell` that BACKGROUND_TASK_WARNING has named
+# since task 2761.  So do NOT "fix" this block by trimming those tools out of
+# it on the theory that the roles cannot reach them -- they can.
 WAIT_PATTERN_GUIDANCE = """
 ## CRITICAL: How to wait for something
 
@@ -337,41 +351,73 @@ on pending background work. This is the other half: how to actually wait.
 
 SANCTIONED
 - Default: run the command in the FOREGROUND with an explicit Bash `timeout`
-  sized to the expected wall clock plus margin (it is in MILLISECONDS). An
-  omitted `timeout` kills the call at the 2-minute default — that is the
-  exit-143 failure mode you will otherwise misdiagnose as a hung command.
+  sized to the expected wall clock plus margin. It is in MILLISECONDS, it
+  DEFAULTS to 120000 (2 minutes) when omitted, and it is CAPPED at 3900000
+  (65 minutes). A 5-minute command silently killed at that 2-minute default is
+  the exit-143 failure mode you will otherwise misdiagnose as a hung command.
   Foreground-and-finished beats backgrounded-and-abandoned.
-- If you must background: `Bash` with `run_in_background=true`, then poll it to
-  completion with `BashOutput` and READ the result before ending your turn
-  (that is the rule above). Background tasks are exempt from the foreground
-  timeout — that exemption is the only good reason to reach for them.
-- If a `Monitor` tool is available in this session, use its until-condition
-  form for a genuinely long wait instead of hand-rolling one in shell — and
-  load its schema with `ToolSearch("select:Monitor")` FIRST, because it is a
-  deferred tool and calling it cold is rejected client-side with
-  `InputValidationError` for invented parameter names.
+- If the run genuinely exceeds the 3900000 ceiling, background it: `Bash` with
+  `run_in_background=true` — background work is exempt from the foreground
+  timeout, and that exemption is the only good reason to reach for it — then
+  poll it to completion with `BashOutput` and READ the result BEFORE ending
+  your turn. Launching it detached with `setsid` and polling its log file is
+  the same sanctioned shape; so is backgrounding a wait command that EXITS on
+  its own when the condition holds. Polling something you launched is NOT the
+  ad-hoc wait prohibited below: you have a real completion signal, and you stay
+  until you have it.
+- `Monitor` streams ONE notification per matching output line, so it fits a
+  recurring event feed, not a single "tell me when this finishes" — for that,
+  background a command that exits when done. If you do reach for it, load its
+  schema with `ToolSearch("select:Monitor")` FIRST: it is a deferred tool, and
+  calling it cold is rejected client-side with `InputValidationError` for
+  invented parameter names.
 
 NEVER — each of these cost a real session a turn or an entire wait
 - `sleep N; tail ...` / `sleep N && cat ...` chained to poll background output.
   The harness anti-polling guard BLOCKS foreground sleep and spends one of your
   turns teaching you this. Do not retry with a different sleep spelling.
-- Back-to-back `Read`/`Bash` calls fired as an ad-hoc wait. They do not wait;
-  they burn turns and context and observe nothing new.
-- A hand-rolled foreground `until`/`while` busy-loop. It runs until the Bash
+- Back-to-back `Read`/`Bash` calls fired as an ad-hoc DELAY — re-reading an
+  unchanged file to "let some time pass". That is not waiting: it burns turns
+  and context and observes nothing new. (Polling a genuine completion signal,
+  as above, is a different thing and is fine.)
+- A hand-rolled FOREGROUND `until`/`while` busy-loop. It runs until the Bash
   timeout SIGTERMs it (exit 143) and you lose EVERYTHING it had observed —
-  strictly worse than not waiting at all.
+  strictly worse than not waiting at all. The same loop is fine BACKGROUNDED,
+  where no foreground timeout applies.
 - `ScheduleWakeup` as a generic delay. It is scoped to `/loop` dynamic mode,
   requires its `prompt` argument, and does nothing for a one-shot dispatched
   session.
-- Polling `TaskOutput` on a task id without first confirming the task is still
-  live. A reaped or unknown id returns nothing, forever.
 """
 
 
-# The single splice unit.  Roles and turn-prompts embed THIS, never either half
-# on its own -- see constraint (b) above; test_roles_wait_pattern.py asserts the
+# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# own -- see constraint (b) above; test_roles_wait_pattern.py asserts the
 # composition so the two rules cannot drift apart.
 BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
+
+
+# Pointer form for a TURN prompt whose role system_prompt already carries the
+# full block above.  Restating all ~3.2 kB at the failure site would hand the
+# agent the identical text twice in one session -- the very double-splice that
+# test_combined_guidance_appears_exactly_once_per_role polices WITHIN a system
+# prompt, just spread across the system/turn pair where that test cannot see
+# it.  The point of the at-the-failure-site injection was always ADJACENCY (put
+# the rule next to the action item that trips it), and a pointer buys that at
+# ~2% of the tokens.
+#
+# Use this ONLY where the receiving role is statically known to carry
+# BACKGROUND_WAIT_GUIDANCE, or the pointer dangles and the agent is left with
+# neither half.  Today that is build_amender_prompt alone, which is invoked
+# under IMPLEMENTER at exactly one call site (workflow.py `_invoke(IMPLEMENTER,
+# ...)`); test_roles_wait_pattern.py pins that precondition rather than
+# trusting this comment.  Same no-literal-braces rule as the constants above.
+WAIT_PATTERN_REMINDER = """
+Reminder — verification is exactly where the wait rules above bite. Run it in
+the FOREGROUND with an explicit Bash `timeout` (milliseconds; 120000 default,
+3900000 max). If it cannot fit under that ceiling, background it and poll to
+completion with `BashOutput` before you end your turn. Never end this turn with
+verification still pending: this session is one-shot, and abandoned work is
+recorded as a successful run."""
 
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
