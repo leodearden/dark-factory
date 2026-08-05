@@ -260,3 +260,166 @@ class TestForwardsParamTo:
         )
         fn = _resolved(tree, 'target')
         assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is False
+
+
+# The argv the manifest declares, minus --file (each test supplies its own).
+_ARGV_TAIL = [
+    '--function', 'scroll_by_metadata',
+    '--param', 'with_vectors',
+    '--annotation', 'bool',
+    '--forwards-to', 'scroll',
+]
+
+
+class TestMainExitCodeContract:
+    """`_run_script_check` maps rc==0 -> DELIVERED and ANY non-zero -> FAILED.
+
+    There is no exit code meaning "I could not evaluate this". FAILED is a
+    definitive-absence claim that `Scheduler._compute_delivered_check_cache`
+    renders as a `DEP_CAPABILITY_NOT_DELIVERED` escalation whose blocked
+    dependents are explicitly NOT auto-re-pended. So every non-zero return must
+    be one this script understands, and must name which conjunct failed — an
+    operator reading that escalation has to be able to tell "the capability
+    regressed" from "the check's own arguments are stale".
+    """
+
+    def _write(self, tmp_path, source: str, name: str = 'mod.py'):
+        target = tmp_path / name
+        target.write_text(source)
+        return target
+
+    def test_real_shape_returns_zero_and_is_silent(self, tmp_path, capsys):
+        target = self._write(tmp_path, REAL_SHAPE)
+        rc = cmpw.main(['--file', str(target), *_ARGV_TAIL])
+        assert rc == 0
+        assert capsys.readouterr().err == ''
+
+    def test_unknown_function_is_distinguishable(self, tmp_path, capsys):
+        target = self._write(tmp_path, REAL_SHAPE)
+        rc = cmpw.main(['--file', str(target), '--function', 'nope',
+                        '--param', 'with_vectors'])
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'not found' in err
+        assert 'nope' in err and str(target) in err
+
+    def test_ambiguous_function_is_distinguishable(self, tmp_path, capsys):
+        target = self._write(
+            tmp_path,
+            'class A:\n'
+            '    def dup(self, with_vectors: bool = False):\n'
+            '        pass\n'
+            '\n'
+            '\n'
+            'class B:\n'
+            '    def dup(self, with_vectors: bool = False):\n'
+            '        pass\n',
+        )
+        rc = cmpw.main(['--file', str(target), '--function', 'dup',
+                        '--param', 'with_vectors'])
+        assert rc != 0
+        assert 'ambiguous' in capsys.readouterr().err
+
+    def test_param_absent_is_distinguishable(self, tmp_path, capsys):
+        target = self._write(tmp_path, REAL_SHAPE)
+        rc = cmpw.main(['--file', str(target), '--function', 'get_point_by_id',
+                        '--param', 'with_vectors'])
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'does not declare' in err
+        assert 'get_point_by_id' in err and 'with_vectors' in err
+
+    def test_annotation_mismatch_is_distinguishable(self, tmp_path, capsys):
+        target = self._write(tmp_path, REAL_SHAPE)
+        rc = cmpw.main(['--file', str(target), '--function', 'scroll_by_metadata',
+                        '--param', 'with_vectors', '--annotation', 'int'])
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'annotation' in err
+        assert 'int' in err
+
+    def test_not_forwarded_is_distinguishable(self, tmp_path, capsys):
+        """Declared but dropped — the hollow-DELIVERED case."""
+        target = self._write(
+            tmp_path,
+            'def scroll_by_metadata(self, *, with_vectors: bool = False):\n'
+            '    return client.scroll(with_payload=True)\n',
+        )
+        rc = cmpw.main(['--file', str(target), *_ARGV_TAIL])
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'does not forward' in err
+        assert 'scroll' in err
+
+    def test_missing_file_is_distinguishable(self, tmp_path, capsys):
+        rc = cmpw.main(['--file', str(tmp_path / 'absent.py'), *_ARGV_TAIL])
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'file not found' in err
+        assert 'absent.py' in err
+
+    def test_unparseable_file_is_distinguishable(self, tmp_path, capsys):
+        target = self._write(tmp_path, 'def broken(:\n    pass\n')
+        rc = cmpw.main(['--file', str(target), *_ARGV_TAIL])
+        assert rc != 0
+        assert 'could not parse' in capsys.readouterr().err
+
+    def test_every_diagnostic_is_distinct(self, tmp_path, capsys):
+        """No two failure modes may print the same message.
+
+        An operator triaging a DEP_CAPABILITY_NOT_DELIVERED escalation reads
+        only this line.
+        """
+        good = self._write(tmp_path, REAL_SHAPE, 'good.py')
+        dropped = self._write(
+            tmp_path,
+            'def scroll_by_metadata(self, *, with_vectors: bool = False):\n'
+            '    return client.scroll(with_payload=True)\n',
+            'dropped.py',
+        )
+        broken = self._write(tmp_path, 'def broken(:\n', 'broken.py')
+        dup = self._write(
+            tmp_path,
+            'def dup(with_vectors: bool = False):\n    pass\n'
+            '\n'
+            '\n'
+            'def dup(with_vectors: bool = False):\n    pass\n',
+            'dup.py',
+        )
+        cases = [
+            ['--file', str(good), '--function', 'nope', '--param', 'with_vectors'],
+            ['--file', str(dup), '--function', 'dup', '--param', 'with_vectors'],
+            ['--file', str(good), '--function', 'get_point_by_id', '--param', 'with_vectors'],
+            ['--file', str(good), '--function', 'scroll_by_metadata',
+             '--param', 'with_vectors', '--annotation', 'int'],
+            ['--file', str(dropped), *_ARGV_TAIL],
+            ['--file', str(tmp_path / 'absent.py'), *_ARGV_TAIL],
+            ['--file', str(broken), *_ARGV_TAIL],
+        ]
+        messages = []
+        for argv in cases:
+            assert cmpw.main(argv) != 0
+            messages.append(capsys.readouterr().err.strip())
+        assert all(messages), 'every non-zero return must explain itself'
+        assert len(set(messages)) == len(messages), messages
+
+
+class TestMainOptionalConjuncts:
+    def test_annotation_and_forwards_to_are_optional(self, tmp_path, capsys):
+        """Omitting both, declaration alone suffices."""
+        target = tmp_path / 'mod.py'
+        target.write_text('def f(self, with_vectors=False):\n    pass\n')
+        rc = cmpw.main(['--file', str(target), '--function', 'f',
+                        '--param', 'with_vectors'])
+        assert rc == 0
+        assert capsys.readouterr().err == ''
+
+    def test_file_is_resolved_relative_to_cwd(self, tmp_path, monkeypatch, capsys):
+        """`_run_script_check` runs with cwd=project_root and a relative path."""
+        pkg = tmp_path / 'nested'
+        pkg.mkdir()
+        (pkg / 'mod.py').write_text(REAL_SHAPE)
+        monkeypatch.chdir(tmp_path)
+        rc = cmpw.main(['--file', 'nested/mod.py', *_ARGV_TAIL])
+        assert rc == 0
+        assert capsys.readouterr().err == ''
