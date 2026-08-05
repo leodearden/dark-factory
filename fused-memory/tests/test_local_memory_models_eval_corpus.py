@@ -1034,3 +1034,202 @@ class TestManifestSerialization:
         assert path.parent.name == 'local_memory_models_eval'
         assert 'scripts' in path.parts
         assert 'data' not in path.parts
+
+
+# ===========================================================================
+# Re-derivability — the task's user-observable signal
+# ===========================================================================
+
+
+class TestVerifyManifestReDerives:
+    """A reviewer re-derives the sample from the manifest's OWN criteria."""
+
+    def test_clean_verify_reports_ok_with_counts(self):
+        population = _population(SYNTHETIC_CELLS)
+        report = _mod.verify_manifest(_built(population=population), population)
+        assert report.status == 'ok'
+        assert report.ok is True
+        assert report.checked == 20
+        assert not report.id_mismatch
+        assert not report.hash_drift
+        assert not report.missing
+
+    def test_re_derivation_reproduces_the_exact_uuid_list_in_order(self):
+        """The property a reviewer actually checks."""
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        report = _mod.verify_manifest(manifest, population)
+        assert report.rederived == [e['uuid'] for e in manifest['episodes']]
+
+    def test_verification_does_not_read_the_episode_list_as_its_own_answer(self):
+        """The check must not be vacuous.
+
+        If verify re-read the manifest's own `episodes` list as the source of
+        truth for what to select, it would pass on ANY manifest — including a
+        tampered one. So: replace the episode list wholesale with records that
+        the recorded criteria would never select, and demand a failure.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        wrong = [
+            {
+                'uuid': r.uuid,
+                'content_hash': _mod.content_hash(r.content),
+                'month': _mod.stratum_key(r)[0],
+                'payload_kind': _mod.stratum_key(r)[1],
+            }
+            for r in population[:20]
+        ]
+        assert [e['uuid'] for e in wrong] != [e['uuid'] for e in manifest['episodes']]
+        report = _mod.verify_manifest({**manifest, 'episodes': wrong}, population)
+        assert report.status == 'id_mismatch'
+
+
+class TestVerifyCatchesTampering:
+    """A tampered criterion must fail loudly, with a structured diff."""
+
+    @pytest.mark.parametrize('field,value', [('seed', 'tampered'), ('n', 25)])
+    def test_mutated_criterion_fails(self, field, value):
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        tampered = {
+            **manifest,
+            'criteria': {**manifest['criteria'], field: value},
+        }
+        report = _mod.verify_manifest(tampered, population)
+        assert report.ok is False
+        assert report.status == 'id_mismatch'
+
+    def test_failure_names_expected_vs_actual_not_a_bare_boolean(self):
+        """A bare False tells a reviewer nothing about what to fix."""
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        tampered = {**manifest, 'criteria': {**manifest['criteria'], 'seed': 'x'}}
+        report = _mod.verify_manifest(tampered, population)
+        assert report.id_mismatch['only_in_manifest']
+        assert report.id_mismatch['only_in_rederivation']
+        assert 'seed' in report.detail or 'id' in report.detail.lower()
+
+    def test_a_single_swapped_id_is_caught(self):
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        episodes = [dict(e) for e in manifest['episodes']]
+        outside = next(
+            r.uuid for r in population if r.uuid not in {e['uuid'] for e in episodes}
+        )
+        episodes[0] = {**episodes[0], 'uuid': outside}
+        report = _mod.verify_manifest({**manifest, 'episodes': episodes}, population)
+        assert report.status == 'id_mismatch'
+
+
+class TestVerifyCatchesContentDrift:
+    """Hash drift is a DIFFERENT failure from an id mismatch."""
+
+    def _drifted(self):
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        target = manifest['episodes'][0]['uuid']
+        drifted = [
+            _record(r.uuid, *_mod.stratum_key(r), content='EDITED')
+            if r.uuid == target
+            else r
+            for r in population
+        ]
+        return manifest, drifted, target
+
+    def test_drift_is_reported_with_the_affected_uuids(self):
+        manifest, drifted, target = self._drifted()
+        report = _mod.verify_manifest(manifest, drifted)
+        assert report.ok is False
+        assert report.status == 'hash_drift'
+        assert target in report.hash_drift
+
+    def test_drift_entry_carries_expected_and_actual_hashes(self):
+        manifest, drifted, target = self._drifted()
+        report = _mod.verify_manifest(manifest, drifted)
+        entry = report.hash_drift[target]
+        assert entry['expected'] != entry['actual']
+        assert entry['actual'] == _mod.content_hash('EDITED')
+
+    def test_drift_is_distinct_from_an_id_mismatch(self):
+        """Different failures, different remedies.
+
+        An id mismatch means the manifest no longer describes what its criteria
+        produce — re-derive or investigate tampering. Hash drift means the
+        SELECTION is still right but the replay inputs changed underneath it —
+        the corpus needs re-hashing and epsilon/zeta/theta results computed
+        against the old bytes are suspect. Collapsing both into one non-zero
+        status would send a reviewer down the wrong path.
+        """
+        manifest, drifted, _ = self._drifted()
+        report = _mod.verify_manifest(manifest, drifted)
+        assert report.status == 'hash_drift'
+        assert not report.id_mismatch
+        assert _mod.EXIT_CODES['hash_drift'] != _mod.EXIT_CODES['id_mismatch']
+
+
+class TestVerifyCatchesMissingEpisodes:
+    """An id in the manifest but absent from the store is reported, not skipped."""
+
+    def _without_a_selected_episode(self):
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        gone = manifest['episodes'][0]['uuid']
+        return manifest, [r for r in population if r.uuid != gone], gone
+
+    def test_vanished_episode_is_reported_as_missing(self):
+        manifest, reduced, gone = self._without_a_selected_episode()
+        report = _mod.verify_manifest(manifest, reduced)
+        assert report.ok is False
+        assert gone in report.missing
+
+    def test_missing_is_never_silently_skipped(self):
+        """The absorb-and-continue failure this seam exists to prevent."""
+        manifest, reduced, _ = self._without_a_selected_episode()
+        report = _mod.verify_manifest(manifest, reduced)
+        assert report.status != 'ok'
+        assert _mod.EXIT_CODES[report.status] != 0
+
+
+class TestVerifyStatusSemantics:
+    """Each failure class is distinguishable by exit code (the INV-2/INV-4 seam)."""
+
+    def test_exit_codes_cover_every_status(self):
+        assert set(_mod.EXIT_CODES) == {
+            'ok',
+            'id_mismatch',
+            'hash_drift',
+            'missing_episodes',
+            'bad_manifest',
+        }
+
+    def test_ok_is_zero_and_every_failure_is_distinctly_non_zero(self):
+        codes = _mod.EXIT_CODES
+        assert codes['ok'] == 0
+        failures = [v for k, v in codes.items() if k != 'ok']
+        assert all(v != 0 for v in failures)
+        assert len(set(failures)) == len(failures), 'failure codes must be distinct'
+
+    @pytest.mark.parametrize(
+        'broken',
+        [
+            {},
+            {'episodes': []},
+            {'criteria': {'seed': 's'}},
+            {'criteria': {'seed': 's', 'n': 20}, 'episodes': 'not-a-list'},
+        ],
+    )
+    def test_a_structurally_broken_manifest_is_bad_manifest_not_a_traceback(
+        self, broken
+    ):
+        report = _mod.verify_manifest(broken, _population(SYNTHETIC_CELLS))
+        assert report.status == 'bad_manifest'
+        assert report.ok is False
+        assert report.detail
+
+    def test_report_exposes_its_own_exit_code(self):
+        population = _population(SYNTHETIC_CELLS)
+        assert _mod.verify_manifest(_built(population=population), population).exit_code == 0
+        assert _mod.verify_manifest({}, population).exit_code == (
+            _mod.EXIT_CODES['bad_manifest']
+        )
