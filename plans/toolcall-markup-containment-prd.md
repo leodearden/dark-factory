@@ -224,6 +224,17 @@ No reciprocal-ownership ambiguity: 3083 and 3141 are both terminal, so this PRD 
 
 ## 9. Decomposition plan (one bullet per task; signals are the G2 gate)
 
+> **`execution_class` on the docs-only leaves (ζ, η, θ, ι) — do NOT "correct" this to `operational`.**
+> The valid vocabulary is `EXECUTION_CLASSES = ('code_tdd', 'operational', 'decision')`
+> (`fused_memory/reconciliation/recon_self_model.py:238`). These four leaves edit files in the
+> repo, so `code_tdd` is correct even though their deliverable is documentation.
+> `operational_routing_guard._maybe_coerce` (`:127`) silently rewrites any task with
+> `execution_class ∈ {operational, decision}` to `task_kind='deterministic'` +
+> `always_escalates=true` — a docs task filed that way **escalates to a human instead of
+> editing the documentation**, and the `submit_task` response does not show the rewrite.
+> This PRD's first decompose (2026-08-05) hit exactly that and corrected all four in place.
+> Original annotation here was an invented `docs` value — inert, but it invited the harmful repair.
+
 **α — `shared.toolcall_markup`: detector, deterministic repairer, committed fixture corpus.** *(intermediate — unlocks β, δ, ε, ζ, θ)*
 Modules: `shared/src/shared/toolcall_markup.py`, `shared/tests/`, `shared/tests/fixtures/toolcall_markup_corpus.jsonl`.
 Implements C1. Extracts the 334 real specimens from the archived transcripts into a committed corpus (tool, param, supplied keys, raw value) and pins the repairer against it.
@@ -252,19 +263,19 @@ Modules: `orchestrator/src/orchestrator/mcp/plan_tools.py`, `orchestrator/tests/
 On `plan.json` read, if a field is corrupted, repair and write back under C3's atomic contract, emitting a structured fact. No fleet quiesce (D4).
 *Signal:* opening a corrupted live plan through plan-tools returns the repaired `rationale`, and the file on disk is repaired atomically — a concurrent reader sees either the old or the new file, never a partial one.
 
-**ζ — Correct `docs/mcp-toolcall-xml-leak.md` §1.** *(leaf)* · depends: α · `execution_class: docs`
+**ζ — Correct `docs/mcp-toolcall-xml-leak.md` §1.** *(leaf)* · depends: α · `execution_class: code_tdd`
 3083's §1 states the parser "terminates a string argument **early**" at a quoted closing tag. The specimens show the opposite direction — over-consumption at the *closing position*. Only over-consumption explains the observed signature (fragment **inside** the value **plus** siblings missing), and the stated direction changes the guidance to authors.
 *Signal:* the doc states the over-consumption direction, carries the four specimen shapes from §2.1 and the §2.3 blast-radius table, and points at `shared.toolcall_markup` as the single literal source.
 
-**η — Retire the non-canonical evidence-log metadata convention.** *(leaf)* · `execution_class: docs`
+**η — Retire the non-canonical evidence-log metadata convention.** *(leaf)* · `execution_class: code_tdd`
 Migrate task 3083's `markup_tripwire_rejections_20260730` / `_burst3` to Tier-C `x_`-prefixed keys per `docs/task-authoring.md`, and document `allow_mcp_markup: True` as the correct move for writes that quote the literals — the convention currently manufactures both schema warnings and tripwire rejections, and is self-perpetuating because it is documented inside 3083's own details.
 *Signal:* touching task 3083 emits **zero** `task_metadata.schema_warning … code=unknown_key` lines in the fused-memory journal. Baseline measured 2026-08-05 over the journal window 2026-07-01→08-05: **43 such lines** (22 for `…_20260730`, 21 for `…_20260730_burst3`). The escalation record's "17" was a narrower window; 43 is the figure this signal is measured against.
 
-**θ — Upstream harness bug report.** *(leaf)* · depends: α · `execution_class: docs`
+**θ — Upstream harness bug report.** *(leaf)* · depends: α · `execution_class: code_tdd`
 A specimen-backed write-up of the parser defect: the four shapes, the over-consumption behaviour, the silent parameter drop, the 0.26% incidence, and the 92.2% deterministic repairability that demonstrates the format is unambiguous enough for the parser to have errored instead.
 *Signal:* a committed report at `docs/upstream/toolcall-parser-overconsumption.md`, self-contained enough to file without this repo as context.
 
-**ι — Paired edit to the owning PRD (G4 bookkeeping).** *(leaf)* · depends: γ · `execution_class: docs`
+**ι — Paired edit to the owning PRD (G4 bookkeeping).** *(leaf)* · depends: γ · `execution_class: code_tdd`
 Re-point `docs/prds/memory-write-path-convergence.md` §8's "XML-leak cure" row from "DF 3083 (pending)" to this PRD, and mark §9 leaf ο's in-line tripwire as superseded by the middleware.
 *Signal:* the owning PRD's §8 table names this PRD as owner and no longer describes 3083 as pending.
 
