@@ -689,7 +689,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 42,
+    """All /static/redux/*?v= cache-busters must share a single version >= 43,
     and graph_layout.js / prd_grouping.js / task_status_counts.js /
     runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
     must all be among the versioned assets.
@@ -699,22 +699,39 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     floor, which needs no uniformity precondition to be sound (the OLDEST
     asset is the one that would still serve stale code).
 
-    The floor tracks the newest bump — currently 42, for task 3470's
-    tab_memory_evals.jsx and tab_escalations.jsx fixes. Raising it matters
-    more than a routine bump for the usual reason: an already-open browser
-    holds a cached copy of the BROKEN file, so without a new ?v= the fix
-    never reaches it.
+    The floor tracks the newest bump — currently 43, for task 3489's
+    null-sample fix in LineChart / StackedAreaChart / BarChart / HistBar
+    (42 was task 3470's tab_memory_evals.jsx and tab_escalations.jsx fixes).
+    Raising it matters more than a routine bump for the usual reason: an
+    already-open browser holds a cached copy of the BROKEN file, so without a
+    new ?v= the fix never reaches it. 3489 is the sharpest case in this chain,
+    because it can BLANK the page rather than only mis-draw it: charts.jsx's
+    module-top-level `window.DF_SPARK_PATH` destructure now reaches for five
+    NEW names (plottableMax, axisY, axisPaths, barFractions,
+    stackedAreaPaths), so a browser holding a cached spark_path.js?v=42 next
+    to a fresh charts.jsx binds five undefined builders and blanks every tab
+    that renders a chart. A fully cached v=42 pair is the milder failure: it
+    keeps drawing missing samples as measured zeros at the chart floor,
+    zero-height bars and 1px HistBar stubs.
     """
     versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
     assert len(versions) == 1, (
         f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
         'bump all of them uniformly to the same value.'
     )
-    v = next(iter(versions))
-    assert v >= 42, (
-        f'index.html cache-buster version is {v}, expected >= 42 — the bump '
-        "that carries task 3470's tab_memory_evals.jsx and tab_escalations.jsx "
-        'fixes to already-open browsers.'
+    v = int(next(iter(versions)))
+    assert v >= 43, (
+        f'index.html cache-buster version is {v}, expected >= 43 (proves the '
+        "uniform bump for task 3489's null-sample fix in LineChart / "
+        'StackedAreaChart / BarChart / HistBar actually reaches already-open '
+        'browsers. This one can BLANK the page rather than merely mis-draw it: '
+        "charts.jsx's top-level window.DF_SPARK_PATH destructure now reaches "
+        'for five new builder names, so a cached spark_path.js?v=42 next to a '
+        'fresh charts.jsx binds five undefined builders and every tab that '
+        'renders a chart goes blank; a fully cached v=42 pair instead keeps '
+        'drawing missing samples as measured zeros at the chart floor. The '
+        "previous floor was 42, for task 3470's tab_memory_evals.jsx and "
+        'tab_escalations.jsx fixes).'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
