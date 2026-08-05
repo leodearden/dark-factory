@@ -171,3 +171,83 @@ async def _head_of(worktree: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
     assert rc == 0
     return out.strip()
+
+
+# ---------------------------------------------------------------------------
+# API surface — the two new PlanFilesTouchedResult fields
+# ---------------------------------------------------------------------------
+
+
+class TestPlanFilesTouchedResultFields:
+    """The classification fields this FP class adds to the gate's result.
+
+    ``missing_from_tree`` and ``resolved_renames`` are APPENDED with
+    ``field(default_factory=...)`` defaults, so every existing construction
+    site — all of which are keyword-only — keeps working untouched.
+    """
+
+    def test_defaults_are_empty(self) -> None:
+        """A bare result carries three empty containers, not None."""
+        result = PlanFilesTouchedResult()
+        assert result.not_touched == []
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {}
+
+    def test_mutable_defaults_are_per_instance(self) -> None:
+        """Each instance owns its containers (pins ``default_factory``).
+
+        A bare ``= []`` / ``= {}`` class attribute would be shared across
+        every instance, so one gate invocation's stale paths would leak into
+        the next one's result.
+        """
+        first = PlanFilesTouchedResult()
+        first.not_touched.append('leaked.py')
+        first.missing_from_tree.append('leaked.py')
+        first.resolved_renames['leaked.py'] = 'somewhere/else.py'
+
+        second = PlanFilesTouchedResult()
+        assert second.not_touched == []
+        assert second.missing_from_tree == []
+        assert second.resolved_renames == {}
+
+    def test_legacy_keyword_construction_still_works(self) -> None:
+        """The pre-existing single-field construction is unchanged.
+
+        This is the exact shape ``test_workflow.py``'s ``_CheckSequence``
+        stubs and ``test_merge_queue.py`` build today.
+        """
+        result = PlanFilesTouchedResult(not_touched=['a.py'])
+        assert result.not_touched == ['a.py']
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {}
+
+    def test_field_container_types(self) -> None:
+        """``missing_from_tree`` is a list of str; ``resolved_renames`` a dict."""
+        result = PlanFilesTouchedResult(
+            not_touched=['crates/tests/topo_e2e.rs'],
+            missing_from_tree=['crates/tests/topo_e2e.rs'],
+            resolved_renames={
+                'crates/tests/topo_e2e.rs': 'crates/tests/harness_topo/topo_e2e.rs',
+            },
+        )
+        assert isinstance(result.missing_from_tree, list)
+        assert all(isinstance(p, str) for p in result.missing_from_tree)
+        assert isinstance(result.resolved_renames, dict)
+        assert all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in result.resolved_renames.items()
+        )
+
+    def test_missing_from_tree_is_subset_of_not_touched(self) -> None:
+        """The documented subset invariant holds for the canonical shape.
+
+        A stale declared entry is reported in BOTH lists — never moved out of
+        ``not_touched`` — so every existing ``not_touched``-only consumer
+        (workflow's block decision, ``_try_narrow_plan``,
+        ``build_plan_tightening_prompt``) keeps its current verdict.
+        """
+        result = PlanFilesTouchedResult(
+            not_touched=['a.py', 'crates/tests/topo_e2e.rs'],
+            missing_from_tree=['crates/tests/topo_e2e.rs'],
+        )
+        assert set(result.missing_from_tree) <= set(result.not_touched)
