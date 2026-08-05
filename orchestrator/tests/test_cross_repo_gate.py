@@ -415,3 +415,222 @@ class TestClassifyMarkerLeg:
         assert verdict.verdict == ALLOW
         assert verdict.signals == ()
         assert verdict.blocked is False
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: classify_cross_repo leg (B) — all-foreign metadata.files
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_roots(tmp_path):
+    """Return (project_root, foreign_root) as real, sibling directories.
+
+    Both are created under ``tmp_path`` so no test depends on the machine's
+    real project layout, and so ``Path.resolve()`` behaves identically for
+    both sides of the containment comparison.
+    """
+    project_root = tmp_path / 'reify'
+    foreign_root = tmp_path / 'dark-factory'
+    project_root.mkdir()
+    foreign_root.mkdir()
+    return project_root, foreign_root
+
+
+class TestClassifyFilesLeg:
+    """Leg (B): every declared ``metadata.files`` entry resolves outside project_root.
+
+    This is the reify-5638 shape — the one the orchestrator CAN classify
+    unaided, by path containment, with no cross-project registry.  Delegated to
+    ``merge_gates.is_cross_repo_task`` so dispatch time and merge time share one
+    definition of "foreign"; the conservatism pinned below (empty → no block,
+    any relative entry → no block, any in-tree entry → no block) is that
+    function's documented contract.
+    """
+
+    def test_all_foreign_absolute_files_block(self, two_roots):
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        files = [
+            str(foreign_root / 'orchestrator/src/orchestrator/harness.py'),
+            str(foreign_root / 'orchestrator/tests/test_harness.py'),
+        ]
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(files=files), project_root=project_root
+        )
+
+        assert verdict.verdict == BLOCK
+        assert 'all_files_foreign' in verdict.signals
+        assert tuple(verdict.foreign_paths) == tuple(files), (
+            f'foreign_paths must echo the offending entries so the L1 is '
+            f'actionable; got {verdict.foreign_paths!r}'
+        )
+
+    def test_files_leg_alone_leaves_owner_unresolved(self, two_roots):
+        """Path containment proves foreignness; it does NOT name the owner."""
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(files=[str(foreign_root / 'a.py')]),
+            project_root=project_root,
+        )
+
+        assert verdict.verdict == BLOCK
+        assert verdict.owner_project is None, (
+            'the orchestrator has no cross-project registry — it must not guess '
+            f'a project name from a path; got {verdict.owner_project!r}'
+        )
+
+    def test_relative_in_tree_files_allow(self, two_roots):
+        """A still-undelivered NEW local file is exactly this shape."""
+        from orchestrator.cross_repo_gate import ALLOW, classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                files=['orchestrator/src/orchestrator/cross_repo_gate.py']
+            ),
+            project_root=project_root,
+        )
+        assert verdict.verdict == ALLOW
+        assert verdict.blocked is False
+
+    def test_mixed_foreign_and_relative_files_allow(self, two_roots):
+        """A MIX is not an all-foreign deliverable — conservative by design."""
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                files=[str(foreign_root / 'a.py'), 'orchestrator/src/local.py']
+            ),
+            project_root=project_root,
+        )
+        assert verdict.blocked is False
+
+    def test_mixed_foreign_and_in_tree_absolute_files_allow(self, two_roots):
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                files=[str(foreign_root / 'a.py'), str(project_root / 'b.py')]
+            ),
+            project_root=project_root,
+        )
+        assert verdict.blocked is False
+
+    def test_absolute_in_tree_files_allow(self, two_roots):
+        from orchestrator.cross_repo_gate import ALLOW, classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                files=[str(project_root / 'orchestrator/src/orchestrator/harness.py')]
+            ),
+            project_root=project_root,
+        )
+        assert verdict.verdict == ALLOW
+
+    def test_empty_files_allow(self, two_roots):
+        from orchestrator.cross_repo_gate import ALLOW, classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(files=[]), project_root=project_root
+        )
+        assert verdict.verdict == ALLOW
+
+    def test_absent_files_allow(self, two_roots):
+        from orchestrator.cross_repo_gate import ALLOW, classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(task_kind='deterministic'),
+            project_root=project_root,
+        )
+        assert verdict.verdict == ALLOW
+
+    def test_marker_still_blocks_when_files_empty(self, two_roots):
+        """Leg B's empty-list conservatism must not swallow leg A's marker.
+
+        ``is_cross_repo_task`` returns False for an empty ``plan_files`` BEFORE
+        it ever reads the marker (merge_gates.py:997), which is exactly why
+        leg A reads ``metadata.cross_repo`` directly instead of delegating.
+        """
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        project_root, _ = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(cross_repo=True, files=[]),
+            project_root=project_root,
+        )
+        assert verdict.verdict == BLOCK
+        assert 'cross_repo_marker' in verdict.signals
+
+    def test_both_legs_fire_signals_are_unioned(self, two_roots):
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                cross_repo=True,
+                cross_repo_project='dark_factory',
+                files=[str(foreign_root / 'a.py')],
+            ),
+            project_root=project_root,
+        )
+        assert verdict.verdict == BLOCK
+        assert 'cross_repo_marker' in verdict.signals
+        assert 'all_files_foreign' in verdict.signals
+        assert verdict.owner_project == 'dark_factory'
+
+    def test_files_leg_blocks_through_json_string_metadata(self, two_roots):
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                files=[str(foreign_root / 'a.py')], metadata_as_json_string=True
+            ),
+            project_root=project_root,
+        )
+        assert verdict.verdict == BLOCK
+
+    def test_project_root_accepts_a_string(self, two_roots):
+        """Callers may pass either a Path or a str — coerced at the boundary."""
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(files=[str(foreign_root / 'a.py')]),
+            project_root=str(project_root),
+        )
+        assert verdict.verdict == BLOCK
+
+    def test_non_string_and_empty_file_entries_are_ignored(self, two_roots):
+        """Junk entries must not be mistaken for local paths that veto the block."""
+        from orchestrator.cross_repo_gate import BLOCK, classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        verdict = classify_cross_repo(
+            task=make_cross_repo_task(
+                files=[str(foreign_root / 'a.py'), '', None, 42]
+            ),
+            project_root=project_root,
+        )
+        assert verdict.verdict == BLOCK
+        assert tuple(verdict.foreign_paths) == (str(foreign_root / 'a.py'),)
+
+    def test_files_not_a_list_allows(self, two_roots):
+        """A malformed files value carries no usable path evidence."""
+        from orchestrator.cross_repo_gate import classify_cross_repo
+
+        project_root, foreign_root = two_roots
+        for bad in (str(foreign_root / 'a.py'), {'a': 1}, 42):
+            verdict = classify_cross_repo(
+                task=make_cross_repo_task(files=bad), project_root=project_root
+            )
+            assert verdict.blocked is False, f'files={bad!r} should not block leg B'
