@@ -1164,7 +1164,15 @@ class ReconciliationHarness:
             live = diff['live']
             corrected_metadata = {
                 'kind': 'project_status_correction',
-                'supersedes': latest['id'],
+                # PRD D2 (task 3196): `supersedes` is a LIST of full UUIDs. Written
+                # list-shaped at the source rather than relying on the service-seam
+                # coercion in validate_memory_metadata(), which stays as defense-in-depth
+                # for the legacy corpus and out-of-repo writers.  Exactly one predecessor
+                # is recorded — `latest` is the single max()-by-created_at memory being
+                # superseded.  Do NOT widen to every deleted duplicate: the queried set
+                # is deleted for pool-capping (task 1938 amendment), a different relation
+                # from supersession.
+                'supersedes': [latest['id']],
                 'task_count_done': live['done'],
                 'task_count_total': live['total'],
                 'active_tasks': live['active_tasks'],
@@ -1177,7 +1185,7 @@ class ReconciliationHarness:
                 f"active={len(live['active_tasks'])}."
             )
             # Add-then-delete: guarantees at least one correct memory always exists
-            # even if a delete below fails — the fresh memory (supersedes=<old_id>)
+            # even if a delete below fails — the fresh memory (supersedes=[<old_id>])
             # is still the most-recent, so next cycle's max()-by-created_at selection
             # ignores any stale leftover and self-heals.  Once add_memory lands, the
             # supersede has effectively happened regardless of delete outcomes below
