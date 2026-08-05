@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -13,6 +14,19 @@ import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 logger = logging.getLogger(__name__)
+
+# record_terminal_outcome's 0-row retry schedule (task 3582). The window is
+# real because BOTH producers INSERT their write_ops row AFTER the enqueue
+# commits: MemoryService.add_episode logs it in a `finally` immediately after
+# durable_queue.enqueue, and MemoryService.add_memory logs its single Layer-1
+# row only after the synchronous Mem0 leg. A queue worker that reaches a
+# terminal state inside that window would otherwise UPDATE 0 rows and drop the
+# outcome silently — the exact invisibility this column exists to remove.
+#
+# A module constant, deliberately NOT a QueueConfig/config.yaml field: no
+# operator surface is worth adding for a ~1.3 s worst case on a path that
+# should never fire. Monkeypatched by the tests.
+_TERMINAL_WRITEBACK_RETRY_DELAYS: tuple[float, ...] = (0.05, 0.25, 1.0)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS write_ops (
@@ -579,23 +593,43 @@ class WriteJournal:
         matters, because building one on the live 16.6M-row journal costs ~47 s
         of startup DDL (see the ``idx_wo_created`` note in ``SCHEMA_SQL``).
 
+        A 0-row UPDATE is RETRIED over ``_TERMINAL_WRITEBACK_RETRY_DELAYS``,
+        because both producers log their ``write_ops`` row after the enqueue
+        commits (see that constant). On exhaustion this logs a WARNING naming
+        the write_op and the status — loud, never silent — and returns
+        ``False``. The happy path never sleeps.
+
         Fire-and-forget per the journal's never-block discipline: logs loudly
         and returns ``False`` on failure, never raises — a journaling hiccup
         must not propagate into the queue worker that calls it.
         """
         try:
-            async with self._txn() as db:
-                cursor = await db.execute(
-                    'UPDATE write_ops SET terminal_status = ?, terminal_at = ?, '
-                    'terminal_error = ? WHERE id = ?',
-                    (
-                        terminal_status,
-                        datetime.now(UTC).isoformat(),
-                        terminal_error,
-                        write_op_id,
-                    ),
-                )
-                return cursor.rowcount > 0
+            for attempt in range(len(_TERMINAL_WRITEBACK_RETRY_DELAYS) + 1):
+                async with self._txn() as db:
+                    cursor = await db.execute(
+                        'UPDATE write_ops SET terminal_status = ?, terminal_at = ?, '
+                        'terminal_error = ? WHERE id = ?',
+                        (
+                            terminal_status,
+                            datetime.now(UTC).isoformat(),
+                            terminal_error,
+                            write_op_id,
+                        ),
+                    )
+                    if cursor.rowcount > 0:
+                        return True
+                if attempt < len(_TERMINAL_WRITEBACK_RETRY_DELAYS):
+                    await asyncio.sleep(_TERMINAL_WRITEBACK_RETRY_DELAYS[attempt])
+
+            logger.warning(
+                'Terminal outcome %s for write_op %s matched no write_ops row '
+                '(after %d retries) — the terminal state of that write is now '
+                'unrecorded',
+                terminal_status,
+                write_op_id,
+                len(_TERMINAL_WRITEBACK_RETRY_DELAYS),
+            )
+            return False
         except Exception as e:
             logger.error(
                 f'Failed to record terminal outcome {terminal_status} '
