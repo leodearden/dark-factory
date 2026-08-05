@@ -7217,6 +7217,12 @@ class Harness:
         of costing a triage round trip.  When no owner could be resolved it says
         so explicitly: the orchestrator has no cross-project registry, and a
         placeholder name in an L1 is worse than an honest "unresolved".
+
+        The summary/detail are written to CLAIM ONLY WHAT THE FIRING SIGNALS
+        ESTABLISH — see the comment on the claim/remedy branch below.  A verdict
+        carrying only path-containment evidence asserts "paths outside
+        project_root", not "owned by another project", because the gate has no
+        way to tell a sibling checkout from a path no project owns.
         """
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
@@ -7244,23 +7250,59 @@ class Harness:
             return
 
         from escalation.models import Escalation  # noqa: PLC0415
+        from orchestrator.cross_repo_gate import SIGNAL_MARKER  # noqa: PLC0415
 
         owner = verdict.owner_project
-        owned_by = (
-            f'owned by {owner}' if owner else 'owned by another project (owner unresolved)'
-        )
-        summary = f'CROSS_REPO_MISFILE: task {task_id} declares work {owned_by}'
+        signals = tuple(verdict.signals or ())
+
+        # Claim exactly what the evidence establishes, and no more.
+        #
+        # The path-containment leg proves only "every declared path is absolute
+        # and resolves outside project_root" — with no cross-project registry it
+        # CANNOT distinguish a sibling project's checkout from a path that
+        # belongs to no project at all (~/.claude/skills/…, /etc/…, a stray
+        # $HOME path).  Asserting foreign OWNERSHIP there, and telling the
+        # operator to refile under "the owning project", would be unactionable
+        # advice for a task whose paths have no owner.  _resolve_owner already
+        # refuses to invent a name; this prose holds the same line.
+        #
+        # The marker leg is different: metadata.cross_repo is the submit path's
+        # own assertion that the declared files ARE owned elsewhere, so ownership
+        # may be stated as fact even when nothing named the owner.
+        if owner:
+            claim = f'declares work owned by {owner}'
+            remedy = (
+                f'The fix is to refile this task under {owner} (and cancel or '
+                f're-scope this one), not to unblock it here.'
+            )
+        elif SIGNAL_MARKER in signals:
+            claim = 'declares work owned by another project (owner unresolved)'
+            remedy = (
+                'The submit path marked this task cross-repo but named no owner '
+                '(no metadata.cross_repo_project companion). The fix is to identify '
+                'the owning project and refile the task there, not to unblock it here.'
+            )
+        else:
+            claim = "declares only paths outside this orchestrator's project_root"
+            remedy = (
+                'This gate has no cross-project registry, so it CANNOT tell whether '
+                'these paths belong to another project or to no project at all. Two '
+                'remedies, depending on which it is: refile the task under the owning '
+                'project if one owns them, or correct metadata.files to the in-tree '
+                'paths this task actually delivers. Do not simply unblock it here.'
+            )
+
+        summary = f'CROSS_REPO_MISFILE: task {task_id} {claim}'
         paths = '\n'.join(f'  - {path}' for path in verdict.foreign_paths) or '  (none declared)'
         detail = (
             f'Dispatch-time cross-repo admission gate blocked this task BEFORE any '
             f'agent spun up.\n'
-            f'Owning project: {owner if owner else "UNRESOLVED — no marker or companion named it"}\n'
-            f'Signals: {", ".join(verdict.signals) or "(none)"}\n'
-            f'Reason: {verdict.reason}\n'
-            f'Foreign paths:\n{paths}\n'
+            f'Owning project: {owner if owner else "UNRESOLVED — nothing in the task metadata named it"}\n'
+            f'Signals: {", ".join(signals) or "(none)"}\n'
+            f'Observed: {verdict.reason}\n'
+            f'Paths judged outside project_root:\n{paths}\n'
             f'This orchestrator owns a single project_root and cannot legitimately land '
-            f'work in another project. The fix is to refile the task under the owning '
-            f'project (and cancel or re-scope this one), not to unblock it here.'
+            f'work outside it. {remedy}'
         )
         esc = Escalation(
             id=self._escalation_queue.make_id(task_id),
@@ -8114,6 +8156,9 @@ class Harness:
             # key-presence predicate — gating on any stricter definition (e.g.
             # one requiring a well-formed marker) would let a MALFORMED marker
             # skip the gate entirely instead of entering it and failing closed.
+            # It admits PRESENT-BUT-UNREADABLE metadata for the same reason, so
+            # the gate's loud SKIP is actually reachable from here rather than
+            # being a guarantee the dispatch path quietly withholds.
             from orchestrator import cross_repo_gate  # noqa: PLC0415
 
             if cross_repo_gate.carries_cross_repo_signal(assignment.task) and not await self._run_cross_repo_gate(assignment):

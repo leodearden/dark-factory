@@ -180,11 +180,14 @@ exemptions exist:
   `done_provenance` **only**, and validates it (`kind` enum + `git merge-base
   --is-ancestor`); it cannot touch any other field.
 - **`CLEARABLE_ANNOTATION_KEYS` clears** — a merge-mode clear of an advisory
-  annotation (e.g. `possible_scope_mismatch`). These stay clearable, but
-  `possible_scope_mismatch` is no longer inert: in its containment-**confirmed**
-  form it can block a dispatch (§3.2.1), so clearing it removes that evidence.
-  The independent `metadata.files` and `metadata.cross_repo` legs of that gate
-  are unaffected by a clear.
+  annotation (e.g. `possible_scope_mismatch`). These stay clearable and stay
+  **advisory**: `possible_scope_mismatch` has no behavioural consumer that can
+  block anything, so clearing it costs no enforcement. The dispatch-time
+  cross-repo gate (§3.2.1) deliberately has **no leg** for it; its two blocking
+  legs read `metadata.cross_repo` and `metadata.files`, neither of which is
+  clearable. The stamp's one remaining effect there is cosmetic — its
+  `suggested_project` supplies the owner **name** in an escalation raised by one
+  of those other legs.
 - **`x_`-prefixed annotation adds** — a merge-mode add of forward-compat
   `x_`-namespaced annotation keys.
 
@@ -317,20 +320,34 @@ orchestrator also runs a **dispatch-time cross-repo admission gate**
 (`orchestrator/src/orchestrator/cross_repo_gate.py`), in `Harness._run_slot`
 just ahead of the D4 substrate gate and **before any agent spins up**. A task
 is blocked there with `block_reason='cross_repo_misfile'` and an **L1
-`scope_violation`** naming the owning project when **any** of:
+`scope_violation`** when **either** of exactly two legs fires:
 
-- `metadata.cross_repo` is truthy — the marker leg;
-- every entry in `metadata.files` is an **absolute** path resolving outside
-  the orchestrator's `project_root` — the containment leg, which needs no
-  registry;
-- a `metadata.possible_scope_mismatch` stamp whose `matched_paths` are
-  **confirmed** foreign by that same containment test.
+- `metadata.cross_repo` is truthy — the **marker** leg. This is the submit
+  path's own assertion that the declared files are owned elsewhere, so the L1
+  states foreign ownership as fact and names the owner from
+  `metadata.cross_repo_project` (falling back to a project name embedded in the
+  marker string, then to `possible_scope_mismatch.suggested_project`).
+- every entry in `metadata.files` is an **absolute** path resolving outside the
+  orchestrator's `project_root` — the **containment** leg, which needs no
+  registry. Containment proves only "outside this `project_root`": with no
+  cross-project registry the gate cannot tell a sibling checkout from a path no
+  project owns, so when nothing names an owner the L1 says exactly that and
+  offers both remedies (refile under the owning project, **or** correct
+  `metadata.files` to in-tree paths).
 
-An advisory stamp alone does **not** block — see the prose-citation rules
-below; the prose scan over-fires, so confirmation by path containment is
-required before it can stop a dispatch. Unreadable metadata is a logged SKIP,
-never a silent pass. The fix for a blocked task is to **refile it under the
-owning project**, not to unblock it in place.
+`metadata.possible_scope_mismatch` is **not** a third leg and cannot block a
+dispatch. It is an advisory prose stamp that over-fires by design, and the
+shape it actually carries — registry **prefixes** such as `orchestrator/`, not
+file paths — is not classifiable by path containment at all. It already fires
+its own advisory escalation at submit time; here it only supplies an owner
+**name** when one of the two real legs has fired.
+
+Metadata that is present but unreadable is a logged **SKIP** — dispatch
+proceeds (an unparseable blob is not evidence of a misfile) but the gate says
+loudly that it read nothing, so a skipped check never passes for a clean one.
+Absent metadata is the ordinary shape and is silent. The fix for a blocked task
+is to **refile it under the owning project** (or correct its `metadata.files`),
+not to unblock it in place.
 
 The merge-time `OutcomeKind.plan_files_cross_repo` route above is unchanged
 and still applies to a task that reaches merge by another path. It was
@@ -350,12 +367,15 @@ blocks anything. It can, however, attract the advisory annotation
 escalation an operator then has to read), because a prose scan cannot tell
 "modifies X" from "mentions X".
 
-The annotation stays advisory. Its one behavioural consumer is the
-dispatch-time gate above, and only in its **confirmed** form: the stamp blocks
-a dispatch just when its `matched_paths` independently resolve foreign by path
-containment. An unconfirmed prose stamp still blocks nothing — turning a
-false-positive advisory into a stalled task plus a spurious L1 would be
-strictly worse than leaving it advisory.
+The annotation stays advisory, and has **no** behavioural consumer: nothing
+reads it to block, reject, requeue, or gate anything. Its escalation is the
+whole of its effect. The dispatch-time gate above deliberately has no leg for
+it — turning a false-positive advisory into a stalled task plus a spurious L1
+would be strictly worse than leaving it advisory, and its `matched_paths` carry
+registry **prefixes** (`orchestrator/`, `fused_memory/`) rather than file paths,
+so there is no independent evidence available to confirm it against. The gate
+does read its `suggested_project` to *name* an owner in an L1 its own legs
+raised; that is cosmetic, not a trigger.
 
 A **declared deliverable** can, so it is what the advisory is attributed on.
 The annotation is suppressed when your declared deliverables attest local
