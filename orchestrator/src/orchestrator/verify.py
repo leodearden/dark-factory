@@ -4757,6 +4757,39 @@ async def run_verification(
                 if segment_chained_test and label == 'test'
                 else None
             )
+            # Co-occurrence guard (task 3478). These two are mutually
+            # exclusive by construction today: junit_path is computed only
+            # when role=='merge' and breadth=='full', while segmentation is
+            # opted into only as `segment_chained_test=role != 'merge'`. So
+            # per-segment junitxml is deliberately UNWIRED — with no writer
+            # and no consumer it would be dead code, and node-id attribution
+            # on this path comes from _extract_failing_test_ids over the
+            # aggregated segment stdout instead.
+            #
+            # If a future change ever relaxes either gate, the tempting
+            # "fix" is to hand every segment the SAME --junitxml path, which
+            # is last-writer-wins: N pytest runs, one report, silently
+            # describing only the last segment. Say so at the point it
+            # becomes observable rather than letting it look like it worked.
+            # Storm-safe without extra machinery: at most once per test leg,
+            # and only in a configuration that does not exist today.
+            if chain_segments is not None and junit_path is not None:
+                logger.warning(
+                    'Segmented verify (%d segments) co-occurs with a junit report '
+                    'path at %s, which will NOT be written: per-segment junitxml is '
+                    'deliberately unwired (task 3478). These two were mutually '
+                    'exclusive by construction — junit_path requires role==\'merge\' '
+                    'with merge_verify_breadth==\'full\', segmentation requires '
+                    'role!=\'merge\' — so reaching here means one of those gates '
+                    'changed. Do NOT resolve this by injecting one shared '
+                    '--junitxml: %d pytest runs writing one path is last-writer-wins, '
+                    'a report describing only the final segment. Node-id attribution '
+                    'for THIS run remains available via _extract_failing_test_ids '
+                    'over the aggregated segment stdout.',
+                    len(chain_segments),
+                    junit_path,
+                    len(chain_segments),
+                )
             if chain_segments is not None:
                 async def _run_one_segment(
                     segment_cmd: str,
