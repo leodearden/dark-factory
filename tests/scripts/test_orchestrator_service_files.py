@@ -466,12 +466,14 @@ _EXPECTED_ORCHESTRATOR_SERVICE_BASENAMES = {
     "orchestrator-solar-challenge-platform.service",
     "orchestrator-my-solar-challenge.service",
     "orchestrator-autopilot-video.service",
+    "orchestrator-know-live.service",
+    "orchestrator-pump-web-ui.service",
     "orchestrator-watchdog.service",
 }
 
 
 def test_orchestrator_service_glob_covers_all_known_units() -> None:
-    """Coverage guard: the glob must be non-empty and include all six known units.
+    """Coverage guard: the glob must be non-empty and include all eight known units.
 
     A wrong CWD or other glob mishap would silently shrink the parametrized
     ORCH_UNIT lint below to zero cases — a zero-case parametrize collects no
