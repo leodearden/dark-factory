@@ -624,6 +624,19 @@ def test_index_html_registers_tab_memory_evals_load_order(
             'shell.jsx',
             'tab_memory_evals.jsx uses window.DF_SHELL formatting helpers.',
         ),
+        (
+            '/static/redux/memory_evals_fmt.js',
+            'memory_evals_fmt.js',
+            'tab_memory_evals.jsx destructures chartForKind/trendGaps/dash/'
+            'ageText/verdictBadge/unmatchedReasonText off '
+            'window.DF_MEMORY_EVALS_FMT at MODULE TOP LEVEL (task 3481 moved '
+            'those pure helpers out of the .jsx so node can execute them). This '
+            'is the same load-order contract that binds this file to tabs.jsx, '
+            'one link further upstream: a later tag leaves the global undefined '
+            'at this file\'s evaluation time, which throws, which leaves '
+            'window.DF_MEMORY_EVALS undefined for tabs.jsx, which blanks every '
+            'tab defined there.',
+        ),
     ]:
         _assert_script_loads_before(
             index_html_body,
@@ -633,6 +646,32 @@ def test_index_html_registers_tab_memory_evals_load_order(
             'tab_memory_evals.jsx',
             why,
         )
+
+    # (b2) memory_evals_fmt.js specifically must be a CLASSIC script — no type
+    #      at all, not even text/babel. _assert_script_loads_before already
+    #      rejects defer/async/type=module (the three ways document order stops
+    #      implying execution order), but a `type="text/babel"` .js would ALSO
+    #      break this file two ways it cannot see: Babel-standalone would
+    #      transform it and it would no longer join the classic-script shared
+    #      global lexical scope, and
+    #      dashboard/tests/js/classic_script_scope.test.mjs's CLASSIC_SCRIPT_RE
+    #      — which matches only `<script src="/static/redux/NAME.js?v=NN"></script>`
+    #      — would stop seeing it at all, silently dropping the module from
+    #      every collision and DF_*-assignment check in that suite.
+    fmt_found = _find_script_position(index_html_body, '/static/redux/memory_evals_fmt.js')
+    assert fmt_found is not None, (
+        'No <script src="/static/redux/memory_evals_fmt.js..."> tag in '
+        'index.html — tab_memory_evals.jsx destructures window.DF_MEMORY_EVALS_FMT '
+        'at module top level.'
+    )
+    _fmt_pos, fmt_attrs = fmt_found
+    assert fmt_attrs.get('type') is None, (
+        'memory_evals_fmt.js is plain JS, so its <script> tag must carry NO type '
+        f'attribute; got type={fmt_attrs.get("type")!r}. A text/babel .js would be '
+        'handed to Babel-standalone and would not join the shared classic-script '
+        'global scope, and classic_script_scope.test.mjs would stop matching the '
+        'tag entirely.'
+    )
 
     # (c) THE load-bearing assertion — before tabs.jsx.
     _assert_script_loads_before(
@@ -696,12 +735,18 @@ def test_index_html_cache_buster_floor(index_html_body: str) -> None:
         'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
         'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    assert min(versions) >= 42, (
+    assert min(versions) >= 43, (
         f'the oldest index.html cache-buster version is {min(versions)}, '
-        "expected >= 42 so task 3470's tab_memory_evals.jsx and "
-        'tab_escalations.jsx fixes actually reach already-open browsers. This '
-        'floor supersedes the two it subsumes: >= 41 (test_index_html.py) and '
-        '>= 38 (the memory-evals section landing in task 3216).'
+        "expected >= 43 so task 3481's extraction actually reaches already-open "
+        'browsers. That bump is not cosmetic here: the extraction adds a NEW '
+        'classic script (memory_evals_fmt.js) that tab_memory_evals.jsx '
+        'destructures at module top level, so a browser holding the cached '
+        'index.html would fetch neither the new tag nor the rewritten .jsx, and '
+        'one holding a cached tab_memory_evals.jsx alongside a fresh index.html '
+        'would run a .jsx whose helpers are defined twice. This floor supersedes '
+        "the three it subsumes: >= 42 (task 3470's tab_memory_evals.jsx and "
+        'tab_escalations.jsx fixes), >= 41 (test_index_html.py) and >= 38 (the '
+        'memory-evals section landing in task 3216).'
     )
 
 
