@@ -119,6 +119,12 @@ class QueueItem:
 
 CallbackFn = Callable[[str, Any, dict[str, Any]], Coroutine[Any, Any, None]]
 
+# (write_op_id, terminal_status, error) -> None. Invoked once per item when it
+# reaches a TERMINAL state ('completed' or 'dead'), never on an intermediate
+# retry. An injected callback rather than a WriteJournal reference, preserving
+# this module's deliberate independence from fused-memory-specific components.
+TerminalHookFn = Callable[[str, str, str | None], Coroutine[Any, Any, None]]
+
 
 class DurableWriteQueue:
     """SQLite WAL-backed write queue with per-group workers and global semaphore."""
@@ -136,9 +142,11 @@ class DurableWriteQueue:
         write_timeout_seconds: float = 120.0,
         transient_max_attempts: int | None = None,
         transient_error_names: Iterable[str] | None = None,
+        on_terminal: TerminalHookFn | None = None,
     ):
         self._data_dir = Path(data_dir)
         self._execute_write = execute_write
+        self._on_terminal = on_terminal
         self._workers_per_group = workers_per_group
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
@@ -342,7 +350,11 @@ class DurableWriteQueue:
 
         Callbacks run *before* marking completed so that a callback
         failure triggers retry instead of being silently lost.
+
+        The terminal hook, by contrast, runs AFTER the queue's own commit and
+        OUTSIDE the semaphore — see ``_notify_terminal``.
         """
+        terminal: tuple[str, str | None] | None = None
         async with self._semaphore:
             try:
                 result = await asyncio.wait_for(
@@ -355,8 +367,52 @@ class DurableWriteQueue:
                         item.callback_type, result, item.parsed_payload()
                     )
                 await self._mark_completed(item)
+                terminal = ('completed', None)
             except Exception as exc:
-                await self._handle_failure(item, exc)
+                terminal = await self._handle_failure(item, exc)
+
+        if terminal is not None:
+            await self._notify_terminal(item, *terminal)
+
+    async def _notify_terminal(
+        self, item: QueueItem, status: str, error: str | None
+    ) -> None:
+        """Report a terminal outcome to the injected ``on_terminal`` hook.
+
+        Deliberately runs after the item's own durable state is committed and
+        outside ``self._semaphore``: the queue's correctness must NEVER depend
+        on the hook succeeding (a raising hook would otherwise flip a landed
+        write back to retry, turning an audit-trail improvement into a
+        correctness regression), and the hook's own retry path must not hold a
+        slot in a pool shared across every group.
+
+        Every failure — an unparseable payload, a raising hook — is logged and
+        swallowed. A payload with no ``_write_op_id`` (``replay_from_store``,
+        ``mem0_classify_and_add``) is skipped silently: there is nothing to
+        join back to.
+        """
+        if self._on_terminal is None:
+            return
+        try:
+            # parsed_payload() re-parses the raw row TEXT on every call, so a
+            # consumer's `payload.pop('_write_op_id')` does not consume the key
+            # here.
+            write_op_id = item.parsed_payload().get('_write_op_id')
+        except Exception:
+            logger.warning(
+                'Item %d: could not parse payload for terminal notification',
+                item.id, exc_info=True,
+            )
+            return
+        if not write_op_id:
+            return
+        try:
+            await self._on_terminal(write_op_id, status, error)
+        except Exception:
+            logger.warning(
+                'Item %d: on_terminal hook failed for write_op %s (%s)',
+                item.id, write_op_id, status, exc_info=True,
+            )
 
     async def _mark_completed(self, item: QueueItem) -> None:
         assert self._db is not None
@@ -374,12 +430,21 @@ class DurableWriteQueue:
         """
         return any(c.__name__ in self._transient_error_names for c in type(exc).__mro__)
 
-    async def _handle_failure(self, item: QueueItem, exc: Exception) -> None:
+    async def _handle_failure(
+        self, item: QueueItem, exc: Exception
+    ) -> tuple[str, str | None] | None:
+        """Dead-letter or schedule a retry.
+
+        Returns ``('dead', error_msg)`` when the item reached its terminal
+        dead state, or ``None`` when it was merely rescheduled — the caller
+        uses that to decide whether to fire the terminal hook.
+        """
         assert self._db is not None
         new_attempts = item.attempts + 1
         error_msg = f'{type(exc).__name__}: {exc}'
         limit = self._transient_max_attempts if self._is_transient(exc) else item.max_attempts
-        if new_attempts >= limit:
+        died = new_attempts >= limit
+        if died:
             await self._db.execute(
                 "UPDATE write_queue SET status = 'dead', attempts = ?, error = ? "
                 "WHERE id = ?",
@@ -406,6 +471,7 @@ class DurableWriteQueue:
                 item.id, new_attempts, limit, delay, error_msg,
             )
         await self._db.commit()
+        return ('dead', error_msg) if died else None
 
     # -- recovery -------------------------------------------------------------
 
