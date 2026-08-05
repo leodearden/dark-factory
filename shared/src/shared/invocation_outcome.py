@@ -168,8 +168,9 @@ _MONTH_ABBR = {
 # copies are pure and forked deliberately (this task is additive-only; see
 # the module docstring), so a future edit to one is not expected to be
 # mirrored in the other — but it also won't be caught if it should have
-# been. Resolved by the beta consumer-rewire, which is expected to delete
-# usage_gate.py's copies in favour of these once callers are repointed here.
+# been. The beta consumer-rewire collapsed the string tables but
+# deliberately left these two functions forked — usage_gate.py:2209/2318
+# remain live copies with the divergent fallback semantics described above.
 
 
 def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | None:
