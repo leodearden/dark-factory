@@ -45,7 +45,7 @@ import { createRequire } from 'node:module';
 
 import mef from '../../src/dashboard/static/redux/memory_evals_fmt.js';
 
-const { dash, ageText } = mef;
+const { dash, ageText, unmatchedReasonText, chartForKind } = mef;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/memory_evals_fmt.js';
 
@@ -54,7 +54,7 @@ const MODULE_SPECIFIER = '../../src/dashboard/static/redux/memory_evals_fmt.js';
 // enumerate the real vocabulary instead of pinning a copy). Asserted
 // EXHAUSTIVELY below as the union of the two lists: an accidental export would
 // otherwise quietly widen the contract tab_memory_evals.jsx depends on.
-const EXPECTED_FUNCTION_NAMES = ['ageText', 'dash'];
+const EXPECTED_FUNCTION_NAMES = ['ageText', 'chartForKind', 'dash', 'unmatchedReasonText'];
 const EXPECTED_DATA_NAMES = [];
 
 function expectedSurface() {
@@ -209,4 +209,123 @@ test('ageText: exactly 48h crosses into the days unit (h < 48 is false at h === 
 test('ageText: beyond 48h reads in days, rounded', () => {
   assert.equal(ageText(49 * 3600), '2d ago'); // Math.round(49/24) === 2
   assert.equal(ageText(72 * 3600), '3d ago');
+});
+
+// ---------------------------------------------------------------------------
+// unmatchedReasonText — the three reasons an escalation can land in the
+// "no matching metric row" list, each with DISTINCT wording. Collapsing them
+// into one undifferentiated "unexplained" list would fire on escalations that
+// are in fact fully explained and train operators to ignore the one signal
+// that catches a real parity orphan (memory_evals._unmatched_projection()).
+//
+// This is the executable replacement for the regex at
+// test_tab_memory_evals.py:1724-1750, which recognised only single-quoted
+// ternaries and therefore silently matched NOTHING for a body that uses `if`
+// returns and a double-quoted string — the vacuous-pass failure mode this
+// whole migration exists to end.
+// ---------------------------------------------------------------------------
+
+test('unmatchedReasonText: each known reason gets its own non-blank wording', () => {
+  const known = ['no_matching_verdict', 'storm_suppressed', 'no_fingerprint'];
+  const texts = known.map(unmatchedReasonText);
+
+  for (let i = 0; i < known.length; i++) {
+    assert.equal(typeof texts[i], 'string', `${known[i]} should render a string`);
+    assert.ok(texts[i].trim().length > 0, `${known[i]} rendered blank`);
+    // A known reason must never fall through to the unrecognised branch.
+    assert.ok(
+      !texts[i].startsWith('unrecognised reason'),
+      `${known[i]} fell through to the unrecognised branch`,
+    );
+  }
+
+  // Pairwise DISTINCT: three reasons rendering the same words is the collapse
+  // the branch exists to prevent, and would otherwise pass every per-reason
+  // assertion above.
+  assert.equal(new Set(texts).size, known.length, 'reason wordings must be pairwise distinct');
+});
+
+test('unmatchedReasonText: no_matching_verdict names the missing metric row', () => {
+  assert.equal(unmatchedReasonText('no_matching_verdict'), 'no metric row explains this');
+});
+
+test('unmatchedReasonText: storm_suppressed says the links are collapsed, not missing', () => {
+  assert.equal(
+    unmatchedReasonText('storm_suppressed'),
+    "explained, but this run's links are collapsed into the aggregate",
+  );
+});
+
+test('unmatchedReasonText: no_fingerprint names the absent dedupe_fingerprint', () => {
+  assert.equal(unmatchedReasonText('no_fingerprint'), 'producer emitted no dedupe_fingerprint');
+});
+
+test('unmatchedReasonText: an unrecognised reason is marked and echoed', () => {
+  assert.equal(unmatchedReasonText('brand_new_reason'), 'unrecognised reason: brand_new_reason');
+});
+
+test('unmatchedReasonText: absent reasons coerce visibly rather than crashing or blanking', () => {
+  // String() coercion is explicit in the source for exactly this: a bare
+  // template interpolation of null would still read 'null', but an absent
+  // reason must never produce a bare 'unrecognised reason: ' with nothing
+  // after it, and must never throw on a payload the producer shortened.
+  assert.equal(unmatchedReasonText(null), 'unrecognised reason: null');
+  assert.equal(unmatchedReasonText(undefined), 'unrecognised reason: undefined');
+  assert.equal(unmatchedReasonText(''), 'unrecognised reason: ');
+});
+
+// ---------------------------------------------------------------------------
+// chartForKind — the metric-kind → chart-primitive vocabulary.
+//
+// RETURNS A TAG, NOT A COMPONENT. The function used to return MEStep/MESpark
+// directly, React component references destructured from window.DF_CHARTS,
+// which is exactly what pinned it inside the .jsx and out of reach of any
+// runner. It now returns a closed-vocabulary tag string and
+// tab_memory_evals.jsx maps tag→component at its single call site, so the
+// vocabulary and its fallback — the actual decision content — are executable
+// here (task 3481, DD-1).
+//
+// The payload's kind vocabulary is exactly {tripwire, proportion, count,
+// scalar}. A kind outside that set is a RENDERING gap, not a data error, so
+// the fallback is null — value only, NO chart.
+// ---------------------------------------------------------------------------
+
+test('chartForKind: tripwire is step-shaped', () => {
+  assert.equal(chartForKind('tripwire'), 'step');
+});
+
+// The three sparkline kinds are asserted SEPARATELY rather than as a group, so
+// dropping one from the vocabulary fails a named test instead of thinning a
+// loop nobody reads.
+test('chartForKind: proportion is a sparkline', () => {
+  assert.equal(chartForKind('proportion'), 'spark');
+});
+
+test('chartForKind: count is a sparkline', () => {
+  assert.equal(chartForKind('count'), 'spark');
+});
+
+test('chartForKind: scalar is a sparkline', () => {
+  assert.equal(chartForKind('scalar'), 'spark');
+});
+
+test('chartForKind: an unknown kind gets NO chart, never a guessed primitive', () => {
+  // A kind outside the closed vocabulary means the builder passed a value
+  // through verbatim and filed an `unknown_kind` issue for it. Guessing a
+  // primitive would render an unvalidated shape as though it were understood.
+  for (const kind of ['histogram', 'ratio', 'TRIPWIRE', '', null, undefined, 0]) {
+    assert.equal(
+      chartForKind(kind),
+      null,
+      `kind ${JSON.stringify(kind)} must resolve to no chart at all`,
+    );
+  }
+});
+
+test('chartForKind: the tag vocabulary is exactly {step, spark, null}', () => {
+  // The .jsx maps these tags through a two-entry lookup; a tag outside this
+  // set would silently resolve to undefined there and disable the chart with
+  // no diagnosis.
+  const tags = ['tripwire', 'proportion', 'count', 'scalar'].map(chartForKind);
+  assert.deepEqual([...new Set(tags)].sort(), ['spark', 'step']);
 });
