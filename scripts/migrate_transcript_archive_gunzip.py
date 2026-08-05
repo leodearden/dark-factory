@@ -41,10 +41,13 @@ runs standalone in any environment with no config load and no PYTHONPATH setup.
 
 from __future__ import annotations
 
+import argparse
 import gzip
+import json
 import logging
 import os
 import shutil
+import sys
 import zlib
 from pathlib import Path
 
@@ -64,6 +67,13 @@ ARCHIVE_ROOT_RELATIVE = 'data/orchestrator/agent-transcripts'
 DEFAULT_ARCHIVE_ROOT = DEFAULT_PROJECT_ROOT / ARCHIVE_ROOT_RELATIVE
 
 GZ_SUFFIX = '.gz'
+
+# Exit codes. DIVERGES from gc_agent_transcripts' unconditional exit 0: that is
+# a routine cron sweep whose per-dir hiccups must not alarm a watchdog, whereas
+# this is a one-off migration whose failures an operator has to act on. A
+# non-zero failure count is an exit code, not a warning buried in a log.
+EXIT_OK = 0
+EXIT_FAILURES = 1
 
 # Every way reading a real gzip stream (or its decoded text) can fail.
 #
@@ -304,3 +314,75 @@ def migrate_archive(root: Path, *, apply: bool) -> dict:
             summary['failed_paths'].append(str(gz_path))
 
     return summary
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI arg parser (unit-testable in isolation).
+
+    ``--root`` defaults to :func:`default_archive_root`. ``--apply`` opts INTO
+    mutation: this follows the MUTATOR house convention (dry-run by default,
+    as ``repair_wiped_metadata_files.py`` and the fused-memory migrations do)
+    rather than :mod:`gc_agent_transcripts`' ``--check`` sweep convention,
+    because a mis-invocation here deletes thousands of source files.
+    """
+    parser = argparse.ArgumentParser(
+        prog='migrate_transcript_archive_gunzip.py',
+        description=(
+            'Decompress the agent-transcript archive in place, leaving one '
+            'plain, greppable .jsonl corpus (idempotent, LOUD, dry-run by '
+            'default).'
+        ),
+    )
+    parser.add_argument(
+        '--root',
+        default=str(default_archive_root()),
+        help='Archive root to migrate (default: %(default)s).',
+    )
+    parser.add_argument(
+        '--apply',
+        action='store_true',
+        help=(
+            'Actually migrate. WITHOUT this flag the run is a dry-run: it '
+            'classifies and reports what it would do, and changes nothing.'
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the migration: walk → migrate (or project) → report → exit.
+
+    The JSON summary goes to stdout and the LOUD lines to stderr, so the report
+    can be piped into ``jq`` while failures stay visible. Exits
+    :data:`EXIT_FAILURES` if any file could not be migrated — every such source
+    ``.gz`` is still on disk and named in ``failed_paths``, so the run is
+    re-runnable after the operator investigates.
+    """
+    logging.basicConfig(level=logging.INFO)
+    args = build_parser().parse_args(argv)
+
+    root = Path(args.root)
+    summary = migrate_archive(root, apply=args.apply)
+    print(json.dumps(summary))
+
+    logger.info(
+        '%s migration complete — root=%s scanned=%d migrated=%d skipped=%d '
+        'failed=%d apply=%s',
+        _LOG_PREFIX,
+        root,
+        summary['scanned'],
+        summary['migrated'],
+        summary['skipped'],
+        summary['failed'],
+        args.apply,
+    )
+    if not args.apply:
+        logger.info(
+            '%s DRY-RUN — nothing was changed; re-run with --apply to migrate.',
+            _LOG_PREFIX,
+        )
+    return EXIT_FAILURES if summary['failed'] else EXIT_OK
+
+
+if __name__ == '__main__':
+    sys.exit(main())
