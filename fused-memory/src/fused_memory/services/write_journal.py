@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import logging
@@ -14,19 +13,6 @@ import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 logger = logging.getLogger(__name__)
-
-# record_terminal_outcome's 0-row retry schedule (task 3582). The window is
-# real because BOTH producers INSERT their write_ops row AFTER the enqueue
-# commits: MemoryService.add_episode logs it in a `finally` immediately after
-# durable_queue.enqueue, and MemoryService.add_memory logs its single Layer-1
-# row only after the synchronous Mem0 leg. A queue worker that reaches a
-# terminal state inside that window would otherwise UPDATE 0 rows and drop the
-# outcome silently — the exact invisibility this column exists to remove.
-#
-# A module constant, deliberately NOT a QueueConfig/config.yaml field: no
-# operator surface is worth adding for a ~1.3 s worst case on a path that
-# should never fire. Monkeypatched by the tests.
-_TERMINAL_WRITEBACK_RETRY_DELAYS: tuple[float, ...] = (0.05, 0.25, 1.0)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS write_ops (
@@ -61,14 +47,41 @@ CREATE TABLE IF NOT EXISTS write_ops (
     --               an operation that never goes through the durable queue at
     --               all (search / delete_memory / task writes).
     --   'completed' the queue executed the write successfully.
-    --   'dead'      the queue exhausted its attempts and dead-lettered it;
-    --               terminal_error carries the queue's own
-    --               f'{type(exc).__name__}: {exc}'.
+    --   'dead'      the queue item EXHAUSTED ITS ATTEMPTS. Read this as "the
+    --               queue gave up", NOT as "the backend write never happened":
+    --               DurableWriteQueue._process_item runs the registered
+    --               callback (dual_write_episode / refresh_entity_summaries)
+    --               AFTER _execute_write has already returned, and a callback
+    --               that keeps failing dead-letters an item whose Graphiti
+    --               write DID land. Blind-replaying such an item duplicates
+    --               the write. That case is separable: the queue prefixes
+    --               terminal_error with POST_EXECUTE_DEAD_PREFIX
+    --               ('post-execute failure (the backend write LANDED; ...)')
+    --               when the failure happened after the backend call
+    --               succeeded. Absent that prefix, terminal_error is the
+    --               queue's own f'{type(exc).__name__}: {exc}' from a failed
+    --               execute. When in doubt, check backend_ops (joined on
+    --               write_op_id) before replaying.
     --
     -- LAST-WRITE-WINS: replay_dead resets a dead item to pending, so a
     -- dead-letter that is later replayed and lands correctly re-stamps
     -- 'completed' and clears terminal_error. A sticky-dead rule would leave a
     -- permanently stale 'dead' on a write that did land.
+    --
+    -- NO WRITE-BACK RACE. Both queue producers INSERT their Layer-1 row AFTER
+    -- the enqueue commits (MemoryService.add_episode in a `finally`;
+    -- add_memory only after the synchronous Mem0 leg, a network/LLM round trip
+    -- of unbounded width), so a worker can legitimately reach a terminal state
+    -- BEFORE the row it wants to stamp exists. record_terminal_outcome
+    -- therefore UPSERTs rather than UPDATEs: it creates the row carrying the
+    -- terminal fact alone (operation NULL — stage_stats skips non-str
+    -- operations, and the dashboard's GROUP BY tolerates the bucket), and
+    -- log_write_op is itself an upsert whose DO UPDATE deliberately omits the
+    -- terminal_* columns, so the producer's late row fills in AROUND an
+    -- already-recorded outcome instead of clobbering it. There is no retry
+    -- ladder and no bounded window to outrun — a time-boxed retry would drop
+    -- the outcome exactly when the producer was slowest, which is exactly when
+    -- an operator most needs it.
     --
     -- HISTORICAL ROWS STAY NULL. _migrate() deliberately does NOT backfill
     -- (unlike `kind`): a pre-change row's terminal outcome is genuinely
@@ -317,7 +330,19 @@ class WriteJournal:
         success: bool = True,
         error: str | None = None,
     ) -> None:
-        """Log a Layer 1 operation. Fire-and-forget — never raises."""
+        """Log a Layer 1 operation. Fire-and-forget — never raises.
+
+        An UPSERT rather than a plain INSERT (task 3582): the durable queue's
+        terminal write-back can legitimately reach this ``write_op_id`` before
+        its producer gets here — ``add_memory`` enqueues the Graphiti leg and
+        only journals this row after the synchronous Mem0 leg, an unbounded
+        network/LLM round trip — in which case ``record_terminal_outcome`` has
+        already created the row carrying the terminal fact alone. The
+        ``DO UPDATE`` therefore fills in every Layer-1 column and DELIBERATELY
+        OMITS ``terminal_status`` / ``terminal_at`` / ``terminal_error``, so the
+        late producer completes that row instead of clobbering the outcome it
+        was racing.
+        """
         try:
             async with self._txn() as db:
                 await db.execute(
@@ -325,7 +350,21 @@ class WriteJournal:
                        (id, causation_id, source, provenance, operation,
                         project_id, agent_id, session_id, kind,
                         params, result_summary, success, error, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           causation_id = excluded.causation_id,
+                           source = excluded.source,
+                           provenance = excluded.provenance,
+                           operation = excluded.operation,
+                           project_id = excluded.project_id,
+                           agent_id = excluded.agent_id,
+                           session_id = excluded.session_id,
+                           kind = excluded.kind,
+                           params = excluded.params,
+                           result_summary = excluded.result_summary,
+                           success = excluded.success,
+                           error = excluded.error,
+                           created_at = excluded.created_at""",
                     (
                         write_op_id,
                         causation_id,
@@ -620,8 +659,8 @@ class WriteJournal:
     ) -> bool:
         """Stamp the durable queue's terminal outcome back onto a write_op.
 
-        ``terminal_status`` is ``'completed'`` or ``'dead'``. Returns whether a
-        row was actually stamped.
+        ``terminal_status`` is ``'completed'`` or ``'dead'``. Returns whether
+        the outcome was durably recorded.
 
         ``success`` is deliberately LEFT UNTOUCHED: it means "the enqueue was
         accepted", and its readers (``reconciliation/stage_stats.py``, which
@@ -632,47 +671,49 @@ class WriteJournal:
         All three terminal fields are always written, so a replayed dead-letter
         that later lands clears its stale ``terminal_error`` (last-write-wins).
 
-        ``WHERE id = ?`` is a PRIMARY KEY seek and needs no new index — which
-        matters, because building one on the live 16.6M-row journal costs ~47 s
-        of startup DDL (see the ``idx_wo_created`` note in ``SCHEMA_SQL``).
+        UPSERT, NOT UPDATE. Both queue producers journal their Layer-1 row
+        AFTER the enqueue commits — ``add_episode`` in a ``finally``,
+        ``add_memory`` only after the synchronous Mem0 leg, a network/LLM round
+        trip of unbounded width — so a worker can reach a terminal state before
+        the row exists. A plain ``UPDATE`` would match 0 rows and drop the
+        outcome; a *time-boxed retry* would drop it precisely when the producer
+        was slowest, which is exactly when an operator most needs it, while
+        stalling the queue worker that awaits this call. Creating the row
+        instead makes the record unconditional: it carries the terminal fact
+        alone (``operation`` NULL — ``stage_stats`` skips non-``str``
+        operations), and the producer's later :meth:`log_write_op` upsert fills
+        in the Layer-1 columns without touching ``terminal_*``.
 
-        A 0-row UPDATE is RETRIED over ``_TERMINAL_WRITEBACK_RETRY_DELAYS``,
-        because both producers log their ``write_ops`` row after the enqueue
-        commits (see that constant). On exhaustion this logs a WARNING naming
-        the write_op and the status — loud, never silent — and returns
-        ``False``. The happy path never sleeps.
+        ``ON CONFLICT(id)`` is a PRIMARY KEY seek and needs no new index —
+        which matters, because building one on the live 16.6M-row journal costs
+        ~47 s of startup DDL (see the ``idx_wo_created`` note in
+        ``SCHEMA_SQL``).
 
         Fire-and-forget per the journal's never-block discipline: logs loudly
         and returns ``False`` on failure, never raises — a journaling hiccup
         must not propagate into the queue worker that calls it.
         """
         try:
-            for attempt in range(len(_TERMINAL_WRITEBACK_RETRY_DELAYS) + 1):
-                async with self._txn() as db:
-                    cursor = await db.execute(
-                        'UPDATE write_ops SET terminal_status = ?, terminal_at = ?, '
-                        'terminal_error = ? WHERE id = ?',
-                        (
-                            terminal_status,
-                            datetime.now(UTC).isoformat(),
-                            terminal_error,
-                            write_op_id,
-                        ),
-                    )
-                    if cursor.rowcount > 0:
-                        return True
-                if attempt < len(_TERMINAL_WRITEBACK_RETRY_DELAYS):
-                    await asyncio.sleep(_TERMINAL_WRITEBACK_RETRY_DELAYS[attempt])
-
-            logger.warning(
-                'Terminal outcome %s for write_op %s matched no write_ops row '
-                '(after %d retries) — the terminal state of that write is now '
-                'unrecorded',
-                terminal_status,
-                write_op_id,
-                len(_TERMINAL_WRITEBACK_RETRY_DELAYS),
-            )
-            return False
+            now = datetime.now(UTC).isoformat()
+            async with self._txn() as db:
+                await db.execute(
+                    """INSERT INTO write_ops
+                       (id, source, kind, created_at,
+                        terminal_status, terminal_at, terminal_error)
+                       VALUES (?, 'durable_queue', 'write', ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           terminal_status = excluded.terminal_status,
+                           terminal_at = excluded.terminal_at,
+                           terminal_error = excluded.terminal_error""",
+                    (
+                        write_op_id,
+                        now,
+                        terminal_status,
+                        now,
+                        terminal_error,
+                    ),
+                )
+            return True
         except Exception as e:
             logger.error(
                 f'Failed to record terminal outcome {terminal_status} '

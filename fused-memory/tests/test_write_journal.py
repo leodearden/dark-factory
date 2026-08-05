@@ -1110,29 +1110,23 @@ async def test_record_terminal_outcome_last_write_wins(journal):
 # The enqueue -> log_write_op ordering hazard (task 3582).
 #
 # Both producers INSERT their write_ops row AFTER enqueue() returns —
-# add_episode in a `finally`, add_memory after the synchronous Mem0 leg — so a
-# fast queue worker can reach a terminal state BEFORE the row exists. A bare
-# UPDATE would match 0 rows and drop the outcome SILENTLY, re-creating exactly
-# the invisibility this task removes.
+# add_episode in a `finally`, add_memory only after the synchronous Mem0 leg,
+# a network/LLM round trip of UNBOUNDED width — so a queue worker can reach a
+# terminal state before the row exists. A bare UPDATE would match 0 rows and
+# drop the outcome silently, re-creating exactly the invisibility this task
+# removes; a time-boxed retry would drop it precisely when the producer was
+# slowest. record_terminal_outcome therefore UPSERTs, and log_write_op fills in
+# around the terminal columns rather than clobbering them.
 # ------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_record_terminal_outcome_retries_until_row_appears(journal, monkeypatch):
-    from fused_memory.services import write_journal as wj
-
+async def test_record_terminal_outcome_creates_row_when_producer_has_not_logged(
+    journal,
+):
+    """No row yet is not an error — the outcome is recorded unconditionally."""
     op_id = str(uuid.uuid4())
-    monkeypatch.setattr(wj, '_TERMINAL_WRITEBACK_RETRY_DELAYS', (0.0, 0.0, 0.0))
-
-    calls = {'n': 0}
-
-    async def _sleep_then_insert(_delay):
-        calls['n'] += 1
-        if calls['n'] == 1:
-            # The producer's log_write_op lands during the retry window.
-            await journal.log_write_op(write_op_id=op_id, operation='add_episode')
-
-    monkeypatch.setattr(wj.asyncio, 'sleep', _sleep_then_insert)
+    assert await journal.get_write_op(op_id) is None
 
     assert await journal.record_terminal_outcome(
         write_op_id=op_id, terminal_status='dead', terminal_error='RuntimeError: boom'
@@ -1141,54 +1135,87 @@ async def test_record_terminal_outcome_retries_until_row_appears(journal, monkey
     row = await journal.get_write_op(op_id)
     assert row is not None
     assert row['terminal_status'] == 'dead'
+    assert row['terminal_error'] == 'RuntimeError: boom'
+    # The stub carries the terminal fact ALONE. `operation` stays NULL rather
+    # than being invented — stage_stats skips non-str operations.
+    assert row['operation'] is None
+    assert row['source'] == 'durable_queue'
 
 
 @pytest.mark.asyncio
-async def test_record_terminal_outcome_warns_when_row_never_appears(
+async def test_late_producer_log_write_op_preserves_terminal_outcome(journal):
+    """The unbounded-window case: the producer logs LONG after the write-back.
+
+    add_memory enqueues the Graphiti leg and journals its Layer-1 row only once
+    the synchronous Mem0 add() returns, so this ordering is the normal one
+    whenever Mem0 is slower than Graphiti. The producer's row must complete the
+    terminal row, never overwrite the outcome that beat it there.
+    """
+    op_id = str(uuid.uuid4())
+
+    # Worker gets there first.
+    await journal.record_terminal_outcome(
+        write_op_id=op_id, terminal_status='dead', terminal_error='RuntimeError: boom'
+    )
+    # ...then the producer finally lands its Layer-1 row, arbitrarily later.
+    await journal.log_write_op(
+        write_op_id=op_id,
+        operation='add_memory',
+        project_id='proj-x',
+        agent_id='agent-x',
+        params={'content': 'hello'},
+        result_summary={'memory_ids': ['m1']},
+        success=True,
+    )
+
+    row = await journal.get_write_op(op_id)
+    assert row is not None
+    # Layer 1 filled in...
+    assert row['operation'] == 'add_memory'
+    assert row['project_id'] == 'proj-x'
+    assert row['agent_id'] == 'agent-x'
+    assert row['success'] == 1
+    # ...without losing the terminal fact that arrived first.
+    assert row['terminal_status'] == 'dead'
+    assert row['terminal_error'] == 'RuntimeError: boom'
+    assert row['terminal_at'] is not None
+
+    # And exactly one row exists — the upsert converged, it did not duplicate.
+    ops = [o for o in await journal.get_ops_since('2000-01-01T00:00:00')
+           if o['id'] == op_id]
+    assert len(ops) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_outcome_returns_false_and_logs_on_db_error(
     journal, monkeypatch, caplog
 ):
-    """Loud, never silent — a dropped outcome must name itself in the log."""
+    """The never-propagate guarantee the whole design rests on.
+
+    _notify_terminal swallows hook exceptions, but this method must not raise
+    in the first place — a journaling hiccup flipping a landed write back to
+    retry would turn an audit improvement into a correctness regression.
+    """
     import logging
 
     from fused_memory.services import write_journal as wj
 
     op_id = str(uuid.uuid4())
-    monkeypatch.setattr(wj, '_TERMINAL_WRITEBACK_RETRY_DELAYS', (0.0, 0.0))
+    await journal.log_write_op(write_op_id=op_id, operation='add_episode')
 
-    async def _noop_sleep(_delay):
-        return None
+    def _boom():
+        raise RuntimeError('db handle exploded')
 
-    monkeypatch.setattr(wj.asyncio, 'sleep', _noop_sleep)
+    monkeypatch.setattr(journal, '_txn', _boom)
 
-    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+    with caplog.at_level(logging.ERROR, logger=wj.logger.name):
         result = await journal.record_terminal_outcome(
             write_op_id=op_id, terminal_status='dead'
         )
 
     assert result is False
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings, 'exhausted write-back must emit a WARNING'
-    joined = ' '.join(r.getMessage() for r in warnings)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, 'a failed write-back must be loud, not silent'
+    joined = ' '.join(r.getMessage() for r in errors)
     assert op_id in joined
     assert 'dead' in joined
-
-
-@pytest.mark.asyncio
-async def test_record_terminal_outcome_does_not_retry_on_hit(journal, monkeypatch):
-    """Zero added latency on the hot path."""
-    from fused_memory.services import write_journal as wj
-
-    op_id = str(uuid.uuid4())
-    await journal.log_write_op(write_op_id=op_id, operation='add_episode')
-
-    calls = {'n': 0}
-
-    async def _counting_sleep(_delay):
-        calls['n'] += 1
-
-    monkeypatch.setattr(wj.asyncio, 'sleep', _counting_sleep)
-
-    assert await journal.record_terminal_outcome(
-        write_op_id=op_id, terminal_status='completed'
-    ) is True
-    assert calls['n'] == 0
