@@ -166,3 +166,97 @@ class TestDeclaresParamAnnotation:
         tree = cmpw.parse_module('def f(self, with_vectors=False):\n    pass\n')
         fn = _resolved(tree, 'f')
         assert cmpw.declares_param(fn, 'with_vectors', annotation=None) is True
+
+
+class TestForwardsParamTo:
+    """Declaration alone is NOT the capability.
+
+    `qdrant-vector-access-for-ann` is vector *access*, not a signature shape. A
+    stub `with_vectors: bool = False` that is accepted and then dropped would
+    satisfy a declaration-only check while delivering nothing — the same
+    hollow-DELIVERED failure mode as the file-scoped grep, one level in.
+    """
+
+    def test_true_for_the_real_forward(self, real_tree):
+        """`client.scroll(..., with_vectors=with_vectors, ...)` on main."""
+        fn = _resolved(real_tree, 'scroll_by_metadata')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is True
+
+    def test_false_for_a_hardcoded_literal(self, real_tree):
+        """`client.retrieve(..., with_vectors=False)` is NOT a forward.
+
+        This is exactly `get_point_by_id`'s shape on main (mem0_client.py:839)
+        and is the discrimination the whole task turns on: an `ast.Constant`
+        value means the parameter is not reaching the call.
+        """
+        fn = _resolved(real_tree, 'get_point_by_id')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'retrieve') is False
+
+    def test_false_when_keyword_forwards_a_different_name(self):
+        tree = cmpw.parse_module(
+            'def f(with_vectors: bool = False):\n'
+            '    return client.scroll(with_vectors=want_vectors)\n'
+        )
+        fn = _resolved(tree, 'f')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is False
+
+    def test_false_when_the_right_forward_goes_to_the_wrong_callee(self):
+        tree = cmpw.parse_module(
+            'def f(with_vectors: bool = False):\n'
+            '    return client.query_points(with_vectors=with_vectors)\n'
+        )
+        fn = _resolved(tree, 'f')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is False
+
+    def test_matches_on_attribute_name_regardless_of_receiver(self):
+        """`other.scroll(...)` still matches `callee='scroll'`.
+
+        The check binds to the method NAME, not to the receiver expression —
+        resolving the receiver would need type inference the AST cannot give.
+        """
+        tree = cmpw.parse_module(
+            'def f(with_vectors: bool = False):\n'
+            '    return other.scroll(with_vectors=with_vectors)\n'
+        )
+        fn = _resolved(tree, 'f')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is True
+
+    def test_true_for_a_bare_call_callee(self):
+        """A plain `ast.Name` func, not just an `ast.Attribute`."""
+        tree = cmpw.parse_module(
+            'def f(with_vectors: bool = False):\n'
+            '    return scroll(with_vectors=with_vectors)\n'
+        )
+        fn = _resolved(tree, 'f')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is True
+
+    def test_true_when_the_call_is_nested_in_another_expression(self):
+        """On main the real call sits inside `await asyncio.wait_for(...)`.
+
+        A body scan inspecting only top-level statements would miss it. The
+        `real_tree` fixture carries that exact nesting; this pins the property
+        in isolation.
+        """
+        tree = cmpw.parse_module(
+            'async def f(with_vectors: bool = False):\n'
+            '    points, _ = await asyncio.wait_for(\n'
+            '        client.scroll(with_vectors=with_vectors),\n'
+            '        timeout=30,\n'
+            '    )\n'
+            '    return points\n'
+        )
+        fn = _resolved(tree, 'f')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is True
+
+    def test_a_forward_in_a_different_function_does_not_count(self):
+        """Walk `fn`, never the module — this is what keeps it method-scoped."""
+        tree = cmpw.parse_module(
+            'def target(with_vectors: bool = False):\n'
+            '    return client.scroll(with_payload=True)\n'
+            '\n'
+            '\n'
+            'def neighbour(with_vectors: bool = False):\n'
+            '    return client.scroll(with_vectors=with_vectors)\n'
+        )
+        fn = _resolved(tree, 'target')
+        assert cmpw.forwards_param_to(fn, 'with_vectors', 'scroll') is False
