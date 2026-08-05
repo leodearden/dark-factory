@@ -1763,6 +1763,7 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
 def test_escalation_links_and_storm_aggregate_banner(
     tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
+    memory_evals_fmt_js_code: str,
 ) -> None:
     """The escalation affordances must be real, built only from fields the
     projection actually carries, and read the banner from the top-level block.
@@ -1849,15 +1850,25 @@ def test_escalation_links_and_storm_aggregate_banner(
         '`payload.unmatched_escalations` — anchored to the read, not the bare '
         'name, which the surrounding prose also uses.'
     )
+    # The reason VOCABULARY moved with unmatchedReasonText into
+    # memory_evals_fmt.js (task 3481), so this names the reasons where they now
+    # live. Kept in Python rather than left to node alone because it is the
+    # cross-file half: node proves each reason renders distinct wording, this
+    # proves the .jsx actually routes its rows through that branch.
     reasons = ('no_matching_verdict', 'storm_suppressed', 'no_fingerprint')
     for reason in reasons:
-        assert f"'{reason}'" in code, (
-            f"the unmatched-escalations block must name the '{reason}' reason. "
+        assert f"'{reason}'" in memory_evals_fmt_js_code, (
+            f"unmatchedReasonText must name the '{reason}' reason. "
             'Collapsing the three into one undifferentiated "unexplained" list '
             'would fire on escalations that are in fact fully explained and '
             'train operators to ignore the one signal that catches a real '
             'parity orphan (memory_evals._unmatched_projection()).'
         )
+    assert re.search(r'\bunmatchedReasonText\s*\(', code), (
+        'tab_memory_evals.jsx must CALL unmatchedReasonText on each unmatched '
+        'row — the per-reason wording existing in the fmt module is worthless '
+        'if this file renders the raw `reason` string instead.'
+    )
     # The per-reason WORDING contract moved to node with the function:
     # memory_evals_fmt.test.mjs 'unmatchedReasonText: each known reason gets
     # its own non-blank wording' asserts the three texts are pairwise

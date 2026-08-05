@@ -1,11 +1,25 @@
 /* tab_memory_evals.jsx — memory-eval monitoring section, rendered INSIDE the
    Memory tab (PRD DD3: not a thirteenth top-level tab, no Rail entry).
 
-   No JS test runner in this project (see scheduler_drawer.jsx comment).
-   Wiring contracts are verified via Python source-assertion tests in
-   dashboard/tests/test_tab_memory_evals.py.
+   The JSX/React wiring here is verified via Python source-assertion tests in
+   dashboard/tests/test_tab_memory_evals.py — no JSX runner exists (this file
+   is transformed by CDN Babel at runtime and the repo has no node_modules).
+   The pure, JSX-free logic that used to live here — chartForKind, trendGaps,
+   dash, ageText, verdictBadge, unmatchedReasonText and the parity tables — was
+   moved to /static/redux/memory_evals_fmt.js (task 3481) precisely so it could
+   escape that limitation: it is now BEHAVIOURALLY tested by `node --test` in
+   dashboard/tests/js/memory_evals_fmt.test.mjs, which executes the verdict x
+   parity matrix instead of grepping for it.
 
-   LOAD ORDER IS THE CONTRACT — this file must load BEFORE tabs.jsx.
+   LOAD ORDER IS THE CONTRACT, in both directions.
+
+   UPSTREAM — memory_evals_fmt.js must load BEFORE this file, because the
+   destructure of window.DF_MEMORY_EVALS_FMT below runs at module top level.
+   A later tag leaves that global undefined here, which throws, which leaves
+   window.DF_MEMORY_EVALS undefined for tabs.jsx, which blanks every tab
+   defined there — the downstream contract below, one link back.
+
+   DOWNSTREAM — this file must load BEFORE tabs.jsx.
    tabs.jsx destructures window.DF_MEMORY_EVALS at module top level (the
    tab_scheduler.jsx:15 / window.DF_SCHED_HEATMAP precedent), so a later tag
    would leave the global undefined at tabs.jsx evaluation time, throw, and
@@ -18,7 +32,11 @@
    contract.  This file CONSUMES the server's judgments; it never re-derives
    them.  In particular nothing here compares a metric value against a limit.
 
-   Exports: window.DF_MEMORY_EVALS = { MemoryEvalsSection, chartForKind, verdictBadge }
+   Exports: window.DF_MEMORY_EVALS = { MemoryEvalsSection }
+   (chartForKind and verdictBadge were exported here only so the Python suite
+   could see them; they are owned by window.DF_MEMORY_EVALS_FMT now, and
+   re-exporting them would create two paths to one function.  tabs.jsx, the
+   only real consumer, destructures MemoryEvalsSection alone.)
 */
 const { Sparkline: MESpark, StepSpark: MEStep, PALETTE: MEC } = window.DF_CHARTS;
 const MEDF = window.DF_DATA;
@@ -33,254 +51,30 @@ const MEDF = window.DF_DATA;
 // "fixing" this.
 const { useState: MEuS } = React;
 
-// ── Chart primitive per metric kind (PRD open question 1) ──
+// The pure, JSX-free helpers live in memory_evals_fmt.js (task 3481) so
+// `node --test` can EXECUTE their branching rather than this repo grepping
+// their source text; their behavioural suite is
+// dashboard/tests/js/memory_evals_fmt.test.mjs.  index.html loads that classic
+// script before this file, exactly as this file loads before tabs.jsx.
 //
-// The payload's kind vocabulary is exactly {tripwire, proportion, count,
-// scalar}.  A kind outside that set is a RENDERING gap, not a data error: the
-// builder passes the value through verbatim and files an `unknown_kind` issue
-// for it.  So the fallback is `null` — value only, NO chart.  Guessing a
-// primitive would render an unvalidated shape as though it were understood.
-function chartForKind(kind) {
-  if (kind === 'tripwire') return MEStep;   // step-shaped item counts
-  if (kind === 'proportion') return MESpark;
-  if (kind === 'count') return MESpark;
-  if (kind === 'scalar') return MESpark;
-  return null;
-}
+// NOTE `chartForKind` returns a TAG ('step' | 'spark' | null), NOT a component:
+// it used to return MEStep/MESpark directly, and that dependency on
+// window.DF_CHARTS is precisely what pinned it inside this .jsx and out of
+// reach of any runner.  ME_CHART_BY_TAG below is the two-entry lookup that
+// turns the tag back into a primitive.
+const {
+  chartForKind,
+  trendGaps,
+  dash,
+  ageText,
+  verdictBadge,
+  unmatchedReasonText,
+} = window.DF_MEMORY_EVALS_FMT;
 
-// Count the deliberate holes in a trend series.  A `null` in `trend.values`
-// means that run produced no sample.
-//
-// The array is handed on UNMODIFIED — dropping a hole would shift this
-// metric's points against every other metric's, since all series share the
-// run_stamps x-axis.
-//
-// HISTORY: charts.jsx's primitives originally could not REPRESENT a hole.
-// `Sparkline` and `StepSpark` did their own arithmetic inline with no null
-// handling, coercing a `null` to 0, so a hole was drawn as a real data point
-// at value 0 connected by line segments to its neighbours — for a `proportion`
-// metric sitting at 0.95, a plunge to the chart floor and back, visually
-// identical to a genuine regression to zero.  That is fixed: the scale/path
-// math now lives in /static/redux/spark_path.js (task 3436), which excludes
-// non-finite samples from the extrema and breaks the path at every hole, and
-// is behaviourally tested under `node --test`
-// (dashboard/tests/js/spark_path.test.mjs).
-//
-// The local suppression below is nonetheless RETAINED for now: a holed series
-// is NOT DRAWN (see `plottable`) and the gap count is disclosed in text
-// instead.  This is the same invariant `dash()` states for scalars — a
-// synthetic zero reads as a measured zero — applied to the trend column.
-// Re-enabling this trend chart now that the primitive is hole-aware is a
-// product decision with its own test churn
-// (test_tab_memory_evals.py::test_trend_holes_are_never_handed_to_a_chart_primitive
-// pins the current behaviour), and is filed as separate follow-up work.
-function trendGaps(values) {
-  if (!values) return 0;
-  let gaps = 0;
-  for (let i = 0; i < values.length; i++) {
-    if (values[i] === null || values[i] === undefined) gaps += 1;
-  }
-  return gaps;
-}
-
-// Missing scalars render an em-dash, never `|| 0`: a synthetic zero reads as a
-// measured zero.  Same placeholder the Memory tab already uses (tabs.jsx:589).
-function dash(v) {
-  if (v === null || v === undefined) return '\u2014';
-  return v;
-}
-
-// Compact age from `latest_run_age_seconds`.  Display only — the staleness
-// THRESHOLD lives server-side and is deliberately absent from the payload, so
-// nothing here can re-derive `stale`.
-function ageText(seconds) {
-  if (seconds === null || seconds === undefined) return '\u2014';
-  const h = seconds / 3600;
-  if (h < 1) return `${Math.round(seconds / 60)}m ago`;
-  if (h < 48) return `${Math.round(h)}h ago`;
-  return `${Math.round(h / 24)}d ago`;
-}
-
-// ── Verdict badge ──
-//
-// `verdict` and `parity` are the ONLY badge inputs.  Re-deriving alarm state
-// from value-vs-limit in the browser is forbidden by PRD section 8 (G6/INV-5):
-// memory_evals._parity() says `parity` exists precisely so the UI does not
-// re-derive badge state "out of three separate fields, which is where the two
-// sides would drift apart".  This function therefore performs string equality
-// only — no arithmetic, no ordering comparison, no limits.
-//
-// The parity dimension REFINES the verdict; it never replaces it.
-//
-// ── The parity vocabulary, in ONE place ──
-//
-// These two declarations are this file's entire view of the parity vocabulary.
-// Every member of memory_evals.PARITY_STATES must appear in EXACTLY ONE of
-// them: PARITY_REFINEMENT for states whose badge carries a fact the verdict
-// alone does not, PARITY_PLAIN for states where the verdict badge already says
-// everything there is to say.  The plain list is an explicit opt-out, not an
-// oversight bucket — "no branch for it" and "considered, nothing to add" are
-// different decisions and only one of them is safe to leave undocumented.
-//
-// test_tab_memory_evals.py::test_parity_vocabulary_fully_covered asserts that
-// split against the exported frozenset rather than a copy pinned in the test
-// file, so a state added by the producer fails there instead of silently
-// rendering through whatever the fall-through happens to be.  (A hand-picked
-// three-member copy DID live in that test, and went blind to six states.)
-//
-// The values are SUFFIXES, never whole labels.  That is what makes "a parity
-// branch may not discard the verdict" structural instead of re-checked per
-// branch: there is no expression below capable of returning a label that omits
-// `base`.
-// Keys are QUOTED: they are the producer's vocabulary strings, looked up by
-// string, not JS identifiers — and quoting keeps them greppable in the same
-// form PARITY_PLAIN and the payload use.
-// EVERY `_open` member renders the same 'escalation open' affordance, in the
-// same words.  `_parity()` suffixes `_open` onto the linked variant of every
-// non-alarm verdict class, so these all assert one fact — an escalation is
-// filed and still live — and the operator should read one marker rather than
-// learn six.  Without it the badge is identical to the same verdict with
-// nothing filed, which is precisely the distinction parity exists to draw.
-//
-// Severity follows the VERDICT, not the linkage: an open escalation on a
-// metric nothing judged alarming is a warn-level parity fact, not a healthy
-// one and not an alarm.  `alarmed_open` keeps `badge bad` and pairs
-// symmetrically with `alarmed_unlinked` — "alarm · escalation open" vs
-// "alarm · no escalation" — where an unsuffixed alarm badge was ambiguous
-// between "escalation linked" and "state nobody handled".
-const PARITY_REFINEMENT = {
-  'alarmed_open':           { suffix: 'escalation open', cls: 'badge bad' },
-  'alarmed_unlinked':       { suffix: 'no escalation',   cls: 'badge bad' },
-  'storm_collapsed':        { suffix: 'storm-collapsed', cls: 'badge bad' },
-  'recovered_open':         { suffix: 'escalation open', cls: 'badge warn' },
-  'insufficient_data_open': { suffix: 'escalation open', cls: 'badge warn' },
-  'grandfathered_open':     { suffix: 'escalation open', cls: 'badge warn' },
-  'unjudged_open':          { suffix: 'escalation open', cls: 'badge warn' },
-
-  // The unknown-verdict pair is the one place severity does NOT follow the
-  // verdict, because there is no readable verdict to follow.  The producer
-  // names this condition as an issue kind — it files an `unknown_verdict`
-  // issue naming the eval, metric and offending value — precisely so a value
-  // outside the closed vocabulary fails toward "visibly unrenderable" rather
-  // than toward the healthy label.  This is the last render step and must not
-  // quietly undo that.
-  //
-  // The condition itself is named by the BASE, which reads 'unreadable
-  // verdict' for a value that is present but outside the vocabulary (see
-  // verdictBadge below).  So these two suffixes carry only what PARITY adds —
-  // the linkage — exactly as the alarm pair does.  Naming the condition in
-  // both halves would render "unreadable verdict · unrecognised verdict",
-  // asserting one fact twice and reading as two.
-  //
-  // Borrowing `badge muted` here would report a PRESENT-but-unreadable verdict
-  // as an ABSENT one — the same substitution the absent-verdict guard
-  // prevents, running the other way.  `unjudged` is the genuinely-absent case
-  // and correctly stays in PARITY_PLAIN, muted, reading 'no verdict'.
-  'unknown_verdict':        { suffix: 'no escalation',   cls: 'badge bad' },
-  'unknown_verdict_open':   { suffix: 'escalation open', cls: 'badge bad' },
-};
-// Reserved for states where the verdict badge already says everything there is
-// to say: nothing is filed, and the verdict names itself.
-//
-// 9 refined + 4 plain = 13 = |memory_evals.PARITY_STATES|.
-const PARITY_PLAIN = [
-  'clear',
-  'insufficient_data',
-  'grandfathered',
-  'unjudged',
-];
-function verdictBadge(metric) {
-  const verdict = metric.verdict;
-  const parity = metric.parity;
-
-  // The plain verdict label is computed FIRST, so that no parity branch below
-  // can discard it.
-  //
-  // This ordering is load-bearing.  memory_evals._parity() is a THREE-case
-  // lookup over (verdict class, linked?): `alarm`, then `no_alarm`, then a
-  // per-class fall-through that suffixes `_open` onto the linked variant of
-  // every remaining class.  So every verdict class carries its own pair of
-  // states and the class survives into the parity string — `recovered_open`
-  // and `clear` are NARROWED to the `no_alarm` verdict, and
-  // `insufficient_data`, `grandfathered` and an absent verdict now reach
-  // `insufficient_data_open`, `grandfathered_open` and `unjudged_open` rather
-  // than borrowing the recovery label.
-  //
-  // The producer draws those distinctions precisely so this badge can keep
-  // them, and a parity branch returning a FIXED label would collapse them
-  // right back — telling the operator that a metric nothing judged had
-  // recovered, the same "we did not measure" -> "we measured and it is fine"
-  // substitution the absent-verdict fall-through exists to prevent.  Suffixing
-  // `base` rather than replacing it is what makes that unrepresentable here,
-  // for every one of the nine refined states at once.
-  //
-  // Absent is absent and unreadable is unreadable: neither is EVER defaulted
-  // to no_alarm, and the two carry DIFFERENT labels — mirroring
-  // memory_evals._verdict_class(), which buckets an absent value to `unjudged`
-  // and a present-but-out-of-vocabulary one to `unknown_verdict`.
-  let base = 'no verdict';
-  let cls = 'badge muted';
-  if (verdict === 'alarm') {
-    base = 'alarm';
-    cls = 'badge bad';
-  } else if (verdict === 'no_alarm') {
-    base = 'no_alarm';
-    cls = 'badge ok';
-  } else if (verdict === 'grandfathered') {
-    base = 'grandfathered';
-    cls = 'badge info';
-  } else if (verdict === 'insufficient_data') {
-    base = 'insufficient_data';
-    cls = 'badge muted';
-  } else if (verdict !== null && verdict !== undefined) {
-    // Present, but outside the closed vocabulary — the bucket
-    // memory_evals._verdict_class() calls `unknown_verdict`.  'no verdict' is
-    // reserved for the genuinely ABSENT case: saying it here would assert the
-    // verdict is MISSING, and the operator reads the rendered string, not this
-    // comment.  `badge bad` rather than muted so the row fails toward
-    // "something is wrong here" on the base alone, before any parity
-    // refinement — the producer files a named `unknown_verdict` issue for
-    // exactly this value and the last render step must not undo it.  Wording
-    // follows `unmatchedReasonText`'s `unrecognised reason: ...`, so the file
-    // has ONE register for "the producer emitted a value this UI does not
-    // recognise".
-    base = 'unreadable verdict';
-    cls = 'badge bad';
-  }
-
-  // Parity states that carry information the verdict alone does not.  Each
-  // REFINES the base label by suffixing it; none replaces it.  `alarmed_unlinked`
-  // and `storm_collapsed` are only reachable when verdict === 'alarm', so those
-  // read as "alarm · ..." as before — composing rather than hard-coding just
-  // keeps them honest if the producer's derivation ever widens.
-  //
-  // One lookup and one composition site.  A state listed in PARITY_PLAIN is not
-  // absent from the table by accident; it is declared there as having nothing
-  // to add to the verdict badge.
-  // `hasOwnProperty` rather than a bare `PARITY_REFINEMENT[parity]`: the table
-  // is a plain object literal, so a bare lookup resolves through
-  // Object.prototype and a payload carrying parity 'constructor' / 'toString'
-  // / 'valueOf' / 'hasOwnProperty' would find a truthy INHERITED member,
-  // rendering `cls: undefined` and a label ending in '· undefined'.
-  const own = Object.prototype.hasOwnProperty.call(PARITY_REFINEMENT, parity);
-  const refinement = own ? PARITY_REFINEMENT[parity] : null;
-  if (refinement) {
-    return { cls: refinement.cls, label: base + ' · ' + refinement.suffix };
-  }
-
-  // A non-empty parity in NEITHER declaration is a state this copy of the file
-  // has never been told about — the producer added one and an already-open
-  // browser is still holding a cached bundle.  It is MARKED, not passed
-  // through: rendering it as the bare verdict badge is indistinguishable from
-  // a state that declined refinement, i.e. the unknown fails toward the
-  // healthy label — the same substitution the unknown-verdict pair above
-  // exists to prevent, one level up.  PARITY_PLAIN is what makes "considered
-  // and declined" distinguishable from "never heard of it" at all.
-  if (parity && PARITY_PLAIN.indexOf(parity) === -1) {
-    return { cls: 'badge bad', label: base + ' · unrecognised parity' };
-  }
-  return { cls: cls, label: base };
-}
+// Tag -> chart primitive.  An unknown kind yields the `null` tag, which misses
+// this table and leaves `Chart` null, preserving the `plottable` truthiness
+// gate below: value only, NO chart.
+const ME_CHART_BY_TAG = { step: MEStep, spark: MESpark };
 
 // ── Escalation link ──
 //
@@ -319,7 +113,7 @@ function EscalationLink({ escalation, onNavigate }) {
 function MemoryEvalMetricRow({ metric, onNavigate }) {
   const m = metric;
   const trend = m.trend || { labels: [], values: [] };
-  const Chart = chartForKind(m.kind);
+  const Chart = ME_CHART_BY_TAG[chartForKind(m.kind)] || null;
   const gaps = trendGaps(trend.values);
   // An EMPTY series is not a drawable series: both Sparkline and StepSpark
   // return null for a zero-length array, so without this count a metric with
@@ -629,19 +423,6 @@ function StormBanner({ storm, onNavigate }) {
   );
 }
 
-// ── Unmatched escalations ──
-//
-// Branched on `reason`, with distinct wording per value.  Collapsing the three
-// into one undifferentiated "unexplained" list would fire on escalations that
-// are in fact fully explained and train operators to ignore the one signal
-// that catches a real parity orphan (memory_evals._unmatched_projection()).
-function unmatchedReasonText(reason) {
-  if (reason === 'no_matching_verdict') return 'no metric row explains this';
-  if (reason === 'storm_suppressed') return "explained, but this run's links are collapsed into the aggregate";
-  if (reason === 'no_fingerprint') return 'producer emitted no dedupe_fingerprint';
-  return `unrecognised reason: ${String(reason)}`;
-}
-
 function UnmatchedEscalations({ rows, onNavigate }) {
   if (!rows || rows.length === 0) return null;
   return (
@@ -813,4 +594,4 @@ function MemoryEvalsSection({ onNavigate }) {
   );
 }
 
-window.DF_MEMORY_EVALS = { MemoryEvalsSection, chartForKind, verdictBadge };
+window.DF_MEMORY_EVALS = { MemoryEvalsSection };
