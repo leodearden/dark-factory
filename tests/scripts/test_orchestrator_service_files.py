@@ -591,3 +591,127 @@ def test_orchestrator_service_points_at_canonical_config_filename(
         "the moment that project retires the symlink — as dark-factory already "
         "did under task 2719."
     )
+
+
+# ---------------------------------------------------------------------------
+# setup-host.sh installer coverage (task 3641)
+# ---------------------------------------------------------------------------
+#
+# A committed unit template that setup-host.sh never installs is invisible: it
+# looks like a supported unit, but a fresh host simply does not get it, and an
+# existing host keeps whatever hand-installed copy it happens to have.  That is
+# the exact defect this task exists to fix — orchestrator-know-live.service had
+# a committed template since e5273d8623 and was never wired in, and
+# orchestrator-pump-web-ui.service ran on the host for weeks with no committed
+# source at all.  Fixing the two instances without a guard leaves the CLASS
+# open, so this asserts the installer's coverage mechanically.
+
+SETUP_HOST_SH = REPO_ROOT / "scripts" / "setup-host.sh"
+
+
+def _unit_has_install_section(content: str) -> bool:
+    """True if the unit declares an [Install] section (i.e. it is enable-able).
+
+    ``systemctl enable`` on a unit with no [Install] section is an error, not a
+    no-op — such a unit is 'static'.  orchestrator-watchdog.service is exactly
+    that: it is pulled in by orchestrator-watchdog.timer, which carries the
+    install instead.
+    """
+    return "Install" in _parse_sections(content)
+
+
+def _shell_statements(script_text: str) -> list[str]:
+    """Non-comment, non-blank statements of a shell script, whitespace-stripped.
+
+    Comments are dropped so that a unit merely NAMED in the section header
+    prose above the cp block cannot satisfy an assertion that the installer
+    actually copies it.
+    """
+    return [
+        stripped
+        for line in script_text.splitlines()
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    ]
+
+
+def test_setup_host_install_predicate_discriminates() -> None:
+    """Coverage guard: the glob is non-empty AND the [Install] predicate splits it.
+
+    Mirrors test_orchestrator_service_glob_covers_all_known_units, plus the
+    silent-green risk specific to the parametrized guard below.  That test's
+    enable half is CONDITIONAL on _unit_has_install_section, so a predicate
+    that answered False for everything (a broken _parse_sections, a change in
+    unit shape) would vacuously satisfy every case while checking nothing.
+    Asserting the predicate discriminates in BOTH directions keeps it honest:
+    at least one enable-able unit, and at least one static unit — today the
+    seven project orchestrators and orchestrator-watchdog.service respectively.
+    """
+    assert ALL_ORCHESTRATOR_SERVICE_FILES, (
+        "glob discovered no orchestrator-*.service templates"
+    )
+    by_install = {
+        p.name: _unit_has_install_section(p.read_text(encoding="utf-8"))
+        for p in ALL_ORCHESTRATOR_SERVICE_FILES
+    }
+    assert any(by_install.values()), (
+        "no orchestrator template has an [Install] section — the enable half of "
+        "test_setup_host_installs_every_orchestrator_unit would pass vacuously "
+        f"for every unit. Parsed: {by_install}"
+    )
+    assert not all(by_install.values()), (
+        "every orchestrator template has an [Install] section, so the static-unit "
+        "branch is never exercised. orchestrator-watchdog.service is expected to "
+        f"have none (it is pulled in by its .timer). Parsed: {by_install}"
+    )
+
+
+@pytest.mark.parametrize(
+    "service_path",
+    ALL_ORCHESTRATOR_SERVICE_FILES,
+    ids=lambda p: p.name,
+)
+def test_setup_host_installs_every_orchestrator_unit(
+    service_path: pathlib.Path,
+) -> None:
+    """setup-host.sh must copy every orchestrator template, and enable each one
+    that has an [Install] section.
+
+    setup-host.sh is how a unit reaches a host.  A template it does not copy is
+    a unit that does not exist on a fresh machine, however correct its contents
+    — so 'committed' and 'installed' silently diverge with nothing to detect it.
+
+    The enable obligation is DERIVED from the [Install] predicate rather than
+    hard-coded around a named watchdog exception, for the same reason
+    test_systemd_restart_backoff.py discovers by content instead of by list: a
+    hand-maintained exception list has to be edited for every future unit, and
+    a unit nobody remembers to add is precisely the bug being fixed here.  With
+    the predicate, a new orchestrator template turns this red on the day it
+    lands unless the installer learns about it.
+
+    This does NOT assert the converse (that the installer names no unknown
+    unit) — a `cp` of a template this glob cannot see would fail the installer
+    loudly at run time, so it needs no test.
+    """
+    basename = service_path.name
+    statements = _shell_statements(SETUP_HOST_SH.read_text(encoding="utf-8"))
+
+    expected_cp = f'cp "$REPO_ROOT/scripts/{basename}" "$UNIT_DIR/"'
+    copied = any(
+        stmt.startswith("cp ") and f"scripts/{basename}" in stmt for stmt in statements
+    )
+    assert copied, (
+        f"{SETUP_HOST_SH.name} never copies {basename} into $UNIT_DIR, so a fresh "
+        f"host never gets that unit. Add a line to the cp block:\n    {expected_cp}"
+    )
+
+    content = service_path.read_text(encoding="utf-8")
+    if not _unit_has_install_section(content):
+        return
+
+    expected_enable = f"systemctl --user enable {basename}"
+    enabled = any(stmt.startswith(expected_enable) for stmt in statements)
+    assert enabled, (
+        f"{basename} declares an [Install] section but {SETUP_HOST_SH.name} never "
+        "enables it, so it is copied to the host and then never starts at boot. "
+        f"Add a line to the enable block:\n    {expected_enable}"
+    )
