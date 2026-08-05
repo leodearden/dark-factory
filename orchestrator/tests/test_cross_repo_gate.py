@@ -1059,3 +1059,161 @@ class TestBlockAndEscalateCrossRepo:
         assert len(l1s) == 1, (
             f'L1 must still be filed when set_task_status raises; got {l1s!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-11 RED: Harness._run_cross_repo_gate
+# ---------------------------------------------------------------------------
+
+
+def _make_assignment(task_id: str = '42', **meta_keys):
+    """Build a minimal TaskAssignment-like object carrying cross-repo metadata."""
+    task = make_cross_repo_task(task_id=task_id, **meta_keys)
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = task
+    return assignment
+
+
+def _allow_verdict():
+    from orchestrator.cross_repo_gate import ALLOW, CrossRepoVerdict
+
+    return CrossRepoVerdict(
+        verdict=ALLOW, owner_project=None, signals=(), foreign_paths=(),
+        reason='no cross-repo evidence in task metadata',
+    )
+
+
+def _skip_verdict():
+    from orchestrator.cross_repo_gate import SKIP, CrossRepoVerdict
+
+    return CrossRepoVerdict(
+        verdict=SKIP, owner_project=None, signals=(), foreign_paths=(),
+        reason='task metadata is not a readable dict (type=list)',
+    )
+
+
+class TestRunCrossRepoGate:
+    """Unit tests for ``Harness._run_cross_repo_gate``.
+
+    Unlike ``_run_substrate_gate`` this gate is PURE: no worktree, no
+    subprocess, no thread offload.  Several tests below assert that property
+    directly, so a later refactor cannot quietly make dispatch pay for it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_block_returns_false_and_escalates(self, tmp_path: Path):
+        h = _make_harness(tmp_path)
+        h._block_and_escalate_cross_repo = AsyncMock()
+        verdict = _block_verdict()
+
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo', return_value=verdict):
+            allowed = await h._run_cross_repo_gate(_make_assignment(cross_repo=True))
+
+        assert allowed is False
+        h._block_and_escalate_cross_repo.assert_awaited_once()
+        assert h._block_and_escalate_cross_repo.await_args.kwargs['verdict'] is verdict
+
+    @pytest.mark.asyncio
+    async def test_allow_returns_true_without_escalating(self, tmp_path: Path):
+        h = _make_harness(tmp_path)
+        h._block_and_escalate_cross_repo = AsyncMock()
+
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo',
+                   return_value=_allow_verdict()):
+            allowed = await h._run_cross_repo_gate(_make_assignment(cross_repo=False))
+
+        assert allowed is True
+        h._block_and_escalate_cross_repo.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skip_returns_true_without_escalating(self, tmp_path: Path):
+        """SKIP is not evidence of a violation — it must not block or escalate."""
+        h = _make_harness(tmp_path)
+        h._block_and_escalate_cross_repo = AsyncMock()
+
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo',
+                   return_value=_skip_verdict()):
+            allowed = await h._run_cross_repo_gate(_make_assignment(cross_repo=True))
+
+        assert allowed is True
+        h._block_and_escalate_cross_repo.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_classify_raising_fails_closed(self, tmp_path: Path):
+        """Mirrors _run_substrate_gate's except branch: unverifiable → block."""
+        h = _make_harness(tmp_path)
+        h._block_and_escalate_cross_repo = AsyncMock()
+
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo',
+                   side_effect=RuntimeError('registry exploded')):
+            allowed = await h._run_cross_repo_gate(_make_assignment(cross_repo=True))
+
+        assert allowed is False, 'an unverifiable classification must fail CLOSED'
+        h._block_and_escalate_cross_repo.assert_awaited_once()
+        verdict = h._block_and_escalate_cross_repo.await_args.kwargs['verdict']
+        assert verdict.blocked is True
+        assert 'registry exploded' in verdict.reason, (
+            f'the synthesized verdict must name the exception; got {verdict.reason!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_passes_config_project_root(self, tmp_path: Path):
+        """A wrong root would make every task look foreign, or none of them."""
+        h = _make_harness(tmp_path)
+        h._block_and_escalate_cross_repo = AsyncMock()
+
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo',
+                   return_value=_allow_verdict()) as classify:
+            await h._run_cross_repo_gate(_make_assignment(cross_repo=True))
+
+        classify.assert_called_once()
+        assert classify.call_args.kwargs['project_root'] == h.config.project_root
+
+    @pytest.mark.asyncio
+    async def test_passes_the_assignment_task(self, tmp_path: Path):
+        h = _make_harness(tmp_path)
+        h._block_and_escalate_cross_repo = AsyncMock()
+        assignment = _make_assignment(cross_repo=True)
+
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo',
+                   return_value=_allow_verdict()) as classify:
+            await h._run_cross_repo_gate(assignment)
+
+        assert classify.call_args.kwargs['task'] is assignment.task
+
+    @pytest.mark.asyncio
+    async def test_no_subprocess_and_no_worktree(self, tmp_path: Path):
+        """The gate is pure and in-process — it must not build a worktree."""
+        import asyncio as _asyncio
+
+        h = _make_harness(tmp_path)
+        h._block_and_escalate_cross_repo = AsyncMock()
+
+        with (
+            patch.object(_asyncio, 'create_subprocess_exec') as spawn,
+            patch('orchestrator.cross_repo_gate.classify_cross_repo',
+                  return_value=_block_verdict()),
+        ):
+            await h._run_cross_repo_gate(_make_assignment(cross_repo=True))
+
+        spawn.assert_not_called()
+        h.git_ops.resolve_branch_sha.assert_not_awaited()
+        assert not (tmp_path / '.worktrees').exists(), (
+            'the cross-repo gate must not create any worktree'
+        )
+
+    @pytest.mark.asyncio
+    async def test_logs_the_verdict_even_when_allowing(self, tmp_path: Path, caplog):
+        """The gate must be observable in logs on every path, not just on block."""
+        h = _make_harness(tmp_path)
+        h._block_and_escalate_cross_repo = AsyncMock()
+        caplog.set_level(logging.INFO, logger='orchestrator.harness')
+
+        with patch('orchestrator.cross_repo_gate.classify_cross_repo',
+                   return_value=_allow_verdict()):
+            await h._run_cross_repo_gate(_make_assignment(task_id='4242', cross_repo=False))
+
+        message = ' '.join(r.getMessage() for r in caplog.records)
+        assert '4242' in message, f'gate must log the task id; got {message!r}'
+        assert 'allow' in message.lower(), f'gate must log the verdict; got {message!r}'
