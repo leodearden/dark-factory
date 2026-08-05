@@ -155,8 +155,9 @@ _MONTH_ABBR = {
 # NOTE — fork, not drift-guarded: _parse_resets_at and _extract_cap_message
 # below are ported from usage_gate.py (their regex/parsing logic originated
 # there), but unlike CAP_HIT_PREFIXES/CAP_CONFIRM_KEYWORDS/NEAR_CAP_PREFIXES/
-# CODEX_CAP_PATTERNS/GEMINI_CAP_PATTERNS/NON_CAP_CLI_ERROR_MARKERS (pinned by
-# TestStringTableDriftGuard in test_invocation_outcome.py), these two
+# CODEX_CAP_PATTERNS/GEMINI_CAP_PATTERNS/NON_CAP_CLI_ERROR_MARKERS (single-
+# sourced here with no mirrored copies elsewhere, guarded by
+# TestSingleSourceOwnership in test_invocation_outcome.py), these two
 # functions have NO automated guard keeping them in sync with their
 # usage_gate.py originals — and have already intentionally diverged: this
 # copy of _parse_resets_at returns None on parse failure and accepts an
@@ -371,8 +372,8 @@ def _extract_cap_message(text: str, prefix: str) -> str:
 
     Forked from usage_gate.py, same as ``_parse_resets_at`` above — see the
     fork/no-drift-guard note by that function's definition. Not covered by
-    TestStringTableDriftGuard, which pins only the plain string-table
-    constants.
+    TestSingleSourceOwnership, which only asserts the plain string-table
+    constants are single-sourced here with no mirrored copies elsewhere.
     """
     lower = text.lower()
     idx = lower.find(prefix.lower())
