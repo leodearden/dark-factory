@@ -145,3 +145,88 @@ def gunzip_one(gz_path: Path) -> Path:
     os.utime(dest, (source_stat.st_atime, source_stat.st_mtime))  # (3) mtime
     gz_path.unlink()                                 # (4) only now destroy
     return dest
+
+
+def _gz_uncompressed_size(gz_path: Path) -> int | None:
+    """Read the gzip ISIZE trailer — the uncompressed length, modulo 2**32.
+
+    Cheap (a 4-byte tail read, no decompression) and authoritative, which makes
+    it the right yardstick for deciding whether a PRE-EXISTING twin is complete.
+    Returns ``None`` when the file is too small to carry a trailer.
+
+    The modulo is harmless here: transcripts are megabytes, and the only way the
+    wrap could mislead is a twin whose size happens to be congruent mod 4 GiB.
+    A spurious MISmatch simply costs a redundant re-decompress — the failure
+    mode is extra work, never false trust.
+    """
+    with open(gz_path, 'rb') as handle:
+        if handle.seek(0, os.SEEK_END) < 8:
+            return None
+        handle.seek(-4, os.SEEK_END)
+        return int.from_bytes(handle.read(4), 'little')
+
+
+def _twin_is_trustworthy(gz_path: Path, twin: Path) -> bool:
+    """Is an EXISTING plain *twin* good enough to skip re-decompressing?
+
+    Applies the SAME read-back corroboration a fresh write gets — never mere
+    existence. A run killed between writing a twin and unlinking its source
+    leaves a half-written file that looks exactly like a finished one from the
+    outside; trusting it would silently truncate a transcript while deleting
+    the only authoritative copy.
+    """
+    try:
+        _corroborate(twin, expected_size=_gz_uncompressed_size(gz_path))
+    except (OSError, UnicodeDecodeError):
+        return False
+    return True
+
+
+def migrate_archive(root: Path, *, apply: bool) -> dict:
+    """Sweep *root*, migrating every ``.jsonl.gz`` to its plain sibling.
+
+    Walks ``root.rglob('*.jsonl.gz')`` in sorted order so a run is deterministic
+    and an interrupted one resumes over the same sequence. Each source is
+    classified before any work happens:
+
+    * an existing twin that corroborates -> ``skipped`` (the crash-resume path);
+      its now-redundant ``.gz`` is still unlinked, so the archive converges to
+      zero ``.gz`` even across a killed run;
+    * anything else -> :func:`gunzip_one`, counted ``migrated``.
+
+    ``apply=False`` is a pure projection: it classifies and counts without
+    touching a single byte, so an operator can see exactly what a real run
+    would do first. An absent or non-directory *root* is a clean empty sweep,
+    not a crash.
+
+    Returns a summary keeping CLASSIFICATION distinct from ACTION (mirroring
+    :func:`gc_agent_transcripts.build_gc_report`), so "skipped 1, migrated 1" is
+    never conflated with "migrated 2".
+    """
+    summary = {
+        'root': str(root),
+        'apply': apply,
+        'scanned': 0,
+        'migrated': 0,
+        'skipped': 0,
+        'failed': 0,
+        'failed_paths': [],
+    }
+    if not root.is_dir():
+        return summary
+
+    for gz_path in sorted(root.rglob('*.jsonl.gz')):
+        summary['scanned'] += 1
+        twin = plain_sibling(gz_path)
+
+        if twin.exists() and _twin_is_trustworthy(gz_path, twin):
+            summary['skipped'] += 1
+            if apply:
+                gz_path.unlink()
+            continue
+
+        summary['migrated'] += 1
+        if apply:
+            gunzip_one(gz_path)
+
+    return summary
