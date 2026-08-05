@@ -39,7 +39,16 @@ import { createRequire } from 'node:module';
 
 import sp from '../../src/dashboard/static/redux/spark_path.js';
 
-const { isPlottable, sparkScale, sparkPaths, stepPaths, plottableMax, axisY, axisPaths } = sp;
+const {
+  isPlottable,
+  sparkScale,
+  sparkPaths,
+  stepPaths,
+  plottableMax,
+  axisY,
+  axisPaths,
+  barFractions,
+} = sp;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 
@@ -60,6 +69,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'plottableMax',
   'axisY',
   'axisPaths',
+  'barFractions',
 ];
 
 // Float tolerance for any y that is not exactly representable. The x
@@ -969,5 +979,86 @@ test('axisPaths: does not mutate its input array', () => {
   const values = [0, null, 2, null, 4];
   const before = values.slice();
   axisPaths(values, LINE_GEOM);
+  assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
+});
+
+// ---------------------------------------------------------------------------
+// barFractions — value -> fraction-of-max, with a NULL for a hole (task 3489)
+//
+// charts.jsx's BarChart computed `(v / max) * chartH` and HistBar
+// `(v / max) * 100`, both after a bare `Math.max(...values, 1)`. A null gave a
+// ZERO-HEIGHT bar, indistinguishable from a measured zero; an undefined gave
+// `height="NaN"`; and HistBar's `minHeight: 1` turned a hole into a visible
+// 1px stub — a fabricated measurement.
+//
+// The fix hands the caller a `null` ENTRY rather than a number, because there
+// is no number a bar renderer can draw that means "absent": 0 and 1px both
+// read as measurements. Only an explicit null lets the caller decline to emit
+// the bar while keeping the slot's label and x position.
+// ---------------------------------------------------------------------------
+
+test('barFractions: a measured 0 and a null are DISTINCT, not both zero-height', () => {
+  // THE RED SIGNAL, and the entire point of the helper.
+  const { fractions } = barFractions([0, null], 4);
+
+  assert.equal(fractions[0], 0, 'a measured zero is a real fraction');
+  assert.equal(fractions[1], null, 'a hole is not a fraction at all');
+  assert.notEqual(fractions[0], fractions[1]);
+});
+
+test('barFractions: undefined and NaN yield null, and no entry is ever NaN', () => {
+  // Pre-fix an undefined poisoned max to NaN, so EVERY bar became
+  // height="NaN" — not just the missing one.
+  const { fractions } = barFractions([1, undefined, NaN, 2], 4);
+
+  assert.deepEqual(fractions, [0.25, null, null, 0.5]);
+  for (const f of fractions) {
+    assert.ok(f === null || Number.isFinite(f), `every entry must be null or finite — got ${f}`);
+  }
+});
+
+test('barFractions: plain fractions are exact on divisible input', () => {
+  assert.deepEqual(barFractions([0, 1, 2, 4], 4).fractions, [0, 0.25, 0.5, 1]);
+});
+
+test('barFractions: length and index alignment are preserved', () => {
+  // A hole must never shift a bar into its neighbour's slot — the category
+  // labels are positioned by index, so a compacted array would silently
+  // relabel every surviving bar.
+  const values = [1, null, 3, undefined, 5];
+  const { fractions } = barFractions(values, 5);
+
+  assert.equal(fractions.length, values.length);
+  assert.deepEqual(fractions, [0.2, null, 0.6, null, 1]);
+});
+
+test('barFractions: an all-hole or empty series yields all nulls rather than throwing', () => {
+  assert.deepEqual(barFractions([null, undefined, NaN], 1).fractions, [null, null, null]);
+  assert.deepEqual(barFractions([], 1).fractions, []);
+  assert.deepEqual(barFractions(null, 1).fractions, [], 'a missing series must not throw');
+  assert.deepEqual(barFractions(undefined, 1).fractions, []);
+});
+
+test('barFractions: max is an explicit argument, so the override path shares one code path', () => {
+  // HistBar has a `maxOverride ?? ...` precedence that must survive the
+  // refactor; passing max in means the override and derived-max paths run the
+  // same arithmetic rather than diverging into two.
+  assert.deepEqual(barFractions([1, 2], 4).fractions, [0.25, 0.5]);
+  assert.deepEqual(barFractions([1, 2], 2).fractions, [0.5, 1], 'a different max rescales');
+});
+
+test('barFractions: reproduces the legacy v / max on hole-free input', () => {
+  // charts.jsx's pre-fix BarChart height was `(v / max) * chartH` and
+  // HistBar's was `(v / max) * 100`; both are this fraction times a constant.
+  for (const values of [[0, 1, 2, 3], [5, 5], [0, 0, 0], [7]]) {
+    const max = Math.max(...values, 1);
+    assert.deepEqual(barFractions(values, max).fractions, values.map(v => v / max));
+  }
+});
+
+test('barFractions: does not mutate its input array', () => {
+  const values = [1, null, 3];
+  const before = values.slice();
+  barFractions(values, 3);
   assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
 });
