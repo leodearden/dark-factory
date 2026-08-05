@@ -49,6 +49,7 @@ SKIP = 'skip'     # evidence UNREADABLE (degenerate metadata) — never "verifie
 # Signal names recorded on a blocking verdict.
 SIGNAL_MARKER = 'cross_repo_marker'
 SIGNAL_ALL_FILES_FOREIGN = 'all_files_foreign'
+SIGNAL_SCOPE_MISMATCH_CONFIRMED = 'scope_mismatch_confirmed'
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +294,21 @@ def classify_cross_repo(
     entry resolving in-tree yields no block, so a still-undelivered NEW local
     file is never mistaken for a foreign deliverable.
 
-    Leg (C) — a containment-confirmed ``possible_scope_mismatch`` — lands in
-    step-8.
+    Leg (C) — a ``possible_scope_mismatch`` stamp whose ``matched_paths`` are
+    CONFIRMED foreign by the same containment test leg (B) uses.  The
+    confirmation requirement is the whole point: the stamp is written by the
+    fused-memory prose matcher (``'source': 'prose'``) and is documented to
+    over-fire — task 3120 landed a right-boundary fix for exactly that and
+    records a KNOWN FAIL-OPEN residue.  Blocking on unconfirmed prose would
+    convert a false-positive advisory into a stalled task PLUS a spurious L1,
+    strictly worse than today.  Confirmation makes leg (C) a genuine second
+    evidence source rather than a restatement of the heuristic.
+
+    Degenerate metadata — unreadable (non-dict, or a string that fails to parse
+    or decodes to a non-dict) — yields SKIP and a WARNING.  SKIP means "no
+    evidence readable", NEVER "verified clean": a silent ALLOW here would wave
+    a task through with no trace that its markers could not be read, which is
+    precisely the no-silent-fail-soft failure this gate exists to prevent.
 
     ``project_root`` may be a ``Path`` or a ``str``; it is coerced here.
 
@@ -304,13 +318,22 @@ def classify_cross_repo(
     root = Path(project_root)
     meta = _extract_metadata(task)
     if meta is None:
-        # step-8 turns this into a LOUD SKIP.  ALLOW for now.
+        raw = task.get('metadata')
+        logger.warning(
+            'cross_repo_gate: task %s metadata is not a readable dict '
+            '(type=%s, repr=%.200r) — classifying SKIP; markers, if any, were '
+            'NOT read, so this is not a clean bill of health',
+            task.get('id'), type(raw).__name__, raw,
+        )
         return CrossRepoVerdict(
-            verdict=ALLOW,
+            verdict=SKIP,
             owner_project=None,
             signals=(),
             foreign_paths=(),
-            reason='task metadata is not a readable dict',
+            reason=(
+                f'task metadata is not a readable dict '
+                f'(type={type(raw).__name__}) — no evidence could be read'
+            ),
         )
 
     signals: list[str] = []
@@ -335,6 +358,21 @@ def classify_cross_repo(
             f'all {len(entries)} declared metadata.files entries are absolute paths '
             f'resolving outside project_root ({root})'
         )
+
+    # ── Leg (C): a CONTAINMENT-CONFIRMED possible_scope_mismatch stamp ───
+    stamp = meta.get('possible_scope_mismatch')
+    if isinstance(stamp, dict):
+        matched = _path_entries(stamp.get('matched_paths'))
+        if matched and _all_entries_foreign(matched, root):
+            signals.append(SIGNAL_SCOPE_MISMATCH_CONFIRMED)
+            foreign_paths = foreign_paths + tuple(
+                path for path in matched if path not in foreign_paths
+            )
+            reasons.append(
+                f'metadata.possible_scope_mismatch (an advisory prose stamp) is '
+                f'CONFIRMED by path containment: all {len(matched)} matched_paths '
+                f'resolve outside project_root ({root})'
+            )
 
     if not signals:
         return CrossRepoVerdict(
