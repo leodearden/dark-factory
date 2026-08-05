@@ -69,9 +69,19 @@ Top victims: `add_design_decision.rationale` (109), `add_memory.content` (90), `
 
 ### 2.4 Landed damage at the ungated boundaries
 
-- **21 of 296 retained `plan.json` files (7.1%), 87 corrupted strings** — including cases where `rationale` was absorbed into `decision`, so the design rationale a future architect reads is another field's text.
-- **51 escalation records** with corrupted `detail`/`summary`/`suggested_action`.
-- Retained plans are a survivor sample; most worktrees are deleted post-merge, so the historical total is larger.
+Re-measured 2026-08-05 **split by sweep lane**, because §5 D4 routes the two lanes to different tasks. The first pass reported a combined "21 of 296 plan.json / 87 strings", which was right in total but wrong in attribution — nearly all of it is live, not terminal:
+
+| Lane | Owner | Files with corruption | Corrupted strings |
+|---|---|---|---|
+| `.worktrees-orphaned/**/.task/plan.json` (terminal) | **δ** (eager sweep) | 1 of 15 | 2 |
+| `.worktrees/**/.task/plan.json` (live) | **ε** (lazy write-back) | 22 of 270 | 91 |
+| `data/escalations/**` | **δ** (eager sweep) | 52 of 3,386 | 53 |
+
+Consequences for the decomposition: δ's *plan* work is nearly a no-op — its real payload is the escalation corpus — while **ε carries essentially all the plan.json damage**. This strengthens D4 rather than undermining it: the corruption sits precisely where a global rewrite would have had to contend with running tasks. Escalation counts drift upward as escalations are written live (51 → 52 across a few hours); treat ~50 as the figure and re-measure at sweep time.
+
+Corrupted strings include cases where `rationale` was absorbed into `decision`, so the design rationale a future architect reads is another field's text. Retained plans are a survivor sample; most worktrees are deleted post-merge, so the historical total is larger.
+
+**Sweep hazard pinned for δ:** `docs/task-recovery-2026-05-13/worktree-inventory.json` is git-tracked, legitimately contains predicate matches, and is replicated into every worktree — a loose glob hits it ~47 times. A sloppy sweep would rewrite committed evidence.
 
 ### 2.5 Containment *where installed* works — which is why the gap is the story
 
