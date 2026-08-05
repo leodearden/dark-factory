@@ -1292,28 +1292,25 @@ def test_verdict_badges_driven_by_persisted_verdict(
     #     that omits `base`, so the invariant holds for states this suite has
     #     not enumerated as well as for the ones it has.
 
-    # (ii) the base label is derived from `verdict`, and an unrecognised
-    #      verdict gets its own state rather than a defaulted one.
-    base_m = re.search(r'\b(?:let|const|var)\s+(\w+)\s*=\s*(.+?);', badge_body)
-    assert base_m, 'verdictBadge must compute a verdict-derived base label.'
-    assert not re.search(
-        r"\b(?:let|const|var)\s+\w+\s*=\s*'(no_alarm|alarm)'\s*;", badge_body
-    ), (
-        'the base label must not be INITIALISED to a real verdict — an '
-        'unrecognised verdict would then inherit it. Absent is absent: seed '
-        'the not-measured state and overwrite it only on a recognised verdict.'
-    )
-    assert not re.search(r"return\s*\{[^}]*\bcls\s*:\s*'badge ok'\s*,", badge_body) or \
-        re.search(r"verdict\s*===\s*'no_alarm'", badge_body), (
-        "the 'badge ok' styling may only be reached via an explicit "
-        "`verdict === 'no_alarm'` test — never as a fall-through."
-    )
-    assert not re.search(
-        r"verdict\s*(\|\||\?\?)\s*['\"]no_alarm['\"]", body
-    ), (
-        'a null verdict must NOT be defaulted to no_alarm — that would report '
-        '"we did not measure" as "we measured and it is fine".'
-    )
+    # (ii) the base label being verdict-DERIVED — not initialised to a real
+    #      verdict, 'badge ok' reachable only via an explicit
+    #      `verdict === 'no_alarm'` test, and a null verdict never defaulted to
+    #      no_alarm — was asserted here by three regexes over the function
+    #      SOURCE. All three are now asserted by CALLING the function, in two
+    #      named node tests:
+    #        memory_evals_fmt.test.mjs
+    #          'verdictBadge: each verdict alone yields its own base label and
+    #           class'  (null and undefined -> 'no verdict'/'badge muted', and
+    #           only no_alarm -> 'badge ok'), and
+    #          'verdictBadge: absent and unreadable are DIFFERENT, and
+    #           unreadable is never muted'.
+    #
+    #      Removed rather than retargeted for a second reason worth recording:
+    #      the last of the three grepped the .jsx BODY, which no longer contains
+    #      verdictBadge at all — so it had become vacuous, passing on a file
+    #      that cannot contain the defect either way. That is precisely the
+    #      blindness this migration exists to end, and leaving it would have
+    #      read as coverage.
 
 
 # The six pure helpers task 3481 moved out of the .jsx into memory_evals_fmt.js.
