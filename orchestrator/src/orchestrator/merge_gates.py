@@ -80,7 +80,11 @@ class PlanFilesTouchedResult:
             consulted for these entries, so no claim about the branch's
             commits can be made from them.  Entries whose absence could not
             be measured (a git error on the existence probe) are deliberately
-            NOT listed here; they land in ``not_touched`` only.
+            NOT listed here; they land in ``not_touched`` only.  Entries that
+            RESOLVED are likewise never listed here, and safely so: a
+            resolution's target is always verified to exist at
+            ``branch_head`` (see :func:`_resolve_renamed_plan_path`), so the
+            file is genuinely present under a known new name.
         resolved_renames: Declared entry → the current path it resolved to,
             recorded whether or not that resolved path was touched, as the
             gate's audit trail.  Keyed by the ORIGINAL declared string (the
@@ -1056,6 +1060,137 @@ def _normalize_plan_path(entry: str) -> str:
     return entry if norm == '.' else norm
 
 
+_MAX_RENAME_HOPS = 8
+"""Upper bound on how many consecutive rename hops the resolver will follow.
+
+A relocation staged as several ``git mv`` commits (``a → b`` then
+``b → c``) is one logical move to a human but N pair-hops to git, so
+mechanism 1 must chase the chain rather than stop at the first pair.  The
+bound exists purely so a pathological history cannot turn one stale plan
+entry into an unbounded subprocess fan-out; 8 is far above any observed
+real chain (the measured reify harness-consolidation moves were 1-2 hops)
+and a chain that exceeds it simply falls through to mechanism 2.
+"""
+
+
+def _ls_tree_object_type(ls_out: str) -> str | None:
+    """Return the git object type named by the first ``git ls-tree`` record.
+
+    ``git ls-tree`` prints ``<mode> <type> <sha>\\t<path>`` — the metadata
+    is TAB-separated from the path, so the type must be read out of the
+    left half only.  Substring-sniffing the whole line for ``' tree '``
+    misclassifies any blob whose repo-relative path happens to contain
+    that substring (e.g. ``docs/my tree notes.md``), which matters because
+    the existence probe's type classification now gates three arms, not
+    one.
+
+    Returns ``None`` for empty or unparseable output (defensive: the
+    caller then treats the object as a non-directory, which is the
+    conservative reading — a directory misread as a blob only costs a
+    prefix-match, never a spurious pass).
+    """
+    for line in ls_out.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split('\t', 1)[0].split()
+        return fields[1] if len(fields) >= 2 else None
+    return None
+
+
+async def _rename_pair_for(
+    path: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> tuple[str, str] | None:
+    """One hop of git's own rename detection for *path*, or ``None``.
+
+    Finds the commit reachable from *branch_head* that DELETED *path*
+    (``git log --diff-filter=D -1``), then re-reads that commit with
+    rename detection on (``git show --name-status -M``) looking for an
+    ``R<score>\\t<old>\\t<new>`` pair whose old side is *path*.
+
+    Returns ``(new_path, deleting_sha)``.  Fails CLOSED: a git error, no
+    deleting commit, or no pairable rename all return ``None``.
+    """
+    rc, del_out, del_err = await _run(
+        ['git', 'log', '--diff-filter=D', '-1', '--format=%H', branch_head, '--', path],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
+            'cmd=%r rc=%s stderr=%s',
+            task_id or '<unknown>', path,
+            'git log --diff-filter=D -1 --format=%H <head> -- <entry>',
+            rc, (del_err or '').strip()[:400],
+        )
+        return None
+
+    del_sha = del_out.strip().splitlines()[0].strip() if del_out.strip() else ''
+    if not del_sha:
+        return None
+
+    rc, show_out, show_err = await _run(
+        ['git', 'show', '--name-status', '-M', '--format=', del_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
+            'cmd=%r rc=%s stderr=%s',
+            task_id or '<unknown>', path,
+            f'git show --name-status -M --format= {del_sha[:12]}',
+            rc, (show_err or '').strip()[:400],
+        )
+        return None
+
+    for line in show_out.splitlines():
+        fields = line.split('\t')
+        if len(fields) < 3:
+            continue
+        status, old_path, new_path = fields[0], fields[1], fields[2]
+        if status.startswith('R') and old_path == path and new_path:
+            return new_path, del_sha
+    return None
+
+
+async def _path_existed_in_branch_history(
+    norm: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> bool:
+    """True when some commit reachable from *branch_head* touched *norm*.
+
+    This is the evidence gate on the basename heuristic: it establishes
+    that the declared path was ever REAL under that exact name.  Without
+    it, a path the architect simply invented (``docs/foo.md``, never
+    created) would fall straight into the basename fallback and could be
+    "rename-resolved" to a coincidentally-unique ``other/place/foo.md`` —
+    a category error (nothing was renamed) that weakens the gate for the
+    one case it must always block.
+
+    Fails CLOSED: a git error returns ``False``, so the heuristic is not
+    consulted on evidence we could not measure.
+    """
+    rc, out, err = await _run(
+        ['git', 'log', '-1', '--format=%H', branch_head, '--', norm],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: history-probe git error task_id=%s entry=%s '
+            'head=%s rc=%s stderr=%s',
+            task_id or '<unknown>', norm, branch_head, rc,
+            (err or '').strip()[:400],
+        )
+        return False
+    return bool(out.strip())
+
+
 async def _resolve_renamed_plan_path(
     norm: str,
     branch_head: str,
@@ -1070,29 +1205,47 @@ async def _resolve_renamed_plan_path(
     Returns ``(resolved_path, mechanism)`` where *mechanism* is a short
     human-readable description for the audit log.
 
-    Mechanism 1 (authoritative — git's own rename detection): find the
-    commit reachable from *branch_head* that DELETED *norm*
-    (``git log --diff-filter=D -1``), then ask git to re-read that commit
-    with rename detection on (``git show --name-status -M``) and look for
-    an ``R<score>\\t<old>\\t<new>`` pair whose old side is *norm*.
+    **Invariant: a returned ``resolved_path`` always EXISTS in the branch
+    tree at ``branch_head``.**  Both mechanisms enforce it (mechanism 1
+    verifies each hop against the tree listing; mechanism 2 draws its
+    candidates from that listing), so a resolution can never point a human
+    at a second phantom path, and an entry that resolved is never
+    ``missing_from_tree``.
 
-    Mechanism 2 (heuristic fallback, tried only when mechanism 1 finds
-    nothing): a UNIQUE basename match against the branch tree listing
-    supplied by *tree_paths*.  Mechanism 1 cannot see a relocation staged
-    as SEPARATE delete and add commits (git pairs renames only within one
-    commit), which is exactly how the reify harness-consolidation
-    programme staged its moves.  The fallback is deliberately conservative
-    and bounded three ways: it requires EXACTLY ONE candidate; it only
-    runs for a path that exists nowhere in the branch tree; and a
-    resolution never passes the gate on its own — the caller additionally
-    requires the resolved path to be in the touched set.  So an ambiguous
-    or coincidental basename cannot silently satisfy the gate.
+    Mechanism 1 (authoritative — git's own rename detection): follow the
+    rename CHAIN from *norm*, hop by hop, via :func:`_rename_pair_for`.
+    Each hop's target is checked against the branch tree: a hop that lands
+    on a live path is the answer; a hop that lands on a path which was
+    itself relocated again keeps walking (bounded by
+    :data:`_MAX_RENAME_HOPS`, with a cycle guard).  Stopping at the FIRST
+    pair would answer a two-step ``a → b → c`` relocation with the dead
+    intermediate ``b`` — blocking a branch that delivered exactly what was
+    asked, and naming a path that does not exist at branch HEAD in the
+    audit trail.  Staged multi-step moves are precisely the shape the
+    reify harness-consolidation programme used.
+
+    Mechanism 2 (heuristic fallback, tried only when the chain dead-ends):
+    a UNIQUE basename match against the branch tree listing supplied by
+    *tree_paths*.  Mechanism 1 cannot see a relocation staged as SEPARATE
+    delete and add commits (git pairs renames only within one commit),
+    which is exactly how the reify harness-consolidation programme staged
+    its moves.  The fallback is deliberately conservative and bounded four
+    ways: it requires EXACTLY ONE candidate; it only runs for a path that
+    exists nowhere in the branch tree; it only runs for a path with actual
+    history under its declared name (see
+    :func:`_path_existed_in_branch_history` — an invented path is a stale
+    declaration, not a rename); and a resolution never passes the gate on
+    its own — the caller additionally requires the resolved path to be in
+    the touched set.  So an ambiguous or coincidental basename cannot
+    silently satisfy the gate.
 
     *tree_paths* is an async provider, not a list, so the (single) tree
     listing is shelled out at most ONCE per gate invocation, shared across
-    every stale entry, and never computed at all when mechanism 1 resolves
-    or when no entry is stale.  It returns ``None`` on a git error, which
-    fails this resolver closed.
+    every stale entry and every hop, and never computed at all when no
+    entry is stale.  It returns ``None`` on a git error, which fails this
+    resolver closed for BOTH mechanisms — without a tree listing neither
+    the hop-liveness check nor the basename bound can be evaluated, so no
+    entry resolves.
 
     Anchored on *branch_head* rather than main's live HEAD deliberately:
     this gate has no ``main_sha`` parameter, and reading ``HEAD`` in
@@ -1108,57 +1261,69 @@ async def _resolve_renamed_plan_path(
     error there would block every plan entry at once, whereas a per-entry
     probe failure can only leave one already-suspect entry flagged.)
     """
-    # ── Mechanism 1: the deleting commit's own rename pair ──────────────
-    rc, del_out, del_err = await _run(
-        ['git', 'log', '--diff-filter=D', '-1', '--format=%H', branch_head, '--', norm],
-        cwd=git_ops.project_root,
-    )
-    if rc != 0:
-        logger.warning(
-            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
-            'cmd=%r rc=%s stderr=%s',
-            task_id or '<unknown>', norm,
-            'git log --diff-filter=D -1 --format=%H <head> -- <entry>',
-            rc, (del_err or '').strip()[:400],
-        )
-        return None
+    tree_set: set[str] | None = None
 
-    del_sha = del_out.strip().splitlines()[0].strip() if del_out.strip() else ''
-    if del_sha:
-        rc, show_out, show_err = await _run(
-            ['git', 'show', '--name-status', '-M', '--format=', del_sha],
-            cwd=git_ops.project_root,
-        )
-        if rc != 0:
-            logger.warning(
-                'plan-files-touched: rename-probe git error task_id=%s entry=%s '
-                'cmd=%r rc=%s stderr=%s',
-                task_id or '<unknown>', norm,
-                f'git show --name-status -M --format= {del_sha[:12]}',
-                rc, (show_err or '').strip()[:400],
-            )
+    async def _tree_set() -> set[str] | None:
+        nonlocal tree_set
+        if tree_set is None:
+            paths = await tree_paths()
+            if paths is None:
+                return None
+            tree_set = set(paths)
+        return tree_set
+
+    # ── Mechanism 1: follow the deleting commits' rename chain ──────────
+    current = norm
+    seen = {norm}
+    shas: list[str] = []
+    for _hop in range(_MAX_RENAME_HOPS):
+        pair = await _rename_pair_for(current, branch_head, git_ops, task_id=task_id)
+        if pair is None:
+            break
+        new_path, del_sha = pair
+        if new_path in seen:
+            # Degenerate a → b → a history; stop rather than loop.
+            break
+        seen.add(new_path)
+        shas.append(del_sha)
+        current = new_path
+
+        live = await _tree_set()
+        if live is None:
             return None
-
-        for line in show_out.splitlines():
-            fields = line.split('\t')
-            if len(fields) < 3:
-                continue
-            status, old_path, new_path = fields[0], fields[1], fields[2]
-            if status.startswith('R') and old_path == norm and new_path:
-                return new_path, f'rename in {del_sha[:12]}'
+        if current in live:
+            mechanism = (
+                f'rename in {shas[0][:12]}' if len(shas) == 1
+                else f'{len(shas)}-hop rename chain ending in {shas[-1][:12]}'
+            )
+            return current, mechanism
+        # The hop landed on a path that is itself gone from the tree: it was
+        # relocated again.  Keep walking rather than returning a dead answer.
 
     # ── Mechanism 2: unique basename match in the branch tree ───────────
     # Reached when no commit deleted the path (never created, or the
-    # relocation predates any reachable delete) or when the deleting
-    # commit carried no pairable rename (separate delete+add commits).
-    paths = await tree_paths()
-    if paths is None:
+    # relocation predates any reachable delete), when the deleting commit
+    # carried no pairable rename (separate delete+add commits), or when
+    # the chain dead-ended on a path that is absent from the tree.
+    if not await _path_existed_in_branch_history(
+        norm, branch_head, git_ops, task_id=task_id,
+    ):
+        logger.warning(
+            'plan-files-touched: declared %s has NO history under that name at '
+            'head=%s — basename fallback deliberately not attempted (a path that '
+            'never existed is an invented declaration, not a rename). task_id=%s',
+            norm, branch_head, task_id or '<unknown>',
+        )
+        return None
+
+    live = await _tree_set()
+    if live is None:
         return None
 
     basename = posixpath.basename(norm)
     if not basename:
         return None
-    candidates = [p for p in paths if posixpath.basename(p) == basename]
+    candidates = [p for p in live if posixpath.basename(p) == basename]
     if len(candidates) == 1:
         return candidates[0], 'unique basename match'
 
@@ -1210,10 +1375,12 @@ async def _check_plan_files_touched_in_branch(
     touched_set = set(touched)
 
     # Lazily-computed, once-per-invocation listing of every path in the
-    # branch tree, used only by the rename resolver's basename fallback.
-    # It is reached only on the already-failing absent-path arm, so the
-    # cost is off the hot path — and it is paid at most once even when
-    # several declared entries are stale (the reify-5196 shape had two).
+    # branch tree, used by the rename resolver to verify each chain hop
+    # landed on a path that still EXISTS and to bound its basename
+    # fallback.  It is reached only on the already-failing absent-path
+    # arm, so the cost is off the hot path — and it is paid at most once
+    # per gate invocation even when several declared entries are stale
+    # (the reify-5196 shape had two) and each walks several hops.
     tree_listing: list[str] | None = None
     tree_listing_failed = False
 
@@ -1279,8 +1446,11 @@ async def _check_plan_files_touched_in_branch(
             continue
 
         if ls_out.strip():
-            # Path EXISTS at branch_head.
-            if ' tree ' in ls_out:
+            # Path EXISTS at branch_head.  Read the object type out of the
+            # TAB-separated metadata half only — sniffing the whole line for
+            # the substring ' tree ' misreads any blob whose path contains
+            # it (e.g. 'docs/my tree notes.md').
+            if _ls_tree_object_type(ls_out) == 'tree':
                 # Directory: prefix-match against the touched set.
                 prefix = norm.rstrip('/') + '/'
                 if any(t.startswith(prefix) for t in touched_set):

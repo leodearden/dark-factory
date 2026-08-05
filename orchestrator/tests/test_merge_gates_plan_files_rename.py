@@ -26,9 +26,14 @@ times over, each time diagnosed as "the implementation has not delivered
 against the plan" when the implementation had in fact delivered exactly
 what was asked, at the file's current name.
 
-These tests exercise the gate against a REAL git repository (no
-monkeypatching whatsoever), so they live in this dedicated file rather
-than in the 15k-line ``test_merge_queue.py``.  They import the gate from
+These tests exercise the gate against a REAL git repository, so they live
+in this dedicated file rather than in the 15k-line ``test_merge_queue.py``.
+The only deviation from pure real-git is :class:`_RunSpy`, a delegating
+wrapper around ``merge_gates._run`` used narrowly for the two properties
+real git cannot produce on demand: how many times a command was shelled
+out (the tree-listing memo), and a non-zero rc from a specific git
+subcommand (the two fail-closed arms).  Every other command still runs
+for real through it.  They import the gate from
 ``orchestrator.merge_gates`` directly — not through the
 ``orchestrator.merge_queue`` shim — matching the ``workflow.py`` call
 site's precedent of keeping hot ``merge_queue.py`` out of this task's
@@ -42,15 +47,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_gates import (  # noqa: F401  (used by later steps)
+from orchestrator.merge_gates import (
     PlanFilesTouchedResult,
     _check_plan_files_touched_in_branch,
+    _ls_tree_object_type,
 )
 
 # ---------------------------------------------------------------------------
@@ -119,7 +126,6 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 
 async def _commit_on_main(
-    git_ops: GitOps,
     repo: Path,
     paths_content: dict[str, str],
     msg: str,
@@ -143,7 +149,6 @@ async def _commit_on_main(
 
 
 async def _rename_on_main(
-    git_ops: GitOps,
     repo: Path,
     old: str,
     new: str,
@@ -172,6 +177,55 @@ async def _head_of(worktree: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
     assert rc == 0
     return out.strip()
+
+
+# ---------------------------------------------------------------------------
+# _RunSpy — the file's one, narrowly-scoped deviation from pure real-git
+# ---------------------------------------------------------------------------
+
+
+class _RunSpy:
+    """Delegating wrapper around ``merge_gates._run`` that records every call.
+
+    Two gate properties are invisible to a pure real-git test: how MANY
+    times a command was shelled out (the tree-listing memo — deleting it
+    entirely leaves every behavioural assertion green), and what the gate
+    does when a specific git subcommand returns a non-zero rc (the two
+    fail-closed arms, which real git will not produce on demand).  This
+    spy covers exactly those, and delegates everything else to the real
+    ``_run``, so the surrounding repository work stays real.
+
+    *fail_when* is an optional predicate over the argv list; a command it
+    matches returns ``(128, '', <fatal>)`` without being executed.
+    """
+
+    def __init__(
+        self, fail_when: Callable[[Sequence[str]], bool] | None = None,
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self._fail_when = fail_when
+
+    async def __call__(
+        self, cmd: list[str], cwd: Path | None = None, **kwargs,
+    ) -> tuple[int, str, str]:
+        self.calls.append(list(cmd))
+        if self._fail_when is not None and self._fail_when(cmd):
+            return 128, '', 'fatal: injected failure (test fault injection)\n'
+        return await _run(cmd, cwd, **kwargs)
+
+    def count(self, predicate: Callable[[Sequence[str]], bool]) -> int:
+        """Number of recorded calls whose argv satisfies *predicate*."""
+        return sum(1 for cmd in self.calls if predicate(cmd))
+
+
+def _is_tree_listing(cmd: Sequence[str]) -> bool:
+    """True for the resolver's shared ``git ls-tree -r --name-only <head>``."""
+    return list(cmd[:4]) == ['git', 'ls-tree', '-r', '--name-only']
+
+
+def _is_existence_probe(cmd: Sequence[str]) -> bool:
+    """True for the per-entry ``git ls-tree <head> -- <path>`` existence probe."""
+    return list(cmd[:2]) == ['git', 'ls-tree'] and '--' in cmd and '-r' not in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -222,36 +276,49 @@ class TestPlanFilesTouchedResultFields:
         assert result.missing_from_tree == []
         assert result.resolved_renames == {}
 
-    def test_field_container_types(self) -> None:
-        """``missing_from_tree`` is a list of str; ``resolved_renames`` a dict."""
-        result = PlanFilesTouchedResult(
-            not_touched=['crates/tests/topo_e2e.rs'],
-            missing_from_tree=['crates/tests/topo_e2e.rs'],
-            resolved_renames={
-                'crates/tests/topo_e2e.rs': 'crates/tests/harness_topo/topo_e2e.rs',
-            },
-        )
-        assert isinstance(result.missing_from_tree, list)
-        assert all(isinstance(p, str) for p in result.missing_from_tree)
-        assert isinstance(result.resolved_renames, dict)
-        assert all(
-            isinstance(k, str) and isinstance(v, str)
-            for k, v in result.resolved_renames.items()
-        )
 
-    def test_missing_from_tree_is_subset_of_not_touched(self) -> None:
-        """The documented subset invariant holds for the canonical shape.
+# ---------------------------------------------------------------------------
+# ls-tree object-type parsing
+# ---------------------------------------------------------------------------
 
-        A stale declared entry is reported in BOTH lists — never moved out of
-        ``not_touched`` — so every existing ``not_touched``-only consumer
-        (workflow's block decision, ``_try_narrow_plan``,
-        ``build_plan_tightening_prompt``) keeps its current verdict.
-        """
-        result = PlanFilesTouchedResult(
-            not_touched=['a.py', 'crates/tests/topo_e2e.rs'],
-            missing_from_tree=['crates/tests/topo_e2e.rs'],
+
+class TestLsTreeObjectType:
+    """The existence probe reads the object type out of the TAB-separated
+    METADATA half, never by sniffing the whole line for ``' tree '``.
+
+    The type classification gates three arms (directory prefix-match /
+    blob / absent-then-rename-resolve), so a blob whose repo-relative path
+    merely CONTAINS ``' tree '`` must not be steered onto the directory
+    arm.
+    """
+
+    def test_blob(self) -> None:
+        assert _ls_tree_object_type(
+            '100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\tsrc/a.py\n',
+        ) == 'blob'
+
+    def test_tree(self) -> None:
+        assert _ls_tree_object_type(
+            '040000 tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\tsrc/pkg\n',
+        ) == 'tree'
+
+    def test_blob_whose_path_contains_the_tree_substring(self) -> None:
+        """The regression this parser exists for."""
+        line = (
+            '100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391'
+            '\tdocs/my tree notes.md\n'
         )
-        assert set(result.missing_from_tree) <= set(result.not_touched)
+        assert ' tree ' in line, 'fixture must contain the misleading substring'
+        assert _ls_tree_object_type(line) == 'blob'
+
+    def test_absent_path_yields_none(self) -> None:
+        """``git ls-tree`` exits 0 with EMPTY output for an absent path."""
+        assert _ls_tree_object_type('') is None
+        assert _ls_tree_object_type('\n') is None
+
+    def test_unparseable_line_yields_none(self) -> None:
+        """Defensive: an unrecognised shape is read as 'not a directory'."""
+        assert _ls_tree_object_type('garbage\n') is None
 
 
 # ---------------------------------------------------------------------------
@@ -275,12 +342,12 @@ class TestRenamedOnMainResolvesViaDeletingCommit:
 
         # 1. Pre-rename main — the state the architect declared against.
         await _commit_on_main(
-            git_ops, git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+            git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
         )
         # 2. Main relocates it (identical basename — the harness-layout
         #    consolidation shape), before any branch exists.
         rename_sha = await _rename_on_main(
-            git_ops, git_repo, old, new, 'harness: consolidate topo tests',
+            git_repo, old, new, 'harness: consolidate topo tests',
         )
         # 3. Branch cut from POST-rename main; touches only the NEW path.
         wt = (await git_ops.create_worktree('rename-on-main')).path
@@ -324,10 +391,10 @@ class TestRenamedOnMainResolvesViaDeletingCommit:
         declared = f'./{old}'
 
         await _commit_on_main(
-            git_ops, git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+            git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
         )
         await _rename_on_main(
-            git_ops, git_repo, old, new, 'harness: consolidate topo tests',
+            git_repo, old, new, 'harness: consolidate topo tests',
         )
         wt = (await git_ops.create_worktree('rename-dot-slash')).path
         base = await _head_of(wt)
@@ -343,6 +410,63 @@ class TestRenamedOnMainResolvesViaDeletingCommit:
         assert result.missing_from_tree == []
         assert result.resolved_renames == {declared: new}
 
+    async def test_multi_hop_rename_chain_resolves_to_the_live_path(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A relocation staged as SEVERAL ``git mv`` commits on main.
+
+        ``a → b`` then ``b → c``; the branch edits ``c``.  Stopping at the
+        first rename pair would answer with the DEAD intermediate ``b`` —
+        blocking a branch that delivered exactly what was asked, and, worse,
+        naming in the audit trail a second path that does not exist at
+        branch HEAD either.  The resolver must chase the chain to the path
+        that actually lives in the tree.  Staged multi-step moves are the
+        shape the cited reify harness-consolidation programme used, so this
+        is not hypothetical.
+        """
+        first = 'crates/tests/a_e2e.rs'
+        middle = 'crates/harness/a_e2e.rs'
+        final = 'crates/harness_topo/a_e2e.rs'
+
+        await _commit_on_main(git_repo, {first: 'fn a() {}\n'}, 'add a_e2e')
+        await _rename_on_main(git_repo, first, middle, 'harness: hop 1')
+        last_sha = await _rename_on_main(git_repo, middle, final, 'harness: hop 2')
+
+        wt = (await git_ops.create_worktree('multi-hop')).path
+        base = await _head_of(wt)
+        (wt / final).write_text('// branch edit\nfn a() { assert!(true); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [first], base, head, git_ops, task_id='multi-hop',
+            )
+
+        assert result.not_touched == [], (
+            'a two-hop relocation on main is one logical move — the branch '
+            'delivered against the final path and the gate must PASS'
+        )
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {first: final}, (
+            'the audit trail must name the LIVE path, never the dead '
+            f'intermediate {middle!r}'
+        )
+
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert middle not in msg, (
+            'no log line may point a human at the dead intermediate path'
+        )
+        assert final in msg
+        assert last_sha[:12] in msg, (
+            'the mechanism must name the LAST hop, so the chain is auditable'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Mechanism 2 — unique-basename fallback
@@ -350,7 +474,6 @@ class TestRenamedOnMainResolvesViaDeletingCommit:
 
 
 async def _relocate_as_delete_then_add(
-    git_ops: GitOps,
     repo: Path,
     old: str,
     new: str,
@@ -364,9 +487,9 @@ async def _relocate_as_delete_then_add(
     """
     rc, _, err = await _run(['git', 'rm', '--quiet', old], cwd=repo)
     assert rc == 0, f'git rm {old} failed: {err}'
-    await _commit_on_main(git_ops, repo, {}, f'remove {old}')
+    await _commit_on_main(repo, {}, f'remove {old}')
     await _commit_on_main(
-        git_ops, repo,
+        repo,
         {new: '// relocated + rewritten\nfn topo() { assert_eq!(1, 1); }\n'},
         f'add {new}',
     )
@@ -388,9 +511,9 @@ class TestUniqueBasenameFallback:
         new = 'crates/tests/harness_topo/topo_e2e.rs'
 
         await _commit_on_main(
-            git_ops, git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+            git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
         )
-        await _relocate_as_delete_then_add(git_ops, git_repo, old, new)
+        await _relocate_as_delete_then_add(git_repo, old, new)
 
         wt = (await git_ops.create_worktree('basename-fallback')).path
         base = await _head_of(wt)
@@ -418,13 +541,20 @@ class TestUniqueBasenameFallback:
         assert new in msg
 
     async def test_two_stale_paths_share_one_tree_listing(
-        self, git_ops: GitOps, git_repo: Path,
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The literal reify-5196 two-file shape.
+        """The literal reify-5196 two-file shape, plus the memo it shares.
 
         Both declared paths were relocated the same way and both new paths
-        are touched, so BOTH must resolve off the single tree listing the
-        gate computes lazily once per invocation.
+        are touched, so BOTH must resolve — and both must resolve off ONE
+        ``git ls-tree -r --name-only``.  The invocation count is asserted
+        directly: without it, deleting the ``tree_listing`` memo entirely
+        (re-shelling per stale entry) would leave every behavioural
+        assertion below green, so the caching this test is named for would
+        be unprotected.
         """
         old_a = 'crates/tests/a_e2e.rs'
         old_b = 'crates/tests/b_e2e.rs'
@@ -432,12 +562,12 @@ class TestUniqueBasenameFallback:
         new_b = 'crates/tests/harness_topo/b_e2e.rs'
 
         await _commit_on_main(
-            git_ops, git_repo,
+            git_repo,
             {old_a: 'fn a() {}\n', old_b: 'fn b() {}\n'},
             'add a_e2e + b_e2e',
         )
-        await _relocate_as_delete_then_add(git_ops, git_repo, old_a, new_a)
-        await _relocate_as_delete_then_add(git_ops, git_repo, old_b, new_b)
+        await _relocate_as_delete_then_add(git_repo, old_a, new_a)
+        await _relocate_as_delete_then_add(git_repo, old_b, new_b)
 
         wt = (await git_ops.create_worktree('basename-fallback-two')).path
         base = await _head_of(wt)
@@ -446,6 +576,8 @@ class TestUniqueBasenameFallback:
         await git_ops.commit(wt, 'step-2')
         head = await _head_of(wt)
 
+        spy = _RunSpy()
+        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
         result = await _check_plan_files_touched_in_branch(
             [old_a, old_b], base, head, git_ops, task_id='basename-two',
         )
@@ -453,6 +585,15 @@ class TestUniqueBasenameFallback:
         assert result.not_touched == []
         assert result.missing_from_tree == []
         assert result.resolved_renames == {old_a: new_a, old_b: new_b}
+
+        assert spy.count(_is_tree_listing) == 1, (
+            'the tree listing must be shelled out exactly ONCE per gate '
+            'invocation and shared across every stale entry; got '
+            f'{spy.count(_is_tree_listing)} calls'
+        )
+        # Sanity: the spy really is on the resolution path (both entries were
+        # probed for existence through it), so the count above is meaningful.
+        assert spy.count(_is_existence_probe) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +612,7 @@ class TestStalePathClassification:
         declared = 'crates/tests/never_created.rs'
 
         await _commit_on_main(
-            git_ops, git_repo, {'crates/tests/real.rs': 'fn real() {}\n'}, 'add real',
+            git_repo, {'crates/tests/real.rs': 'fn real() {}\n'}, 'add real',
         )
         wt = (await git_ops.create_worktree('never-created')).path
         base = await _head_of(wt)
@@ -503,7 +644,7 @@ class TestStalePathClassification:
         second = 'crates/b/dup_e2e.rs'
 
         await _commit_on_main(
-            git_ops, git_repo,
+            git_repo,
             {first: 'fn a() {}\n', second: 'fn b() {}\n'},
             'add two dup_e2e files',
         )
@@ -537,10 +678,10 @@ class TestStalePathClassification:
         new = 'crates/tests/harness_topo/topo_e2e.rs'
 
         await _commit_on_main(
-            git_ops, git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+            git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
         )
         await _rename_on_main(
-            git_ops, git_repo, old, new, 'harness: consolidate topo tests',
+            git_repo, old, new, 'harness: consolidate topo tests',
         )
         wt = (await git_ops.create_worktree('resolved-untouched')).path
         base = await _head_of(wt)
@@ -558,3 +699,202 @@ class TestStalePathClassification:
         )
         assert result.resolved_renames == {old: new}
         assert result.missing_from_tree == []
+
+    async def test_invented_path_does_not_resolve_by_basename(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A path with NO history under its declared name is never resolved.
+
+        The basename fallback is a *rename* resolver; a path the architect
+        simply invented was never renamed, so calling a coincidentally-unique
+        same-basename file its "resolution" is a category error that would
+        silently pass the gate on a declaration nothing ever delivered.
+        Distinct from ``test_never_existed_path_is_classified_missing_from_tree``,
+        where no basename candidate exists at all: here a UNIQUE candidate
+        exists AND the branch touched it, so only the history evidence gate
+        can stop it.
+        """
+        declared = 'docs/spec.md'
+        elsewhere = 'notes/archive/spec.md'
+
+        await _commit_on_main(
+            git_repo, {elsewhere: '# real, unrelated\n'}, 'add archive spec',
+        )
+        wt = (await git_ops.create_worktree('invented-path')).path
+        base = await _head_of(wt)
+        (wt / elsewhere).write_text('# real, unrelated — edited\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [declared], base, head, git_ops, task_id='invented',
+        )
+
+        assert result.resolved_renames == {}, (
+            f'{declared!r} never existed, so {elsewhere!r} is not its rename — '
+            'a unique basename must not be enough on its own'
+        )
+        assert result.not_touched == [declared], 'the gate must still block'
+        assert result.missing_from_tree == [declared]
+
+    async def test_mixed_stale_and_untouched_partitions_correctly(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The MIXED shape workflow.py's class-scoped message depends on.
+
+        One declared path EXISTS in the branch tree but no commit touched it
+        (a genuine under-delivery); a second is stale and unresolvable.  Both
+        block, but only the stale one is ``missing_from_tree`` — and the
+        documented subset invariant is asserted on the GATE's own output, not
+        on a hand-built result.
+        """
+        existing = 'crates/tests/real.rs'
+        stale = 'crates/tests/gone.rs'
+        delivered = 'crates/tests/delivered.rs'
+
+        await _commit_on_main(
+            git_repo,
+            {existing: 'fn real() {}\n', delivered: 'fn delivered() {}\n'},
+            'add real + delivered',
+        )
+        wt = (await git_ops.create_worktree('mixed-classes')).path
+        base = await _head_of(wt)
+        (wt / delivered).write_text('fn delivered() { assert!(true); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [existing, stale], base, head, git_ops, task_id='mixed',
+        )
+
+        assert result.not_touched == [existing, stale], (
+            'both classes still block, in declaration order'
+        )
+        assert result.missing_from_tree == [stale], (
+            'only the path absent from the branch tree is a stale declaration; '
+            'the existing-but-untouched path is a real under-delivery'
+        )
+        assert set(result.missing_from_tree) <= set(result.not_touched), (
+            'the documented subset invariant — a stale entry is reported in '
+            'BOTH lists, never moved out of not_touched, so every existing '
+            'not_touched-only consumer keeps its current verdict'
+        )
+        assert result.resolved_renames == {}
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed arms — reachable only by forcing a git error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGitErrorArmsFailClosed:
+    """Both probe failures degrade LOUDLY and conservatively: the gate still
+    blocks, and it never asserts a fact it could not measure."""
+
+    async def test_existence_probe_error_is_not_classified_missing(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``ls-tree`` probe rc != 0 ⇒ blocked, but NOT ``missing_from_tree``.
+
+        This is the headline "never claim an absence we did not measure"
+        rule: without a successful existence probe the gate cannot know
+        whether the declared path is stale, so it must not say so.
+        """
+        declared = 'crates/tests/topo_e2e.rs'
+
+        await _commit_on_main(
+            git_repo, {declared: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        wt = (await git_ops.create_worktree('probe-error')).path
+        base = await _head_of(wt)
+        (wt / 'unrelated.rs').write_text('fn unrelated() {}\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        spy = _RunSpy(fail_when=_is_existence_probe)
+        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [declared], base, head, git_ops, task_id='probe-error',
+            )
+
+        assert spy.count(_is_existence_probe) == 1, 'the fault must have fired'
+        assert result.not_touched == [declared], (
+            'an unmeasurable entry still blocks — the gate fails CLOSED'
+        )
+        assert result.missing_from_tree == [], (
+            'absence was never established, so the entry must NOT be labelled '
+            'a stale path'
+        )
+        assert result.resolved_renames == {}
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'ls-tree probe failed' in msg, (
+            f'the degradation must be loud, not silent; got: {msg!r}'
+        )
+
+    async def test_tree_listing_error_blocks_every_stale_entry_once(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No tree listing ⇒ nothing resolves, and the memo does not retry.
+
+        Without the listing neither the hop-liveness check nor the basename
+        bound can be evaluated, so the resolver fails closed for every stale
+        entry.  The memo latches the failure: it must be attempted ONCE per
+        gate invocation, not once per stale entry.
+        """
+        old_a = 'crates/tests/a_e2e.rs'
+        old_b = 'crates/tests/b_e2e.rs'
+        new_a = 'crates/tests/harness_topo/a_e2e.rs'
+        new_b = 'crates/tests/harness_topo/b_e2e.rs'
+
+        await _commit_on_main(
+            git_repo,
+            {old_a: 'fn a() {}\n', old_b: 'fn b() {}\n'},
+            'add a_e2e + b_e2e',
+        )
+        await _relocate_as_delete_then_add(git_repo, old_a, new_a)
+        await _relocate_as_delete_then_add(git_repo, old_b, new_b)
+
+        wt = (await git_ops.create_worktree('tree-listing-error')).path
+        base = await _head_of(wt)
+        (wt / new_a).write_text('// branch edit a\n')
+        (wt / new_b).write_text('// branch edit b\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        spy = _RunSpy(fail_when=_is_tree_listing)
+        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [old_a, old_b], base, head, git_ops, task_id='tree-listing-error',
+            )
+
+        assert spy.count(_is_tree_listing) == 1, (
+            'the failed tree listing must be LATCHED, not retried per stale '
+            f'entry; got {spy.count(_is_tree_listing)} calls'
+        )
+        assert result.not_touched == [old_a, old_b], (
+            'without a tree listing nothing resolves — the gate fails CLOSED'
+        )
+        assert result.missing_from_tree == [old_a, old_b], (
+            'the existence probe DID measure the absence, so both entries are '
+            'correctly classified as stale paths even though resolution failed'
+        )
+        assert result.resolved_renames == {}
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'tree-listing failed' in msg, (
+            f'the degradation must be loud, not silent; got: {msg!r}'
+        )
