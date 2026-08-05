@@ -1460,6 +1460,9 @@ def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
 
     assert outcome.status == "deferred"
     assert outcome.reason
+    # The two defer sites must be distinguishable by FIELD, not by parsing
+    # prose out of a shared reason string (task 3645).
+    assert outcome.deferred_stage == "preflight"
 
     assert len(fake_escalate_fn.calls) == 1
     call = fake_escalate_fn.calls[0]
@@ -1472,6 +1475,85 @@ def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
     assert not kwargs["codebook_path"].exists()
     assert not kwargs["census_state_path"].exists()
     assert not kwargs["report_path"].exists()
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / DEFECT 2: the stage-boundary re-probe.
+#
+# Headroom was probed exactly ONCE, at preflight. A cap arriving during the
+# long, expensive gap between preflight and verify was never noticed -- and
+# because the default verifier fails CLOSED per cluster, it then presented as
+# an ordinary run in which every cluster happened to be rejected.
+# ---------------------------------------------------------------------------
+
+def _capped_after_preflight_invoke(cap_message=REAL_CLI_CAP_MESSAGES[0]):
+    """`invoke` that passes the FIRST headroom probe and fails every later one.
+
+    Keys on the probe prompt specifically rather than on call ordinal, because
+    mining shares this same seam: mining prompts must keep returning real
+    judgments (otherwise there would be no novel cluster to verify, and the
+    gate under test would be skipped for the wrong reason).
+    """
+    probes = []
+
+    def response_fn(prompt, model):
+        if prompt == mod._HEADROOM_PROBE_PROMPT:
+            probes.append(prompt)
+            return "pong" if len(probes) == 1 else cap_message
+        return _happy_invoke_response(prompt, model)
+
+    return response_fn
+
+
+def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
+    tmp_path, caplog
+):
+    """A cap arriving after preflight aborts BEFORE verify, persisting nothing.
+
+    The load-bearing assertions are the three `not ... .exists()` ones. They
+    prove no matrix was rendered from a truncated verified list, no
+    reject_candidate burned a cluster that was never actually adjudicated, and
+    -- most importantly -- last_census_at never advanced past a window that
+    was not adjudicated, so these sightings ARE re-mined on the next run. The
+    mining spend is sunk; the state stays honest.
+    """
+    batch = [_hand_digest("novel-verified", "a genuinely new confusion shape")]
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_capped_after_preflight_invoke()),
+        batch_source=[batch],
+        verify_fn=_poison("verify_fn"),
+        synthesize_fn=_poison("synthesize_fn"),
+        commit=_poison("commit"),
+    )
+    fake_submit_fn = kwargs["submit_fn"]
+    fake_escalate_fn = kwargs["escalate_fn"]
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "deferred"
+    assert outcome.deferred_stage == "verify"
+    assert outcome.unverified_clusters == 1
+    assert outcome.reason
+    assert "verify" in outcome.reason.lower(), "the reason names the stage that was skipped"
+
+    # verify_fn is a _poison: reaching it at all would have raised.
+    assert fake_submit_fn.calls == []
+    assert not kwargs["report_path"].exists()
+    assert not kwargs["codebook_path"].exists()
+    assert not kwargs["census_state_path"].exists()
+
+    assert len(fake_escalate_fn.calls) == 1
+    call = fake_escalate_fn.calls[0]
+    assert call.get("category") == "infra_issue"
+    assert call.get("severity") == "info"
+    summary = call.get("summary") or ""
+    detail = call.get("detail") or ""
+    assert "verify" in (summary + detail).lower(), "the escalation names the stage"
+    assert "1" in (summary + detail), "the escalation names the unverified count"
+
+    assert sum(1 for r in caplog.records if r.levelno >= logging.WARNING) >= 1
 
 
 # ---------------------------------------------------------------------------
