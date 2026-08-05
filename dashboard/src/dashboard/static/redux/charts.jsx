@@ -24,6 +24,7 @@ const {
   plottableMax,
   axisY,
   axisPaths,
+  barFractions,
   stackedAreaPaths,
 } = window.DF_SPARK_PATH;
 
@@ -261,7 +262,12 @@ function BarChart({ labels, values, height = 160, color = PALETTE.accent, format
   const padL = 30, padR = 8, padT = 8, padB = 22;
   const chartW = Math.max(w - padL - padR, 50);
   const chartH = height - padT - padB;
-  const max = Math.max(...values, 1);
+  // Hole-excluding fold, then one fraction per slot — `null` where there is no
+  // measurement (task 3489). Pre-fix, one undefined poisoned max to NaN and
+  // emitted height="NaN" on EVERY rect, and a null gave a zero-height bar
+  // indistinguishable from a measured zero. The `1` seed is preserved.
+  const max = plottableMax(values, 1);
+  const { fractions } = barFractions(values, max);
   const bw = chartW / values.length;
   return (
     <div ref={ref} style={{ width: '100%', height }}>
@@ -276,13 +282,19 @@ function BarChart({ labels, values, height = 160, color = PALETTE.accent, format
             </g>
           );
         })}
-        {values.map((v, i) => {
-          const h = (v / max) * chartH;
+        {fractions.map((f, i) => {
+          const h = f === null ? null : f * chartH;
           const x = padL + i * bw + 2;
-          const y = padT + chartH - h;
           return (
             <g key={i}>
-              <rect x={x} y={y} width={Math.max(bw - 4, 2)} height={h} fill={color} rx={2} />
+              {/* No measurement here -> NO rect at all, while the category
+                  label and the slot's x position stay. An absent bar in a
+                  labelled slot reads as "not measured"; a zero-height one
+                  reads as a measured zero, which is what the pre-fix code
+                  drew. A real 0 still gets its honest zero-height rect. */}
+              {h !== null && (
+                <rect x={x} y={padT + chartH - h} width={Math.max(bw - 4, 2)} height={h} fill={color} rx={2} />
+              )}
               <text x={padL + i * bw + bw / 2} y={height - 6} fontSize="9" fill={PALETTE.fg3} textAnchor="middle" fontFamily="JetBrains Mono">{labels[i]}</text>
             </g>
           );
@@ -393,11 +405,24 @@ function Heatmap({ rows, cols, getCell }) {
 }
 
 function HistBar({ values, maxOverride, height = 50, color = PALETTE.accent }) {
-  const max = maxOverride ?? Math.max(...values, 1);
+  // The `maxOverride ?? ...` precedence is preserved by passing whichever max
+  // wins through as barFractions' explicit argument, so the override and the
+  // derived-max paths run the same arithmetic (task 3489).
+  const max = maxOverride ?? plottableMax(values, 1);
+  const { fractions } = barFractions(values, max);
   return (
     <div style={{ display: 'flex', alignItems: 'flex-end', gap: 2, height }}>
-      {values.map((v, i) => (
-        <div key={i} style={{ flex: 1, height: `${(v / max) * 100}%`, background: color, borderRadius: '2px 2px 0 0', minHeight: 1 }} />
+      {/* A hole keeps its flex slot — so the bars either side stay in their own
+          positions — but draws no bar. The 1px floor this used to carry turned
+          every hole into a visible stub: a fabricated measurement at a fixed
+          size no data produced. A measured 0 keeps its honest zero height. */}
+      {fractions.map((f, i) => (
+        <div
+          key={i}
+          style={f === null
+            ? { flex: 1 }
+            : { flex: 1, height: `${f * 100}%`, background: color, borderRadius: '2px 2px 0 0' }}
+        />
       ))}
     </div>
   );
