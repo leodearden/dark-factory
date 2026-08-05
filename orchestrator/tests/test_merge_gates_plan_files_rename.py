@@ -453,3 +453,108 @@ class TestUniqueBasenameFallback:
         assert result.not_touched == []
         assert result.missing_from_tree == []
         assert result.resolved_renames == {old_a: new_a, old_b: new_b}
+
+
+# ---------------------------------------------------------------------------
+# Classification — missing_from_tree, and the two no-false-NEGATIVE guards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStalePathClassification:
+    """An unresolvable declared path still BLOCKS — this class only changes
+    the diagnosis, never the routing."""
+
+    async def test_never_existed_path_is_classified_missing_from_tree(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        declared = 'crates/tests/never_created.rs'
+
+        await _commit_on_main(
+            git_ops, git_repo, {'crates/tests/real.rs': 'fn real() {}\n'}, 'add real',
+        )
+        wt = (await git_ops.create_worktree('never-created')).path
+        base = await _head_of(wt)
+        (wt / 'crates' / 'tests' / 'real.rs').write_text('fn real() { }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [declared], base, head, git_ops, task_id='never-created',
+        )
+
+        assert result.not_touched == [declared], 'the gate must still block'
+        assert result.missing_from_tree == [declared], (
+            'a declared path absent from the branch tree is a STALE PATH, not '
+            'evidence the branch under-delivered'
+        )
+        assert result.resolved_renames == {}
+
+    async def test_ambiguous_basename_does_not_resolve(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Two candidates sharing the basename ⇒ no resolution, ever.
+
+        Guards the fallback against a coincidental basename silently
+        satisfying the gate.
+        """
+        declared = 'crates/tests/dup_e2e.rs'
+        first = 'crates/a/dup_e2e.rs'
+        second = 'crates/b/dup_e2e.rs'
+
+        await _commit_on_main(
+            git_ops, git_repo,
+            {first: 'fn a() {}\n', second: 'fn b() {}\n'},
+            'add two dup_e2e files',
+        )
+        wt = (await git_ops.create_worktree('ambiguous-basename')).path
+        base = await _head_of(wt)
+        (wt / first).write_text('fn a() { /* edited */ }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [declared], base, head, git_ops, task_id='ambiguous',
+        )
+
+        assert result.not_touched == [declared]
+        assert result.missing_from_tree == [declared]
+        assert result.resolved_renames == {}, (
+            'two basename candidates must NOT resolve — a coincidental '
+            'basename can never satisfy the gate'
+        )
+
+    async def test_resolved_but_untouched_still_blocks_and_is_not_missing(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The rename resolved, but the branch touched neither name.
+
+        Still blocks — the branch genuinely did not deliver — but the entry
+        must NOT be labelled "does not exist in the tree": the tree WAS
+        consulted and the file exists under a known new name.
+        """
+        old = 'crates/tests/topo_e2e.rs'
+        new = 'crates/tests/harness_topo/topo_e2e.rs'
+
+        await _commit_on_main(
+            git_ops, git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_ops, git_repo, old, new, 'harness: consolidate topo tests',
+        )
+        wt = (await git_ops.create_worktree('resolved-untouched')).path
+        base = await _head_of(wt)
+        (wt / 'unrelated.rs').write_text('fn unrelated() {}\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [old], base, head, git_ops, task_id='resolved-untouched',
+        )
+
+        assert result.not_touched == [old], (
+            'a resolution alone must never pass the gate — the resolved path '
+            'must additionally be in the touched set'
+        )
+        assert result.resolved_renames == {old: new}
+        assert result.missing_from_tree == []
