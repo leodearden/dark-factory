@@ -91,6 +91,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import random
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -390,6 +391,154 @@ def allocate(cell_counts: dict[tuple[str, str], int], n: int) -> dict[tuple[str,
     if total != n:  # pragma: no cover — an allocator bug, not a data condition
         raise CorpusBuildError(f'allocation totals {total}, expected {n}')
     return alloc
+
+
+# ---------------------------------------------------------------------------
+# Selection — a prefix of a per-cell seeded permutation
+# ---------------------------------------------------------------------------
+
+SELECTION_RULE = (
+    'per cell: canonical uuid sort -> seeded permutation -> take the first '
+    'allocate() entries (a PREFIX, so growing N only appends)'
+)
+"""Recorded verbatim in the manifest's criteria; see :func:`select`."""
+
+DISPOSITIONS: tuple[str, ...] = ('selected', 'not_drawn')
+"""The closed vocabulary of exits from :func:`select`.
+
+Every record handed to :func:`select` leaves by exactly ONE of these — the
+``SampleResult`` convention from ``scripts/legibility/sampling.py``. Only two
+doors exist here *because* the sampler applies no eligibility filter at all:
+there is deliberately no ``ineligible`` or ``low_quality`` exit, since either
+would be a place for outcome conditioning to hide. A record is either drawn or
+it is not, and nothing else can happen to it.
+"""
+
+
+@dataclass(frozen=True)
+class SelectionResult:
+    """The selection plus its exhaustive accounting.
+
+    ``selected`` and ``not_selected`` partition the input population exactly:
+    no episode disappears unexplained. Without that, a corpus that quietly lost
+    records would still report a clean total.
+    """
+
+    selected: list[EpisodeRecord]
+    not_selected: dict[str, str]
+    allocation: dict[tuple[str, str], int]
+    cell_counts: dict[tuple[str, str], int]
+
+
+def _group_by_cell(
+    population: list[EpisodeRecord],
+) -> dict[tuple[str, str], list[EpisodeRecord]]:
+    """Group *population* by stratum key, rejecting duplicate uuids.
+
+    A duplicate uuid would break the disposition accounting (one id could be
+    both selected and not-selected), so it is a loud error rather than a
+    silently deduplicated row.
+    """
+    if not population:
+        raise CorpusBuildError('cannot select from an empty population')
+    seen: set[str] = set()
+    cells: dict[tuple[str, str], list[EpisodeRecord]] = {}
+    for record in population:
+        if record.uuid in seen:
+            raise CorpusBuildError(
+                f'duplicate episode uuid in population: {record.uuid!r} — '
+                f'disposition accounting requires unique ids'
+            )
+        seen.add(record.uuid)
+        cells.setdefault(stratum_key(record), []).append(record)
+    return cells
+
+
+def cell_permutation(
+    population: list[EpisodeRecord], cell: tuple[str, str], *, seed: str
+) -> list[str]:
+    """Return *cell*'s full seeded permutation of uuids, for any N.
+
+    Exposed as its own function so the prefix property is directly checkable:
+    a reviewer (and the test suite) can confirm that what :func:`select`
+    returned for a cell really is the head of this list, rather than taking the
+    claim on faith.
+
+    The **canonical uuid sort before seeding** is what makes the result
+    independent of the order FalkorDB returns rows — which is not guaranteed
+    stable between runs. Without it, a re-run could silently produce a
+    different corpus while still claiming the same seed.
+    """
+    cells = _group_by_cell(population)
+    if cell not in cells:
+        raise CorpusBuildError(f'no such stratum cell in population: {cell!r}')
+    uuids = sorted(record.uuid for record in cells[cell])
+    # Per-cell RNG derived from the seed — never a module-global `random`
+    # draw, which would make the result depend on whatever else ran first in
+    # the process (the keyword-only injected-RNG convention at
+    # scripts/legibility/census.py). Per cell rather than one stream for the
+    # whole run so a cell's permutation does not shift when a DIFFERENT cell
+    # gains or loses episodes.
+    random.Random(f'{seed}:{cell[0]}:{cell[1]}').shuffle(uuids)
+    return uuids
+
+
+def select(population: list[EpisodeRecord], n: int, *, seed: str) -> SelectionResult:
+    """Draw *n* records from *population*, stratified, deterministically.
+
+    Within each cell the draw is a **prefix of a seeded permutation**: sort the
+    cell canonically by uuid, permute it under ``Random(f'{seed}:{month}:{kind}')``,
+    and take the first ``allocate()[cell]`` entries.
+
+    Two properties fall out of that choice, and both are load-bearing:
+
+    *Order-independence* — the canonical sort happens before any seeding, so
+    the sample does not depend on the order the store returned rows in.
+
+    *Nestedness under an N re-tune* — PRD Open Q4 leaves the final corpus size
+    (~150–300) to be settled jointly with ζ from measured control variance and
+    wall-clock. Because growing N only ever *appends* to a cell's take, ζ can
+    re-run this builder at a different N without invalidating replays ε has
+    already completed at the smaller one. Note this is a PER-CELL guarantee,
+    not a global one: largest-remainder allocation can move a single seat
+    between cells as N changes, so a cell whose allocation *shrank* is the one
+    case where an earlier pick is dropped.
+
+    Records are returned ordered by ``(cell key, position in that cell's
+    permutation)``, so the output ordering is fully determined rather than
+    incidental.
+
+    No eligibility filter is applied — see :data:`DISPOSITIONS`. Every episode
+    in *population* competes, including one the incumbent pipeline extracted
+    nothing from.
+    """
+    cells = _group_by_cell(population)
+    cell_counts = {cell: len(records) for cell, records in cells.items()}
+    allocation = allocate(cell_counts, n)
+
+    by_uuid = {record.uuid: record for record in population}
+    selected: list[EpisodeRecord] = []
+    not_selected: dict[str, str] = {}
+    for cell in sorted(cells):
+        permutation = cell_permutation(population, cell, seed=seed)
+        take = allocation[cell]
+        selected.extend(by_uuid[uuid] for uuid in permutation[:take])
+        for uuid in permutation[take:]:
+            not_selected[uuid] = 'not_drawn'
+
+    if len(selected) != n:  # pragma: no cover — a sampler bug, not a data condition
+        raise CorpusBuildError(f'selected {len(selected)} records, expected {n}')
+    if len(selected) + len(not_selected) != len(population):  # pragma: no cover
+        raise CorpusBuildError(
+            f'disposition accounting lost records: {len(selected)} selected + '
+            f'{len(not_selected)} not selected != {len(population)} in population'
+        )
+    return SelectionResult(
+        selected=selected,
+        not_selected=not_selected,
+        allocation=allocation,
+        cell_counts=cell_counts,
+    )
 
 
 def record_field_names() -> tuple[str, ...]:
