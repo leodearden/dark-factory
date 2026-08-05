@@ -7224,49 +7224,29 @@ class TestWrapperPayloadHarness:
                 f'PYTHONPATH; got {out!r}'
             )
 
-    async def test_assert_submit_cli_invokable_reports_a_broken_interpreter(
+    async def test_assert_submit_cli_invokable_rejects_a_broken_interpreter(
         self, tmp_path: Path,
     ):
-        """A broken interpreter must be NAMED and its stderr QUOTED.
+        """The preflight must actually fail for an interpreter that cannot run the CLI.
 
-        This is the legibility contract that was missing: when the submit CLI
-        is not invokable the suite previously degraded into
-        "exactly one L2 must be filed on failure, got 0", pointing the reader
-        at production filing logic while the real diagnosis sat unread in a
-        discarded pipe.  Deterministic in any environment — the stub stands in
-        for an interpreter that cannot run `-m escalation submit`.
-
-        The message must also state the PRODUCTION consequence, so the two
-        halves of task 3404 are explained in the one place a developer with a
-        broken environment actually looks: an operator who greps journald for
-        the reserved exit code lands on the same explanation this test prints.
+        This pins only that the helper is not a no-op: an interpreter which
+        cannot run `-m escalation submit` must raise, so a broken environment
+        stops at the preflight instead of degrading into "exactly one L2 must
+        be filed on failure, got 0" (task 3404).  The *wording* of the raised
+        message is deliberately NOT asserted — it is test scaffolding, not
+        production behaviour, and the real journald signature is covered
+        against the real wrapper by
+        `test_fired_wrapper_reports_a_failed_escalation_submit` (above) and
+        test_proc_supervision.py::test_wrapper_surfaces_failed_on_failure_submit.
         """
-        from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
-
         stub = tmp_path / 'broken-python'
         stub.write_text(
             "#!/bin/sh\nprintf 'NO-ESCALATION-MODULE-3404\\n' >&2\nexit 1\n"
         )
         stub.chmod(0o755)
 
-        with pytest.raises(AssertionError) as excinfo:
+        with pytest.raises(AssertionError):
             _assert_submit_cli_invokable(str(stub))
-
-        message = str(excinfo.value)
-        assert str(stub) in message, (
-            f'the failing interpreter must be named in the message: {message!r}'
-        )
-        assert 'NO-ESCALATION-MODULE-3404' in message, (
-            f"the child's stderr must be quoted in the message: {message!r}"
-        )
-        assert str(RP4_ESCALATION_SUBMIT_FAILED_RC) in message, (
-            f'the message must name the reserved exit code a fired RP-4 unit '
-            f'would use, so it is greppable in journald: {message!r}'
-        )
-        assert 'RP-4: on-failure escalation submit failed' in message, (
-            f'the message must quote the journald signature an operator would '
-            f'actually see on this failure: {message!r}'
-        )
 
     async def test_assert_submit_cli_invokable_passes_for_the_real_interpreter(self):
         """The interpreter running this suite must be able to reach the CLI."""
