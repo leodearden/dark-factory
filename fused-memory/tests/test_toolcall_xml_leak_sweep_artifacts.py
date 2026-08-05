@@ -262,7 +262,7 @@ class TestDetectorReproducesEveryClassification:
         report = _load(path)
         for record in report['records']:
             assert record['classification'] in CLASSIFICATIONS, (
-                f'record {record.get("memory_id")!r} carries unknown '
+                f'record {record.get("id")!r} carries unknown '
                 f'classification {record["classification"]!r}'
             )
 
@@ -280,7 +280,7 @@ class TestDetectorReproducesEveryClassification:
             derived = classify_record({'data': record['content']})
             if derived != claimed:
                 mismatches.append(
-                    f'  {record.get("memory_id")!r}: claims {claimed!r}, '
+                    f'  {record.get("id")!r}: claims {claimed!r}, '
                     f'detector says {derived!r}'
                 )
         assert not mismatches, (
@@ -300,7 +300,7 @@ class TestDetectorReproducesEveryClassification:
             checked += 1
             derived = classify_record({'data': repaired})
             assert derived == CLEAN, (
-                f'record {record.get("memory_id")!r} has repaired_content the '
+                f'record {record.get("id")!r} has repaired_content the '
                 f'detector still classifies {derived!r}, not {CLEAN!r}'
             )
             assert repaired, 'a repair must never leave the memory empty'
@@ -318,10 +318,10 @@ class TestDetectorReproducesEveryClassification:
             if record['classification'] != 'manual_review':
                 continue
             assert not record.get('repaired'), (
-                f'manual_review record {record.get("memory_id")!r} is marked '
+                f'manual_review record {record.get("id")!r} is marked '
                 'repaired — the sweep must never mutate one'
             )
             assert record.get('repaired_content') is None, (
-                f'manual_review record {record.get("memory_id")!r} carries a '
+                f'manual_review record {record.get("id")!r} carries a '
                 'repaired_content; repair_content() returns None to REFUSE'
             )
