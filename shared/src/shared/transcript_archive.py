@@ -5,7 +5,7 @@ stores each agent session's raw JSONL transcript under
 ``<config_dir>/projects/<enc>/<session_id>.jsonl`` (plus subagent transcripts
 at ``<config_dir>/projects/<enc>/<session_id>/subagents/agent-*.jsonl``). That
 config dir lives *inside* the task worktree and is destroyed at teardown, so
-this module gzips the transcripts to a durable archive root outside the
+this module copies the transcripts to a durable archive root outside the
 worktree while each session is still born-complete.
 
 Design properties (see plans/agent-transcript-archival-prd.md, task α):
@@ -14,11 +14,11 @@ Design properties (see plans/agent-transcript-archival-prd.md, task α):
   ``projects/`` are ever globbed. The per-task OAuth ``.credentials.json``
   lives at the config-dir root and is structurally unreachable, as are any
   non-``.jsonl`` files.
-* **Idempotent** — the source ``.jsonl`` mtime is mirrored onto the gzipped
+* **Idempotent** — the source ``.jsonl`` mtime is mirrored onto the archived
   copy via :func:`os.utime`; an already-current archive is skipped. A resumed
   session only ever grows its transcript, so mtime strictly advances and the
   grown transcript is re-archived (last-write-wins).
-* **Best-effort / never-raises** — any per-file I/O or gzip error is caught and
+* **Best-effort / never-raises** — any per-file I/O error is caught and
   logged once as a structured WARNING (``path``/``task_id``/``errno``) — the
   production signal an operator greps for a systemic breakage — while the
   module-level :data:`_ARCHIVAL_FAILURES` counter accrues the same failures as
@@ -26,15 +26,13 @@ Design properties (see plans/agent-transcript-archival-prd.md, task α):
   is total so the producer can call it inside ``_invoke``'s ``finally`` during
   exception propagation.
 
-Each transcript is streamed source → gzip in fixed-size chunks rather than
-slurped whole, so peak memory stays bounded even for the multi-MB transcripts a
-long or resumed session produces; the producer additionally offloads the whole
-call to a worker thread so the CPU-bound compression never stalls the event loop.
+The archive is a VERBATIM copy: one plain, greppable ``.jsonl`` corpus, so
+``rg`` works across it and no reader needs a decompression branch (task 3618,
+leaf α of plans/transcript-preservation-seam-prd.md).
 """
 
 from __future__ import annotations
 
-import gzip
 import logging
 import os
 import shutil
@@ -95,11 +93,11 @@ def _archive_one(
     archive_root: Path,
     task_id: str,
 ) -> bool:
-    """Gzip a single transcript *src* to its mirror under *archive_root*.
+    """Copy a single transcript *src* to its mirror under *archive_root*.
 
-    The destination mirrors *src*'s path relative to ``projects/`` with a
-    ``.gz`` suffix: ``<archive_root>/<task_id>/<relpath-under-projects>.gz``.
-    The source mtime is mirrored onto the ``.gz`` so an already-current
+    The destination mirrors *src*'s path relative to ``projects/`` with NO
+    added suffix: ``<archive_root>/<task_id>/<relpath-under-projects>``.
+    The source mtime is mirrored onto the copy so an already-current
     archive is skipped: if the dest exists and its (int-truncated) mtime
     equals the source's, the file is left untouched and ``False`` is
     returned. A resumed session only ever grows its transcript, so its mtime
@@ -107,20 +105,20 @@ def _archive_one(
     Returns ``True`` when a file was newly written.
     """
     rel = src.relative_to(projects_root)
-    dest = archive_root / task_id / rel.parent / (rel.name + '.gz')
+    dest = archive_root / task_id / rel.parent / rel.name
     st = src.stat()
     # Idempotency: skip when the archive is already current. int-truncate to
     # dodge FS mtime-granularity mismatch between source and the utime copy.
     if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # Stream source -> gzip in fixed-size chunks (shutil's default 64 KiB
-    # buffer) rather than slurping the whole transcript via read_bytes():
-    # agent-session JSONL can be many MB and only grows on resume, so streaming
-    # bounds peak RSS to one buffer instead of the full file. Any I/O/gzip error
-    # here is still an OSError, caught + counted by the caller (best-effort).
-    with src.open('rb') as sfh, gzip.open(dest, 'wb') as dfh:
-        shutil.copyfileobj(sfh, dfh)
+    # shutil.copyfile uses the platform fast-copy path (copy_file_range /
+    # sendfile) and is exactly as memory-bounded as an explicit chunked loop:
+    # agent-session JSONL can be many MB and only grows on resume, so peak RSS
+    # stays flat regardless of transcript size. This is a COPY, not a rename —
+    # the session may still be live and reading its own source file. Any I/O
+    # error here is an OSError, caught + counted by the caller (best-effort).
+    shutil.copyfile(src, dest)
     os.utime(dest, (st.st_atime, st.st_mtime))
     return True
 
@@ -132,7 +130,7 @@ def archive_task_transcripts(
     *,
     archive_root: Path,
 ) -> int:
-    """Archive a task's agent transcripts to a durable gzipped mirror.
+    """Archive a task's agent transcripts to a durable plain-.jsonl mirror.
 
     When *session_id* is given, only that session's main transcript
     (``projects/*/<session_id>.jsonl``) and its subagent transcripts
@@ -152,10 +150,9 @@ def archive_task_transcripts(
 
     count = 0
     for src in sources:
-        # Best-effort: a per-file OSError (incl. gzip.BadGzipFile, which
-        # subclasses OSError) is logged + counted, never re-raised, so one bad
-        # file cannot lose its siblings and the whole function stays total —
-        # the property the producer relies on to call it inside a finally.
+        # Best-effort: a per-file OSError is logged + counted, never re-raised,
+        # so one bad file cannot lose its siblings and the whole function stays
+        # total — the property the producer relies on to call it in a finally.
         try:
             if _archive_one(src, projects_root, archive_root, task_id):
                 count += 1
