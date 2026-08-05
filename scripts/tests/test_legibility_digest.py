@@ -192,10 +192,11 @@ class TestLoadTranscript:
 
 
 # ---------------------------------------------------------------------------
-# load_transcript — gz transparency. Archived fleet sessions land on disk as
-# ``<sid>.jsonl.gz`` (shared.transcript_archive); load_transcript must read
-# them identically to a plain .jsonl so census/nightly RENDER their digests
-# rather than enumerate-then-drop the whole archive at build_digest time.
+# load_transcript — plain-corpus read. Archived fleet sessions land on disk as
+# ``<sid>.jsonl`` (shared.transcript_archive), a verbatim copy with no added
+# suffix, so load_transcript reads them with the same plain open it uses for a
+# live transcript — census/nightly RENDER their digests rather than
+# enumerate-then-drop the whole archive at build_digest time.
 # ---------------------------------------------------------------------------
 
 class TestLoadTranscriptPlain:
