@@ -9590,13 +9590,49 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             if not check.not_touched:
                                 narrowing_succeeded = True
                 if check.not_touched:
-                    reason = (
+                    # Task 3110 — the message is CLASS-SCOPED, because the
+                    # gate's two failure classes are different failures.
+                    # `missing_from_tree` entries do not exist in the branch
+                    # tree at all (renamed away on main, or never created),
+                    # so the touched set was never consulted for them: the
+                    # old unconditional "no commit on the branch touched
+                    # them" was a confident claim about a branch that was
+                    # never tested.  Measured on reify-5196 / esc-5196-22,
+                    # where main relocated crates/tests/*_e2e.rs into
+                    # crates/tests/harness_topo/ and 22 escalations in a row
+                    # told a human the implementation had not delivered —
+                    # while it had delivered exactly what was asked, at the
+                    # file's current name.  The head (prefix + full path
+                    # list) is preserved verbatim: unblock_types
+                    # .classify_block_reason keys off it via startswith.
+                    stale_set = set(check.missing_from_tree)
+                    stale = [e for e in check.not_touched if e in stale_set]
+                    real = [e for e in check.not_touched if e not in stale_set]
+                    parts = [
                         f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: '
                         f'{", ".join(check.not_touched)}. '
-                        f'The architect declared these files but no commit '
-                        f'on the branch touched them.  Implementation has '
-                        f'not delivered against the plan.'
-                    )
+                    ]
+                    if real:
+                        parts.append(
+                            f'The architect declared these files but no commit '
+                            f'on the branch touched them: {", ".join(real)}.  '
+                            f'Implementation has not delivered against the plan.  '
+                        )
+                    if stale:
+                        parts.append(
+                            f'Declared path does not exist in the tree at branch '
+                            f'HEAD (renamed or never created), so the '
+                            f'branch-touched set was not consulted for: '
+                            f'{", ".join(stale)} — investigate the declared '
+                            f'path, not the branch.  '
+                        )
+                    if check.resolved_renames:
+                        pairs = ', '.join(
+                            f'{declared} -> {resolved}'
+                            for declared, resolved in check.resolved_renames.items()
+                        )
+                        parts.append(f'Rename resolution: {pairs}.')
+                    reason = ''.join(parts).strip()
                     _emit_merge_attempt(
                         self.event_store, self.task_id,
                         OutcomeKind.plan_files_not_touched,
