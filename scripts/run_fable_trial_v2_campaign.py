@@ -350,6 +350,101 @@ def format_campaign_report(report: dict[str, Any]) -> str:
     return '\n'.join(lines)
 
 
+BANDS = ('ceiling', 'intermittent', 'no_plan', 'unmeasured')
+
+# ``ceiling`` is the ONLY discarded band. Everything else is retained.
+RETAINED_BANDS = tuple(b for b in BANDS if b != 'ceiling')
+
+# Which band wins when one fixture has SEVERAL admitted cells — most-retaining
+# first, so ``ceiling`` is last and a fixture is discarded only when EVERY cell
+# says ceiling. Among the retained bands the order is a labelling choice with
+# one consequence: γ1's recipe re-runs ``unmeasured`` fixtures to get an
+# admissible cell, so a fixture that already has a genuine measurement must not
+# be labelled ``unmeasured`` and re-run pointlessly. ``no_plan`` leads because a
+# candidate that could not plan at all is the strongest evidence of headroom
+# this pool is being selected for.
+_BAND_PRECEDENCE = ('no_plan', 'intermittent', 'unmeasured', 'ceiling')
+
+
+def band_for_cell(metrics: dict[str, Any], q_ceiling: float, marker_available: bool) -> str:
+    """Band ONE cell per PRD D6. *marker_available* is a run-level fact.
+
+    Precedence, and why each rung sits where it does:
+
+    1. ``cap_tainted`` -> ``unmeasured``. A transport refusal: we never got to
+       ask the model. γ1's recipe re-runs these so every fixture gets one
+       admissible cell, so the driver NAMES them rather than banding on a
+       refusal — banding one would penalise whichever candidate happened to be
+       scheduled inside a session-cap window, a property of the schedule.
+    2. ``not produced_a_plan`` -> ``no_plan``. THE plan-production predicate
+       (``metrics.py:191``), used directly and never re-implemented, and never
+       replaced by ``plan_quality > 0``: the two plan scorers disagreed exactly
+       on a stepless artifact, so a nonzero score is not evidence a plan exists.
+    3. reference validity not KNOWN-GOOD -> ``intermittent``. Either the run
+       predates σ (*marker_available* False, so validity is unknown) or the cell
+       is marked as judged without one. ``plan_quality`` is interpretable only
+       where a real reference block exists.
+    4. ``plan_quality`` missing or below *q_ceiling* -> ``intermittent``.
+    5. otherwise -> ``ceiling``, the sole DISCARDED band.
+
+    Rungs 3-4 encode D6's asymmetry: ambiguity resolves to RETAIN, because
+    misbanding-to-retain costs ~$20 of stage-2 spend while misbanding-to-discard
+    loses the signal permanently. Concretely, before σ lands rung 3 always fires
+    on a planned cell, so no fixture can be discarded at all — the conservative
+    direction, by construction rather than by care.
+    """
+    from orchestrator.evals.metrics import produced_a_plan
+
+    if metrics.get('cap_tainted'):
+        return 'unmeasured'
+    if not produced_a_plan(metrics):
+        return 'no_plan'
+    if not marker_available or metrics.get(MARKER_KEY):
+        return 'intermittent'
+    quality = metrics.get('plan_quality')
+    if quality is None or quality < q_ceiling:
+        return 'intermittent'
+    return 'ceiling'
+
+
+def partition_bands(results: list[Any], q_ceiling: float) -> dict[str, Any]:
+    """Band every fixture in the pool and split it into retained vs discarded.
+
+    Stage 1 is one trial per fixture per candidate, but a re-run (or a second
+    arm) can leave a fixture with several admitted cells. Those collapse via
+    :data:`_BAND_PRECEDENCE`, most-retaining first, so a fixture is discarded
+    only when EVERY one of its cells says ``ceiling`` — the D6 ambiguity rule
+    holding at the fixture level as well as the cell level.
+
+    ``retained`` and ``discarded`` partition the pool EXACTLY: disjoint, and
+    their union is every fixture that produced a cell. ``counts`` always carries
+    all four bands, zeros included, so the artifact's schema does not shift with
+    its contents.
+    """
+    ranked: dict[str, int] = {}
+    for result in results:
+        metrics = result.metrics or {}
+        if metrics.get('role_under_test') != 'architect':
+            continue
+        band = band_for_cell(metrics, q_ceiling, marker_available(results))
+        rank = _BAND_PRECEDENCE.index(band)
+        task_id = result.task_id
+        ranked[task_id] = min(rank, ranked.get(task_id, rank))
+
+    by_fixture = {task_id: _BAND_PRECEDENCE[rank] for task_id, rank in sorted(ranked.items())}
+    counts = {band: 0 for band in BANDS}
+    for band in by_fixture.values():
+        counts[band] += 1
+    return {
+        'q_ceiling': q_ceiling,
+        'marker_available': marker_available(results),
+        'by_fixture': by_fixture,
+        'counts': counts,
+        'retained': sorted(t for t, b in by_fixture.items() if b in RETAINED_BANDS),
+        'discarded': sorted(t for t, b in by_fixture.items() if b == 'ceiling'),
+    }
+
+
 def _run_campaign(*args: Any, **kwargs: Any) -> list[Any]:
     """The LIVE real-API-spend seam — wired in a later step of this task.
 
@@ -396,6 +491,16 @@ def _build_parser() -> argparse.ArgumentParser:
              'the γ2 comparison-regime ruling is applied (equal-cost, equal-turns, or '
              'both arms) — a pure parameter choice, no runner surgery.',
     )
+    parser.add_argument(
+        '--stage1', action='store_true',
+        help='Compute the PRD-D6 banding partition (retained vs ceiling-discarded). '
+             'Requires --q-ceiling.',
+    )
+    parser.add_argument(
+        '--q-ceiling', type=float, default=None, metavar='FLOAT',
+        help='plan_quality at or above which a validly-referenced planned fixture is '
+             'banded ceiling and DISCARDED. No default, deliberately — see --stage1.',
+    )
     parser.add_argument('--trials', type=int, default=1, help='Trials per (fixture, candidate) cell.')
     parser.add_argument('--max-parallel', type=int, default=None, help='Max concurrent eval cells.')
     parser.add_argument('--config', dest='config_path', type=Path, default=None,
@@ -428,9 +533,33 @@ def _format_dry_run(
     return '\n'.join(lines)
 
 
+def _resolve_q_ceiling(args: argparse.Namespace) -> float | None:
+    """The banding threshold, or a loud exit — NEVER a guessed default (G6).
+
+    PRD D6 makes Q_ceiling empirically anchored: derived in γ1 from v1 incumbent
+    cells on validly-referenced fixtures, recorded provisional, then ratified or
+    adjusted by Leo at γ2. A default baked in here would silently become the de
+    facto threshold and pre-empt that ruling — and it decides which fixtures are
+    DISCARDED, the one direction D6 calls permanently lossy.
+    """
+    if args.stage1 and args.q_ceiling is None:
+        raise SystemExit(
+            'Error: --stage1 requires --q-ceiling, which has no default.\n'
+            '  PRD D6: the plan-quality ceiling is empirically anchored — derived in γ1 '
+            'from v1 incumbent cells on validly-referenced fixtures, recorded '
+            'provisional, and ratified or adjusted by Leo at γ2. It decides which '
+            'fixtures are DISCARDED, and misbanding-to-discard loses signal '
+            'permanently, so it is never guessed here.'
+        )
+    return args.q_ceiling if args.stage1 else None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
+    # Validated FIRST, before fixture resolution and long before any spend: a
+    # campaign that would end in an un-computable banding must not be launched.
+    _resolve_q_ceiling(args)
     fixture_paths = resolve_fixture_paths(args.tasks_dir)
     candidates = resolve_candidates(list(args.candidate))
     budgets = dict(_parse_budget_spec(s) for s in (args.budget or []))
