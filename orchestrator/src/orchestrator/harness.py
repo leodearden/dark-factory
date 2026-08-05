@@ -7190,6 +7190,97 @@ class Harness:
                 exc,
             )
 
+    async def _block_and_escalate_cross_repo(
+        self,
+        task_id: str,
+        *,
+        verdict,
+    ) -> None:
+        """Block a task and file an L1 escalation for a cross-repo misfile.
+
+        Structurally a sibling of ``_block_and_escalate_substrate_flip`` below —
+        the two dispatch-gate blockers are kept adjacent deliberately:
+        - Sets the task to ``blocked`` via ``scheduler.set_task_status``
+          (unconditional; wrapped in try/except so a transient write failure does
+          not prevent the L1 from being filed).
+        - Submits a level-1 ``Escalation`` with category='scope_violation'.
+        - Deduped by ``has_open_l1`` so repeated dispatch attempts (after the
+          requeue cooldown expires) do not stack duplicate escalations.
+        - No-ops gracefully when ``_escalation_queue`` is None (bare-Harness tests).
+
+        ``scope_violation`` rather than the substrate gate's ``design_concern``:
+        the task's work belongs to ANOTHER project — a scope failure, not a
+        premise failure.
+
+        The summary NAMES the owning project when the verdict resolved one, so
+        the L1 is directly actionable ("refile task N under project B") instead
+        of costing a triage round trip.  When no owner could be resolved it says
+        so explicitly: the orchestrator has no cross-project registry, and a
+        placeholder name in an L1 is worse than an honest "unresolved".
+        """
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'Cross-repo block for task %s — set_task_status raised; '
+                'will still attempt to file escalation',
+                task_id,
+                exc_info=True,
+            )
+
+        if not self._escalation_queue:
+            logger.warning(
+                'Cross-repo block for task %s — no escalation queue, skipping L1 file',
+                task_id,
+            )
+            return
+
+        if self._escalation_queue.has_open_l1(task_id):
+            logger.warning(
+                'Cross-repo block for task %s — open L1 already exists, suppressing '
+                'duplicate; pre-existing L1 may be for an unrelated cause',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        owner = verdict.owner_project
+        owned_by = (
+            f'owned by {owner}' if owner else 'owned by another project (owner unresolved)'
+        )
+        summary = f'CROSS_REPO_MISFILE: task {task_id} declares work {owned_by}'
+        paths = '\n'.join(f'  - {path}' for path in verdict.foreign_paths) or '  (none declared)'
+        detail = (
+            f'Dispatch-time cross-repo admission gate blocked this task BEFORE any '
+            f'agent spun up.\n'
+            f'Owning project: {owner if owner else "UNRESOLVED — no marker or companion named it"}\n'
+            f'Signals: {", ".join(verdict.signals) or "(none)"}\n'
+            f'Reason: {verdict.reason}\n'
+            f'Foreign paths:\n{paths}\n'
+            f'This orchestrator owns a single project_root and cannot legitimately land '
+            f'work in another project. The fix is to refile the task under the owning '
+            f'project (and cancel or re-scope this one), not to unblock it here.'
+        )
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category='scope_violation',
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning(
+            'Filed L1 cross-repo-misfile escalation %s for task %s (owner=%s)',
+            esc.id,
+            task_id,
+            owner or 'unresolved',
+        )
+
     async def _block_and_escalate_substrate_flip(
         self,
         task_id: str,
