@@ -942,7 +942,7 @@ class TestBlockAndEscalateCrossRepo:
 
         await h._block_and_escalate_cross_repo('99', verdict=_block_verdict())
 
-        h.scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')
+        h.scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_files_one_l1_scope_violation(self, tmp_path: Path):
@@ -1044,7 +1044,7 @@ class TestBlockAndEscalateCrossRepo:
 
         await h._block_and_escalate_cross_repo('33', verdict=_block_verdict())
 
-        h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')
+        h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_files_l1_even_when_set_task_status_raises(self, tmp_path: Path):
@@ -1115,7 +1115,8 @@ class TestRunCrossRepoGate:
 
         assert allowed is False
         h._block_and_escalate_cross_repo.assert_awaited_once()
-        assert h._block_and_escalate_cross_repo.await_args.kwargs['verdict'] is verdict
+        await_kwargs = h._block_and_escalate_cross_repo.await_args.kwargs  # type: ignore[union-attr]
+        assert await_kwargs['verdict'] is verdict
 
     @pytest.mark.asyncio
     async def test_allow_returns_true_without_escalating(self, tmp_path: Path):
@@ -1154,7 +1155,8 @@ class TestRunCrossRepoGate:
 
         assert allowed is False, 'an unverifiable classification must fail CLOSED'
         h._block_and_escalate_cross_repo.assert_awaited_once()
-        verdict = h._block_and_escalate_cross_repo.await_args.kwargs['verdict']
+        await_kwargs = h._block_and_escalate_cross_repo.await_args.kwargs  # type: ignore[union-attr]
+        verdict = await_kwargs['verdict']
         assert verdict.blocked is True
         assert 'registry exploded' in verdict.reason, (
             f'the synthesized verdict must name the exception; got {verdict.reason!r}'
@@ -1201,7 +1203,7 @@ class TestRunCrossRepoGate:
             await h._run_cross_repo_gate(_make_assignment(cross_repo=True))
 
         spawn.assert_not_called()
-        h.git_ops.resolve_branch_sha.assert_not_awaited()
+        h.git_ops.resolve_branch_sha.assert_not_awaited()  # type: ignore[attr-defined]
         assert not (tmp_path / '.worktrees').exists(), (
             'the cross-repo gate must not create any worktree'
         )
@@ -1316,11 +1318,11 @@ class TestRunSlotCrossRepoGateWiring:
             MockWorkflow.return_value = _make_mock_workflow()
             await h._run_slot(assignment, sem)
 
-        h.scheduler.release.assert_called_once()
-        requeued = h.scheduler.release.call_args.kwargs.get('requeued', None)
+        h.scheduler.release.assert_called_once()  # type: ignore[attr-defined]
+        call_args = h.scheduler.release.call_args  # type: ignore[attr-defined]
+        requeued = call_args.kwargs.get('requeued', None)
         assert requeued is True, (
-            f'scheduler.release must be called with requeued=True; got '
-            f'{h.scheduler.release.call_args!r}'
+            f'scheduler.release must be called with requeued=True; got {call_args!r}'
         )
 
     @pytest.mark.asyncio
@@ -1492,7 +1494,7 @@ class TestCrossRepoAdmissionEndToEnd:
         )
 
         # (2) The task reaches `blocked`.
-        h.scheduler.set_task_status.assert_awaited_once_with('5638', 'blocked')
+        h.scheduler.set_task_status.assert_awaited_once_with('5638', 'blocked')  # type: ignore[attr-defined]
 
         # (3) Exactly one L1, naming the owning project.
         l1s = [e for e in esc_queue.get_pending() if e.task_id == '5638' and e.level == 1]
@@ -1539,7 +1541,7 @@ class TestCrossRepoAdmissionEndToEnd:
 
         assert MockWorkflow.called, 'a local task must dispatch normally'
         mock_wf.run.assert_awaited_once()
-        h.scheduler.set_task_status.assert_not_awaited()
+        h.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
         assert not [e for e in esc_queue.get_pending() if e.task_id == '5639'], (
             'a local task must file no escalation'
         )
