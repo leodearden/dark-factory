@@ -195,6 +195,14 @@ def _build_parser() -> argparse.ArgumentParser:
             'serialized <parameter name="..."> tool-call fragment). '
             "Detection/reporting only -- never mutates task text."
         ),
+        epilog=(
+            "exit codes: 0 = clean, no leaks found; 1 = at least one leak "
+            "found; 2 = no tasks.db could be resolved from --db / "
+            "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
+            "dark-factory default; 3 = every resolved tasks.db was "
+            "unreadable, so NOTHING was scanned (never treat 3 as a clean "
+            "run)."
+        ),
     )
     add_db_discovery_args(
         parser,
