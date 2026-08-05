@@ -376,3 +376,84 @@ def test_rows_are_sorted_by_config_name():
     rows = mod.summarize_candidates(_mixed_results())
 
     assert [r['config_name'] for r in rows] == sorted(r['config_name'] for r in rows)
+
+
+# ===== step 7: judged_without_reference — UNMEASURED is not zero =====
+
+
+def test_marker_absent_everywhere_reports_none_not_zero():
+    """With today's instrument, the count is ``None`` for every candidate.
+
+    Asserting ``is None`` and NOT ``== 0`` is the whole point. The marker's
+    producer is eval-revival σ (task 3628), which is unlanded, so no cell can
+    carry the key yet. ``EvalMetrics.to_dict()`` is an ``asdict`` and therefore
+    emits every DECLARED field, which makes "key absent on every cell" mean
+    unambiguously "this instrument predates σ" rather than "no offending cell".
+    Reporting ``0`` would let ``plan_quality`` read as fully validity-bounded
+    when nothing bounded it — the silent degradation the PRD exists to end.
+    """
+    results = _mixed_results()
+
+    counts = mod.count_judged_without_reference(results)
+
+    assert set(counts) == {'architect-opus-max', 'architect-fable-high'}
+    assert all(v is None for v in counts.values())
+    assert all(
+        row['judged_without_reference'] is None
+        for row in mod.summarize_candidates(results)
+    )
+
+
+def test_marker_present_counts_per_candidate():
+    """Once σ lands, the key simply starts appearing and the Nones become counts."""
+    results = [
+        _cell('f1', 'A', plan_quality=0.8, plan_steps=5,
+              extra_metrics={'judged_without_reference': True}),
+        _cell('f2', 'A', plan_quality=0.8, plan_steps=5,
+              extra_metrics={'judged_without_reference': True}),
+        _cell('f3', 'A', plan_quality=0.8, plan_steps=5,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f4', 'A', plan_quality=0.8, plan_steps=5,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f1', 'B', plan_quality=0.7, plan_steps=4,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f2', 'B', plan_quality=0.7, plan_steps=4,
+              extra_metrics={'judged_without_reference': False}),
+    ]
+
+    counts = mod.count_judged_without_reference(results)
+
+    # B's 0 is a REAL measurement here, precisely because the key IS present.
+    assert counts == {'A': 2, 'B': 0}
+
+
+def test_only_architect_cells_are_counted():
+    """An implementer cell carrying the marker is ignored, even under the same config.
+
+    An implementer run never invokes the plan judge, so it cannot have been
+    judged without a reference; counting it would inflate the very number that
+    bounds how far ``plan_quality`` may be trusted.
+    """
+    results = [
+        _cell('f1', 'A', plan_quality=0.8, plan_steps=5,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f2', 'A', plan_quality=0.8, plan_steps=5,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f3', 'A', role_under_test='implementer',
+              extra_metrics={'judged_without_reference': True}),
+    ]
+
+    assert mod.count_judged_without_reference(results) == {'A': 0}
+
+
+def test_rendered_table_marks_unmeasured_loudly():
+    """The rendered report says UNMEASURED and names σ — it never prints ``0``."""
+    report = {'candidates': mod.summarize_candidates(_mixed_results())}
+
+    text = mod.format_campaign_report(report)
+
+    assert 'unmeasured' in text.lower()
+    assert 'judged_without_reference' in text
+    # The legend must name the producing instrument change, so an operator
+    # reading γ1's output cannot mistake an absent bound for a clean one.
+    assert '3628' in text or 'σ' in text
