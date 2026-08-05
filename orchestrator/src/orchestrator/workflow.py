@@ -3454,14 +3454,20 @@ class TaskWorkflow:
         # D4 accepted consequence: a pending critical/urgent from a
         # prior incarnation DOES gate a fresh run — stop-the-line
         # semantics.  See _is_gating_escalation for the full policy.
+        # Task 3536 (γ₁) extends, and does not weaken, that consequence:
+        # what changed is the DISPOSITION *after* the gate fires, not
+        # which records fire it.  The gate now hands off to the shared
+        # bounded ESCALATED machinery (steward + _wait_for_resolution)
+        # instead of returning ESCALATED with no steward and no status
+        # write — so stop-the-line no longer means "strand".  Nothing
+        # merges past an open gating record either way; the task now
+        # either resolves it in-slot and merges, or parks visibly as
+        # `blocked` for a human.  See _handle_merge_gate_escalations.
         gating = [e for e in self._check_escalations() if _is_gating_escalation(e)]
         if gating:
-            logger.warning(
-                'Task %s: %d gating escalation(s) at MERGE entry '
-                '— bailing to ESCALATED',
-                self.task_id, len(gating),
-            )
-            return WorkflowOutcome.ESCALATED
+            _gate = await self._handle_merge_gate_escalations(gating)
+            if _gate is not None:
+                return _gate
 
         # Ghost-loop early exit (PRD workflow-state-machine α, MP-1/MP-2): a
         # MergeProvenance hit or the _has_prior_implementation fallback both
@@ -3636,6 +3642,75 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 'Merge retries exhausted after steward resolutions'
             )
+        return None
+
+    async def _handle_merge_gate_escalations(
+        self, gating: list[Escalation],
+    ) -> WorkflowOutcome | None:
+        """Dispose of the gating escalation(s) found at MERGE entry (task 3536).
+
+        A deliberate mirror of ``run()``'s ESCALATED branch (workflow.py:
+        2636-2647) — ``_enter_phase(ESCALATED)`` →
+        :meth:`_ensure_steward_started` → :meth:`_wait_for_resolution` →
+        ``except _StewardReescalated`` → :meth:`_mark_blocked`.  PRD
+        ``plans/task-escalation-state-graph-prd.md`` D1: uniformity is the
+        point — ONE ESCALATED semantics, not two.  Before this, the gate did a
+        bare ``return WorkflowOutcome.ESCALATED`` with no steward, no wait and
+        no task-status write; ``harness._run_slot``'s ``finally``
+        (harness.py:7949-7972) then cleared the claimant while writing no
+        status, leaving ``in-progress`` + NULL claimant + an open gating
+        record with nothing running to advance it (spec
+        ``docs/task-escalation-state-spec.md`` E1).
+
+        **Invariant (spec S1) — every non-``None`` return of this method is a
+        :meth:`_mark_blocked` return value**, so the successor status is
+        written BEFORE the caller ever sees an outcome.  There must be no bare
+        ``return WorkflowOutcome.ESCALATED`` anywhere on this path; a future
+        edit that reintroduces one reintroduces the strand.  Note that
+        ``_mark_blocked`` may itself legitimately return ``ESCALATED`` (its
+        ``StewardReescalatedL1`` branch, :14077) — that is spec-blessed
+        precisely because the row was already written.
+
+        Returns ``None`` when the gate cleared and the caller should fall
+        through to the merge retry loop IN-SLOT: no re-dispatch is burned and
+        the row stays ``in-progress`` under the live claimant for the whole
+        wait (spec §4 — ``in-progress`` covers Path-A escalated-waiting).
+
+        The gate PREDICATE is untouched (PRD out-of-scope fence): this method
+        never re-decides what gates, only what happens next.
+        """
+        logger.warning(
+            'Task %s: %d gating escalation(s) at MERGE entry '
+            '— entering the bounded ESCALATED wait',
+            self.task_id, len(gating),
+        )
+        # MERGE → ESCALATED projects IN_PROGRESS → BLOCKED, which
+        # is_legal_transition allows for ActorClass.ORCHESTRATOR.  The machine
+        # is in-memory, so this writes NO task row — it only makes the in-slot
+        # wait observable in phase_enter/phase_exit telemetry exactly as Path
+        # A's is, and keeps _mark_blocked's blocked_from_phase stamp reporting
+        # an escalation park rather than MERGE.
+        self._enter_phase(WorkflowState.ESCALATED)
+        await self._ensure_steward_started()
+        logger.info(
+            'Task %s: waiting for merge-entry escalation resolution', self.task_id,
+        )
+        try:
+            await self._wait_for_resolution()
+        except _StewardReescalated as reesc:
+            # Byte-for-byte the shape at :2643-2647.  merge_phase stays at its
+            # default False so the row actually lands `blocked` (spec S1); the
+            # merge_phase=True carve-out writes no status at all (spec
+            # divergence E2) and this path is exiting the slot, not retrying a
+            # queue submission.
+            return await self._mark_blocked(
+                'Steward re-escalated to human',
+                detail=_format_reescalation_detail(reesc.escalations),
+                skip_escalation=True,
+            )
+        # Gate cleared — resume the merge in this same slot.  BLOCKED →
+        # IN_PROGRESS is likewise legal for ActorClass.ORCHESTRATOR.
+        self._enter_phase(WorkflowState.MERGE)
         return None
 
     def _resolve_module_configs(self, modules: list[str] | None = None) -> list[ModuleConfig]:
