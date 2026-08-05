@@ -2,7 +2,6 @@
 
 import ast
 import json
-import pathlib
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -1526,16 +1525,6 @@ class TestAwaitIndexOperational:
 # would read as a barrier-guard bug rather than a bad fixture here.
 # ---------------------------------------------------------------------------
 
-# The gather guard parses PRODUCTION source, not test modules — which is why
-# the shared parse is named for Python modules generally, not for test ones.
-_PRODUCTION_SOURCE = (
-    pathlib.Path(__file__).parents[1]
-    / 'src'
-    / 'fused_memory'
-    / 'reconciliation'
-    / 'context_assembler.py'
-)
-
 # A bare call, an attribute call, an unrelated callee, and the SAME token
 # appearing only inside a string constant.
 _CALLS_SNIPPET = """
@@ -1562,24 +1551,24 @@ def elsewhere():
 class TestSharedAstGuardMachinery:
     """Unit coverage for parse_python_module() / calls_named()."""
 
-    def test_parses_a_production_source_module(self):
-        """The parse must accept non-test source — the gather guard's call site.
+    def test_parses_arbitrary_python_source(self, tmp_path):
+        """Any Python file parses — which is why the name says module, not TEST module.
 
         test_gather_idiom_helper_routing asserts over src/fused_memory/*.py, so
         a parse that only claimed to handle test modules would be lying at one
-        of its three call sites.
+        of its three call sites. The helper is path-agnostic (read_text +
+        ast.parse), so a module written here pins that property without
+        coupling this file to some production module's current location.
         """
-        assert _PRODUCTION_SOURCE.exists(), (
-            f'{_PRODUCTION_SOURCE} is missing — this test pins that the shared '
-            f'parse accepts production source, so it needs a real one.'
-        )
+        source = tmp_path / 'prod.py'
+        source.write_text('def f():\n    return 1\n')
 
-        tree = parse_python_module(_PRODUCTION_SOURCE)
+        tree = parse_python_module(source)
 
         assert isinstance(tree, ast.Module)
         assert tree.body, 'parsed an empty module — the parse silently read nothing'
 
-    def test_repeated_parses_return_the_identical_tree(self):
+    def test_repeated_parses_return_the_identical_tree(self, tmp_path):
         """Memoised: the same path yields the SAME object, not an equal copy.
 
         Consequence every consumer must respect: the tree is SHARED across
@@ -1588,10 +1577,10 @@ class TestSharedAstGuardMachinery:
         A mutation here would silently corrupt an unrelated guard's view of the
         same file.
         """
-        first = parse_python_module(_PRODUCTION_SOURCE)
-        second = parse_python_module(_PRODUCTION_SOURCE)
+        source = tmp_path / 'memoised.py'
+        source.write_text('value = 1\n')
 
-        assert first is second
+        assert parse_python_module(source) is parse_python_module(source)
 
     def test_missing_path_raises_assertion_error(self, tmp_path):
         """A path that does not exist fails loudly rather than parsing empty.
@@ -1647,7 +1636,9 @@ class TestSharedAstGuardMachinery:
         assignment) from one that merely builds a marker object and drops it.
         """
         tree = ast.parse(_NESTED_SNIPPET)
-        (decorated,) = [n for n in tree.body if isinstance(n, ast.FunctionDef)][:1]
+        (decorated,) = [
+            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'decorated'
+        ]
         (decorator,) = decorated.decorator_list
 
         scoped = calls_named(decorator, 'widget')
@@ -1671,6 +1662,16 @@ from pkg.other import gamma
 from pkg.mod import delta as renamed
 import pkg.mod
 from . import relative
+"""
+
+# The same module imported inside two sibling function bodies, so a node-scoped
+# query can be shown to see only its own subtree.
+_SCOPED_IMPORTS_SNIPPET = """
+def inner():
+    from pkg.mod import scoped
+
+def sibling():
+    from pkg.mod import elsewhere
 """
 
 
@@ -1727,3 +1728,32 @@ class TestImportedNamesFrom:
         """
         assert imported_names_from(ast.parse('from . import relative\n'), 'pkg.mod') == set()
         assert 'relative' not in imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.mod')
+
+    def test_star_import_reports_the_literal_star(self):
+        """`from pkg.mod import *` reports `'*'` — an edge, pinned as deliberate.
+
+        `alias.name` is the literal `'*'` for a star import, so both former
+        forks behaved this way and the extraction preserved it rather than
+        quietly filtering it. The consequence is visible at the call sites: a
+        star-importing module reads as importing `['*']`, which satisfies no
+        guard demanding a NAMED helper. Pinned so the behaviour is a documented
+        choice rather than a surprise in a failure message.
+        """
+        assert imported_names_from(ast.parse('from pkg.mod import *\n'), 'pkg.mod') == {'*'}
+
+    def test_accepts_a_non_module_node_and_searches_only_that_subtree(self):
+        """Any ast.AST, not just a Module — the symmetry with calls_named the docstring claims.
+
+        Pinned rather than left as an unverified promise: without this, the
+        annotation could be narrowed to ast.Module tomorrow with every test
+        still green.
+        """
+        tree = ast.parse(_SCOPED_IMPORTS_SNIPPET)
+        inner, sibling = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+
+        assert imported_names_from(inner, 'pkg.mod') == {'scoped'}
+        assert imported_names_from(sibling, 'pkg.mod') == {'elsewhere'}
+        assert imported_names_from(tree, 'pkg.mod') == {'scoped', 'elsewhere'}, (
+            'the whole-module search should still see every import — the narrowing '
+            'must come from the node passed in, not from the search itself.'
+        )

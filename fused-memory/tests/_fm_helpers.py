@@ -1293,11 +1293,6 @@ async def reap_leaked_ticket_workers() -> int:
 
 
 @functools.cache
-def _python_source(path: pathlib.Path) -> str:
-    return path.read_text()
-
-
-@functools.cache
 def parse_python_module(path: pathlib.Path) -> ast.Module:
     """Parse *path* into an ``ast.Module``, memoised per session.
 
@@ -1308,7 +1303,11 @@ def parse_python_module(path: pathlib.Path) -> ast.Module:
     The returned tree is SHARED between callers, so no consumer may mutate it.
     """
     assert path.exists(), f'{path} not found'
-    return ast.parse(_python_source(path), filename=str(path))
+    # The read is deliberately not memoised separately: this function is its
+    # only caller and is itself cached on the same key, so a source cache would
+    # score zero hits while pinning every parsed file's full text for the
+    # session on top of its tree. The tree is the one retained artefact.
+    return ast.parse(path.read_text(), filename=str(path))
 
 
 def calls_named(node: ast.AST, name: str) -> list[ast.Call]:
@@ -1342,7 +1341,9 @@ def imported_names_from(node: ast.AST, module: str) -> set[str]:
 
     Only ``from <module> import …`` counts: a plain ``import <module>`` binds
     the module and never a name from it, so it cannot satisfy a guard demanding
-    a specific helper be imported. Returns an empty set — never None — when
+    a specific helper be imported. A star import reports the literal ``'*'``
+    (that is its ``alias.name``), which likewise satisfies no guard asking for
+    a NAMED helper. Returns an empty set — never None — when
     nothing is imported from *module*, which callers rely on both for set
     algebra and to render ``imported or 'nothing'`` in a failure message.
 

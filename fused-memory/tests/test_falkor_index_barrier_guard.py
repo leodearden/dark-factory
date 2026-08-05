@@ -128,10 +128,9 @@ def _discover_live_index_modules() -> list[pathlib.Path]:
             continue
         if _LIVE_GRAPH_CALL not in path.read_text():
             # Cheap prefilter — strict superset of criterion (2). Deliberately a
-            # raw read rather than the memoised one behind parse_python_module:
-            # this reads every test module but only ~7 survive to be parsed, so
-            # caching here would retain all of them for the session to save a
-            # handful of re-reads.
+            # discarded raw read rather than parse_python_module: that would
+            # parse AND retain a tree for every test module here, when only ~7
+            # survive the prefilter to be parsed at all.
             continue
         tree = parse_python_module(path)
         if _has_index_creating_literal(tree) and calls_named(tree, _LIVE_GRAPH_CALL):
