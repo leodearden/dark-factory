@@ -52,7 +52,10 @@ Must stay directly executable (mode 100755): ``_run_script_check`` builds
 non-executable target raises OSError -> ERRORED forever — a check that can never
 pass and never fail, i.e. a silently un-gated capability.
 """
+import argparse
 import ast
+import sys
+from pathlib import Path
 
 
 class AmbiguousFunction(Exception):
@@ -156,3 +159,96 @@ def forwards_param_to(
             if kw.arg == param and isinstance(kw.value, ast.Name) and kw.value.id == param:
                 return True
     return False
+
+
+def _fail(message: str, *, file: str, function: str, param: str) -> int:
+    """Print a one-line diagnostic to stderr and return the FAILED exit code.
+
+    Every non-zero return goes through here, so no failure mode can exit
+    silently — an operator triaging the resulting
+    ``DEP_CAPABILITY_NOT_DELIVERED`` escalation sees only this line.
+    """
+    print(
+        f'check_method_param_wiring: {message} '
+        f'(file={file}, function={function}, param={param})',
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description='Assert a specific function declares — and forwards — a parameter.'
+    )
+    parser.add_argument('--file', required=True, help='Path to the module, relative to cwd.')
+    parser.add_argument('--function', required=True, help='Function/method name to resolve.')
+    parser.add_argument('--param', required=True, help='Parameter that must be declared.')
+    parser.add_argument(
+        '--annotation',
+        default=None,
+        help='Exact annotation the parameter must carry (ast.unparse form).',
+    )
+    parser.add_argument(
+        '--forwards-to',
+        default=None,
+        dest='forwards_to',
+        help='Callee name the parameter must be forwarded to by name.',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Return 0 when every requested conjunct holds, else 1.
+
+    Reads the WORKING CHECKOUT only — deliberately no ``--ref`` / ``git show``
+    mode, whose ref-absent failure (a worktree, a CI sandbox) would exit
+    non-zero and be misread as a definitive regression, blocking a dependent
+    task on an evaluation error. See the module docstring.
+    """
+    args = _build_parser().parse_args(argv)
+    ctx = {'file': args.file, 'function': args.function, 'param': args.param}
+
+    path = Path(args.file)
+    try:
+        source = path.read_text()
+    except FileNotFoundError:
+        return _fail('file not found', **ctx)
+    except OSError as exc:
+        return _fail(f'file could not be read: {exc.strerror}', **ctx)
+
+    try:
+        tree = parse_module(source)
+    except SyntaxError as exc:
+        return _fail(f'could not parse file: {exc.msg} at line {exc.lineno}', **ctx)
+
+    try:
+        fn = resolve_function(tree, args.function)
+    except AmbiguousFunction as exc:
+        return _fail(f'function is ambiguous: {exc}', **ctx)
+    if fn is None:
+        return _fail('function not found in file', **ctx)
+
+    if not declares_param(fn, args.param):
+        return _fail('function does not declare the parameter', **ctx)
+
+    if args.annotation is not None and not declares_param(
+        fn, args.param, annotation=args.annotation
+    ):
+        return _fail(
+            f'parameter is declared but its annotation is not {args.annotation!r}', **ctx
+        )
+
+    if args.forwards_to is not None and not forwards_param_to(
+        fn, args.param, args.forwards_to
+    ):
+        return _fail(
+            f'function does not forward the parameter by name to a call '
+            f'named {args.forwards_to!r}',
+            **ctx,
+        )
+
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
