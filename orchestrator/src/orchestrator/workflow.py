@@ -3687,8 +3687,17 @@ class TaskWorkflow:
         the row stays ``in-progress`` under the live claimant for the whole
         wait (spec §4 — ``in-progress`` covers Path-A escalated-waiting).
 
+        **Bounded by construction (spec S5).**  The whole path costs at most
+        ONE derived idle window: the post-wait gate re-check is SINGLE-SHOT,
+        so a still-open or newly-filed gating record parks the task rather
+        than buying another wait.  Two deliberate divergences from ``run()``'s
+        ESCALATED branch are documented at the branches that differ — expiry
+        blocks here instead of resuming, and the re-check does not loop.
+
         The gate PREDICATE is untouched (PRD out-of-scope fence): this method
-        never re-decides what gates, only what happens next.
+        never re-decides what gates, only what happens next.  The post-wait
+        re-check calls the same :func:`_is_gating_escalation`, so there is
+        exactly one gate policy in this file.
         """
         logger.warning(
             'Task %s: %d gating escalation(s) at MERGE entry '
@@ -3752,6 +3761,48 @@ class TaskWorkflow:
                         f'  {e.id} (severity={e.severity}, level={e.level}, '
                         f'category={e.category}): {e.summary}'
                         for e in gating
+                    )
+                ),
+                escalate_to_human=True,
+            )
+        # SINGLE-SHOT re-check.  The wait can return having cleared what it was
+        # waiting on while a DIFFERENT gating record is open — most sharply a
+        # born-at-L2 filed mid-resolution, which the wait cannot see at all
+        # (its loop polls level-0, its stop-the-line check ran at entry before
+        # the record existed, and its tail's has_open_l1 matches level-1).
+        # Without this, such a record is merged straight past.  Re-uses the
+        # SAME _is_gating_escalation predicate rather than an equivalent
+        # inline condition, so there is exactly one gate policy in this file.
+        #
+        # Deliberately NOT a loop back into the machinery.  Boundedness (spec
+        # S5): the whole merge-entry gate path must cost at most ONE derived
+        # idle window, and a steward that keeps chaining fresh records would
+        # otherwise hold the slot indefinitely — the unbounded-hold defect this
+        # task exists to remove.  Contrast run()'s ESCALATED branch, which
+        # legitimately loops because each pass re-invokes the implementer and
+        # can make real progress; the merge-entry gate does no work between
+        # passes, so a second wait is pure latency with no new information.
+        # D4 is preserved either way — nothing merges past an open gating
+        # record — only the disposition differs: a visible `blocked` park with
+        # an L1 for a human rather than another automated wait.
+        still_gating = [
+            e for e in self._check_escalations() if _is_gating_escalation(e)
+        ]
+        if still_gating:
+            return await self._mark_blocked(
+                f'Merge-entry gate: {len(still_gating)} gating escalation(s) '
+                f'still open after the steward wait',
+                detail=(
+                    'The MERGE-entry gate re-checked after the steward wait '
+                    'concluded and found gating record(s) still open — either '
+                    'never resolved, or filed during the resolution. The merge '
+                    'was NOT attempted (stop-the-line), and the gate does not '
+                    're-enter the wait: one bounded window per merge entry, '
+                    'then a human decides. Open gating records:\n'
+                    + '\n'.join(
+                        f'  {e.id} (severity={e.severity}, level={e.level}, '
+                        f'category={e.category}): {e.summary}'
+                        for e in still_gating
                     )
                 ),
                 escalate_to_human=True,
