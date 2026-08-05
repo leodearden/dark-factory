@@ -116,3 +116,43 @@ def declares_param(
             return False
         return ast.unparse(arg.annotation) == annotation
     return False
+
+
+def _callee_name(func: ast.expr) -> str | None:
+    """Resolve a call's callee to a bare name, or None when it has none.
+
+    ``client.scroll(...)`` and ``scroll(...)`` both resolve to ``'scroll'``.
+    Anything else — a subscripted or called-expression func — resolves to None
+    and simply does not match. The RECEIVER is deliberately not resolved:
+    binding ``client`` to a type needs inference the AST cannot give, so the
+    assertion is on the method name.
+    """
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def forwards_param_to(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef, param: str, callee: str
+) -> bool:
+    """True when *fn* passes its own *param* through to a call named *callee*.
+
+    The keyword's value must be an ``ast.Name`` bound to *param* — a literal
+    (``with_vectors=False``) is a hardcoded constant, not a forward, and that is
+    exactly what separates ``scroll_by_metadata``'s ``with_vectors=with_vectors``
+    from ``get_point_by_id``'s ``with_vectors=False``.
+
+    ``ast.walk(fn)`` covers calls nested in any expression — on main the real
+    call sits inside ``await asyncio.wait_for(client.scroll(...), timeout=...)``,
+    which a top-level-statement scan would miss. Walking *fn* rather than the
+    module is what keeps the assertion method-scoped.
+    """
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call) or _callee_name(node.func) != callee:
+            continue
+        for kw in node.keywords:
+            if kw.arg == param and isinstance(kw.value, ast.Name) and kw.value.id == param:
+                return True
+    return False
