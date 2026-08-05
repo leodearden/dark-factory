@@ -48,6 +48,7 @@ SKIP = 'skip'     # evidence UNREADABLE (degenerate metadata) — never "verifie
 
 # Signal names recorded on a blocking verdict.
 SIGNAL_MARKER = 'cross_repo_marker'
+SIGNAL_ALL_FILES_FOREIGN = 'all_files_foreign'
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +223,51 @@ def _resolve_owner(meta: dict[str, Any]) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Path containment
+# ---------------------------------------------------------------------------
+
+
+def _path_entries(value: Any) -> list[str]:
+    """Return the usable path entries in *value* — non-empty strings only.
+
+    A bare string is NOT treated as a one-element list: ``files`` is declared
+    as a list, and silently splitting or wrapping a malformed value would
+    invent evidence the task never carried.
+
+    Junk entries (empty strings, ``None``, ints) are DROPPED rather than kept,
+    because ``is_cross_repo_task`` reads a non-absolute entry as "local" and
+    would let one piece of junk veto an otherwise-unanimous foreign verdict.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        return []
+    return [entry for entry in value if isinstance(entry, str) and entry]
+
+
+def _all_entries_foreign(entries: list[str], root: Path) -> bool:
+    """True iff every entry is an ABSOLUTE path resolving outside *root*.
+
+    Delegates to ``merge_gates.is_cross_repo_task`` so dispatch time and merge
+    time share ONE definition of "foreign" rather than forking it.
+
+    ``metadata=None`` is load-bearing, not incidental:
+
+    * it isolates the pure path-containment leg, so the ``cross_repo`` marker
+      is scored exactly ONCE — in leg (A), where the owner-naming lives — and
+      is not double-counted here;
+    * with metadata passed, that function's ``if not plan_files: return False``
+      early return (merge_gates.py:997) precedes its marker check, so a MARKED
+      task with no declared files would silently classify False.  Leg (A)
+      reading the marker directly is immune to that ordering.
+
+    Imported function-locally (mirroring workflow.py's call site) so this
+    module stays import-light at module scope — it runs on every dispatch.
+    """
+    from orchestrator.merge_gates import is_cross_repo_task  # noqa: PLC0415
+
+    return is_cross_repo_task(entries, root, None)
+
+
+# ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
 
@@ -240,12 +286,22 @@ def classify_cross_repo(
     unaided.  A FALSY value is not evidence: key-presence is what got the task
     into the gate (see ``carries_cross_repo_signal``), truth is what blocks.
 
-    Legs (B) and (C) — declared-files containment and a containment-confirmed
-    ``possible_scope_mismatch`` — land in later steps.
+    Leg (B) — every declared ``metadata.files`` entry is an ABSOLUTE path
+    resolving OUTSIDE ``project_root``.  The reify-5638 shape, and the only
+    one the orchestrator can judge unaided.  Conservative by ``is_cross_repo_
+    task``'s documented contract: an empty list, any relative entry, or any
+    entry resolving in-tree yields no block, so a still-undelivered NEW local
+    file is never mistaken for a foreign deliverable.
+
+    Leg (C) — a containment-confirmed ``possible_scope_mismatch`` — lands in
+    step-8.
+
+    ``project_root`` may be a ``Path`` or a ``str``; it is coerced here.
 
     Never raises for any metadata shape; the caller (``_run_cross_repo_gate``)
     additionally fails CLOSED should that ever prove wrong.
     """
+    root = Path(project_root)
     meta = _extract_metadata(task)
     if meta is None:
         # step-8 turns this into a LOUD SKIP.  ALLOW for now.
@@ -259,13 +315,25 @@ def classify_cross_repo(
 
     signals: list[str] = []
     reasons: list[str] = []
+    foreign_paths: tuple[str, ...] = ()
 
+    # ── Leg (A): the metadata.cross_repo marker ──────────────────────────
     marker = meta.get('cross_repo')
     if marker:
         signals.append(SIGNAL_MARKER)
         reasons.append(
             f'metadata.cross_repo is set ({marker!r}) — the submit path classified '
             f'this task\'s declared files as owned by another project'
+        )
+
+    # ── Leg (B): every declared file resolves outside project_root ───────
+    entries = _path_entries(meta.get('files'))
+    if entries and _all_entries_foreign(entries, root):
+        signals.append(SIGNAL_ALL_FILES_FOREIGN)
+        foreign_paths = tuple(entries)
+        reasons.append(
+            f'all {len(entries)} declared metadata.files entries are absolute paths '
+            f'resolving outside project_root ({root})'
         )
 
     if not signals:
@@ -281,6 +349,6 @@ def classify_cross_repo(
         verdict=BLOCK,
         owner_project=_resolve_owner(meta),
         signals=tuple(signals),
-        foreign_paths=(),
+        foreign_paths=foreign_paths,
         reason='; '.join(reasons),
     )
