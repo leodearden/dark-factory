@@ -12,6 +12,7 @@ See also:
 """
 
 import pathlib
+import re
 
 import pytest
 
@@ -714,4 +715,166 @@ def test_setup_host_installs_every_orchestrator_unit(
         f"{basename} declares an [Install] section but {SETUP_HOST_SH.name} never "
         "enables it, so it is copied to the host and then never starts at boot. "
         f"Add a line to the enable block:\n    {expected_enable}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# SETUP.md operator remediation coverage (task 3641, review feedback)
+# ---------------------------------------------------------------------------
+#
+# setup-host.sh installs and ENABLES orchestrator units for several projects
+# that are not part of this repo.  SETUP.md's "Known gap" callout is the only
+# operator-facing remediation for that: it hands a non-maintainer a copy-paste
+# `systemctl --user disable --now ...` command naming the units to turn off.
+#
+# That block is EXECUTABLE, not prose — which makes it the same class of
+# artifact as setup-host.sh's own cp/enable lines guarded above, and it drifts
+# the same way.  Every unit the installer enables but the doc omits is left
+# running on a non-maintainer's host with a --config path that does not exist:
+# at the next login/default.target it crash-loops until StartLimitBurst is
+# exhausted, then sits failed.  And every unit the doc names but the installer
+# does NOT install breaks the operator's copy-paste outright, because
+# `systemctl --user disable --now` on a nonexistent unit file exits non-zero.
+# So both drift directions are real defects and both are asserted, separately.
+
+SETUP_MD = REPO_ROOT / "SETUP.md"
+
+# The one enabled orchestrator unit that IS genuinely the reader's own, which
+# SETUP.md explicitly tells them to keep ("orchestrator-dark-factory.service
+# itself is genuinely yours and is fine to run").  Keying the exclusion on this
+# repo's OWN unit — rather than hand-listing the foreign ones — means a seventh
+# project is covered by this guard the day its unit lands, matching the
+# [Install]-predicate reasoning used by the installer-coverage guard above.
+_OWN_PROJECT_UNIT = "orchestrator-dark-factory.service"
+
+_DISABLE_COMMAND = "systemctl --user disable --now"
+
+_ORCHESTRATOR_UNIT_RE = re.compile(r"orchestrator-[\w.-]+?\.service")
+
+
+def _enabled_orchestrator_service_units() -> set[str]:
+    """Orchestrator .service units that setup-host.sh actually enables.
+
+    Derived from the same comment-stripped view of setup-host.sh that the
+    installer-coverage guard uses, so the doc is checked against what the
+    installer DOES, never against what its section header prose says.
+
+    The ``.service`` filter naturally drops ``orchestrator-watchdog.timer``,
+    which setup-host.sh also enables and which SETUP.md correctly tells the
+    reader to KEEP enabled (it skips disabled units, so it is harmless).
+    """
+    statements = _shell_statements(SETUP_HOST_SH.read_text(encoding="utf-8"))
+    prefix = "systemctl --user enable "
+    units = set()
+    for stmt in statements:
+        if not stmt.startswith(prefix):
+            continue
+        unit = stmt.split()[-1]
+        if unit.startswith("orchestrator-") and unit.endswith(".service"):
+            units.add(unit)
+    return units
+
+
+def _fenced_code_blocks(md_text: str) -> list[str]:
+    """Bodies of every ``` -fenced code block, in document order.
+
+    Parsed by walking fences rather than by line number so the guard survives
+    any edit above the block it cares about.
+    """
+    blocks: list[str] = []
+    current: list[str] | None = None
+    for line in md_text.splitlines():
+        if line.lstrip().startswith("```"):
+            if current is None:
+                current = []
+            else:
+                blocks.append("\n".join(current))
+                current = None
+            continue
+        if current is not None:
+            current.append(line)
+    return blocks
+
+
+def _setup_md_disable_blocks() -> list[str]:
+    """Every fenced block in SETUP.md carrying the disable-the-foreign-units command."""
+    return [
+        block
+        for block in _fenced_code_blocks(SETUP_MD.read_text(encoding="utf-8"))
+        if _DISABLE_COMMAND in block
+    ]
+
+
+def test_setup_md_disable_block_is_discoverable() -> None:
+    """Coverage guard: exactly one disable block, and a non-empty derived set.
+
+    Mirrors the intent of test_setup_host_install_predicate_discriminates.  The
+    parity assertion below compares two derived sets, and BOTH can silently
+    collapse to empty: a fence-parse mishap returning no block, or an enable-
+    statement scan that matches nothing.  Empty-vs-empty is a passing set
+    comparison that checks nothing — the same silent-green failure mode the
+    other coverage guards in this file exist to prevent — so both inputs are
+    asserted non-degenerate here, before the parity test relies on them.
+    """
+    blocks = _setup_md_disable_blocks()
+    assert len(blocks) == 1, (
+        f"expected exactly one fenced block in {SETUP_MD.name} containing "
+        f"{_DISABLE_COMMAND!r}, found {len(blocks)}. The parity guard below "
+        "assumes a single copy-paste remediation block; if the doc genuinely "
+        "grew a second one, teach the helper which is which rather than "
+        "letting it pick arbitrarily."
+    )
+
+    enabled = _enabled_orchestrator_service_units()
+    assert enabled, (
+        f"derived no `{_DISABLE_COMMAND.replace('disable --now', 'enable')} "
+        f"orchestrator-*.service` statements from {SETUP_HOST_SH.name} — the "
+        "parity guard below would pass vacuously against an empty set."
+    )
+    assert enabled - {_OWN_PROJECT_UNIT}, (
+        f"{SETUP_HOST_SH.name} enables no orchestrator unit other than "
+        f"{_OWN_PROJECT_UNIT}, so the foreign-unit set is empty and the parity "
+        "guard below checks nothing."
+    )
+
+
+def test_setup_md_disable_block_covers_every_foreign_orchestrator_unit() -> None:
+    """SETUP.md's disable block must name exactly the foreign units setup-host.sh enables.
+
+    Scope, deliberate: this guards ONLY the executable
+    ``systemctl --user disable --now`` block — the artifact an operator actually
+    copy-pastes.  It does NOT pin the surrounding prose (the "four projects"
+    count, or the sentence-form list of unit names), because asserting on
+    documentation wording is a brittle meta-test that rots on the next rewrite
+    and buys nothing this block-level assertion does not already give.  That
+    prose is corrected by hand.  Do not "helpfully" extend this test into a
+    wording pin.
+    """
+    foreign = _enabled_orchestrator_service_units() - {_OWN_PROJECT_UNIT}
+    block = _setup_md_disable_blocks()[0]
+    named = set(_ORCHESTRATOR_UNIT_RE.findall(block))
+
+    missing = sorted(foreign - named)
+    assert not missing, (
+        f"{SETUP_HOST_SH.name} enables {', '.join(missing)} but {SETUP_MD.name}'s "
+        f"`{_DISABLE_COMMAND}` block does not name "
+        f"{'them' if len(missing) > 1 else 'it'}. A non-maintainer who follows "
+        "the documented remediation verbatim is left with "
+        f"{'those units' if len(missing) > 1 else 'that unit'} enabled, pointing "
+        "at a --config path that does not exist on their machine; at the next "
+        "login/default.target they crash-loop until StartLimitBurst is exhausted "
+        f"and then sit failed. Fix: add {', '.join(missing)} to the "
+        f"`{_DISABLE_COMMAND}` block in {SETUP_MD.name}."
+    )
+
+    extra = sorted(named - foreign - {_OWN_PROJECT_UNIT})
+    assert not extra, (
+        f"{SETUP_MD.name}'s `{_DISABLE_COMMAND}` block names "
+        f"{', '.join(extra)}, which {SETUP_HOST_SH.name} does not enable. "
+        "`systemctl --user disable --now` on a unit file that does not exist "
+        "fails with 'Unit file does not exist' and returns NON-ZERO, so a stale "
+        "entry breaks the whole copy-paste command for the operator — this is a "
+        f"real defect, not cosmetic. Fix: remove {', '.join(extra)} from the "
+        f"block in {SETUP_MD.name} (or, if the unit should be installed after "
+        f"all, add it to {SETUP_HOST_SH.name}'s enable block)."
     )
