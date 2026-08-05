@@ -39,7 +39,7 @@ import { createRequire } from 'node:module';
 
 import sp from '../../src/dashboard/static/redux/spark_path.js';
 
-const { isPlottable, sparkScale, sparkPaths, stepPaths, plottableMax, axisY } = sp;
+const { isPlottable, sparkScale, sparkPaths, stepPaths, plottableMax, axisY, axisPaths } = sp;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 
@@ -59,6 +59,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'stepPaths',
   'plottableMax',
   'axisY',
+  'axisPaths',
 ];
 
 // Float tolerance for any y that is not exactly representable. The x
@@ -155,6 +156,36 @@ function legacyStepPaths(values, width, height) {
   }
   const linePath = parts.join(' ');
   const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
+  return { line: linePath, area: areaPath };
+}
+
+// Frozen verbatim copy of charts.jsx's PRE-FIX LineChart arithmetic (task 3489,
+// charts.jsx:99-137 as it stood before this task). Same frozen-copy rules as
+// the two above: not a live mirror, valid for HOLE-FREE input only, and its
+// only job is to answer by exact string comparison whether the refactor moved
+// any existing chart.
+//
+// Takes the component's own inputs (`w` and `height` are the resize-observed
+// box; `labelCount` is labels.length, which drives stepX independently of the
+// series length) so the fixture below is charts.jsx's real geometry rather
+// than a re-derivation of it.
+function legacyLineChartPaths(values, w, height, labelCount) {
+  const padL = 38, padR = 12, padT = 8, padB = 22;
+  const chartW = Math.max(w - padL - padR, 50);
+  const chartH = height - padT - padB;
+  const all = values.slice();
+  const maxV = Math.max(...all, 1);
+  const minV = 0;
+  const range = maxV - minV || 1;
+  const n = labelCount;
+  const stepX = chartW / Math.max(n - 1, 1);
+  const pts = values.map((v, i) => {
+    const x = padL + i * stepX;
+    const y = padT + chartH - ((v - minV) / range) * chartH;
+    return [x, y];
+  });
+  const linePath = pts.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ');
+  const areaPath = `${linePath} L${padL + chartW},${padT + chartH} L${padL},${padT + chartH} Z`;
   return { line: linePath, area: areaPath };
 }
 
@@ -786,4 +817,157 @@ test('axisY: honours a non-zero min', () => {
   const geom = { y0: 8, height: 190, min: 2, range: 2 };
   assert.equal(axisY(2, geom), 198, 'the min sits on the floor');
   assert.equal(axisY(4, geom), 8, 'min + range sits at the top');
+});
+
+// ---------------------------------------------------------------------------
+// axisPaths — the padded/offset analogue of sparkPaths (task 3489)
+//
+// charts.jsx's LineChart built its own points/line/area inline with no hole
+// handling, so a `null` was plotted as a real point at the chart floor and
+// joined by line segments to both neighbours, and the area was closed across
+// the FULL chart width regardless of where the measurements actually stopped.
+//
+// GEOMETRY NOTE — the exact-reproduction fixtures below are pinned on
+// DIVISIBLE geometry, deliberately. Per-run area closing ends at the run's own
+// `x0 + (count-1)*stepX`, whereas the pre-fix code closed at the literal
+// `x0 + width`; those are not always the same double. A sweep over width
+// 200..1400 x count 2..40 found 216 of 6708 combinations differing by 1 ULP
+// (e.g. width=228, count=12 gives 216.00000000000003 vs 216). w=150/height=220
+// -> padL=38, padT=8, chartW=100, chartH=190 with 5 points gives stepX=25 and
+// lastX=138 exactly, so exact equality here is a real assertion rather than a
+// doomed one. Do not "generalise" these fixtures to arbitrary numbers.
+// ---------------------------------------------------------------------------
+
+// charts.jsx's LineChart geometry at w=150, height=220, labels.length=5.
+const LINE_GEOM = { x0: 38, y0: 8, width: 100, height: 190, count: 5, min: 0, range: 4 };
+
+test('axisPaths: hole-free input reproduces the pre-fix LineChart paths exactly', () => {
+  // "Did this refactor quietly move every existing chart?" — answered by exact
+  // string comparison against the frozen pre-fix arithmetic, no tolerance.
+  const values = [0, 1, 2, 3, 4];
+  const legacy = legacyLineChartPaths(values, 150, 220, 5);
+  const actual = axisPaths(values, LINE_GEOM);
+
+  assert.equal(actual.line, legacy.line);
+  assert.equal(actual.area, legacy.area);
+  // Spelled out, so a reader can see the geometry rather than trust two
+  // implementations that could in principle drift together.
+  assert.equal(actual.line, 'M38,198 L63,150.5 L88,103 L113,55.5 L138,8');
+  assert.equal(actual.area, 'M38,198 L63,150.5 L88,103 L113,55.5 L138,8 L138,198 L38,198 Z');
+});
+
+test('axisPaths: a null mid-series breaks the line into two subpaths', () => {
+  // THE RED SIGNAL. Pre-fix, the null became a real point at y=198 (the chart
+  // floor) wired to both neighbours — a measured plunge to zero and back that
+  // never happened.
+  const { line } = axisPaths([0, 1, null, 3, 4], LINE_GEOM);
+
+  assert.equal(countCommand(line, 'M'), 2, 'the line must be genuinely discontinuous');
+  assert.equal(line, 'M38,198 L63,150.5 M113,55.5 L138,8');
+  assert.ok(!xs(line).includes(88), 'nothing may be drawn in the missing slot');
+});
+
+test('axisPaths: no area is painted across a hole', () => {
+  // Pre-fix the area closed at the full chart width, so the fill spanned the
+  // gap even where the line did not.
+  const { area } = axisPaths([0, 1, null, 3, 4], LINE_GEOM);
+
+  assert.equal(countCommand(area, 'M'), 2, 'one closed shape per run');
+  assert.equal(countCommand(area, 'Z'), 2, 'each run closes on itself');
+  assert.equal(
+    area,
+    'M38,198 L63,150.5 L63,198 L38,198 Z M113,55.5 L138,8 L138,198 L113,198 Z',
+  );
+});
+
+test('axisPaths: undefined and NaN holes behave exactly like null, with no NaN emitted', () => {
+  // Pre-fix these were WORSE than null: they poisoned maxV to NaN, `range =
+  // NaN - NaN || 1` silently fell back to 1, and a single NaN token in the `d`
+  // attribute makes SVG drop the ENTIRE path — the whole series vanished.
+  const reference = axisPaths([0, 1, null, 3, 4], LINE_GEOM);
+
+  for (const hole of [undefined, NaN]) {
+    const actual = axisPaths([0, 1, hole, 3, 4], LINE_GEOM);
+    assert.equal(actual.line, reference.line, `${String(hole)} must break like null`);
+    assert.equal(actual.area, reference.area, `${String(hole)} must break like null`);
+    assert.ok(!actual.line.includes('NaN'), `line still carries a NaN: ${actual.line}`);
+    assert.ok(!actual.area.includes('NaN'), `area still carries a NaN: ${actual.area}`);
+    for (const n of coords(actual.line).flat()) {
+      assert.ok(Number.isFinite(n), `every coordinate must be finite — got ${actual.line}`);
+    }
+  }
+});
+
+test('axisPaths: an all-hole or empty series yields empty strings rather than throwing', () => {
+  // The decline-to-render decision stays at the call site. LineChart keeps its
+  // axes, gridlines and tick labels (chart furniture describing the requested
+  // window) and skips only the series paths.
+  for (const values of [[null, null, null], [undefined, NaN], [null], [], null, undefined]) {
+    const { line, area } = axisPaths(values, LINE_GEOM);
+    assert.equal(line, '', `expected no line for ${JSON.stringify(values) ?? String(values)}`);
+    assert.equal(area, '', `expected no area for ${JSON.stringify(values) ?? String(values)}`);
+  }
+});
+
+test('axisPaths: a lone sample flanked by holes is a dot at its own x, with no area', () => {
+  // A bare Move command renders NOTHING in SVG, so an isolated sample is drawn
+  // as a zero-length segment. It is deliberately NOT extended toward either
+  // neighbour: that would assert a measurement in a slot known to be empty.
+  // The area is dropped because a zero-width fill is an invisible sliver, and
+  // the pre-fix full-width triangle under one sample was itself fabricated.
+  const { line, area } = axisPaths([null, 1, null], { ...LINE_GEOM, count: 3, range: 4 });
+
+  assert.equal(line, 'M88,150.5 L88,150.5');
+  assert.equal(distinctCoords(line).length, 1, 'one sample marks exactly one place');
+  assert.equal(area, '', 'a zero-width run contributes no area');
+});
+
+test('axisPaths: x comes from the ORIGINAL index, so a hole never shifts the axis', () => {
+  // Compacting instead would silently REDATE every surviving sample — the
+  // sample after the hole would slide back into the missing slot's x and claim
+  // to have been measured a bucket earlier than it was.
+  const dense = axisPaths([0, 1, 2, 3, 4], LINE_GEOM);
+  const holed = axisPaths([0, 1, null, 3, 4], LINE_GEOM);
+
+  const denseXs = xs(dense.line);
+  const holedXs = xs(holed.line);
+  assert.deepEqual(holedXs, [38, 63, 113, 138], 'surviving samples keep their own x');
+  assert.equal(holedXs[2], denseXs[3], 'the sample after the hole keeps index 3’s x');
+  assert.equal(ys(holed.line)[2], ys(dense.line)[3], '...and index 3’s y');
+});
+
+test('axisPaths: stepX derives from count (labels.length), not values.length', () => {
+  // charts.jsx drives stepX off the LABEL row, so a series shorter than the
+  // label row must stop at its own last x rather than being stretched across
+  // the full width and implying measurements it does not have.
+  const short = axisPaths([0, 1, 2], LINE_GEOM);
+
+  assert.deepEqual(xs(short.line), [38, 63, 88], 'three samples occupy the first three slots');
+  assert.ok(!xs(short.line).includes(138), 'a short series must not reach the last slot');
+});
+
+test('axisPaths: a measured 0 is plotted on the floor, a hole is not plotted at all', () => {
+  // The distinction the pre-fix code destroyed: both rendered as a point at
+  // y=198. Now only the measurement does.
+  const measured = axisPaths([0, 1, 0, 1, 0], LINE_GEOM);
+  const holed = axisPaths([0, 1, null, 1, 0], LINE_GEOM);
+
+  assert.equal(countCommand(measured.line, 'M'), 1, 'a real zero keeps the line continuous');
+  assert.ok(xs(measured.line).includes(88), 'the measured zero occupies its slot');
+  assert.equal(countCommand(holed.line, 'M'), 2, 'a hole breaks it');
+  assert.notEqual(measured.line, holed.line);
+});
+
+test('axisPaths: a single-sample series draws a dot rather than a full-width line', () => {
+  const { line, area } = axisPaths([2], { ...LINE_GEOM, count: 1, range: 4 });
+
+  assert.equal(line, 'M38,103 L38,103');
+  assert.equal(area, '');
+});
+
+test('axisPaths: does not mutate its input array', () => {
+  const values = [0, null, 2, null, 4];
+  const before = values.slice();
+  axisPaths(values, LINE_GEOM);
+  assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
 });
