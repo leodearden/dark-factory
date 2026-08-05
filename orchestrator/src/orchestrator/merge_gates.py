@@ -70,9 +70,28 @@ class PlanFilesTouchedResult:
             touch.  Non-empty means the architect declared work that the
             branch never actually delivered.  Empty list means every plan
             entry is covered by some commit on the branch.
+        missing_from_tree: Declared entries that do NOT exist in the branch
+            tree at ``branch_head`` and for which no rename resolved.
+            ALWAYS a subset of ``not_touched`` (a stale entry is reported in
+            both), so fail-closed behaviour and every existing
+            ``not_touched``-only consumer are unchanged.  A non-empty value
+            means the declared PATH is stale — renamed away or never created
+            — NOT that the branch under-delivered: the touched-set was never
+            consulted for these entries, so no claim about the branch's
+            commits can be made from them.  Entries whose absence could not
+            be measured (a git error on the existence probe) are deliberately
+            NOT listed here; they land in ``not_touched`` only.
+        resolved_renames: Declared entry → the current path it resolved to,
+            recorded whether or not that resolved path was touched, as the
+            gate's audit trail.  Keyed by the ORIGINAL declared string (the
+            architect's spelling, pre-normalization) so the diagnostic names
+            exactly what plan.json says.  A resolution alone never passes the
+            gate — the resolved path must additionally be in the touched set.
     """
 
     not_touched: list[str] = field(default_factory=list)
+    missing_from_tree: list[str] = field(default_factory=list)
+    resolved_renames: dict[str, str] = field(default_factory=dict)
 
 
 DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
