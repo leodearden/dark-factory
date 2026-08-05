@@ -433,6 +433,34 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     return HeadroomResult(ok=True, reason=None)
 
 
+def _stage_headroom_gate(invoke, *, model: str, stage: str) -> HeadroomResult:
+    """Re-probe headroom at a stage boundary, logging which stage asked.
+
+    Deliberately NOT a second probe implementation -- it is a thin wrapper
+    over ``preflight_headroom`` that adds the stage name to the log and
+    nothing else, so the "one tiny call, no usage API assumed" decision
+    (PRD decision 5) and its fail-safe exception handling hold identically
+    at every gate.
+
+    Gates exist only where an unnoticed cap CORRUPTS output, not at every
+    stage transition. Today that means the preflight and this one, before
+    verification. There is deliberately NO gate before synthesis: a cap
+    there makes ``synthesize_fn`` RAISE, which propagates into ``main()``'s
+    hard-failure path and is already loud and already distinguishable from
+    a verification result -- so a gate there would only abort a run whose
+    ``verified`` list is complete and honest, discarding work that was
+    genuinely paid for. Mining is the same: a storm batch is already
+    detected and reported. Do not "complete the pattern" by adding them.
+    """
+    result = preflight_headroom(invoke, model=model)
+    if not result.ok:
+        logger.warning(
+            "census headroom gate FAILED at the %s stage boundary: %s",
+            stage, result.reason,
+        )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # build_task_payloads — verified clusters -> curator-path submit_task
 # kwargs (PRD decision 9: normal task_kind, never planning_mode; PRD
@@ -1003,9 +1031,9 @@ already spent (reviewer_comprehensive finding #3)."""
 
 @dataclass
 class CensusOutcome:
-    """Outcome of ``run_census``. ``status`` is ``"deferred"`` (headroom
-    preflight failed -- no further work was done) or ``"done"`` (the full
-    pipeline ran to completion)."""
+    """Outcome of ``run_census``. ``status`` is ``"deferred"`` (a headroom
+    gate failed -- NOTHING was persisted) or ``"done"`` (the full pipeline
+    ran to completion)."""
 
     status: str
     reason: str | None = None
@@ -1013,6 +1041,79 @@ class CensusOutcome:
     filed_task_ids: list[str] = field(default_factory=list)
     stop_reason: str | None = None
     dry_run: DryRunFiling | None = None
+
+    deferred_stage: str | None = None
+    """Which headroom gate deferred this run: ``"preflight"`` (before any
+    work) or ``"verify"`` (after mining, before or during verification).
+    Meaningful ONLY when ``status == "deferred"``; ``None`` otherwise.
+
+    Exists so the two are distinguishable by FIELD rather than by parsing
+    prose out of ``reason``. They differ in what an operator has lost: a
+    preflight defer spent nothing, a verify defer sank the mining cost.
+    Neither persisted anything, so both recover by re-running."""
+
+    unverified_clusters: int = 0
+    """How many novel clusters were left unadjudicated by a ``"verify"``
+    deferral -- the hitting cluster plus every one never attempted.
+
+    NOT a loss count: because the abort happens before
+    ``advance_census_state``, ``last_census_at`` is untouched and these
+    sightings are re-mined by the next run. It is the size of the work the
+    cap interrupted, which is what makes a defer legible next to an
+    ordinary run in which the verifier genuinely rejected everything."""
+
+
+def _defer(stage: str, reason: str | None, *, escalate_fn, unverified: int = 0) -> CensusOutcome:
+    """Abort the census at *stage*: log loudly, escalate, return the outcome.
+
+    ONE owner of the deferral shape, so the preflight gate, the
+    stage-boundary gate and the in-verify abort cannot drift into three
+    slightly different logs/escalations/outcomes (design-invariants:
+    one mechanism, one spelling). Every caller must ``return`` this
+    directly -- a defer that keeps going and persists something is the
+    exact failure this whole guard exists to prevent.
+
+    The escalation is best-effort, matching the mass-rejection site below:
+    a raising ``escalate_fn`` must never be what turns a clean abort into
+    a crash, and the warning above it is the real signal either way.
+    """
+    reason = reason or f"headroom gate failed at the {stage} stage"
+    logger.warning("census deferred at the %s stage: %s", stage, reason)
+
+    detail = reason
+    if stage != "preflight":
+        detail = (
+            f"{reason}\n\n"
+            f"{unverified} novel cluster(s) were NOT verified. Nothing was "
+            "persisted: no report, no matrix, no codebook merge, no filed "
+            "tasks, and last_census_at was NOT advanced -- so this window "
+            "WILL be re-mined and these sightings are not lost. The mining "
+            "spend for this run is sunk. Recovery is a plain re-run once "
+            "capacity returns; re-mining is idempotent (apply_coding_record "
+            "dedups sightings by session)."
+        )
+
+    try:
+        escalate_fn(
+            category="infra_issue",
+            severity="info",
+            summary=(
+                f"legibility census deferred at the {stage} stage "
+                f"({unverified} cluster(s) unverified): {reason}"
+                if stage != "preflight"
+                else f"legibility census deferred: {reason}"
+            ),
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
+        logger.warning("census: deferral escalation failed (best-effort): %s", exc)
+
+    return CensusOutcome(
+        status="deferred",
+        reason=reason,
+        deferred_stage=stage,
+        unverified_clusters=unverified,
+    )
 
 
 def run_census(
@@ -1051,7 +1152,22 @@ def run_census(
     whole census: files one INFO escalation via *escalate_fn* naming the
     deferral, logs loudly, and returns immediately -- no batch is pulled
     from *batch_source*, no ``submit_fn``/``codebook.dump``/
-    ``advance_census_state`` call happens. Otherwise falls through to the
+    ``advance_census_state`` call happens.
+
+    There is a SECOND headroom gate, after mining and before ``verify_fn``
+    (``_stage_headroom_gate``, skipped when there is nothing to verify).
+    Mining is long and expensive, so a cap absent at preflight can easily
+    have arrived by the time verification starts -- and verification is
+    where an unnoticed cap goes SILENT rather than loud, because the
+    default verifier fails closed per cluster and would record every
+    cap-poisoned call as an ordinary rejection. A mid-run cap detected
+    INSIDE verification surfaces as ``CensusHeadroomExhausted`` and lands
+    on this same path. Both defer through ``_defer``, so all three aborts
+    emit an identical log/escalation/outcome shape, and all three return
+    BEFORE any persistence -- crucially before ``advance_census_state``,
+    so ``last_census_at`` is untouched and the window is re-mined. The
+    outcome's ``deferred_stage``/``unverified_clusters`` tell the two
+    apart. Otherwise falls through to the
     happy path: ``mine_to_saturation`` (Sonnet miners, ``census_miner``) ->
     split records into duplicates vs novel clusters -> ``verify_fn``
     (Sonnet, ``census_verify``, asserts observations vs current main, never
@@ -1181,15 +1297,11 @@ def run_census(
 
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
-        reason = headroom.reason or "headroom preflight failed"
-        logger.warning("census deferred: %s", reason)
-        escalate_fn(
-            category="infra_issue",
-            severity="info",
-            summary=f"legibility census deferred: {reason}",
-            detail=reason,
+        return _defer(
+            "preflight",
+            headroom.reason or "headroom preflight failed",
+            escalate_fn=escalate_fn,
         )
-        return CensusOutcome(status="deferred", reason=reason)
 
     # Every output parent, created ONCE, here -- not at each of the four
     # write sites below. Three reasons, in order of how much they cost when
@@ -1266,6 +1378,31 @@ def run_census(
                 "confusion RECURS -- this run advances last_census_at, so these "
                 "sightings are not re-mined",
                 max_verify_clusters, deferred_count, len(novel_clusters),
+            )
+
+    # Stage-boundary gate. Mining is long and expensive, so a cap that was
+    # absent at preflight can easily have arrived by now -- and the stage it
+    # guards is the one where an unnoticed cap goes SILENT rather than loud:
+    # the default verifier fails closed per cluster, so every cap-poisoned
+    # verify call would land as an ordinary rejection and the run would exit 0
+    # looking unremarkable. Guarded by `if clusters_to_verify` so a run with
+    # nothing to verify spends no probe on a stage it is about to skip.
+    if clusters_to_verify:
+        stage_headroom = _stage_headroom_gate(
+            invoke, model=config.models.trickle, stage="verify",
+        )
+        if not stage_headroom.ok:
+            # The reason NAMES the stage. The preflight's reason is left
+            # byte-identical to what it has always been (nothing downstream
+            # that reads it changes), so the stage name is added here, where
+            # it is new information, rather than in _defer where it would
+            # rewrite both.
+            return _defer(
+                "verify",
+                "headroom gate failed at the verify stage boundary: "
+                f"{stage_headroom.reason or 'no headroom'}",
+                escalate_fn=escalate_fn,
+                unverified=len(clusters_to_verify),
             )
 
     verify_result = verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
