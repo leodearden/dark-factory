@@ -351,7 +351,11 @@ class TicketStore:
         policy (the cancelled-premise blocklist / recon premise registry) —
         not an error. Sweeping refusals into the janitor's failure path would
         page a steward every time the blocklist did its job, training
-        operators to ignore the signal. Do not "fix" this omission.
+        operators to ignore the signal. Do not "fix" this omission — it is
+        pinned by
+        ``tests/test_ticket_store.py::test_fetch_unescalated_failures_never_returns_refused``,
+        so broadening this predicate (e.g. to "all terminal non-created
+        statuses") fails there rather than in production.
 
         Args:
             project_id: When set, restrict to a single project. Default None
