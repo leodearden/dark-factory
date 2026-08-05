@@ -200,6 +200,46 @@ def apply_budgets(candidates: list[Any], budgets: dict[str, float]) -> list[Any]
     ]
 
 
+# The per-candidate fields copied through from the report layer's accumulator.
+# Named once so the summary and the renderer cannot disagree about the schema.
+_SUMMARY_FIELDS = (
+    'config_name', 'n', 'total', 'cap_excluded', 'no_plan', 'plan_rate',
+    'mean_plan_quality',
+)
+
+
+def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
+    """Per-candidate rows, SURFACED from the report layer — never recomputed here.
+
+    THE LOAD-BEARING RULE: none of these counts are derived in this driver.
+    ``cap_excluded``, ``no_plan`` and ``plan_rate`` are
+    :func:`build_plan_quality_report`'s per-config accumulator (tasks
+    3118/3302/3379) and ``mean_plan_quality`` is its shared reduction. Both
+    reductions were deliberately made SHARED with ``build_composite_report``'s
+    row so the two tables the CLI prints adjacently cannot give contradictory
+    answers about the same quantity. Re-deriving any of them here would create
+    exactly that second free-to-disagree surface — so this function copies the
+    fields through verbatim and adds nothing arithmetic of its own.
+
+    Why ``plan_rate`` is trustworthy on the no-plan band specifically: it is
+    JUDGE-FREE by construction, computed from :func:`produced_a_plan` over the
+    PERSISTED ``plan_steps``, so it stays valid on exactly the fixtures where no
+    reference diff exists and ``plan_quality`` therefore cannot be interpreted.
+
+    Rows are sorted by ``config_name`` so a committed report artifact diffs
+    cleanly.
+    """
+    from orchestrator.evals.report import build_plan_quality_report
+
+    report = build_plan_quality_report(results)
+    rows = [
+        {field: entry[field] for field in _SUMMARY_FIELDS}
+        for entry in report['configs']
+    ]
+    rows.sort(key=lambda r: r['config_name'])
+    return rows
+
+
 def _run_campaign(*args: Any, **kwargs: Any) -> list[Any]:
     """The LIVE real-API-spend seam — wired in a later step of this task.
 
