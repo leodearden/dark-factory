@@ -77,12 +77,24 @@ One §6 row was re-checked at the re-walk and found accurate — no drift:
   `client.retrieve` at `backends/mem0_client.py:454` — which δ does not touch. An
   earlier pass had it backwards, claiming §6 was imprecise; that claim has been
   corrected on δ's binding in this manifest (task 3359). Task 3210's own description
-  (WORK item 1) still carried the identical wrong claim as of this writing, and the
-  capability's `delivered_check` (a whole-file `with_vectors: bool` grep) cannot by
-  itself distinguish `scroll_by_metadata`'s signature from `get_point_by_id`'s.
-  Editing in-progress task 3210 directly was judged out of scope for task 3359 (it
-  held locks only on this manifest pair, and 3210 was actively claimed), so both
-  gaps are filed as follow-up ticket `tkt_0RRX6GAXW40S49J2BACDGRGP98` instead.
+  (WORK item 1) still carried the identical wrong claim, and the capability's
+  `delivered_check` (a whole-file `with_vectors: bool` grep) could not by itself
+  distinguish `scroll_by_metadata`'s signature from `get_point_by_id`'s. Editing
+  in-progress task 3210 directly was out of scope for task 3359 (it held locks only
+  on this manifest pair, and 3210 was actively claimed), so both gaps were filed as
+  follow-up ticket `tkt_0RRX6GAXW40S49J2BACDGRGP98`. **Both are now CLOSED by task
+  3364:** (a) 3210's WORK item (1) was corrected on the live task record, once 3210
+  had reached `done` and shed its claimant, to state that `scroll_by_metadata` passes
+  no `with_vectors` argument on main and that the module's only `with_vectors=False`
+  literal belongs to `get_point_by_id`; (b) the file-scoped grep was replaced by a
+  method-scoped `kind: script` check (`scripts/check_method_param_wiring.py`) that
+  asserts `scroll_by_metadata` specifically *declares* `with_vectors: bool` and
+  *forwards* it by name into `client.scroll`. A grep could not do this: `_run_grep_check`
+  shells to `git grep -E` — single-line POSIX ERE, no multiline mode — while this
+  module spreads every `def` across lines, so no single-line pattern can bind a match
+  to one signature. Requiring the forwarded value to be a *name* rather than a literal
+  is also what separates the two call sites the original mix-up confused, and keeps a
+  stub parameter that is accepted and then dropped from counting as vector access.
 
 All other spot-checked rows verified clean on main: unvalidated `category: str`
 (`escalation/models.py:93`) ⇒ `eval_regression` filable; direct `EscalationQueue`
