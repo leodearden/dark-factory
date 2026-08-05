@@ -16,7 +16,9 @@
 // weak in three ways this suite fixes:
 //
 //   1. It never EXECUTES the code. `verdictBadge` composes a base label with a
-//      parity suffix across 5 verdicts × 13 parity states = 65 combinations; a
+//      parity suffix across the 7 verdict inputs that produce a distinct base
+//      (the 4 in-vocabulary verdicts, absent-as-null, absent-as-undefined, and
+//      a present-but-unreadable one) × 13 parity states = 91 combinations; a
 //      regex can see that a `+ ' · ' +` exists, never that the right string
 //      comes out of the right pair.
 //   2. A regex that matches NOTHING passes silently. Two regexes in that file
@@ -45,7 +47,16 @@ import { createRequire } from 'node:module';
 
 import mef from '../../src/dashboard/static/redux/memory_evals_fmt.js';
 
-const { dash, ageText, unmatchedReasonText, chartForKind, trendGaps } = mef;
+const {
+  dash,
+  ageText,
+  unmatchedReasonText,
+  chartForKind,
+  trendGaps,
+  verdictBadge,
+  PARITY_REFINEMENT,
+  PARITY_PLAIN,
+} = mef;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/memory_evals_fmt.js';
 
@@ -60,8 +71,14 @@ const EXPECTED_FUNCTION_NAMES = [
   'dash',
   'trendGaps',
   'unmatchedReasonText',
+  'verdictBadge',
 ];
-const EXPECTED_DATA_NAMES = [];
+// The parity vocabulary TABLES are exported as data so this suite can drive its
+// verdict×parity matrix off the REAL vocabulary the module ships, rather than a
+// copy pinned here. tab_memory_evals.jsx records why that matters: "a
+// hand-picked three-member copy DID live in that test, and went blind to six
+// states". A state the producer adds is covered the moment it lands in the table.
+const EXPECTED_DATA_NAMES = ['PARITY_PLAIN', 'PARITY_REFINEMENT'];
 
 function expectedSurface() {
   return EXPECTED_FUNCTION_NAMES.concat(EXPECTED_DATA_NAMES).slice().sort();
@@ -84,6 +101,10 @@ test('default-imported module exposes exactly the memory-eval format helpers', (
   );
   for (const name of EXPECTED_FUNCTION_NAMES) {
     assert.equal(typeof mef[name], 'function', `mef.${name} should be a function`);
+  }
+  for (const name of EXPECTED_DATA_NAMES) {
+    assert.equal(typeof mef[name], 'object', `mef.${name} should be a data table`);
+    assert.ok(mef[name] !== null, `mef.${name} should not be null`);
   }
 });
 
@@ -402,4 +423,225 @@ test('trendGaps: counts holes WITHOUT dropping them from the series', () => {
   assert.equal(values.length, pristine.length, 'the series length must not change');
   assert.equal(values[1], null, 'the null hole must stay at its own index');
   assert.equal(values[3], undefined, 'the undefined hole must stay at its own index');
+});
+
+// ---------------------------------------------------------------------------
+// verdictBadge — the verdict×parity matrix.
+//
+// `verdict` and `parity` are the ONLY badge inputs. Re-deriving alarm state
+// from value-vs-limit in the browser is forbidden by PRD section 8 (G6/INV-5);
+// the source-level guard for that lives in Python
+// (test_tab_memory_evals.py::test_no_client_side_alarm_derivation, which scans
+// BOTH this module and tab_memory_evals.jsx). What this suite adds is the half
+// a regex could never reach: which label and class each COMBINATION actually
+// produces.
+//
+// The state axis is built from the module's EXPORTED tables, never a copy — see
+// EXPECTED_DATA_NAMES above.
+// ---------------------------------------------------------------------------
+
+// The verdict axis, with the base label and class each verdict must yield on
+// its own. Asserted directly in the base-label test below, then reused as the
+// expected PREFIX for every parity combination — which is what makes
+// "compose, never replace" checkable across the whole matrix at once.
+const VERDICT_BASES = [
+  { verdict: 'alarm', base: 'alarm', cls: 'badge bad' },
+  { verdict: 'no_alarm', base: 'no_alarm', cls: 'badge ok' },
+  { verdict: 'grandfathered', base: 'grandfathered', cls: 'badge info' },
+  { verdict: 'insufficient_data', base: 'insufficient_data', cls: 'badge muted' },
+  // Genuinely ABSENT — memory_evals._verdict_class() buckets this to `unjudged`.
+  { verdict: null, base: 'no verdict', cls: 'badge muted' },
+  { verdict: undefined, base: 'no verdict', cls: 'badge muted' },
+  // PRESENT but outside the closed vocabulary — the `unknown_verdict` bucket.
+  { verdict: 'wat', base: 'unreadable verdict', cls: 'badge bad' },
+];
+
+function allParityStates() {
+  return Object.keys(PARITY_REFINEMENT).concat(PARITY_PLAIN);
+}
+
+test('verdictBadge: the exported parity vocabulary is the full 13-state split', () => {
+  // 9 refined + 4 plain = 13 = |memory_evals.PARITY_STATES|. The cross-language
+  // half of this — that those 13 are exactly the producer's frozenset — stays in
+  // Python, which is the only place that frozenset can be imported.
+  assert.equal(Object.keys(PARITY_REFINEMENT).length, 9, 'expected 9 refined states');
+  assert.equal(PARITY_PLAIN.length, 4, 'expected 4 plain states');
+  assert.equal(allParityStates().length, 13);
+
+  // The two declarations must be DISJOINT: a state in both would be ambiguous
+  // about whether it refines the badge or declines to.
+  const overlap = PARITY_PLAIN.filter(s =>
+    Object.prototype.hasOwnProperty.call(PARITY_REFINEMENT, s),
+  );
+  assert.deepEqual(overlap, [], 'a state may be refined or plain, never both');
+  assert.equal(new Set(allParityStates()).size, 13, 'parity states must be unique');
+});
+
+test('verdictBadge: each verdict alone yields its own base label and class', () => {
+  for (const { verdict, base, cls } of VERDICT_BASES) {
+    const out = verdictBadge({ verdict, parity: null });
+    assert.equal(out.label, base, `verdict ${JSON.stringify(verdict)} label`);
+    assert.equal(out.cls, cls, `verdict ${JSON.stringify(verdict)} class`);
+  }
+});
+
+test('verdictBadge: absent and unreadable are DIFFERENT, and unreadable is never muted', () => {
+  const absent = verdictBadge({ verdict: null, parity: null });
+  const unreadable = verdictBadge({ verdict: 'not_a_verdict', parity: null });
+
+  // 'no verdict' asserts the verdict is MISSING. Saying it for a value that is
+  // present but out-of-vocabulary would be a false statement about the payload.
+  assert.notEqual(absent.label, unreadable.label);
+  assert.equal(absent.label, 'no verdict');
+  assert.equal(unreadable.label, 'unreadable verdict');
+
+  // The producer files a named `unknown_verdict` issue for exactly this value;
+  // the last render step must fail toward "something is wrong here", not toward
+  // the muted/healthy end.
+  assert.equal(unreadable.cls, 'badge bad');
+  assert.notEqual(unreadable.cls, 'badge muted');
+  assert.notEqual(unreadable.cls, 'badge ok');
+});
+
+test('verdictBadge: no parity branch can discard the verdict (compose, never replace)', () => {
+  // The structural statement of CONSTRAINT (1), across the WHOLE matrix:
+  // 7 verdicts × 13 parity states. The parity dimension REFINES the verdict; a
+  // branch returning a FIXED label would collapse distinctions the producer
+  // drew deliberately.
+  let checked = 0;
+  for (const { verdict, base } of VERDICT_BASES) {
+    for (const parity of allParityStates()) {
+      const out = verdictBadge({ verdict, parity });
+      assert.ok(
+        out.label === base || out.label.startsWith(base + ' · '),
+        `verdict ${JSON.stringify(verdict)} × parity '${parity}' produced ` +
+          `'${out.label}', which does not carry the verdict base '${base}'`,
+      );
+      assert.ok(out.cls, `verdict ${JSON.stringify(verdict)} × parity '${parity}' has no class`);
+      checked += 1;
+    }
+  }
+  assert.equal(checked, VERDICT_BASES.length * 13, 'the matrix must be fully enumerated');
+});
+
+test('verdictBadge: an escalation-open parity on a never-measured metric is NOT a recovery', () => {
+  // Regression case for commit f79daa4c06. memory_evals._parity() suffixes
+  // `_open` onto the linked variant of EVERY non-alarm verdict class, so an
+  // `insufficient_data` metric with a linked escalation reaches
+  // `insufficient_data_open` — and previously reached `recovered_open`. A
+  // parity-FIRST branch would render "recovered", telling the operator a metric
+  // nothing ever measured had recovered: the "we did not measure" -> "we
+  // measured and it is fine" substitution this ordering exists to prevent.
+  const out = verdictBadge({ verdict: 'insufficient_data', parity: 'recovered_open' });
+  assert.equal(out.label, 'insufficient_data · escalation open');
+  assert.ok(!out.label.includes('recovered'), 'must not read as a recovery');
+  assert.equal(out.cls, 'badge warn');
+
+  // The same metric via its own state reads identically — the two paths agree
+  // because both suffix the verdict-derived base.
+  const own = verdictBadge({ verdict: 'insufficient_data', parity: 'insufficient_data_open' });
+  assert.equal(own.label, 'insufficient_data · escalation open');
+});
+
+test('verdictBadge: every _open state renders the same escalation-open affordance', () => {
+  // `_parity()` suffixes `_open` onto the linked variant of every non-alarm
+  // verdict class, so these all assert ONE fact — an escalation is filed and
+  // still live — and the operator should read one marker rather than learn six.
+  const openStates = Object.keys(PARITY_REFINEMENT).filter(s => s.endsWith('_open'));
+  assert.ok(openStates.length >= 6, `expected the _open family, got ${openStates.length}`);
+
+  for (const parity of openStates) {
+    assert.equal(
+      PARITY_REFINEMENT[parity].suffix,
+      'escalation open',
+      `${parity} must use the shared escalation-open wording`,
+    );
+    const out = verdictBadge({ verdict: 'no_alarm', parity });
+    assert.ok(out.label.endsWith(' · escalation open'), `${parity} label: ${out.label}`);
+    // An open escalation is never a healthy state, whatever the verdict says.
+    assert.notEqual(out.cls, 'badge ok', `${parity} must not render as healthy`);
+  }
+});
+
+test('verdictBadge: severity follows the verdict, not the linkage', () => {
+  // An open escalation on a metric nothing judged alarming is a warn-level
+  // parity fact, not a healthy one and not an alarm.
+  const warn = ['recovered_open', 'insufficient_data_open', 'grandfathered_open', 'unjudged_open'];
+  for (const parity of warn) {
+    assert.equal(PARITY_REFINEMENT[parity].cls, 'badge warn', `${parity} should be warn`);
+    assert.equal(verdictBadge({ verdict: 'no_alarm', parity }).cls, 'badge warn');
+  }
+
+  // `alarmed_open` keeps `badge bad` and pairs symmetrically with
+  // `alarmed_unlinked` — "alarm · escalation open" vs "alarm · no escalation" —
+  // where an unsuffixed alarm badge was ambiguous between "escalation linked"
+  // and "state nobody handled".
+  const bad = ['alarmed_open', 'alarmed_unlinked', 'storm_collapsed'];
+  for (const parity of bad) {
+    assert.equal(PARITY_REFINEMENT[parity].cls, 'badge bad', `${parity} should be bad`);
+    assert.equal(verdictBadge({ verdict: 'alarm', parity }).cls, 'badge bad');
+  }
+  assert.equal(
+    verdictBadge({ verdict: 'alarm', parity: 'alarmed_open' }).label,
+    'alarm · escalation open',
+  );
+  assert.equal(
+    verdictBadge({ verdict: 'alarm', parity: 'alarmed_unlinked' }).label,
+    'alarm · no escalation',
+  );
+});
+
+test('verdictBadge: a PARITY_PLAIN state adds nothing to the verdict badge', () => {
+  // PARITY_PLAIN is an explicit opt-out, not an oversight bucket: "considered,
+  // nothing to add" is a different decision from "no branch for it", and only
+  // one of them is safe to leave undocumented.
+  for (const parity of PARITY_PLAIN) {
+    for (const { verdict, base, cls } of VERDICT_BASES) {
+      const out = verdictBadge({ verdict, parity });
+      assert.equal(out.label, base, `plain parity '${parity}' must render the bare base`);
+      assert.equal(out.cls, cls, `plain parity '${parity}' must keep the verdict's class`);
+      assert.ok(!out.label.includes(' · '), `plain parity '${parity}' must add no suffix`);
+    }
+  }
+});
+
+test('verdictBadge: an absent parity renders the bare verdict badge', () => {
+  for (const parity of [null, undefined, '']) {
+    const out = verdictBadge({ verdict: 'alarm', parity });
+    assert.equal(out.label, 'alarm', `parity ${JSON.stringify(parity)} must not be marked`);
+    assert.equal(out.cls, 'badge bad');
+  }
+});
+
+test('verdictBadge: an unrecognised parity is MARKED, not passed through', () => {
+  // A non-empty parity in NEITHER declaration is a state this copy of the file
+  // has never been told about — the producer added one and an already-open
+  // browser is holding a cached bundle. Rendering it as the bare verdict badge
+  // would be indistinguishable from a state that DECLINED refinement, i.e. the
+  // unknown would fail toward the healthy label.
+  for (const { verdict, base } of VERDICT_BASES) {
+    const out = verdictBadge({ verdict, parity: 'brand_new_parity' });
+    assert.equal(out.label, base + ' · unrecognised parity');
+    assert.equal(out.cls, 'badge bad', 'an unknown parity must fail toward "something is wrong"');
+  }
+});
+
+test('verdictBadge: an inherited Object.prototype member is not a parity state', () => {
+  // The table is a plain object literal, so a BARE `PARITY_REFINEMENT[parity]`
+  // lookup resolves through Object.prototype: a payload carrying parity
+  // 'constructor' / 'toString' / 'valueOf' / 'hasOwnProperty' would find a
+  // truthy INHERITED member and render `cls: undefined` with a label ending
+  // '· undefined'. The source uses Object.prototype.hasOwnProperty.call for
+  // exactly this, and this is the clearest example of behaviour the
+  // source-as-text suite could only grep for and never execute.
+  for (const parity of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+    const out = verdictBadge({ verdict: 'no_alarm', parity });
+    assert.equal(
+      out.label,
+      'no_alarm · unrecognised parity',
+      `parity '${parity}' must take the unrecognised branch`,
+    );
+    assert.equal(out.cls, 'badge bad', `parity '${parity}' produced cls ${out.cls}`);
+    assert.ok(!out.label.endsWith('· undefined'), `parity '${parity}' leaked an inherited member`);
+  }
 });
