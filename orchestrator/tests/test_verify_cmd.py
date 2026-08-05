@@ -14,6 +14,8 @@ from __future__ import annotations
 import dataclasses
 import re
 import shlex
+import shutil
+import subprocess
 
 import pytest
 from _verify_config_corpus import (
@@ -47,6 +49,36 @@ from orchestrator.verify_cmd import (
     strip_cwd,
     with_junitxml,
 )
+
+#: Resolved once, absolutely — bash is a hard dependency of the code under
+#: test (verify.py execs ``/bin/bash -c`` at :3517,:3530), so a missing bash
+#: must fail loudly rather than silently skip the regression coverage below.
+_BASH = shutil.which('bash') or '/bin/bash'
+
+
+def _assert_bash_parses(rendered: str, *, what: str) -> None:
+    """Assert *rendered* is a syntactically valid bash command (``bash -n``).
+
+    Shells out to a real bash rather than approximating parseability in
+    Python, because bash parseability IS the production contract here
+    (verify.py runs the recovered command as ``/bin/bash -c <string>``), not
+    a proxy for it. On failure the assertion message carries both bash's own
+    diagnostic and the offending string, so a regression reports the actual
+    syntax error (e.g. ``syntax error near unexpected token `-p'``) instead
+    of a bare ``assert 2 == 0``.
+    """
+    result = subprocess.run(
+        [_BASH, '-n', '-c', rendered],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, (
+        f'{what}: rendered command is not valid bash.\n'
+        f'stderr: {result.stderr}\n'
+        f'rendered: {rendered!r}'
+    )
+
 
 # The real config command strings this suite exercises live in
 # `_verify_config_corpus.py` (one definition site, shared with test_verify_plan.py
