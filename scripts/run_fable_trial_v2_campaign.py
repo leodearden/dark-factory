@@ -1143,6 +1143,10 @@ def main(argv: list[str] | None = None) -> int:
     # weakens the comparison; an absent arm means there is no comparison.
     absent = (report.get('missing_cells') or {}).get('candidates_absent')
     if absent:
+        # Flushed before the stderr line so "see MISSING CELLS above" stays true
+        # under a pipe, where stdout is block-buffered and would otherwise land
+        # after it — i.e. in exactly the CI log where the pointer matters most.
+        sys.stdout.flush()
         print(
             f'ERROR: no cells returned for candidate(s): {", ".join(absent)}. The '
             'campaign produced no comparison; see MISSING CELLS above and the '
