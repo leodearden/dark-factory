@@ -26,6 +26,61 @@ import pytest
 import run_fable_trial_v2_campaign as mod
 
 
+def _cell(
+    task_id, config_name, *, trial=1, plan_quality=None, plan_steps=0,
+    role_under_test='architect', cap_tainted=False, invocation_error=None,
+    cost_usd=0.0, judge_cost_usd=0.0, extra_metrics=None,
+):
+    """Build a synthetic ``EvalResult`` with a production-shaped metrics dict.
+
+    Copies ``orchestrator/tests/test_eval_composite_report.py``'s helper shape:
+    ``plan_steps`` is threaded EXPLICITLY because it is the plan-production
+    predicate the report layer reads — a cell declaring a ``plan_quality``
+    without the step count it came from is a self-contradictory fixture.
+
+    ``extra_metrics`` merges keys the current ``EvalMetrics`` has no field for.
+    That is exactly how ``judged_without_reference`` will arrive once
+    eval-revival σ (task 3628) adds the field, so tests can exercise the
+    post-σ world without the driver forward-referencing an unlanded instrument.
+    """
+    from orchestrator.evals.metrics import EvalMetrics
+    from orchestrator.evals.runner import EvalResult
+
+    m = EvalMetrics(
+        plan_quality=plan_quality,
+        role_under_test=role_under_test,
+        plan_steps=plan_steps,
+        cost_usd=cost_usd,
+        judge_cost_usd=judge_cost_usd,
+        cap_tainted=cap_tainted,
+        invocation_error=invocation_error,
+    )
+    metrics = {**m.to_dict(), **(extra_metrics or {})}
+    return EvalResult(
+        task_id=task_id,
+        config_name=config_name,
+        outcome='completed',
+        metrics=metrics,
+        worktree_path='/tmp/eval',
+        trial=trial,
+    )
+
+
+def _mixed_results():
+    """Candidate A with one cap-tainted cell, candidate B with one no-plan cell."""
+    return [
+        # A: one transport refusal (never got to ask the model) + two scored cells.
+        _cell('f1', 'architect-opus-max', cap_tainted=True,
+              invocation_error='architect: cap_hit'),
+        _cell('f2', 'architect-opus-max', plan_quality=0.80, plan_steps=6),
+        _cell('f3', 'architect-opus-max', plan_quality=0.60, plan_steps=4),
+        # B: one genuine no-plan measurement + two scored cells.
+        _cell('f1', 'architect-fable-high', plan_quality=0.0, plan_steps=0),
+        _cell('f2', 'architect-fable-high', plan_quality=0.70, plan_steps=5),
+        _cell('f3', 'architect-fable-high', plan_quality=0.50, plan_steps=3),
+    ]
+
+
 def _make_fixture_dir(tmp_path, stems, *, name='tasks_hard_v2'):
     """Build a fixture dir holding one minimal ``*.json`` per stem.
 
@@ -251,3 +306,73 @@ def test_dry_run_prints_the_comparison_regime(tmp_path, capsys, monkeypatch):
     assert 'claude-fable-5' in out, 'candidate model not shown'
     assert 'opus' in out
     assert '15' in out, 'the overridden budget — the γ2 comparison regime — not shown'
+
+
+# ===== step 5: the per-candidate summary SURFACES the report layer =====
+
+
+def test_summary_rows_match_the_report_layer_field_for_field():
+    """THE anti-drift assertion: every count comes from the report layer verbatim.
+
+    ``cap_excluded`` / ``no_plan`` / ``plan_rate`` / ``mean_plan_quality`` are
+    the report layer's per-config accumulator (tasks 3118/3302/3379), built on
+    the SHARED ``_plan_rate`` and ``_mean_plan_quality`` reductions precisely so
+    two adjacent surfaces cannot give contradictory answers about the same
+    quantity. Re-deriving any of them in this driver would create exactly that
+    second surface. This test pins the equality field for field.
+    """
+    from orchestrator.evals.report import build_plan_quality_report
+
+    results = _mixed_results()
+    rows = mod.summarize_candidates(results)
+    reference = {c['config_name']: c for c in build_plan_quality_report(results)['configs']}
+
+    assert {r['config_name'] for r in rows} == set(reference)
+    for row in rows:
+        ref = reference[row['config_name']]
+        for field in ('n', 'total', 'cap_excluded', 'no_plan', 'plan_rate',
+                      'mean_plan_quality'):
+            assert row[field] == ref[field], f'{row["config_name"]}.{field} drifted'
+
+
+def test_cap_excluded_is_per_candidate_not_a_report_total():
+    """Cap exclusion is reported PER CANDIDATE — the differential-exclusion signal.
+
+    ``build_plan_quality_report`` also emits a report-level ``cap_excluded``
+    total; summing every arm into one number would hide the very asymmetry the
+    reopening condition watches for, since the costlier candidate is the more
+    cap-exposed one.
+    """
+    rows = {r['config_name']: r for r in mod.summarize_candidates(_mixed_results())}
+
+    assert rows['architect-opus-max']['cap_excluded'] == 1
+    assert rows['architect-fable-high']['cap_excluded'] == 0
+    # And the counterpart signal stays disjoint from it.
+    assert rows['architect-opus-max']['no_plan'] == 0
+    assert rows['architect-fable-high']['no_plan'] == 1
+
+
+def test_no_scored_cells_reports_none_not_zero():
+    """A candidate whose every cell was cap-tainted reports n=0, mean=None."""
+    results = [
+        _cell('f1', 'architect-opus-max', cap_tainted=True,
+              invocation_error='architect: cap_hit'),
+        _cell('f2', 'architect-opus-max', cap_tainted=True,
+              invocation_error='architect: cap_hit'),
+    ]
+
+    row = mod.summarize_candidates(results)[0]
+
+    assert row['n'] == 0
+    assert row['total'] == 2
+    assert row['cap_excluded'] == 2
+    assert row['mean_plan_quality'] is None, (
+        '"we measured nothing" must never read as "it scored nothing"'
+    )
+
+
+def test_rows_are_sorted_by_config_name():
+    """Deterministic ordering, so a committed report artifact diffs cleanly."""
+    rows = mod.summarize_candidates(_mixed_results())
+
+    assert [r['config_name'] for r in rows] == sorted(r['config_name'] for r in rows)
