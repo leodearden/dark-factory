@@ -1927,3 +1927,258 @@ async def test_sample_curator_counts_refused_tickets_in_centiles(tmp_path: Path,
     assert result['p50_active_ms'] == int(percentile([100.0, 400.0], 50))
     assert result['p90_active_ms'] == int(percentile([100.0, 400.0], 90))
     assert result['p99_active_ms'] == int(percentile([100.0, 400.0], 99))
+
+
+# ---------------------------------------------------------------------------
+# task 3126 (review round 2): refusals need a COUNTED signal, not just latency
+#
+# A refusal discards a candidate permanently and creates nothing. The janitor
+# failure sweep deliberately excludes refusals, and the curator tab renders
+# pending tickets only — so an over-broad blocklist/premise entry could eat
+# real reconciliation output indefinitely with only a logger.info to show for
+# it. Folding refusals into the centiles (above) does not surface a RATE.
+# ---------------------------------------------------------------------------
+
+
+def _write_tickets(path: Path, rows: list[tuple[str, str, datetime, datetime]]) -> None:
+    """Seed a tickets.db with (id, status, created_at, resolved_at) rows."""
+    conn_sync = sqlite3.connect(str(path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    for ticket_id, status, created, resolved in rows:
+        conn_sync.execute(
+            'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (ticket_id, 'proj', status, created.isoformat(), resolved.isoformat()),
+        )
+    conn_sync.commit()
+    conn_sync.close()
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_counts_refusals_in_the_last_hour(tmp_path: Path, config):
+    """_sample_curator returns refused_last_hour — the count an operator needs
+    to notice a guard entry whose refusal rate has spiked."""
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+    recent = now - timedelta(minutes=30)
+    stale = now - timedelta(hours=3)
+
+    tickets_path = tmp_path / 'tickets.db'
+    _write_tickets(
+        tickets_path,
+        [
+            ('t1', 'created', recent, recent + timedelta(milliseconds=100)),
+            ('t2', 'refused', recent, recent + timedelta(milliseconds=400)),
+            ('t3', 'refused', recent, recent + timedelta(milliseconds=500)),
+            # Outside the 1-hour window — must not inflate the count.
+            ('t4', 'refused', stale, stale + timedelta(milliseconds=200)),
+        ],
+    )
+
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    transport = httpx.MockTransport(_ListTicketsHandler(count=2))
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            result = await _sample_curator(
+                http_client, config, tickets_conn, [runs_conn], now=now,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    assert result['refused_last_hour'] == 2, (
+        'only the two in-window refusals count; the create and the 3h-old '
+        'refusal must not be counted'
+    )
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_refusal_count_is_zero_not_none_when_sampled(
+    tmp_path: Path, config,
+):
+    """0 (sampled, nothing refused) must be distinguishable from None (window
+    never read) — otherwise a broken sampler reads as a quiet blocklist."""
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+    recent = now - timedelta(minutes=30)
+
+    tickets_path = tmp_path / 'tickets.db'
+    _write_tickets(
+        tickets_path, [('t1', 'created', recent, recent + timedelta(milliseconds=100))],
+    )
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    transport = httpx.MockTransport(_ListTicketsHandler(count=2))
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            sampled = await _sample_curator(
+                http_client, config, tickets_conn, [runs_conn], now=now,
+            )
+            # No tickets_db at all → the window was never read.
+            unsampled = await _sample_curator(
+                http_client, config, None, [runs_conn], now=now,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    assert sampled['refused_last_hour'] == 0
+    assert unsampled['refused_last_hour'] is None
+
+
+def test_curator_refusal_snapshots_table_exists_after_schema_migration(tmp_path: Path):
+    """METRICS_SCHEMA creates curator_refusal_snapshots.
+
+    A sibling table, not a column on curator_snapshots: the schema is applied
+    with CREATE TABLE IF NOT EXISTS only, so a new column would never
+    materialise on an existing metrics.db and its INSERT would then fail —
+    taking the whole curator sampler row down with it.
+    """
+    db_path = tmp_path / 'refusal_schema.db'
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(METRICS_SCHEMA)
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='curator_refusal_snapshots'"
+    ).fetchone()
+    assert row is not None, 'curator_refusal_snapshots was not created by METRICS_SCHEMA'
+
+    col_info = conn.execute('PRAGMA table_info(curator_refusal_snapshots)').fetchall()
+    assert {r[1] for r in col_info} == {'ts', 'refused_count'}
+    assert 'ts' in {r[1] for r in col_info if r[5] == 1}, 'ts is not the PRIMARY KEY'
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics_snapshot_persists_the_refusal_count(tmp_path: Path, config):
+    """The count is durable, not just logged — an operator can chart a spike."""
+    from dashboard.data.memory import reset_sessions
+
+    t_base = datetime.now(UTC) - timedelta(minutes=30)
+
+    metrics_path = tmp_path / 'metrics.db'
+    metrics_conn = await aiosqlite.connect(str(metrics_path))
+    await metrics_conn.executescript(METRICS_SCHEMA)
+    await metrics_conn.commit()
+
+    tickets_path = tmp_path / 'tickets.db'
+    _write_tickets(
+        tickets_path,
+        [
+            ('t1', 'created', t_base, t_base + timedelta(milliseconds=100)),
+            ('t2', 'refused', t_base, t_base + timedelta(milliseconds=200)),
+            ('t3', 'refused', t_base, t_base + timedelta(milliseconds=300)),
+        ],
+    )
+
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    transport = httpx.MockTransport(_ListTicketsHandler(count=2))
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            await collect_metrics_snapshot(
+                conn=metrics_conn,
+                config=config,
+                http_client=http_client,
+                recon_db=None,
+                merge_dbs=[('proj', runs_conn)],
+                tickets_db=tickets_conn,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    async with metrics_conn.execute(
+        'SELECT refused_count FROM curator_refusal_snapshots'
+    ) as cur:
+        refusal_rows = list(await cur.fetchall())
+    # The centiles row must still be written — the two inserts commit
+    # independently so neither can roll the other back.
+    async with metrics_conn.execute('SELECT COUNT(*) FROM curator_snapshots') as cur:
+        centile_count = (await cur.fetchone())[0]
+    await metrics_conn.close()
+
+    assert len(refusal_rows) == 1
+    assert refusal_rows[0][0] == 2
+    assert centile_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_curator_refusal_spark_reads_the_persisted_counts(metrics_db_path: Path):
+    """The reader returns an in-window {labels, values} series, ts-ordered."""
+    from dashboard.data.metrics import get_curator_refusal_spark
+
+    now = datetime.now(UTC)
+    older_ts = (now - timedelta(hours=6)).isoformat()
+    newer_ts = (now - timedelta(hours=2)).isoformat()
+    out_of_window_ts = (now - timedelta(days=5)).isoformat()
+
+    conn_sync = sqlite3.connect(str(metrics_db_path))
+    for ts, count in ((newer_ts, 4), (older_ts, 1), (out_of_window_ts, 99)):
+        conn_sync.execute(
+            'INSERT INTO curator_refusal_snapshots (ts, refused_count) VALUES (?, ?)',
+            (ts, count),
+        )
+    conn_sync.commit()
+    conn_sync.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        series = await get_curator_refusal_spark(db, days=1)
+    finally:
+        await db.close()
+
+    assert series == {'labels': [older_ts, newer_ts], 'values': [1, 4]}
+
+
+@pytest.mark.asyncio
+async def test_get_curator_refusal_spark_none_db_returns_empty_series():
+    from dashboard.data.metrics import get_curator_refusal_spark
+
+    assert await get_curator_refusal_spark(None, days=1) == {'labels': [], 'values': []}
+
+
+@pytest.mark.asyncio
+async def test_get_curator_sparks_shape_is_unchanged_by_the_refusal_signal():
+    """The refusal count is a separate reader on purpose: get_curator_sparks'
+    4-key contract (consumed by shape_curator) must not shift underneath it."""
+    from dashboard.data.metrics import get_curator_sparks
+
+    assert set((await get_curator_sparks(None, days=1)).keys()) == {
+        'pending', 'p50', 'p90', 'p99',
+    }

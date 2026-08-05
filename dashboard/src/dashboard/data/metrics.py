@@ -234,6 +234,24 @@ CREATE TABLE IF NOT EXISTS curator_snapshots (
     p90_active_ms INTEGER,
     p99_active_ms INTEGER
 );
+
+-- Count of tickets a deterministic curator guard REFUSED (cancelled-premise
+-- blocklist / recon premise registry) in the trailing hour. A refusal
+-- discards a candidate permanently and creates nothing, so an over-broad
+-- guard entry can eat real reconciliation output indefinitely; this is the
+-- counted signal that makes a refusal-rate spike visible without grepping
+-- logs. NULL means "not sampled" (no tickets.db connection), which is
+-- distinct from 0 = "sampled, none refused".
+--
+-- Deliberately a sibling table rather than a column on curator_snapshots:
+-- this schema is applied with CREATE TABLE IF NOT EXISTS only (no ALTER
+-- migration hook), so a new column would never materialise on an existing
+-- metrics.db and its INSERT would then fail — silently killing the whole
+-- curator sampler row. A new table is the migration-free way to extend.
+CREATE TABLE IF NOT EXISTS curator_refusal_snapshots (
+    ts            TEXT PRIMARY KEY,
+    refused_count INTEGER
+);
 """
 
 
@@ -337,9 +355,12 @@ async def _sample_curator(
 
     Returns:
         Always returns a dict with keys: pending_total, capped_now,
-        p50_active_ms, p90_active_ms, p99_active_ms. Individual sub-errors
-        are swallowed and treated as 0/None — the function never propagates
-        a top-level exception to the caller.
+        p50_active_ms, p90_active_ms, p99_active_ms, refused_last_hour.
+        Individual sub-errors are swallowed and treated as 0/None — the
+        function never propagates a top-level exception to the caller.
+        ``refused_last_hour`` is None when the ticket window was not sampled
+        at all (no tickets_db, or the query failed), which is deliberately
+        distinct from 0 ("sampled, nothing refused").
     """
     effective_now = resolve_now(now)
 
@@ -400,6 +421,7 @@ async def _sample_curator(
     p50: int | None = None
     p90: int | None = None
     p99: int | None = None
+    refused_last_hour: int | None = None
     if tickets_db is not None:
         cutoff = (effective_now - timedelta(hours=1)).isoformat()
         try:
@@ -410,12 +432,27 @@ async def _sample_curator(
             # the centiles. Omitting a status here silently erases it from the
             # metric rather than failing loudly.
             async with tickets_db.execute(
-                'SELECT created_at, resolved_at FROM tickets '
+                'SELECT created_at, resolved_at, status FROM tickets '
                 'WHERE resolved_at >= ? AND status IN '
                 "('created', 'combined', 'cancelled', 'failed', 'refused')",
                 (cutoff,),
             ) as cur:
                 ticket_rows = await cur.fetchall()
+
+            # 4b. Refusal count — the counted signal for deterministic guard
+            # refusals. A refusal creates NOTHING and is never escalated (the
+            # janitor sweep covers failures only, deliberately), so without a
+            # count an over-broad blocklist/premise entry could silently eat
+            # real reconciliation output forever with only a logger.info to
+            # show for it. Counted before the created/resolved parsing below
+            # so a malformed timestamp cannot suppress the count.
+            refused_last_hour = sum(1 for row in ticket_rows if row[2] == 'refused')
+            if refused_last_hour:
+                logger.info(
+                    'curator sampler: %d ticket(s) refused by a deterministic guard '
+                    'in the last hour (no task was created for any of them)',
+                    refused_last_hour,
+                )
 
             # 5. Per-ticket active_ms with cap subtraction.
             active_ms_list: list[float] = []
@@ -450,6 +487,7 @@ async def _sample_curator(
         'p50_active_ms': p50,
         'p90_active_ms': p90,
         'p99_active_ms': p99,
+        'refused_last_hour': refused_last_hour,
     }
 
 
@@ -590,6 +628,14 @@ async def collect_metrics_snapshot(
             ),
         )
         await conn.commit()
+        # Refusal count lands in its own row+commit so a write error here can
+        # never roll back the centiles row above (and vice versa).
+        await conn.execute(
+            'INSERT OR REPLACE INTO curator_refusal_snapshots (ts, refused_count) '
+            'VALUES (?, ?)',
+            (now, curator['refused_last_hour']),
+        )
+        await conn.commit()
     except Exception:
         logger.warning('curator sampler failed', exc_info=True)
         with contextlib.suppress(Exception):
@@ -608,6 +654,7 @@ _DOWNSAMPLE_TABLES = (
     ('recon_snapshots', None),
     ('merge_snapshots', 'project_id'),
     ('curator_snapshots', None),
+    ('curator_refusal_snapshots', None),
 )
 
 
@@ -858,6 +905,45 @@ async def get_curator_sparks(
         'p90': _coerce_series([(r[0], r[3]) for r in rows]),
         'p99': _coerce_series([(r[0], r[4]) for r in rows]),
     }
+
+
+async def get_curator_refusal_spark(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 1,
+    now: datetime | None = None,
+) -> dict[str, list]:
+    """Return the trailing-hour deterministic-refusal count over time.
+
+    One ChartData series ({labels, values}) of ``refused_count`` — how many
+    candidates a deterministic curator guard (cancelled-premise blocklist /
+    recon premise registry) refused in the hour before each 10-minute sample.
+    A ``None`` value marks a sample where the ticket window was not read at
+    all, which is distinct from 0 ("read it, nothing was refused").
+
+    Deliberately a separate reader rather than a fifth key on
+    :func:`get_curator_sparks`: that function's 4-key {pending, p50, p90, p99}
+    shape is the established contract consumed by ``shape_curator``, and a
+    refusal count is a different unit (a raw count, not a latency centile or
+    queue depth) sampled over a different window (trailing hour, not
+    point-in-time).
+
+    Returns the empty series when *db* is None or when no rows exist.
+    """
+    if db is None:
+        return dict(_EMPTY_SERIES)
+    since = (resolve_now(now) - timedelta(days=days)).isoformat()
+    try:
+        async with db.execute(
+            'SELECT ts, refused_count FROM curator_refusal_snapshots '
+            'WHERE ts >= ? ORDER BY ts',
+            (since,),
+        ) as cur:
+            rows = await cur.fetchall()
+    except Exception:
+        logger.debug('curator refusal spark query failed', exc_info=True)
+        return dict(_EMPTY_SERIES)
+    return _coerce_series([(r[0], r[1]) for r in rows])
 
 
 async def get_merge_active_series(
