@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import os
+import subprocess
 import zlib
 from pathlib import Path
 
@@ -428,3 +429,132 @@ def test_unwritable_destination_directory_retains_the_source(tmp_path):
         assert gz.exists()
     finally:
         enc.chmod(0o700)  # restore so tmp_path teardown can clean up
+
+
+# ---------------------------------------------------------------------------
+# step-7: the CLI contract, driven as a real subprocess
+#
+# Invoked via subprocess (the idiom at test_gc_agent_transcripts.py:417-432) so
+# the stdout/stderr split is proven for real: stdout stays PURE JSON while the
+# LOUD logs go to stderr, which is what lets an operator pipe the report into
+# jq while still seeing failures.
+#
+# The headline contract is that DRY-RUN IS THE DEFAULT. This script deletes
+# thousands of source files, so it follows the MUTATOR house convention
+# (repair_wiped_metadata_files.py:924 and ~18 fused-memory migrations) rather
+# than gc_agent_transcripts' --check sweep convention: mutation is opt-in.
+# ---------------------------------------------------------------------------
+
+SCRIPT = Path(__file__).parent.parent / "migrate_transcript_archive_gunzip.py"
+
+
+def _run_cli(*args):
+    """Drive the migration CLI as a real subprocess (inherits the parent env).
+
+    stdout carries the machine-readable JSON summary; stderr carries the LOUD
+    human log lines (basicConfig logs to stderr), so ``json.loads(stdout)`` sees
+    pure JSON.
+    """
+    return subprocess.run(
+        ["python3", str(SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_cli_dry_run_is_the_default_and_mutates_nothing(tmp_path):
+    """(a) THE headline safety property: with no --apply, a run over a real
+    archive touches nothing at all, yet still reports what it WOULD do."""
+    payload = _payload()
+    gz = _write_gz(tmp_path / "3618" / "enc" / "sess-a.jsonl.gz", payload)
+    before = _mtimes(tmp_path)
+
+    result = _run_cli("--root", str(tmp_path))
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert gz.exists(), "the default run must NOT delete a source .gz"
+    assert not mig.plain_sibling(gz).exists(), "the default run must NOT write"
+    assert _mtimes(tmp_path) == before
+    # ... and still projects the work accurately.
+    summary = json.loads(result.stdout)
+    assert summary["apply"] is False
+    assert summary["scanned"] == 1
+    assert summary["migrated"] == 1
+    # LOUD: stderr says plainly that nothing was changed.
+    assert LOG_PREFIX in result.stderr
+
+
+def test_cli_apply_performs_the_migration(tmp_path):
+    """(b) --apply opts into the mutation."""
+    payload = _payload()
+    gz = _write_gz(tmp_path / "3618" / "enc" / "sess-b.jsonl.gz", payload)
+
+    result = _run_cli("--root", str(tmp_path), "--apply")
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert not gz.exists()
+    assert mig.plain_sibling(gz).read_bytes() == payload
+    summary = json.loads(result.stdout)
+    assert summary["apply"] is True
+    assert summary["migrated"] == 1
+
+
+def test_cli_root_defaults_to_the_archive_root(tmp_path):
+    """(c) --root overrides the default; the default is default_archive_root()
+    — asserted against the parser rather than by sweeping the live archive."""
+    parser = mig.build_parser()
+
+    assert parser.parse_args([]).root == str(mig.default_archive_root())
+    assert parser.parse_args(["--root", str(tmp_path)]).root == str(tmp_path)
+    # Dry-run is the parser-level default, not just a runtime convention.
+    assert parser.parse_args([]).apply is False
+    assert parser.parse_args(["--apply"]).apply is True
+
+
+def test_cli_stdout_is_pure_json(tmp_path):
+    """(d) stdout parses as a SINGLE JSON object carrying the counters — the
+    LOUD log lines must not contaminate it."""
+    _write_gz(tmp_path / "3618" / "enc" / "sess-c.jsonl.gz", _payload())
+
+    result = _run_cli("--root", str(tmp_path), "--apply")
+
+    summary = json.loads(result.stdout)  # must not raise
+    assert set(summary) >= {
+        "root", "apply", "scanned", "migrated", "skipped", "failed", "failed_paths",
+    }
+    assert LOG_PREFIX not in result.stdout, "log lines leaked into the JSON stream"
+
+
+def test_cli_exits_zero_when_nothing_failed(tmp_path):
+    """(e) exit 0 on a clean run."""
+    _write_gz(tmp_path / "3618" / "enc" / "sess-d.jsonl.gz", _payload())
+
+    result = _run_cli("--root", str(tmp_path), "--apply")
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert json.loads(result.stdout)["failed"] == 0
+
+
+def test_cli_exits_non_zero_when_any_file_failed(tmp_path):
+    """(e) A non-zero failure count must be an EXIT CODE, not a warning buried
+    in a log — this is a one-off migration whose failures an operator has to
+    act on, which is why it diverges from gc_agent_transcripts' always-exit-0
+    sweep posture."""
+    _write_truncated_gz(tmp_path / "3618" / "enc" / "broken.jsonl.gz")
+    _write_gz(tmp_path / "3618" / "enc" / "healthy.jsonl.gz", _payload())
+
+    result = _run_cli("--root", str(tmp_path), "--apply")
+
+    assert result.returncode != 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    summary = json.loads(result.stdout)
+    assert summary["failed"] == 1
+    assert summary["migrated"] == 1  # the healthy sibling still migrated
+
+
+def test_cli_absent_root_is_a_clean_no_op(tmp_path):
+    """An absent root exits 0 with an empty summary rather than crashing."""
+    result = _run_cli("--root", str(tmp_path / "does-not-exist"))
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert json.loads(result.stdout)["scanned"] == 0
