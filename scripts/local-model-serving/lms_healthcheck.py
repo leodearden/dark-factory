@@ -39,6 +39,7 @@ provides, while `jsonschema` is declared by no workspace member.
 from __future__ import annotations
 
 import json
+import math
 import time
 from enum import StrEnum
 from typing import Any, Literal
@@ -63,6 +64,14 @@ PROBE_TEXT = (
     'Leo runs Dark Factory, a software factory whose memory layer is Graphiti, '
     'a temporal knowledge graph backed by FalkorDB.'
 )
+#: Embedding arms are probed with a QUERY, not a passage: the Qwen3-Embedding
+#: family's `query_prefix` is a query-side instruct prefix, so probing with a
+#: document would exercise the wrong half of an asymmetric model.
+EMBEDDING_PROBE_QUERY = 'Which graph database backs the memory layer?'
+EMBEDDING_TIMEOUT_S = 60.0
+#: Below this L2 norm a vector carries no direction, so cosine similarity
+#: against it is undefined and every retrieval score computed from it is noise.
+MIN_EMBEDDING_NORM = 1e-6
 
 Verdict = Literal['PASS', 'FAIL']
 
@@ -103,6 +112,16 @@ class Reason(StrEnum):
     MARKDOWN_FENCED_JSON = 'markdown_fenced_json'
     SCHEMA_MISSING_FIELD = 'schema_missing_field'
     SCHEMA_WRONG_TYPE = 'schema_wrong_type'
+
+    # -- embedding axis --------------------------------------------------
+    #: 200 with a `data` list that is empty.
+    EMPTY_EMBEDDING_DATA = 'empty_embedding_data'
+    #: The vector's length is not the arm's declared `dims`.
+    DIMS_MISMATCH = 'dims_mismatch'
+    #: A NaN, an infinity, or a value that is not a number at all.
+    NON_FINITE_EMBEDDING = 'non_finite_embedding'
+    #: A zero (or near-zero) vector — finite, right length, and useless.
+    DEGENERATE_EMBEDDING = 'degenerate_embedding'
 
 
 # ---------------------------------------------------------------------------
@@ -339,27 +358,167 @@ def check_model_identity(arm: ArmEntry, models_body: Any) -> ProbeResult:
 
 
 # ---------------------------------------------------------------------------
+# Embedding axis
+#
+# An embedding arm fails QUIETLY in a way an LLM arm does not: it returns a
+# vector of plausible-looking floats no matter what.  A wrong-length vector, a
+# NaN, or an all-zero degenerate output all still LOOK like an embedding, and
+# every one of them would corrupt iota's retrieval numbers rather than
+# crashing anything.  These checks are the only place they can be caught.
+# ---------------------------------------------------------------------------
+
+
+def build_embedding_probe_request(arm: ArmEntry) -> dict[str, Any]:
+    """The `/v1/embeddings` body for *arm*, with its declared prefix applied.
+
+    The prefix lives in the manifest precisely so it cannot be forgotten at a
+    call site: the Qwen3-Embedding family REQUIRES a query-side instruct
+    prefix (PRD line 134), and omitting it produces a perfectly well-formed
+    vector that is simply worse.  That degradation is invisible to every check
+    except a side-by-side retrieval comparison — which is exactly what iota
+    runs, and exactly what it would then mis-attribute to the model.
+    """
+    if arm.axis != 'embedding':
+        raise HealthcheckError(
+            f'arm {arm.arm_id!r} is axis={arm.axis!r}; the embedding probe does '
+            'not apply. Use build_llm_probe_request for the LLM axis.'
+        )
+
+    text = f'{arm.query_prefix or ""}{EMBEDDING_PROBE_QUERY}'
+    return {
+        'model': arm.served_model_name,
+        'input': [text],
+        # Ask for plain floats: some servers default to base64, which would
+        # make every vector fail the finiteness check for the wrong reason.
+        'encoding_format': 'float',
+    }
+
+
+def verify_embedding_response(arm: ArmEntry, body: Any) -> ProbeResult:
+    """Judge one embedding response against the arm's declared contract."""
+    if arm.dims is None:
+        raise HealthcheckError(
+            f'arm {arm.arm_id!r} declares no dims; there is nothing to verify '
+            'the returned vector against'
+        )
+
+    if not isinstance(body, dict):
+        return _fail(
+            Reason.MALFORMED_RESPONSE,
+            f'the embeddings response is a {type(body).__name__}, not an object',
+        )
+
+    # Defence in depth behind the /v1/models gate: the OpenAI embeddings
+    # response echoes the model that answered.  Absence is tolerated (not
+    # every stack fills it); a MISMATCH never is.
+    answered_by = body.get('model')
+    if isinstance(answered_by, str) and answered_by != arm.served_model_name:
+        return _fail(
+            Reason.IDENTITY_MISMATCH,
+            f'port {arm.port} was answered by {answered_by!r}, not '
+            f'{arm.served_model_name!r}',
+        )
+
+    data = body.get('data')
+    if not isinstance(data, list):
+        return _fail(
+            Reason.MALFORMED_RESPONSE,
+            f'the embeddings response carries no `data` list: '
+            f'{json.dumps(body, default=str)[:200]}',
+        )
+    if not data:
+        return _fail(
+            Reason.EMPTY_EMBEDDING_DATA,
+            'the embeddings response carries an empty `data` list, so the arm '
+            'returned no vector at all',
+        )
+
+    first = data[0]
+    vector = first.get('embedding') if isinstance(first, dict) else None
+    if not isinstance(vector, list):
+        return _fail(
+            Reason.MALFORMED_RESPONSE,
+            f'data[0].embedding is a {type(vector).__name__}, not a list of floats',
+        )
+
+    if len(vector) != arm.dims:
+        return _fail(
+            Reason.DIMS_MISMATCH,
+            f'arm declares dims={arm.dims} but the server returned a vector of '
+            f'length {len(vector)}; iota compares arms at their declared dims, '
+            'so this arm and the manifest disagree about what is being measured',
+        )
+
+    for index, value in enumerate(vector):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return _fail(
+                Reason.NON_FINITE_EMBEDDING,
+                f'data[0].embedding[{index}] is {value!r} '
+                f'({type(value).__name__}), not a number',
+            )
+        if not math.isfinite(value):
+            return _fail(
+                Reason.NON_FINITE_EMBEDDING,
+                f'data[0].embedding[{index}] is {value!r}; a NaN or infinity '
+                'poisons every similarity computed from this vector',
+            )
+
+    norm = math.sqrt(math.fsum(float(v) * float(v) for v in vector))
+    if norm < MIN_EMBEDDING_NORM:
+        return _fail(
+            Reason.DEGENERATE_EMBEDDING,
+            f'the vector has L2 norm {norm!r} — finite and the right length, '
+            'but with no direction, so cosine similarity against it is '
+            'undefined and every retrieval score from it would be noise',
+        )
+
+    return _ok(f'{len(vector)}-dim vector, L2 norm {norm:.4f}')
+
+
+# ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
 
 
-def probe_llm_arm(arm: ArmEntry) -> ProbeResult:
-    """Identity, then completion.  Never raises on a transport failure.
+def _identity_gate(arm: ArmEntry, http: Any) -> ProbeResult:
+    """PASS, or the FAIL that must abort this probe before it measures anything.
 
-    A traceback out of here would abort the whole sweep on the first dead arm
-    and lose the verdicts already measured for the others.
+    Carried over from scripts/run_vllm_eval.py:541-553: without this leg the
+    worst outcome is silent — a stale unit holding the port answers, and a
+    whole arm's metrics land under the wrong model's name.
     """
-    if arm.is_placeholder:
+    try:
+        models = http.get(f'{arm.base_url}/v1/models', timeout=IDENTITY_TIMEOUT_S)
+    except Exception as exc:
+        return _fail(Reason.TRANSPORT_ERROR, f'GET /v1/models: {_exc_detail(exc)}')
+
+    if models.status_code != 200:
         return _fail(
-            Reason.PLACEHOLDER_ARM,
-            f'arm {arm.arm_id!r} still carries TBD placeholders '
-            f'(model_ref={arm.model_ref!r}, image={arm.image!r}, quant={arm.quant!r}); '
-            'the PRD Open Question it depends on is unresolved, so there is '
-            'nothing to probe',
+            Reason.HTTP_STATUS, f'GET /v1/models returned {models.status_code}'
         )
 
-    request = build_llm_probe_request(arm)
+    try:
+        models_body = models.json()
+    except Exception as exc:
+        return _fail(Reason.MALFORMED_RESPONSE, f'GET /v1/models: {_exc_detail(exc)}')
 
+    return check_model_identity(arm, models_body)
+
+
+def _probe(
+    arm: ArmEntry,
+    *,
+    path: str,
+    request: dict[str, Any],
+    timeout_s: float,
+    verify: Any,
+) -> ProbeResult:
+    """Identity, then the measurement.  Never raises on a transport failure.
+
+    A traceback out of here would abort the whole sweep on the first dead arm
+    and lose the verdicts already measured for the others — the report would
+    then be both incomplete AND silent about being incomplete.
+    """
     import httpx  # lazy: keeps import cost off every consumer of this module
 
     started = time.monotonic()
@@ -367,51 +526,75 @@ def probe_llm_arm(arm: ArmEntry) -> ProbeResult:
     def elapsed_ms() -> float:
         return (time.monotonic() - started) * 1000.0
 
-    try:
-        models = httpx.get(f'{arm.base_url}/v1/models', timeout=IDENTITY_TIMEOUT_S)
-    except Exception as exc:
-        return _fail(
-            Reason.TRANSPORT_ERROR, f'GET /v1/models: {_exc_detail(exc)}'
-        ).with_latency(elapsed_ms())
-
-    if models.status_code != 200:
-        return _fail(
-            Reason.HTTP_STATUS, f'GET /v1/models returned {models.status_code}'
-        ).with_latency(elapsed_ms())
-
-    try:
-        models_body = models.json()
-    except Exception as exc:
-        return _fail(
-            Reason.MALFORMED_RESPONSE, f'GET /v1/models: {_exc_detail(exc)}'
-        ).with_latency(elapsed_ms())
-
-    identity = check_model_identity(arm, models_body)
+    identity = _identity_gate(arm, httpx)
     if identity.verdict == 'FAIL':
         return identity.with_latency(elapsed_ms())
 
     try:
-        completion = httpx.post(
-            f'{arm.base_url}/v1/chat/completions',
-            json=request,
-            timeout=COMPLETION_TIMEOUT_S,
-        )
+        response = httpx.post(f'{arm.base_url}{path}', json=request, timeout=timeout_s)
     except Exception as exc:
         return _fail(
-            Reason.TRANSPORT_ERROR, f'POST /v1/chat/completions: {_exc_detail(exc)}'
+            Reason.TRANSPORT_ERROR, f'POST {path}: {_exc_detail(exc)}'
         ).with_latency(elapsed_ms())
 
-    if completion.status_code != 200:
+    if response.status_code != 200:
         return _fail(
-            Reason.HTTP_STATUS,
-            f'POST /v1/chat/completions returned {completion.status_code}',
+            Reason.HTTP_STATUS, f'POST {path} returned {response.status_code}'
         ).with_latency(elapsed_ms())
 
     try:
-        completion_body = completion.json()
+        body = response.json()
     except Exception as exc:
         return _fail(
-            Reason.MALFORMED_RESPONSE, f'POST /v1/chat/completions: {_exc_detail(exc)}'
+            Reason.MALFORMED_RESPONSE, f'POST {path}: {_exc_detail(exc)}'
         ).with_latency(elapsed_ms())
 
-    return verify_llm_response(arm, completion_body).with_latency(elapsed_ms())
+    return verify(arm, body).with_latency(elapsed_ms())
+
+
+def _placeholder_refusal(arm: ArmEntry) -> ProbeResult | None:
+    """Refuse a TBD arm BEFORE any request.
+
+    Probing it anyway would 404 on a literal `TBD-Q3` model id and record that
+    as an arm failure, burying the real cause — an unresolved PRD Open
+    Question — under a transport error that looks like every other one.
+    """
+    if not arm.is_placeholder:
+        return None
+    return _fail(
+        Reason.PLACEHOLDER_ARM,
+        f'arm {arm.arm_id!r} still carries TBD placeholders '
+        f'(model_ref={arm.model_ref!r}, image={arm.image!r}, quant={arm.quant!r}); '
+        'the PRD Open Question it depends on is unresolved, so there is '
+        'nothing to probe',
+    )
+
+
+def probe_llm_arm(arm: ArmEntry) -> ProbeResult:
+    """Probe one LLM arm end to end: identity, then a constrained completion."""
+    refusal = _placeholder_refusal(arm)
+    if refusal is not None:
+        return refusal
+
+    return _probe(
+        arm,
+        path='/v1/chat/completions',
+        request=build_llm_probe_request(arm),
+        timeout_s=COMPLETION_TIMEOUT_S,
+        verify=verify_llm_response,
+    )
+
+
+def probe_embedding_arm(arm: ArmEntry) -> ProbeResult:
+    """Probe one embedding arm end to end: identity, then a real vector."""
+    refusal = _placeholder_refusal(arm)
+    if refusal is not None:
+        return refusal
+
+    return _probe(
+        arm,
+        path='/v1/embeddings',
+        request=build_embedding_probe_request(arm),
+        timeout_s=EMBEDDING_TIMEOUT_S,
+        verify=verify_embedding_response,
+    )

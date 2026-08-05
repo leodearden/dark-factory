@@ -580,10 +580,12 @@ def test_the_declared_query_prefix_is_applied():
     retrieval number iota later reports, which is a far worse outcome than a
     crash because nothing downstream would ever notice."""
     arm = _embedding_arm()
+    prefix = arm.query_prefix
+    assert prefix is not None
 
     body = lms_healthcheck.build_embedding_probe_request(arm)
 
-    assert body['input'] == [arm.query_prefix + lms_healthcheck.EMBEDDING_PROBE_QUERY]
+    assert body['input'] == [prefix + lms_healthcheck.EMBEDDING_PROBE_QUERY]
     assert body['input'][0].startswith('Instruct:')
 
 
