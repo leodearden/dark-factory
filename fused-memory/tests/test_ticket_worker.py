@@ -1285,11 +1285,62 @@ async def test_resolve_ticket_returns_server_closed_when_store_closed_before_ini
 class TestDispatchTicketDecision:
     """Unit tests for the extracted _dispatch_ticket_decision helper.
 
-    The helper performs the drop/combine/create dispatch logic and returns a
-    (status, task_id, reason, result_dict, curator_degrade_reason) tuple.
-    It does NOT call mark_resolved or signal ticket events — those are the
-    caller's responsibility.
+    The helper performs the refuse/drop/combine/create dispatch logic and
+    returns a (status, task_id, reason, result_dict, curator_degrade_reason)
+    tuple.  It does NOT call mark_resolved or signal ticket events — those are
+    the caller's responsibility.
     """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_refuse_returns_refused_and_creates_nothing(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """action='refuse' → returns (refused, None, ...) and never calls add_task.
+
+        Distinct from 'drop': a drop folds the candidate into an existing target
+        and needs a target_id; a refusal creates NOTHING.  Before this action
+        existed the deterministic guards emitted a targetless 'drop', which
+        matched no guarded branch and fell through to tm.add_task — creating the
+        very candidate the guard refused.
+        """
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        candidate = CandidateTask(title='Refused Task')
+        decision = CuratorDecision(
+            action='refuse',
+            target_id=None,
+            justification='cancelled-premise-blocklist: e: premise reverted',
+        )
+
+        taskmaster.add_task = AsyncMock()
+
+        with patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            status, task_id, reason, result_dict, degrade_reason = (
+                await interceptor_with_store._dispatch_ticket_decision(
+                    ticket_id='tkt_refuse',
+                    project_root='/p',
+                    project_id='p',
+                    candidate=candidate,
+                    decision=decision,
+                    kwargs={'title': 'Refused Task'},
+                    metadata=None,
+                    curator=None,
+                )
+            )
+
+        taskmaster.add_task.assert_not_awaited()
+        assert status == 'refused'
+        assert task_id is None
+        assert reason is not None and 'no task created' in reason
+        assert decision.justification in reason
+        assert isinstance(result_dict, dict)
+        assert result_dict.get('id') is None
+        assert result_dict.get('created') is False
+        assert result_dict.get('action') == 'refuse'
+        assert degrade_reason is None
 
     @pytest.mark.asyncio
     async def test_dispatch_create_decision_returns_created_status_and_task_id(

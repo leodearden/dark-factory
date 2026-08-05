@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -11966,3 +11966,375 @@ async def test_dispatch_drop_decision_unaffected_by_pure_gate_stamping(
     assert status == 'combined'
     assert task_id == '99'
     taskmaster.add_task.assert_not_awaited()
+
+
+# ── task 3126 step-3 RED: refuse -> dispatch chokepoint creates NOTHING ──
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuse_creates_nothing(interceptor, taskmaster):
+    """(a) THE FIX. A deterministic refusal must resolve status='refused' with
+    NO task_id and must never reach tm.add_task. Before this, the guards emitted
+    action='drop', target_id=None, which matched neither guarded drop branch and
+    fell through to the create path — creating the very candidate the guard's own
+    justification said to refuse."""
+    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(
+            action='refuse',
+            target_id=None,
+            justification='cancelled-premise-blocklist: x: y',
+        ),
+        kwargs={'title': 'Convert FIX C relay-flag deletion'},
+        metadata=None,
+        curator=None,
+    )
+
+    taskmaster.add_task.assert_not_awaited()
+    assert status == 'refused', f'expected refused, got {status!r} (reason={reason!r})'
+    assert task_id is None, f'a refusal must carry no task_id; got {task_id!r}'
+    # `reason` is the only legibility channel that reaches an MCP caller
+    # (_format_ticket_result deliberately does not expose result_json), so it
+    # must itself say that nothing was created and carry the justification.
+    assert reason is not None
+    assert 'refused' in reason
+    assert 'no task created' in reason
+    assert 'cancelled-premise-blocklist: x: y' in reason
+    assert result_dict is not None
+    assert result_dict.get('created') is False, result_dict
+    assert result_dict.get('id') is None, result_dict
+    assert result_dict.get('action') == 'refuse', result_dict
+    assert degrade is None, f'expected no curator_degrade_reason; got {degrade!r}'
+
+
+@pytest.mark.asyncio
+async def test_dispatch_targetless_llm_drop_still_fails_open_to_create(
+    interceptor, taskmaster,
+):
+    """(b) FAIL-OPEN REGRESSION. This locks the deliberately-rejected
+    'minimum viable alternative' of treating any targetless drop as a refusal.
+    A targetless 'drop' is an LLM dedupe that LOST its target, not a refusal —
+    silently discarding it would trade the bug being fixed for task loss in the
+    opposite direction. It must still create."""
+    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(
+            action='drop',
+            target_id=None,
+            justification='duplicate of an unresolvable sibling',
+        ),
+        kwargs={'title': 'Some ordinary candidate'},
+        metadata=None,
+        curator=None,
+    )
+
+    taskmaster.add_task.assert_awaited_once()
+    assert status == 'created', f'expected created, got {status!r} (reason={reason!r})'
+    assert task_id == '2'
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuse_precedes_drop_even_with_stray_target(
+    interceptor, taskmaster,
+):
+    """(c) BRANCH ORDER. A refusal carrying a stray target_id must still refuse.
+    The refuse branch precedes the drop branch, so a refusal can never be
+    shadowed into the dedupe path and silently reported as 'combined'."""
+    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(
+            action='refuse',
+            target_id='99',
+            justification='recon-premise-refuted: x: y',
+        ),
+        kwargs={'title': 'Fix a premise that live source refutes'},
+        metadata=None,
+        curator=None,
+    )
+
+    taskmaster.add_task.assert_not_awaited()
+    assert status == 'refused', f'expected refused, got {status!r} (reason={reason!r})'
+    assert task_id is None, f'a refusal must carry no task_id; got {task_id!r}'
+    assert reason is not None and 'recon-premise-refuted: x: y' in reason
+
+
+# ── task 3126 step-5 RED: the user-observable signal — a refusal creates no task ──
+
+
+def _refusal_curator(decision: CuratorDecision) -> MagicMock:
+    """A curator mock returning *decision*, wired for BOTH worker paths.
+
+    Extends :func:`_mock_curator` with the prepared-batch entry points the batch
+    worker uses (``prepare_candidate`` / ``curate_batch_prepared``), so the same
+    refusal can be driven through the single and batch paths alike.
+    """
+    from fused_memory.middleware.task_curator import PreparedCandidate
+
+    curator = _mock_curator(decision)
+
+    async def _prepare(candidate, project_id, project_root):
+        return PreparedCandidate(
+            candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0,
+        )
+
+    curator.prepare_candidate = AsyncMock(side_effect=_prepare)
+
+    async def _batch_prepared(prepared, project_id, project_root):
+        return [await curator.curate(p.candidate, project_id, project_root) for p in prepared]
+
+    curator.curate_batch_prepared = AsyncMock(side_effect=_batch_prepared)
+    return curator
+
+
+def _blocklisted_refusal() -> CuratorDecision:
+    """The decision `_maybe_blocklist_drop` emits for a blocklisted candidate."""
+    return CuratorDecision(
+        action='refuse',
+        target_id=None,
+        justification='cancelled-premise-blocklist: fixc_flag_marker: premise reverted by ae58a59d81f1',
+    )
+
+
+def _premise_refuted_refusal() -> CuratorDecision:
+    """The decision `_maybe_premise_refuted_drop` emits when live source refutes."""
+    return CuratorDecision(
+        action='refuse',
+        target_id=None,
+        justification='recon-premise-refuted: entity_summary_rebuild: the filter already exists',
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'decision_factory, expected_marker',
+    [
+        (_blocklisted_refusal, 'cancelled-premise-blocklist:'),
+        (_premise_refuted_refusal, 'recon-premise-refuted:'),
+    ],
+    ids=['blocklist', 'premise-refuted'],
+)
+async def test_refused_ticket_creates_no_task_end_to_end(
+    curator_interceptor, taskmaster, decision_factory, expected_marker,
+):
+    """THE USER-OBSERVABLE SIGNAL. A candidate refused by a deterministic guard
+    must resolve as refused with NO task created and NO task_id — through the
+    real submit → worker → resolve_ticket lifecycle.
+
+    Before the fix this resolved status='created' with a live task_id: the
+    guard's refusal was INERT, so the candidate it named was filed anyway.
+    """
+    decision = decision_factory()
+    curator_interceptor._curator = _refusal_curator(decision)
+
+    submit_result = await curator_interceptor.submit_task(
+        '/project',
+        title='Convert FIX C relay-flag deletion: search-then-delete',
+        description='Metric fixc_flags_deleted_not_found is not tracked.',
+    )
+    assert 'ticket' in submit_result, submit_result
+    resolve = await curator_interceptor.resolve_ticket(
+        submit_result['ticket'], '/project', timeout_seconds=10.0,
+    )
+
+    # (a) terminal status names the refusal
+    assert resolve['status'] == 'refused', resolve
+    # (b) NO task_id key at all — a caller structurally cannot read a refusal
+    #     as a creation (_format_ticket_result omits it when the column is NULL)
+    assert 'task_id' not in resolve, resolve
+    # (c) reason names the refusal and carries the guard's justification
+    assert 'no task created' in resolve['reason'], resolve
+    assert expected_marker in resolve['reason'], resolve
+    assert decision.justification in resolve['reason'], resolve
+    # (d) nothing was created
+    taskmaster.add_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refused_ticket_creates_no_task_on_batch_path(
+    curator_interceptor, taskmaster,
+):
+    """The batch worker path must honour a refusal too. The batch dispatcher's
+    sibling-substitution guard keys on `dec.action == 'drop' and target is not
+    None`, so a refusal (which carries no batch_target_index) must pass through
+    it untouched and reach the shared chokepoint."""
+    store = curator_interceptor._ticket_store
+    candidate_json = json.dumps({
+        'project_root': '/project',
+        'kwargs': {'title': 'Convert FIX C relay-flag deletion', 'description': 'x'},
+        'metadata': None,
+    })
+    ticket = await store.submit('project', candidate_json)
+
+    refusal = _blocklisted_refusal()
+    mock_curator = _refusal_curator(refusal)
+    mock_curator.curate_batch_prepared = AsyncMock(return_value=[refusal])
+
+    with patch.object(
+        type(curator_interceptor), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ), patch.object(
+        type(curator_interceptor), '_ensure_taskmaster',
+        new=AsyncMock(return_value=taskmaster),
+    ):
+        await curator_interceptor._process_add_tickets_batch([ticket])
+
+    row = await store.get(ticket)
+    assert row is not None
+    assert row['status'] == 'refused', row
+    assert row['task_id'] is None, row
+    assert 'no task created' in (row['reason'] or ''), row
+    taskmaster.add_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
+    curator_interceptor, taskmaster,
+):
+    """A refusal must never CASCADE. A sibling whose batch_target_index points
+    at a refused candidate sees task_id=None and must fail OPEN to create —
+    refusing one candidate cannot silently discard an unrelated one."""
+    store = curator_interceptor._ticket_store
+
+    def _cj(title):
+        return json.dumps({
+            'project_root': '/project',
+            'kwargs': {'title': title, 'description': 'x'},
+            'metadata': None,
+        })
+
+    t1 = await store.submit('project', _cj('Convert FIX C relay-flag deletion'))
+    t2 = await store.submit('project', _cj('Unrelated sibling that names t1 as its target'))
+
+    refusal = _blocklisted_refusal()
+    mock_curator = _refusal_curator(refusal)
+    mock_curator.curate_batch_prepared = AsyncMock(return_value=[
+        refusal,
+        CuratorDecision(
+            action='drop',
+            target_id=None,
+            batch_target_index=0,  # points at the REFUSED sibling
+            justification='dup of batch 0',
+        ),
+    ])
+    taskmaster.add_task = AsyncMock(return_value={'id': '77', 'title': 'Unrelated sibling'})
+
+    with patch.object(
+        type(curator_interceptor), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ), patch.object(
+        type(curator_interceptor), '_ensure_taskmaster',
+        new=AsyncMock(return_value=taskmaster),
+    ):
+        await curator_interceptor._process_add_tickets_batch([t1, t2])
+
+    r1 = await store.get(t1)
+    r2 = await store.get(t2)
+
+    assert r1 is not None and r1['status'] == 'refused', r1
+    assert r1['task_id'] is None, r1
+    # The sibling fails OPEN — it was never refused by any guard.
+    assert r2 is not None and r2['status'] == 'created', r2
+    assert r2['task_id'] == '77', r2
+    assert taskmaster.add_task.await_count == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-3126 step-10 RED: a refusal must not be bypassable by submitting the
+# SAME candidate twice in one batch.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _real_blocklist_curator(tmp_path):
+    """A REAL TaskCurator wired to a tmp_path blocklist YAML.
+
+    A mock curator would bypass ``curate_batch_prepared``'s pre-batch
+    payload_hash dedup — the very code under test — so this test needs the real
+    thing. Only ``prepare_candidate`` (corpus assembly, not under test) is
+    stubbed, to keep the test hermetic and off the network.
+    """
+    import yaml
+
+    from fused_memory.middleware.task_curator import PreparedCandidate, TaskCurator
+
+    blocklist = tmp_path / 'e2e_blocklist.yaml'
+    blocklist.write_text(
+        yaml.dump([{
+            'name': 'fixc_flag_marker_search_then_delete',
+            'reason': 'premise reverted by ae58a59d81f1',
+            'title_substrings': ['search-then-delete', 'fix c'],
+            'description_substrings': ['fixc_flags_deleted_not_found'],
+        }]),
+        encoding='utf-8',
+    )
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(
+        enabled=True, cancelled_premise_blocklist_path=str(blocklist),
+    )
+    curator = TaskCurator(config=cfg, taskmaster=None)
+
+    async def _prepare(candidate, project_id, project_root):
+        return PreparedCandidate(
+            candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0,
+        )
+
+    curator.prepare_candidate = AsyncMock(side_effect=_prepare)
+    return curator
+
+
+@pytest.mark.asyncio
+async def test_identical_blocklisted_duplicates_in_one_batch_create_nothing(
+    curator_interceptor, taskmaster, tmp_path,
+):
+    """Two BYTE-IDENTICAL blocklisted candidates in one batch must BOTH refuse.
+
+    The pre-batch payload_hash dedup runs before the blocklist guard, so the
+    duplicate was never checked and carried a synthetic batch_target_index drop.
+    At dispatch that drop resolved against a sibling with task_id=None (a
+    refusal creates nothing), took the 'sibling failed' branch and degraded to
+    create — filing the very dead-premise task the guard had just refused. Net
+    effect was identical to the pre-fix bug.
+    """
+    store = curator_interceptor._ticket_store
+
+    payload = json.dumps({
+        'project_root': '/project',
+        'kwargs': {
+            'title': 'Convert FIX C relay-flag deletion: search-then-delete',
+            'description': 'Metric fixc_flags_deleted_not_found is not tracked.',
+        },
+        'metadata': None,
+    })
+    # Byte-identical payloads → identical payload_hash → the dedup path.
+    t1 = await store.submit('project', payload)
+    t2 = await store.submit('project', payload)
+
+    curator = _real_blocklist_curator(tmp_path)
+    taskmaster.add_task = AsyncMock(return_value={'id': '99', 'title': 'x'})
+
+    with patch.object(
+        type(curator_interceptor), '_get_curator',
+        new=AsyncMock(return_value=curator),
+    ), patch.object(
+        type(curator_interceptor), '_ensure_taskmaster',
+        new=AsyncMock(return_value=taskmaster),
+    ):
+        await curator_interceptor._process_add_tickets_batch([t1, t2])
+
+    # THE HEADLINE ASSERTION: a refused dead-premise candidate is never filed,
+    # no matter how many byte-identical copies land in the same batch.
+    taskmaster.add_task.assert_not_awaited()
+
+    for tid in (t1, t2):
+        row = await store.get(tid)
+        assert row is not None and row['status'] == 'refused', (tid, row)
+        assert row['task_id'] is None, (tid, row)
+        assert 'cancelled-premise-blocklist:' in (row['reason'] or ''), (tid, row)

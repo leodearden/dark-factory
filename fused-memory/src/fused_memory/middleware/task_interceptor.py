@@ -3298,12 +3298,51 @@ class TaskInterceptor:
         curator: Any,  # TaskCurator | None
         curator_degrade_reason: str | None = None,
     ) -> tuple[str, str | None, str | None, dict | None, str | None]:
-        """Execute the drop/combine/create dispatch for one curator decision.
+        """Execute the refuse/drop/combine/create dispatch for one curator decision.
 
         Returns (status, task_id, reason, result_dict, curator_degrade_reason).
         Does NOT call mark_resolved, _signal_ticket_event, journal, or commit —
         those are the caller's responsibility.
+
+        This is the single dispatch chokepoint shared by both worker paths
+        (``_process_add_ticket`` and ``_process_add_tickets_batch_prepared``), so
+        a branch added here is inherited by both.
         """
+        if decision is not None and decision.action == 'refuse':
+            # Deterministic refusal (cancelled-premise blocklist / recon premise
+            # guard): the candidate's premise is dead. Unlike 'drop' — which means
+            # "fold into existing target task N" and needs a target — this creates
+            # NOTHING and must never reach tm.add_task.
+            #
+            # Checked FIRST, ahead of the drop branch, so a refusal carrying a
+            # stray target_id cannot be shadowed into the dedupe path and silently
+            # reported as 'combined'.
+            #
+            # task_id is None so _format_ticket_result omits the key entirely — a
+            # caller therefore cannot mistake a refusal for a creation. That makes
+            # `reason` the only legibility channel reaching the caller (result_json
+            # is deliberately not exposed), so it states outright that no task was
+            # created.
+            logger.info(
+                'ticket %s: curator REFUSED the candidate (no task created): %s',
+                ticket_id, decision.justification,
+            )
+            result_dict = {
+                'id': None,
+                'title': candidate.title if candidate else '',
+                'created': False,
+                'refused': True,
+                'action': 'refuse',
+                'justification': decision.justification,
+            }
+            return (
+                'refused',
+                None,
+                f'refused (no task created): {decision.justification}',
+                result_dict,
+                None,
+            )
+
         if decision is not None and decision.action == 'drop' and decision.target_id:
             # Drop: fold candidate into the existing target task (status='combined').
             # Preserves legacy result shape for the add_task facade.

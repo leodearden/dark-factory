@@ -25,8 +25,16 @@ transport window to absorb network jitter and response-serialization overhead; i
 values like 90 s or 110 s would leave too little margin to reliably surface the failure as a
 retryable timeout.  See the [`timeout`](#timeout) failure section.
 
-`resolve["status"]` is one of `"created"`, `"combined"`, or `"failed"`.
+`resolve["status"]` is one of `"created"`, `"combined"`, `"refused"`, or `"failed"`.
 When `"failed"`, `resolve["reason"]` names the failure class.
+
+A `refused` ticket is a **success**, not a failure: a deterministic guard
+(the cancelled-premise blocklist or the recon premise registry) rejected the
+candidate because its premise is dead.  **No task was created and there is no
+`task_id` key at all** — not a null one.  Do NOT retry it (a retry re-hits the
+same guard), do NOT record a task id for it, and do NOT route it through any of
+the failure policies below.  `resolve["reason"]` carries the justification;
+record that verbatim wherever you would have recorded the created task id.
 
 ---
 
