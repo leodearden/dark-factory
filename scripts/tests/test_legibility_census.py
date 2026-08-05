@@ -3438,3 +3438,54 @@ def test_run_census_calls_verify_fn_once_with_the_full_cluster_list(tmp_path):
     assert len(fake_verify_fn.calls) == 1, "one call, not one per batch"
     assert len(fake_verify_fn.calls[0]["clusters"]) == 3, "the FULL cluster list"
     assert fake_verify_fn.calls[0]["model"] == "sonnet"
+
+
+def test_default_verify_fn_probes_at_batch_boundaries_only():
+    """Detector (c): the periodic backstop probes between batches, not per cluster.
+
+    `invoke` returns a clean verdict every time, so neither the banner
+    detector nor the exception detector can fire — this isolates the backstop.
+    12 clusters at probe_every=5 means boundaries after clusters 5 and 10:
+    twice, not twelve times. The probe is cheap but not free, and verification
+    is already one agentic call per cluster.
+    """
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
+    )
+
+    result = verify_fn(_clusters(12), model="sonnet")
+
+    assert len(result["verified"]) == 12
+    assert len(probe.calls) == 2, "boundaries after clusters 5 and 10 only"
+
+
+def test_default_verify_fn_backstop_raises_at_the_first_failing_boundary():
+    """The backstop aborts at its boundary, leaving the rest untouched."""
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker")
+    )
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(12), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 5
+    assert exc.unverified == 7, "clusters 6-12, none of them adjudicated"
+    assert len(probe.calls) == 1
+
+
+def test_default_verify_fn_backstop_does_not_probe_after_the_last_cluster():
+    """No probe when nothing remains -- it would guard a stage already over."""
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
+    )
+
+    verify_fn(_clusters(5), model="sonnet")
+
+    assert probe.calls == [], "cluster 5 is the last one; there is nothing left to guard"
