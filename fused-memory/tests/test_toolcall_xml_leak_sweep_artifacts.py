@@ -53,8 +53,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -121,6 +123,20 @@ def _report_paths() -> list[Path]:
 
 def _load(path: Path) -> dict:
     return json.loads(path.read_text())
+
+
+def _provenance_path(report_path: Path) -> Path:
+    """The sidecar that belongs to *report_path*.
+
+    ``<name>-report.json`` pairs with ``<name>-provenance.json``, so the two
+    halves of one capture cannot drift apart or be silently reattributed.
+    """
+    return report_path.with_name(
+        report_path.name.removesuffix('-report.json') + '-provenance.json'
+    )
+
+
+_SHA_RE = re.compile(r'\A[0-9a-f]{40}\Z')
 
 
 def _ids(paths: list[Path]) -> list[str]:
@@ -325,3 +341,122 @@ class TestDetectorReproducesEveryClassification:
                 f'manual_review record {record.get("id")!r} carries a '
                 'repaired_content; repair_content() returns None to REFUSE'
             )
+
+
+# ---------------------------------------------------------------------------
+# Provenance sidecar — ties a committed report back to the run that made it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('path', _REPORT_PATHS, ids=_ids(_REPORT_PATHS))
+class TestProvenanceSidecar:
+    """Every report must be attributable to a real, identified run.
+
+    The sidecar exists for a specific reason beyond bookkeeping. ``new_progress()``
+    (script line ~532) seeds ``collection`` to ``''`` and the field can land
+    BLANK in the emitted report — which it did for this capture, and which is
+    exactly the defect task 3243 (still pending) will fix upstream. A report
+    that does not say which collection it swept cannot be trusted as a
+    measurement of that collection.
+
+    Recording the collection out-of-band here closes that gap LOCALLY, for this
+    capture, without editing the sweep script — which would duplicate and
+    probably conflict with 3243's work, and would put production-code changes
+    inside a task whose whole point is an operational run.
+    """
+
+    def test_sidecar_exists(self, path: Path) -> None:
+        sidecar = _provenance_path(path)
+        assert sidecar.is_file(), (
+            f'{path.name} has no provenance sidecar at {sidecar.name}. A report '
+            'that cannot be tied back to the run that produced it -- the sha, '
+            'the argv, the collection, the bracketing point counts -- is not '
+            'auditable evidence.'
+        )
+
+    def test_records_the_collection_the_report_may_omit(self, path: Path) -> None:
+        prov = _load(_provenance_path(path))
+        collection = prov['collection']
+        assert isinstance(collection, str)
+        assert collection.strip(), (
+            'provenance.collection is blank. This field is the whole reason the '
+            "sidecar exists: the sweep's own report can emit collection='' "
+            '(task 3243), so if the sidecar is blank too, nothing identifies '
+            'what was swept.'
+        )
+
+    def test_point_counts_bracket_the_run(self, path: Path) -> None:
+        """Measured exact Qdrant counts either side of the sweep.
+
+        Deliberately NO assertion relating these to report['scanned']. The
+        corpus takes concurrent writes so the count drifts during the run;
+        consolidation actively DELETES entries (this task's own premise) so it
+        is not even monotonic and points_after can fall BELOW scanned; and
+        scan_payload_text scopes by group_id while a collection-level count does
+        not, so the two are different populations. Any ratio would be a guess
+        tuned to whatever the first run happened to print.
+        """
+        prov = _load(_provenance_path(path))
+        for field in ('collection_points_before', 'collection_points_after'):
+            value = prov[field]
+            assert isinstance(value, int) and not isinstance(value, bool), (
+                f'{field} must be an int, got {type(value).__name__}'
+            )
+            assert value > 0, (
+                f'{field}={value}: a zero or absent count must never be '
+                'recorded as a clean corpus -- an unreachable or wrong-scoped '
+                'store returns an empty match list that reads exactly like one.'
+            )
+
+    def test_git_sha_is_a_full_sha(self, path: Path) -> None:
+        prov = _load(_provenance_path(path))
+        sha = prov['git_sha']
+        assert isinstance(sha, str)
+        assert _SHA_RE.match(sha), (
+            f'git_sha {sha!r} is not a 40-char lowercase hex sha; an '
+            'abbreviated or dirty-marked sha does not pin the code that ran.'
+        )
+
+    def test_swept_at_is_parseable_iso8601(self, path: Path) -> None:
+        prov = _load(_provenance_path(path))
+        swept_at = prov['swept_at']
+        assert isinstance(swept_at, str)
+        parsed = datetime.fromisoformat(swept_at.replace('Z', '+00:00'))
+        assert parsed.tzinfo is not None, (
+            f'swept_at {swept_at!r} carries no timezone; a naive timestamp on a '
+            'shared live corpus is not a fact anyone can line up with anything.'
+        )
+
+    def test_command_is_the_argv_actually_run(self, path: Path) -> None:
+        """The argv is what makes the report's own claims checkable.
+
+        A report can SAY exhaustive=true; the recorded command is the
+        independent record of what was actually invoked.
+        """
+        prov = _load(_provenance_path(path))
+        command = prov['command']
+        assert isinstance(command, list)
+        assert command, 'command must not be empty'
+        assert all(isinstance(part, str) for part in command)
+        assert '--exhaustive' in command, (
+            f'command {command!r} lacks --exhaustive; only the exhaustive walk '
+            'is the authoritative incidence rate (runbook 7).'
+        )
+        assert not any(part.startswith('--limit') for part in command), (
+            f'command {command!r} carries --limit; a capped run covers an '
+            'unknown fraction of the corpus.'
+        )
+        report = _load(path)
+        assert ('--apply' in command) is (report['dry_run'] is False), (
+            f'command {command!r} and report dry_run={report["dry_run"]} '
+            'disagree about whether this run mutated the store.'
+        )
+
+    def test_exit_code_is_recorded(self, path: Path) -> None:
+        prov = _load(_provenance_path(path))
+        exit_code = prov['exit_code']
+        assert isinstance(exit_code, int) and not isinstance(exit_code, bool)
+        assert exit_code != 2, (
+            'exit 2 means the run aborted partway and covered only part of the '
+            'corpus; it is not an incidence measurement.'
+        )
