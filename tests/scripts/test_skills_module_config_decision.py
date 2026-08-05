@@ -483,8 +483,15 @@ def test_every_skills_consuming_test_stays_under_a_gated_directory() -> None:
     """
     collected = _all_collected_dirs()
 
-    # NON-VACUITY, both sides.
-    assert SKILLS_CONSUMING_TESTS, (
+    # NON-VACUITY, both sides. Spelled `len(...) > 0` and NOT as a truthiness
+    # test: the inventory is a tuple LITERAL in this module, so pyright folds
+    # `assert SKILLS_CONSUMING_TESTS` to a constant and emits
+    # reportAssertAlwaysTrue — MEASURED as the single warning of an otherwise
+    # clean `npx pyright tests/scripts/` run. The runtime guard is real
+    # regardless (emptying the tuple must fail here rather than silently make
+    # the whole test pass), so the spelling is changed rather than the check
+    # dropped or the diagnostic suppressed. Do not "simplify" it back.
+    assert len(SKILLS_CONSUMING_TESTS) > 0, (
         "the skills/-consuming test inventory is EMPTY (task 3554) — this "
         "guard would pass vacuously, and CORRECTION 1 of the DECIDED block in "
         f"{DF_CONFIG_NAME} would be asserting nothing."
