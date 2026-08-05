@@ -1198,6 +1198,7 @@ class MemoryService:
             write_timeout_seconds=qcfg.write_timeout_seconds,
             transient_max_attempts=qcfg.transient_max_attempts,
             transient_error_names=qcfg.transient_error_names,
+            on_terminal=self._record_queue_terminal_outcome,
         )
         self.durable_queue.register_callback(
             'dual_write_episode', self._dual_write_callback
@@ -1335,6 +1336,35 @@ class MemoryService:
                     error=str(e),
                 )
             raise
+
+    async def _record_queue_terminal_outcome(
+        self,
+        write_op_id: str,
+        terminal_status: str,
+        error: str | None = None,
+    ) -> None:
+        """Write a durable-queue terminal outcome back onto its write_op row.
+
+        Passed to ``DurableWriteQueue(on_terminal=...)`` in ``initialize()``.
+        Because it lives at the queue seam, every enqueue site inherits the
+        write-back: ``add_episode``, ``add_memory``'s Graphiti leg, and the
+        retained ``mem0_add`` dispatcher alike.
+
+        This is a BOUND METHOD rather than a captured ``WriteJournal``
+        reference so ``self._write_journal`` is resolved at CALL time — the
+        same lazy-collaborator idiom as ``execute_write=self._execute_durable_write``.
+        It has to be: ``server/main.py`` calls ``memory_service.initialize()``
+        (which constructs the queue) BEFORE ``set_write_journal()``, so the
+        journal is still ``None`` when the hook is wired.
+        """
+        journal = self._write_journal
+        if journal is None:
+            return
+        await journal.record_terminal_outcome(
+            write_op_id=write_op_id,
+            terminal_status=terminal_status,
+            terminal_error=error,
+        )
 
     @staticmethod
     def _mem0_payload_digest(
