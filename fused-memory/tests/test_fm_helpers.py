@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from _fm_helpers import calls_named, parse_python_module, submit_and_resolve
+from _fm_helpers import (
+    calls_named,
+    imported_names_from,
+    parse_python_module,
+    submit_and_resolve,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1653,3 +1658,71 @@ class TestSharedAstGuardMachinery:
             'the whole-module search should still see every call — the narrowing '
             'must come from the node passed in, not from the search itself.'
         )
+
+
+# The two properties below are what the barrier guard's "must import the shared
+# barrier" clause and the gather guard's "must import a named helper" clause
+# both rest on, so they are pinned rather than left to the two former copies to
+# agree by luck.
+_IMPORTS_SNIPPET = """
+from pkg.mod import alpha, beta
+from pkg.other import gamma
+from pkg.mod import delta as renamed
+import pkg.mod
+from . import relative
+"""
+
+
+class TestImportedNamesFrom:
+    """Unit coverage for imported_names_from(node, module)."""
+
+    def test_collects_names_imported_from_the_named_module(self):
+        assert imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.mod') == {
+            'alpha',
+            'beta',
+            'delta',
+        }
+
+    def test_excludes_names_imported_from_other_modules(self):
+        """`gamma` comes from pkg.other and must not leak into a pkg.mod query."""
+        assert 'gamma' not in imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.mod')
+        assert imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.other') == {'gamma'}
+
+    def test_unimported_module_returns_an_empty_set(self):
+        """Empty, not None — both call sites render it as `imported or "nothing"`.
+
+        A None return would print "None" in a guard's failure message and break
+        the set intersection the gather guard performs on the result.
+        """
+        result = imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.absent')
+
+        assert result == set()
+        assert not result
+
+    def test_plain_import_statement_contributes_nothing(self):
+        """`import pkg.mod` is an ast.Import, not an ast.ImportFrom.
+
+        It binds the module, never a name FROM it, so it cannot satisfy a
+        guard demanding that a specific helper be imported.
+        """
+        assert imported_names_from(ast.parse('import pkg.mod\n'), 'pkg.mod') == set()
+
+    def test_aliased_import_reports_the_source_side_name(self):
+        """`from pkg.mod import delta as renamed` reports `delta`, not `renamed`.
+
+        Load-bearing: both guards compare the result against SOURCE-side names
+        (`await_index_operational`, `gather_or_raise`), so reporting the local
+        binding instead would make a legitimately-aliased import look missing.
+        """
+        tree = ast.parse('from pkg.mod import delta as renamed\n')
+
+        assert imported_names_from(tree, 'pkg.mod') == {'delta'}
+
+    def test_relative_import_does_not_match_a_named_module(self):
+        """`from . import relative` has `node.module is None` — must not match.
+
+        Guards against a None/str comparison crash or a spurious match when a
+        parsed module happens to use relative imports.
+        """
+        assert imported_names_from(ast.parse('from . import relative\n'), 'pkg.mod') == set()
+        assert 'relative' not in imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.mod')
