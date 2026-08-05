@@ -24,16 +24,26 @@ from what ``write_metric_series`` emits. The pattern is lifted from
 ``shared/tests/test_memory_eval_boundary.py``'s
 ``TestCommittedExemplarsAreProducible``.
 
-**Lane discipline.** Pure file reads plus one ``git`` subprocess: no network,
-no Qdrant, no OPENAI_API_KEY. Deliberately carries NO ``integration`` marker
-so it runs under the merge lane's default ``-m 'not integration'`` selection —
-a durability guard that the merge lane deselects guards nothing.
+:class:`TestTheExemplarCannotBeMistakenForALiveRun` guards the other half:
+the exemplar must stay provably disjoint from the probe's live artifact root,
+because ``is_initial_run()`` globs that root and an exemplar living inside it
+would burn the one-shot D1 snapshot for the next genuine first run. A README
+saying "don't put this in the live root" is unenforceable; that test is.
+
+**Lane discipline.** File reads, one ``git`` subprocess, and an importlib load
+of the probe: no network, no Qdrant, no OPENAI_API_KEY. Deliberately carries
+NO ``integration`` marker so it runs under the merge lane's default
+``-m 'not integration'`` selection — a durability guard that the merge lane
+deselects guards nothing.
 """
 from __future__ import annotations
 
+import functools
+import importlib.util
 import json
 import shutil
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -46,6 +56,7 @@ from shared.memory_eval_metrics import (
 
 REPO_ROOT = Path(__file__).parents[2]
 EXEMPLAR_ROOT = REPO_ROOT / 'plans' / 'memory-eval-e1-first-live-run'
+SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
 
 EVAL_ID = 'e1-retrieval-health'
 RUN_STAMP = '20260805T093831Z'
@@ -55,6 +66,38 @@ REPORT_PATH = EXEMPLAR_ROOT / EVAL_ID / f'report-{RUN_STAMP}.txt'
 
 ARTIFACTS = (METRICS_PATH, REPORT_PATH)
 _IDS = [p.name for p in ARTIFACTS]
+
+
+def _load_module() -> types.ModuleType:
+    """Load memory_eval_retrieval_probe.py from its file path.
+
+    Same loader as ``test_memory_eval_retrieval_probe.py`` (and
+    ``test_calibrate_write_triage.py``, ``test_audit_duplicate_memories.py``):
+    ``scripts/`` has no ``__init__.py``, so the probe is not importable as a
+    package. Registered in ``sys.modules`` under its own name because
+    ``@dataclass`` and other reflection-based decorators look the module up
+    there.
+    """
+    import sys  # noqa: PLC0415
+
+    mod_name = 'memory_eval_retrieval_probe'
+    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {SCRIPT_PATH}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
+
+
+@functools.cache
+def _mod() -> types.ModuleType:
+    """Lazy, so the pure file-contract tests above never load the probe."""
+    return _load_module()
 
 
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
@@ -172,3 +215,51 @@ class TestItIsTheFirstRunReport:
         be reworded.
         """
         assert 'INITIAL STATE — known-bad items' in REPORT_PATH.read_text(encoding='utf-8')
+
+
+class TestTheExemplarCannotBeMistakenForALiveRun:
+    """The separation invariant, asserted structurally rather than in prose.
+
+    ``is_initial_run()`` globs ``metrics-*.json`` under the probe's artifact
+    root. An exemplar committed inside that root would make every fresh clone
+    look like it had already run, permanently suppressing the one-shot D1
+    initial-state snapshot for the next genuine first run — a strictly worse
+    outcome than the unreachability bug this exemplar fixes. So the two roots
+    must be disjoint, and that has to be a test: a README asking future
+    readers not to relocate the artifact cannot enforce anything.
+    """
+
+    def test_the_probe_names_the_exemplar_root(self):
+        """The constant and the on-disk location cannot drift apart.
+
+        The test computes the path independently from ``Path(__file__)``; if
+        the probe's constant were edited to point elsewhere (or the directory
+        moved without it), the two would disagree here.
+        """
+        assert _mod().COMMITTED_EXEMPLAR_ROOT.resolve() == EXEMPLAR_ROOT.resolve()
+
+    def test_the_exemplar_root_is_disjoint_from_the_live_artifact_root(self):
+        """Neither root may be, or contain, the other."""
+        exemplar = _mod().COMMITTED_EXEMPLAR_ROOT.resolve()
+        live = _mod().DEFAULT_OUT_ROOT.resolve()
+        assert exemplar != live
+        assert not exemplar.is_relative_to(live), (
+            f'{exemplar} sits inside the live artifact root {live}; a '
+            f'committed artifact there would burn the one-shot D1 '
+            f'initial-state snapshot for the next genuine first run'
+        )
+        assert not live.is_relative_to(exemplar)
+
+    def test_a_pristine_root_is_a_first_run_but_the_exemplar_root_is_not(self, tmp_path):
+        """The consequence that makes the disjointness matter.
+
+        Two things at once, both against the real ``is_initial_run`` rather
+        than a mock: the exemplar root holds a genuine, discoverable run (so
+        it is not a first run), and an untouched root still reports as one. It
+        is precisely because of the disjointness above that the former can
+        never influence the latter when the probe next runs for real against
+        ``DEFAULT_OUT_ROOT``.
+        """
+        is_initial_run = _mod().is_initial_run
+        assert is_initial_run(tmp_path) is True
+        assert is_initial_run(_mod().COMMITTED_EXEMPLAR_ROOT) is False
