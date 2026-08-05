@@ -513,6 +513,140 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
     return _FakeSteward
 
 
+# ---------------------------------------------------------------------------
+# Boundary #1 — steward consumes the L0 → the merge retries IN-SLOT
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeGateBailEntersBoundedWait:
+    """Boundary #1: a gating L0 at MERGE entry enters the bounded wait, and a
+    steward that consumes it lets the merge proceed IN-SLOT.
+
+    Pre-γ₁ the gate did ``return WorkflowOutcome.ESCALATED`` with no steward
+    started and no status write: the task exited the slot, the harness nulled
+    its claimant, and the row sat ``in-progress`` forever (spec E1).  The
+    corrected disposition burns no re-dispatch at all — the row stays
+    ``in-progress`` under the live claimant for the whole wait (spec §4:
+    ``in-progress`` covers Path-A escalated-waiting) and the merge simply
+    continues once the record is adjudicated.
+    """
+
+    async def test_resolved_l0_falls_through_to_the_merge_in_slot(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+
+        _submit_gating_l0(queue, task_id)
+        wf._steward_factory = _make_resolving_steward(queue, task_id)
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        # Fell through to the SUCCESS tail rather than bailing out of the slot.
+        assert outcome is None, (
+            f'a consumed gating L0 must fall through to the merge, not exit '
+            f'the slot; got {outcome}'
+        )
+        # ...and the merge genuinely ran, in this same slot.
+        assert submit.await_count == 1, (
+            f'expected exactly one in-slot merge submission; got '
+            f'{submit.await_count}'
+        )
+        # The steward was actually started — _ensure_steward_started is on
+        # this path, not skipped (the resolving fake asserts a pending L0
+        # exists when its start() runs, so this also pins the ordering).
+        assert wf._steward is not None, (
+            'the merge-entry gate must start a steward, exactly as run()\'s '
+            'ESCALATED branch does'
+        )
+        # The steward consumed its own L0 — nothing left pending to re-strand
+        # the next entry.
+        assert queue.get_by_task(task_id, status='pending') == []
+        # No re-dispatch burned: the row was never re-pended and never parked.
+        written = scheduler.statuses.get(task_id, [])
+        assert 'pending' not in written, (
+            f'the in-slot wait must not re-pend the task; got {written}'
+        )
+        assert 'blocked' not in written, (
+            f'a resolved gate must not park the task; got {written}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Boundary #2 — born-at-L2 short-circuits to a visible ``blocked`` park
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeGateL2ShortCircuits:
+    """Boundary #2: a born-at-L2 (or level≥2) record open at MERGE entry parks
+    the row ``blocked`` immediately — it is never waited on in-slot.
+
+    ``_wait_for_resolution``'s stop-the-line check (``workflow.py:12206-12217``)
+    raises ``_StewardReescalated`` BEFORE the wait loop, so the handler's
+    ``except`` clause routes straight to ``_mark_blocked(...,
+    skip_escalation=True)``.  Two properties matter equally: the row IS
+    written (no strand, spec S1) and the human-facing L2 is NOT consumed
+    (repend-PRD boundary B1 stop-the-line — ``_mark_blocked``'s straggler
+    cleanup dismisses level-0 only).
+    """
+
+    async def test_born_at_l2_blocks_without_merging_or_consuming_the_record(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+
+        _submit_born_at_l2(queue, task_id)
+        # Must never be needed: with no pending L0, _ensure_steward_started
+        # returns without constructing anything, and the short-circuit fires
+        # before the wait loop.
+        silent = _make_silent_steward()
+        wf._steward_factory = silent
+
+        # The short-circuit sits BEFORE the wait loop, so a human-gated record
+        # is never waited on in-slot.  5s is far below the 1.0s-window-times-
+        # anything a regression to "wait on the L2" would cost, and far above
+        # the real path's cost.
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 5)
+
+        assert outcome is not None, (
+            'a born-at-L2 record must terminate the slot, not fall through '
+            'to the merge'
+        )
+        # The row is written BEFORE the return (spec S1: a status write
+        # precedes every terminal return).
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked'], (
+            f'expected the row parked blocked before the return; got '
+            f'{scheduler.statuses.get(task_id)}'
+        )
+        # D4 stop-the-line: nothing merges past an open gating record.
+        assert submit.await_count == 0, (
+            'the merge must not be attempted while a born-at-L2 record is open'
+        )
+        # The gate does not consume the human's record.
+        still_pending = queue.get_by_task(task_id, status='pending', level=2)
+        assert len(still_pending) == 1, (
+            f'the pending L2 must survive the gate; got {still_pending}'
+        )
+        assert silent.instances == [], (
+            'no steward should be constructed for a record no steward can resolve'
+        )
+
+
 __all__ = [
     'PLAN',
     '_build_workflow',
