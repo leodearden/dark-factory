@@ -111,6 +111,95 @@ def enumerate_cells(
     ]
 
 
+def resolve_candidates(names: list[str]) -> list[Any]:
+    """Resolve candidate NAMES to ``EvalConfig``s, rejecting any non-architect.
+
+    Two loud failures, both structural rather than advisory:
+
+    * an unresolvable name exits naming itself;
+    * a RESOLVABLE config whose ``role != 'architect'`` exits too.
+
+    The second is the load-bearing one. ``run_ofat_stage`` dispatches BY ROLE:
+    an implementer candidate goes through ``run_eval``, a full agentic workflow
+    cell at roughly 10x the cost of the plan-only ``run_architect_eval`` cell
+    this campaign is made of. The PRD forbids ``eval-ofat`` for exactly that
+    reason (it runs all 8 candidates including the implementer/judge cells), so
+    a typo that happened to name a real implementer config would otherwise turn
+    into hundreds of dollars of the wrong spend, silently and with no error.
+    ``ofat_candidates()`` is never called anywhere in this driver.
+    """
+    from orchestrator.evals.configs import get_config_by_name
+
+    resolved = []
+    for name in names:
+        cfg = get_config_by_name(name)
+        if cfg is None:
+            raise SystemExit(
+                f'Error: unknown eval config: {name!r}\n'
+                '  Architect candidates live in ARCHITECT_EVAL_CONFIGS '
+                '(orchestrator/src/orchestrator/evals/configs.py).'
+            )
+        if cfg.role != 'architect':
+            raise SystemExit(
+                f'Error: candidate {name!r} has role={cfg.role!r}, not \'architect\'.\n'
+                '  run_ofat_stage dispatches BY ROLE, so this candidate would be routed '
+                'through run_eval — a full agentic workflow cell at roughly 10x the cost '
+                'of the plan-only architect cell this campaign measures. That is the spend '
+                'the PRD forbids when it says "Do NOT use eval-ofat". Name an '
+                'ARCHITECT_EVAL_CONFIGS entry instead.'
+            )
+        resolved.append(cfg)
+    return resolved
+
+
+def _parse_budget_spec(spec: str) -> tuple[str, float]:
+    """Parse a ``NAME=AMOUNT`` ``--budget`` spec, or exit naming the bad spec."""
+    name, sep, raw = spec.partition('=')
+    if not sep or not name:
+        raise SystemExit(
+            f'Error: malformed --budget spec {spec!r}: expected NAME=AMOUNT '
+            '(e.g. architect-opus-max=15).'
+        )
+    try:
+        amount = float(raw)
+    except ValueError as e:
+        raise SystemExit(
+            f'Error: malformed --budget spec {spec!r}: {raw!r} is not a number.'
+        ) from e
+    return name, amount
+
+
+def apply_budgets(candidates: list[Any], budgets: dict[str, float]) -> list[Any]:
+    """Return *candidates* with ``max_budget_usd`` overridden per *budgets*.
+
+    ``dataclasses.replace``, never in-place mutation: the module-level
+    ``ARCHITECT_EVAL_CONFIGS`` entries are shared with every other eval caller
+    and must stay byte-unchanged, which is the parity discipline the revival
+    lane enforces. ``run_architect_eval`` binds ``max_budget_usd`` straight off
+    the config, so γ2's comparison-regime ruling — equal-cost $15/$15,
+    equal-turns with fable's budget lifted, or both arms — is a pure per-config
+    parameter choice needing no runner surgery.
+
+    A budget naming a candidate that is NOT being run exits non-zero: silently
+    ignoring it would run an arm at the wrong price and invalidate the very
+    comparison the ruling rests on.
+    """
+    import dataclasses
+
+    selected = {c.name for c in candidates}
+    unknown = sorted(set(budgets) - selected)
+    if unknown:
+        raise SystemExit(
+            f'Error: --budget names candidate(s) not being run: {", ".join(unknown)}\n'
+            f'  Selected candidates: {", ".join(sorted(selected))}. A silently-ignored '
+            'budget would run a comparison arm at the wrong price.'
+        )
+    return [
+        dataclasses.replace(c, max_budget_usd=budgets[c.name]) if c.name in budgets else c
+        for c in candidates
+    ]
+
+
 def _run_campaign(*args: Any, **kwargs: Any) -> list[Any]:
     """The LIVE real-API-spend seam — wired in a later step of this task.
 
@@ -151,6 +240,12 @@ def _build_parser() -> argparse.ArgumentParser:
              'no default candidate list, so this driver carries no forward reference to '
              'an unlanded config and the comparison arms stay auditable on the CLI.',
     )
+    parser.add_argument(
+        '--budget', action='append', default=None, metavar='NAME=AMOUNT',
+        help='Override a candidate\'s max_budget_usd; repeat per candidate. This is how '
+             'the γ2 comparison-regime ruling is applied (equal-cost, equal-turns, or '
+             'both arms) — a pure parameter choice, no runner surgery.',
+    )
     parser.add_argument('--trials', type=int, default=1, help='Trials per (fixture, candidate) cell.')
     parser.add_argument('--max-parallel', type=int, default=None, help='Max concurrent eval cells.')
     parser.add_argument('--config', dest='config_path', type=Path, default=None,
@@ -161,15 +256,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _format_dry_run(
-    fixture_paths: list[Path], candidates: list[str], trials: int, cells: list[dict[str, Any]],
+    fixture_paths: list[Path], candidates: list[Any], trials: int, cells: list[dict[str, Any]],
 ) -> str:
-    """Render the zero-spend matrix preview."""
+    """Render the zero-spend matrix preview AND the comparison regime.
+
+    The per-candidate ``model / effort / max_budget_usd`` line is the point: the
+    regime γ2 rules on is auditable on the terminal before a single dollar is
+    spent, rather than reconstructed from a log afterwards.
+    """
     lines = [
         f'fable-trial-v2 campaign (DRY RUN — no spend): {len(candidates)} candidates '
         f'x {len(fixture_paths)} fixtures x {trials} trials = {len(cells)} cells',
     ]
-    for name in candidates:
-        lines.append(f'  candidate: {name}')
+    for cfg in candidates:
+        lines.append(
+            f'  candidate: {cfg.name} (model={cfg.model} effort={cfg.effort} '
+            f'max_budget_usd={cfg.max_budget_usd})'
+        )
     for path in fixture_paths:
         lines.append(f'  fixture:   {path.stem}')
     return '\n'.join(lines)
@@ -179,11 +282,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
     fixture_paths = resolve_fixture_paths(args.tasks_dir)
-    candidate_names: list[str] = list(args.candidate)
-    cells = enumerate_cells(fixture_paths, candidate_names, args.trials)
+    candidates = resolve_candidates(list(args.candidate))
+    budgets = dict(_parse_budget_spec(s) for s in (args.budget or []))
+    candidates = apply_budgets(candidates, budgets)
+    cells = enumerate_cells(fixture_paths, [c.name for c in candidates], args.trials)
 
     if args.dry_run:
-        print(_format_dry_run(fixture_paths, candidate_names, args.trials, cells))
+        print(_format_dry_run(fixture_paths, candidates, args.trials, cells))
         return 0
 
     raise NotImplementedError('--run / --results-dir are wired by a later step of task 3632')
