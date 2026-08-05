@@ -77,7 +77,7 @@ def container_gguf_path(arm: ArmEntry) -> str:
     return f'{CONTAINER_HF_CACHE}/{GGUF_SUBDIR}/{arm.arm_id}/{arm.gguf_file}'
 
 
-def _image_ref(arm: ArmEntry) -> str:
+def image_ref(arm: ArmEntry) -> str:
     """Prefer the resolved digest: a tag can be re-pushed, a digest cannot."""
     if not arm.image_digest:
         return arm.image
@@ -101,7 +101,7 @@ def _docker_preamble(arm: ArmEntry, mount: str) -> list[str]:
 def _vllm_argv(arm: ArmEntry, gpu: lms_vram.GpuReading) -> list[str]:
     argv = _docker_preamble(arm, f'{HOST_HF_CACHE}:{CONTAINER_HF_CACHE}')
     argv += ['-e', f'HF_HOME={CONTAINER_HF_CACHE}']
-    argv.append(_image_ref(arm))
+    argv.append(image_ref(arm))
     argv += [
         '--model', arm.model_ref,
         '--served-model-name', arm.served_model_name,
@@ -130,7 +130,7 @@ def _llamacpp_argv(arm: ArmEntry, gpu: lms_vram.GpuReading) -> list[str]:
     del gpu  # llama.cpp sizes itself from -ngl and -c, not from a memory share.
     model_path = container_gguf_path(arm)
     argv = _docker_preamble(arm, f'{HOST_HF_CACHE}:{CONTAINER_HF_CACHE}')
-    argv.append(_image_ref(arm))
+    argv.append(image_ref(arm))
     argv += [
         '-m', model_path,
         '-ngl', str(LLAMACPP_GPU_LAYERS),
@@ -152,7 +152,7 @@ def _tei_argv(arm: ArmEntry, gpu: lms_vram.GpuReading) -> list[str]:
     del gpu  # TEI has no memory-share knob.
     argv = _docker_preamble(arm, f'{HOST_HF_CACHE}:{CONTAINER_DATA_DIR}')
     argv += ['-e', f'HUGGINGFACE_HUB_CACHE={CONTAINER_DATA_DIR}']
-    argv.append(_image_ref(arm))
+    argv.append(image_ref(arm))
     argv += [
         '--model-id', arm.model_ref,
         '--hostname', '0.0.0.0',
