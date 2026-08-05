@@ -45,6 +45,7 @@ import gzip
 import logging
 import os
 import shutil
+import zlib
 from pathlib import Path
 
 logger = logging.getLogger('migrate_transcript_archive_gunzip')
@@ -63,6 +64,25 @@ ARCHIVE_ROOT_RELATIVE = 'data/orchestrator/agent-transcripts'
 DEFAULT_ARCHIVE_ROOT = DEFAULT_PROJECT_ROOT / ARCHIVE_ROOT_RELATIVE
 
 GZ_SUFFIX = '.gz'
+
+# Every way reading a real gzip stream (or its decoded text) can fail.
+#
+# Deliberately WIDER than the post-3618 reader-side
+# ``inventory.UNREADABLE_FILE_ERRORS``: after this task the readers only ever
+# open plain ``.jsonl``, so the two non-OSError gzip shapes below are
+# unreachable there and that tuple narrows to ``(UnicodeDecodeError,)``. This
+# script is the ONE component that still reads real gzip streams, which is
+# exactly what licenses the narrowing — so the shapes have to be caught HERE.
+#
+# * ``OSError``      — covers ``gzip.BadGzipFile`` (a subclass) plus ordinary
+#                      I/O failures: EACCES on the destination, EIO mid-read.
+# * ``EOFError``     — a stream that ends before its end-of-stream marker (the
+#                      interrupted-write shape). NOT an OSError.
+# * ``zlib.error``   — an unparseable DEFLATE body. Also NOT an OSError.
+# * ``UnicodeDecodeError`` — a structurally valid stream whose decompressed
+#                      bytes are not UTF-8. A ``ValueError`` subclass, so an
+#                      ``except OSError``-only handler would miss it entirely.
+_UNREADABLE_SOURCE_ERRORS = (OSError, EOFError, zlib.error, UnicodeDecodeError)
 
 
 def default_archive_root() -> Path:
@@ -127,22 +147,68 @@ def _corroborate(path: Path, expected_size: int | None = None) -> None:
             pass
 
 
+def _warn_migrate_failure(path: Path, err: BaseException) -> None:
+    """LOUD, greppable WARNING for a file that could not be migrated.
+
+    Modelled on :func:`gc_agent_transcripts._warn_stat_skip`: lazy
+    %-formatting, the greppable ``migrate_transcript_archive_gunzip:`` prefix
+    first, and an explicit ``errno=`` where the exception carries one (the
+    non-OSError gzip shapes do not). The path is named so an operator can act
+    on the specific file rather than just seeing a count.
+    """
+    logger.warning(
+        '%s failed to migrate %s (errno=%s): %s: %s — source RETAINED',
+        _LOG_PREFIX,
+        path,
+        getattr(err, 'errno', None),
+        type(err).__name__,
+        err,
+    )
+
+
+def _discard_partial(dest: Path) -> None:
+    """Remove a partially-written destination after a failed migration.
+
+    Not tidiness — correctness. :func:`migrate_archive` decides whether to
+    trust an existing twin, and a half-written file left behind by a failure
+    is exactly the debris a later resume run could mistake for a finished
+    migration and then unlink the authoritative ``.gz`` on top of.
+    """
+    try:
+        dest.unlink(missing_ok=True)
+    except OSError as err:  # pragma: no cover - cleanup is itself best-effort
+        logger.warning(
+            '%s failed to remove partial %s (errno=%s): %s',
+            _LOG_PREFIX,
+            dest,
+            err.errno,
+            err,
+        )
+
+
 def gunzip_one(gz_path: Path) -> Path:
     """Migrate one ``.jsonl.gz`` to its plain sibling, returning the new path.
 
     Implements the module's ordering contract exactly: decompress → corroborate
     → mirror mtime → unlink. The source ``.gz`` is removed ONLY after the plain
     twin has been read back and stamped; any exception before that point leaves
-    the authoritative source untouched.
+    the authoritative source untouched and clears the partial destination.
+
+    Raises the underlying failure rather than swallowing it — classification
+    and counting belong to :func:`migrate_archive`, which owns the report.
     """
     dest = plain_sibling(gz_path)
     # Capture the source mtime BEFORE any mutation — it is the retention age
     # gc_agent_transcripts keys on, and the source is gone by the end.
     source_stat = gz_path.stat()
 
-    written = _decompress_to(gz_path, dest)          # (1) decompress
-    _corroborate(dest, expected_size=written)        # (2) read back
-    os.utime(dest, (source_stat.st_atime, source_stat.st_mtime))  # (3) mtime
+    try:
+        written = _decompress_to(gz_path, dest)      # (1) decompress
+        _corroborate(dest, expected_size=written)    # (2) read back
+        os.utime(dest, (source_stat.st_atime, source_stat.st_mtime))  # (3) mtime
+    except _UNREADABLE_SOURCE_ERRORS:
+        _discard_partial(dest)
+        raise
     gz_path.unlink()                                 # (4) only now destroy
     return dest
 
@@ -219,14 +285,22 @@ def migrate_archive(root: Path, *, apply: bool) -> dict:
         summary['scanned'] += 1
         twin = plain_sibling(gz_path)
 
-        if twin.exists() and _twin_is_trustworthy(gz_path, twin):
-            summary['skipped'] += 1
-            if apply:
-                gz_path.unlink()
-            continue
+        try:
+            if twin.exists() and _twin_is_trustworthy(gz_path, twin):
+                if apply:
+                    gz_path.unlink()
+                summary['skipped'] += 1
+                continue
 
-        summary['migrated'] += 1
-        if apply:
-            gunzip_one(gz_path)
+            if apply:
+                gunzip_one(gz_path)
+            summary['migrated'] += 1
+        except _UNREADABLE_SOURCE_ERRORS as err:
+            # Never re-raise: one bad file must not abort a sweep over ~4,554
+            # siblings. The source .gz is still on disk (gunzip_one unlinks it
+            # only after corroborating), which is the whole point.
+            _warn_migrate_failure(gz_path, err)
+            summary['failed'] += 1
+            summary['failed_paths'].append(str(gz_path))
 
     return summary
