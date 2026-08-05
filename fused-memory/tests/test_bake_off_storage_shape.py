@@ -2247,6 +2247,148 @@ class TestGuardThresholdIsNotHardcodedTwice:
         assert _mod().resolve_guard_threshold(None) == _DEFAULT_NEAR_DUP_THRESHOLD
 
 
+class TestAuditThresholdIsNotHardcodedTwice:
+    """The D10 mirror of the guard-threshold class above.
+
+    `resolve_audit_threshold` reads the detector's default reflectively so the
+    artifact cannot report a threshold nobody runs — but nothing tied it to
+    the number the artifact actually SHIPS, and every other test hardcodes
+    0.85.  A retune upstream would silently shift the reported audit-recall
+    while the committed report went on saying 0.85.
+
+    Deliberately NOT re-asserting `inspect.signature(...)` against itself:
+    that form was deleted in an earlier cycle as tautological, and rightly —
+    it could only fail if the function stopped using inspect, and a retune
+    moved both sides together.  The committed artifact is the independent
+    side that makes the comparison mean something.
+    """
+
+    def test_the_resolved_threshold_is_the_one_the_committed_artifact_reports(self):
+        """A retune upstream must break the build rather than quietly make
+        the shipped number describe a detector nobody is running."""
+        committed = _committed_report()['audit_recall']
+
+        assert _mod().resolve_audit_threshold() == committed['threshold']
+
+    def test_the_committed_artifact_names_the_detector_it_replayed(self):
+        """The threshold alone is meaningless if the reader cannot tell which
+        function it was the default of."""
+        committed = _committed_report()['audit_recall']
+        detector = _mod().load_audit_script().find_near_duplicate_memory_groups
+
+        assert committed['detector'] == (
+            f'audit_duplicate_memories.{detector.__name__}'
+        )
+
+    def test_a_renamed_threshold_parameter_is_a_clear_error_not_a_keyerror(
+        self, monkeypatch
+    ):
+        """The failure mode this guards is a rename in
+        `audit_duplicate_memories`, which surfaces only during a live D10 run.
+        A bare `KeyError: 'threshold'` there names neither the upstream that
+        moved nor the fix."""
+        mod = _mod()
+
+        def _renamed(records, *, cutoff=0.85):  # NOT `threshold`
+            return []
+
+        monkeypatch.setattr(
+            mod, 'load_audit_script',
+            lambda: types.SimpleNamespace(
+                find_near_duplicate_memory_groups=_renamed,
+            ),
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            mod.resolve_audit_threshold()
+
+        message = str(excinfo.value)
+        assert not isinstance(excinfo.value, KeyError)
+        assert 'threshold' in message
+        # Names the upstream that moved and what it found instead, so the
+        # reader does not have to go and diff the signature by hand.
+        assert '_renamed' in message
+        assert 'cutoff' in message
+
+
+class TestDropCollectionsNeverAbandonsTheRemainingNames:
+    """The reaper that actually removes the ephemeral collections.
+
+    Every other test in this file monkeypatches `drop_collections` away, so
+    its two documented contracts — tolerate an already-absent collection, and
+    never abandon the rest after one failure — were unasserted.  A reaper that
+    stops at the first error leaks collections into a SHARED Qdrant, which is
+    the same class of failure the sibling reaper's own test file was added for
+    in this diff.
+    """
+
+    @staticmethod
+    def _fake_qdrant(monkeypatch, *, fails_on=frozenset()):
+        import qdrant_client  # noqa: PLC0415
+
+        state = {'attempted': [], 'closed': 0}
+
+        class _Client:
+            def __init__(self, url, timeout=None):
+                state['url'] = url
+
+            def delete_collection(self, name):
+                state['attempted'].append(name)
+                if name in fails_on:
+                    raise RuntimeError(f'qdrant said no: {name}')
+
+            def close(self):
+                state['closed'] += 1
+
+        monkeypatch.setattr(qdrant_client, 'QdrantClient', _Client)
+        return state
+
+    def test_a_failure_on_one_name_still_attempts_every_other(self, monkeypatch):
+        """The one that matters: a mid-list failure that aborted the loop
+        would leave later collections alive with the run reporting success."""
+        state = self._fake_qdrant(monkeypatch, fails_on={'b'})
+
+        _mod().drop_collections(['a', 'b', 'c'], qdrant_url='http://q:6333')
+
+        assert state['attempted'] == ['a', 'b', 'c']
+        assert state['closed'] == 1
+
+    def test_an_already_absent_collection_is_not_an_error(self, monkeypatch):
+        """Absence is the NORMAL case on the pre-run sweep, so every name
+        failing must still return rather than raise into the caller."""
+        state = self._fake_qdrant(monkeypatch, fails_on={'a', 'b'})
+
+        _mod().drop_collections(['a', 'b'], qdrant_url='http://q:6333')
+
+        assert state['attempted'] == ['a', 'b']
+        assert state['closed'] == 1
+
+    def test_the_client_is_closed_when_the_name_source_itself_raises(
+        self, monkeypatch
+    ):
+        """Chosen because it is the ONLY case that distinguishes the `finally`
+        from a plain trailing `close()`.
+
+        A "closed even when a delete failed" test would pass identically
+        against a trailing close, since the per-name `except` swallows delete
+        failures and the line after the loop is always reached — the exact
+        dead test the sibling reaper's review caught.  `names` is typed `Any`,
+        so a caller can hand it a lazy iterable that raises mid-iteration; that
+        escapes the inner `except` and only `finally` closes the connection.
+        """
+        state = self._fake_qdrant(monkeypatch)
+
+        def _names():
+            yield 'a'
+            raise RuntimeError('the name source died')
+
+        with pytest.raises(RuntimeError, match='the name source died'):
+            _mod().drop_collections(_names(), qdrant_url='http://q:6333')
+
+        assert state['attempted'] == ['a']
+        assert state['closed'] == 1, 'the connection leaked'
+
+
 class TestSelectProbingWrite:
     """Which write IS "the one that became duplicate N+1"?"""
 

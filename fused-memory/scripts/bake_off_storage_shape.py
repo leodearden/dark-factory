@@ -1570,7 +1570,20 @@ def resolve_audit_threshold() -> float:
     import inspect  # noqa: PLC0415
 
     detector = load_audit_script().find_near_duplicate_memory_groups
-    return float(inspect.signature(detector).parameters['threshold'].default)
+    params = inspect.signature(detector).parameters
+    if 'threshold' not in params:
+        # A bare `KeyError: 'threshold'` deep in a live D10 run says nothing
+        # about which upstream moved or what to do.  Plain RuntimeError
+        # rather than MeasurementError: nothing was mis-measured here, the
+        # detector this script exists to replay has changed shape.
+        raise RuntimeError(
+            f'{detector.__module__}.{detector.__name__} has no `threshold` '
+            f'parameter (signature: {sorted(params)}). D10 reads the audit '
+            f'threshold off the detector\'s own signature so the artifact '
+            f'cannot report a number nobody runs; a rename upstream has to '
+            f'be followed here, not defaulted around.'
+        )
+    return float(params['threshold'].default)
 
 
 def max_lexical_ratio(left: str, right: str) -> float | None:
