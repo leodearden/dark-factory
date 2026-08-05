@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,45 @@ logger = logging.getLogger(__name__)
 BLOCK = 'block'   # foreign-owned: block dispatch + escalate
 ALLOW = 'allow'   # no cross-repo evidence: dispatch may proceed
 SKIP = 'skip'     # evidence UNREADABLE (degenerate metadata) — never "verified clean"
+
+# Signal names recorded on a blocking verdict.
+SIGNAL_MARKER = 'cross_repo_marker'
+
+
+# ---------------------------------------------------------------------------
+# Verdict dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CrossRepoVerdict:
+    """Result of a dispatch-time cross-repo classification.
+
+    Mirrors ``substrate_gate.SubstrateVerdict`` / ``.flipped``.
+
+    Attributes:
+        verdict: One of BLOCK / ALLOW / SKIP.
+        owner_project: The project that owns the declared work, when it can be
+            RESOLVED from the task's own metadata.  ``None`` when nothing names
+            it — the orchestrator has no cross-project registry and must not
+            guess a project name from a path.  An honest "unresolved" in the L1
+            beats a placeholder a human would have to disbelieve.
+        signals: The evidence legs that fired, e.g. ``('cross_repo_marker',)``.
+        foreign_paths: The declared entries the path-containment leg judged
+            foreign (empty when no path evidence was weighed).
+        reason: Human-readable explanation, rendered into the L1 detail.
+    """
+
+    verdict: str
+    owner_project: str | None
+    signals: tuple[str, ...]
+    foreign_paths: tuple[str, ...]
+    reason: str
+
+    @property
+    def blocked(self) -> bool:
+        """True when the verdict is BLOCK (gate should block dispatch)."""
+        return self.verdict == BLOCK
 
 
 # ---------------------------------------------------------------------------
@@ -124,3 +165,122 @@ def carries_cross_repo_signal(task: dict[str, Any]) -> bool:
         return True
 
     return bool(meta.get('files'))
+
+
+# ---------------------------------------------------------------------------
+# Owner resolution
+# ---------------------------------------------------------------------------
+
+
+def _as_project_name(value: Any) -> str | None:
+    """Return *value* as a non-empty project name, or None.
+
+    Rejects non-strings (including ``bool``) and blank/whitespace strings, so a
+    malformed companion never becomes a placeholder owner in an L1.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    return name or None
+
+
+def _resolve_owner(meta: dict[str, Any]) -> str | None:
+    """Resolve the owning project from *meta*, or None when nothing names it.
+
+    Precedence, most-authoritative first:
+
+    1. ``cross_repo_project`` — the typed companion the fused-memory submit
+       path writes alongside the marker.
+    2. ``cross_repo`` itself when it is a non-empty string.  The observed
+       caller-authored spellings are ``'dark-factory'`` and
+       ``'dark-factory:orchestrator/src/orchestrator/offline_lane.py'``, so the
+       pre-``':'`` field is taken.
+    3. ``possible_scope_mismatch['suggested_project']`` — the prose matcher's
+       suggestion; last because it is advisory.
+
+    Returns None rather than inventing a name.  The orchestrator owns exactly
+    one project_root and has no cross-project registry, so it genuinely cannot
+    name the owner of a bare ``cross_repo: true``.
+    """
+    owner = _as_project_name(meta.get('cross_repo_project'))
+    if owner:
+        return owner
+
+    marker = meta.get('cross_repo')
+    if isinstance(marker, str):
+        owner = _as_project_name(marker.split(':', 1)[0])
+        if owner:
+            return owner
+
+    stamp = meta.get('possible_scope_mismatch')
+    if isinstance(stamp, dict):
+        owner = _as_project_name(stamp.get('suggested_project'))
+        if owner:
+            return owner
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
+
+
+def classify_cross_repo(
+    *,
+    task: dict[str, Any],
+    project_root: Path | str,
+) -> CrossRepoVerdict:
+    """Classify *task* as foreign-owned (BLOCK), local (ALLOW) or unreadable (SKIP).
+
+    Leg (A) — ``metadata.cross_repo`` truthy.  The marker the fused-memory
+    submit path writes when its ``ProjectPrefixRegistry`` recognizes that every
+    declared file is owned by one other project.  This is the only leg that can
+    see the RELATIVE-foreign shape, which the orchestrator cannot classify
+    unaided.  A FALSY value is not evidence: key-presence is what got the task
+    into the gate (see ``carries_cross_repo_signal``), truth is what blocks.
+
+    Legs (B) and (C) — declared-files containment and a containment-confirmed
+    ``possible_scope_mismatch`` — land in later steps.
+
+    Never raises for any metadata shape; the caller (``_run_cross_repo_gate``)
+    additionally fails CLOSED should that ever prove wrong.
+    """
+    meta = _extract_metadata(task)
+    if meta is None:
+        # step-8 turns this into a LOUD SKIP.  ALLOW for now.
+        return CrossRepoVerdict(
+            verdict=ALLOW,
+            owner_project=None,
+            signals=(),
+            foreign_paths=(),
+            reason='task metadata is not a readable dict',
+        )
+
+    signals: list[str] = []
+    reasons: list[str] = []
+
+    marker = meta.get('cross_repo')
+    if marker:
+        signals.append(SIGNAL_MARKER)
+        reasons.append(
+            f'metadata.cross_repo is set ({marker!r}) — the submit path classified '
+            f'this task\'s declared files as owned by another project'
+        )
+
+    if not signals:
+        return CrossRepoVerdict(
+            verdict=ALLOW,
+            owner_project=None,
+            signals=(),
+            foreign_paths=(),
+            reason='no cross-repo evidence in task metadata',
+        )
+
+    return CrossRepoVerdict(
+        verdict=BLOCK,
+        owner_project=_resolve_owner(meta),
+        signals=tuple(signals),
+        foreign_paths=(),
+        reason='; '.join(reasons),
+    )
