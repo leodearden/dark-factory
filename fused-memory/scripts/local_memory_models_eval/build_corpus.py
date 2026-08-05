@@ -91,11 +91,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
 import random
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -138,6 +140,19 @@ _TEMPORAL_PREFIX_RE = re.compile(r'^\[temporal:[^\]]*\]\s*')
 Verified absent from dark_factory today — all rows are bare ``add_memory:*`` —
 but stripping it here keeps a future episode from landing in its own bogus
 payload-kind stratum.
+"""
+
+STRATIFICATION_DIMENSIONS: tuple[str, ...] = (
+    'month(created_at)',
+    'payload_kind(source_description)',
+)
+"""The two stratification axes, named as the manifest records them.
+
+``source_description``, NOT ``source``: measured read-only, ``e.source`` is
+uniformly ``'text'`` across every episode in the store and discriminates
+nothing. Neither axis is derived from anything the incumbent pipeline
+produced — that is the point, and the manifest records this tuple beside the
+no-outcome-filter statement so the claim is checkable.
 """
 
 ADD_EPISODE_KIND = 'add_episode'
@@ -699,6 +714,177 @@ def _falkor_port_from_env() -> int:
             f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
             f'default (6379), or set it to the port your FalkorDB listens on.'
         ) from None
+
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
+
+PRD_MARKER = 'PRD-MARKER:local-memory-models-eval corpus-manifest'
+"""The literal the delivered_check greps for on the COMMITTED tree.
+
+Carried as a top-level manifest field so it survives JSON serialization
+intact, and present in this module's docstring so the script satisfies the
+check too. See ``plans/local-memory-models-eval-prd.capability-manifest.yaml``.
+"""
+
+DEFAULT_N = 200
+"""Provisional corpus size — the midpoint of the PRD's 150–300 band.
+
+Checked against the measured census: at ~7.2% sampling every one of the 16
+non-empty cells receives at least one seat, and the min-1 floor consumes only
+16 of the 200. PRD Open Q4 defers the FINAL figure to ζ, so this is a starting
+point recorded as a criterion, not a baked-in constant — see
+:data:`N_RATIONALE`.
+"""
+
+N_RATIONALE = (
+    "N=200 is delta (δ)'s provisional choice: the midpoint of the PRD's 150-300 "
+    'band, checked against the measured census so that all 16 non-empty cells '
+    'receive at least one seat. PRD Open Q4 defers the FINAL corpus size to '
+    'zeta (ζ), to be settled from measured control variance and wall-clock. '
+    'Because selection is a prefix of a per-cell seeded permutation, zeta can '
+    're-run this builder at a different N without invalidating replays '
+    'epsilon (ε) has already completed.'
+)
+"""Recorded in the manifest so a later reader does not mistake 200 for settled.
+
+Task labels are spelled BOTH ways — ``zeta (ζ)`` — deliberately. The PRD names
+its tasks with Greek letters, but this string lands in a JSON artifact that
+reviewers and scripts will grep; a bare ``ζ`` is not something anyone types at
+a search prompt. The ASCII spelling is what makes the criterion findable, the
+Greek is what ties it back to the PRD row.
+"""
+
+NO_OUTCOME_FILTER_STATEMENT = (
+    'Corpus membership is NEVER conditioned on the incumbent extraction '
+    "pipeline's outcome. The population query projects only the six fields "
+    'listed in projected_fields and applies no WHERE clause, no LIMIT and no '
+    'ranking of any kind; e.entity_edges — the per-episode record of what the '
+    'incumbent produced — is never read, never filtered on, and never used as a '
+    'stratification dimension. Within each stratum the draw is an unconditioned '
+    'seeded permutation, not a score-ranked take. An episode the incumbent '
+    'extracted zero edges from is exactly as eligible as any other.'
+)
+"""The prose half of the guarantee. The checkable half sits beside it."""
+
+DEFAULT_MANIFEST_PATH = str(Path(__file__).resolve().parent / 'corpus_manifest.json')
+"""Where the committed manifest lives.
+
+Deliberately beside this script rather than in the conventional
+``fused-memory/data/memory-evals/`` eval-artifact directory:
+``fused-memory/.gitignore`` ignores ``data/``, so a manifest written there
+would be uncommittable — satisfying neither the "committed corpus manifest"
+deliverable nor the delivered_check, which greps the COMMITTED tree. The
+stamped-run convention is right for gitignored per-run output; this artifact is
+a committed, reviewable input fixture, so it takes one stable path with no run
+stamp.
+"""
+
+
+def _cell_label(cell: tuple[str, str]) -> str:
+    """Render a cell key as a JSON-safe ``month|kind`` string.
+
+    JSON object keys must be strings, and a tuple would serialize as an
+    unparseable ``"('2026-04', 'temporal_facts')"``. The pipe is safe because
+    neither a month bucket nor a category ever contains one.
+    """
+    return f'{cell[0]}|{cell[1]}'
+
+
+def build_manifest(
+    result: SelectionResult,
+    population: list[EpisodeRecord],
+    *,
+    n: int,
+    seed: str,
+    graph: str = DEFAULT_GRAPH,
+) -> dict:
+    """Assemble the committed corpus manifest.
+
+    Carries four things: the selected ids with their content hashes, the
+    criteria needed to re-derive them, a stratification report that reconciles
+    to the whole population, and the no-outcome-filter guarantee in both its
+    prose and machine-checkable forms.
+
+    Episode **content is deliberately not copied** into the manifest. The
+    replay engines read content from the store by uuid; a second copy here
+    could silently disagree with the first, and hash drift — the exact thing
+    :func:`verify_manifest` exists to catch — would then be undetectable.
+    """
+    created = [record.created_at for record in population]
+    cells = {
+        _cell_label(cell): {
+            'population': count,
+            'allocated': result.allocation[cell],
+            'selected': sum(
+                1 for r in result.selected if stratum_key(r) == cell
+            ),
+        }
+        for cell, count in sorted(result.cell_counts.items())
+    }
+    return {
+        'prd_marker': PRD_MARKER,
+        'criteria': {
+            'allocation_rule': ALLOCATION_RULE,
+            'builder_version': BUILDER_VERSION,
+            'graph': graph,
+            'n': n,
+            'n_rationale': N_RATIONALE,
+            'population_size': len(population),
+            'seed': seed,
+            'selection_rule': SELECTION_RULE,
+            'stratification_dimensions': list(STRATIFICATION_DIMENSIONS),
+            'window': {'min_created_at': min(created), 'max_created_at': max(created)},
+        },
+        'episodes': [
+            {
+                'uuid': record.uuid,
+                'content_hash': content_hash(record.content),
+                'month': stratum_key(record)[0],
+                'payload_kind': stratum_key(record)[1],
+            }
+            for record in result.selected
+        ],
+        'no_outcome_filter': {
+            'entity_edges_queried': False,
+            'entity_edges_used_as_filter': False,
+            'entity_edges_used_as_stratum': False,
+            'population_query': POPULATION_CYPHER,
+            'projected_fields': list(PROJECTED_FIELDS),
+            'statement': NO_OUTCOME_FILTER_STATEMENT,
+            'stratification_dimensions': list(STRATIFICATION_DIMENSIONS),
+        },
+        'stratification_report': {
+            'cells': cells,
+            'totals': {
+                'allocated': sum(c['allocated'] for c in cells.values()),
+                'not_selected': len(result.not_selected),
+                'population': sum(c['population'] for c in cells.values()),
+                'selected': sum(c['selected'] for c in cells.values()),
+            },
+        },
+    }
+
+
+def serialize_manifest(manifest: dict) -> str:
+    """Render *manifest* canonically, so two builds diff cleanly.
+
+    ``sort_keys`` and the fixed indent are what make "two builds over an
+    unchanged store are byte-identical" true; without them a re-run would diff
+    against itself on incidental key ordering and a real change would be
+    unreadable inside the noise. ``ensure_ascii=False`` keeps UTF-8 verbatim
+    rather than escaping it into unreviewable ``\\uXXXX`` runs.
+    """
+    return json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+
+
+def write_manifest(manifest: dict, path: str | Path = DEFAULT_MANIFEST_PATH) -> Path:
+    """Write *manifest* to *path* canonically and return the path."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(serialize_manifest(manifest), encoding='utf-8')
+    return target
 
 
 def record_field_names() -> tuple[str, ...]:
