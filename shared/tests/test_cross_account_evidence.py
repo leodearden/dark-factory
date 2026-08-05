@@ -368,3 +368,110 @@ class TestEmitRunEvidence:
         lines = path.read_text(encoding='utf-8').strip().splitlines()
         assert len(lines) == 1
         assert json.loads(lines[0])['r2_output'] == 'line one\nline two\nZEPPELIN'
+
+
+@pytest.fixture
+def reload_integration_module(monkeypatch):
+    """Reload ``test_cli_invoke_integration`` under a controlled fake environ.
+
+    Yields ``reload(**tokens)`` -> the reloaded module.  Every
+    ``CLAUDE_OAUTH_TOKEN_*`` letter and the override var are cleared first, so
+    the machine's real ``.env`` (which has B..G all set) cannot leak in and make
+    these assertions environment-dependent.
+
+    Reloading mutates the module object other collected items may hold, so on
+    teardown the real environment is restored (``monkeypatch.undo()`` first,
+    since this fixture finalises BEFORE monkeypatch's own teardown) and the
+    module is reloaded once more under it — no reload side effect escapes.
+    """
+    import importlib
+
+    module = importlib.import_module('test_cli_invoke_integration')
+
+    def _reload(**tokens: str):
+        for ch in 'ABCDEFG':
+            monkeypatch.delenv(f'CLAUDE_OAUTH_TOKEN_{ch}', raising=False)
+        monkeypatch.delenv('CROSS_ACCOUNT_RESUME_TOKENS', raising=False)
+        for name, value in tokens.items():
+            monkeypatch.setenv(name, value)
+        return importlib.reload(module)
+
+    try:
+        yield _reload
+    finally:
+        monkeypatch.undo()
+        importlib.reload(module)
+
+
+class TestIntegrationModuleUsesSelectTokenPair:
+    """The integration module must RESOLVE its pair through ``select_token_pair``.
+
+    Not a structure or docstring test — a runtime-behaviour test of module-level
+    selection.  It is the only thing that would catch the helper sitting unused
+    beside a still-hard-coded ``_AVAILABLE_TOKENS[0]/[1]``, i.e. a live
+    measurement silently running on the capped default pair.  That is the precise
+    failure this task exists to end: two rounds, 0 valid runs, both because the
+    pair could not be aimed.
+    """
+
+    def test_override_steers_the_module_level_pair(self, reload_integration_module):
+        module = reload_integration_module(
+            CLAUDE_OAUTH_TOKEN_B='tok-b',
+            CLAUDE_OAUTH_TOKEN_C='tok-c',
+            CLAUDE_OAUTH_TOKEN_F='tok-f',
+            CROSS_ACCOUNT_RESUME_TOKENS='F,C',
+        )
+        assert module._ACCOUNT_PAIR is not None
+        (name_a, tok_a), (name_b, tok_b) = module._ACCOUNT_PAIR
+        assert (name_a, tok_a) == ('CLAUDE_OAUTH_TOKEN_F', 'tok-f')
+        assert (name_b, tok_b) == ('CLAUDE_OAUTH_TOKEN_C', 'tok-c')
+
+    def test_falls_back_to_first_two_available_without_override(
+        self, reload_integration_module
+    ):
+        module = reload_integration_module(
+            CLAUDE_OAUTH_TOKEN_C='tok-c',
+            CLAUDE_OAUTH_TOKEN_E='tok-e',
+            CLAUDE_OAUTH_TOKEN_F='tok-f',
+        )
+        assert module._ACCOUNT_PAIR is not None
+        assert [name for name, _ in module._ACCOUNT_PAIR] == [
+            'CLAUDE_OAUTH_TOKEN_C',
+            'CLAUDE_OAUTH_TOKEN_E',
+        ]
+
+    def test_account_a_is_the_session_starting_account(
+        self, reload_integration_module
+    ):
+        """The control/baseline tests must run on account A, not on token index 0."""
+        module = reload_integration_module(
+            CLAUDE_OAUTH_TOKEN_B='tok-b',
+            CLAUDE_OAUTH_TOKEN_C='tok-c',
+            CLAUDE_OAUTH_TOKEN_G='tok-g',
+            CROSS_ACCOUNT_RESUME_TOKENS='G,B',
+        )
+        assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_G', 'tok-g')
+
+    def test_bad_override_does_not_crash_collection(self, reload_integration_module):
+        """A mis-set override must skip the cross-account test, not break the
+        whole module's collection — and it must NOT silently run the default pair."""
+        module = reload_integration_module(
+            CLAUDE_OAUTH_TOKEN_B='tok-b',
+            CLAUDE_OAUTH_TOKEN_C='tok-c',
+            CROSS_ACCOUNT_RESUME_TOKENS='F,C',  # F is unset here
+        )
+        assert module._ACCOUNT_PAIR is None
+        assert module._PAIR_ERROR is not None
+        assert 'F' in module._PAIR_ERROR
+        # Single-account tests still have somebody to run on.
+        assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_B', 'tok-b')
+
+    def test_single_token_leaves_pair_unset(self, reload_integration_module):
+        module = reload_integration_module(CLAUDE_OAUTH_TOKEN_C='tok-c')
+        assert module._ACCOUNT_PAIR is None
+        assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_C', 'tok-c')
+
+    def test_no_tokens_leaves_both_unset(self, reload_integration_module):
+        module = reload_integration_module()
+        assert module._ACCOUNT_PAIR is None
+        assert module._ACCOUNT_A is None
