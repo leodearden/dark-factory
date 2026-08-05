@@ -117,14 +117,6 @@ _ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
 _LINKER_CONTEXT_RE = re.compile(r'linking with|collect2', re.IGNORECASE)
 _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE)
 
-# flock/semaphore slot-acquisition timeout — a lock/slot/semaphore token
-# co-occurring with a timeout token. Deliberately NARROWER than
-# _FLOCK_ERROR_RE ('^flock:') so a plain flock-contention error with no
-# timeout token (e.g. the golden 'flock: failed to acquire lock on
-# /var/lock/mylock') still falls through to FLOCK_ERROR unchanged.
-_LOCK_TOKEN_RE = re.compile(r'\b(?:flock|lock|slot|semaphore)\b', re.IGNORECASE)
-_TIMEOUT_TOKEN_RE = re.compile(r'\btimed?\s*out\b', re.IGNORECASE)
-
 # task 3679: LINE-ANCHORED, producer-grounded slot-timeout markers — the
 # POSITIVE detector for the SEMAPHORE_TIMEOUT arm, replacing the whole-output
 # token co-occurrence above (deleted in the follow-up step).
@@ -179,138 +171,6 @@ _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
     r'failed to acquire .{1,40}? within \S+s\b',
     re.MULTILINE,
 )
-
-# task 2748: deterministic-diagnostic veto for the SEMAPHORE_TIMEOUT arm. A
-# genuine flock/semaphore slot-acquisition timeout is emitted by the
-# concurrency-limiter WRAPPER (reify lib_slot_acquire.sh / `flock -w`) BEFORE
-# the wrapped tool ever runs, so its output CANNOT also contain a compiler/
-# lint diagnostic. `_LOCK_TOKEN_RE`/`_TIMEOUT_TOKEN_RE` are independent
-# whole-output searches, so a deterministic `cargo clippy`/rustc diagnostic
-# that quotes lock/slot/semaphore source and mentions "timed out" in a note
-# satisfies both and is misclassified SEMAPHORE_TIMEOUT. The clippy
-# lint-namespace token `clippy::` is present in every denied-lint note (e.g.
-# `-D clippy::await-holding-lock`) and a rustc error code (`_COMPILE_ERROR_
-# RUSTC_CODE_RE`, reused from the shared primitives above) is present in
-# every rustc compile-error diagnostic — either PROVES the wrapped command
-# ran, so both are used as the veto marker set rather than inventing a new
-# one.
-# Plain substring check (not a compiled regex — 'clippy::' has no
-# metacharacters to match and this mirrors the _ENOSPC_MARKERS substring
-# style used a few lines below).
-_CLIPPY_LINT_MARKER = 'clippy::'
-
-# task 2821 (reify 2026-07-19 red-main incident, /deb deb-reify-964887):
-# generalizes the task-2748 veto above from Rust compiler/clippy diagnostics
-# to ANY deterministic pytest/cargo test-runner VERDICT, for the identical
-# reason — the wrapper emits a genuine slot/semaphore timeout BEFORE the
-# wrapped tool runs, so its output can never ALSO carry a pass/fail test
-# verdict. `_TEST_VERDICT_PAIR_RE` matches a "N passed"/"M failed" count PAIR
-# in EITHER order within a short same-line span (pytest's "6 failed, 48
-# passed" and cargo's "48 passed; 6 failed" both grounded in the incident's
-# literal "48 passed, 6 failed"); `_has_deterministic_test_verdict` also
-# treats the shared `_TEST_FAILURE_LEADING_RE`/`_TEST_FAILURE_TRAILING_RE`
-# FAILED-line markers (defined in the shared primitives above) as verdict
-# evidence WHEN the matched line also carries a test-runner-shaped 'test'/
-# '::' token (see the context-anchor check inside `_has_deterministic_test_
-# verdict` below) — a bare line-ending-in-FAILED match with no such context
-# is an incidental wrapper log line (e.g. 'flock: lock acquisition FAILED'),
-# not proof a test runner emitted a per-test result, so it is NOT treated as
-# verdict evidence. Like the task-2748 markers, this is additive to the veto
-# marker set — it only ever REMOVES false-positives, so a genuine
-# wrapper-only timeout (no verdict marker of any kind) is unaffected and
-# still classifies SEMAPHORE_TIMEOUT.
-_TEST_VERDICT_PAIR_RE = re.compile(
-    r'\b\d+\s+passed\b[^\n]{0,20}?\b\d+\s+failed\b'
-    r'|'
-    r'\b\d+\s+failed\b[^\n]{0,20}?\b\d+\s+passed\b',
-    re.IGNORECASE,
-)
-
-# ZERO-PASS pytest short-summary (task 2821 step-4): when every collected
-# test fails, pytest omits the "N passed" token entirely, so
-# `_TEST_VERDICT_PAIR_RE` above (which requires BOTH a passed and a
-# failed/error count) cannot match — the ONLY verdict is the bracketed
-# failure-count short-summary pytest always emits, e.g.
-# "===== 6 failed in 1.20s =====". A bare "\d+\s+failed\b" alone is NOT used
-# here (too loose — it would match an incidental "2 failed attempts" in a
-# wrapper's own log text with no test runner involved at all); this pattern
-# is anchored on pytest's own short-summary punctuation instead — the
-# whole-line `=+ ... =+` divider banner bracketing the count (mirroring the
-# grounded, already-production-tested shape of verify.py's OWN
-# `_PYTEST_FAILURE_SUMMARY_RE`, part of the separate `_extract_cause_hint`
-# human-hint ladder this module's docstring says NOT to import from — same
-# name is deliberate here, the same cross-module duplication convention
-# `_PYTEST_INTERNALERROR_RE` above already follows, not a collision) — so
-# only pytest's own generated summary line can match, not an incidental
-# mention elsewhere.
-#
-# Review follow-up (task 2821): an earlier draft ALSO accepted a bare
-# trailing " in <float>s" timing suffix as a fallback anchor, reasoning that
-# pytest always appends it. That fallback was dropped: it is not actually
-# anchored to any pytest-exclusive punctuation, so a wrapper-shaped message
-# like "2 errors in 30s while waiting for the slot that timed out" would
-# false-positive-veto a GENUINE SEMAPHORE_TIMEOUT (see
-# test_bare_errors_in_seconds_wrapper_line_stays_semaphore_timeout in
-# test_verify_classify.py). The banner-only form already fully covers the
-# grounded zero-pass golden below — pytest's short-summary line is always
-# bracketed by '=' padding, even under a non-tty/CI terminal width — so the
-# fallback bought no grounded coverage, only false-veto risk.
-_PYTEST_FAILURE_SUMMARY_RE = re.compile(
-    r'^=+\s*\d+\s+(?:failed|errors?)\b.*=+\s*$',
-    re.MULTILINE | re.IGNORECASE,
-)
-
-
-def _is_test_runner_shaped_line(line: str) -> bool:
-    """True when *line* carries a test-runner-shaped token ('test' or '::').
-
-    Review follow-up (task 2821): both grounded FAILED-line verdict goldens
-    carry one of these on their FAILED line —
-    ``_SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT``'s
-    'tests/test_registry_drift.py::test_registry_pin' and
-    ``_SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT``'s 'test
-    families::non_geometry_families_disjoint' — so requiring one here is a
-    no-op for the real, grounded verdict shapes. Plain substring checks (not
-    a compiled regex — neither token has metacharacters to match), mirroring
-    the ``_CLIPPY_LINT_MARKER`` style above.
-    """
-    return 'test' in line.lower() or '::' in line
-
-
-def _has_deterministic_test_verdict(output: str) -> bool:
-    """True when *output* carries a real pytest/cargo test-runner VERDICT —
-    a "N passed, M failed" count pair (either order, see
-    ``_TEST_VERDICT_PAIR_RE``), pytest's bracketed zero-pass failure-count
-    short-summary (``_PYTEST_FAILURE_SUMMARY_RE``), or a test-runner-shaped
-    FAILED line (``_TEST_FAILURE_LEADING_RE``/``_TEST_FAILURE_TRAILING_RE``,
-    additionally gated by ``_is_test_runner_shaped_line``) — the
-    single-output proxy (task 2821) that the wrapped tool actually ran and
-    reported a result, which a wrapper-emitted pre-run slot/semaphore
-    timeout can never do.
-
-    The FAILED-line markers are checked line-by-line rather than against the
-    whole output (unlike the other two checks) because
-    ``_TEST_FAILURE_LEADING_RE``/``_TEST_FAILURE_TRAILING_RE`` match ANY line
-    starting/ending with 'FAILED' — including an incidental wrapper log line
-    with no test runner involved at all (e.g. 'flock: lock acquisition
-    FAILED'). Since this evidence is consulted only inside the
-    SEMAPHORE_TIMEOUT arm — i.e. only once lock/slot/semaphore + "timed out"
-    tokens are already present — an unanchored match would veto a GENUINE
-    wrapper-emitted timeout. Requiring the matched line to also be
-    test-runner-shaped (``_is_test_runner_shaped_line``) closes that false-veto
-    risk without touching the shared regexes themselves, which other
-    classification paths (``_classify_pytest``/``_classify_cargo``/
-    ``_classify_opaque``) still consult unanchored, unaffected by this gate.
-    """
-    if _TEST_VERDICT_PAIR_RE.search(output) or _PYTEST_FAILURE_SUMMARY_RE.search(output):
-        return True
-    for line in output.splitlines():
-        if not (_TEST_FAILURE_LEADING_RE.search(line) or _TEST_FAILURE_TRAILING_RE.search(line)):
-            continue
-        if _is_test_runner_shaped_line(line):
-            return True
-    return False
-
 
 # Broken _merge-verify worktree (task 2756) — a guard script (e.g. reify's
 # check-manifold-deps.sh) that cannot read the ephemeral merge-verify
@@ -484,66 +344,67 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     proceeds to per-tool dispatch) when none of these conditions is grounded
     in *output*.
 
-    ORDERING (task 2831 reorder — more-specific root cause wins on
-    co-occurrence): DISK_FULL (ENOSPC/linker) is checked FIRST, then the
+    ORDERING: DISK_FULL (ENOSPC/linker) is checked FIRST, then the
     broken-``_merge-verify``-worktree ENV_TRANSIENT checks (task 2756's
-    Cargo.lock signature + task 2831's restart-collateral shapes), and ONLY
-    THEN the looser SEMAPHORE_TIMEOUT lock+timeout heuristic. Broken-worktree
-    collateral is a more-specific root cause than the loose lock+timeout
-    heuristic, so it wins over SEMAPHORE_TIMEOUT (see
-    ``TestReplayedMergeVerifyCollateralWinsOverSemaphore`` — a replayed
-    wrapper lock/timeout line co-occurring with collateral shapes classifies
-    ENV_TRANSIENT, not SEMAPHORE_TIMEOUT); DISK_FULL/ENOSPC remains the
-    most-specific root cause and stays first (see
-    ``test_enospc_with_unreadable_lock_stays_disk_full`` and
-    ``test_enospc_with_collateral_stays_disk_full``). Before task 2831, the
-    broken-worktree checks ran AFTER the semaphore arm; they are reordered
-    ahead of it here because a removed verify worktree is never a genuine
-    slot/lock-acquisition timeout co-occurrence.
+    Cargo.lock signature + task 2831's restart-collateral shapes), then the
+    pyright-misresolution check, and LAST the SEMAPHORE_TIMEOUT arm.
+    DISK_FULL/ENOSPC remains the most-specific root cause and stays first
+    (see ``test_enospc_with_unreadable_lock_stays_disk_full`` and
+    ``test_enospc_with_collateral_stays_disk_full``).
 
-    SEMAPHORE_TIMEOUT deterministic-diagnostic veto (task 2748): a genuine
-    slot/lock-acquisition timeout is raised by the concurrency-limiter
-    wrapper BEFORE the wrapped tool runs, so its output can never carry a
-    Rust compiler/clippy diagnostic. When *output* carries the clippy
-    lint-namespace token (``clippy::``) or a rustc error code
-    (``error[E\\d+]:``), the lock/slot/semaphore + timeout tokens are
-    incidental to a deterministic lint/compile failure, so this returns
-    ``None`` instead of ``SEMAPHORE_TIMEOUT`` and defers to per-tool
-    dispatch. Applies ONLY to the SEMAPHORE_TIMEOUT arm — DISK_FULL's ENOSPC
-    markers and the broken-worktree ENV_TRANSIENT checks (below) are more
-    specific and checked first, so a compile/lint failure caused by a
-    genuinely full disk or a removed worktree stays DISK_FULL/ENV_TRANSIENT
-    respectively.
+    SEMAPHORE_TIMEOUT's last position is retained from task 2831's reorder,
+    but since task 3679 the REASON is different and much weaker: the arm's
+    marker and the worktree-collateral shapes are now disjoint BY
+    CONSTRUCTION, so the order between them no longer decides any outcome. A
+    replayed wrapper line quoted inside collateral output cannot reach the
+    semaphore arm anyway — it is not line-anchored at column 0 — so
+    ``TestReplayedMergeVerifyCollateralWinsOverSemaphore`` now passes
+    structurally rather than by ordering. Before task 2831 the
+    broken-worktree checks ran AFTER the semaphore arm and the order DID
+    decide the outcome, because the arm was a loose co-occurrence that
+    collateral output routinely satisfied; that is no longer the case.
 
-    SEMAPHORE_TIMEOUT deterministic-TEST-VERDICT veto (task 2821, reify
-    2026-07-19 red-main incident, /deb deb-reify-964887): generalizes the
-    task-2748 veto above from Rust compiler/clippy diagnostics to ANY
-    deterministic pytest/cargo test-runner VERDICT — identical
-    justification: a genuine slot timeout is raised by the wrapper BEFORE
-    the wrapped tool runs, so it can never carry a pass/fail verdict either.
-    When *output* carries a real "N passed, M failed" count pair
-    (``_TEST_VERDICT_PAIR_RE``) or a FAILED line
-    (``_has_deterministic_test_verdict``), the lock/slot/semaphore + timeout
-    tokens are incidental to a deterministic test failure, so this returns
-    ``None`` instead of ``SEMAPHORE_TIMEOUT`` and defers to per-tool
-    dispatch, exactly like the clippy/rustc veto above.
+    SEMAPHORE_TIMEOUT — LINE-ANCHORED, producer-grounded marker (task 3679,
+    esc-5848-2 / esc-5893-3). The arm fires when *output* contains, AT THE
+    START OF A LINE, either the ``@@REIFY_SLOT_TIMEOUT@@`` sentinel or a
+    slot-acquisition deadline message from one of three allowlisted reify
+    emitter scripts (see ``_SLOT_TIMEOUT_SENTINEL_RE`` /
+    ``_SLOT_ACQUIRE_DEADLINE_RE`` above for the per-emitter grounding). The
+    event is now detected POSITIVELY, by the producer naming itself, instead
+    of being inferred from a whole-output token co-occurrence.
 
-    Known gap (out of scope for task 2821, narrowed from task 2748's
-    Rust-only gap): a deterministic failure whose output incidentally quotes
-    a lock/slot/semaphore token together with a "timed out" token but
-    carries NO grounded verdict marker of any kind — e.g. a deterministic
-    SHELL-script assertion (a gate script's manifest-drift check) that emits
-    neither a pytest/cargo count pair nor a FAILED line — still satisfies
-    the loose ``_LOCK_TOKEN_RE`` + ``_TIMEOUT_TOKEN_RE`` co-occurrence with
-    no veto marker to suppress it, and is still misclassified
-    ``SEMAPHORE_TIMEOUT``. That looseness predates task 2748 and is now
-    narrowed for Rust diagnostics (2748) and pytest/cargo test verdicts
-    (2821); a future task extending the marker set to a grounded
-    shell-assertion shape, or tightening ``_LOCK_TOKEN_RE``/
-    ``_TIMEOUT_TOKEN_RE`` to require wrapper-emitted context (e.g. an
-    anchored ``lib_slot_acquire.sh``/``flock -w`` marker so a genuine slot
-    timeout is matched positively instead of by loose co-occurrence), would
-    close it.
+    What this replaced, and why it had to go: the arm previously fired when a
+    lock/slot/semaphore token appeared ANYWHERE in *output* together with a
+    "timed out" token ANYWHERE else in it. That precondition is satisfied by
+    essentially every verify log in the fleet — a repo containing a
+    ``package-lock.json``/``uv.lock`` whose runner is invoked under
+    ``timeout(1)`` satisfies both halves before any failure has occurred (DF's
+    own ``test_command`` carries ``--timeout=300`` seven times). The
+    classification was therefore decided almost entirely by SUBTRACTION: three
+    successive vetoes (task 2748's clippy/rustc markers, task 2821's test
+    verdicts) each removed one shape of false positive without ever making the
+    positive correct. Two live escalations got through anyway — rustc BUILT-IN
+    lints denied via ``-D warnings``, which carry no ``clippy::`` token, no
+    ``error[E\\d+]:`` code and no test verdict — and each held its lane ~5h.
+    Meanwhile the arm was BLIND to every real event: none of reify's actual
+    deadline lines contains a "timed out" token at all.
+
+    The vetoes are DELETED rather than retained as defence-in-depth, because
+    they are no longer load-bearing: a rustc/clippy diagnostic or a
+    pytest/cargo verdict cannot begin a line with
+    ``lib_test_semaphore.sh: failed to acquire`` or ``@@REIFY_SLOT_TIMEOUT@@``.
+    Retaining them would keep ~130 lines of comment justifying a premise
+    verified FALSE on both clauses — ``flock -w`` appears nowhere in reify's
+    verify path (``lib_slot_acquire.sh`` uses non-blocking ``flock -xn`` in a
+    shuffle loop), and this classifier is handed the ENTIRE aggregated verify
+    output, not the wrapper's own stream, so "the wrapper's output cannot
+    contain a diagnostic" was never the situation being classified.
+
+    The historical "Known gap" (a deterministic shell-script assertion with
+    incidental lock+timeout tokens and no verdict marker of any kind) is
+    CLOSED, not narrowed further: with no co-occurrence path left, incidental
+    tokens cannot reach this category regardless of what else *output*
+    contains.
 
     ENV_TRANSIENT — broken verify worktree (task 2756): a malformed
     ``_merge-verify`` worktree (e.g. an unreadable or missing ``Cargo.lock``)
@@ -552,8 +413,8 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     more specific ENOSPC/linker DISK_FULL checks — a co-occurring disk-full
     still wins as the more specific root cause (see
     ``test_enospc_with_unreadable_lock_stays_disk_full``) — but BEFORE the
-    looser SEMAPHORE_TIMEOUT lock+timeout heuristic (task 2831 reorder — see
-    the ORDERING note above) — and wins over per-tool dispatch regardless of
+    SEMAPHORE_TIMEOUT arm (task 2831 reorder, now order-independent — see the
+    ORDERING note above) — and wins over per-tool dispatch regardless of
     ``ToolKind``. This source is DISTINCT from the pytest-scoped shared-venv
     ``_ENV_TRANSIENT_PATTERNS`` below (different grounded patterns mapping to
     the same ``ENV_TRANSIENT`` category, exactly like how ``DISK_FULL`` above
@@ -612,9 +473,11 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ``is_interpreter_missing_workspace_packages``, whose conjunctive
     discriminator (a baseline sentinel module AND >=5 distinct unresolved
     top-level modules) is documented on the predicate itself. Checked after the
-    broken-worktree shapes and before the looser SEMAPHORE_TIMEOUT heuristic,
-    the same placement and for the same reason as those: a specific grounded
-    host condition outranks a loose lock+timeout co-occurrence. Like them, it
+    broken-worktree shapes and before the SEMAPHORE_TIMEOUT arm, the same
+    placement as those (which mattered when that arm was a loose co-occurrence;
+    since task 3679 anchored it, the placement is no longer load-bearing —
+    a pyright import-resolution failure carries no anchored slot-timeout
+    marker, so neither check can shadow the other). Like them, it
     is tool-blind by design — the fleet chain ``cd fused-memory && npx pyright
     && ...`` resolves ``ToolKind.OPAQUE`` while the per-module commands resolve
     ``ToolKind.PYRIGHT``, and one guard-3 branch covers both without any
@@ -638,14 +501,6 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     if is_interpreter_missing_workspace_packages(output):
         return FailureCategory.ENV_TRANSIENT
     if _SLOT_TIMEOUT_SENTINEL_RE.search(output) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
-        return FailureCategory.SEMAPHORE_TIMEOUT
-    if (  # task 3679 step-2: legacy co-occurrence — scheduled for deletion in step-4
-        _LOCK_TOKEN_RE.search(output)
-        and _TIMEOUT_TOKEN_RE.search(output)
-        and _CLIPPY_LINT_MARKER not in output
-        and not _COMPILE_ERROR_RUSTC_CODE_RE.search(output)
-        and not _has_deterministic_test_verdict(output)
-    ):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
