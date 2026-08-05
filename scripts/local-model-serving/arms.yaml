@@ -1,0 +1,213 @@
+# Candidate serving arms for the local-memory-models eval.
+#
+# PRD-MARKER:local-memory-models-eval serving
+#
+# Task 3713 (LME-alpha) of plans/local-memory-models-eval-prd.md.
+# Slate transcribed from that PRD's candidate tables (lines 122-137); Leo
+# selected every entry.  This file is THE contract: lms_serve, lms_ctl,
+# lms_fetch_weights and lms_healthcheck all derive from it, and the downstream
+# eval tasks (eta screening, theta full runs, iota embedding arms) read
+# base_url / served_model_name / dims / structured_output_mode out of it.
+# Validated by lms_manifest.load_arms() — see scripts/tests/test_lms_manifest.py.
+#
+# PORT RESERVATION.  8410-8417 is reserved for this rig, one port per arm.
+# Chosen to clear the ports already in service on this host: 8002
+# (fused-memory MCP) and 8102 (escalation server).  Arms bind 127.0.0.1 only.
+# lms_manifest refuses a manifest whose arm lands outside this block.
+#
+# VRAM.  est_vram_gib is the arm's declared resident footprint and is checked
+# against MEASURED free VRAM before any arm starts (lms_vram / lms_ctl).  The
+# measured operating budget on this host is ~16.4 GiB, not PRD D10's nominal
+# 19-20 GiB -- whisper-writer holds 4050 MiB and the KDE/X11 desktop ~3.3 GB
+# more.  See README.md.
+#
+# TBD- values are decisions the PRD explicitly delegates to live measurement in
+# this task (Open Q1: embedding serving stack; Open Q3: MoE model + quant).
+# lms_manifest.ArmEntry.is_placeholder is True while they stand, and the tools
+# refuse to launch or fetch such an arm rather than 404ing on a literal "TBD".
+
+port_block: [8410, 8417]
+
+arms:
+
+  # ---------------------------------------------------------------------
+  # LLM axis -- dense arms, vLLM with structured outputs (PRD lines 124-126)
+  # ---------------------------------------------------------------------
+
+  - arm_id: qwen3.5-9b
+    axis: llm
+    stack: vllm
+    image: vllm/vllm-openai:v0.26.0
+    model_ref: QuantTrio/Qwen3.5-9B-AWQ
+    quant: awq
+    port: 8410
+    served_model_name: qwen3.5-9b
+    structured_output_mode: json_schema
+    est_vram_gib: 6.0
+    max_model_len: 32768
+    max_num_seqs: 8
+    notes: >-
+      IFEval 91.5 / BFCL-V4 66.1 (official card) -- best published
+      conformance-adjacent scores on the slate.  ~6 GiB of weights against a
+      16.4 GiB budget leaves the largest KV headroom, hence the slate's only
+      32k context and its highest max_num_seqs.
+
+  - arm_id: mistral-small-3.2-24b
+    axis: llm
+    stack: vllm
+    image: vllm/vllm-openai:v0.26.0
+    model_ref: jeffcookio/Mistral-Small-3.2-24B-Instruct-2506-awq-sym
+    quant: awq
+    port: 8411
+    served_model_name: mistral-small-3.2-24b
+    structured_output_mode: json_schema
+    est_vram_gib: 14.0
+    max_model_len: 16384
+    max_num_seqs: 4
+    notes: >-
+      Mature quant ecosystem; the 3.2 release targeted stronger function
+      calling.  ~14 GiB of weights leaves only ~2 GiB for KV against the
+      measured budget, so context and concurrency are deliberately the
+      slate's tightest -- eta must verify graphiti's longest prompt still fits.
+
+  - arm_id: phi-4-14b
+    axis: llm
+    stack: vllm
+    image: vllm/vllm-openai:v0.26.0
+    model_ref: stelterlab/phi-4-AWQ
+    quant: awq
+    port: 8412
+    served_model_name: phi-4-14b
+    structured_output_mode: json_schema
+    est_vram_gib: 9.0
+    max_model_len: 16384
+    max_num_seqs: 5
+    notes: >-
+      SOB Value Accuracy 0.798, top of the small-model group.  16K is the
+      MODEL's ceiling, not a tuning choice (PRD line 126) -- eta must verify
+      graphiti's longest prompts fit inside it before this arm is scored.
+
+  # ---------------------------------------------------------------------
+  # LLM axis -- MoE stretch arm, llama.cpp (PRD line 127)
+  #
+  # arm_id is deliberately generic and STABLE across the Open Q3 decision:
+  # resolving Q3 changes model_ref/quant/image/gguf_file only, so the port,
+  # the unit name, and every artifact already keyed on this arm stay valid.
+  # ---------------------------------------------------------------------
+
+  - arm_id: moe-stretch
+    axis: llm
+    stack: llamacpp
+    image: TBD-Q3-llamacpp-server-cuda-tag-pinned-in-step-19
+    model_ref: TBD-Q3-Qwen3.6-35B-A3B-GGUF-or-gemma-4-26B-A4B-it-GGUF
+    quant: TBD-Q3
+    port: 8413
+    served_model_name: moe-stretch
+    # json_object ONLY, and this is enforced by lms_manifest, not merely
+    # documented: llama.cpp silently falls back to unconstrained output on the
+    # $ref/$defs schemas graphiti really emits (ggml-org/llama.cpp#21228).
+    # Alpha guarantees the endpoint; the forced client selection is beta's and
+    # the hard client-side validator is epsilon's.
+    structured_output_mode: json_object
+    est_vram_gib: 17.0
+    max_model_len: 16384
+    max_num_seqs: 4
+    notes: >-
+      PRD Open Q3, resolved from live measurement in this task's step 22.
+      Candidates Qwen3.6-35B-A3B and gemma-4-26B-A4B-it; 115-133 tok/s on a
+      3090 (6x dense-on-vLLM).  est_vram_gib 17.0 is the PRD's nominal IQ4
+      figure and DOES NOT FIT the measured 16.4 GiB budget -- so the VRAM
+      pre-flight refuses this arm today, on purpose, until step 22 pins a
+      quant that actually fits.
+
+  # ---------------------------------------------------------------------
+  # Embedding axis (PRD lines 132-137)
+  #
+  # stack: vllm across all four is the Open Q1 hypothesis -- one stack removes
+  # a serving-stack confound from iota's query-latency comparison.  Each arm
+  # records TEI as its fallback_stack; step 22 re-pins per arm from what the
+  # vLLM pooling runner actually loads.
+  #
+  # max_model_len is 8192 uniformly: it is granite-r2's and gte-modernbert's
+  # native ceiling, memory texts are far shorter, and a uniform bound keeps
+  # input-length capacity from becoming a second confound.
+  # ---------------------------------------------------------------------
+
+  - arm_id: qwen3-embedding-0.6b
+    axis: embedding
+    stack: vllm
+    fallback_stack: tei
+    image: vllm/vllm-openai:v0.26.0
+    model_ref: Qwen/Qwen3-Embedding-0.6B
+    quant: none
+    port: 8414
+    served_model_name: qwen3-embedding-0.6b
+    structured_output_mode: none
+    est_vram_gib: 2.0
+    max_model_len: 8192
+    max_num_seqs: 32
+    dims: 1024
+    query_prefix: "Instruct: Given a search query, retrieve relevant memory records that answer the query\nQuery: "
+    notes: >-
+      MTEB(eng,v2) 70.70, Apache 2.0, ~1.2 GB.  TBD-Q1 stack.  The query-side
+      instruct prefix is REQUIRED by this family (PRD line 134) and is carried
+      here rather than at a call site so it cannot be silently dropped.
+
+  - arm_id: granite-embedding-english-r2
+    axis: embedding
+    stack: vllm
+    fallback_stack: tei
+    image: vllm/vllm-openai:v0.26.0
+    model_ref: ibm-granite/granite-embedding-english-r2
+    quant: none
+    port: 8415
+    served_model_name: granite-embedding-english-r2
+    structured_output_mode: none
+    est_vram_gib: 1.0
+    max_model_len: 8192
+    max_num_seqs: 32
+    dims: 768
+    notes: >-
+      149M, IBM 6-benchmark composite 59.5, fastest mid-size, no prefix.
+      TBD-Q1 stack.  At ~300 MB it is the cheapest arm on the slate, which is
+      why step 20 smokes the whole chain end to end on THIS arm before
+      committing to the full slate's downloads.
+
+  - arm_id: qwen3-embedding-4b
+    axis: embedding
+    stack: vllm
+    fallback_stack: tei
+    image: vllm/vllm-openai:v0.26.0
+    model_ref: Qwen/Qwen3-Embedding-4B
+    quant: none
+    port: 8416
+    served_model_name: qwen3-embedding-4b
+    structured_output_mode: none
+    est_vram_gib: 9.0
+    max_model_len: 8192
+    max_num_seqs: 8
+    dims: 2560
+    query_prefix: "Instruct: Given a search query, retrieve relevant memory records that answer the query\nQuery: "
+    notes: >-
+      MTEB(eng,v2) 74.60 -- the slate's quality ceiling.  No 2B variant exists
+      (family is 0.6B/4B/8B, verified 2026-08-05).  fp16 weights are ~8 GB;
+      if that will not squeeze, step 22 re-pins to the GGUF Q4 (~2.5 GB).
+      The eval runs this arm as a batch job with the LLM server stopped, so
+      residency only matters at cutover (PRD line 136).
+
+  - arm_id: gte-modernbert-base
+    axis: embedding
+    stack: vllm
+    fallback_stack: tei
+    image: vllm/vllm-openai:v0.26.0
+    model_ref: Alibaba-NLP/gte-modernbert-base
+    quant: none
+    port: 8417
+    served_model_name: gte-modernbert-base
+    structured_output_mode: none
+    est_vram_gib: 1.0
+    max_model_len: 8192
+    max_num_seqs: 32
+    dims: 768
+    notes: >-
+      149M, the second small-model pole, no prefix.  TBD-Q1 stack.
