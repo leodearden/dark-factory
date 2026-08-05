@@ -44,6 +44,26 @@
 // slot that holds no measurement. The behavioural suite is
 // dashboard/tests/js/spark_path.test.mjs; charts.jsx's delegation to this
 // module is pinned by dashboard/tests/test_charts_null_samples.py.
+//
+// ── SCOPE: ALSO THE PADDED CHART PRIMITIVES (task 3489) ────────────────────
+//
+// charts.jsx's LineChart, StackedAreaChart, BarChart and HistBar carried the
+// SAME defect class as the two sparklines, with the same four failure modes
+// plus two of their own: StackedAreaChart's `(st.values[i] || 0)` conflated a
+// measured 0 with a missing sample and fabricated a zero-height band for a
+// hole, and HistBar's `minHeight: 1` rendered a hole as a 1px stub. Task 3489
+// therefore extended this module past the two sparklines with the primitives
+// those four need — `plottableMax`, `axisY`, `axisPaths`, `barFractions` and
+// `stackedAreaPaths` — so the file's name is now slightly narrower than its
+// contents. They live here rather than in a second module because they share
+// the one hole predicate below (a sparkline and a bar chart must never
+// disagree about what counts as a measurement) and the same two private
+// helpers, and because a second module would need its own script tag, load-
+// order guard, `window.DF_*` global and destructure in charts.jsx.
+//
+// The difference from the sparkline builders is only the BOX: a sparkline
+// scales into a bare 0..height viewport, whereas a chart scales into a box
+// offset by its axis gutter, so x gains an `x0` and y a `y0`.
 
 // ── Is this value a real, plottable measurement? ───────────────────────────
 // Finite numbers only. `null`/`undefined` (a missing sample), `NaN`/`±Infinity`
@@ -236,12 +256,54 @@ function stepPaths(values, width, height) {
   return { line: lines.join(' '), area: areas.join(' ') };
 }
 
+// ── Axis maximum over real samples only ────────────────────────────────────
+// The NaN-proof replacement for charts.jsx's bare `Math.max(...values, 1)`,
+// used by LineChart (over the flattened series), BarChart and HistBar.
+//
+// One `undefined` or `NaN` made that fold NaN, and every downstream division
+// then yielded NaN: LineChart emitted a `d` attribute containing a NaN token,
+// which invalidates the WHOLE attribute so SVG drops the entire path, and
+// BarChart emitted literal `height="NaN"` rects. Excluding holes from the fold
+// removes that failure at the source.
+//
+// `seed` is passed by the caller and DELIBERATELY preserved from the pre-fix
+// code (charts.jsx seeded every one of these with 1) for the same reason
+// sparkScale keeps its seeds: it guarantees the axis spans at least [0, 1], so
+// a flat all-zero series renders at the floor rather than being amplified into
+// noise. Only WHICH samples enter the fold changed.
+function plottableMax(values, seed) {
+  return Math.max(...(values || []).filter(isPlottable), seed);
+}
+
+// ── Scale one value to a pixel y inside a PADDED box ───────────────────────
+// `geom` is { y0, height, min, range }: the box starts at y0 (the chart's top
+// padding) and is `height` tall, and the value axis spans min..min+range.
+// Reproduces charts.jsx's pre-fix `padT + chartH - ((v - minV) / range) * chartH`
+// exactly for a plottable value.
+//
+// A hole returns `null`, NOT a number. That is the load-bearing part: the
+// pre-fix expression coerced a `null` sample to 0 and returned the floor pixel,
+// so a MISSING measurement was plotted as a real point at the bottom of the
+// chart. Handing the caller a null instead forces the decision — draw nothing
+// here — to be made explicitly.
+function axisY(value, geom) {
+  if (!isPlottable(value)) return null;
+  return geom.y0 + geom.height - ((value - geom.min) / geom.range) * geom.height;
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced by
 // dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
 // leave window.DF_SPARK_PATH undefined and break charts.jsx's top-level
 // destructure of it, blanking nearly every tab.
-const SPARK_PATH_API = { isPlottable, sparkScale, sparkPaths, stepPaths };
+const SPARK_PATH_API = {
+  isPlottable,
+  sparkScale,
+  sparkPaths,
+  stepPaths,
+  plottableMax,
+  axisY,
+};
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = SPARK_PATH_API;
