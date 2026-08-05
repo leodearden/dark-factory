@@ -44,6 +44,49 @@ CREATE TABLE IF NOT EXISTS write_ops (
     success INTEGER DEFAULT 1,
     error TEXT,
     created_at TEXT NOT NULL,
+    -- terminal_* (task 3582): the durable queue's TERMINAL outcome for this
+    -- write, written back by DurableWriteQueue's on_terminal hook.
+    --
+    -- TWO DIFFERENT FACTS, both kept. `success` above means "the enqueue was
+    -- ACCEPTED" — it is stamped the instant durable_queue.enqueue() commits,
+    -- which is genuinely useful for a caller that got a 200 back. These
+    -- columns mean "the write LANDED". Before they existed, a row for a write
+    -- with a 0% landing rate was byte-for-byte indistinguishable from a row
+    -- for a write that landed. `success`'s existing readers
+    -- (reconciliation/stage_stats.py, which gates on op.get('success', 1)) are
+    -- deliberately unchanged rather than silently redefined under them.
+    --
+    -- terminal_status domain:
+    --   NULL        no terminal outcome recorded — either still in flight, or
+    --               an operation that never goes through the durable queue at
+    --               all (search / delete_memory / task writes).
+    --   'completed' the queue executed the write successfully.
+    --   'dead'      the queue exhausted its attempts and dead-lettered it;
+    --               terminal_error carries the queue's own
+    --               f'{type(exc).__name__}: {exc}'.
+    --
+    -- LAST-WRITE-WINS: replay_dead resets a dead item to pending, so a
+    -- dead-letter that is later replayed and lands correctly re-stamps
+    -- 'completed' and clears terminal_error. A sticky-dead rule would leave a
+    -- permanently stale 'dead' on a write that did land.
+    --
+    -- HISTORICAL ROWS STAY NULL. _migrate() deliberately does NOT backfill
+    -- (unlike `kind`): a pre-change row's terminal outcome is genuinely
+    -- unknown, and inventing one would repeat the original sin of an audit
+    -- trail asserting more than it knows.
+    --
+    -- NO INDEX. The write-back is `WHERE id = ?`, a PRIMARY KEY seek. Adding
+    -- an index here is not free: see the idx_wo_created deployment note below,
+    -- where one measured ~47 s of one-time startup DDL on the live 16.6M-row
+    -- journal against a ~120 s watchdog startup grace.
+    --
+    -- OPERATOR AUDIT QUERY, now a single-row read with no join:
+    --   SELECT terminal_status, terminal_error FROM write_ops WHERE id = ?
+    -- (WriteJournal.get_write_op). Keep the standing caveat that any
+    -- JOIN-based query must go through write_op_id, NOT backend_ops.operation:
+    -- _execute_graphiti_write journals the literal 'add_episode' for BOTH the
+    -- add_episode and add_memory_graphiti paths, which is what reports ~8547
+    -- spurious add_episode "successes" when that column is filtered directly.
     terminal_status TEXT,
     terminal_at TEXT,
     terminal_error TEXT
