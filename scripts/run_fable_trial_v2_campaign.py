@@ -378,16 +378,35 @@ def build_campaign_report(
     ``bands`` is OMITTED, not emptied, when *q_ceiling* is None: an empty band
     dict would read as "we banded the pool and found nothing", which is a
     different claim from "banding was not requested".
+
+    EVERY ROW MUST TRACE TO A RESOLVED ``EvalConfig``. A cell naming a config
+    that is not among *candidates* RAISES rather than emitting a row with null
+    model/effort/budget. This is defense in depth behind
+    :func:`filter_campaign_results`: ``getattr(None, 'model', None)`` silently
+    yielding ``None`` is the exact mechanism that turned a wrong-pool load into
+    a plausible-looking table, and a null-config row is a silent degradation
+    rather than a tolerable gap.
     """
     config_by_name = {c.name: c for c in candidates}
     rows = []
     for row in summarize_candidates(results):
-        cfg = config_by_name.get(row['config_name'])
+        name = row['config_name']
+        cfg = config_by_name.get(name)
+        if cfg is None:
+            raise SystemExit(
+                f'Error: result cell names config {name!r}, which is not one of this '
+                f'campaign\'s candidates: {", ".join(sorted(config_by_name)) or "(none)"}.\n'
+                '  Every reported row must trace to a resolved EvalConfig — emitting one '
+                'with a null model/effort/budget would present an out-of-campaign cell as '
+                'a plausible result. If this came from --results-dir, the dir holds cells '
+                'from another campaign; if from --run, the runner dispatched a config that '
+                'was never requested.'
+            )
         rows.append({
             **row,
-            'model': getattr(cfg, 'model', None),
-            'effort': getattr(cfg, 'effort', None),
-            'max_budget_usd': getattr(cfg, 'max_budget_usd', None),
+            'model': cfg.model,
+            'effort': cfg.effort,
+            'max_budget_usd': cfg.max_budget_usd,
         })
 
     cells = [
@@ -654,6 +673,39 @@ def _run_campaign(
     return results
 
 
+def filter_campaign_results(
+    results: list[Any], candidate_names: set[str], fixture_stems: set[str],
+) -> tuple[list[Any], list[Any]]:
+    """Split loaded cells into ``(kept, dropped)`` by THIS campaign's scope.
+
+    A cell is kept iff its ``config_name`` is one of *candidate_names* AND its
+    ``task_id`` is one of *fixture_stems*.
+
+    WHY THIS IS MANDATORY, not defensive tidiness. ``save_result`` persists into
+    the SHARED packaged ``orchestrator/src/orchestrator/evals/results/``
+    (``runner.py:50``), alongside every eval that has ever run — 586 cells in the
+    main checkout today, 51 of them v1 ``architect-fable-high`` runs over the
+    incumbent-success-biased standing corpus that the v2 screen exists to
+    escape. The documented round-trip (``--run`` persists, a later
+    ``--results-dir`` re-reads) points a re-analysis straight at that pool. Left
+    unfiltered it silently answers a DIFFERENT question over the WRONG fixture
+    set — the same failure :func:`resolve_fixture_paths`'s loud no-fallback rule
+    prevents on the run path, re-entering through the analyze path.
+
+    BOTH AXES MATTER INDEPENDENTLY. Filtering only on candidate name would let
+    every v1 cell for a reused candidate through, since ``architect-fable-high``
+    ran in v1 too; a right-candidate/wrong-fixture cell is precisely the
+    contamination case, and it is caught on the fixture axis alone.
+    """
+    kept, dropped = [], []
+    for result in results:
+        in_scope = (
+            result.config_name in candidate_names and result.task_id in fixture_stems
+        )
+        (kept if in_scope else dropped).append(result)
+    return kept, dropped
+
+
 def _load_results_from_dir(results_dir: Path) -> list[Any]:
     """Load every persisted ``EvalResult`` JSON in *results_dir*.
 
@@ -669,6 +721,51 @@ def _load_results_from_dir(results_dir: Path) -> list[Any]:
         data = json.loads(path.read_text())
         results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
     return results
+
+
+def _load_campaign_results(
+    results_dir: Path, candidates: list[Any], fixture_paths: list[Path],
+) -> tuple[list[Any], dict[str, Any]]:
+    """Load persisted cells, scope them to THIS campaign, and account for the drops.
+
+    LOUD, NEVER SILENT. Filtering silently would be nearly as bad as not
+    filtering: the committed γ1 artifact must carry its own exclusion record so
+    the calibration is auditable, and an operator who pointed at the wrong
+    directory must be told rather than handed a plausible report.
+
+    Zero survivors EXITS rather than rendering an empty-pool report, because "we
+    measured nothing" and "you pointed at the wrong directory" must not share a
+    shape — and the latter is by far the likelier cause, given the shared
+    packaged results dir this path is aimed at by default.
+    """
+    loaded = _load_results_from_dir(results_dir)
+    candidate_names = {c.name for c in candidates}
+    fixture_stems = {p.stem for p in fixture_paths}
+    kept, dropped = filter_campaign_results(loaded, candidate_names, fixture_stems)
+
+    filtered = {
+        'dropped': len(dropped),
+        'dropped_config_names': sorted({r.config_name for r in dropped}),
+        'dropped_task_ids': sorted({r.task_id for r in dropped}),
+    }
+    if dropped:
+        print(
+            f'dropped {len(dropped)} out-of-campaign cell(s) loaded from {results_dir}: '
+            f'config(s) {", ".join(filtered["dropped_config_names"])}; '
+            f'fixture(s) {", ".join(filtered["dropped_task_ids"])}'
+        )
+    if not kept:
+        raise SystemExit(
+            f'Error: no in-campaign cells found in {results_dir} '
+            f'({len(loaded)} loaded, all {len(dropped)} out of campaign).\n'
+            f'  Selected candidates: {", ".join(sorted(candidate_names))}\n'
+            f'  Fixture pool: {", ".join(sorted(fixture_stems))}\n'
+            '  This usually means the dir predates this campaign or belongs to another '
+            'one — note that save_result writes into the SHARED packaged evals/results/ '
+            'dir alongside every eval that has ever run. Reporting over an empty pool '
+            'would give "we measured nothing" the same shape as a real result.'
+        )
+    return kept, filtered
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -800,19 +897,28 @@ def main(argv: list[str] | None = None) -> int:
     # Three mutually-exclusive modes, all converging on the SAME report builder
     # and renderer, so a dry-run preview, a live campaign and a re-analysis of
     # persisted cells cannot describe the run in three different schemas.
+    filtered: dict[str, Any] | None = None
     if args.dry_run:
         print(_format_dry_run(fixture_paths, candidates, args.trials, cell_matrix))
         results: list[Any] = []
     elif args.run:
+        # DELIBERATELY UNFILTERED. These cells are in-campaign by construction,
+        # so an unexpected one means the runner dispatched something never
+        # requested — a real bug that must surface through the unknown-config
+        # guard, not be silently dropped behind a clean-looking report.
         results = _run_campaign(
             fixture_paths, candidates,
             trials=args.trials, max_parallel=args.max_parallel,
             config_path=args.config_path, timeout=args.timeout,
         )
     else:
-        results = _load_results_from_dir(args.results_dir)
+        results, filtered = _load_campaign_results(
+            args.results_dir, candidates, fixture_paths,
+        )
 
     report = build_campaign_report(results, candidates, cell_matrix, q_ceiling=q_ceiling)
+    if filtered is not None:
+        report['filtered'] = filtered
     if not args.dry_run:
         print(format_campaign_report(report))
     _write_report(report, args.out)

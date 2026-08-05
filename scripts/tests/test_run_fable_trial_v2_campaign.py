@@ -1179,9 +1179,13 @@ def test_build_campaign_report_rejects_an_unknown_config():
     """
     candidates = mod.resolve_candidates(['architect-opus-max'])
 
-    with pytest.raises(Exception) as exc:
+    # SystemExit, matching every other loud failure in this module — and note it
+    # derives from BaseException, so a bare `except Exception` upstream cannot
+    # swallow it back into the silent degradation this guard exists to end.
+    with pytest.raises(SystemExit) as exc:
         mod.build_campaign_report([_out_of_campaign_cell()], candidates, [])
 
+    assert exc.value.code != 0
     assert 'architect-sonnet-high' in str(exc.value)
     assert 'architect-opus-max' in str(exc.value)
 
@@ -1203,9 +1207,12 @@ def test_run_path_results_are_not_filtered(tmp_path, campaign_seam, monkeypatch)
     monkeypatch.setattr(eval_runner, 'run_ofat_stage', _returns_a_stray)
     d = _make_fixture_dir(tmp_path, ['alpha'])
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(SystemExit) as exc:
         mod.main([
             '--run', '--tasks-dir', str(d), '--candidate', 'architect-opus-max',
         ])
 
+    assert exc.value.code != 0
     assert 'architect-sonnet-high' in str(exc.value)
+    # It surfaced as an unknown-config error, NOT as a quiet drop.
+    assert 'candidates' in str(exc.value)
