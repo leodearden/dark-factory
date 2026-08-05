@@ -82,6 +82,22 @@ def _mixed_results():
     ]
 
 
+def _mixed_marker_results():
+    """A MIXED corpus: one keyless (pre-σ) architect cell + one keyed (post-σ) one.
+
+    Both are planned and high-quality, so the ONLY thing distinguishing them is
+    whether their reference validity was ever measured. This is the normal
+    transition state, not an exotic one: γ1's recipe re-runs cap-tainted
+    fixtures, and a re-run after eval-revival σ (task 3628) lands writes new
+    cells carrying the key alongside the old ones that never could.
+    """
+    return [
+        _cell('f_pre', 'A', plan_steps=5, plan_quality=0.95),
+        _cell('f_post', 'A', plan_steps=5, plan_quality=0.95,
+              extra_metrics={'judged_without_reference': False}),
+    ]
+
+
 def _make_fixture_dir(tmp_path, stems, *, name='tasks_hard_v2'):
     """Build a fixture dir holding one minimal ``*.json`` per stem.
 
@@ -877,3 +893,145 @@ def test_results_dir_reanalyzes_persisted_cells(tmp_path, capsys):
     assert {c['task_id'] for c in loaded['cells']} == {'alpha', 'beta'}
     assert loaded['candidates'][0]['n'] == 2
     assert loaded['candidates'][0]['mean_plan_quality'] == 0.75
+
+
+# ===== step 15: reference validity is a PER-CELL fact, not a run-level one =====
+
+
+def test_mixed_corpus_never_discards_the_keyless_fixture():
+    """THE regression: an unrelated sibling cell must not flip a fixture to DISCARDED.
+
+    Reproduced first-hand against this branch before this test existed:
+    ``partition_bands([pre], 0.8)['discarded']`` was ``[]`` but
+    ``partition_bands([pre, post], 0.8)['discarded']`` was
+    ``['f_post', 'f_pre']`` — adding one post-σ sibling that says nothing
+    whatsoever about ``f_pre`` flipped ``f_pre`` from RETAINED to DISCARDED.
+
+    ``f_pre``'s reference validity was NEVER measured, so D6's "ambiguity ->
+    retain" must fire on it regardless of what any other cell carries. This is
+    the one direction PRD D6 calls permanently lossy: misbanding-to-retain costs
+    ~$20 of stage-2 spend, misbanding-to-discard loses the signal for good.
+    """
+    pre, post = _mixed_marker_results()
+
+    mixed = mod.partition_bands([pre, post], 0.80)
+    alone = mod.partition_bands([pre], 0.80)
+
+    assert mixed['by_fixture']['f_pre'] == 'intermittent'
+    assert 'f_pre' not in mixed['discarded']
+    # The keyless fixture's band must be INDEPENDENT of the sibling's presence.
+    assert mixed['by_fixture']['f_pre'] == alone['by_fixture']['f_pre']
+    # And the genuinely-measured sibling still bands on its own merits.
+    assert mixed['by_fixture']['f_post'] == 'ceiling'
+    assert mixed['discarded'] == ['f_post']
+
+
+def test_band_for_cell_reads_validity_per_cell():
+    """``band_for_cell(metrics, q_ceiling)`` — validity read off the CELL, no run flag.
+
+    The keyless and key-``True`` cases must be INDISTINGUISHABLE at the band
+    level: both mean "this cell's reference validity is not known-good", and
+    ``plan_quality`` is interpretable only where a real reference block exists.
+    The run-level parameter is gone entirely rather than ignored — an argument
+    that looks load-bearing but is not is precisely the trap that produced this
+    bug.
+    """
+    keyless = _metrics(plan_steps=5, plan_quality=0.95)
+    judged_without = _metrics(plan_steps=5, plan_quality=0.95,
+                              extra_metrics={'judged_without_reference': True})
+    validly_judged = _metrics(plan_steps=5, plan_quality=0.95,
+                              extra_metrics={'judged_without_reference': False})
+
+    assert mod.MARKER_KEY not in keyless, 'premise: this cell predates σ'
+
+    assert mod.band_for_cell(keyless, 0.80) == 'intermittent'
+    assert mod.band_for_cell(judged_without, 0.80) == 'intermittent'
+    assert mod.band_for_cell(validly_judged, 0.80) == 'ceiling'
+
+
+def test_mixed_corpus_count_reads_unmeasured_not_zero():
+    """One unmeasured architect cell makes the candidate's count ``None``, never ``0``.
+
+    Partial measurement is not measurement. ``0`` asserts "we looked at every
+    cell and none was judged without a reference" — the exact fabrication the
+    module forbids, and it would let ``plan_quality`` read as fully
+    validity-bounded when one of the two cells was never bounded at all.
+    Verified first-hand that the pre-fix code returned ``{'A': 0}`` here.
+    """
+    counts = mod.count_judged_without_reference(_mixed_marker_results())
+
+    assert counts['A'] is None
+    assert counts['A'] != 0
+
+
+def test_unmeasured_marker_cells_are_counted_per_candidate():
+    """``None`` alone cannot distinguish 1-of-50 unmeasured from 50-of-50.
+
+    So the driver also reports HOW MANY architect cells lacked the key, which
+    makes a partially-instrumented corpus legible rather than merely unknown.
+    """
+    assert mod.count_unmeasured_marker_cells(_mixed_marker_results()) == {'A': 1}
+
+    fully_keyed = [
+        _cell('f1', 'A', plan_steps=5, plan_quality=0.9,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f2', 'A', plan_steps=5, plan_quality=0.9,
+              extra_metrics={'judged_without_reference': True}),
+    ]
+    assert mod.count_unmeasured_marker_cells(fully_keyed) == {'A': 0}
+
+    fully_keyless = [
+        _cell('f1', 'A', plan_steps=5, plan_quality=0.9),
+        _cell('f2', 'A', plan_steps=5, plan_quality=0.9),
+        _cell('f3', 'A', plan_steps=5, plan_quality=0.9),
+    ]
+    assert mod.count_unmeasured_marker_cells(fully_keyless) == {'A': 3}
+
+
+def test_implementer_cell_missing_the_key_does_not_poison_the_count():
+    """A non-architect cell cannot flip a fully-measured candidate to unmeasured.
+
+    An implementer run never invokes the plan judge, so it is out of scope by
+    construction. The role filter must therefore run BEFORE the key check —
+    otherwise a single implementer cell riding along under the same config name
+    would erase a genuine, complete measurement.
+    """
+    results = [
+        _cell('f1', 'A', plan_steps=5, plan_quality=0.9,
+              extra_metrics={'judged_without_reference': True}),
+        _cell('f2', 'A', plan_steps=5, plan_quality=0.9,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f3', 'A', role_under_test='implementer'),  # no marker key at all
+    ]
+
+    assert mod.count_judged_without_reference(results) == {'A': 1}
+    assert mod.count_unmeasured_marker_cells(results) == {'A': 0}
+
+
+def test_uniform_corpora_are_unchanged():
+    """THE anti-overcorrection assertion: only the MIXED case may change.
+
+    Both uniform directions must behave exactly as before — an all-keyless
+    corpus still reports every count ``None`` and discards nothing, and an
+    all-keyed corpus still counts and bands exactly as it did.
+    """
+    # All keyless (today's instrument): unmeasured everywhere, nothing discarded.
+    keyless = _mixed_results()
+    assert all(v is None for v in mod.count_judged_without_reference(keyless).values())
+    assert mod.partition_bands(keyless, 0.80)['discarded'] == []
+
+    # All keyed (post-σ): real counts, and the ceiling band is reachable again.
+    keyed = [
+        _cell('f1', 'A', plan_steps=6, plan_quality=0.92,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f2', 'A', plan_steps=5, plan_quality=0.40,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f3', 'A', plan_steps=5, plan_quality=0.99,
+              extra_metrics={'judged_without_reference': True}),
+    ]
+    assert mod.count_judged_without_reference(keyed) == {'A': 1}
+    part = mod.partition_bands(keyed, 0.80)
+    assert part['discarded'] == ['f1']
+    assert part['by_fixture'] == {
+        'f1': 'ceiling', 'f2': 'intermittent', 'f3': 'intermittent',
+    }
