@@ -11,10 +11,18 @@ first-party package is imported here — that is load-bearing for the fallback
 verify chain (see the conftest docstring).
 """
 import ast
+import subprocess
+from pathlib import Path
 
 import pytest
 
 import check_method_param_wiring as cmpw
+
+# scripts/tests -> scripts -> repo root. Same idiom as
+# shared/tests/capability_manifest_corpus.py; correct inside a worktree too.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / 'scripts' / 'check_method_param_wiring.py'
+MEM0_CLIENT = 'fused-memory/src/fused_memory/backends/mem0_client.py'
 
 # Mirrors mem0_client.py's real shape: a class with two async methods, each
 # signature spread one parameter per line — the exact layout that defeats a
@@ -423,3 +431,50 @@ class TestMainOptionalConjuncts:
         rc = cmpw.main(['--file', 'nested/mod.py', *_ARGV_TAIL])
         assert rc == 0
         assert capsys.readouterr().err == ''
+
+
+class TestEndToEndAgainstTheRealRepo:
+    """Exec the script the way `_run_script_check` actually does.
+
+    It builds ``argv = [str(project_root / meta.script), *meta.args]`` and execs
+    it directly, so this is the only test that covers the shebang and the
+    executable bit as well as the assertion. A non-executable target raises
+    OSError, which `run_delivered_check`'s catch-all maps to ERRORED — a check
+    that can never pass and never fail, i.e. a capability that is silently
+    un-gated while looking configured.
+    """
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(SCRIPT), *args], cwd=REPO_ROOT, capture_output=True, text=True
+        )
+
+    def test_manifest_argv_passes_on_the_real_module(self):
+        """The positive case, with exactly the argv the manifest declares."""
+        result = self._run(
+            '--file', MEM0_CLIENT,
+            '--function', 'scroll_by_metadata',
+            '--param', 'with_vectors',
+            '--annotation', 'bool',
+            '--forwards-to', 'scroll',
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_the_mutation_the_whole_file_grep_would_have_missed_fails(self):
+        """`get_point_by_id` declares no `with_vectors` parameter.
+
+        Its `with_vectors=False` is a literal on `client.retrieve`. The
+        superseded whole-file grep `'with_vectors: bool'` would have reported
+        DELIVERED had the parameter landed here instead of on
+        `scroll_by_metadata`; this is the regression proof that the replacement
+        is method-scoped.
+        """
+        result = self._run(
+            '--file', MEM0_CLIENT,
+            '--function', 'get_point_by_id',
+            '--param', 'with_vectors',
+            '--annotation', 'bool',
+            '--forwards-to', 'retrieve',
+        )
+        assert result.returncode != 0
+        assert 'check_method_param_wiring:' in result.stderr
