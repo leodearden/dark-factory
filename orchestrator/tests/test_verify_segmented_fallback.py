@@ -981,6 +981,128 @@ class TestSegmentsAreDashNCapped:
         assert self._segment_cmds(calls) == [s.command for s in _fleet_segments()]
 
 
+class TestPerSegmentJunitIsDeliberatelyUnwired:
+    """Per-segment junitxml stays unwired, and says so out loud (task 3478).
+
+    Task 3338 left the junitxml branch on the segmented path as a recorded
+    follow-up. Reading the two gates rather than the comment shows it is not
+    a deferred feature but STRUCTURALLY UNREACHABLE code:
+
+    - ``junit_path`` is computed only when ``role == 'merge'`` and breadth is
+      'full' (verify.py's ``_prepare_junit_report_path`` call site);
+    - segmentation is opted into by exactly one call site,
+      ``run_scoped_verification``'s fallback, as
+      ``segment_chained_test=role != 'merge'``.
+
+    So whenever ``chain_segments`` is not None, ``junit_path`` is None.
+    Wiring per-segment junit today would produce a writer with no consumer:
+    ``_extract_failing_test_ids_from_junit`` runs only ``if junit_path is not
+    None``. The stated motivation — node-id attribution for the triaging
+    agent — is already served here by ``_extract_failing_test_ids``, the
+    stdout-regex counterpart, over ``_run_segmented``'s aggregate output.
+
+    A decision that lives only in a comment is one nobody reads, so the
+    second half of this class pins the LOUD guard instead: construct the
+    otherwise-unreachable co-occurrence and assert verify warns rather than
+    silently handing 8 pytest runs one last-writer-wins path.
+    """
+
+    @staticmethod
+    async def _run_merge_role_segmented(tmp_path, *, caplog):
+        """Force the co-occurrence the two production gates make impossible.
+
+        ``run_verification``'s public signature accepts ``role='merge'`` and
+        ``segment_chained_test=True`` independently — only the single
+        production call site couples them — so this is the exact future
+        change the guard exists to catch: someone segmenting a merge-role
+        verify, where a junit path IS computed.
+        """
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result, calls, runs = await TestRunVerificationSegmentChainedTestWiring._run(
+                tmp_path,
+                _FLEET_TEST_COMMAND,
+                config_overrides={'merge_verify_breadth': 'full'},
+                segment_chained_test=True,
+                role='merge',
+            )
+        # Preconditions, so neither guard test can pass vacuously: BOTH sides
+        # of the co-occurrence must really be present. `_prepare_junit_report_path`
+        # creates `.df-verify-junit` exactly when it returns a path, and 8
+        # `_run_cmd` calls mean the chain really did segment.
+        assert (tmp_path / '.df-verify-junit').exists(), 'no junit path was computed'
+        assert len([c for c in calls if 'pytest' in c['cmd']]) == 8, 'chain did not segment'
+        return result, calls, runs
+
+    @pytest.mark.asyncio
+    async def test_task_role_segmented_run_collects_no_junit_at_all(self, tmp_path):
+        """Status quo, green today and kept honest.
+
+        Even with breadth explicitly 'full', a task-role segmented run
+        computes no junit path, writes no report directory, and injects
+        ``--junitxml`` into no segment — because the breadth gate is
+        ``role == 'merge' and ...``. This is the mutual exclusion the
+        decision rests on; if it ever stops holding, this test says so.
+        """
+        _result, calls, _runs = await TestRunVerificationSegmentChainedTestWiring._run(
+            tmp_path,
+            _FLEET_TEST_COMMAND,
+            config_overrides={'merge_verify_breadth': 'full'},
+            segment_chained_test=True,
+            role='task',
+        )
+
+        assert not (tmp_path / '.df-verify-junit').exists()
+        assert not any('--junitxml' in c['cmd'] for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_task_role_segmented_run_reports_no_junit_derived_test_ids(self, tmp_path):
+        """The consumer half: no junit path means no junit-derived node ids."""
+        result, _calls, _runs = await TestRunVerificationSegmentChainedTestWiring._run(
+            tmp_path,
+            _FLEET_TEST_COMMAND,
+            config_overrides={'merge_verify_breadth': 'full'},
+            segment_chained_test=True,
+            role='task',
+        )
+
+        assert result.failing_test_ids is None
+
+    @pytest.mark.asyncio
+    async def test_the_co_occurrence_warns_naming_the_unwritten_path(self, tmp_path, caplog):
+        """RED until the guard exists: segmentation + a junit path must be loud.
+
+        Silence here is the failure mode worth catching — a future change
+        that made these co-occur would otherwise hand every segment the same
+        junit path, last-writer-wins, and look like it was working.
+        """
+        await self._run_merge_role_segmented(tmp_path, caplog=caplog)
+
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        junit_warnings = [r for r in warnings if 'junit' in r.getMessage().lower()]
+        assert junit_warnings, (
+            'segmentation co-occurring with a junit path must warn; '
+            f'got warnings: {[r.getMessage() for r in warnings]}'
+        )
+        message = junit_warnings[0].getMessage()
+        assert '.df-verify-junit' in message, (
+            f'the warning must name the path that will NOT be written: {message}'
+        )
+        assert '8' in message, f'the warning must state how many segments: {message}'
+
+    @pytest.mark.asyncio
+    async def test_the_guard_warns_instead_of_injecting_a_shared_junit_path(
+        self, tmp_path, caplog,
+    ):
+        """It must not 'helpfully' inject: one path for 8 runs is last-writer-wins."""
+        _result, calls, _runs = await self._run_merge_role_segmented(
+            tmp_path, caplog=caplog,
+        )
+
+        assert not any('--junitxml' in c['cmd'] for c in calls)
+
+
 class _SegmentedBudgetClock:
     """A monotonic clock that blows ``_run_segmented``'s budget after N segments.
 
