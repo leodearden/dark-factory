@@ -1305,7 +1305,55 @@ def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
 # operator (&&, ||, ;) or end of string — the span serial_pytest's raw-chain
 # path rewrites. Word-bounded so it doesn't match inside 'pytest_xdist' etc.
 # Moved from verify.py's _PYTEST_INVOCATION_RE / _force_serial_pytest.
+#
+# Deliberately left broad — it does NOT exclude ')' — even though a matched
+# span can therefore run past a subshell-closing ')' (the committed fleet
+# test_command's cockpit clause is exactly this shape:
+# ``( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/
+# --timeout=300 )``). The tempting fix, adding ')' to the excluded class
+# (``[^&|;)]*``), was measured and REJECTED (task 3650): it repairs that one
+# chain but silently corrupts any invocation whose own arguments legitimately
+# contain a ')' — e.g. ``pytest -k "not (slow or integration)" tests/``
+# becomes ``pytest -k "not (slow or integration -p no:xdist -o
+# addopts='')" tests/``, which still passes ``bash -n`` while running the
+# wrong tests (the flags land inside the quoted expression and `tests/` is
+# orphaned outside the invocation). That trades today's loud syntax error for
+# a silent wrong-tests-run, which is strictly worse. Keep this pattern
+# byte-identical; fix placement in ``_append_to_raw_pytest_invocations``
+# instead, via ``_split_at_unbalanced_close``.
 _PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
+
+
+def _split_at_unbalanced_close(segment: str) -> tuple[str, str]:
+    """Split *segment* at its first depth-0 ')', or return it whole.
+
+    Scans *segment* left to right tracking paren depth (``(`` increments,
+    ``)`` decrements) and returns ``(body, closer)`` split at the first
+    ``)`` that would take depth below zero — i.e. a ``)`` NOT opened by a
+    ``(`` occurring earlier in *segment* itself. Such a ``)`` closes a group
+    that started before *segment* (e.g. the subshell wrapping a pytest
+    invocation), so it and everything from it onward belong outside the
+    invocation's own arguments. A ``)`` that IS balanced within *segment*
+    (e.g. inside a ``-k "not (slow)"`` expression or a ``$(...)``
+    substitution) stays in *body*. Returns ``(segment, '')`` when *segment*
+    contains no such unbalanced ``)``.
+
+    Quote-blind by design: parens inside quotes are themselves balanced in
+    any sane command, so a quote-aware scanner would add real complexity for
+    no measured behaviour change — see the design decision recorded for task
+    3650. Every measured shape (the fleet chain, a ``-k`` expression, a
+    ``$(...)`` substitution, a no-space ``(cd x && pytest tests/)``) reaches
+    the correct split with this quote-blind counter alone.
+    """
+    depth = 0
+    for i, ch in enumerate(segment):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            if depth == 0:
+                return segment[:i], segment[i:]
+            depth -= 1
+    return segment, ''
 
 
 def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
@@ -1313,16 +1361,25 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
 
     Shared rewrite closure for ``serial_pytest``/``apply_pytest_numprocesses``'s
     raw-retained (chained) path: matches each ``_PYTEST_INVOCATION_RE`` span,
-    strips trailing whitespace, appends *suffix*, then re-attaches the
-    trailing whitespace so an immediately-following chain operator (e.g.
+    then anchors the append to the end of the pytest invocation's own
+    ARGUMENTS rather than to the end of the matched span — the span can run
+    past a subshell-closing ')' (see ``_PYTEST_INVOCATION_RE``'s comment),
+    and appending there would produce an unparseable shell command. Each
+    matched span is split via ``_split_at_unbalanced_close`` into a ``body``
+    (the invocation's own arguments, ')'-free at depth 0) and a ``closer``
+    (a subshell-closing ')' onward, or ``''`` if none); *suffix* is appended
+    to ``body``, and ``closer`` is re-attached last. Within ``body``,
+    trailing whitespace is stripped, *suffix* appended, then the trailing
+    whitespace re-attached so an immediately-following chain operator (e.g.
     `` && ``) survives untouched. *suffix* should include its own leading
     space (e.g. ``' -n 16'``).
     """
     def _rewrite(match: re.Match[str]) -> str:
         segment = match.group(0)
-        stripped = segment.rstrip()
-        trailing = segment[len(stripped) :]
-        return f'{stripped}{suffix}{trailing}'
+        body, closer = _split_at_unbalanced_close(segment)
+        stripped = body.rstrip()
+        trailing = body[len(stripped) :]
+        return f'{stripped}{suffix}{trailing}{closer}'
 
     return _PYTEST_INVOCATION_RE.sub(_rewrite, raw)
 
