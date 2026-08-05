@@ -148,16 +148,11 @@ tasks:
       literal in the module is with_vectors=False inside get_point_by_id (client.retrieve,
       mem0_client.py:454), a different call site that delta does not touch. CHECK
       TIGHTENED (task 3364): the superseded {kind: grep, pattern: ''with_vectors: bool''}
-      was FILE-scoped, so it would have reported DELIVERED had the parameter landed
-      on get_point_by_id instead of scroll_by_metadata — git grep -E is single-line
-      POSIX ERE and this module spreads every def across lines, so no single-line
-      pattern can bind a match to one signature. Replaced by a method-scoped AST
-      check that asserts scroll_by_metadata specifically DECLARES with_vectors: bool
-      and FORWARDS it by name into client.scroll (an ast.Name value, so a hardcoded
-      literal like get_point_by_id''s with_vectors=False does not satisfy it —
-      declaration alone is not vector access). timeout_secs: 60 mirrors the sole
-      existing kind: script precedent (plans/agent-transcript-archival-prd.capability-manifest.yaml);
-      the check is a pure single-file AST parse, so 60s is generous'
+      was FILE-scoped and so could not tell those two call sites apart; it is replaced
+      by a method-scoped AST check asserting that scroll_by_metadata specifically
+      declares AND forwards with_vectors. Why a grep cannot do this, and why each
+      conjunct is load-bearing, is argued in scripts/check_method_param_wiring.py''s
+      module docstring — do not restate it here'
     verdict: PASS
     delivered_check:
       kind: script

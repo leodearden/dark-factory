@@ -89,12 +89,10 @@ One §6 row was re-checked at the re-walk and found accurate — no drift:
   literal belongs to `get_point_by_id`; (b) the file-scoped grep was replaced by a
   method-scoped `kind: script` check (`scripts/check_method_param_wiring.py`) that
   asserts `scroll_by_metadata` specifically *declares* `with_vectors: bool` and
-  *forwards* it by name into `client.scroll`. A grep could not do this: `_run_grep_check`
-  shells to `git grep -E` — single-line POSIX ERE, no multiline mode — while this
-  module spreads every `def` across lines, so no single-line pattern can bind a match
-  to one signature. Requiring the forwarded value to be a *name* rather than a literal
-  is also what separates the two call sites the original mix-up confused, and keeps a
-  stub parameter that is accepted and then dropped from counting as vector access.
+  *forwards* it by name into `client.scroll` — exactly the discrimination the
+  whole-file grep could not make. Why a grep cannot be method-scoped here, and why
+  the forwarding conjunct is load-bearing rather than decorative, is argued once in
+  that script's module docstring.
 
 All other spot-checked rows verified clean on main: unvalidated `category: str`
 (`escalation/models.py:93`) ⇒ `eval_regression` filable; direct `EscalationQueue`
