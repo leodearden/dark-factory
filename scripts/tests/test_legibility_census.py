@@ -3198,3 +3198,156 @@ def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
     # (3) synthesize_fn -> the one large Fable call carries 1800.
     kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
     assert recorded[-1] == {"model": "fable", "timeout": 1800}
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / DEFECT 3: a cap arriving DURING verification must never be
+# laundered into a verdict.
+#
+# _build_default_verify_fn fails CLOSED per cluster: any invocation error or
+# parse failure appends the cluster to `rejected` and continues. That is the
+# right default for a genuinely unverifiable CLAIM, and exactly wrong for an
+# infra failure -- a cap mid-verify silently mass-rejects the remaining
+# population, and the run exits 0 looking unremarkable.
+#
+# Three detectors, ordered cheapest-first. These two fire at the FIRST
+# corrupted cluster, which is what a periodic counter alone cannot do.
+# ---------------------------------------------------------------------------
+
+def _verdict(verified=True):
+    return json.dumps({"verified": verified, "reason": "because"})
+
+
+def _clusters(n):
+    return [{"title": f"cluster-{i}"} for i in range(n)]
+
+
+def _make_recording_probe(*results):
+    """Fake `headroom_probe() -> HeadroomResult` seam, recording its calls.
+
+    Returns the i-th result for the i-th call, repeating the last one after
+    that, so a test can say "healthy, then capped" without counting calls.
+    """
+    calls = []
+
+    def probe():
+        calls.append(len(calls))
+        return results[min(len(calls) - 1, len(results) - 1)]
+
+    probe.calls = calls
+    return probe
+
+
+def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner():
+    """Detector (a): the cap text arrives as the verify reply itself.
+
+    This is the FREE detector -- the reply is already paid for, so scanning
+    it costs nothing and no probe is needed. It is also the common case: the
+    CLI prints the cap banner to stdout, which parse_coder_output would
+    otherwise turn into a parse failure and thus a rejection.
+    """
+    cap = REAL_CLI_CAP_MESSAGES[0]
+    replies = [_verdict(), _verdict(), cap, _verdict(), _verdict()]
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        return replies[len(calls) - 1]
+
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(5), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.reason and "banner" in exc.reason.lower()
+    assert exc.verified == 2, "the two clusters adjudicated before the cap"
+    assert exc.unverified == 3, "the hitting cluster plus the two never attempted"
+    assert probe.calls == [], "this detector must not spend a probe -- the reply was free"
+
+
+def test_default_verify_fn_raises_when_an_invocation_error_reprobes_capped():
+    """Detector (b): a per-cluster invocation error, then a failing re-probe.
+
+    The cluster that hit the cap must NOT be recorded as rejected. Recording
+    it would be the defect in miniature: an infra failure written into the
+    codebook as a verdict about the claim.
+    """
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+        return _verdict()
+
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker")
+    )
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(4), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 1
+    assert exc.unverified == 3
+    assert len(probe.calls) == 1, "exactly one re-probe, on a path that already failed"
+
+
+def test_default_verify_fn_still_rejects_when_the_reprobe_says_healthy():
+    """Detector (b), negative: a healthy re-probe preserves the fail-closed contract.
+
+    An invocation error with capacity still available means the claim really
+    could not be verified. That must keep rejecting exactly as it does today
+    -- the guard narrows the fail-closed default to non-cap causes, it does
+    not remove it.
+    """
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            raise coder.CoderInvocationError("claude CLI exited 1: unrelated outage")
+        return _verdict()
+
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    result = verify_fn(_clusters(4), model="sonnet")
+
+    assert len(probe.calls) == 1
+    assert len(result["verified"]) == 3, "the loop ran to completion"
+    rejected_titles = {c["title"] for c in result["rejected"]}
+    assert rejected_titles == {"cluster-1"}, "the failing cluster rejects, as today"
+
+
+def test_default_verify_fn_without_probe_args_behaves_exactly_as_before():
+    """The pre-existing signature keeps working, unguarded and fail-closed.
+
+    Every existing call site and test passes no probe; they must be
+    completely unaffected by this work.
+    """
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            raise coder.CoderInvocationError("claude CLI exited 1: simulated outage")
+        return _verdict()
+
+    verify_fn = mod._build_default_verify_fn("/tmp/root", invoke)
+    result = verify_fn(_clusters(3), model="sonnet")
+
+    assert len(result["verified"]) == 2
+    assert [c["title"] for c in result["rejected"]] == ["cluster-1"]
+    assert result["fixed"] == []
