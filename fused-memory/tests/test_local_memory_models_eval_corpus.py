@@ -22,6 +22,7 @@ import asyncio
 import dataclasses
 import hashlib
 import importlib.util
+import json
 import random
 import re
 import sys
@@ -806,3 +807,230 @@ class TestNoGraphitiDriverIsConstructed:
         ]
         assert not [ln for ln in imports if 'falkordb_driver' in ln or 'FalkorDriver' in ln]
         assert not [ln for ln in imports if 'graphiti_core' in ln]
+
+
+# ===========================================================================
+# Manifest — structure, reconciliation, byte-stability
+# ===========================================================================
+
+# The literal the delivered_check greps for on the COMMITTED tree
+# (plans/local-memory-models-eval-prd.capability-manifest.yaml). Assembled from
+# fragments so this test module never itself satisfies the check it is
+# asserting on — the manifest-pair docs use the same trick with 'PRD[-]MARKER'.
+MARKER = 'PRD' + '-MARKER:local-memory-models-eval corpus' + '-manifest'
+
+
+def _built(n: int = 20, seed: str = 's', population=None):
+    """Build a manifest over a synthetic population."""
+    population = population if population is not None else _population(SYNTHETIC_CELLS)
+    result = _mod.select(population, n, seed=seed)
+    return _mod.build_manifest(result, population, n=n, seed=seed, graph='dark_factory')
+
+
+class TestManifestEpisodes:
+    """The ids + content hashes the task requires."""
+
+    def test_one_entry_per_selected_episode(self):
+        manifest = _built(n=20)
+        assert len(manifest['episodes']) == 20
+
+    def test_entry_shape(self):
+        entry = _built()['episodes'][0]
+        assert set(entry) == {'uuid', 'content_hash', 'month', 'payload_kind'}
+
+    def test_content_hash_is_the_full_digest_of_the_episode_content(self):
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        by_uuid = {r.uuid: r for r in population}
+        for entry in manifest['episodes']:
+            assert entry['content_hash'] == _mod.content_hash(by_uuid[entry['uuid']].content)
+            assert len(entry['content_hash']) == 64
+
+    def test_episode_content_itself_is_not_copied_into_the_manifest(self):
+        """The manifest is an index, not a copy of the store.
+
+        The replay engines read content from the store by uuid; duplicating it
+        here would create a second copy that can silently disagree with the
+        first, and hash drift would then be undetectable.
+        """
+        entry = _built()['episodes'][0]
+        assert 'content' not in entry
+
+    def test_episodes_are_in_the_selection_order(self):
+        manifest = _built(n=20)
+        result = _mod.select(_population(SYNTHETIC_CELLS), 20, seed='s')
+        assert [e['uuid'] for e in manifest['episodes']] == _uuids(result.selected)
+
+
+class TestManifestCriteria:
+    """Everything needed to re-derive the sample, recorded in the artifact."""
+
+    def test_records_every_re_derivation_input(self):
+        criteria = _built(n=20, seed='s')['criteria']
+        assert criteria['seed'] == 's'
+        assert criteria['n'] == 20
+        assert criteria['graph'] == 'dark_factory'
+        assert criteria['stratification_dimensions'] == [
+            'month(created_at)',
+            'payload_kind(source_description)',
+        ]
+        assert criteria['allocation_rule'] == _mod.ALLOCATION_RULE
+        assert criteria['selection_rule'] == _mod.SELECTION_RULE
+        assert criteria['builder_version'] == _mod.BUILDER_VERSION
+        assert criteria['population_size'] == len(_population(SYNTHETIC_CELLS))
+
+    def test_records_the_observed_window(self):
+        criteria = _built()['criteria']
+        assert criteria['window']['min_created_at'] <= criteria['window']['max_created_at']
+        assert criteria['window']['min_created_at'].startswith('2026-04')
+
+    def test_records_n_as_provisional_pending_zeta(self):
+        """PRD Open Q4 defers the final N to zeta; the artifact must say so.
+
+        Without it a later reader takes 200 for a settled figure and a re-tune
+        looks like a contradiction rather than the planned next step.
+        """
+        criteria = _built()['criteria']
+        assert 'n_rationale' in criteria
+        assert 'zeta' in criteria['n_rationale'].lower()
+
+
+class TestStratificationReport:
+    """Per-cell accounting that reconciles to the whole population."""
+
+    def test_covers_every_non_empty_cell(self):
+        report = _built(n=20)['stratification_report']
+        assert set(report['cells']) == {f'{m}|{k}' for m, k in SYNTHETIC_CELLS}
+
+    def test_each_cell_reports_population_allocated_selected(self):
+        report = _built(n=20)['stratification_report']
+        for key, cell in report['cells'].items():
+            assert set(cell) == {'population', 'allocated', 'selected'}
+            assert cell['allocated'] == cell['selected'], key
+            assert cell['selected'] <= cell['population'], key
+
+    def test_selected_totals_to_n(self):
+        report = _built(n=20)['stratification_report']
+        assert sum(c['selected'] for c in report['cells'].values()) == 20
+        assert report['totals']['selected'] == 20
+
+    def test_population_totals_reconcile_no_cell_silently_dropped(self):
+        """The check that makes the report trustworthy rather than decorative.
+
+        If the per-cell populations do not sum to population_size, a cell was
+        dropped between the fetch and the report — and every proportional share
+        in the artifact is then computed against a denominator that does not
+        describe the store.
+        """
+        manifest = _built(n=20)
+        report = manifest['stratification_report']
+        summed = sum(c['population'] for c in report['cells'].values())
+        assert summed == report['totals']['population']
+        assert summed == manifest['criteria']['population_size']
+
+    def test_reports_the_not_selected_count(self):
+        """Exhaustive disposition survives into the artifact."""
+        manifest = _built(n=20)
+        totals = manifest['stratification_report']['totals']
+        assert totals['selected'] + totals['not_selected'] == totals['population']
+
+
+class TestNoOutcomeFilterStatement:
+    """The guarantee, recorded so a reviewer can CHECK it rather than trust it."""
+
+    def test_carries_the_prose_statement(self):
+        block = _built()['no_outcome_filter']
+        assert isinstance(block['statement'], str)
+        assert len(block['statement']) > 80
+
+    def test_records_the_projected_field_list_as_a_machine_checkable_fact(self):
+        block = _built()['no_outcome_filter']
+        assert block['projected_fields'] == list(_mod.PROJECTED_FIELDS)
+
+    def test_projected_fields_contain_no_outcome_signal(self):
+        block = _built()['no_outcome_filter']
+        for field in block['projected_fields']:
+            assert 'entity_edges' not in field
+            assert 'edges' not in field
+
+    def test_records_that_entity_edges_was_neither_queried_nor_used(self):
+        block = _built()['no_outcome_filter']
+        assert block['entity_edges_queried'] is False
+        assert block['entity_edges_used_as_filter'] is False
+        assert block['entity_edges_used_as_stratum'] is False
+
+    def test_records_the_query_that_was_actually_issued(self):
+        """The strongest checkable fact: the reviewer reads the real Cypher."""
+        block = _built()['no_outcome_filter']
+        assert block['population_query'] == _mod.POPULATION_CYPHER
+        assert 'entity_edges' not in block['population_query']
+        assert 'WHERE' not in block['population_query'].upper()
+
+    def test_records_the_stratification_dimensions_used(self):
+        block = _built()['no_outcome_filter']
+        assert block['stratification_dimensions'] == [
+            'month(created_at)',
+            'payload_kind(source_description)',
+        ]
+
+
+class TestManifestSerialization:
+    """Canonical, re-runnable, and carrying the marker."""
+
+    def test_carries_the_prd_marker_as_a_top_level_field(self):
+        assert _built()['prd_marker'] == MARKER
+
+    def test_marker_survives_serialization_intact(self):
+        """The delivered_check greps the SERIALIZED text, not the dict."""
+        assert MARKER in _mod.serialize_manifest(_built())
+
+    def test_serialization_is_canonical(self):
+        text = _mod.serialize_manifest(_built())
+        assert text.endswith('\n')
+        assert json.loads(text) == _built()
+        keys = list(json.loads(text))
+        assert keys == sorted(keys)
+
+    def test_two_builds_over_an_unchanged_population_are_byte_identical(self):
+        """The determinism convention: a re-run must diff cleanly against itself.
+
+        Without it a real change would be unreadable, buried in incidental
+        reordering.
+        """
+        first = _mod.serialize_manifest(_built())
+        for _ in range(3):
+            assert _mod.serialize_manifest(_built()) == first
+
+    def test_shuffled_population_yields_a_byte_identical_manifest(self):
+        """Store row order must not reach the artifact."""
+        population = _population(SYNTHETIC_CELLS)
+        baseline = _mod.serialize_manifest(_built(population=population))
+        shuffled = list(population)
+        random.Random(3).shuffle(shuffled)
+        assert _mod.serialize_manifest(_built(population=shuffled)) == baseline
+
+    def test_non_ascii_is_kept_verbatim_not_escaped(self):
+        population = [
+            *_population(SYNTHETIC_CELLS),
+            _record('ffffffff-0000-0000-0000-000000000000', '2026-08', 'temporal_facts',
+                    content='δ corpus — naïve'),
+        ]
+        text = _mod.serialize_manifest(_built(n=20, population=population))
+        assert '\\u' not in text
+
+    def test_write_manifest_round_trips(self, tmp_path):
+        path = tmp_path / 'corpus_manifest.json'
+        manifest = _built()
+        _mod.write_manifest(manifest, path)
+        assert json.loads(path.read_text(encoding='utf-8')) == manifest
+        assert MARKER in path.read_text(encoding='utf-8')
+
+    def test_default_manifest_path_is_under_scripts_not_gitignored_data(self):
+        """fused-memory/.gitignore ignores data/, so a manifest written to the
+        usual eval-artifact directory would be uncommittable and would fail the
+        delivered_check, which greps the COMMITTED tree.
+        """
+        path = Path(_mod.DEFAULT_MANIFEST_PATH)
+        assert path.parent.name == 'local_memory_models_eval'
+        assert 'scripts' in path.parts
+        assert 'data' not in path.parts
