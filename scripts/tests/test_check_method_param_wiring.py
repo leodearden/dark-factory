@@ -11,6 +11,7 @@ first-party package is imported here — that is load-bearing for the fallback
 verify chain (see the conftest docstring).
 """
 import ast
+import os
 import subprocess
 from pathlib import Path
 
@@ -478,3 +479,73 @@ class TestEndToEndAgainstTheRealRepo:
         )
         assert result.returncode != 0
         assert 'check_method_param_wiring:' in result.stderr
+
+
+MANIFEST = REPO_ROOT / 'docs' / 'prds' / 'memory-eval-program.capability-manifest.yaml'
+CAPABILITY = 'qdrant-vector-access-for-ann'
+
+
+@pytest.fixture
+def delivered_check() -> dict:
+    """The `qdrant-vector-access-for-ann` delivered_check, from the sidecar.
+
+    Plain `yaml.safe_load`, NOT `shared.capability_manifest` — `conftest.py`
+    documents "scripts/tests/ imports no first-party package" as load-bearing
+    for the fallback verify chain, which folds this directory into a single
+    `uv run --project shared pytest` invocation on the strength of it.
+    """
+    import yaml
+
+    doc = yaml.safe_load(MANIFEST.read_text())
+    for task in doc.get('tasks', []):
+        for capability in task.get('capabilities', []):
+            if capability.get('name') == CAPABILITY:
+                return capability['delivered_check']
+    pytest.fail(f'{CAPABILITY} not found in {MANIFEST}')
+
+
+class TestManifestScriptCoherence:
+    """A manifest naming a script that cannot be exec'd is ERRORED forever.
+
+    Complements rather than duplicates
+    `shared/tests/test_capability_manifest.py::TestCheckedInManifestCorpus`,
+    whose docstring states it deliberately "Does NOT assert delivered_check
+    `script:` targets exist on disk". That exclusion is exactly the silent
+    un-gating this task exists to remove, so it is the one thing worth pinning.
+    """
+
+    def test_check_is_the_script_kind(self, delivered_check):
+        assert delivered_check['kind'] == 'script'
+
+    def test_declared_script_exists_and_is_executable(self, delivered_check):
+        target = REPO_ROOT / delivered_check['script']
+        assert target.is_file(), f'{target} does not exist'
+        assert os.access(target, os.X_OK), (
+            f'{target} is not executable; _run_script_check execs it as argv[0], '
+            'so a non-executable target ERRORs forever'
+        )
+
+    def test_timeout_secs_is_set_and_positive(self, delivered_check):
+        """The schema requires it for kind: script."""
+        assert delivered_check.get('timeout_secs') is not None
+        assert delivered_check['timeout_secs'] > 0
+
+    def test_grep_only_fields_are_absent(self, delivered_check):
+        """`_check_kind_conditional_fields` FORBIDS these for kind: script."""
+        assert not delivered_check.get('pattern')
+        assert not delivered_check.get('expect')
+        assert not delivered_check.get('paths')
+
+    def test_args_name_what_makes_the_check_method_scoped(self, delivered_check):
+        args = delivered_check['args']
+        assert MEM0_CLIENT in args
+        assert 'scroll_by_metadata' in args
+        assert 'with_vectors' in args
+
+    def test_manifest_argv_is_the_argv_the_end_to_end_test_runs(self, delivered_check):
+        """Sidecar and script must not drift apart silently."""
+        args = delivered_check['args']
+        assert args[args.index('--file') + 1] == MEM0_CLIENT
+        assert args[args.index('--function') + 1] == 'scroll_by_metadata'
+        assert args[args.index('--param') + 1] == 'with_vectors'
+        assert delivered_check['script'] == 'scripts/check_method_param_wiring.py'
