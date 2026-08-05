@@ -352,6 +352,29 @@ function axisPaths(values, geom) {
   return { line: lines.join(' '), area: areas.join(' ') };
 }
 
+// ── Bar heights as a fraction of the axis max (`BarChart`, `HistBar`) ──────
+// Returns { fractions }, the SAME length as `values`, holding `null` at every
+// hole and `values[i] / max` everywhere else. The caller multiplies by
+// whatever its bar space is — chartH pixels for BarChart, 100 percent for
+// HistBar — so one helper serves both.
+//
+// WHY A NULL ENTRY AND NOT A ZERO. There is no NUMBER a bar renderer can draw
+// that means "no measurement here". charts.jsx proved this twice: a `null`
+// coerced to 0 gave a zero-height bar indistinguishable from a measured zero,
+// and HistBar's `minHeight: 1` floor turned that same hole into a visible 1px
+// stub — a fabricated measurement, drawn at a fixed size no data produced.
+// Handing back a null forces the caller to decide explicitly, which is what
+// lets it drop the bar while KEEPING the slot's category label and x position:
+// an absent bar in a labelled slot reads as "not measured", where an absent
+// slot would silently relabel every bar after it.
+//
+// `max` is an explicit argument rather than folded here so HistBar's
+// `maxOverride ?? plottableMax(...)` precedence survives unchanged and both
+// paths run the same arithmetic.
+function barFractions(values, max) {
+  return { fractions: (values || []).map(v => (isPlottable(v) ? v / max : null)) };
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced by
 // dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
@@ -365,6 +388,7 @@ const SPARK_PATH_API = {
   plottableMax,
   axisY,
   axisPaths,
+  barFractions,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
