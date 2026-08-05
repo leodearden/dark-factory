@@ -24,12 +24,19 @@ against a named constant, not a prose or regex pin.
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import (
     BACKGROUND_TASK_WARNING,
     BACKGROUND_WAIT_GUIDANCE,
     ROLES,
     WAIT_PATTERN_GUIDANCE,
 )
+from orchestrator.config import GitConfig, OrchestratorConfig
 
 # A role can encounter background work iff it holds the UNQUALIFIED ``'Bash'``
 # tool — i.e. it can launch a build, a full test suite, or a long verification
@@ -189,4 +196,56 @@ def test_combined_guidance_is_stated_up_front() -> None:
         f'(budget={_UP_FRONT_CHAR_BUDGET} chars, and it must precede '
         f'{_TAIL_BLOCK_LANDMARK!r}). Splice BACKGROUND_WAIT_GUIDANCE immediately '
         'after the opening identity paragraph, before the first `##` heading.'
+    )
+
+
+@pytest.fixture
+def briefing(tmp_path: Path) -> BriefingAssembler:
+    """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O),
+    mirroring the fixture in test_roles_background_warning.py."""
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    return BriefingAssembler(config)
+
+
+@pytest.mark.asyncio
+async def test_amender_prompt_carries_combined_guidance(
+    briefing: BriefingAssembler,
+) -> None:
+    """The built amender turn-prompt reinforces BOTH rules, not just 2761's half.
+
+    The amender has no dedicated role — it runs under IMPLEMENTER's system
+    prompt, which now carries the block up front. The turn-prompt injection is
+    the deliberate at-the-failure-site reinforcement: Reify-5164's amender
+    backgrounded a 2700s verify and ended its turn at exactly the "Run
+    verification before finishing" step this block sits under. An amender told
+    only "don't end your turn" and not "here is how to wait" is the case this
+    task exists to close.
+
+    ``_get_memory_context`` is patched to a stub so no real fused-memory HTTP
+    call fires (mirrors the resume golden test).
+    """
+    with patch.object(
+        BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
+    ):
+        prompt = await briefing.build_amender_prompt(
+            plan={'task_id': '1', 'title': 't', 'analysis': 'a'},
+            iteration_log=[],
+            suggestions=[],
+            locked_modules=['x'],
+            task_id='1',
+        )
+
+    assert BACKGROUND_WAIT_GUIDANCE in prompt, (
+        'The amender turn-prompt does not carry BACKGROUND_WAIT_GUIDANCE. '
+        'build_amender_prompt must interpolate the combined unit, not '
+        'BACKGROUND_TASK_WARNING alone — the wait-pattern half is what tells the '
+        'amender how to run a long verify without abandoning it.'
     )
