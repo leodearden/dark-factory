@@ -84,6 +84,55 @@ earlier entry. If anything escapes anyway, the CLI prints the **partial** report
 **before** any further large consolidation pass — consolidation deletes
 corrupted entries as a merge side effect and destroys the specimens.
 
+#### First live-corpus sweep: ~0.19% incidence, and `--apply` must not run sandboxed (task 3567)
+
+Ran 3083's sweep against the live Mem0/Qdrant corpus. This ships no runtime
+behaviour; the deliverable is committed evidence in
+[`docs/toolcall-xml-leak-sweep-2026-08-05/`](docs/toolcall-xml-leak-sweep-2026-08-05/)
+— verbatim report, provenance sidecar, and `investigation.md`.
+
+**The incidence measurement**, the first anyone has had: an exhaustive walk of
+**21,080 points** found **41 leak-carrying records (~0.19%)** — 1
+`repairable_duplicate`, 40 `manual_review`, 0 `repairable_tail`. Read it as a
+statement about what the sweep walked, not a clean ratio over the collection:
+the corpus takes concurrent writes, consolidation *deletes* entries so the count
+is not monotonic, and `scan_payload_text` scopes by `group_id` while a
+collection count does not. Both 2026-07-27 specimens were already consolidated
+away before the run — the evidence-loss risk that motivated running this now was
+real, and it had already fired.
+
+**All 40 `manual_review` records were adjudicated by hand** (nothing mutated),
+each verdict re-derived by running the production detector over that record's own
+content. They share one shape, and it is not the shape 3083 anticipated: a stray
+closing tag followed by a `parameter` continuation naming a **sibling argument**
+whose value is the swallowed remainder — manifestation #1 (sibling-argument loss,
+the silent one) in live data at scale. 35 swallowed a short `priority`/`category`
+value; 3 are nested double leaks that are functionally `repairable_duplicate` but
+invisible to the detector; **2 need a human**, holding ~1KB of real prose and a
+JSON blob that a tail-drop would destroy. A third repairable shape would make 38
+of the 40 auto-repairable — filed as follow-up, not done here.
+
+**`--apply` must not be run from a sandboxed agent session.** The gated apply run
+repaired 0 records and **deleted one record from Qdrant with no re-add**
+(`7d073281`, flagged `record_error`). The sandbox denies file *creation* under
+`~/.mem0`, so SQLite cannot create its rollback journal and mem0's history write
+fails with *"attempt to write a readonly database"* — while the Qdrant delete,
+being a network call, succeeds. That splits delete-then-re-add down the middle.
+The record's text survives **only because the dry-run report was committed
+first**, which is exactly the ordering constraint the runbook prescribes; that
+safety net fired on its first real use. Two lessons now in the runbook: read the
+per-record flags rather than the exit code (exit 1 was overdetermined here, and
+the exit code alone would have hidden the mutation), and run `--apply` from an
+ordinary interactive shell. Recovery of `7d073281` from the committed report is
+**still outstanding** — the blocking escalation was auto-dismissed on timeout,
+not adjudicated.
+
+`fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py` guards any
+committed sweep artifact against fabrication: it re-runs the production
+`classify_record` over each record's own stored content and requires a provenance
+sidecar naming the collection, sha, argv and bracketing point counts. Hermetic —
+no live store — so it stays green whether or not Qdrant is up.
+
 ### Changed (BREAKING)
 
 #### MCP writes carrying raw envelope markup are now REJECTED (task 3141)

@@ -235,8 +235,11 @@ discard.
 
 ## 4. What was repaired — **nothing, and one record was lost**
 
-> **Status: escalated as a blocker (`esc-3567-2`). Store state needs human
-> adjudication. Do not re-run the sweep to "fix" this.**
+> **Status: OUTSTANDING. Escalated as a blocker (`esc-3567-2`); that escalation
+> was subsequently AUTO-DISMISSED on timeout — "steward did not resolve within
+> the ESCALATED wait window" — not adjudicated by a human. Recovery of
+> `7d073281` has therefore not happened and is still owed. Do not re-run the
+> sweep to "fix" this.**
 
 The gate opened (`repairable_tail 0 + repairable_duplicate 1 = 1 ≥ 1`), so
 `--apply` ran, with the dry-run report and its sidecar already committed —
@@ -306,6 +309,15 @@ The content is not lost, because it was committed first. To restore
 id will necessarily differ. Per the runbook, do **not** re-run the sweep to
 recover it.
 
+**This has not been done.** It was left for a human deliberately — re-adding
+text to the shared corpus mints a new id and is a mutation whose authorisation
+is not this task's to assume — and the escalation that asked for that decision
+was auto-dismissed on timeout rather than answered. Two decisions remain open:
+the recovery above, and whether `--apply`-class operations should be blocked
+from sandboxed sessions outright or the sandbox permit writes under `~/.mem0`.
+Until one lands, no agent session should run this sweep — or any
+`delete_memory` — with `--apply`.
+
 ---
 
 ## 5. Caveats and boundaries
@@ -347,4 +359,7 @@ without touching production memory.
 - Task 3243 — blank `collection` field in the report (pending)
 - Task 2939 — the task-DB-side scan (`scripts/scan_task_toolcall_leaks.py`)
 - Escalation `esc-3567-1` — this sweep's findings, filed as disclosure
+  (**auto-dismissed on timeout**, so the class-3 dispositions were never ruled on)
+- Escalation `esc-3567-2` — the partial-mutation blocker of §4
+  (**auto-dismissed on timeout**; recovery of `7d073281` still owed)
 - Ticket `tkt_0RS3HSVVY7CGSQSMNM8P5KH184` — follow-up: a third repairable shape
