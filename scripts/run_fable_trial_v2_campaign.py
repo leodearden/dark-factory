@@ -516,14 +516,64 @@ def partition_bands(results: list[Any], q_ceiling: float) -> dict[str, Any]:
     }
 
 
-def _run_campaign(*args: Any, **kwargs: Any) -> list[Any]:
-    """The LIVE real-API-spend seam — wired in a later step of this task.
+def _run_campaign(
+    fixture_paths: list[Path],
+    candidates: list[Any],
+    *,
+    trials: int,
+    max_parallel: int | None,
+    config_path: Path | None,
+    timeout: int | None,
+) -> list[Any]:
+    """Drive the campaign LIVE over ``run_ofat_stage`` and persist every cell.
 
-    Named and referenced from ``main`` already so ``--dry-run``'s
-    never-reach-the-live-path guarantee is testable by monkeypatching THIS
-    attribute rather than a heavyweight transitive import.
+    THE single real-API-spend seam, and deliberately not unit-tested end to end
+    — the ``run_judge_ofat_pilot.py`` precedent. Its WIRING is covered instead by
+    tests that monkeypatch ``run_ofat_stage`` / ``save_result`` / ``load_config``
+    and assert exactly what this function hands over.
+
+    ``run_ofat_stage``'s architect branch already routes every ``role ==
+    'architect'`` candidate to ``run_architect_eval`` and handles trials,
+    ``max_parallel`` and per-cell failure isolation, so this driver only
+    assembles the arguments and fans out. Consumed UNMODIFIED — PRD D1 forbids
+    instrument edits from this lane. ``ofat_candidates()`` is never called: the
+    candidate list is exactly what :func:`resolve_candidates` returned, every
+    entry already checked to be an architect.
     """
-    raise NotImplementedError('_run_campaign is wired by the --run step of task 3632')
+    import asyncio
+
+    from orchestrator.config import ConfigRequiredError, load_config
+    from orchestrator.evals.runner import run_ofat_stage, save_result
+
+    try:
+        base_config = load_config(config_path)
+    except ConfigRequiredError as e:
+        raise SystemExit(f'Error: {e} (pass --config or set ORCH_CONFIG_PATH)') from e
+
+    results = asyncio.run(run_ofat_stage(
+        fixture_paths, candidates, base_config,
+        max_parallel=max_parallel, trials=trials, timeout_override=timeout,
+    ))
+    for result in results:
+        save_result(result)
+    return results
+
+
+def _load_results_from_dir(results_dir: Path) -> list[Any]:
+    """Load every persisted ``EvalResult`` JSON in *results_dir*.
+
+    Filters each loaded dict to the known dataclass fields, mirroring
+    ``runner.load_results``, so a cell persisted before a field existed still
+    loads instead of raising on an unexpected keyword.
+    """
+    from orchestrator.evals.runner import EvalResult
+
+    known = {f.name for f in EvalResult.__dataclass_fields__.values()}
+    results = []
+    for path in sorted(Path(results_dir).glob('*.json')):
+        data = json.loads(path.read_text())
+        results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
+    return results
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -576,6 +626,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--max-parallel', type=int, default=None, help='Max concurrent eval cells.')
     parser.add_argument('--config', dest='config_path', type=Path, default=None,
                         help='Orchestrator config YAML for --run.')
+    parser.add_argument('--timeout', type=int, default=None,
+                        help='Per-cell timeout override (minutes) for --run.')
     parser.add_argument('--out', type=Path, default=None,
                         help='Write the campaign report as JSON to this path.')
     return parser
@@ -650,13 +702,20 @@ def main(argv: list[str] | None = None) -> int:
     candidates = apply_budgets(candidates, budgets)
     cell_matrix = enumerate_cells(fixture_paths, [c.name for c in candidates], args.trials)
 
+    # Three mutually-exclusive modes, all converging on the SAME report builder
+    # and renderer, so a dry-run preview, a live campaign and a re-analysis of
+    # persisted cells cannot describe the run in three different schemas.
     if args.dry_run:
         print(_format_dry_run(fixture_paths, candidates, args.trials, cell_matrix))
         results: list[Any] = []
-    else:
-        raise NotImplementedError(
-            '--run / --results-dir are wired by a later step of task 3632'
+    elif args.run:
+        results = _run_campaign(
+            fixture_paths, candidates,
+            trials=args.trials, max_parallel=args.max_parallel,
+            config_path=args.config_path, timeout=args.timeout,
         )
+    else:
+        results = _load_results_from_dir(args.results_dir)
 
     report = build_campaign_report(results, candidates, cell_matrix, q_ceiling=q_ceiling)
     if not args.dry_run:

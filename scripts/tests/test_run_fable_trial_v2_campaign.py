@@ -847,3 +847,33 @@ def test_run_persists_each_cell(tmp_path, campaign_seam):
 
     assert len(campaign_seam['saved']) == 4
     assert {r.task_id for r in campaign_seam['saved']} == {'alpha', 'beta'}
+
+
+def test_results_dir_reanalyzes_persisted_cells(tmp_path, capsys):
+    """``--results-dir`` re-reads persisted cells and rebuilds the SAME schema.
+
+    This is what makes a committed γ1 artifact recomputable: the verdict can be
+    regenerated from the stored cells without re-spending the campaign. Fields
+    unknown to ``EvalResult`` are dropped rather than raising, so a cell
+    persisted before a field existed still loads.
+    """
+    results_dir = tmp_path / 'results'
+    results_dir.mkdir()
+    for stem in ('alpha', 'beta'):
+        cell = _cell(stem, 'architect-opus-max', plan_quality=0.75, plan_steps=5)
+        payload = {**cell.to_dict(), 'a_field_this_driver_has_never_heard_of': 1}
+        (results_dir / f'{stem}.json').write_text(json.dumps(payload))
+
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+    out = tmp_path / 'reanalyzed.json'
+
+    rc = mod.main([
+        '--results-dir', str(results_dir), '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max', '--out', str(out),
+    ])
+
+    assert rc == 0
+    loaded = json.loads(out.read_text())
+    assert {c['task_id'] for c in loaded['cells']} == {'alpha', 'beta'}
+    assert loaded['candidates'][0]['n'] == 2
+    assert loaded['candidates'][0]['mean_plan_quality'] == 0.75
