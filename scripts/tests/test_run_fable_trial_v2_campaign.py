@@ -457,3 +457,157 @@ def test_rendered_table_marks_unmeasured_loudly():
     # The legend must name the producing instrument change, so an operator
     # reading γ1's output cannot mistake an absent bound for a clean one.
     assert '3628' in text or 'σ' in text
+
+
+# ===== step 9: the PRD-D6 banding partition — ambiguity resolves to RETAIN =====
+
+
+def _metrics(**kwargs):
+    """The metrics dict of a single synthetic cell."""
+    return _cell('f', 'A', **kwargs).metrics
+
+
+def test_ceiling_band_requires_plan_and_valid_reference_and_quality():
+    """All three conjuncts satisfied -> the sole DISCARDED band."""
+    m = _metrics(plan_steps=5, plan_quality=0.90,
+                 extra_metrics={'judged_without_reference': False})
+
+    assert mod.band_for_cell(m, 0.80, True) == 'ceiling'
+
+
+def test_planned_below_q_ceiling_is_intermittent():
+    """Same cell below the threshold is retained."""
+    m = _metrics(plan_steps=5, plan_quality=0.60,
+                 extra_metrics={'judged_without_reference': False})
+
+    assert mod.band_for_cell(m, 0.80, True) == 'intermittent'
+
+
+def test_planned_without_valid_reference_is_intermittent():
+    """A high score judged WITHOUT a valid reference can never discard a fixture.
+
+    plan_quality is interpretable only where a real reference block exists, so a
+    high plausibility score against no reference is not evidence of a ceiling.
+    """
+    m = _metrics(plan_steps=5, plan_quality=0.95,
+                 extra_metrics={'judged_without_reference': True})
+
+    assert mod.band_for_cell(m, 0.80, True) == 'intermittent'
+
+
+def test_no_plan_band():
+    """No plan -> ``no_plan``, decided by produced_a_plan and NOT by plan_quality.
+
+    metrics.py:204 records why: the two plan scorers disagreed exactly on a
+    stepless artifact, so a nonzero plan_quality is not evidence a plan exists.
+    """
+    m = _metrics(plan_steps=0, plan_quality=0.95,
+                 extra_metrics={'judged_without_reference': False})
+
+    assert mod.band_for_cell(m, 0.80, True) == 'no_plan'
+
+
+def test_cap_tainted_cell_bands_unmeasured():
+    """A transport refusal is NAMED, not banded on a refusal we never got to ask.
+
+    γ1's recipe re-runs these so every fixture gets one admissible cell; banding
+    one would penalise whichever candidate happened to be scheduled inside a
+    session-cap window — a property of the schedule, not of the candidate.
+    """
+    m = _metrics(plan_steps=5, plan_quality=0.95, cap_tainted=True,
+                 invocation_error='architect: cap_hit',
+                 extra_metrics={'judged_without_reference': False})
+
+    assert mod.band_for_cell(m, 0.80, True) == 'unmeasured'
+
+
+def test_marker_unavailable_never_bands_ceiling():
+    """THE load-bearing D6 safety rule: unknown validity can never discard.
+
+    With σ unlanded the driver cannot know whether a cell was judged against a
+    real reference diff, so the ceiling band's "valid reference exists" conjunct
+    is unsatisfiable and no fixture can be discarded. D6 is explicit about the
+    asymmetry: misbanding-to-retain costs ~$20 of stage-2 spend, while
+    misbanding-to-discard loses signal permanently.
+    """
+    m = _metrics(plan_steps=5, plan_quality=0.95)
+    assert mod.MARKER_KEY not in m, 'premise: this cell predates σ and carries no marker'
+
+    assert mod.band_for_cell(m, 0.80, False) == 'intermittent'
+
+
+def test_partition_is_exact():
+    """retained + discarded partitions the pool exactly — nothing lost or doubled."""
+    results = [
+        # ceiling: planned, validly referenced, at/over the threshold.
+        _cell('f1', 'A', plan_steps=6, plan_quality=0.92,
+              extra_metrics={'judged_without_reference': False}),
+        # intermittent: planned but below it.
+        _cell('f2', 'A', plan_steps=5, plan_quality=0.40,
+              extra_metrics={'judged_without_reference': False}),
+        # no_plan.
+        _cell('f3', 'A', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False}),
+        # unmeasured: cap-tainted.
+        _cell('f4', 'A', cap_tainted=True, invocation_error='architect: cap_hit',
+              extra_metrics={'judged_without_reference': False}),
+    ]
+
+    part = mod.partition_bands(results, 0.80)
+
+    assert part['q_ceiling'] == 0.80
+    assert part['marker_available'] is True
+    assert part['by_fixture'] == {
+        'f1': 'ceiling', 'f2': 'intermittent', 'f3': 'no_plan', 'f4': 'unmeasured',
+    }
+    assert part['counts'] == {
+        'ceiling': 1, 'intermittent': 1, 'no_plan': 1, 'unmeasured': 1,
+    }
+    assert part['discarded'] == ['f1']
+    assert part['retained'] == ['f2', 'f3', 'f4']
+    assert set(part['retained']) & set(part['discarded']) == set()
+    assert set(part['retained']) | set(part['discarded']) == set(part['by_fixture'])
+
+
+def test_partition_bands_on_the_most_retaining_cell():
+    """Multiple admitted cells for one fixture -> band on the most RETAINING one.
+
+    Stage 1 is one trial per fixture, but a re-run can leave two; the D6
+    ambiguity rule must still hold, so a fixture with any non-ceiling cell is
+    retained.
+    """
+    results = [
+        _cell('f1', 'A', trial=1, plan_steps=6, plan_quality=0.95,
+              extra_metrics={'judged_without_reference': False}),
+        _cell('f1', 'A', trial=2, plan_steps=5, plan_quality=0.20,
+              extra_metrics={'judged_without_reference': False}),
+    ]
+
+    part = mod.partition_bands(results, 0.80)
+
+    assert part['by_fixture'] == {'f1': 'intermittent'}
+    assert part['discarded'] == []
+
+
+def test_banding_without_q_ceiling_exits(tmp_path, monkeypatch):
+    """``--stage1`` with no ``--q-ceiling`` exits BEFORE any spend.
+
+    G6: the threshold is derived in γ1 and ratified by Leo at γ2. A default here
+    would silently become the de facto threshold and pre-empt that ruling.
+    """
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    def _boom(*args, **kwargs):
+        pytest.fail('reached the live-spend seam before rejecting a missing --q-ceiling',
+                    pytrace=False)
+
+    monkeypatch.setattr(mod, '_run_campaign', _boom)
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([
+            '--run', '--tasks-dir', str(d),
+            '--candidate', 'architect-opus-max', '--stage1',
+        ])
+
+    assert exc.value.code != 0
+    assert 'q-ceiling' in str(exc.value)
