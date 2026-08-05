@@ -103,7 +103,12 @@ def recover_recorded_action(
     key), and to ``status == 'refused' -> 'refuse'``. Refusal is the one
     action that IS unambiguous from status alone: only the deterministic
     guards (cancelled-premise blocklist, recon premise registry) ever emit
-    it, and it carries no target. ``target_id`` prefers ``result_json['id']``
+    it, and it carries no target. Recovering it keeps the verdict READABLE
+    (provenance); it does not make it a corpus item —
+    :func:`build_curator_corpus` filters the 'refuse' stratum out before
+    sampling and frontier labeling, since no frontier proposer can emit
+    'refuse' and the curator LLM never sees a guard-refused candidate.
+    ``target_id`` prefers ``result_json['id']``
     (or the less common
     ``result_json['target_id']``), falling back to the ticket row's own
     *task_id* column when neither is present -- but only for drop/combine,
@@ -519,7 +524,10 @@ async def build_curator_corpus(
     """Build a labeled curator replay corpus from *db_path* (T5).
 
     Reads recorded decisions from tickets.db (:func:`read_curator_decisions`),
-    optionally downsamples to *n* stratified by recorded action
+    DROPS every ``action='refuse'`` decision (deterministic-guard refusals are
+    provenance only -- see the inline rationale below; they are unlabelable by
+    construction and the curator LLM never sees those candidates), optionally
+    downsamples the remainder to *n* stratified by recorded action
     (:func:`_sample_stratified`), obtains a GOLD label for every sampled
     candidate from the injected *frontier_proposer* (NEVER the recorded
     decision -- PRD D-6: decisions != ground truth), flags a deterministic
@@ -533,7 +541,33 @@ async def build_curator_corpus(
     and only reads (never writes) *db_path*.
     """
     decisions = read_curator_decisions(db_path)
-    sampled = _sample_stratified(decisions, n, seed)
+    # Refusals are recovered as PROVENANCE ONLY -- they are never labeled
+    # corpus items. `recover_recorded_action` keeps status='refused' readable
+    # (an auditor reading tickets.db still sees the verdict), but a refused row
+    # must not reach _sample_stratified or the frontier proposer:
+    #   * PRD D-6 sources every gold label from *frontier_proposer*, whose
+    #     schema (_FRONTIER_CURATOR_LABEL_SCHEMA) is deliberately restricted to
+    #     drop/combine/create -- no proposer can emit 'refuse', so every
+    #     refused item would carry a definitionally-wrong gold label.
+    #   * The curator LLM never sees these candidates in production anyway:
+    #     both deterministic guards short-circuit pre-LLM, so no prompt change
+    #     could ever be trained or scored on them.
+    #   * _sample_stratified round-robins across recorded-action strata, so a
+    #     'refuse' stratum would additionally spend ~1/4 rather than ~1/3 of a
+    #     bounded *n* -- and select_spot_check_subset would spend scarce human
+    #     review budget -- on rows whose gold labels are noise.
+    labelable = [d for d in decisions if d.action != 'refuse']
+    refused_excluded = len(decisions) - len(labelable)
+    if refused_excluded:
+        # Never a silent drop: an operator comparing corpus size against the
+        # ticket count must be able to account for the difference.
+        logger.info(
+            'curator corpus: excluded %d refused decision(s) of %d recovered — '
+            'refusals are provenance only (no frontier label is possible for them)',
+            refused_excluded,
+            len(decisions),
+        )
+    sampled = _sample_stratified(labelable, n, seed)
 
     spot_check_ids = set(select_spot_check_subset(sampled, cap=spot_check_size, seed=seed))
 
