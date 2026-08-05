@@ -29,8 +29,8 @@ The transcript shapes it reads (measured, not assumed)
 ------------------------------------------------------
 Archive layout, written by ``shared.transcript_archive``::
 
-    <archive_root>/<task_id>/<enc-cwd>/<session_id>.jsonl.gz
-    <archive_root>/<task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+    <archive_root>/<task_id>/<enc-cwd>/<session_id>.jsonl
+    <archive_root>/<task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl
 
 A search is an ``assistant`` record whose ``message.content`` holds::
 
@@ -64,7 +64,7 @@ holding::
 
     {
       "schema_version": 1,             // SCHEMA_VERSION; bump on any change
-      "transcript":     "3214/-home-…/<session>.jsonl.gz",
+      "transcript":     "3214/-home-…/<session>.jsonl",
       "task_id":        "3214",        // ─┐
       "session_id":     "<uuid>",      //  │ ALL path-derived, by
       "is_subagent":    false,         //  │ parse_archive_path — never
@@ -165,13 +165,12 @@ failed) therefore differ in BOTH the status string a human reads and the exit
 code a wrapper reads. See :func:`coverage_status`.
 
 That vocabulary is only closed if a damaged file lands INSIDE it. The archive
-is fire-and-forget runtime state written by the running fleet, so a unit
-killed mid-write or a file read while still compressing leaves a partially
-written ``.gz``, and a flipped byte in stored data damages an intact one — and
-an unreadable transcript surfaces as FOUR different exception types, only one
-of which is an ``OSError``. ``legibility.inventory.as_unreadable_file_error``
-enumerates them and normalizes all four to ``OSError`` preserving the original
-message; BOTH readers this script uses funnel through that one helper, so
+is fire-and-forget runtime state written by the running fleet, so a flipped
+byte in stored data, or a file half-written by a unit killed mid-write, can
+leave bytes that are not valid UTF-8 — and that shape surfaces as
+``UnicodeDecodeError``, a ``ValueError`` subclass rather than an ``OSError``.
+``legibility.inventory.as_unreadable_file_error`` normalizes it to ``OSError``
+preserving the original message; BOTH readers this script uses funnel through that one helper, so
 every shape lands in the counted ``parse_failures`` path — ``degraded`` if
 other files read, ``total_failure`` if none did — instead of aborting the run
 with a traceback and an exit code outside this table.
@@ -189,7 +188,7 @@ Usage::
 
     # one transcript, for debugging
     python fused-memory/scripts/memory_eval_transcript_corpus.py \
-        --transcript <path/to/session.jsonl.gz>
+        --transcript <path/to/session.jsonl>
 """
 from __future__ import annotations
 
@@ -247,8 +246,8 @@ from shared.memory_eval_metrics import (  # noqa: E402
 # one-line change filed as a follow-up — outside this task's locked modules.
 
 # INV-5 / D9: TWO existing readers, ONE core, ZERO new parsers. The scan path
-# streams via iter_json_lines (memory-bounded across thousands of multi-MB gz
-# files); --transcript mode slurps via load_transcript (an ordered list is the
+# streams via iter_json_lines (memory-bounded across thousands of multi-MB
+# transcripts); --transcript mode slurps via load_transcript (an ordered list is the
 # right shape for one small file). Both feed the identical extract_searches.
 # The test asserts these bindings ARE those functions, so a future regression
 # that quietly reintroduces a local parser fails rather than passing review.
@@ -276,9 +275,7 @@ minable without editing this file.
 
 
 def _strip_transcript_suffix(name: str) -> str:
-    """``<x>.jsonl.gz`` / ``<x>.jsonl`` -> ``<x>``."""
-    if name.endswith('.jsonl.gz'):
-        return name[: -len('.jsonl.gz')]
+    """``<x>.jsonl`` -> ``<x>``."""
     if name.endswith('.jsonl'):
         return name[: -len('.jsonl')]
     return name
@@ -291,8 +288,8 @@ def parse_archive_path(rel_path: str | Path) -> dict[str, Any]:
     than line-cited so this reader stays coupled to that producer by name as
     it evolves::
 
-        <task_id>/<enc-cwd>/<session_id>.jsonl.gz
-        <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+        <task_id>/<enc-cwd>/<session_id>.jsonl
+        <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl
 
     Every field degrades to None independently rather than raising. An archive
     is append-only runtime state that can acquire a stray file, and one
@@ -313,10 +310,10 @@ def parse_archive_path(rel_path: str | Path) -> dict[str, Any]:
     if len(parts) >= 1:
         parsed['task_id'] = parts[0] if len(parts) > 1 else None
     if len(parts) == 3:
-        # <task_id>/<enc-cwd>/<session_id>.jsonl.gz
+        # <task_id>/<enc-cwd>/<session_id>.jsonl
         parsed['session_id'] = _strip_transcript_suffix(parts[2])
     elif len(parts) == 5 and parts[3] == 'subagents':
-        # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+        # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl
         parsed['session_id'] = parts[2]
         parsed['is_subagent'] = True
         parsed['subagent_id'] = _strip_transcript_suffix(parts[4])
@@ -368,10 +365,10 @@ def archive_relative_slice(path: str | Path) -> str:
     provenance is not.
     """
     parts = Path(path).parts
-    # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+    # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl
     if len(parts) >= 5 and parts[-2] == 'subagents' and _is_encoded_cwd(parts[-4]):
         return Path(*parts[-5:]).as_posix()
-    # <task_id>/<enc-cwd>/<session_id>.jsonl.gz
+    # <task_id>/<enc-cwd>/<session_id>.jsonl
     if len(parts) >= 3 and _is_encoded_cwd(parts[-2]):
         return Path(*parts[-3:]).as_posix()
     return Path(path).name
@@ -694,7 +691,7 @@ def iter_transcripts(root: Path) -> list[Path]:
     """
     if not root.is_dir():
         return []
-    found = set(root.glob('*/**/*.jsonl.gz')) | set(root.glob('*/**/*.jsonl'))
+    found = set(root.glob('*/**/*.jsonl'))
     return sorted(p for p in found if p.is_file())
 
 
@@ -707,8 +704,8 @@ def scan_archive(
     """Mine a whole archive tree. Returns ``(records, coverage)``.
 
     Each file streams through the PROMOTED ``legibility.inventory.iter_json_lines``
-    rather than being slurped: the live archive is thousands of multi-MB gz
-    files, so memory has to stay bounded by the largest single record.
+    rather than being slurped: the live archive is thousands of multi-MB
+    transcripts, so memory has to stay bounded by the largest single record.
 
     Per that reader's documented contract, a blank or corrupt LINE is skipped
     silently while an unreadable FILE raises ``OSError``. That split is
