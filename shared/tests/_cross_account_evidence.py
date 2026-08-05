@@ -25,7 +25,14 @@ Imported by bare module name (``from _cross_account_evidence import ...``);
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from pathlib import Path
+from typing import IO
+
+from _capacity_skip import result_looks_like_capacity_failure
+
+from shared.cli_invoke import AgentResult
 
 #: The account letters scanned, in order, when no override is set.
 #:
@@ -135,5 +142,98 @@ def select_token_pair(environ: Mapping[str, str]) -> TokenPair:
             f'{[f"CLAUDE_OAUTH_TOKEN_{ch}" for ch in TOKEN_LETTERS]}.'
         )
     return (tokens[0], tokens[1])
+
+
+def format_run_evidence(
+    *,
+    account_a: str,
+    account_b: str,
+    r1: AgentResult,
+    r2: AgentResult,
+    r1_transcript_present: bool,
+    r1_transcript_records: int | None,
+    control_passed: bool | None,
+) -> dict:
+    """Build the JSON-serialisable per-run record task 3484 must record verbatim.
+
+    Every field the task requires, and nothing derived destructively:
+
+    - ``account_a`` / ``account_b`` — the env var NAMES actually used, so the
+      record is self-describing about which accounts produced it.
+    - ``r1_session_id``, ``r1_transcript_present``, ``r1_transcript_records``.
+    - ``r2_output`` / ``r2_stderr`` — **verbatim**: no truncation, no strip, no
+      redaction.  A truncated cap message is what made the 3454 round ambiguous,
+      and a cap phrasing the guard has never seen is the one remaining way a
+      capped account can still masquerade as context loss.
+    - ``r2_success``, ``codeword_recalled``.
+    - ``control_passed`` — ``None`` when the same-account control did not run in
+      this process (unknown is not the same as failed).
+    - ``verdict`` — ``'void_capped'`` when the cap guard matches r2, else
+      ``'preserved'`` / ``'not_preserved'`` from ``codeword_recalled``.
+
+    ``r1_transcript_records`` is ``None`` (not ``0``) when the transcript is
+    absent: "no transcript on disk" and "a transcript with no records" are
+    different findings, and only the first would rule the run out on
+    transcript-reachability grounds.
+
+    ``void_capped`` takes precedence over ``not_preserved`` deliberately — the
+    2026-08-01 cross-account run looked exactly like lost context and was really
+    a weekly cap with no model turn.  The classification delegates to
+    ``_capacity_skip.result_looks_like_capacity_failure``; do NOT grow a second
+    cap-text matcher here.  Task 3483 single-homed that corpus and added a
+    bidirectional drift guard against production's ``classify_invocation``
+    precisely because a divergent marker list is what voided that attempt.
+    """
+    codeword_recalled = 'ZEPPELIN' in (r2.output or '').upper()
+    if result_looks_like_capacity_failure(r2):
+        verdict = 'void_capped'
+    else:
+        verdict = 'preserved' if codeword_recalled else 'not_preserved'
+    return {
+        'account_a': account_a,
+        'account_b': account_b,
+        'r1_session_id': r1.session_id,
+        'r1_transcript_present': r1_transcript_present,
+        'r1_transcript_records': (
+            r1_transcript_records if r1_transcript_present else None
+        ),
+        'r2_output': r2.output,
+        'r2_stderr': r2.stderr,
+        'r2_success': r2.success,
+        'codeword_recalled': codeword_recalled,
+        'control_passed': control_passed,
+        'verdict': verdict,
+    }
+
+
+def emit_run_evidence(
+    record: Mapping[str, object],
+    environ: Mapping[str, str],
+    stream: IO[str],
+) -> str:
+    """Write *record* as ONE JSON line to *stream*; append it to the evidence file.
+
+    The line goes to *stream* (pytest shows it under ``-s``) prefixed with
+    ``CROSS_ACCOUNT_RESUME_EVIDENCE`` so it is greppable out of a noisy live run,
+    and — when ``CROSS_ACCOUNT_EVIDENCE_PATH`` is set in *environ* — is appended
+    verbatim to that path, parents created.  Absent (or blank) that var, the
+    filesystem is not touched at all.
+
+    ``json.dumps`` escapes embedded newlines, so a multi-line ``r2_output``
+    cannot split the JSONL record across lines.
+
+    Returns the JSON line (no trailing newline) so a caller can also attach it to
+    an assertion message or to an escalation's structured evidence.
+    """
+    line = json.dumps(record, sort_keys=True)
+    stream.write(f'\nCROSS_ACCOUNT_RESUME_EVIDENCE {line}\n')
+    stream.flush()
+    path_value = environ.get(EVIDENCE_PATH_VAR)
+    if path_value:
+        path = Path(path_value)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8') as fh:
+            fh.write(f'{line}\n')
+    return line
 
 
