@@ -380,18 +380,32 @@ def require_lane_lock_holders(
         except OSError as exc:
             last_error = exc
         if time.monotonic() >= deadline:
+            # `!s`, deliberately NOT `!r`: repr(OSError) DROPS the filename —
+            # repr(OSError(2, 'No such file...', '/proc/locks')) renders as
+            # `FileNotFoundError(2, 'No such file...')`, while str() carries
+            # `: '/proc/locks'`.  That path is the forensic distinction the
+            # strict read exists to preserve, because TWO different reads can
+            # fail here and they mean different things — and the headline case
+            # for this task (a genuinely-held lane whose LOCK FILE was unlinked)
+            # fails on os.stat(lock_path), not on /proc/locks at all.  Blaming
+            # the kernel lock table for it would send a human debugging a
+            # vacuous-green B12 poll straight past the actual cause.
             pytest.fail(
-                f'could not read the kernel lock table for {lock_path} within '
-                f'{timeout}s — last error: {last_error!r}. This is UNKNOWN, not '
-                f'"the lane is free": an unreadable table means no rows were '
-                f'examined at all, so reading it as "no holders" would pass a '
-                f'B12 leak assertion vacuously while the lane is genuinely '
-                f'held (task 3604)'
+                f'could not determine the FLOCK holders of {lock_path} within '
+                f'{timeout}s — the lock file itself, or the kernel lock table '
+                f'(/proc/locks), could not be read; last error: {last_error!s}. '
+                f'This is UNKNOWN, not "the lane is free": neither read examined '
+                f'a single row, so rendering it as "no holders" would pass a B12 '
+                f'leak assertion vacuously while the lane is genuinely held '
+                f'(task 3604)'
             )
         time.sleep(interval)
 
 
-def lane_is_free(lock_path: Path) -> bool:
+def lane_is_free(
+    lock_path: Path,
+    strict_read_timeout: float = _LANE_LOCK_STRICT_READ_SECS,
+) -> bool:
     """Whether *lock_path* is unheld AND unattributed to this process.
 
     The PRD's B12 signal verbatim, and BOTH halves are load-bearing: a
@@ -420,8 +434,18 @@ def lane_is_free(lock_path: Path) -> bool:
     why the strict read comes first and why neither it nor the ordering should
     later be "simplified" back: the check must fail while the lock file is
     still absent, before the probe can resurrect the evidence.
+
+    *strict_read_timeout* forwards to :func:`require_lane_lock_holders` and
+    defaults to the full transient-absorber bound, which is what both B12 call
+    sites get.  It exists for the tests below that stage a DETERMINISTICALLY
+    unreadable read — a permanently-unlinked lock file, an injected reader that
+    always raises — where the retry is guaranteed to exhaust and the absorber
+    budget therefore buys nothing but ~2s of full-suite wall clock per case.
+    Do NOT shorten it at a call site staging a REAL race: absorbing a one-off
+    procfs hiccup is the only thing keeping this from becoming its own flake
+    class.
     """
-    if os.getpid() in require_lane_lock_holders(lock_path):
+    if os.getpid() in require_lane_lock_holders(lock_path, timeout=strict_read_timeout):
         return False
     probe = acquire_merge_verify_flock(lock_path, 0.0)
     if probe is None:
@@ -630,18 +654,35 @@ class TestRequireLaneLockHolders:
         lane is free", which is what the caller is trying to establish. The
         failure must also name the underlying error, or the diagnostic is
         strictly worse than the fail-safe `[]` it replaces.
+
+        The FAILING PATH is pinned separately from the strerror, and that is
+        not belt-and-braces: `repr(OSError)` drops the filename while `str()`
+        keeps it, so a `{...!r}` message names neither the path nor which of
+        the helper's two possible reads (`os.stat(lock_path)` or
+        `/proc/locks`) actually failed — the first thing a human needs here.
         """
         def _reader(_path: Path) -> list[int]:
             raise OSError(errno.EACCES, 'Permission denied', '/proc/locks')
 
         timeout = 0.1
         start = time.monotonic()
-        with pytest.raises(pytest.fail.Exception, match='Permission denied'):
+        with pytest.raises(pytest.fail.Exception) as excinfo:
             require_lane_lock_holders(
                 Path('/irrelevant'), timeout=timeout, interval=0.01,
                 read_holders=_reader,
             )
         elapsed = time.monotonic() - start
+
+        message = str(excinfo.value)
+        assert 'Permission denied' in message, (
+            f'the failure must carry the underlying error, or it diagnoses '
+            f'less than the fail-safe [] it replaces; got {message!r}'
+        )
+        assert '/proc/locks' in message, (
+            f'the FAILING PATH must survive into the message — render the '
+            f'error with !s, not !r, which drops OSError.filename and so '
+            f'cannot say WHICH read failed; got {message!r}'
+        )
 
         assert elapsed >= timeout, (
             f'must not give up before the bound elapses — a hair trigger would '
@@ -707,7 +748,9 @@ class TestRequireLaneLockHolders:
 class TestLaneIsFreeNeverPassesOnAnUnknownRead:
     """lane_is_free has THREE outcomes — free, held, and UNKNOWN (loud)."""
 
-    def test_a_held_but_unlinked_lane_is_never_reported_free(self, tmp_path: Path):
+    def test_a_held_but_unlinked_lane_fails_loudly_without_recreating_the_lock_file(
+        self, tmp_path: Path
+    ):
         """THE headline case: a genuinely-held lane whose lock file is gone.
 
         Staged entirely against a real kernel with no monkeypatching, because a
@@ -721,32 +764,30 @@ class TestLaneIsFreeNeverPassesOnAnUnknownRead:
         halves pass vacuously, and the ``wait_until`` wrapper at the two B12
         call sites short-circuits green on the first such poll — a leaked lane
         reported clean, strictly worse than the red task 3598 removed.
+
+        The second assertion — that the lock file is still ABSENT afterwards —
+        is non-obvious and load-bearing, and is the reason this stays one test
+        rather than two: it pins the ORDERING that makes the first assertion
+        reachable at all. Attribution is checked before the probe (as
+        ``lane_is_free`` documents), so a correct implementation fails while
+        the lock file is still gone. Today's code does not: the probe's
+        ``O_CREAT`` recreates the very file whose absence made the answer
+        unknown, quietly repairing the evidence a human would need to diagnose
+        the leak. Split across two tests these were byte-identical staging and
+        the weaker one covered nothing the stronger did not.
+
+        The short *strict_read_timeout*: the unlink is PERMANENT, so the retry
+        is guaranteed to exhaust. The absorber bound exists to ride out a
+        transient procfs hiccup and buys nothing against a deterministic
+        never-resolves staging — it would only spend the default 2s of
+        full-suite wall clock waiting for a certain failure.
         """
         lock_path = lane_lock_path(tmp_path / 'lane')
         with leaked_lane_lock(lock_path):
             lock_path.unlink()
 
             with pytest.raises(pytest.fail.Exception):
-                lane_is_free(lock_path)
-
-    def test_the_probe_must_not_recreate_the_lock_file_it_was_asked_about(
-        self, tmp_path: Path
-    ):
-        """The unknown read must abort BEFORE the probe can resurrect the file.
-
-        Non-obvious and load-bearing. Attribution is checked before the probe
-        (the ordering ``lane_is_free`` already documents), so a correct
-        implementation fails while the lock file is still absent. Today's code
-        does not: the probe's ``O_CREAT`` recreates the very file whose absence
-        made the answer unknown, quietly repairing the evidence a human would
-        need to diagnose the leak.
-        """
-        lock_path = lane_lock_path(tmp_path / 'lane')
-        with leaked_lane_lock(lock_path):
-            lock_path.unlink()
-
-            with pytest.raises(pytest.fail.Exception):
-                lane_is_free(lock_path)
+                lane_is_free(lock_path, strict_read_timeout=0.1)
 
             assert not lock_path.exists(), (
                 'the probe-acquire ran despite the attribution read being '
@@ -789,7 +830,10 @@ class TestLaneIsFreeNeverPassesOnAnUnknownRead:
 
         lock_path = lane_lock_path(tmp_path / 'lane')
         with leaked_lane_lock(lock_path), pytest.raises(pytest.fail.Exception):
-            lane_is_free(lock_path)
+            # Short bound for the same reason as the case above: this reader
+            # ALWAYS raises, so the transient-absorber retry is certain to
+            # exhaust and the default 2s would be spent waiting for it.
+            lane_is_free(lock_path, strict_read_timeout=0.1)
 
     def test_a_genuinely_free_lane_is_still_reported_free(self, tmp_path: Path):
         """NON-VACUITY CONTROL: a fresh, unheld lane must still read as free.
