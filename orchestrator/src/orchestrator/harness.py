@@ -8094,6 +8094,43 @@ class Harness:
                     )
                 steward_factory = _make_steward
 
+            # ── Cross-repo admission gate ────────────────────────────────────
+            # Block a FOREIGN-OWNED task (its declared work belongs to another
+            # project) BEFORE spinning up the agent, rather than letting it
+            # reach the architect, produce a legitimately-empty branch, and
+            # cost an L2 at merge time — the only place the cross-repo signal
+            # was previously read (merge_gates.is_cross_repo_task), which such
+            # a task never reaches.
+            #
+            # Runs FIRST, ahead of the D4 substrate gate: classification here is
+            # pure and in-process (a metadata read + path containment), whereas
+            # the substrate gate builds an ephemeral worktree and runs a checker
+            # subprocess.  A foreign-owned task that also carries a probe must
+            # not pay for a worktree it can only throw away.  This ordering is
+            # asserted in test_cross_repo_gate.py so it cannot silently invert.
+            #
+            # NOTE: the predicate is cross_repo_gate.carries_cross_repo_signal
+            # (key-presence), for the same reason the substrate gate uses a
+            # key-presence predicate — gating on any stricter definition (e.g.
+            # one requiring a well-formed marker) would let a MALFORMED marker
+            # skip the gate entirely instead of entering it and failing closed.
+            from orchestrator import cross_repo_gate  # noqa: PLC0415
+
+            if cross_repo_gate.carries_cross_repo_signal(assignment.task) and not await self._run_cross_repo_gate(assignment):
+                # Foreign-owned: task is already blocked + escalated inside the
+                # gate.  Return a BLOCKED report so the caller (and
+                # reconciliation) can observe the outcome; arm the requeue
+                # cooldown so the task is not immediately re-dispatched before
+                # the blocked-status propagation window closes.
+                arm_requeue_cooldown = True
+                return TaskReport(
+                    task_id=assignment.task_id,
+                    title=assignment.task.get('title', ''),
+                    outcome=WorkflowOutcome.BLOCKED,
+                    block_reason='cross_repo_misfile',
+                )
+            # ────────────────────────────────────────────────────────────────
+
             # ── D4 substrate gate ────────────────────────────────────────────
             # Re-run the committed probe set against current main BEFORE
             # spinning up the agent.  A PASS→FAIL flip (e.g. a sibling deleted
