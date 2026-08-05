@@ -1,11 +1,13 @@
 """Tests for the submit_and_resolve helper in _fm_helpers.py."""
 
+import ast
 import json
+import pathlib
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from _fm_helpers import submit_and_resolve
+from _fm_helpers import calls_named, parse_python_module, submit_and_resolve
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1496,3 +1498,158 @@ class TestAwaitIndexOperational:
 
         with pytest.raises(AssertionError, match='not OPERATIONAL'):
             await await_index_operational(graph, timeout_s=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared AST migration-guard machinery (task 3502 / 3574)
+# ---------------------------------------------------------------------------
+# parse_python_module() and calls_named() are the single parse/search
+# implementation behind three migration guards — test_falkor_probe_routing_guard,
+# test_falkor_index_barrier_guard and test_gather_idiom_helper_routing. Those
+# guards are themselves the enforcement layer for two false-green mechanisms
+# (an unbarriered async index build; a hand-rolled gather Pass-2), so a silent
+# weakening HERE disarms all three at once while every one of them still
+# reports green. The semantics they rest on are pinned below.
+#
+# NOTE the sample identifiers are deliberately inert (`widget`, `mod.widget`)
+# and no snippet contains an index-creating literal. test_falkor_index_barrier_guard
+# discovers its parametrized module set by selecting every tests/test_*.py that
+# holds BOTH a /CREATE\s+INDEX|createNodeIndex/i string constant AND a real
+# ast.Call to select_graph. This file already mentions select_graph in prose, so
+# a sample that combined a select_graph(...) call with an index-creation string
+# would drag THIS file into that guard's scope and fail it — and the failure
+# would read as a barrier-guard bug rather than a bad fixture here.
+# ---------------------------------------------------------------------------
+
+# The gather guard parses PRODUCTION source, not test modules — which is why
+# the shared parse is named parse_python_module rather than parse_test_module.
+_PRODUCTION_SOURCE = (
+    pathlib.Path(__file__).parents[1]
+    / 'src'
+    / 'fused_memory'
+    / 'reconciliation'
+    / 'context_assembler.py'
+)
+
+# A bare call, an attribute call, an unrelated callee, and the SAME token
+# appearing only inside a string constant.
+_CALLS_SNIPPET = """
+widget(1)
+mod.widget(2)
+gadget(3)
+note = 'widget(4) is described here but never called'
+"""
+
+# Calls in three distinct positions so a node-scoped query can be shown to see
+# only its own subtree.
+_NESTED_SNIPPET = """
+@decorate(widget('in-decorator'))
+def decorated():
+    pass
+
+assigned = [widget('in-assignment'), gadget('sibling')]
+
+def elsewhere():
+    return widget('in-function-body')
+"""
+
+
+class TestSharedAstGuardMachinery:
+    """Unit coverage for parse_python_module() / calls_named()."""
+
+    def test_parses_a_production_source_module(self):
+        """The parse must accept non-test source — the gather guard's call site.
+
+        test_gather_idiom_helper_routing asserts over src/fused_memory/*.py, so
+        a parse that only claimed to handle test modules would be lying at one
+        of its three call sites.
+        """
+        assert _PRODUCTION_SOURCE.exists(), (
+            f'{_PRODUCTION_SOURCE} is missing — this test pins that the shared '
+            f'parse accepts production source, so it needs a real one.'
+        )
+
+        tree = parse_python_module(_PRODUCTION_SOURCE)
+
+        assert isinstance(tree, ast.Module)
+        assert tree.body, 'parsed an empty module — the parse silently read nothing'
+
+    def test_repeated_parses_return_the_identical_tree(self):
+        """Memoised: the same path yields the SAME object, not an equal copy.
+
+        Consequence every consumer must respect: the tree is SHARED across
+        guards and across tests within a session, so no caller may mutate it
+        (no ast.NodeTransformer in place, no attribute assignment on nodes).
+        A mutation here would silently corrupt an unrelated guard's view of the
+        same file.
+        """
+        first = parse_python_module(_PRODUCTION_SOURCE)
+        second = parse_python_module(_PRODUCTION_SOURCE)
+
+        assert first is second
+
+    def test_missing_path_raises_assertion_error(self, tmp_path):
+        """A path that does not exist fails loudly rather than parsing empty.
+
+        A guard whose target file was renamed must break, not quietly assert
+        over an empty tree and report green having checked nothing.
+        """
+        missing = tmp_path / 'nope.py'
+
+        with pytest.raises(AssertionError):
+            parse_python_module(missing)
+
+    def test_finds_bare_and_attribute_calls_but_not_string_mentions(self):
+        """Bare `widget()` and `mod.widget()` match; the same token in a string does not.
+
+        The attribute form is what makes `asyncio.gather(...)` and
+        `db.select_graph(...)` match in the real guards. The string clause is
+        the AST-not-grep property every guard docstring claims: prose that
+        merely *describes* the idiom being migrated must not satisfy or trip a
+        check.
+        """
+        tree = ast.parse(_CALLS_SNIPPET)
+
+        found = calls_named(tree, 'widget')
+
+        assert len(found) == 2, (
+            f'expected the bare and attribute calls only, got {len(found)} — a '
+            f'string constant mentioning the name must not count.'
+        )
+        assert calls_named(tree, 'gadget'), 'an unrelated callee should still match its own name'
+        assert calls_named(tree, 'absent') == [], 'a name that is never called must match nothing'
+
+    def test_returns_real_call_nodes_with_keywords_and_lineno(self):
+        """Results keep `.keywords` and `.lineno` — both are load-bearing.
+
+        The gather guard filters results on `kw.arg == 'return_exceptions'`, and
+        all three guards print `.lineno` in their failure messages so a
+        developer can find the offending call.
+        """
+        tree = ast.parse('x = widget(payload, return_exceptions=True)\n')
+
+        (call,) = calls_named(tree, 'widget')
+
+        assert isinstance(call, ast.Call)
+        assert [kw.arg for kw in call.keywords] == ['return_exceptions']
+        assert call.lineno == 1
+
+    def test_accepts_a_non_module_node_and_searches_only_that_subtree(self):
+        """Any ast.AST, not just a Module — so a guard can ask "is it called *here*".
+
+        The probe-routing guard uses exactly this to distinguish a marker call
+        in a gating position (a decorator, or the value of a `pytestmark`
+        assignment) from one that merely builds a marker object and drops it.
+        """
+        tree = ast.parse(_NESTED_SNIPPET)
+        (decorated,) = [n for n in tree.body if isinstance(n, ast.FunctionDef)][:1]
+        (decorator,) = decorated.decorator_list
+
+        scoped = calls_named(decorator, 'widget')
+
+        assert len(scoped) == 1, f'node-scoped search leaked outside its subtree: {scoped}'
+        assert scoped[0].args[0].value == 'in-decorator'
+        assert len(calls_named(tree, 'widget')) == 3, (
+            'the whole-module search should still see every call — the narrowing '
+            'must come from the node passed in, not from the search itself.'
+        )
