@@ -116,12 +116,12 @@ def _write_jsonl(tmp_path, records):
     return path
 
 
-def _write_jsonl_gz(tmp_path, records, name='transcript.jsonl.gz'):
-    """Serialize *records* gzip-compressed to ``<tmp_path>/<name>``; return its
-    Path. Mirrors the on-disk form of an archived fleet session produced by
-    ``shared.transcript_archive`` (``<sid>.jsonl.gz``)."""
+def _write_archived_jsonl(tmp_path, records, name='archived.jsonl'):
+    """Serialize *records* to ``<tmp_path>/<name>``; return its Path.
+    Mirrors the on-disk form of an archived fleet session produced by
+    ``shared.transcript_archive`` (``<sid>.jsonl``, a verbatim copy)."""
     path = tmp_path / name
-    with gzip.open(path, 'wt', encoding='utf-8') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         for r in records:
             f.write(json.dumps(r))
             f.write('\n')
@@ -246,21 +246,9 @@ class TestLoadTranscript:
 # rather than enumerate-then-drop the whole archive at build_digest time.
 # ---------------------------------------------------------------------------
 
-class TestLoadTranscriptGzAware:
-    def test_gz_transcript_parses_identically_to_plain_jsonl(self, tmp_path):
-        records = [_user_text('first'), _assistant(_text('second')), _user_text('third')]
-        gz_path = _write_jsonl_gz(tmp_path, records)
-        plain_path = _write_jsonl(tmp_path, records)
-
-        loaded_gz = mod.load_transcript(gz_path)
-
-        assert loaded_gz == mod.load_transcript(plain_path)
-        assert [r['message']['content'] for r in loaded_gz] == [
-            'first', [{'type': 'text', 'text': 'second'}], 'third',
-        ]
-
+class TestLoadTranscriptPlain:
     def test_plain_jsonl_still_parses_as_before(self, tmp_path):
-        # Byte-parity: the non-gz branch keeps the exact pre-existing read.
+        # Byte-parity: the reader keeps the exact pre-existing read.
         records = [_user_text('one'), _user_text('two')]
         path = _write_jsonl(tmp_path, records)
 
@@ -387,14 +375,14 @@ class TestLoadTranscriptCorruptionShapes:
         assert type(slurped.value) is type(streamed.value)
         assert str(slurped.value) == str(streamed.value)
 
-    def test_corrupt_line_in_a_valid_gz_still_degrades_silently(self, tmp_path):
-        # The line-level half, unchanged: a well-formed gz whose LAST line is
-        # a half-written record still yields every parseable record and still
-        # does not raise. A fix that wrapped the parse loop too broadly would
-        # collapse this into the file-level path and inflate a caller's
+    def test_corrupt_line_in_a_valid_file_still_degrades_silently(self, tmp_path):
+        # The line-level half, unchanged: a well-formed transcript whose LAST
+        # line is a half-written record still yields every parseable record and
+        # still does not raise. A fix that wrapped the parse loop too broadly
+        # would collapse this into the file-level path and inflate a caller's
         # unreadable-file count with ordinary trailing debris.
-        path = tmp_path / 'trailing-partial.jsonl.gz'
-        with gzip.open(path, 'wt', encoding='utf-8') as f:
+        path = tmp_path / 'trailing-partial.jsonl'
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(json.dumps(_user_text('one')) + '\n')
             f.write('\n')
             f.write('{not valid json,,,\n')
@@ -1641,9 +1629,9 @@ class TestEmitConsistencyGuard:
         assert body.strip() != ''
         assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
-    def test_build_digest_end_to_end_on_gz_orchestrated_session(self, tmp_path):
+    def test_build_digest_end_to_end_on_archived_orchestrated_session(self, tmp_path):
         # Already green off steps 2/4 -- the end-to-end acceptance check:
-        # a real orchestrated-looking gz transcript (briefing turn +
+        # a real orchestrated-looking archived transcript (briefing turn +
         # genuine human correction + tool_error + not_found) yields a
         # non-empty, briefing-free digest with an intact frontmatter
         # contract.
@@ -1654,7 +1642,7 @@ class TestEmitConsistencyGuard:
             _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),
             _with_session_meta(_tool_result('tu-nf', 'bash: foo: command not found', is_error=False)),
         ]
-        path = _write_jsonl_gz(tmp_path, records)
+        path = _write_archived_jsonl(tmp_path, records)
 
         digest = mod.build_digest(path)
 

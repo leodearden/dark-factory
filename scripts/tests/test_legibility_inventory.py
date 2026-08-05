@@ -17,9 +17,9 @@ mechanics).
 """
 from __future__ import annotations
 
-import gzip
 import importlib.util
 import io
+import gzip
 import json
 import re
 import subprocess
@@ -429,21 +429,6 @@ def _write_session(dir_path: Path, session_id: str, cwd: str, timestamp: str = '
     return session_path
 
 
-def _write_session_gz(
-    dir_path: Path, session_id: str, cwd: str, timestamp: str = '2026-07-13T10:00:00.000Z'
-):
-    """Gzip sibling of :func:`_write_session`: write a ``<sid>.jsonl.gz``
-    fixture in the archived-fleet-transcript format (shared.transcript_archive)."""
-    dir_path.mkdir(parents=True, exist_ok=True)
-    session_path = dir_path / f'{session_id}.jsonl.gz'
-    lines = [
-        {'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'message': {'content': 'hello'}},
-    ]
-    with gzip.open(session_path, 'wt', encoding='utf-8') as f:
-        f.write('\n'.join(json.dumps(line) for line in lines) + '\n')
-    return session_path
-
-
 class TestIsMember:
     """is_member uses Path.is_relative_to path-component semantics."""
 
@@ -520,45 +505,6 @@ class TestSessionCwd:
         assert mod.session_cwd(tmp_path / 'does-not-exist.jsonl') is None
 
 
-class TestGzAwareReader:
-    """The single low-level reader (``iter_json_lines``, via
-    ``_session_cwd_and_date`` / ``session_cwd``) transparently reads
-    gzip-compressed ``.jsonl.gz`` transcripts — the archived fleet-transcript
-    format (shared.transcript_archive) — keeping byte-parity for plain
-    ``.jsonl`` and degrading a corrupt ``.gz`` to ``(None, None)`` rather than
-    raising (gzip.BadGzipFile subclasses OSError, so it flows through the
-    existing ``except OSError`` degrade path)."""
-
-    def test_session_cwd_reads_gz(self, tmp_path):
-        gz_path = _write_session_gz(tmp_path, 'sess', MAIN_CWD)
-        assert mod.session_cwd(gz_path) == MAIN_CWD
-
-    def test_session_cwd_and_date_reads_gz(self, tmp_path):
-        gz_path = _write_session_gz(
-            tmp_path, 'sess', WORKTREE_CWD, timestamp='2026-07-13T10:00:00.000Z'
-        )
-        cwd, session_date = mod._session_cwd_and_date(gz_path)
-        assert cwd == WORKTREE_CWD
-        assert session_date == dt_date(2026, 7, 13)
-
-    def test_plain_jsonl_parity(self, tmp_path):
-        # A plain .jsonl still reads exactly as before (no gz branch taken).
-        plain_path = _write_session(
-            tmp_path, 'sess', MAIN_CWD, timestamp='2026-07-13T10:00:00.000Z'
-        )
-        cwd, session_date = mod._session_cwd_and_date(plain_path)
-        assert cwd == MAIN_CWD
-        assert session_date == dt_date(2026, 7, 13)
-
-    def test_corrupt_gz_degrades_to_none(self, tmp_path):
-        # Raw non-gzip bytes under a .jsonl.gz name: gzip raises BadGzipFile
-        # (an OSError subclass) on first read, which _session_cwd_and_date's
-        # `except OSError` maps to (None, None) — no raise.
-        corrupt = tmp_path / 'corrupt.jsonl.gz'
-        corrupt.write_bytes(b'this is not gzip\n{"cwd": "/x", "timestamp": "2026-07-13T10:00:00Z"}\n')
-        assert mod.session_cwd(corrupt) is None
-
-
 class TestPublicIterJsonLines:
     """``iter_json_lines`` is PUBLIC — the single low-level transcript reader.
 
@@ -594,31 +540,6 @@ class TestPublicIterJsonLines:
         path = tmp_path / 'session.jsonl'
         path.write_text(self._lines(), encoding='utf-8')
         assert list(mod.iter_json_lines(path)) == self.RECORDS
-
-    def test_gz_round_trips_identically(self, tmp_path):
-        gz_path = tmp_path / 'session.jsonl.gz'
-        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
-            f.write(self._lines())
-        assert list(mod.iter_json_lines(gz_path)) == self.RECORDS
-
-    def test_plain_and_gz_yield_the_same_records(self, tmp_path):
-        plain = tmp_path / 'session.jsonl'
-        plain.write_text(self._lines(), encoding='utf-8')
-        gz_path = tmp_path / 'session.jsonl.gz'
-        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
-            f.write(self._lines())
-        assert list(mod.iter_json_lines(plain)) == list(mod.iter_json_lines(gz_path))
-
-    def test_corrupt_gz_raises_oserror(self, tmp_path):
-        # The documented file-level contract the corpus extractor's coverage
-        # accounting depends on: an unreadable FILE raises OSError
-        # (gzip.BadGzipFile subclasses it), so `except OSError` counts one
-        # parse failure — as distinct from the corrupt LINES above, which are
-        # skipped silently and must NOT inflate that count.
-        corrupt = tmp_path / 'corrupt.jsonl.gz'
-        corrupt.write_bytes(b'this is not gzip at all\n')
-        with pytest.raises(OSError):
-            list(mod.iter_json_lines(corrupt))
 
 
 class TestIterJsonLinesCorruptionShapes:
@@ -694,7 +615,7 @@ class TestIterJsonLinesCorruptionShapes:
         # Same byte, no gzip layer: the plain branch opens with the same
         # strict encoding, so this shape is reachable there too and must
         # normalize identically.
-        undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl')
+        undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl.gz')
         with pytest.raises(OSError):
             list(mod.iter_json_lines(undecodable))
 
@@ -844,7 +765,7 @@ class TestEnumerateSessions:
 class TestEnumerateArchiveRoots:
     """enumerate_sessions additionally walks agent_transcript_roots — the
     archived fleet-transcript tree written by shared.transcript_archive in
-    the production nested layout ``<archive>/<task_id>/<enc>/<sid>.jsonl.gz``
+    the production nested layout ``<archive>/<task_id>/<enc>/<sid>.jsonl``
     (+ a plain ``.jsonl`` variant) — recursively, gated solely by
     :func:`is_member` on each session's REAL cwd. The empty-roots path is
     byte-identical to today (the archive loop simply does not execute).
@@ -854,17 +775,17 @@ class TestEnumerateArchiveRoots:
     WT_ENC = '-home-leo-src-dark-factory--worktrees-2573'
 
     def _build_archive(self, root: Path) -> Path:
-        # Production nested layout: <archive>/<task_id>/<enc>/<sid>.jsonl(.gz)
+        # Production nested layout: <archive>/<task_id>/<enc>/<sid>.jsonl
         enc_dir = root / '2573' / self.WT_ENC
-        _write_session_gz(
-            enc_dir, 'gz-session', WORKTREE_CWD, timestamp='2026-07-13T09:00:00.000Z'
+        _write_session(
+            enc_dir, 'archived-session', WORKTREE_CWD, timestamp='2026-07-13T09:00:00.000Z'
         )
         _write_session(
             enc_dir, 'plain-session', WORKTREE_CWD, timestamp='2026-07-13T10:00:00.000Z'
         )
         # A non-member cockpit cwd under its own task-id/enc dir: is_member
         # is false, so it is excluded even though it is inside the archive.
-        _write_session_gz(
+        _write_session(
             root / '9999' / '-home-leo-src-dark-factory-cockpit',
             'cockpit-session', COCKPIT_CWD, timestamp='2026-07-13T09:30:00.000Z',
         )
@@ -877,7 +798,7 @@ class TestEnumerateArchiveRoots:
             agent_transcript_roots=[archive],
         )
         assert {r.path.name for r in records} == {
-            'gz-session.jsonl.gz', 'plain-session.jsonl',
+            'archived-session.jsonl', 'plain-session.jsonl',
         }
 
     def test_archive_record_fields(self, tmp_path):
@@ -886,11 +807,11 @@ class TestEnumerateArchiveRoots:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        gz = next(r for r in records if r.path.name == 'gz-session.jsonl.gz')
-        assert gz.encoded_dir == self.WT_ENC
-        assert gz.cwd == WORKTREE_CWD
-        assert gz.date == self.TARGET_DATE
-        assert gz.size_bytes == gz.path.stat().st_size
+        archived = next(r for r in records if r.path.name == 'archived-session.jsonl')
+        assert archived.encoded_dir == self.WT_ENC
+        assert archived.cwd == WORKTREE_CWD
+        assert archived.date == self.TARGET_DATE
+        assert archived.size_bytes == archived.path.stat().st_size
 
     def test_non_member_cockpit_session_excluded(self, tmp_path):
         archive = self._build_archive(tmp_path / 'archive')
@@ -898,7 +819,7 @@ class TestEnumerateArchiveRoots:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        assert 'cockpit-session.jsonl.gz' not in {r.path.name for r in records}
+        assert 'cockpit-session.jsonl' not in {r.path.name for r in records}
 
     def test_empty_agent_transcript_roots_is_byte_identical(self, tmp_path):
         # A tree with BOTH a projects-root session and a populated archive.
@@ -1019,8 +940,8 @@ class TestArchiveEncPrefilter:
     ``<enc>`` is skipped WITHOUT a gz-decompress. :func:`is_member` on the
     real cwd remains the SOLE membership authority for lossy false-positives
     (e.g. a ``-cockpit`` sibling that string-startswith the prefix). ``<enc>``
-    is ``parts[1]`` for BOTH the main (``<task>/<enc>/<sid>.jsonl.gz``) and
-    subagent (``<task>/<enc>/<sid>/subagents/agent-*.jsonl.gz``) layouts —
+    is ``parts[1]`` for BOTH the main (``<task>/<enc>/<sid>.jsonl``) and
+    subagent (``<task>/<enc>/<sid>/subagents/agent-*.jsonl``) layouts —
     never ``session_path.parent.name`` (== ``'subagents'`` for the subagent
     variant, which would wrongly drop every subagent transcript)."""
 
@@ -1048,7 +969,7 @@ class TestArchiveEncPrefilter:
         # excluded AND its path is never passed to the reader — skipped without
         # a gz-decompress by the cheap <enc> pre-filter.
         archive = tmp_path / 'archive'
-        _write_session_gz(
+        _write_session(
             archive / '2573' / self.OTHER_ENC, 'foreign', self.OTHER_CWD,
             timestamp='2026-07-13T09:00:00.000Z',
         )
@@ -1057,14 +978,14 @@ class TestArchiveEncPrefilter:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        foreign_path = archive / '2573' / self.OTHER_ENC / 'foreign.jsonl.gz'
+        foreign_path = archive / '2573' / self.OTHER_ENC / 'foreign.jsonl'
         assert records == []
         assert foreign_path not in opened
 
     def test_member_enc_kept_and_opened(self, tmp_path, monkeypatch):
         # (b) A member <enc> is kept AND its path WAS passed to the reader.
         archive = tmp_path / 'archive'
-        member_path = _write_session_gz(
+        member_path = _write_session(
             archive / '2573' / self.WT_ENC, 'member', WORKTREE_CWD,
             timestamp='2026-07-13T09:00:00.000Z',
         )
@@ -1073,7 +994,7 @@ class TestArchiveEncPrefilter:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        assert {r.path.name for r in records} == {'member.jsonl.gz'}
+        assert {r.path.name for r in records} == {'member.jsonl'}
         assert member_path in opened
 
     def test_lossy_cockpit_false_positive_is_opened_then_is_member_rejected(
@@ -1085,7 +1006,7 @@ class TestArchiveEncPrefilter:
         # The pre-filter is a superset filter; is_member is the sole authority.
         archive = tmp_path / 'archive'
         cockpit_enc = mod.encode_cwd(COCKPIT_CWD)
-        cockpit_path = _write_session_gz(
+        cockpit_path = _write_session(
             archive / '9999' / cockpit_enc, 'cockpit', COCKPIT_CWD,
             timestamp='2026-07-13T09:00:00.000Z',
         )
@@ -1098,14 +1019,14 @@ class TestArchiveEncPrefilter:
         assert cockpit_path in opened
 
     def test_subagent_layout_member_kept_and_opened(self, tmp_path, monkeypatch):
-        # (d) Subagent layout: <archive>/<task>/<enc>/<sid>/subagents/agent-x.jsonl.gz.
+        # (d) Subagent layout: <archive>/<task>/<enc>/<sid>/subagents/agent-x.jsonl.
         # <enc> is parts[1] (the member WT_ENC), NOT parent.name (== 'subagents',
         # which never encoded-prefix-matches a cwd and would drop EVERY subagent
         # transcript). The member subagent file is kept + opened, and its
         # encoded_dir is the real <enc>, not 'subagents'.
         archive = tmp_path / 'archive'
         sub_dir = archive / '2573' / self.WT_ENC / 'cafe-sid' / 'subagents'
-        sub_path = _write_session_gz(
+        sub_path = _write_session(
             sub_dir, 'agent-x', WORKTREE_CWD, timestamp='2026-07-13T09:00:00.000Z',
         )
         opened = self._install_open_spy(monkeypatch)
@@ -1113,7 +1034,7 @@ class TestArchiveEncPrefilter:
             tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
             agent_transcript_roots=[archive],
         )
-        assert {r.path.name for r in records} == {'agent-x.jsonl.gz'}
+        assert {r.path.name for r in records} == {'agent-x.jsonl'}
         assert sub_path in opened
-        record = next(r for r in records if r.path.name == 'agent-x.jsonl.gz')
+        record = next(r for r in records if r.path.name == 'agent-x.jsonl')
         assert record.encoded_dir == self.WT_ENC
