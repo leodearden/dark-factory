@@ -72,6 +72,21 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Bind `shared` to the SAME checkout as this script via a __file__-relative
+# path, never a hardcoded absolute. An editable install puts the MAIN
+# checkout's shared/src on sys.path for a bare `python3`, so without this a
+# copy of this script running from a worktree would scan cap-banner text using
+# the MAIN checkout's marker list rather than its own. Same reasoning and same
+# form as scripts/audit_combine_gate_marker_loss.py:74-84 and
+# scripts/repair_wiped_metadata_files.py:65-75 (tasks 2881/2882/3329), with
+# parents[2] rather than parent.parent because census.py sits one directory
+# deeper (scripts/legibility/, not scripts/). Unconditional -- NOT inside the
+# `__main__` guard above -- because the `shared.cap_markers` import it enables
+# is module-level, so it must resolve under pytest and package import too.
+_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
 import codebook  # noqa: E402
 import coder  # noqa: E402
 import digest  # noqa: E402
