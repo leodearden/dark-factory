@@ -1041,3 +1041,66 @@ async def test_get_write_op_roundtrip(journal):
     assert row['terminal_status'] is None
 
     assert await journal.get_write_op('no-such-id') is None
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_outcome_stamps_completed(journal):
+    from datetime import UTC, datetime
+
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(write_op_id=op_id, operation='add_episode')
+
+    assert await journal.record_terminal_outcome(
+        write_op_id=op_id, terminal_status='completed'
+    ) is True
+
+    row = await journal.get_write_op(op_id)
+    assert row is not None
+    assert row['terminal_status'] == 'completed'
+    assert row['terminal_error'] is None
+    stamped = datetime.fromisoformat(row['terminal_at'])
+    assert stamped.tzinfo is not None
+    assert stamped.utcoffset() == UTC.utcoffset(None)
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_outcome_stamps_dead_and_preserves_success(journal):
+    """`success` (enqueue accepted) and `terminal_status` (write landed) are
+    two different facts and BOTH survive."""
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(write_op_id=op_id, operation='add_episode')
+
+    assert await journal.record_terminal_outcome(
+        write_op_id=op_id,
+        terminal_status='dead',
+        terminal_error='RuntimeError: node abc not found',
+    ) is True
+
+    row = await journal.get_write_op(op_id)
+    assert row is not None
+    assert row['terminal_status'] == 'dead'
+    assert row['terminal_error'] == 'RuntimeError: node abc not found'
+    assert row['success'] == 1
+    assert row['error'] is None
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_outcome_last_write_wins(journal):
+    """A replayed dead-letter that later lands re-stamps 'completed'."""
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(write_op_id=op_id, operation='add_episode')
+
+    await journal.record_terminal_outcome(
+        write_op_id=op_id, terminal_status='dead', terminal_error='RuntimeError: boom'
+    )
+    first = await journal.get_write_op(op_id)
+    assert first is not None and first['terminal_status'] == 'dead'
+
+    await journal.record_terminal_outcome(
+        write_op_id=op_id, terminal_status='completed'
+    )
+    second = await journal.get_write_op(op_id)
+    assert second is not None
+    assert second['terminal_status'] == 'completed'
+    assert second['terminal_error'] is None
+    assert second['terminal_at'] >= first['terminal_at']
