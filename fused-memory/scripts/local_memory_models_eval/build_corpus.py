@@ -110,16 +110,24 @@ Status                Exit  Meaning and remedy
                             a reader can tell a broken artifact from a broken
                             checker.
 ====================  ====  ==================================================
+
+Exit ``1`` (:data:`EXIT_RUN_FAILED`) is reserved for a run that could not
+complete at all — the store was unreachable, or the requested corpus is
+unsatisfiable. It is deliberately outside the table above so a caller can tell
+"the corpus is wrong" from "the check never ran".
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import dataclasses
 import hashlib
 import json
 import os
 import random
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -781,6 +789,17 @@ a search prompt. The ASCII spelling is what makes the criterion findable, the
 Greek is what ties it back to the PRD row.
 """
 
+DEFAULT_SEED = 'local-memory-models-eval:corpus:v1'
+"""The default sampling seed — fixed, never drawn from the clock or ``urandom``.
+
+A random default would make the committed artifact irreproducible from the CLI
+alone: a reviewer running the documented command would get a different corpus
+every time and could not tell a tampered manifest from a re-seeded one. The
+seed is recorded in the manifest, and :func:`verify_manifest` re-derives from
+the RECORDED seed rather than from this constant, so changing the default here
+never invalidates an existing artifact.
+"""
+
 NO_OUTCOME_FILTER_STATEMENT = (
     'Corpus membership is NEVER conditioned on the incumbent extraction '
     "pipeline's outcome. The population query projects only the six fields "
@@ -929,6 +948,15 @@ Each failure gets its own code because each has a different remedy, and a
 wrapper or CI job reads the code without ever opening the report. Collapsing
 them into one non-zero would send a reader down the wrong path — see
 :class:`VerifyReport`.
+"""
+
+EXIT_RUN_FAILED = 1
+"""The run could not complete at all — no verdict was reached.
+
+Deliberately outside :data:`EXIT_CODES`, whose values are 0 and 2-5, leaving 1
+free for this. A store that could not be read and a corpus that verified
+badly are opposite situations: one says "re-run me", the other says "the
+artifact is wrong". A single non-zero for both would conflate them.
 """
 
 
@@ -1101,3 +1129,230 @@ def record_field_names() -> tuple[str, ...]:
     in prose alone.
     """
     return tuple(f.name for f in dataclasses.fields(EpisodeRecord))
+
+
+# ---------------------------------------------------------------------------
+# Report rendering
+# ---------------------------------------------------------------------------
+
+
+def render_report(manifest: dict) -> str:
+    """Render the stratification report as a terminal table.
+
+    Rendered from the manifest rather than from the in-memory
+    :class:`SelectionResult`, so what an operator reads on stdout and what a
+    reviewer reads in the committed artifact are the same numbers by
+    construction. A report computed independently could disagree with the file
+    it describes, and the disagreement would be invisible.
+    """
+    criteria = manifest['criteria']
+    report = manifest['stratification_report']
+    cells: dict = report['cells']
+    totals = report['totals']
+    width = max([len('stratum'), *(len(label) for label in cells)])
+    window = criteria['window']
+    lines = [
+        f'LME replay corpus — graph={criteria["graph"]} n={criteria["n"]} '
+        f'seed={criteria["seed"]!r} builder_version={criteria["builder_version"]}',
+        f'population: {criteria["population_size"]} episodes in {len(cells)} non-empty '
+        f'cells, {window["min_created_at"]} .. {window["max_created_at"]}',
+        '',
+        f'{"stratum".ljust(width)}  population  allocated  selected',
+        f'{"-" * width}  ----------  ---------  --------',
+    ]
+    lines += [
+        f'{label.ljust(width)}  {cell["population"]:>10}  {cell["allocated"]:>9}  '
+        f'{cell["selected"]:>8}'
+        for label, cell in sorted(cells.items())
+    ]
+    lines.append(
+        f'{"TOTAL".ljust(width)}  {totals["population"]:>10}  {totals["allocated"]:>9}  '
+        f'{totals["selected"]:>8}'
+    )
+    return '\n'.join(lines) + '\n'
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """The CLI: flat mode flags, no subcommands.
+
+    Every flag is a read or an output-location parameter. There is deliberately
+    no flag that mutates the store — no ``--prune``, no ``--reindex``, no
+    ``--apply`` — and a test pins this flag set by EQUALITY so one cannot be
+    added without a test saying so out loud.
+    """
+    parser = argparse.ArgumentParser(
+        # The module docstring carries RST tables that argparse's formatter
+        # reflows into rubble (the memory_eval_retrieval_probe treatment); the
+        # first line plus the two guarantees is what an operator needs here.
+        description=(
+            f'{(__doc__ or "LME replay corpus builder").splitlines()[0]}\n\n'
+            'Strictly read-only: one GRAPH.RO_QUERY against the graph, one\n'
+            'committed manifest written beside this script. Corpus membership\n'
+            "is never conditioned on the incumbent pipeline's outcome."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        '--verify',
+        action='store_true',
+        help=(
+            'Re-derive the manifest at --out from its OWN recorded criteria and '
+            'compare. Catches a tampered seed, a drifted episode and a vanished '
+            f'one, each on its own exit code {sorted(EXIT_CODES.values())}. '
+            'Default mode is build.'
+        ),
+    )
+    parser.add_argument(
+        '--n',
+        type=int,
+        default=DEFAULT_N,
+        help=(
+            'Corpus size (default: %(default)s, the midpoint of the PRD 150-300 '
+            'band). An n that cannot satisfy the min-1 floor, or that exceeds '
+            f'the population, exits {EXIT_RUN_FAILED} rather than quietly '
+            'producing a shorter corpus. Ignored under --verify, which uses the '
+            'n the manifest recorded.'
+        ),
+    )
+    parser.add_argument(
+        '--seed',
+        default=DEFAULT_SEED,
+        help=(
+            'Sampling seed (default: %(default)s). Fixed, never clock-derived: a '
+            'random default would make the committed artifact irreproducible and '
+            'a reviewer could not tell a re-seed from tampering. Ignored under '
+            '--verify, which re-derives from the recorded seed.'
+        ),
+    )
+    parser.add_argument(
+        '--graph',
+        default=DEFAULT_GRAPH,
+        help=(
+            'FalkorDB graph to read (default: %(default)s). Under --verify this '
+            'is only a fallback: re-derivation reads the graph the manifest '
+            'records, since verifying against a different graph would compare a '
+            'corpus to a population it was never drawn from.'
+        ),
+    )
+    parser.add_argument(
+        '--out',
+        default=DEFAULT_MANIFEST_PATH,
+        help=(
+            'Manifest path — written in build mode, read in --verify mode '
+            '(default: %(default)s). The default is under scripts/ and NOT under '
+            'data/, which fused-memory/.gitignore ignores; a manifest written '
+            'there would be uncommittable and would fail the delivered_check.'
+        ),
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help=(
+            'Print the stratification report and write NOTHING. Use it to check '
+            'an --n before committing an artifact, so a re-tune never leaves a '
+            'half-considered manifest in the tree.'
+        ),
+    )
+    return parser
+
+
+def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
+    """Read the whole ``Episodic`` population from *graph_name*.
+
+    ``EpisodeReader`` is looked up on the module at call time rather than
+    captured, so a test can substitute an offline double for the whole CLI.
+    """
+    return asyncio.run(EpisodeReader(graph_name=graph_name).fetch_population())
+
+
+def _run_build(args: argparse.Namespace) -> int:
+    """Build mode: sample, report, and (unless ``--dry-run``) write."""
+    population = _fetch_population(args.graph)
+    result = select(population, args.n, seed=args.seed)
+    manifest = build_manifest(
+        result, population, n=args.n, seed=args.seed, graph=args.graph
+    )
+    print(render_report(manifest), end='')
+    if args.dry_run:
+        print(f'dry-run: nothing written (would have written {args.out})')
+        return 0
+    print(f'manifest: {write_manifest(manifest, args.out)}')
+    return 0
+
+
+def _run_verify(args: argparse.Namespace) -> int:
+    """Verify mode: re-derive the artifact at ``--out`` and exit on its status.
+
+    The manifest is read BEFORE the store, so an unreadable artifact costs no
+    query — and reports ``bad_manifest`` rather than surfacing whatever the
+    store said, which would send the reader after the wrong problem.
+    """
+    path = Path(args.out)
+    try:
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+    except OSError as exc:
+        return _emit_verdict(
+            VerifyReport(status='bad_manifest', detail=f'cannot read {path}: {exc}')
+        )
+    except ValueError as exc:
+        return _emit_verdict(
+            VerifyReport(status='bad_manifest', detail=f'{path} is not valid JSON: {exc}')
+        )
+
+    # Re-derive against the graph the MANIFEST names — that is what "re-derive
+    # from the recorded criteria" means. --graph is the fallback for a manifest
+    # that records none.
+    recorded_graph = None
+    if isinstance(manifest, dict) and isinstance(manifest.get('criteria'), dict):
+        candidate = manifest['criteria'].get('graph')
+        recorded_graph = candidate if isinstance(candidate, str) and candidate else None
+    population = _fetch_population(recorded_graph or args.graph)
+    return _emit_verdict(verify_manifest(manifest, population))
+
+
+def _emit_verdict(report: VerifyReport) -> int:
+    """Print *report* and return its exit code.
+
+    A clean verdict goes to stdout; every failure goes to stderr WITH its
+    structured diff, so a caller that only reads stderr still sees which ids or
+    hashes are at issue rather than a bare status word.
+    """
+    line = f'verify: {report.status} — {report.detail}'
+    if report.ok:
+        print(line)
+        return report.exit_code
+    print(line, file=sys.stderr)
+    diff = {
+        key: value
+        for key, value in (
+            ('id_mismatch', report.id_mismatch),
+            ('hash_drift', report.hash_drift),
+            ('missing', report.missing),
+        )
+        if value
+    }
+    if diff:
+        print(json.dumps(diff, indent=2, sort_keys=True), file=sys.stderr)
+    return report.exit_code
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the CLI and return a process exit code."""
+    args = _build_parser().parse_args(argv)
+    try:
+        return _run_verify(args) if args.verify else _run_build(args)
+    except CorpusBuildError as exc:
+        # A typed build/read failure, reported as a message plus a documented
+        # code rather than a traceback plus exit 1-by-accident. Distinct from
+        # every EXIT_CODES verification status: nothing was verified.
+        print(f'error: {exc}', file=sys.stderr)
+        return EXIT_RUN_FAILED
+
+
+if __name__ == '__main__':
+    sys.exit(main())
