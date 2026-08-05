@@ -299,15 +299,18 @@ type_check_command: "npx pyright scripts/"
 # this command; runs 5-6 are otherwise the same command against the same two
 # target trees as runs 3-4.
 #
-# (2) THE SIZING ARITHMETIC. W = 930.59s, the LARGEST wall-clock across all
-# six runs (run 4) — never the mean. A mean would land near 530s, which run 4
-# alone disproves: it is a recorded HONEST GREEN run of this exact command on
-# a byte-identical tree, so a budget under it would manufacture infra_timeout
-# on the green path — the exact defect this task exists to prevent. The runs
-# span ~293s to ~931s wall for the same command on this oversubscribed host;
-# that spread is LOAD at measurement time, not suite variance, which is
-# exactly why the max and not the mean is the sizing input (the same
-# reasoning tests/scripts/orchestrator.yaml applies to its own budget).
+# (2) THE SIZING ARITHMETIC. W = 930.59s (run 4), the largest wall-clock of
+# the five runs that recorded one; run 3 recorded only a pytest-internal
+# duration (310.33s pytest, no wall-clock captured), well under W either way,
+# so it cannot change which run is worst — never the mean. A mean would land
+# near 530s, which run 4 alone disproves: it is a recorded HONEST GREEN run
+# of this exact command on a byte-identical tree, so a budget under it would
+# manufacture infra_timeout on the green path — the exact defect this task
+# exists to prevent. The recorded wall-clocks span ~293s to ~931s for the
+# same command on this oversubscribed host; that spread is LOAD at
+# measurement time, not suite variance, which is exactly why the max and not
+# the mean is the sizing input (the same reasoning
+# tests/scripts/orchestrator.yaml applies to its own budget).
 # verify_command_timeout_secs: 2400 is ~2.6x W — the same multiple
 # tests/scripts/orchestrator.yaml uses for its own 600s budget (~2.6x its
 # 233.50s worst of two runs) — kept identical across the two sibling configs
