@@ -1313,16 +1313,42 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
 
     Shared rewrite closure for ``serial_pytest``/``apply_pytest_numprocesses``'s
     raw-retained (chained) path: matches each ``_PYTEST_INVOCATION_RE`` span,
-    strips trailing whitespace, appends *suffix*, then re-attaches the
-    trailing whitespace so an immediately-following chain operator (e.g.
-    `` && ``) survives untouched. *suffix* should include its own leading
-    space (e.g. ``' -n 16'``).
+    peels the trailing run of whitespace and SUBSHELL TERMINATORS off it,
+    appends *suffix*, then re-attaches that tail — so both an
+    immediately-following chain operator (e.g. `` && ``) and an enclosing
+    subshell's ``)`` survive untouched. *suffix* should include its own
+    leading space (e.g. ``' -n 16'``).
+
+    **Why terminators are peeled (task 3478).** ``_PYTEST_INVOCATION_RE``'s
+    ``[^&|;]*`` class stops at the chain operators but NOT at ``)``, so on a
+    clause like ``( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest
+    tests/ )`` the span runs PAST the closing paren. Appending there yields
+    ``( ... pytest tests/ ) -p no:xdist``, which bash refuses to parse at all
+    (``syntax error near unexpected token``) — so the defect is not a clause
+    quietly losing its flags but the WHOLE chain becoming unrunnable. The
+    committed fleet ``test_command`` contains exactly such a subshell, and
+    ``serial_pytest`` drives the env-transient and flaky-scoped recovery
+    re-runs, so this fired at shipped defaults with no knob set.
+
+    The peel is gated on ``count(')') > count('(')`` — an UNBALANCED trailing
+    paren, which within a single invocation span can only be a terminator the
+    class over-matched into. A balanced paren belonging to an argument, e.g.
+    ``-k 'test_a and (b or c)'``, fails that test and correctly keeps the
+    suffix at the end. Looping handles nesting.
+
+    Widening the class to ``[^&|;()]*`` is the tempting one-character fix and
+    is WRONG: it would halt the span at an argument's OPENING paren and
+    splice the suffix into the middle of that ``-k`` expression — a silent
+    wrong-command, strictly worse than the syntax error it replaces.
     """
     def _rewrite(match: re.Match[str]) -> str:
         segment = match.group(0)
-        stripped = segment.rstrip()
-        trailing = segment[len(stripped) :]
-        return f'{stripped}{suffix}{trailing}'
+        # Shrink `core` past trailing whitespace and unbalanced `)`; whatever
+        # it gives up is the tail, re-attached verbatim after the suffix.
+        core = segment.rstrip()
+        while core.endswith(')') and core.count(')') > core.count('('):
+            core = core[:-1].rstrip()
+        return f'{core}{suffix}{segment[len(core):]}'
 
     return _PYTEST_INVOCATION_RE.sub(_rewrite, raw)
 
