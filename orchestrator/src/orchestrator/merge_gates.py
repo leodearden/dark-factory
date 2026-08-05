@@ -1240,6 +1240,7 @@ async def _check_plan_files_touched_in_branch(
         return tree_listing
 
     not_touched: list[str] = []
+    missing_from_tree: list[str] = []
     resolved_renames: dict[str, str] = {}
     for entry in plan_files:
         if not entry:
@@ -1310,17 +1311,29 @@ async def _check_plan_files_touched_in_branch(
                     entry, resolved, mechanism, task_id or '<unknown>',
                 )
                 continue
+        else:
+            # Absent AND unresolvable: the declared PATH is stale.  Recorded
+            # in BOTH lists (subset invariant) so every existing
+            # not_touched-only consumer is unchanged while the diagnosis
+            # can distinguish "the branch under-delivered" from "the plan
+            # names a path that isn't there".  Entries reaching here via
+            # the git-error arm above are deliberately NOT classified —
+            # their absence was never measured.
+            missing_from_tree.append(entry)
 
         not_touched.append(entry)
 
     if not_touched:
         logger.warning(
             'plan-files-touched: not_touched task_id=%s '
-            'base=%s head=%s entries=%r',
+            'base=%s head=%s entries=%r '
+            'missing_from_tree=%r resolved_renames=%r',
             task_id or '<unknown>', base_sha, branch_head, not_touched,
+            missing_from_tree, resolved_renames,
         )
     return PlanFilesTouchedResult(
         not_touched=not_touched,
+        missing_from_tree=missing_from_tree,
         resolved_renames=resolved_renames,
     )
 
