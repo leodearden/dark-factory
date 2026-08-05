@@ -4764,8 +4764,34 @@ async def run_verification(
                     segment_timeout: float,
                     segment_label: str,
                 ) -> tuple[int, str, bool]:
-                    # cpu-governance and the nice prefix are per-segment: each
-                    # segment is its own subprocess, so each needs its own wrap.
+                    # The `-n` cap, cpu-governance and the nice prefix are all
+                    # per-segment: each segment is its own subprocess, so each
+                    # needs its own wrap.
+                    #
+                    # Per SEGMENT is the right granularity, not N times the
+                    # parallelism (task 3478, correcting task 3338's comment):
+                    # _run_segmented awaits `run_one` once per loop iteration,
+                    # so segments run SEQUENTIALLY. A per-segment `-n N`
+                    # therefore caps N workers at any instant — exactly what
+                    # `-n N` means for a single pytest command. Without this
+                    # the cap was silently dropped on this path, since the
+                    # rewrite above lands on `cmd` while segments are built
+                    # from `config_cmd`.
+                    #
+                    # BEFORE _govern_cpu_str, the same ordering constraint the
+                    # junitxml site documents: a governed command is an opaque
+                    # outer `<exec> -- /bin/bash -c '...'` string that
+                    # parse_config_command can no longer see as pytest.
+                    # Governance is inert here (_resolve_governed_exec_path
+                    # returns None for role != 'merge', and segmentation only
+                    # happens for role != 'merge'), so ordering it first is
+                    # defence in depth against a future change to that gate
+                    # rather than a live dependency.
+                    if pytest_n_capped:
+                        segment_cmd = _with_pytest_numprocesses_str(
+                            segment_cmd, config.verify_admission_pytest_n,
+                        )
+                        assert segment_cmd is not None  # None only for a None input
                     governed = _govern_cpu_str(
                         segment_cmd, _resolve_governed_exec_path(config, worktree, role),
                     )
