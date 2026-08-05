@@ -1653,7 +1653,8 @@ class TestSharedAstGuardMachinery:
         scoped = calls_named(decorator, 'widget')
 
         assert len(scoped) == 1, f'node-scoped search leaked outside its subtree: {scoped}'
-        assert scoped[0].args[0].value == 'in-decorator'
+        marker = scoped[0].args[0]
+        assert isinstance(marker, ast.Constant) and marker.value == 'in-decorator'
         assert len(calls_named(tree, 'widget')) == 3, (
             'the whole-module search should still see every call — the narrowing '
             'must come from the node passed in, not from the search itself.'
