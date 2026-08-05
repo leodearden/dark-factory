@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -871,3 +873,189 @@ class TestClassifyDegenerateMetadata:
                 task=make_cross_repo_task(metadata=shape), project_root=project_root
             )
             assert verdict.verdict in ('block', 'allow', 'skip')
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED: Harness._block_and_escalate_cross_repo
+# ---------------------------------------------------------------------------
+
+
+def _make_harness(tmp_path: Path):
+    """Build a bare Harness with mocked internals for cross-repo gate tests.
+
+    Copied from test_substrate_gate.py:777 (per-test-file helper convention).
+    """
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.harness import Harness
+
+    config = OrchestratorConfig(project_root=tmp_path, max_per_module=1)
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.OverrideStore'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        h = Harness(config)
+
+    h.scheduler = MagicMock()
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
+
+    h.git_ops = MagicMock()
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' * 5)
+    h.git_ops.worktree_base = tmp_path / '.worktrees'
+    h.git_ops.project_root = tmp_path
+    h.git_ops.prune_worktrees = AsyncMock(return_value=None)
+
+    # No escalation queue by default — tests that need one attach it explicitly.
+    h._escalation_queue = None
+
+    return h
+
+
+def _block_verdict(owner: str | None = 'dark_factory', paths: tuple[str, ...] = ()):
+    from orchestrator.cross_repo_gate import BLOCK, CrossRepoVerdict
+
+    return CrossRepoVerdict(
+        verdict=BLOCK,
+        owner_project=owner,
+        signals=('cross_repo_marker', 'all_files_foreign'),
+        foreign_paths=paths or ('/home/leo/src/dark-factory/orchestrator/src/x.py',),
+        reason='all 1 declared metadata.files entries resolve outside project_root',
+    )
+
+
+class TestBlockAndEscalateCrossRepo:
+    """Unit tests for ``Harness._block_and_escalate_cross_repo``.
+
+    Modelled on TestBlockAndEscalateSubstrateFlip (test_substrate_gate.py:786).
+    """
+
+    @pytest.mark.asyncio
+    async def test_sets_task_blocked(self, tmp_path: Path):
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+
+        await h._block_and_escalate_cross_repo('99', verdict=_block_verdict())
+
+        h.scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')
+
+    @pytest.mark.asyncio
+    async def test_files_one_l1_scope_violation(self, tmp_path: Path):
+        """scope_violation, not design_concern: the work belongs to another project."""
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        await h._block_and_escalate_cross_repo('77', verdict=_block_verdict())
+
+        l1s = [e for e in esc_queue.get_pending() if e.task_id == '77' and e.level == 1]
+        assert len(l1s) == 1, f'Expected exactly 1 L1 for task 77; got {l1s!r}'
+        esc = l1s[0]
+        assert esc.category == 'scope_violation'
+        assert esc.severity == 'blocking'
+        assert esc.level == 1
+
+    @pytest.mark.asyncio
+    async def test_summary_names_the_owning_project(self, tmp_path: Path):
+        """An L1 naming the owner is directly actionable; one that doesn't costs a triage round trip."""
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        await h._block_and_escalate_cross_repo(
+            '66', verdict=_block_verdict(owner='dark_factory')
+        )
+
+        esc = [e for e in esc_queue.get_pending() if e.task_id == '66'][0]
+        assert 'dark_factory' in esc.summary, (
+            f'summary must name the owning project; got {esc.summary!r}'
+        )
+        assert len(esc.summary) <= 200, 'summary must be truncated to 200 chars'
+
+    @pytest.mark.asyncio
+    async def test_detail_carries_reason_signals_and_paths(self, tmp_path: Path):
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        verdict = _block_verdict(paths=('/home/leo/src/dark-factory/orchestrator/a.py',))
+        await h._block_and_escalate_cross_repo('65', verdict=verdict)
+
+        esc = [e for e in esc_queue.get_pending() if e.task_id == '65'][0]
+        assert verdict.reason in esc.detail
+        assert '/home/leo/src/dark-factory/orchestrator/a.py' in esc.detail
+        for signal in verdict.signals:
+            assert signal in esc.detail, f'detail must name the signal {signal!r}'
+        assert 'refile' in esc.detail.lower(), (
+            'detail must state the fix — refile the task under the owning project'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unresolved_owner_says_so_explicitly(self, tmp_path: Path):
+        """No placeholder, no empty name — say the owner could not be resolved."""
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        await h._block_and_escalate_cross_repo('64', verdict=_block_verdict(owner=None))
+
+        esc = [e for e in esc_queue.get_pending() if e.task_id == '64'][0]
+        assert 'None' not in esc.summary, (
+            f'must not leak a Python None into the L1 summary; got {esc.summary!r}'
+        )
+        assert 'unresolved' in esc.summary.lower(), (
+            f'summary must say the owner is unresolved; got {esc.summary!r}'
+        )
+        assert 'unresolved' in esc.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_deduped_by_has_open_l1(self, tmp_path: Path):
+        """Repeated dispatch after the requeue cooldown must not stack duplicates."""
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        await h._block_and_escalate_cross_repo('55', verdict=_block_verdict())
+        await h._block_and_escalate_cross_repo('55', verdict=_block_verdict())
+
+        l1s = [e for e in esc_queue.get_pending() if e.task_id == '55' and e.level == 1]
+        assert len(l1s) == 1, f'Expected exactly 1 L1 after dedup; got {l1s!r}'
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_escalation_queue(self, tmp_path: Path):
+        """Blocking the task is unconditional even with no queue to file into."""
+        h = _make_harness(tmp_path)
+        h._escalation_queue = None
+
+        await h._block_and_escalate_cross_repo('33', verdict=_block_verdict())
+
+        h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')
+
+    @pytest.mark.asyncio
+    async def test_files_l1_even_when_set_task_status_raises(self, tmp_path: Path):
+        """A transient status-write failure must not swallow the escalation."""
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+        h.scheduler.set_task_status = AsyncMock(side_effect=RuntimeError('memory down'))
+
+        await h._block_and_escalate_cross_repo('22', verdict=_block_verdict())
+
+        l1s = [e for e in esc_queue.get_pending() if e.task_id == '22' and e.level == 1]
+        assert len(l1s) == 1, (
+            f'L1 must still be filed when set_task_status raises; got {l1s!r}'
+        )
