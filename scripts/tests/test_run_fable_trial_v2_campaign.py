@@ -712,3 +712,138 @@ def test_rendering_is_deterministic():
 
     assert first == second
     assert 'ceiling' in first, 'the band summary is not rendered'
+
+
+# ===== step 13: the --run path drives run_ofat_stage, never eval-ofat =====
+
+
+@pytest.fixture
+def campaign_seam(monkeypatch):
+    """Patch every live seam so ``--run`` is exercised at ZERO spend.
+
+    Three patches, each closing a different way a test could reach the real
+    world: ``run_ofat_stage`` (the fan-out that would spawn architect runs),
+    ``save_result`` (which writes into the packaged results dir), and
+    ``load_config`` (which would demand a real config / OAuth).
+
+    A fourth is a TRIPWIRE rather than a stub: ``ofat_candidates`` fails the
+    test outright if the driver ever calls it. The PRD forbids eval-ofat
+    because it runs all 8 candidates including the ~10x-cost implementer and
+    judge cells, so "the driver only ever passes the explicitly-named architect
+    candidates" has to be enforced on every --run test, not just one.
+    """
+    import orchestrator.config as orch_config
+    from orchestrator.evals import configs as eval_configs
+    from orchestrator.evals import runner as eval_runner
+
+    calls = {'ofat': [], 'saved': []}
+
+    async def _recorder(task_paths, candidates, base_config=None, **kwargs):
+        calls['ofat'].append({
+            'task_paths': list(task_paths),
+            'candidates': list(candidates),
+            'base_config': base_config,
+            **kwargs,
+        })
+        return [
+            _cell(path.stem, cfg.name, trial=trial, plan_quality=0.75, plan_steps=5)
+            for path in task_paths
+            for cfg in candidates
+            for trial in range(1, (kwargs.get('trials') or 1) + 1)
+        ]
+
+    def _tripwire(*args, **kwargs):
+        pytest.fail(
+            'the driver called ofat_candidates(). eval-ofat runs all 8 candidates '
+            'including the ~10x-cost implementer/judge cells — the exact spend the '
+            'PRD forbids. Only the explicitly-named architect candidates may be '
+            'passed to run_ofat_stage.',
+            pytrace=False,
+        )
+
+    monkeypatch.setattr(eval_runner, 'run_ofat_stage', _recorder)
+    monkeypatch.setattr(eval_runner, 'save_result', lambda r: calls['saved'].append(r))
+    monkeypatch.setattr(orch_config, 'load_config', lambda *a, **k: object())
+    monkeypatch.setattr(eval_configs, 'ofat_candidates', _tripwire)
+    return calls
+
+
+def test_run_passes_resolved_candidates_fixtures_trials_and_parallelism(
+    tmp_path, campaign_seam,
+):
+    """``--run`` hands the seam exactly the resolved candidates and parameters."""
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+
+    rc = mod.main([
+        '--run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max',
+        '--trials', '3', '--max-parallel', '2',
+        '--budget', 'architect-opus-max=15',
+    ])
+
+    assert rc == 0
+    assert len(campaign_seam['ofat']) == 1
+    call = campaign_seam['ofat'][0]
+    assert call['task_paths'] == sorted(d.glob('*.json'))
+    assert len(call['candidates']) == 1
+    assert call['candidates'][0].name == 'architect-opus-max'
+    assert call['candidates'][0].max_budget_usd == 15.0
+    assert call['trials'] == 3
+    assert call['max_parallel'] == 2
+
+
+def test_run_never_uses_the_eval_ofat_candidate_set(tmp_path, campaign_seam):
+    """Only the named architect candidates reach the seam — never the 8-candidate set.
+
+    The ``ofat_candidates`` tripwire in ``campaign_seam`` fails this test if the
+    driver reaches for the OFAT bundle; the assertions below additionally pin
+    that nothing non-architect rode along.
+    """
+    d = _make_fixture_dir(tmp_path, ['alpha'])
+
+    mod.main([
+        '--run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max',
+        '--candidate', 'architect-fable-high',
+    ])
+
+    passed = campaign_seam['ofat'][0]['candidates']
+    assert [c.name for c in passed] == ['architect-opus-max', 'architect-fable-high']
+    assert all(c.role == 'architect' for c in passed)
+
+
+def test_run_summarizes_the_returned_cells(tmp_path, campaign_seam, capsys):
+    """The returned cells flow into the printed report AND the --out artifact.
+
+    i.e. ``--run`` and the analyze path produce the same schema, so the campaign
+    is auditable from the file without re-reading the terminal.
+    """
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+    out = tmp_path / 'r.json'
+
+    mod.main([
+        '--run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max',
+        '--out', str(out),
+    ])
+
+    printed = capsys.readouterr().out
+    assert 'architect-opus-max' in printed
+    loaded = json.loads(out.read_text())
+    assert len(loaded['cells']) == 2
+    assert {c['task_id'] for c in loaded['cells']} == {'alpha', 'beta'}
+    assert loaded['candidates'][0]['config_name'] == 'architect-opus-max'
+    assert loaded['candidates'][0]['n'] == 2
+
+
+def test_run_persists_each_cell(tmp_path, campaign_seam):
+    """Every returned cell is persisted, so a later --results-dir can re-read it."""
+    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
+
+    mod.main([
+        '--run', '--tasks-dir', str(d),
+        '--candidate', 'architect-opus-max', '--trials', '2',
+    ])
+
+    assert len(campaign_seam['saved']) == 4
+    assert {r.task_id for r in campaign_seam['saved']} == {'alpha', 'beta'}
