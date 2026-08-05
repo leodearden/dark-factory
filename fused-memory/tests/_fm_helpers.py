@@ -1277,31 +1277,38 @@ async def reap_leaked_ticket_workers() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Shared AST migration-guard machinery (task 3502)
+# Shared AST migration-guard machinery (task 3502; consumers widened by 3574)
 # ---------------------------------------------------------------------------
 #
 # Migration guards (tests/test_falkor_probe_routing_guard.py;
-# tests/test_gather_idiom_helper_routing.py) assert over the source text of a
-# fixed set of migrated modules. Parsing is shared and memoised here so several
-# guards asserting over overlapping module sets pay one parse per file per
-# session rather than one each.
+# tests/test_falkor_index_barrier_guard.py;
+# tests/test_gather_idiom_helper_routing.py) assert over the source of a set of
+# migrated modules. The target is not always a TEST module: the gather-idiom
+# guard asserts over production source under src/fused_memory/, which is why
+# the parse is named for Python modules generally rather than for test ones.
+# Parsing is shared and memoised here so several guards asserting over
+# overlapping module sets pay one parse per file per session rather than one
+# each.
 # ---------------------------------------------------------------------------
 
 
 @functools.cache
-def _test_module_source(path: pathlib.Path) -> str:
+def _python_source(path: pathlib.Path) -> str:
     return path.read_text()
 
 
 @functools.cache
-def parse_test_module(path: pathlib.Path) -> ast.Module:
+def parse_python_module(path: pathlib.Path) -> ast.Module:
     """Parse *path* into an ``ast.Module``, memoised per session.
 
-    Test sources do not change mid-session, so several guards asserting over
-    overlapping module sets can share one parse per file.
+    Accepts any Python module — a test module or production source under
+    ``src/fused_memory/``. Sources do not change mid-session, so several guards
+    asserting over overlapping module sets can share one parse per file.
+
+    The returned tree is SHARED between callers, so no consumer may mutate it.
     """
     assert path.exists(), f'{path} not found'
-    return ast.parse(_test_module_source(path), filename=str(path))
+    return ast.parse(_python_source(path), filename=str(path))
 
 
 def calls_named(node: ast.AST, name: str) -> list[ast.Call]:

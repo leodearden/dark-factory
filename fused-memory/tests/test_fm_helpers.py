@@ -1522,7 +1522,7 @@ class TestAwaitIndexOperational:
 # ---------------------------------------------------------------------------
 
 # The gather guard parses PRODUCTION source, not test modules — which is why
-# the shared parse is named parse_python_module rather than parse_test_module.
+# the shared parse is named for Python modules generally, not for test ones.
 _PRODUCTION_SOURCE = (
     pathlib.Path(__file__).parents[1]
     / 'src'
