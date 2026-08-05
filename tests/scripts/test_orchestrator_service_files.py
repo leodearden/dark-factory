@@ -511,3 +511,83 @@ def test_orchestrator_service_sets_own_orch_unit(
         f"{service_path.name} must set `{expected_line}` in its [Service] section "
         "(systemd only honours Environment= under [Service])"
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical orchestrator-config filename (task 3641; completes task 3512's sweep)
+# ---------------------------------------------------------------------------
+
+CANONICAL_CONFIG_BASENAME = "dark-factory-orchestrator.yaml"
+
+
+def _exec_start_config_arg(content: str) -> str | None:
+    """Return the `--config` argument of the unit's ExecStart=, or None if absent.
+
+    None is a real answer, not a parse failure: orchestrator-watchdog.service
+    runs a probe script that takes no --config at all.  Callers must skip on
+    None rather than fail, or the watchdog gets dragged into an invariant that
+    does not apply to it.
+    """
+    exec_line = next(
+        (ln for ln in content.splitlines() if ln.startswith("ExecStart=")), None
+    )
+    if exec_line is None:
+        return None
+    tokens = exec_line.split()
+    for i, token in enumerate(tokens):
+        if token == "--config":
+            return tokens[i + 1] if i + 1 < len(tokens) else None
+        if token.startswith("--config="):
+            return token.split("=", 1)[1]
+    return None
+
+
+@pytest.mark.parametrize(
+    "service_path",
+    ALL_ORCHESTRATOR_SERVICE_FILES,
+    ids=lambda p: p.name,
+)
+def test_orchestrator_service_points_at_canonical_config_filename(
+    service_path: pathlib.Path,
+) -> None:
+    """Every orchestrator unit's --config must name the CANONICAL config filename.
+
+    CLAUDE.md makes ``<project_root>/dark-factory-orchestrator.yaml`` the
+    canonical, required filename — the dashboard's escalation-URL discovery
+    (``_discover_escalation_urls``) keys on it, and legacy spellings
+    (``orchestrator.yaml``, ``orchestrator-config.yaml``,
+    ``orchestrator/config.yaml``) are honoured only as a discovery fallback for
+    not-yet-migrated projects, never as a supported choice.  Task 2698
+    canonicalized the filename; task 2719 then RETIRED dark-factory's own
+    transitional symlinks (guarded by test_legacy_config_symlinks_retired.py),
+    which is the precedent that makes the legacy spelling a defect here rather
+    than merely an inconsistency.
+
+    The failure this catches is latent, not active, and that is exactly why it
+    needs a guard: a target project that still keeps ``orchestrator.yaml`` as a
+    SYMLINK to the canonical file resolves the legacy path fine today, so a
+    stale unit template starts cleanly and nothing looks wrong.  It breaks on
+    the day that project retires its symlink the way this repo already did —
+    at which point the unit fails to start and the cause is a line nobody has
+    looked at in months.
+
+    The ``--config`` predicate is load-bearing: orchestrator-watchdog.service
+    runs a probe script with no ``--config``, so it is skipped rather than
+    failed.  Keying on the flag's presence (rather than naming the watchdog as
+    an exception) means a future unit is covered the day it lands.
+    """
+    content = service_path.read_text(encoding="utf-8")
+    config_arg = _exec_start_config_arg(content)
+    if config_arg is None:
+        pytest.skip(f"{service_path.name} has no ExecStart --config argument")
+
+    actual = pathlib.PurePosixPath(config_arg).name
+    assert actual == CANONICAL_CONFIG_BASENAME, (
+        f"{service_path.name} points --config at {config_arg!r}, whose basename "
+        f"is {actual!r}. It must be the canonical {CANONICAL_CONFIG_BASENAME!r} "
+        "(CLAUDE.md: the dashboard's _discover_escalation_urls keys on that "
+        "exact filename). If the target project still has a legacy "
+        "orchestrator.yaml symlink, the legacy path resolves today and breaks "
+        "the moment that project retires the symlink — as dark-factory already "
+        "did under task 2719."
+    )
