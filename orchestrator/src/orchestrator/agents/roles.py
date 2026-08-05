@@ -343,6 +343,23 @@ leaving a half-done tree that is falsely recorded as a completed, successful run
 # holds for the `BashOutput`/`KillShell` that BACKGROUND_TASK_WARNING has named
 # since task 2761.  So do NOT "fix" this block by trimming those tools out of
 # it on the theory that the roles cannot reach them -- they can.
+#
+# THE ~25-MINUTE BACKGROUND THRESHOLD is deliberate and is NOT the harness Bash
+# cap; do not "simplify" it back to 3900000.  The operative limit on a
+# dispatched session is the working-regime watchdog in
+# shared/src/shared/cli_invoke.py (~line 2450), which kills the session once
+# `idle_elapsed >= max(working_idle_secs, timeout_seconds)` where progress is
+# measured ONLY by NEW transcript turns (`count_transcript_turns`).  A blocking
+# foreground Bash call emits no turn while it runs.  At stock config
+# (defaults.yaml `timeouts`: working_idle_secs=1800; implementer/debugger/
+# reviewer=1200, merger=600, steward=1800) that bound is 1800s = 30 minutes for
+# every role except architect (2400s) and simple_task (7200s) -- so 30 minutes
+# is the floor the guidance must be safe under, and ~25 leaves the margin.
+# Polling a BACKGROUNDED command is exempt in practice because each
+# `BashOutput` poll is itself a new turn and resets `last_progress_monotonic`.
+# The 120000 default / 3900000 max remain true harness facts and are still
+# stated as such -- they are just not the background-vs-foreground decision
+# threshold.  (Task 3607 review, reviewer_comprehensive.)
 WAIT_PATTERN_GUIDANCE = """
 ## CRITICAL: How to wait for something
 
@@ -350,21 +367,30 @@ The rule above is one half of the contract — it tells you not to end your turn
 on pending background work. This is the other half: how to actually wait.
 
 SANCTIONED
-- Default: run the command in the FOREGROUND with an explicit Bash `timeout`
-  sized to the expected wall clock plus margin. It is in MILLISECONDS, it
-  DEFAULTS to 120000 (2 minutes) when omitted, and it is CAPPED at 3900000
-  (65 minutes). A 5-minute command silently killed at that 2-minute default is
-  the exit-143 failure mode you will otherwise misdiagnose as a hung command.
+- Default, for anything that finishes inside ~25 minutes: run it in the
+  FOREGROUND with an explicit Bash `timeout` sized to the expected wall clock
+  plus margin. It is in MILLISECONDS and DEFAULTS to 120000 (2 minutes) when
+  omitted. A 5-minute command silently killed at that 2-minute default is the
+  exit-143 failure mode you will otherwise misdiagnose as a hung command.
   Foreground-and-finished beats backgrounded-and-abandoned.
-- If the run genuinely exceeds the 3900000 ceiling, background it: `Bash` with
-  `run_in_background=true` — background work is exempt from the foreground
-  timeout, and that exemption is the only good reason to reach for it — then
-  poll it to completion with `BashOutput` and READ the result BEFORE ending
-  your turn. Launching it detached with `setsid` and polling its log file is
-  the same sanctioned shape; so is backgrounding a wait command that EXITS on
-  its own when the condition holds. Polling something you launched is NOT the
-  ad-hoc wait prohibited below: you have a real completion signal, and you stay
-  until you have it.
+- BACKGROUND anything that will not produce a NEW assistant turn for more than
+  ~25 minutes. Sizing a long run to a big foreground `timeout` does NOT buy you
+  that time. The binding constraint is not the harness Bash cap (3900000 ms /
+  65 minutes) — it is the orchestrator's working-regime watchdog, which kills
+  your entire SESSION once no new transcript turn has appeared for
+  max(working_idle_secs, your role's timeout), stock 1800s = 30 minutes. A
+  blocking foreground Bash call emits NO turn while it runs, so a 45-minute
+  verify sized to a 2700000 timeout sits well under the harness cap and still
+  gets the session killed at 30 minutes, losing everything it observed — the
+  same lose-all-observations failure the `until`-loop bullet warns about.
+  Polling is safe for exactly the inverse reason: every `BashOutput` poll IS a
+  new turn and resets that idle clock.
+  So: `Bash` with `run_in_background=true`, then poll it to completion with
+  `BashOutput` and READ the result BEFORE ending your turn. Launching it
+  detached with `setsid` and polling its log file is the same sanctioned shape;
+  so is backgrounding a wait command that EXITS on its own when the condition
+  holds. Polling something you launched is NOT the ad-hoc wait prohibited
+  below: you have a real completion signal, and you stay until you have it.
 - `Monitor` streams ONE notification per matching output line, so it fits a
   recurring event feed, not a single "tell me when this finishes" — for that,
   background a command that exits when done. If you do reach for it, load its
@@ -421,12 +447,15 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # lives here rather than as an assertion: a length floor would pass on filler
 # and fail on a tighter, better-worded reminder.
 WAIT_PATTERN_REMINDER = """
-Reminder — verification is exactly where the wait rules above bite. Run it in
-the FOREGROUND with an explicit Bash `timeout` (milliseconds; 120000 default,
-3900000 max). If it cannot fit under that ceiling, background it and poll to
-completion with `BashOutput` before you end your turn. Never end this turn with
-verification still pending: this session is one-shot, and abandoned work is
-recorded as a successful run."""
+Reminder — verification is exactly where the wait rules above bite. If it will
+finish inside ~25 minutes, run it in the FOREGROUND with an explicit Bash
+`timeout` (milliseconds; 120000 default). If it will run longer than that
+WITHOUT emitting a new assistant turn, background it and poll `BashOutput` to
+completion before you end your turn — the deciding limit is the working-regime
+watchdog, which kills this SESSION after ~30 minutes with no new turn, well
+short of the 3900000 harness ceiling, and each poll resets that clock. Never
+end this turn with verification still pending: this session is one-shot, and
+abandoned work is recorded as a successful run."""
 
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into

@@ -84,6 +84,51 @@ def test_wait_pattern_guidance_is_nonempty() -> None:
     assert WAIT_PATTERN_GUIDANCE.strip()
 
 
+def test_background_threshold_is_the_session_idle_bound_not_the_bash_cap() -> None:
+    """The background-vs-foreground threshold tracks the WATCHDOG, not the Bash cap.
+
+    ``shared.cli_invoke``'s working-regime watchdog kills a whole session once
+    ``idle_elapsed >= max(working_idle_secs, timeout_seconds)`` with no NEW
+    transcript turn, and a blocking foreground ``Bash`` call emits no turn while
+    it runs. So the operative ceiling on a foreground command is the role's idle
+    bound (stock 1800s = 30 min), NOT the harness's 3900000 ms (65 min) Bash cap.
+    Guidance that used 3900000 as the decision threshold actively instructed
+    agents to size a 45-minute foreground verify to a 2700000 timeout and lose
+    the entire session at 30 minutes — the same lose-all-observations failure the
+    guidance's own ``until``-loop bullet warns against. Pinned because the wrong
+    number READS more authoritative (it is a real harness fact, just not the
+    binding one) and will be "restored" by a future editor otherwise.
+    """
+    idle_secs = OrchestratorConfig.model_fields['timeouts'].default_factory().working_idle_secs  # type: ignore[misc]
+    assert idle_secs == 1800, (
+        f'timeouts.working_idle_secs default moved to {idle_secs}s. The wait-pattern '
+        'guidance quotes 1800s / 30 minutes as the session idle bound and derives its '
+        '~25-minute background threshold from it — update both constants in roles.py '
+        'to stay under the new bound, then update this assertion.'
+    )
+
+    for name, text in (
+        ('WAIT_PATTERN_GUIDANCE', WAIT_PATTERN_GUIDANCE),
+        ('WAIT_PATTERN_REMINDER', WAIT_PATTERN_REMINDER),
+    ):
+        assert '25 minutes' in text, (
+            f'{name} no longer states the ~25-minute background threshold. Sizing a '
+            'long run to a large foreground `timeout` does not buy that time: the '
+            'working-regime watchdog kills the session after 30 minutes with no new '
+            'transcript turn. Do not replace this with the 3900000 harness cap.'
+        )
+        assert '30 minutes' in text, (
+            f'{name} no longer states the 30-minute session idle bound that JUSTIFIES '
+            'the threshold. A bare number with no stated reason gets "corrected" back '
+            'to the 3900000 Bash cap by the next editor.'
+        )
+        assert 'BashOutput' in text, (
+            f'{name} no longer names `BashOutput`. Polling is what makes a backgrounded '
+            'long run safe — each poll is a new transcript turn and resets the idle '
+            'clock — so the escape hatch must be named alongside the threshold.'
+        )
+
+
 def test_combined_guidance_composes_both_rules() -> None:
     """``BACKGROUND_WAIT_GUIDANCE`` carries BOTH halves of the contract.
 
