@@ -1189,3 +1189,217 @@ def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(
             f'test_spawn_claude.py, ...) and {OWN_TESTS_DIR} is that directory\'s '
             'own suite, so dropping either trades one coverage gap for another'
         )
+
+
+# The scripts module's own measured wall-clock. Task 3458 ran two fresh,
+# independent, sequential runs of the verbatim union test_command at this
+# branch's base commit 37f761f5a4 (360.47s and 293.32s wall) and combined
+# them with the four runs of the byte-identical command already recorded in
+# scripts/orchestrator.yaml's MEASURED GREEN / COST DELTA blocks (444.17s,
+# 565.37s wall; 310.33s pytest-only; 914.61s pytest / 930.59s wall). The
+# floor below is set against the WORST wall-clock across ALL SIX of those
+# (930.59s, the "amendment-pass verification" run) — never the mean: that
+# same block records a ~3x spread (310.33s -> 914.61s) for a BYTE-IDENTICAL
+# command on a BYTE-IDENTICAL tree, which is this oversubscribed host's LOAD
+# at measurement time, not suite variance. Neither of task 3458's own two
+# fresh runs came anywhere near this worst figure, which is itself evidence
+# for sizing against the max rather than any single run: the worst case is
+# real but not the common case, so a mean or a fresh-only measurement would
+# both have under-sized the floor.
+MEASURED_SUITE_WORST_SECS = 930.59
+MIN_MODULE_BUDGET_SECS = 1800
+
+
+def test_scripts_module_carries_its_own_measured_verify_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The module must carry its own warm verify budget, narrower than the repo-root ceiling.
+
+    Mirrors ``tests/scripts/test_tests_scripts_module_config.py::
+    test_tests_scripts_module_carries_its_own_tight_verify_budget``
+    assertion-for-assertion (task 3350's shape, applied here by task 3458).
+    Two sides are bounded:
+
+    - Below (b): at least 1800s, ~2x the worst of six measured runs of the
+      verbatim union test_command (930.59s — see MEASURED_SUITE_WORST_SECS
+      above). An achievable floor derived from measurement, not a guess.
+    - Above (c): strictly below the repo-root ceiling (3600s): a real
+      narrowing, not a relabelling.
+
+    SCOPE, stated honestly rather than copied from the sibling: this is a
+    floor-REGRESSION guard, not a suite-growth detector. Nothing here
+    re-measures anything, and if the suite doubles tomorrow the frozen
+    constant still passes. The narrowing this buys is also modest, unlike
+    the sibling's "surfaces a hang in minutes": 3600s -> 2400s means a hang
+    surfaces in ~40 minutes instead of ~60, because an observed HONEST GREEN
+    run of this suite has measured 930.59s, and nothing tighter than ~2.6x
+    that is declarable without manufacturing infra_timeout on the green path
+    under load — the same failure this task exists to prevent, one level
+    down. The duplicate-run cost that inflates the measured figure
+    (tests/scripts/ collected twice per full verify) is task 3383's
+    dedupe-by-command guard in verify.run_full_verification, not something a
+    yaml budget can fix.
+
+    (d) exercises the REAL precedence mechanism
+    (``verify._resolve_verify_timeout``) rather than restating it, so the
+    assertion cannot drift from the code that implements it.
+    """
+    mc = _discovered()[MODULE_PREFIX]
+
+    # (a) Declared at all — otherwise the global ceiling silently applies.
+    assert mc.verify_command_timeout_secs is not None, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares no '
+        'verify_command_timeout_secs (task 3458), so this module silently '
+        'inherits the repo-root whole-fleet ceiling — the budget sized for '
+        f'seven subprojects, applied to a suite that has measured up to '
+        f'{MEASURED_SUITE_WORST_SECS}s'
+    )
+
+    # (b) Measurement-derived floor.
+    assert mc.verify_command_timeout_secs >= MIN_MODULE_BUDGET_SECS, (
+        f'{MODULE_PREFIX} verify_command_timeout_secs='
+        f'{mc.verify_command_timeout_secs} is below the {MIN_MODULE_BUDGET_SECS}s '
+        f'floor (task 3458). The suite has measured up to '
+        f'{MEASURED_SUITE_WORST_SECS}s across six independent runs (see '
+        'scripts/orchestrator.yaml\'s MEASURED GREEN / COST DELTA blocks); a '
+        'budget under the floor would manufacture infra_timeout on the honest '
+        'green path — the exact defect this task exists to remove, '
+        'reintroduced one level down'
+    )
+
+    # (c) Strictly tighter than the repo-root ceiling: a real narrowing. Read
+    # through the PRODUCTION loader — the precedent this file already
+    # establishes in `_root_scripts_suites_pytest_targets` above (ORCH_CONFIG_PATH
+    # anchoring is load-bearing, not hygiene; see that helper's docstring for
+    # why `project_root` alone does not select which yaml is read).
+    assert ROOT_CONFIG_PATH.is_file(), (
+        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
+        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
+        'skips a non-existent path rather than raising), and root_warm below '
+        'would be the wrong number to compare against'
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
+    cfg = OrchestratorConfig(project_root=REPO_ROOT)
+    root_warm = cfg.verify_command_timeout_secs
+    assert mc.verify_command_timeout_secs < root_warm, (
+        f'{MODULE_PREFIX} verify_command_timeout_secs='
+        f'{mc.verify_command_timeout_secs} is not strictly below the repo-root '
+        f'verify_command_timeout_secs={root_warm} (task 3458). A per-module '
+        'budget at or above the global one is a relabelling, not a narrowing: '
+        'it surfaces a hang no sooner than the whole-fleet ceiling would'
+    )
+
+    # (d) verify.py's documented precedence actually honours it, warm.
+    resolved = verify._resolve_verify_timeout(cfg, mc, is_cold=False)
+    assert resolved == mc.verify_command_timeout_secs, (
+        f'_resolve_verify_timeout returned {resolved} for a warm verify, not '
+        f'the module budget {mc.verify_command_timeout_secs} (task 3458) — the '
+        'per-module override is not reaching the code path that enforces it'
+    )
+    assert resolved != root_warm, (
+        f'_resolve_verify_timeout returned the repo-root global {root_warm} '
+        f'rather than the module budget for {MODULE_PREFIX}'
+    )
+
+
+def test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new WARM budget must NOT narrow the COLD path — a deliberate asymmetry.
+
+    Task 3458 declares ``verify_command_timeout_secs`` but leaves
+    ``verify_cold_command_timeout_secs`` UNSET on this module (no build step
+    to budget for). Per ``verify._resolve_verify_timeout``'s documented
+    cascade, an unset module cold knob falls through to
+    ``config.verify_cold_command_timeout_secs`` (the repo-root 5400s) — NOT
+    to the new warm value — and ``is_merge_verify=True`` wins first with
+    ``config.merge_verify_cold_command_timeout_secs`` (7200s, shipped by the
+    package-bundled ``orchestrator/src/orchestrator/defaults.yaml`` and not
+    overridden by the root yaml).
+
+    This is exactly the misreading the task description flags as likely:
+    that an unset cold knob "inherits" the new warm budget. It does not.
+    scripts/orchestrator.yaml's new budget block documents this in prose;
+    this guard makes it un-silent rather than leaving it a
+    documented-but-ungated invariant — the same defect class tasks 3445/3460
+    closed elsewhere in this file.
+    """
+    mc = _discovered()[MODULE_PREFIX]
+
+    # (a) The deliberate asymmetry: warm is set, cold is not.
+    assert mc.verify_command_timeout_secs is not None, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares no '
+        'verify_command_timeout_secs (task 3458) — this test cannot check the '
+        'cold fall-through behaves correctly relative to a warm budget that '
+        'does not exist yet'
+    )
+    assert mc.verify_cold_command_timeout_secs is None, (
+        f'{MODULE_PREFIX}/orchestrator.yaml now declares '
+        f'verify_cold_command_timeout_secs={mc.verify_cold_command_timeout_secs} '
+        '(task 3458 deliberately left this UNSET: no build step on this module '
+        'to budget for). If this was set intentionally, this guard and its '
+        'assertions below must be updated together, not just this line'
+    )
+
+    # Read the root cold ceilings through the PRODUCTION loader, same
+    # anchoring precedent as the warm-budget guard above and
+    # `_root_scripts_suites_pytest_targets`.
+    assert ROOT_CONFIG_PATH.is_file(), (
+        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
+        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
+        'skips a non-existent path rather than raising), and the cold ceilings '
+        'below would be the wrong numbers to compare against'
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
+    cfg = OrchestratorConfig(project_root=REPO_ROOT)
+
+    # (b) Warm (non-merge) cold verify falls through to the ROOT cold ceiling,
+    # NOT the new warm value.
+    root_cold = cfg.verify_cold_command_timeout_secs
+    resolved_cold = verify._resolve_verify_timeout(
+        cfg, mc, is_cold=True, is_merge_verify=False
+    )
+    assert resolved_cold == root_cold, (
+        f'_resolve_verify_timeout(is_cold=True) returned {resolved_cold}, not '
+        f'the repo-root verify_cold_command_timeout_secs={root_cold} (task '
+        f'3458). {MODULE_PREFIX}/orchestrator.yaml leaves its own cold knob '
+        'UNSET deliberately, so a cold verify must fall through to the root '
+        'ceiling'
+    )
+    assert resolved_cold != mc.verify_command_timeout_secs, (
+        f'_resolve_verify_timeout(is_cold=True) returned the module\'s WARM '
+        f'budget ({mc.verify_command_timeout_secs}) rather than falling '
+        'through to the root cold ceiling (task 3458) — this is precisely the '
+        'misreading this guard exists to make un-silent: an unset cold knob '
+        'does not "inherit" the new warm budget'
+    )
+
+    # (c) The merge-cold knob wins first when is_merge_verify=True.
+    merge_cold = cfg.merge_verify_cold_command_timeout_secs
+    assert merge_cold is not None, (
+        'config.merge_verify_cold_command_timeout_secs is None — the '
+        'package-bundled orchestrator/src/orchestrator/defaults.yaml is '
+        'expected to ship this (task 3458), so there is nothing for the '
+        'merge-cold assertion below to check against'
+    )
+    resolved_merge_cold = verify._resolve_verify_timeout(
+        cfg, mc, is_cold=True, is_merge_verify=True
+    )
+    assert resolved_merge_cold == merge_cold, (
+        f'_resolve_verify_timeout(is_cold=True, is_merge_verify=True) returned '
+        f'{resolved_merge_cold}, not '
+        f'config.merge_verify_cold_command_timeout_secs={merge_cold} (task '
+        '3458) — the merge-cold knob should win before the module/root cold '
+        'cascade'
+    )
+
+    # (d) Coherence: the module's warm budget must not exceed the resolved
+    # (non-merge) cold budget, since a cold run does strictly more work
+    # (fresh worktree setup) than a warm one.
+    assert mc.verify_command_timeout_secs <= resolved_cold, (
+        f'{MODULE_PREFIX} warm verify_command_timeout_secs='
+        f'{mc.verify_command_timeout_secs} exceeds the resolved cold budget '
+        f'{resolved_cold} (task 3458) — a cold run does strictly more work '
+        'than a warm one, so the warm budget must not be looser than the cold '
+        'one'
+    )
