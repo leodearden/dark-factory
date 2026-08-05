@@ -1,7 +1,9 @@
 # Toolcall-XML leak: live Mem0/Qdrant corpus sweep, 2026-08-05
 
 **Task:** 3567 (operational follow-up to 3083)
-**Git sha at run:** `411f453063306a76466134a32e42221d4a9fd9e0`
+**Git sha at run:** `411f453063306a76466134a32e42221d4a9fd9e0` (a pre-rebase
+branch sha — a record of the run environment, not a durability pin, and not
+expected to be reachable from `main`; see the note in §"the `--apply` run")
 **Swept at:** 2026-08-05T10:27:11Z → 10:27:26Z (15s)
 **Collection:** `fused_dark_factory` (Qdrant), exact point count 21079 @ 10:14:27Z → 21087 @ 10:45:17Z
 **Exit code:** 0
@@ -252,9 +254,19 @@ discard.
 > the sweep to "fix" this.
 
 The gate opened (`repairable_tail 0 + repairable_duplicate 1 = 1 ≥ 1`), so
-`--apply` ran, with the dry-run report and its sidecar already committed —
-`a1b77e3265` and `1b7906526b`. That ordering is the only reason this section
-can be written at all.
+`--apply` ran, with the dry-run report and its sidecar already committed. That
+ordering is the only reason this section can be written at all.
+
+> **Why no commit sha is cited for that payload.** Earlier drafts pinned it to
+> `a1b77e3265` / `1b7906526b` / `3e926d2744`. Those shas were real when written
+> and are unreachable now: the merge lane rebases this branch, so a sha naming
+> a same-branch commit is an orphan by the time the work lands on main, and
+> `git show <sha>:<path>` fails outright once `git gc` prunes it — taking the
+> documented recovery path with it. A durability pin on unmerged work must
+> therefore be a **repo-relative path plus a content hash**, never a
+> same-branch commit sha. `recovery-tracking.json` records
+> `payload_content_sha256` / `payload_repaired_content_sha256`, which the
+> artifact suite re-derives from the committed bytes on every run.
 
 ```
 cd fused-memory
@@ -272,7 +284,7 @@ uv run python scripts/sweep_toolcall_xml_leak.py --apply --exhaustive \
 | `repaired` | `false`; no `new_id` recorded |
 | Qdrant state | **absent** — measured read-only after the run, 0 points returned for that id |
 | Point count | 21,089 → 21,088 (net −1) |
-| Surviving copy | **git only** — `dry-run-report.json` @ `a1b77e3265`: 867-char original + the intended 415-char `repaired_content` |
+| Surviving copy | **git only** — `docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json`: 867-char original (`sha256 f8cf0112…c8a6bd`) + the intended 415-char `repaired_content` (`sha256 e3214e60…a5691b`) |
 
 ### Why exit 1 here is *not* the benign case
 

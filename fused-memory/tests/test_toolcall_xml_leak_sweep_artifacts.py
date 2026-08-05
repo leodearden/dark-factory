@@ -52,6 +52,7 @@ reproducing the very bug under test. This module needs no such literal today
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import re
 import sys
@@ -160,6 +161,19 @@ REPAIRABLE_CLASSIFICATIONS = ('repairable_tail', 'repairable_duplicate')
 RECOVERY_TRACKING_NAME = 'recovery-tracking.json'
 
 _DIGITS_RE = re.compile(r'\A[0-9]+\Z')
+
+_SHA256_RE = re.compile(r'\A[0-9a-f]{64}\Z')
+
+# How the recovery payload is pinned: by CONTENT, not by commit. Each entry
+# maps a tracking-file digest field to the payload-record field it must be the
+# sha256 of. A commit sha cannot do this job on a branch the merge lane
+# rebases — it is an unreachable orphan by the time the work reaches main —
+# whereas a digest over the bytes survives any rebase, and is checkable
+# hermetically from the working tree with no git invocation at all.
+_PAYLOAD_DIGEST_FIELDS = {
+    'payload_content_sha256': 'content',
+    'payload_repaired_content_sha256': 'repaired_content',
+}
 
 
 def _ids(paths: list[Path]) -> list[str]:
@@ -620,11 +634,25 @@ class TestUnrepairedMutationsAreTracked:
                 f'{record["id"]}: payload_source_report {rel!r} is not a sweep '
                 'report; the payload must come from a validated capture.'
             )
-            commit = entry.get('payload_source_commit')
-            assert isinstance(commit, str) and _SHA_RE.match(commit), (
-                f'{record["id"]}: payload_source_commit {commit!r} is not a '
-                '40-char lowercase hex sha. An abbreviated sha does not pin '
-                'the object holding the only surviving copy of the text.'
+            required = ['payload_content_sha256']
+            if entry.get('classification') in REPAIRABLE_CLASSIFICATIONS:
+                # Only these carry a repaired_content to hash.
+                required.append('payload_repaired_content_sha256')
+            for field in required:
+                digest = entry.get(field)
+                assert isinstance(digest, str) and _SHA256_RE.match(digest), (
+                    f'{record["id"]}: {field}={digest!r} is not a 64-char '
+                    'lowercase hex sha256. The payload is pinned by CONTENT, '
+                    'not by commit — see test_payload_digests_reproduce.'
+                )
+            assert 'payload_source_commit' not in entry, (
+                f'{record["id"]}: payload_source_commit is back. A commit sha '
+                'naming a same-branch commit is broken BY CONSTRUCTION here: '
+                'the merge lane rebases the branch, so the sha is an '
+                'unreachable orphan by the time the work lands on main and '
+                '`git show <sha>:<path>` fails once gc prunes it — taking the '
+                'documented recovery path with it. Pin the payload with the '
+                'repo-relative path plus the sha256 digests instead.'
             )
 
     def test_recovered_flag_and_new_id_agree(self, path: Path) -> None:
@@ -709,6 +737,71 @@ class TestUnrepairedMutationsAreTracked:
                     f'is still classified {derived!r} by the production '
                     f'detector, not {CLEAN!r}. Recovering it would re-introduce '
                     'the leak.'
+                )
+
+    def test_payload_digests_reproduce(self, path: Path) -> None:
+        """The durability pin must be REPRODUCIBLE, not merely well-shaped.
+
+        This is the assertion the previous commit-sha pin could never make. A
+        sha recorded for a same-branch commit is stale by construction — the
+        merge lane rebases, so it names an orphan that ``git gc`` eventually
+        prunes — and a test can only ever check its SHAPE, which is exactly as
+        true of a fabricated sha as of a real one. A content digest instead
+        re-derives from the committed bytes: the payload is located by the same
+        memory id and re-hashed here, so an edited, truncated, swapped or
+        hand-typed payload fails. Hermetic — file reads and hashlib, no git.
+        """
+        report = _load(path)
+        outstanding = _unrepaired_danger_records(report)
+        if not outstanding:
+            return
+        tracking = _load(_recovery_tracking_path(path.parent))
+        for record in outstanding:
+            memory_id = record['id']
+            entry = tracking[memory_id]
+            payload_report = _load(
+                (REPO_ROOT / entry['payload_source_report']).resolve()
+            )
+            matches = [
+                r for r in payload_report['records'] if r.get('id') == memory_id
+            ]
+            assert matches, (
+                f'{memory_id}: payload_source_report carries no record with '
+                'that id; there is nothing to hash.'
+            )
+            payload = matches[0]
+            for field, payload_field in _PAYLOAD_DIGEST_FIELDS.items():
+                claimed = entry.get(field)
+                if claimed is None:
+                    continue
+                text = payload.get(payload_field)
+                assert isinstance(text, str), (
+                    f'{memory_id}: {field} is recorded but the payload record '
+                    f'has no {payload_field!r} string to hash it against.'
+                )
+                actual = hashlib.sha256(text.encode('utf-8')).hexdigest()
+                assert actual == claimed, (
+                    f'{memory_id}: {field} claims {claimed}, but the '
+                    f'{payload_field!r} committed at '
+                    f'{entry["payload_source_report"]} hashes to {actual}. '
+                    'The recovery payload is not the text this entry pins — '
+                    'either it was altered after the digest was taken, or the '
+                    'digest was never derived from it.'
+                )
+            # The char counts are human-facing commentary on the same bytes;
+            # if they disagree with the payload the entry is internally
+            # inconsistent and a reader cannot tell which half to believe.
+            for count_field, payload_field in (
+                ('payload_content_chars', 'content'),
+                ('payload_repaired_content_chars', 'repaired_content'),
+            ):
+                claimed_len = entry.get(count_field)
+                if claimed_len is None:
+                    continue
+                assert claimed_len == len(payload.get(payload_field) or ''), (
+                    f'{memory_id}: {count_field}={claimed_len} disagrees with '
+                    f'the committed {payload_field!r} '
+                    f'({len(payload.get(payload_field) or "")} chars).'
                 )
 
 
