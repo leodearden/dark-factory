@@ -27,12 +27,19 @@ TWO RULES A LATER READER MUST NOT UNDO
    derived in γ1 from v1 incumbent cells on validly-referenced fixtures,
    recorded provisional, and ratified or adjusted by Leo at γ2. A default here
    would silently become the de facto threshold and pre-empt that ruling (G6).
-2. ``judged_without_reference`` reads UNMEASURED, never ``0``, when no cell
-   carries the key. Its producer is eval-revival σ (task 3628); until that
-   lands, reporting ``0`` would let ``plan_quality`` read as fully
+2. ``judged_without_reference`` reads UNMEASURED, never ``0``, whenever ANY
+   architect cell lacks the key. Its producer is eval-revival σ (task 3628);
+   until that lands, reporting ``0`` would let ``plan_quality`` read as fully
    validity-bounded when nothing bounded it. Mirrors ``report.py``'s own
    ``mean_plan_quality=None`` convention — "we measured nothing" must never read
    as "it scored nothing".
+3. Reference validity is read PER CELL (``MARKER_KEY not in metrics`` -> not
+   known-good), never from a run-level flag. The run-level
+   :func:`marker_available` survives only as a DISPLAY flag on the bands dict
+   and in the renderer legend. This is not a stylistic preference: answering the
+   per-cell question with the run-level fact made one post-σ sibling cell
+   silently discard a fixture whose validity was never measured — the one
+   direction PRD D6 calls permanently lossy.
 
 Additionally: ``--candidate`` is REQUIRED with no default, so this driver
 carries no forward reference to ``architect-fable-max`` (eval-revival ρ, task
@@ -213,6 +220,10 @@ _SUMMARY_FIELDS = (
 # rather than a guess.
 MARKER_KEY = 'judged_without_reference'
 
+# How many architect cells carried no marker at all — the companion that makes a
+# PARTIALLY measured corpus legible instead of merely unknown.
+UNMEASURED_CELLS_KEY = 'judged_without_reference_unmeasured_cells'
+
 # What an unmeasured marker renders as. Deliberately a WORD, never ``0`` and
 # never the ``-`` report.py uses for an empty mean: this one has to survive
 # being skimmed.
@@ -222,7 +233,14 @@ UNMEASURED = 'unmeasured'
 def marker_available(results: list[Any]) -> bool:
     """True iff ANY cell carries :data:`MARKER_KEY` — i.e. the instrument emits it.
 
-    This test is EXACT, not heuristic. ``EvalMetrics.to_dict()`` is an
+    DISPLAY ONLY. This answers exactly one question — "does this instrument emit
+    the marker at all?" — for the renderer's NOTE line and the bands artifact's
+    schema. It must NEVER be used to decide a PER-CELL question. It once was,
+    and in a mixed corpus that made a keyless cell score as though its reference
+    had been verified good, discarding a fixture that was never measured.
+    Per-cell validity is read off each cell: ``MARKER_KEY not in metrics``.
+
+    The test is EXACT, not heuristic. ``EvalMetrics.to_dict()`` is an
     ``asdict``, so it emits every DECLARED field regardless of value — which
     means a cell whose reference WAS valid still carries the key, set ``False``.
     "Key absent on every cell" therefore has exactly one cause: the instrument
@@ -231,35 +249,71 @@ def marker_available(results: list[Any]) -> bool:
     return any(MARKER_KEY in (r.metrics or {}) for r in results)
 
 
-def count_judged_without_reference(results: list[Any]) -> dict[str, int | None]:
-    """Per candidate: how many architect cells were judged without a valid reference.
+def _architect_cells(results: list[Any]) -> list[tuple[str, dict[str, Any]]]:
+    """``(config_name, metrics)`` for architect cells only.
 
-    ``None`` for EVERY candidate when the marker is unavailable — never ``0``.
-    The distinction is the point: ``0`` asserts that we looked and found none,
-    which would let ``plan_quality`` read as fully validity-bounded when in fact
-    nothing bounded it. ``None`` says we never measured. This mirrors
-    ``report.py``'s own ``mean_plan_quality=None`` convention, where "we
-    measured nothing" is likewise kept distinct from "it scored nothing".
-
-    ARCHITECT CELLS ONLY, matching ``build_plan_quality_report``'s aggregate: an
-    implementer run never invokes the plan judge, so it cannot have been judged
-    without a reference, and counting one would inflate the very number that
-    bounds how far ``plan_quality`` may be trusted.
-
-    No edit is needed here when σ lands. The key simply starts appearing on each
-    cell and these ``None``s become real counts.
+    THE ROLE FILTER RUNS FIRST, everywhere. An implementer run never invokes the
+    plan judge, so it is out of scope by construction — and if it were filtered
+    after the marker check instead, a single implementer cell riding along under
+    the same config name (carrying no marker key, because it never could) would
+    erase a candidate's genuine, complete measurement.
     """
-    available = marker_available(results)
-    counts: dict[str, int | None] = {}
+    cells = []
     for result in results:
         metrics = result.metrics or {}
         if metrics.get('role_under_test') != 'architect':
             continue
-        name = result.config_name
-        if not available:
+        cells.append((result.config_name, metrics))
+    return cells
+
+
+def count_judged_without_reference(results: list[Any]) -> dict[str, int | None]:
+    """Per candidate: how many architect cells were judged without a valid reference.
+
+    ``None`` — never ``0`` — for any candidate with even ONE architect cell
+    lacking :data:`MARKER_KEY`. The distinction is the point: ``0`` asserts that
+    we looked at every cell and found none, which would let ``plan_quality``
+    read as fully validity-bounded when in fact nothing bounded it. ``None``
+    says we never measured. This mirrors ``report.py``'s own
+    ``mean_plan_quality=None`` convention, where "we measured nothing" is
+    likewise kept distinct from "it scored nothing".
+
+    PARTIAL MEASUREMENT IS NOT MEASUREMENT, and this is decided PER CELL. An
+    earlier version short-circuited on the run-level :func:`marker_available`,
+    so in a mixed corpus a keyless cell silently scored as ``False`` and the
+    candidate reported a fabricated ``0``. One unmeasured cell means the
+    candidate's bound is unknown, so the honest value is ``None``. Use
+    :func:`count_unmeasured_marker_cells` to see how much of it was unmeasured.
+
+    No edit is needed here when σ lands. The key simply starts appearing on each
+    cell and these ``None``s become real counts.
+    """
+    counts: dict[str, int | None] = {}
+    unmeasured = count_unmeasured_marker_cells(results)
+    for name, metrics in _architect_cells(results):
+        if unmeasured.get(name):
             counts[name] = None
             continue
         counts[name] = (counts.get(name) or 0) + (1 if metrics.get(MARKER_KEY) else 0)
+    return counts
+
+
+def count_unmeasured_marker_cells(results: list[Any]) -> dict[str, int]:
+    """Per candidate: how many architect cells carry NO :data:`MARKER_KEY` at all.
+
+    ``None`` from :func:`count_judged_without_reference` cannot distinguish "1
+    of 50 cells unmeasured" from "50 of 50" — a huge difference to an operator
+    reading γ1's artifact. This count makes a partially-instrumented corpus
+    LEGIBLE rather than merely unknown, which is the loud-over-silent norm
+    applied to the transition state.
+
+    That state is normal, not exotic: γ1's recipe re-runs cap-tainted fixtures,
+    and a re-run after eval-revival σ (task 3628) lands writes cells carrying
+    the key alongside older ones that never could.
+    """
+    counts: dict[str, int] = {}
+    for name, metrics in _architect_cells(results):
+        counts[name] = counts.get(name, 0) + (0 if MARKER_KEY in metrics else 1)
     return counts
 
 
@@ -288,10 +342,16 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
 
     report = build_plan_quality_report(results)
     marker_counts = count_judged_without_reference(results)
+    unmeasured_counts = count_unmeasured_marker_cells(results)
     rows = []
     for entry in report['configs']:
         row = {field: entry[field] for field in _SUMMARY_FIELDS}
-        row[MARKER_KEY] = marker_counts.get(entry['config_name'])
+        name = entry['config_name']
+        row[MARKER_KEY] = marker_counts.get(name)
+        # How much of the above was never measured. Carried alongside rather
+        # than folded in, because `None` alone cannot distinguish 1-of-50
+        # unmeasured cells from 50-of-50.
+        row[UNMEASURED_CELLS_KEY] = unmeasured_counts.get(name, 0)
         rows.append(row)
     rows.sort(key=lambda r: r['config_name'])
     return rows
@@ -382,13 +442,20 @@ def format_campaign_report(report: dict[str, Any]) -> str:
     lines.append('-' * len(header))
     unmeasured_marker = False
     for row in report.get('candidates', []):
+        marker = _fmt(row.get(MARKER_KEY))
         if row.get(MARKER_KEY) is None:
             unmeasured_marker = True
+            # A PARTIALLY measured corpus reads as "unmeasured (3 of 12 cells)"
+            # rather than a bare word, so an operator can tell a fully pre-σ run
+            # from one re-run cell short of a complete bound.
+            missing = row.get(UNMEASURED_CELLS_KEY)
+            if missing:
+                marker = f'{UNMEASURED} ({missing} of {row["total"]} cells)'
         lines.append(
             f'{row["config_name"]:<26} {_fmt(row["n"]):>4} {_fmt(row["total"]):>6} '
             f'{_fmt(row["cap_excluded"]):>9} {_fmt(row["no_plan"]):>8} '
             f'{_fmt(row["plan_rate"]):>10} {_fmt(row["mean_plan_quality"]):>10} '
-            f'{_fmt(row.get(MARKER_KEY)):>26}'
+            f'{marker:>26}'
         )
     bands = report.get('bands')
     if bands:
@@ -408,15 +475,23 @@ def format_campaign_report(report: dict[str, Any]) -> str:
     if unmeasured_marker:
         lines += [
             '',
-            f'LEGEND — {MARKER_KEY} = {UNMEASURED}: this instrument does not emit the '
-            'marker,',
-            '  so NO bound was placed on how far plan_quality may be trusted. It is NOT '
-            'a count of',
-            '  zero. The producer is eval-revival σ (task 3628); once it lands the key '
-            'appears on',
-            '  every cell and these read as real counts. Until then, treat every '
-            'plan_quality here',
-            '  as unvalidated against a reference diff.',
+            f'LEGEND — {MARKER_KEY} = {UNMEASURED}: at least one architect cell carries '
+            'no',
+            '  reference-validity marker, so NO bound was placed on how far plan_quality '
+            'may be',
+            '  trusted for that candidate. It is NOT a count of zero. The producer is '
+            'eval-revival σ',
+            '  (task 3628); once it lands the key appears on every cell and these read '
+            'as real counts.',
+            f'  "{UNMEASURED} (N of M cells)" is the MIXED case: only N cells lacked the '
+            'marker. That is',
+            '  the normal transition state — a γ1 re-run of cap-tainted fixtures after σ '
+            'lands writes',
+            '  keyed cells alongside older keyless ones — not an exotic one. Partial '
+            'measurement is',
+            '  not measurement, so the bound stays unknown until every cell carries the '
+            'key; and each',
+            '  keyless cell bands intermittent (RETAINED) on its own, never ceiling.',
         ]
     return '\n'.join(lines)
 
@@ -437,8 +512,8 @@ RETAINED_BANDS = tuple(b for b in BANDS if b != 'ceiling')
 _BAND_PRECEDENCE = ('no_plan', 'intermittent', 'unmeasured', 'ceiling')
 
 
-def band_for_cell(metrics: dict[str, Any], q_ceiling: float, marker_available: bool) -> str:
-    """Band ONE cell per PRD D6. *marker_available* is a run-level fact.
+def band_for_cell(metrics: dict[str, Any], q_ceiling: float) -> str:
+    """Band ONE cell per PRD D6, reading every fact off THAT CELL's metrics.
 
     Precedence, and why each rung sits where it does:
 
@@ -451,17 +526,30 @@ def band_for_cell(metrics: dict[str, Any], q_ceiling: float, marker_available: b
        (``metrics.py:191``), used directly and never re-implemented, and never
        replaced by ``plan_quality > 0``: the two plan scorers disagreed exactly
        on a stepless artifact, so a nonzero score is not evidence a plan exists.
-    3. reference validity not KNOWN-GOOD -> ``intermittent``. Either the run
-       predates σ (*marker_available* False, so validity is unknown) or the cell
-       is marked as judged without one. ``plan_quality`` is interpretable only
+    3. reference validity not KNOWN-GOOD -> ``intermittent``. Either THIS CELL
+       carries no :data:`MARKER_KEY` (it predates σ, so its validity was never
+       measured) or it is marked as judged without a reference. The two cases
+       are deliberately indistinguishable here: both mean "we cannot interpret
+       this cell's ``plan_quality``", and ``plan_quality`` is meaningful only
        where a real reference block exists.
     4. ``plan_quality`` missing or below *q_ceiling* -> ``intermittent``.
     5. otherwise -> ``ceiling``, the sole DISCARDED band.
 
+    PER CELL, NOT PER RUN — the rule a later reader must not undo. This function
+    once took a run-level ``marker_available`` third argument, which answered
+    the per-cell question "was THIS cell's plan_quality bounded by a real
+    reference diff?" with the run-level fact "does ANY cell carry the key?". In
+    a MIXED corpus those diverge, and the failure was silent and in the
+    forbidden direction: a keyless cell alongside one post-σ sibling scored as
+    if its reference had been verified good, flipping a never-measured fixture
+    from RETAINED to DISCARDED. The parameter is GONE rather than ignored,
+    because an argument that looks load-bearing but is not is exactly the trap
+    that produced that bug.
+
     Rungs 3-4 encode D6's asymmetry: ambiguity resolves to RETAIN, because
     misbanding-to-retain costs ~$20 of stage-2 spend while misbanding-to-discard
-    loses the signal permanently. Concretely, before σ lands rung 3 always fires
-    on a planned cell, so no fixture can be discarded at all — the conservative
+    loses the signal permanently. Concretely, on a pre-σ cell rung 3 always
+    fires, so such a fixture can never be discarded — the conservative
     direction, by construction rather than by care.
     """
     from orchestrator.evals.metrics import produced_a_plan
@@ -470,7 +558,7 @@ def band_for_cell(metrics: dict[str, Any], q_ceiling: float, marker_available: b
         return 'unmeasured'
     if not produced_a_plan(metrics):
         return 'no_plan'
-    if not marker_available or metrics.get(MARKER_KEY):
+    if MARKER_KEY not in metrics or metrics.get(MARKER_KEY):
         return 'intermittent'
     quality = metrics.get('plan_quality')
     if quality is None or quality < q_ceiling:
@@ -491,13 +579,20 @@ def partition_bands(results: list[Any], q_ceiling: float) -> dict[str, Any]:
     their union is every fixture that produced a cell. ``counts`` always carries
     all four bands, zeros included, so the artifact's schema does not shift with
     its contents.
+
+    The returned ``marker_available`` is a run-level DISPLAY flag ONLY: it
+    answers "does this instrument emit the marker at all", which the renderer's
+    NOTE line reports and the artifact's schema keeps stable. It must NEVER
+    again be consulted to decide a per-cell question — doing exactly that is
+    what let one post-σ sibling discard a never-measured fixture. Banding reads
+    :data:`MARKER_KEY` off each cell, via :func:`band_for_cell`.
     """
     ranked: dict[str, int] = {}
     for result in results:
         metrics = result.metrics or {}
         if metrics.get('role_under_test') != 'architect':
             continue
-        band = band_for_cell(metrics, q_ceiling, marker_available(results))
+        band = band_for_cell(metrics, q_ceiling)
         rank = _BAND_PRECEDENCE.index(band)
         task_id = result.task_id
         ranked[task_id] = min(rank, ranked.get(task_id, rank))

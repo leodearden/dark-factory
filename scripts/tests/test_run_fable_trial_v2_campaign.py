@@ -489,7 +489,7 @@ def test_ceiling_band_requires_plan_and_valid_reference_and_quality():
     m = _metrics(plan_steps=5, plan_quality=0.90,
                  extra_metrics={'judged_without_reference': False})
 
-    assert mod.band_for_cell(m, 0.80, True) == 'ceiling'
+    assert mod.band_for_cell(m, 0.80) == 'ceiling'
 
 
 def test_planned_below_q_ceiling_is_intermittent():
@@ -497,7 +497,7 @@ def test_planned_below_q_ceiling_is_intermittent():
     m = _metrics(plan_steps=5, plan_quality=0.60,
                  extra_metrics={'judged_without_reference': False})
 
-    assert mod.band_for_cell(m, 0.80, True) == 'intermittent'
+    assert mod.band_for_cell(m, 0.80) == 'intermittent'
 
 
 def test_planned_without_valid_reference_is_intermittent():
@@ -509,7 +509,7 @@ def test_planned_without_valid_reference_is_intermittent():
     m = _metrics(plan_steps=5, plan_quality=0.95,
                  extra_metrics={'judged_without_reference': True})
 
-    assert mod.band_for_cell(m, 0.80, True) == 'intermittent'
+    assert mod.band_for_cell(m, 0.80) == 'intermittent'
 
 
 def test_no_plan_band():
@@ -521,7 +521,7 @@ def test_no_plan_band():
     m = _metrics(plan_steps=0, plan_quality=0.95,
                  extra_metrics={'judged_without_reference': False})
 
-    assert mod.band_for_cell(m, 0.80, True) == 'no_plan'
+    assert mod.band_for_cell(m, 0.80) == 'no_plan'
 
 
 def test_cap_tainted_cell_bands_unmeasured():
@@ -535,7 +535,7 @@ def test_cap_tainted_cell_bands_unmeasured():
                  invocation_error='architect: cap_hit',
                  extra_metrics={'judged_without_reference': False})
 
-    assert mod.band_for_cell(m, 0.80, True) == 'unmeasured'
+    assert mod.band_for_cell(m, 0.80) == 'unmeasured'
 
 
 def test_marker_unavailable_never_bands_ceiling():
@@ -550,7 +550,7 @@ def test_marker_unavailable_never_bands_ceiling():
     m = _metrics(plan_steps=5, plan_quality=0.95)
     assert mod.MARKER_KEY not in m, 'premise: this cell predates σ and carries no marker'
 
-    assert mod.band_for_cell(m, 0.80, False) == 'intermittent'
+    assert mod.band_for_cell(m, 0.80) == 'intermittent'
 
 
 def test_partition_is_exact():
@@ -660,6 +660,11 @@ def test_output_schema_carries_the_four_required_per_candidate_fields():
             'config_name', 'model', 'effort', 'max_budget_usd',
             'n', 'total', 'plan_rate', 'mean_plan_quality',
             'cap_excluded', 'no_plan', 'judged_without_reference',
+            # The companion count: `judged_without_reference is None` alone
+            # cannot distinguish 1-of-50 unmeasured cells from 50-of-50, so a
+            # partially-instrumented corpus stays legible rather than merely
+            # unknown.
+            'judged_without_reference_unmeasured_cells',
         }
     by_name = {e['config_name']: e for e in report['candidates']}
     assert by_name['architect-fable-high']['model'] == 'claude-fable-5'
