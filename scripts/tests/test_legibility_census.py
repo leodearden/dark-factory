@@ -3351,3 +3351,90 @@ def test_default_verify_fn_without_probe_args_behaves_exactly_as_before():
     assert len(result["verified"]) == 2
     assert [c["title"] for c in result["rejected"]] == ["cluster-1"]
     assert result["fixed"] == []
+
+
+def test_run_census_aborts_cleanly_on_mid_verify_headroom_exhaustion(tmp_path, caplog):
+    """A CensusHeadroomExhausted raised INSIDE verify_fn aborts before any write.
+
+    `invoke` answers every headroom probe with "pong", so the stage-boundary
+    gate passes and this test isolates the in-verify path.
+
+    The three `not ... .exists()` assertions are the load-bearing ones: they
+    prove no matrix was rendered from the truncated `verified` list, no
+    reject_candidate burned a cluster that was never actually adjudicated, and
+    last_census_at never advanced past a window that was not adjudicated.
+    """
+    def raising_verify_fn(clusters, *, model):
+        raise mod.CensusHeadroomExhausted(
+            stage="verify",
+            reason="verify reply carries a banner marker: 'weekly limit'",
+            verified=1,
+            unverified=4,
+        )
+
+    fake_escalate_fn = _make_fake_escalate_fn()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=raising_verify_fn,
+        synthesize_fn=_poison("synthesize_fn"),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=fake_escalate_fn,
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_poison("commit"),
+    )
+    fake_submit_fn = kwargs["submit_fn"]
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "deferred"
+    assert outcome.deferred_stage == "verify"
+    assert outcome.unverified_clusters == 4
+
+    # synthesize_fn and commit are _poison: reaching either would have raised.
+    assert fake_submit_fn.calls == []
+    assert not kwargs["report_path"].exists()
+    assert not kwargs["codebook_path"].exists()
+    assert not kwargs["census_state_path"].exists()
+
+    # Exactly one escalation -- the mass-rejection detector must NOT also fire,
+    # because the abort returns before it.
+    assert len(fake_escalate_fn.calls) == 1, fake_escalate_fn.calls
+    call = fake_escalate_fn.calls[0]
+    assert call["category"] == "infra_issue"
+    assert call["severity"] == "info"
+    blob = (call.get("summary") or "") + (call.get("detail") or "")
+    assert "verify" in blob.lower()
+    assert "4" in blob, "the escalation names the unverified count"
+
+
+def test_run_census_calls_verify_fn_once_with_the_full_cluster_list(tmp_path):
+    """No-regression: the verify_fn(clusters, *, model) seam is UNCHANGED.
+
+    The obvious reading of "re-probe between verify batches" would have
+    run_census chunk the list and call verify_fn once per chunk — changing the
+    contract of an injected seam for every fake in this file and any custom
+    verifier. In-verify probing lives inside the DEFAULT verifier instead, so
+    this stays one call with the whole list.
+    """
+    fake_verify_fn = _make_fake_verify_fn(verified_titles=set(_THREE_NOVEL_TITLES))
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert len(fake_verify_fn.calls) == 1, "one call, not one per batch"
+    assert len(fake_verify_fn.calls[0]["clusters"]) == 3, "the FULL cluster list"
+    assert fake_verify_fn.calls[0]["model"] == "sonnet"
