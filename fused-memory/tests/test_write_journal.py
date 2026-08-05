@@ -1019,3 +1019,25 @@ async def test_existing_db_gains_terminal_columns_on_initialize(tmp_path):
         assert row[4] is None
     finally:
         await j.close()
+
+
+@pytest.mark.asyncio
+async def test_get_write_op_roundtrip(journal):
+    """The no-join audit read: one write_ops row by id, or None."""
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(
+        write_op_id=op_id,
+        operation='add_episode',
+        project_id='test-project',
+        agent_id='claude-interactive',
+    )
+
+    row = await journal.get_write_op(op_id)
+    assert row is not None
+    assert row['id'] == op_id
+    assert row['operation'] == 'add_episode'
+    assert row['success'] == 1
+    assert 'terminal_status' in row
+    assert row['terminal_status'] is None
+
+    assert await journal.get_write_op('no-such-id') is None
