@@ -195,6 +195,20 @@ DIVERGENCE_ALLOWLIST: dict[str, str] = {
         "and a gate that is always red gets switched off — taking the "
         "accidental drift it exists to catch with it."
     ),
+    "DASHBOARD_PROJECT_ROOT": (
+        "The dashboard's data root. The committed unit hardcodes "
+        "/home/leo/src/dark-factory, while setup-host.sh renders the installed "
+        "copy from scripts/dashboard.service.template with THAT host's real "
+        "$REPO_ROOT — so a cross-copy value comparison reports drift on every "
+        "correctly-configured host that is not this one. "
+        "NOT A HOLE, unlike the entry above: the value is still checked, just "
+        "not across copies. UnitSpec.env_matches_directive compares it against "
+        "the SAME copy's WorkingDirectory=, a relation that is host-invariant "
+        "and catches a repointed or stale value on either side, and the "
+        "Environment= name-set branch still makes a dropped variable drift. "
+        "The two entries are a PAIR — removing either one silently gives back "
+        "the failure the other prevents."
+    ),
 }
 
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -860,6 +874,20 @@ UNITS: dict[str, UnitSpec] = {
         # name-set comparison below just checked, from a file off this tree.
         override_directives=(("Service", "EnvironmentFile"),),
         environment_section="Service",
+        env_matches_directive=(
+            # DASHBOARD_PROJECT_ROOT is the dashboard's DATA ROOT — burndown,
+            # metrics, runs, escalations and memory-evals all resolve under it,
+            # because config.py's project_root falls back to Path.cwd() when the
+            # variable is unset (task 3503), and task 3572 made the unit declare
+            # it rather than leave it an undeclared side effect of
+            # WorkingDirectory=. Its value legitimately differs per host, so it
+            # is allowlisted out of the cross-copy value comparison below and
+            # checked HERE instead, against the SAME copy's WorkingDirectory=.
+            # That relation is host-invariant, so it still catches a repointed
+            # or stale value on either side — which a bare allowlist entry
+            # would not: =/tmp/wrong would otherwise read as parity.
+            ("DASHBOARD_PROJECT_ROOT", "WorkingDirectory"),
+        ),
         exec_start_flags=(
             # The two flags task 3306 added. Comparing them is what makes
             # "the unit change reached the running system" a checkable claim.
