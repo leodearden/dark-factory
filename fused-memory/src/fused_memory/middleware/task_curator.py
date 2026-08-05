@@ -1585,10 +1585,16 @@ class TaskCurator:
                 continue
             refusal = blocklist_decisions.get(j) or premise_decisions.get(j)
             if refusal is not None:
-                pre_dedup_decisions[i] = CuratorDecision(
-                    action='refuse',
-                    justification=refusal.justification,
-                )
+                # `replace` (not a fresh CuratorDecision) so the inherited
+                # refusal is FIELD-IDENTICAL to the one it copies — including
+                # the guards' pool_sizes={'anchor': 0, ...}/latency_ms=0
+                # observability shape. A byte-identical duplicate should not
+                # persist a differently-shaped row in tickets.db / the decision
+                # log than the twin it inherited from. Only batch_target_index
+                # is cleared: a refusal creates nothing, so it must carry no
+                # sibling-substitution target (the guards' own refusals never
+                # set one either).
+                pre_dedup_decisions[i] = replace(refusal, batch_target_index=None)
         # ── End refusal propagation ───────────────────────────────────────────
 
         # ── Recon claim-verification advisory backstop (task 2438) ─────────────
