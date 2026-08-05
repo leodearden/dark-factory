@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import importlib.util
+import random
 import sys
 import types
 from pathlib import Path
@@ -356,3 +357,212 @@ class TestAllocate:
         """
         with pytest.raises(_mod.CorpusBuildError):
             _mod.allocate({**CENSUS, ('2026-09', 'temporal_facts'): 0}, 200)
+
+
+# ===========================================================================
+# Selection — prefix of a seeded permutation, per cell
+# ===========================================================================
+
+# The real eligibility anchor, measured read-only on 2026-08-05: the ONE
+# episode of 2770 with size(entity_edges) == 0, i.e. the one the incumbent
+# extraction pipeline produced nothing from. If corpus membership were ever
+# conditioned on the incumbent's outcome, this is the episode that would
+# silently disappear. It must stay eligible.
+ANCHOR_UUID = 'e622a9bf-f1c8-431b-ad36-92762d69436d'
+
+
+def _record(uuid: str, month: str = '2026-05', kind: str = 'temporal_facts', content=None):
+    """One EpisodeRecord with a stratum key of exactly (month, kind)."""
+    return _mod.EpisodeRecord(
+        uuid=uuid,
+        name=f'ep-{uuid[:8]}',
+        group_id='dark_factory',
+        source_description=f'add_memory:{kind}',
+        created_at=f'{month}-16T12:00:00+00:00',
+        content=content if content is not None else f'content of {uuid}',
+    )
+
+
+def _population(per_cell: dict[tuple[str, str], int]) -> list[_mod.EpisodeRecord]:
+    """A synthetic population with the requested per-cell counts.
+
+    UUIDs are zero-padded and globally unique so canonical uuid sorting is
+    well-defined and cells cannot alias each other.
+    """
+    out = []
+    counter = 0
+    for (month, kind), count in sorted(per_cell.items()):
+        for _ in range(count):
+            out.append(_record(f'{counter:08d}-0000-0000-0000-000000000000', month, kind))
+            counter += 1
+    return out
+
+
+SYNTHETIC_CELLS: dict[tuple[str, str], int] = {
+    ('2026-04', 'decisions_and_rationale'): 40,
+    ('2026-04', 'procedural_knowledge'): 1,
+    ('2026-05', 'decisions_and_rationale'): 30,
+    ('2026-05', 'temporal_facts'): 25,
+    ('2026-06', 'entities_and_relations'): 12,
+    ('2026-07', 'temporal_facts'): 60,
+}
+
+
+def _uuids(records) -> list[str]:
+    return [r.uuid for r in records]
+
+
+class TestSelect:
+    """``select`` draws N records: deterministic, order-blind, cell-prefix."""
+
+    def test_returns_exactly_n(self):
+        pop = _population(SYNTHETIC_CELLS)
+        assert len(_mod.select(pop, 50, seed='s').selected) == 50
+
+    def test_db_row_order_does_not_matter(self):
+        """The guard against FalkorDB returning rows in an arbitrary order.
+
+        Row order is not guaranteed stable between runs. Without a canonical
+        re-sort before seeding, a re-run could silently produce a DIFFERENT
+        corpus while still claiming the same seed — the worst kind of failure,
+        because the artifact would look reproducible and not be.
+        """
+        pop = _population(SYNTHETIC_CELLS)
+        baseline = _uuids(_mod.select(pop, 50, seed='s').selected)
+        for shuffle_seed in range(5):
+            shuffled = list(pop)
+            random.Random(shuffle_seed).shuffle(shuffled)
+            assert _uuids(_mod.select(shuffled, 50, seed='s').selected) == baseline
+
+    def test_same_seed_is_byte_identical_across_calls(self):
+        pop = _population(SYNTHETIC_CELLS)
+        first = _uuids(_mod.select(pop, 50, seed='s').selected)
+        for _ in range(5):
+            assert _uuids(_mod.select(pop, 50, seed='s').selected) == first
+
+    def test_different_seed_changes_the_selection_not_just_its_order(self):
+        pop = _population(SYNTHETIC_CELLS)
+        a = set(_uuids(_mod.select(pop, 50, seed='seed-a').selected))
+        b = set(_uuids(_mod.select(pop, 50, seed='seed-b').selected))
+        assert a != b
+
+    def test_uses_no_module_global_random_state(self):
+        """RNG is derived from the seed, never from the ambient random module.
+
+        A module-global draw would make the result depend on whatever else ran
+        first in the process — reproducible only by accident.
+        """
+        pop = _population(SYNTHETIC_CELLS)
+        random.seed(1)
+        first = _uuids(_mod.select(pop, 50, seed='s').selected)
+        random.seed(999)
+        [random.random() for _ in range(50)]
+        assert _uuids(_mod.select(pop, 50, seed='s').selected) == first
+
+    def test_per_cell_counts_match_allocate_exactly(self):
+        pop = _population(SYNTHETIC_CELLS)
+        result = _mod.select(pop, 50, seed='s')
+        expected = _mod.allocate(SYNTHETIC_CELLS, 50)
+        got: dict[tuple[str, str], int] = {}
+        for record in result.selected:
+            got[_mod.stratum_key(record)] = got.get(_mod.stratum_key(record), 0) + 1
+        assert got == expected
+
+    def test_selection_is_a_prefix_of_each_cells_permutation(self):
+        """The property that makes zeta's N re-tune (PRD Open Q4) cheap.
+
+        Asserted per cell, deliberately NOT as global nestedness: largest
+        remainder allocation can move a single seat BETWEEN cells as N grows,
+        so global nestedness is not guaranteed and asserting it would be
+        asserting something false.
+        """
+        pop = _population(SYNTHETIC_CELLS)
+        small = _mod.select(pop, 50, seed='s')
+        large = _mod.select(pop, 120, seed='s')
+        for cell in SYNTHETIC_CELLS:
+            perm = _mod.cell_permutation(pop, cell, seed='s')
+            for result in (small, large):
+                taken = [r.uuid for r in result.selected if _mod.stratum_key(r) == cell]
+                assert taken == perm[: len(taken)], (cell, taken)
+
+    def test_a_cell_whose_allocation_grew_keeps_its_earlier_picks(self):
+        """The consequence epsilon cares about: replays already done stay valid."""
+        pop = _population(SYNTHETIC_CELLS)
+        small = _mod.select(pop, 50, seed='s')
+        large = _mod.select(pop, 120, seed='s')
+        for cell in SYNTHETIC_CELLS:
+            before = [r.uuid for r in small.selected if _mod.stratum_key(r) == cell]
+            after = [r.uuid for r in large.selected if _mod.stratum_key(r) == cell]
+            if len(after) >= len(before):
+                assert after[: len(before)] == before, cell
+
+    def test_output_order_is_fully_determined(self):
+        """Ordered by (cell key, position in permutation) — no incidental order."""
+        pop = _population(SYNTHETIC_CELLS)
+        selected = _mod.select(pop, 50, seed='s').selected
+        cells_in_order = [_mod.stratum_key(r) for r in selected]
+        assert cells_in_order == sorted(cells_in_order)
+
+    def test_every_record_is_accounted_for_exactly_once(self):
+        """Exhaustive disposition — no episode disappears unexplained.
+
+        The SampleResult convention from scripts/legibility/sampling.py: every
+        record handed in leaves by exactly ONE door. Without it, a corpus that
+        quietly lost records would report a clean total.
+        """
+        pop = _population(SYNTHETIC_CELLS)
+        result = _mod.select(pop, 50, seed='s')
+        selected = _uuids(result.selected)
+        not_selected = sorted(result.not_selected)
+        assert len(set(selected)) == len(selected)
+        assert set(selected).isdisjoint(not_selected)
+        assert set(selected) | set(not_selected) == {r.uuid for r in pop}
+        assert len(selected) + len(not_selected) == len(pop)
+
+    def test_every_non_selected_record_carries_a_reason(self):
+        pop = _population(SYNTHETIC_CELLS)
+        result = _mod.select(pop, 50, seed='s')
+        assert result.not_selected
+        for uuid, reason in result.not_selected.items():
+            assert isinstance(reason, str) and reason.strip(), uuid
+        assert set(result.not_selected.values()) <= set(_mod.DISPOSITIONS)
+
+    def test_duplicate_uuids_are_rejected(self):
+        """Two records claiming one uuid would break disposition accounting."""
+        pop = _population(SYNTHETIC_CELLS)
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod.select([*pop, pop[0]], 50, seed='s')
+        assert pop[0].uuid in str(exc.value)
+
+    def test_empty_population_raises(self):
+        with pytest.raises(_mod.CorpusBuildError):
+            _mod.select([], 10, seed='s')
+
+
+class TestSelectionIsNotConditionedOnOutcome:
+    """The binding hazard, at the sampler: an outcome-failed episode stays eligible."""
+
+    def _population_with_anchor(self):
+        pop = _population(SYNTHETIC_CELLS)
+        # The anchor lands in its own singleton cell so its allocation is 1
+        # under the min-1 floor and it is therefore ALWAYS selected — the
+        # strongest form of "never excluded".
+        return [*pop, _record(ANCHOR_UUID, '2026-08', 'temporal_facts')]
+
+    def test_anchor_is_in_the_population(self):
+        pop = self._population_with_anchor()
+        assert ANCHOR_UUID in _uuids(pop)
+
+    @pytest.mark.parametrize('seed', ['s', 'other', 'zeta-2026', ''])
+    def test_anchor_is_selected_under_every_seed(self, seed):
+        """The one episode the incumbent extracted NOTHING from.
+
+        It is the concrete test of the no-outcome-filter hazard: if membership
+        were conditioned on incumbent success this episode would be first out.
+        """
+        result = _mod.select(self._population_with_anchor(), 50, seed=seed)
+        assert ANCHOR_UUID in _uuids(result.selected)
+
+    def test_anchor_is_never_dispositioned_as_ineligible(self):
+        result = _mod.select(self._population_with_anchor(), 50, seed='s')
+        assert ANCHOR_UUID not in result.not_selected
