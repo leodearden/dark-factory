@@ -1129,6 +1129,77 @@ def test_registry_environment_sections_really_declare_environment():
         )
 
 
+def test_registry_env_matches_directive_entries_are_declared_in_the_committed_units():
+    """STALENESS GUARD, intra-copy-relation edition.
+
+    Both halves of each registered pair must really exist in the committed unit.
+    A misspelled variable or directive name would compare absent-to-absent
+    forever — or, worse, be skipped entirely by the absent-variable branch —
+    while the gate kept reporting green, which is the invisible-by-construction
+    failure the sibling guards above were written for.
+
+    Also asserts environment_section is set, since the variable is read through
+    it: a pair registered on a spec with no section could never resolve.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        if not spec.env_matches_directive:
+            continue
+        assert spec.environment_section is not None, (
+            f"{name}: registry declares env_matches_directive but no "
+            "environment_section, so the variable can never be read."
+        )
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        env = mod._environment_map(parsed, spec.environment_section)
+        for var, key in spec.env_matches_directive:
+            assert var in env, (
+                f"{name}: registry relates Environment={var} to {key}, but the "
+                f"committed unit {spec.repo_relpath} declares no such variable "
+                "— the entry checks nothing. Fix the registry or the unit."
+            )
+            assert key in parsed.get(spec.environment_section, {}), (
+                f"{name}: registry relates Environment={var} to "
+                f"[{spec.environment_section}] {key}, but the committed unit "
+                f"{spec.repo_relpath} does not declare that directive."
+            )
+
+
+def test_divergence_allowlist_names_are_declared_in_a_committed_unit():
+    """STALENESS GUARD, allowlist edition: no waiver for a variable nobody sets.
+
+    DIVERGENCE_ALLOWLIST is the one deliberate hole in this gate, and its own
+    comment says to keep it small and every reason checkable.  An entry naming a
+    variable no committed unit declares any more is worse than useless: it is a
+    standing, invisible waiver that nothing will ever remove, because nothing
+    reports it.  If the variable comes back later — reused for something else —
+    the waiver is already there, blessing a value comparison nobody re-examined.
+    """
+    mod = _load_checker()
+
+    declared: set[str] = set()
+    for spec in mod.UNITS.values():
+        if spec.environment_section is None:
+            continue
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        declared |= set(mod._environment_map(parsed, spec.environment_section))
+
+    for var, reason in mod.DIVERGENCE_ALLOWLIST.items():
+        assert var in declared, (
+            f"DIVERGENCE_ALLOWLIST waives value comparison for {var}, but no "
+            f"committed unit in the registry declares it. Declared: "
+            f"{sorted(declared)}. Remove the entry or restore the variable."
+        )
+        assert reason.strip(), (
+            f"DIVERGENCE_ALLOWLIST entry {var} has an empty reason. Every hole "
+            "in this gate must state one specific enough for a reviewer to check."
+        )
+
+
 def test_dashboard_service_spec_pins_the_tasks_minimum_coverage():
     """The dashboard service compares the restart directives and 3306's flags."""
     mod = _load_checker()
@@ -1150,6 +1221,58 @@ def test_dashboard_service_spec_pins_the_tasks_minimum_coverage():
             "RestartSteps=, so an installed unit whose cap systemd is silently "
             f"ignoring would be reported as parity. compared: {compared_keys}"
         )
+
+
+def test_dashboard_service_spec_pins_the_project_root_env_contract():
+    """The dashboard service relates DASHBOARD_PROJECT_ROOT to WorkingDirectory=.
+
+    This is the VALUE half of the contract task 3572 made explicit.  Without the
+    registry entry the variable is PRESENCE-checked only — the name-set branch
+    would still catch it disappearing, but ``DASHBOARD_PROJECT_ROOT=/tmp/wrong``
+    on the installed copy would be reported as parity.  That value is the
+    dashboard's entire data root (config.py's project_root falls back to
+    Path.cwd() when it is unset), so "present, and pointing anywhere at all"
+    is not the claim this gate should be making about it.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+
+    assert ("DASHBOARD_PROJECT_ROOT", "WorkingDirectory") in spec.env_matches_directive, (
+        "the dashboard spec does not relate DASHBOARD_PROJECT_ROOT to "
+        "WorkingDirectory=, so its value is unchecked. "
+        f"env_matches_directive: {spec.env_matches_directive}"
+    )
+
+
+def test_project_root_is_allowlisted_for_cross_host_value_divergence():
+    """...and it is allowlisted out of the CROSS-COPY value comparison.
+
+    The pairing is deliberate, and the two entries must land together.  The
+    allowlist waives a comparison that would otherwise fire on every host whose
+    checkout is not /home/leo/src/dark-factory: the committed unit hardcodes
+    that path while setup-host.sh renders the installed copy from
+    scripts/dashboard.service.template with the host's real $REPO_ROOT.
+
+    Unpaired, either entry alone is a defect.  The allowlist alone would leave
+    the data root genuinely unchecked — the hole its own preamble warns about.
+    The relation alone would leave the gate permanently red off this host, which
+    the module docstring records as how a gate gets switched off entirely.
+    Together, presence is checked cross-copy, value is checked intra-copy, and
+    nothing is waived that is not checked another way — so this is the one
+    allowlist entry that is not a hole.
+    """
+    mod = _load_checker()
+
+    assert "DASHBOARD_PROJECT_ROOT" in mod.DIVERGENCE_ALLOWLIST, (
+        "DASHBOARD_PROJECT_ROOT is not allowlisted, so its value is compared "
+        "across copies — that fires on every correctly-configured host whose "
+        "repo does not live at /home/leo/src/dark-factory."
+    )
+    assert mod.DIVERGENCE_ALLOWLIST["DASHBOARD_PROJECT_ROOT"].strip(), (
+        "every allowlist entry must state its reason; this one must also name "
+        "what closes the hole (env_matches_directive), so the preamble's "
+        "'THIS IS A HOLE IN THE GATE' stays honest."
+    )
 
 
 def test_watchdog_service_spec_compares_the_whole_tick_bound():
