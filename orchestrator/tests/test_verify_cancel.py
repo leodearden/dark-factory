@@ -772,6 +772,45 @@ class TestLaneLockHolderPidsStrict:
 
         assert lane_lock_holder_pids_strict(lock_path, locks_path=locks) == [4242]
 
+    def test_git_ops_binds_the_fail_safe_wrapper_not_the_strict_core(self):
+        """STRUCTURAL PIN: production imports the wrapper, never the strict core.
+
+        The module now exports two names one word apart, and only the
+        fail-safe one is safe in :mod:`orchestrator.git_ops`: all four call
+        sites there sit on acquire-timeout paths, where an ``OSError`` would
+        convert a diagnosable stall into a broken merge — precisely the outcome
+        both docstrings warn about.
+
+        Nothing else pins that. An autocomplete slip importing the ``_strict``
+        variant into ``git_ops`` would type-check, pass every case in this file
+        unchanged, and surface only as an unhandled
+        ``FileNotFoundError``/``PermissionError`` mid-merge on a host where the
+        lock file was cleaned or ``/proc/locks`` is unreadable — the worst
+        possible place to discover it. Same class of guard as
+        ``test_reset_acquires_through_the_shared_guarded_seam``: assert on the
+        BINDING, because the defect is which name got imported, not what any
+        one function does.
+        """
+        import orchestrator.git_ops as git_ops_mod
+        import orchestrator.verify_cancel as verify_cancel_mod
+
+        assert (
+            git_ops_mod.lane_lock_holder_pids
+            is verify_cancel_mod.lane_lock_holder_pids
+        ), (
+            'git_ops must bind the FAIL-SAFE wrapper — binding the strict core '
+            'would make a missing lock file or an unreadable /proc/locks raise '
+            'from inside an acquire-timeout path'
+        )
+        assert (
+            git_ops_mod.lane_lock_holder_pids
+            is not verify_cancel_mod.lane_lock_holder_pids_strict
+        ), (
+            'the wrapper must not have been aliased to the strict core — that '
+            'would satisfy the identity check above while silently deleting '
+            'the fail-safe policy every git_ops call site depends on'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Task 2306 step-7: LOCK_HOLDER_PGID_KEY + write/read/remove_lock_holder_pgid —
