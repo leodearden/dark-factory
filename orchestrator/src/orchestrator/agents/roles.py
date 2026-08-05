@@ -315,6 +315,65 @@ leaving a half-done tree that is falsely recorded as a completed, successful run
 """
 
 
+# Census-R3 companion to BACKGROUND_TASK_WARNING (task 3607, census
+# 2026-08-02 §1.1).  2761 told agents what NOT to do; it never told them what
+# to do instead, so sessions kept improvising a wait — blocked `sleep` chains,
+# back-to-back tool calls as an ad-hoc delay, hand-rolled `until` busy-loops
+# that get SIGTERMed at the Bash timeout.  This states the sanctioned wait
+# paths.  Anchored by test_roles_wait_pattern.py, which pins two HARD
+# constraints:
+#   (a) NO literal `{`/`}` braces — this text is interpolated into
+#       build_amender_prompt's f-string, same invariant as the constant above.
+#   (b) BACKGROUND_WAIT_GUIDANCE (defined below) is the ONLY thing that may be
+#       spliced into a role prompt.  Splicing either half on its own reopens
+#       the exact footgun-trade the composition mandate exists to prevent: the
+#       prohibition without the pattern breeds busy-loops, the pattern without
+#       the prohibition breeds abandoned background work.
+WAIT_PATTERN_GUIDANCE = """
+## CRITICAL: How to wait for something
+
+The rule above is one half of the contract — it tells you not to end your turn
+on pending background work. This is the other half: how to actually wait.
+
+SANCTIONED
+- Default: run the command in the FOREGROUND with an explicit Bash `timeout`
+  sized to the expected wall clock plus margin (it is in MILLISECONDS). An
+  omitted `timeout` kills the call at the 2-minute default — that is the
+  exit-143 failure mode you will otherwise misdiagnose as a hung command.
+  Foreground-and-finished beats backgrounded-and-abandoned.
+- If you must background: `Bash` with `run_in_background=true`, then poll it to
+  completion with `BashOutput` and READ the result before ending your turn
+  (that is the rule above). Background tasks are exempt from the foreground
+  timeout — that exemption is the only good reason to reach for them.
+- If a `Monitor` tool is available in this session, use its until-condition
+  form for a genuinely long wait instead of hand-rolling one in shell — and
+  load its schema with `ToolSearch("select:Monitor")` FIRST, because it is a
+  deferred tool and calling it cold is rejected client-side with
+  `InputValidationError` for invented parameter names.
+
+NEVER — each of these cost a real session a turn or an entire wait
+- `sleep N; tail ...` / `sleep N && cat ...` chained to poll background output.
+  The harness anti-polling guard BLOCKS foreground sleep and spends one of your
+  turns teaching you this. Do not retry with a different sleep spelling.
+- Back-to-back `Read`/`Bash` calls fired as an ad-hoc wait. They do not wait;
+  they burn turns and context and observe nothing new.
+- A hand-rolled foreground `until`/`while` busy-loop. It runs until the Bash
+  timeout SIGTERMs it (exit 143) and you lose EVERYTHING it had observed —
+  strictly worse than not waiting at all.
+- `ScheduleWakeup` as a generic delay. It is scoped to `/loop` dynamic mode,
+  requires its `prompt` argument, and does nothing for a one-shot dispatched
+  session.
+- Polling `TaskOutput` on a task id without first confirming the task is still
+  live. A reaped or unknown id returns nothing, forever.
+"""
+
+
+# The single splice unit.  Roles and turn-prompts embed THIS, never either half
+# on its own -- see constraint (b) above; test_roles_wait_pattern.py asserts the
+# composition so the two rules cannot drift apart.
+BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
+
+
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
 # kind="found_on_main"). Being a single shared constant IS the mechanism that
