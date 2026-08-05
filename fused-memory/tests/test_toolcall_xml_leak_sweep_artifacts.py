@@ -51,8 +51,8 @@ reproducing the very bug under test. This module needs no such literal today
 
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import json
 import re
 import sys
