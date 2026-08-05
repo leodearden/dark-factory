@@ -16,12 +16,13 @@ from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
 
 
-@pytest_asyncio.fixture
-async def integrated_service(mock_config):
-    """MemoryService with real DurableWriteQueue, mocked Graphiti/Mem0."""
-    svc = MemoryService(mock_config)
+def _mock_backends(svc: MemoryService) -> MemoryService:
+    """Stub Graphiti/Mem0 on *svc* so tests never hit real FalkorDB/Qdrant.
 
-    # Mock backends so we never hit real FalkorDB/Qdrant
+    THE single definition of what a mocked MemoryService looks like in this
+    module — every fixture below builds on it, so a backend that grows a new
+    method is taught about in exactly one place.
+    """
     svc.graphiti = MagicMock()
     svc.graphiti.initialize = AsyncMock()
     svc.graphiti.add_episode = AsyncMock(return_value=None)
@@ -33,6 +34,13 @@ async def integrated_service(mock_config):
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    return svc
+
+
+@pytest_asyncio.fixture
+async def integrated_service(mock_config):
+    """MemoryService with real DurableWriteQueue, mocked Graphiti/Mem0."""
+    svc = _mock_backends(MemoryService(mock_config))
 
     # Real initialize — creates DurableWriteQueue with real SQLite
     await svc.initialize()
@@ -711,19 +719,9 @@ async def journaled_service(mock_config, tmp_path):
     """
     from fused_memory.services.write_journal import WriteJournal
 
-    svc = MemoryService(mock_config)
-
-    svc.graphiti = MagicMock()
-    svc.graphiti.initialize = AsyncMock()
-    svc.graphiti.add_episode = AsyncMock(return_value=None)
-    svc.graphiti.close = AsyncMock()
-    svc.graphiti._require_client = MagicMock()
-
-    svc.mem0 = MagicMock()
-    svc.mem0.search = AsyncMock(return_value={'results': []})
-    svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
-    svc.mem0.get_all = AsyncMock(return_value={'results': []})
-    svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    # Same mocked-backend definition as integrated_service — deliberately not a
+    # second copy of it.
+    svc = _mock_backends(MemoryService(mock_config))
 
     await svc.initialize()
 
@@ -896,5 +894,56 @@ class TestTerminalOutcomeWrittenBack:
             message='replayed write never re-stamped completed',
         )
         row = await journal.get_write_op(write_op_id)
+        assert row['terminal_status'] == 'completed'
+        assert row['terminal_error'] is None
+
+    @pytest.mark.asyncio
+    async def test_terminal_outcome_survives_an_arbitrarily_slow_producer(
+        self, journaled_service
+    ):
+        """The unbounded-window case, end to end.
+
+        add_memory enqueues the Graphiti leg immediately but journals its
+        Layer-1 write_ops row only after the SYNCHRONOUS Mem0 leg — a real
+        network/LLM round trip whose width is unbounded, and which routinely
+        outlasts the queue worker. Here Mem0 is held open until the terminal
+        write-back has provably landed, so the producer's row is written
+        strictly afterwards. A time-boxed retry ladder would drop the outcome
+        exactly in this case — the slow-producer case — which is precisely when
+        an operator most needs it.
+        """
+        svc, journal = journaled_service
+
+        stamped = asyncio.Event()
+        original_record = journal.record_terminal_outcome
+
+        async def _record_then_release(**kwargs):
+            result = await original_record(**kwargs)
+            stamped.set()
+            return result
+
+        journal.record_terminal_outcome = _record_then_release
+
+        async def _mem0_add_slower_than_the_queue(*_args, **_kwargs):
+            await asyncio.wait_for(stamped.wait(), timeout=20.0)
+            return {'results': [{'id': 'mem0-1'}]}
+
+        svc.mem0.add = AsyncMock(side_effect=_mem0_add_slower_than_the_queue)
+
+        await svc.add_memory(
+            content='The auth service depends on Redis',
+            category='entities_and_relations',
+            project_id='test',
+            dual_write=True,
+        )
+        write_op_id = await _sole_queue_write_op_id(svc)
+
+        row = await journal.get_write_op(write_op_id)
+        assert row is not None
+        # The producer's Layer-1 fields landed...
+        assert row['operation'] == 'add_memory'
+        assert row['success'] == 1
+        # ...on top of a terminal outcome that got there first, without
+        # clobbering it.
         assert row['terminal_status'] == 'completed'
         assert row['terminal_error'] is None
