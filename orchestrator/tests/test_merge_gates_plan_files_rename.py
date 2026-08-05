@@ -41,6 +41,7 @@ the pair ``('test_workflow.py', '_check_plan_files_touched_in_branch')``.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -251,3 +252,93 @@ class TestPlanFilesTouchedResultFields:
             missing_from_tree=['crates/tests/topo_e2e.rs'],
         )
         assert set(result.missing_from_tree) <= set(result.not_touched)
+
+
+# ---------------------------------------------------------------------------
+# Mechanism 1 — resolution via the deleting commit's rename pair
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRenamedOnMainResolvesViaDeletingCommit:
+    """The measured reify-5196 shape: ``git mv`` on main, branch edits the
+    new path, gate must PASS instead of blaming the branch."""
+
+    async def test_renamed_on_main_gate_passes(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        old = 'crates/tests/topo_e2e.rs'
+        new = 'crates/tests/harness_topo/topo_e2e.rs'
+
+        # 1. Pre-rename main — the state the architect declared against.
+        await _commit_on_main(
+            git_ops, git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        # 2. Main relocates it (identical basename — the harness-layout
+        #    consolidation shape), before any branch exists.
+        rename_sha = await _rename_on_main(
+            git_ops, git_repo, old, new, 'harness: consolidate topo tests',
+        )
+        # 3. Branch cut from POST-rename main; touches only the NEW path.
+        wt = (await git_ops.create_worktree('rename-on-main')).path
+        base = await _head_of(wt)
+        (wt / new).write_text('fn topo() { assert!(true); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [old], base, head, git_ops, task_id='rename-5196',
+            )
+
+        assert result.not_touched == [], (
+            'a path renamed on main before the branch was cut must not be '
+            'reported as untouched by the branch'
+        )
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {old: new}
+
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert old in msg, 'resolution log must name the declared path'
+        assert new in msg, 'resolution log must name the resolved path'
+        assert rename_sha[:12] in msg, (
+            'resolution log must name the deleting commit so the rename is auditable'
+        )
+
+    async def test_dot_slash_declared_entry_resolves_and_keys_on_original(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Composes with task 1587's ``./``-prefix normalization class.
+
+        Matching happens on the normalized form, but ``resolved_renames`` is
+        keyed by the ORIGINAL declared string so the diagnostic reflects
+        exactly what the architect wrote in plan.json.
+        """
+        old = 'crates/tests/topo_e2e.rs'
+        new = 'crates/tests/harness_topo/topo_e2e.rs'
+        declared = f'./{old}'
+
+        await _commit_on_main(
+            git_ops, git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_ops, git_repo, old, new, 'harness: consolidate topo tests',
+        )
+        wt = (await git_ops.create_worktree('rename-dot-slash')).path
+        base = await _head_of(wt)
+        (wt / new).write_text('fn topo() { assert!(true); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [declared], base, head, git_ops, task_id='rename-dot-slash',
+        )
+
+        assert result.not_touched == []
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {declared: new}
