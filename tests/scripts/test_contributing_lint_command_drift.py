@@ -65,8 +65,12 @@ from __future__ import annotations
 
 import pathlib
 import re
+import shlex
 
 import pytest
+import yaml
+
+from orchestrator import verify_cmd
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -297,3 +301,150 @@ def test_documented_lint_command_is_immune_to_the_generic_ruff_decoy() -> None:
     destroy a correct, audience-appropriate instruction.
     """
     assert _documented_lint_command(_DECOY_DOC) == _HAPPY_COMMAND
+
+
+# ---------------------------------------------------------------------------
+# The live drift assertion. Everything below reads BOTH committed artifacts
+# fresh on every run and never stores its own snapshot of the command — a
+# snapshot would just relocate the drift problem into this file.
+# ---------------------------------------------------------------------------
+
+_LIVE_LABEL = "the root lint_command's ruff leg (dark-factory-orchestrator.yaml)"
+_DOC_LABEL = "the documented Lint bullet (CONTRIBUTING.md)"
+
+
+def _root_lint_command() -> str:
+    return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["lint_command"]
+
+
+def _ruff_segment(cmd: str, label: str) -> str:
+    """The ``&&``-chained segment of *cmd* that actually invokes ``ruff check``.
+
+    Uses the production splitter ``verify_cmd.split_top_level_and`` (quote-aware)
+    rather than a naive ``str.split('&&')`` — matching ``_ruff_segment`` in
+    ``test_root_lint_covers_nonmember_py.py`` and ``test_scripts_module_config.py``.
+    Duplicated rather than imported from either sibling: that is this repo's
+    stated norm for this helper, and cross-importing a leading-underscore private
+    would couple two guards' failure modes for ~10 lines. The genuinely shared
+    dependency — the production splitter — IS imported by all of them.
+
+    Extracting the ruff segment FIRST is what keeps the target comparison honest:
+    tokenising the whole live chain would read ``&&``, ``python3`` and the
+    magicmock checker's own directory arguments as ruff lint targets.
+
+    Works unchanged on the single-segment documented command, so both sides of
+    the mirror are tokenised by exactly one code path.
+    """
+    segments = verify_cmd.split_top_level_and(cmd)
+    ruff_segments = [s for s in segments if "ruff check" in s]
+    assert len(ruff_segments) == 1, (
+        f"expected exactly one `ruff check` segment in {label}, got "
+        f"{ruff_segments!r} (task 3558); full command: {cmd!r}"
+    )
+    return ruff_segments[0].strip()
+
+
+def _ruff_targets(cmd: str, label: str) -> list[str]:
+    """The positional path arguments the ``ruff check`` segment of *cmd* lints.
+
+    Returns whole path TOKENS. Callers must compare against them by exact element
+    and never substring-match the raw command — the contract documented on
+    ``_lint_leg_targets`` in ``test_fallback_verify_config.py`` and restated on
+    ``_ruff_targets`` in ``test_root_lint_covers_nonmember_py.py``.
+
+    That rule is backed by a MEASURED counterexample, not a hypothetical:
+    ``'shared' in cmd`` is ALREADY TRUE of the live ``lint_command`` via the
+    ``check_bare_magicmock_config.py`` TAIL leg's ``shared/tests`` argument. The
+    ruff leg and the tail leg have DISJOINT target lists, so a substring test
+    would pass vacuously for a path the ruff leg never checks.
+    """
+    tokens = shlex.split(_ruff_segment(cmd, label))
+    assert "check" in tokens, f"no ruff `check` subcommand in {label}: {cmd!r} (task 3558)"
+    tail = tokens[tokens.index("check") + 1:]
+    return [t for t in tail if not t.startswith("-")]
+
+
+def test_contributing_lint_bullet_mirrors_the_live_lint_command() -> None:
+    """CONTRIBUTING.md's marked Lint bullet must equal the live ruff leg.
+
+    Reads BOTH sides live from the committed artifacts. The documented string is
+    compared against the extracted ruff SEGMENT of ``lint_command``, not against
+    the whole ``&&`` chain: the live command's tail leg
+    (``python3 fused-memory/scripts/check_bare_magicmock_config.py <test dirs>``)
+    has a DISJOINT target list and is a gate-internal style check, not something
+    a contributor runs as "the lint command". Forcing the doc to carry it would
+    be wrong for its audience.
+
+    MEASURED RED at base HEAD ``ca8dfb6a6e``: (b) reported missing
+    ``['sampler', 'cockpit', 'conftest.py', 'df_pytest_isolation.py', 'skills']``
+    — 5 documented targets against 10 live — and (c) reported the string
+    mismatch. (a) and (d) passed already, which is correct: they are vacuity and
+    typo backstops, not the RED.
+    """
+    live_cmd = _root_lint_command()
+    live_segment = _ruff_segment(live_cmd, _LIVE_LABEL)
+    live_targets = _ruff_targets(live_cmd, _LIVE_LABEL)
+    documented = _documented_lint_command(CONTRIBUTING_PATH.read_text(encoding="utf-8"))
+
+    # (a) NON-VACUITY, both sides. Neither an empty target list nor an empty
+    # extraction may let this invariant pass by checking nothing at all.
+    assert live_targets, (
+        f"{_LIVE_LABEL} had no positional targets at all (task 3558) — this "
+        f"mirror invariant would pass vacuously; command: {live_cmd!r}"
+    )
+    assert documented, (
+        f"{_DOC_LABEL} extracted as empty (task 3558) — this mirror invariant "
+        f"would pass vacuously"
+    )
+    assert shlex.split(documented)[:4] == ["uv", "run", "ruff", "check"], (
+        f"{_DOC_LABEL} does not lead with `uv run ruff check` (task 3558): "
+        f"{documented!r}. The marker must wrap the copy-pasteable lint command; "
+        f"if the bullet was repurposed, move the marker to the command it names."
+    )
+
+    documented_targets = _ruff_targets(documented, _DOC_LABEL)
+
+    # (b) SEMANTIC — whole-token set equality, element-wise, NEVER substring
+    # (see _ruff_targets for the measured reason).
+    missing = [t for t in live_targets if t not in documented_targets]
+    extra = [t for t in documented_targets if t not in live_targets]
+    assert not missing and not extra, (
+        f"CONTRIBUTING.md's Lint bullet has drifted from "
+        f"dark-factory-orchestrator.yaml's lint_command (task 3558).\n"
+        f"  MISSING from the doc (linted by the gate, not by the documented "
+        f"command): {missing}\n"
+        f"  EXTRA in the doc (documented but not linted by the gate): {extra}\n"
+        f"  documented: {documented_targets}\n"
+        f"  live:       {live_targets}\n"
+        f"UNDER-COVERAGE is the failure this guard exists to stop: a contributor "
+        f"who runs the documented command gets a clean LOCAL GREEN over a strict "
+        f"subset of what the gate checks, then eats a RED merge verify on a "
+        f"branch they believed was ready. If you widened the yaml head, update "
+        f"the bullet inside the `lint-command-mirror` marker in CONTRIBUTING.md "
+        f"to match."
+    )
+
+    # (c) EXACT. Catches flag and spelling drift a set comparison alone would
+    # miss — e.g. a future `--select` added to the live head.
+    assert documented == live_segment, (
+        f"CONTRIBUTING.md's Lint bullet is not verbatim equal to the ruff leg of "
+        f"lint_command (task 3558), even though their target SETS agree — so the "
+        f"difference is in flags, spelling or spacing.\n"
+        f"  documented: {documented!r}\n"
+        f"  live:       {live_segment!r}\n"
+        f"Copy the live segment into the `lint-command-mirror` marker verbatim. "
+        f"Note the doc deliberately mirrors the ruff leg ONLY, never the "
+        f"`&& python3 ...check_bare_magicmock_config.py` tail."
+    )
+
+    # (d) STALE-TARGET / typo guard. A bogus documented target is invisible to
+    # (b) and (c) once the yaml carries the same typo, and it would instruct a
+    # contributor to run a command that exits non-zero on a path that is not
+    # there. (Mirrors assertion (c) of
+    # test_root_lint_command_targets_every_root_level_and_skills_py.)
+    for target in documented_targets:
+        assert (REPO_ROOT / target).exists(), (
+            f"{_DOC_LABEL} names {target!r}, which does not exist under "
+            f"{REPO_ROOT} (task 3558) — the doc would instruct a contributor to "
+            f"run a command that exits non-zero; targets: {documented_targets}"
+        )
