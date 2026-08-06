@@ -283,14 +283,26 @@ whose median was 92. Do not expect to reproduce either without a cap.
 `test_warm_lane_gc.sh` dominates: 34 `git worktree add` calls, 33 `flock`
 acquisitions and `/proc/<pid>/{exe,cwd,fd,maps}` liveness walks.
 
-### The two gc-driving suites have regressed ~2x, and it is not load
+**Read the two bold ratios as a cross-DAY comparison, not as a regression.**
+The `ratio` column divides a 2026-08-05 figure by a 2026-07-30 one, so it
+brackets five days of host state, not a commit range. For `gc_sweep` a direct
+same-sitting A/B between the commits puts the ratio at 0.93x — see the next
+subsection.
+
+### `gc_sweep` did NOT regress: the 2.23x was a confounded comparison (task 3655)
+
+**This subsection previously claimed the two gc-driving suites had regressed
+~2x and that it was "attributable to task 3292". For `gc_sweep` that claim is
+RETRACTED — it does not survive a direct A/B against the pre-3292 tree.** What
+follows is what task 3655 established. It is the second conclusion this section
+has had to overturn, which is the argument for keeping it: it records its own
+refutations.
 
 Six of the eight rows reproduce their 2026-07-30 figures within 1.00–1.41x at
 comparable load — `test_warm_lane_disk_guard.sh` lands on 1.04s both times.
-The two that drive `warm-lane-gc.sh` do not: **gc-sweep is 2.23x its baseline
-at an UNCHANGED 86 assertions**, and gc.sh is 2.74x on an 8% assert growth
-(198→214). Load cannot explain a divergence measured inside a single sitting,
-and three confounds were checked and eliminated:
+The two that drive `warm-lane-gc.sh` did not: gc-sweep was 2.23x its baseline
+at an UNCHANGED 86 assertions, and gc.sh 2.74x on an 8% assert growth
+(198→214). Three confounds were checked and eliminated at the time:
 
 - **Cold FS cache** — ruled out. Warm-cache re-runs minutes later reproduced:
   gc.sh 46.01s, gc-sweep 13.89s, audit 13.85s.
@@ -301,34 +313,150 @@ and three confounds were checked and eliminated:
   ~0.45s of an 8.3s gain.
 - **Assertion growth** — ruled out for gc-sweep, whose assert count did not move.
 
-**It is attributable to task 3292, by a pair of measurements this README already
-contained.** The `test_warm_lane_gc_sweep.sh` before/after pair recorded below
-(59.5s at loadavg 203→184, then 124.0s at 212→189) brackets exactly 3292's four
-commits — `git log e1c04cf316..04b2dd82d5` is 464b085e7a, a62db712d8,
-2e1927c6bf, 04b2dd82d5 and nothing else. That pair was dismissed below as load
-noise ("same caveat, same reason"). It was not noise:
+The confound that was NOT checked is the one that mattered: **whether the
+regression reproduces at all when the only thing that changes is the commit.**
 
-| `gc_sweep` | loadavg | pre-3292 | post-3292 | ratio |
-|---|---|---|---|---|
-| 2026-08-01 pair | ~200 | 59.5s | 124.0s | 2.08x |
-| 2026-07-30 → 2026-08-05 | ~14 | 6.73s | 15.01s | 2.23x |
+#### The direct A/B: it does not reproduce
 
-**A ratio that holds at 2.1x across a 14x difference in host load is the
-signature of added work, not of dilation** — dilation would scale with load and
-does not. Two independent measurements at opposite ends of the load range agree,
-and both bracket the same change.
+Both endpoints were exported with `git archive` into `/tmp` (so the two arms
+differ ONLY by commit — same filesystem, same mount, same `.venv`, which is
+symlinked into each and proven working by `lane_protect_glob _lane- _spec-`
+returning the glob at rc=0 with no `[warn]` before any figure was taken). Runs
+alternate A,B,A,B; every figure carries the loadavg sampled immediately before
+and after it.
 
-The **mechanism** is still unidentified, and it is NOT the render bridge (5
-renders ≈ 2.3s in the gc suite, 1 ≈ 0.45s in gc-sweep, both strace-verified).
-The hypothesis worth testing first is that a62db712d8 added per-invocation cost
-to `warm-lane-gc.sh` itself — e.g. sourcing `lib_lane_state.sh` — which every
-invocation pays even when the `PROTECT_GLOB` pin short-circuits the render, and
-which would scale with each suite's gc.sh invocation count while touching no
-other suite. That is a hypothesis, not a finding; it has not been tested.
+| `gc_sweep`, 2026-08-05, alternating A/B ×3 | median | runs |
+|---|---|---|
+| A = pre-3292 (`ee7571e253`) | **30.86s** | 86 passed, 0 failed ×3 |
+| B = post-3292 (`be86ccc9e5`) | **28.58s** | 86 passed, 0 failed ×3 |
+| **ratio B/A** | **0.93x** | B ≤ A in all three pairs |
 
-This is the first honest same-load comparison the table has ever supported, and
-it overturned a conclusion recorded in this same file on its first use. That is
-the argument for keeping the table rather than retiring it.
+Loadavg band across the sitting 88.47–129.73 (1.46x spread) — VALID under this
+section's own rule. **A first sitting was discarded, not salvaged**: its band
+was 110.82–225.37 (2.03x), and its ratio came out 1.22x with the sign FLIPPED
+in the third pair (A slower than B). That discard is the protocol working.
+
+Post-3292 is, if anything, marginally *faster*. There is no 2.23x to explain.
+
+#### The counters: both arms do the same work
+
+Wall-clock on this host is nearly unusable (median 1-min loadavg 92–121; under
+1.5% of samples below 20), so the argument is carried by **load-independent
+counters**, which are exact at loadavg 15 and at loadavg 200 alike. `strace -f
+-e trace=execve` over one whole suite run, per arm:
+
+| counter | pre-3292 | post-3292 | delta |
+|---|---|---|---|
+| total `execve` | 1133 | 1132 | **−1** |
+| `warm-lane-gc.sh` invocations | 4 | 4 | **0** |
+| `.venv/bin/python3` (renders) | 0 | 1 | **+1** |
+| `/proc/<pid>/fd` liveness walks | 21 | 21 | **0** |
+| `flock` acquisitions | 103 | 103 | **0** |
+| `sleep` | 13 | 11 | −2 (retry timing) |
+
+Every other binary count is identical. The `/proc` liveness walk — the cost
+centre worth suspecting first, since gc.sh's own comment prices it at a
+MEASURED ~1.9s per lane (task 5572) — **did not move**. Post-3292 does one
+extra render and, net, one FEWER `execve` than pre-3292.
+
+#### The mechanism, named and classified
+
+3292's entire measurable per-invocation cost in this suite is **one
+`.venv/bin/python3` PROTECT_GLOB render per suite run**, and it is paid by
+exactly one call site: the direct `bash "$GC_REAL" reclaim --mount "$WB"` in
+Block W of `test_warm_lane_gc_sweep.sh`, which bypasses `run_sweep` and so does
+not carry the `REIFY_WARM_LANE_GC_PROTECT_GLOB` pin. The four `run_sweep`-driven
+real-gc cases are correctly short-circuited — that is why the counter reads 1
+and not 5. That one render cost `si_utime` 0.90s + `si_stime` 0.16s of CPU in
+this sitting.
+
+**Classification: INHERENT.** It is the price of rendering `PROTECT_GLOB` from
+the registry instead of the hand-copied `PROTECTED_PREFIXES` literal that 3292
+existed to delete (INV-5), and Block W is the only place this suite exercises
+gc.sh's real production default. It is not contorted away. `run_sweep`'s pin
+already removes it everywhere it can be removed without losing coverage, and
+that pin is now itself pinned — see Block Y below.
+
+#### The refuted hypothesis
+
+This section used to propose that `a62db712d8` "added per-invocation cost to
+`warm-lane-gc.sh` itself — e.g. sourcing `lib_lane_state.sh`". **It did not.**
+The refutation is one command, re-runnable rather than trusted:
+
+```bash
+git show ee7571e253:orchestrator/scripts/warm-lane/warm-lane-gc.sh | grep -n lib_lane_state
+```
+
+`source "$SCRIPT_DIR/lib_lane_state.sh"` is already at line 313 PRE-3292 (it is
+line 319 today). 3292 added no source line and no fork to gc.sh. The lib's
+source-time work is `cd`/`pwd` BUILTINS in subshells and is unchanged across the
+window. Filtering 3292's whole gc.sh diff to non-comment lines leaves only the
+3-line `PROTECT_GLOB` default plus a `usage()` heredoc edit reachable only via
+`--help`; the `lib_lane_state.sh` and `warm-lane-gc-sweep.sh` changes in the
+window are **comment-only**. And the protect-set delta is behaviourally inert:
+it adds `_merge-verify` (already covered by `_merge-*`) plus `.lane-state` and
+`.task-meta`, two dot patterns that gc.sh's `for entry in "$WORKTREES_DIR"/*/`
+enumeration can never match, and `_matches_glob` is pure builtins, so 7→10
+patterns costs zero forks.
+
+#### The attribution, corrected
+
+The old claim was "two independent measurements … both bracket the same
+change". Only one of them brackets anything:
+
+| `gc_sweep` | loadavg | pre-3292 | post-3292 | ratio | what it actually brackets |
+|---|---|---|---|---|---|
+| 2026-08-01 pair | ~200 | 59.5s | 124.0s | 2.08x | 3292's commits — but taken at the load this README itself calls untrustworthy |
+| 2026-07-30 → 2026-08-05 | ~14 | 6.73s | 15.01s | 2.23x | **five days of host state**, not a commit range |
+| **2026-08-05 direct A/B** | **89–130** | **30.86s** | **28.58s** | **0.93x** | **3292's commits, and nothing else** |
+
+Two figures agreeing on a ratio is weaker evidence than it looks when only one
+of them is a controlled comparison. In fairness to the old claim, the code-side
+confound really is excluded — the only commits touching warm-lane paths in that
+five-day window are 3292's own plus one README-only commit
+(`git log ee7571e253..HEAD -- orchestrator/scripts/warm-lane/
+orchestrator/tests/warm-lane/`). What is not excluded is everything else on
+this host across those five days: repo object growth, `/tmp` state, mount
+contents, `.venv`, kernel. The direct A/B holds all of that fixed, and the
+ratio goes to 0.93x.
+
+**A note on the SHAs this section used to quote.** `464b085e7a, a62db712d8,
+2e1927c6bf, 04b2dd82d5` are pre-rebase task-branch SHAs and are **not in
+`main`** (`git merge-base --is-ancestor` fails for all four). On `main`, task
+3292 is **five** commits — `e29131c457, 3156952dc0, b441fb296d, 61fde6548e,
+b4c6759c51` — off parent `ee7571e253`, whose warm-lane tree is byte-identical
+to `e1c04cf316`'s. Quote the reachable ones.
+
+#### What was NOT established
+
+- **`test_warm_lane_gc.sh`'s 2.74x was not re-tested.** Only `gc_sweep` was
+  A/B'd. Part of that row is known assert growth (198→214); the remainder is
+  unexplained and stays unexplained here rather than being assumed to share
+  gc-sweep's verdict.
+- **No four-point bisect was run.** The endpoint pair does not reproduce, so
+  there is no jump to localise, and forcing a guilty commit out of a flat
+  bisect would manufacture a finding.
+- **A latent hazard, named but not gated here.** Both gc suites now drive gc.sh
+  through a pin set to `$LANE_PROTECT_GLOB_FALLBACK`, which is behaviour-neutral
+  only because the fallback currently equals the rendered set byte-for-byte
+  (re-verified 2026-08-05). `TestProtectGlobFallbackDrift` enforces only
+  fallback ⊇ rendered. The day a band is added to `PROTECTED_PREFIXES` and the
+  fallback becomes a strict superset, both suites silently begin testing gc.sh
+  with a protect set production never uses, and nothing fails. Closing that
+  means changing the drift gate, which is outside task 3655's file set.
+
+#### Block Y: the seam is now pinned
+
+`run_sweep`'s header conceded that "NO assert in this file inspects the protect
+glob" — so the pin this whole investigation turns on was verified by nothing,
+and a silently-broken pin would have shown up only as the kind of wall-clock
+drift that started this. Block Y (task 3655) closes it, in counts and
+set-membership rather than seconds: `REIFY_WARM_LANE_IACT_PREFIX=_sentinelband-`
+rides alongside the existing pin, and since it can move the RENDERED band but
+cannot touch the static `$LANE_PROTECT_GLOB_FALLBACK`, `_iact-` staying
+protected while `_sentinelband-` does not is proof the render was
+short-circuited. Removing the pin flips those two asserts to red. Floor
+86 → 90.
 
 **α2 predicted these figures would "roughly double" under concurrent load. That
 prediction is wrong, and the correction is measured, not argued.** This machine
@@ -421,12 +549,20 @@ The `test_warm_lane_gc_sweep.sh` pair from the same session, for the record:
 `e1c04cf316`), **124.0s / 86 passed** at loadavg 212.09→189.41 after.
 
 **This pair was originally written off here as the same between-run variance
-that spoiled the sandwich above. That reading is RETRACTED (2026-08-05).**
-Unlike the sandwich legs, these two runs are at *comparable* load (~194 and
-~201 mean) and differ by 2.08x — and the 2026-08-05 quiet-window sitting
-reproduces the same 2.23x ratio at loadavg ~14. Between-run variance does not
-survive a 14x change in load; added work does. See the regression subsection
-above, which this pair is now the earliest evidence for.
+that spoiled the sandwich above. That reading was RETRACTED on 2026-08-05 — and
+then RE-INSTATED later the same day (task 3655), which is the reading that
+stands.** The retraction's argument was that these two runs are at *comparable*
+load (~194 and ~201 mean), differ by 2.08x, and that a 2026-08-05 quiet-window
+comparison reproduced 2.23x — so that between-run variance "does not survive a
+14x change in load". The flaw is that the quiet-window figure was not a
+controlled comparison: it was a 2026-07-30 number against a 2026-08-05 number,
+bracketing five days of host state. A **direct A/B between the same two
+commits**, alternating and same-sitting, puts the ratio at **0.93x**, and the
+execve counters put the two arms at the same work (see the regression
+subsection above). So this pair is NOT evidence of added work; whatever
+produced its 2.08x, it was not 3292's diff. It is left on the record because
+it is the measurement that misled, and knowing which measurements mislead is
+the point of this section.
 
 **The `test_warm_lane_gc.sh` re-measurement owed by task 3075 (re-attributed to
 3292) is DISCHARGED — measured 2026-08-05, 46.37s at 214 asserts, in the
