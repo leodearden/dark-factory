@@ -2539,34 +2539,27 @@ output never lands in a diff by accident.
 That cuts BOTH ways, and the second half is the one that bites: because the
 tree is ignored, a run here is preserved by nothing — not by merging, not by a
 clone, not by anything surviving ``git clean -xdf``. It lives on exactly one
-host until that host's disk is wiped. A run worth keeping must be copied to
-:data:`COMMITTED_EXEMPLAR_ROOT`, which is tracked. Task 3694 exists because
-that step was skipped for the first live run, leaving three PRD provenance
-citations pointing at a path their readers could not open.
+host until that host's disk is wiped. A run worth keeping must be copied OUT to
+a tracked path; ``plans/memory-eval-e1-first-live-run/`` is the frozen copy of
+the first live run and the precedent for where the next one goes (same
+``plans/`` home and same idiom as :data:`DEFAULT_CENSUS_PATH` below, this
+repo's existing convention for a committed real-measurement artifact). Task
+3694 exists because that copy-out step was skipped for the first live run,
+leaving three PRD provenance citations pointing at a path their readers could
+not open.
+
+Copy runs OUT; never un-ignore this tree to keep one IN. :func:`is_initial_run`
+globs ``metrics-*.json`` under here, so a committed artifact inside this root
+would make every fresh clone look like it had already run and would permanently
+burn the one-shot initial-state snapshot for the next genuine first run —
+destroying evidence rather than merely hiding it. That the frozen copy stays
+disjoint from this root is asserted in
+``tests/test_memory_eval_e1_first_live_run.py``, so it cannot be undone by a
+later tidy-up; read that directory's README before relocating it.
 """
 
 DEFAULT_CALIBRATION_PATH = _PACKAGE_ROOT / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
 DEFAULT_CENSUS_PATH = _REPO_ROOT / 'plans' / 'memory-metadata-census-report.json'
-
-COMMITTED_EXEMPLAR_ROOT = _REPO_ROOT / 'plans' / 'memory-eval-e1-first-live-run'
-"""Frozen provenance: the first live run of this probe, committed and tracked.
-
-A byte-for-byte copy of the ``20260805T093831Z`` run — the only one carrying
-the D1 initial-state snapshot — laid out as a real artifact root
-(``<root>/<eval_id>/metrics-<STAMP>.json``), so the shared path helpers
-resolve against it unchanged. Same ``plans/`` home and same idiom as
-:data:`DEFAULT_CENSUS_PATH` one line up, which is this repo's existing
-convention for a committed real-measurement artifact.
-
-Deliberately OUTSIDE :data:`DEFAULT_OUT_ROOT`, and that is not a filing
-preference. :func:`is_initial_run` globs ``metrics-*.json`` under the out-root,
-so an exemplar sitting there would make every fresh clone look like it had
-already run and would permanently burn the one-shot initial-state snapshot for
-the next genuine first run — destroying evidence rather than merely hiding it.
-The disjointness is asserted in
-``tests/test_memory_eval_e1_first_live_run.py`` so it cannot be undone by a
-later tidy-up. Read that directory's README before moving anything into it.
-"""
 
 
 def corpus_categories() -> tuple[str, ...]:

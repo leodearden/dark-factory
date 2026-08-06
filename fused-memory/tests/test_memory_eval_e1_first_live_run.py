@@ -39,6 +39,7 @@ deselects guards nothing.
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -65,6 +66,15 @@ REPORT_PATH = EXEMPLAR_ROOT / EVAL_ID / f'report-{RUN_STAMP}.txt'
 
 ARTIFACTS = (METRICS_PATH, REPORT_PATH)
 _IDS = [p.name for p in ARTIFACTS]
+
+# The report is pinned by digest, not by prose. Nothing regenerates it any more
+# (the run is explicitly unreproducible — see the directory README), so a
+# substring check could only catch an edit that happened to land on the exact
+# lines it names; a hand-edited metric value, failing item or routing count in
+# the body would sail past. These two numbers make ANY byte change go RED, and
+# are the .txt half's counterpart to the JSON's re-serialize guard.
+REPORT_SHA256 = 'f5101c6449f48f5d04609a70e0b70c367527538c8b87c526655f37c725f5381d'
+REPORT_SIZE_BYTES = 13849
 
 
 def _load_module() -> types.ModuleType:
@@ -99,16 +109,45 @@ def _mod() -> types.ModuleType:
     return _load_module()
 
 
+@functools.cache
+def _git_cannot_answer() -> str | None:
+    """Why the git checks below cannot be run here, or None if they can.
+
+    Two environments have to be told apart from a real defect, and only one of
+    them is a missing binary. The other is a source tree that is not a git
+    working copy at all — an exported tarball, an sdist, a ``docker COPY`` of
+    the sources without ``.git``. There ``ls-files --error-unmatch`` and
+    ``check-ignore`` both exit 128 ("fatal: not a git repository"), which the
+    assertions below would otherwise report as "the exemplar is NOT tracked by
+    git" and "check-ignore did not report it as unignored" — loudly naming a
+    durability defect that is not present. Skip both, for the same reason the
+    missing-binary case skips.
+    """
+    if shutil.which('git') is None:
+        return 'git is not available; cannot check tracked-ness'
+    probe = subprocess.run(
+        ['git', 'rev-parse', '--is-inside-work-tree'],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != 'true':
+        return 'not a git working tree; cannot check tracked-ness'
+    return None
+
+
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
-    """Run git at the repo root, or skip if git is unavailable.
+    """Run git at the repo root, or skip if git cannot answer here.
 
     ``check=False`` throughout: ``git check-ignore``'s exit code IS the
     answer being asserted on, so a non-zero exit must reach the test rather
-    than raise. Skipping (not failing) on a missing binary keeps this from
-    becoming an environment-dependent flake in a container without git.
+    than raise — which is exactly why the "git can't answer at all" cases have
+    to be excluded up front by :func:`_git_cannot_answer` instead.
     """
-    if shutil.which('git') is None:
-        pytest.skip('git is not available; cannot check tracked-ness')
+    reason = _git_cannot_answer()
+    if reason is not None:
+        pytest.skip(reason)
     return subprocess.run(
         ['git', *args],
         cwd=REPO_ROOT,
@@ -199,10 +238,26 @@ class TestTheExemplarIsAValidM1Artifact:
 class TestItIsTheFirstRunReport:
     """What makes this pair the evidence 3208 promised, not just any run."""
 
-    def test_the_report_names_the_same_run_as_the_metrics_beside_it(self):
-        header = REPORT_PATH.read_text(encoding='utf-8').splitlines()[:3]
-        assert f'memory-eval run: {EVAL_ID}' in header[0]
-        assert RUN_STAMP in header[1]
+    def test_the_report_bytes_are_pinned(self):
+        """The .txt half's anti-hand-edit guard, matching the JSON's.
+
+        A digest rather than a set of substring probes: the report cannot be
+        regenerated (the run needs a live Qdrant and an empty artifact root,
+        and neither is coming back), so there is nothing to reconcile it
+        against and every byte is evidence. Length is asserted alongside the
+        digest purely so a mismatch says *how* the file changed before it says
+        that it did.
+        """
+        raw = REPORT_PATH.read_bytes()
+        assert len(raw) == REPORT_SIZE_BYTES, (
+            f'{REPORT_PATH.relative_to(REPO_ROOT)} is {len(raw)} bytes, expected '
+            f'{REPORT_SIZE_BYTES} — this is frozen provenance, not a regenerable '
+            f'artifact; do not hand-edit it'
+        )
+        assert hashlib.sha256(raw).hexdigest() == REPORT_SHA256, (
+            f'{REPORT_PATH.relative_to(REPO_ROOT)} no longer matches the run the '
+            f'PRDs cite; its contents were edited rather than regenerated'
+        )
 
     def test_the_report_carries_the_d1_initial_state_section(self):
         """D1's one-shot snapshot is the whole reason this run is special.
@@ -228,18 +283,16 @@ class TestTheExemplarCannotBeMistakenForALiveRun:
     readers not to relocate the artifact cannot enforce anything.
     """
 
-    def test_the_probe_names_the_exemplar_root(self):
-        """The constant and the on-disk location cannot drift apart.
-
-        The test computes the path independently from ``Path(__file__)``; if
-        the probe's constant were edited to point elsewhere (or the directory
-        moved without it), the two would disagree here.
-        """
-        assert _mod().COMMITTED_EXEMPLAR_ROOT.resolve() == EXEMPLAR_ROOT.resolve()
-
     def test_the_exemplar_root_is_disjoint_from_the_live_artifact_root(self):
-        """Neither root may be, or contain, the other."""
-        exemplar = _mod().COMMITTED_EXEMPLAR_ROOT.resolve()
+        """Neither root may be, or contain, the other.
+
+        The exemplar side is computed here from ``Path(__file__)`` and the live
+        side is read from the probe, so this compares the artifact's real
+        location against the probe's real behaviour — the probe is deliberately
+        not given a constant naming the exemplar, which would only have made
+        this a check of one hardcoded string against another.
+        """
+        exemplar = EXEMPLAR_ROOT.resolve()
         live = _mod().DEFAULT_OUT_ROOT.resolve()
         assert exemplar != live
         assert not exemplar.is_relative_to(live), (
@@ -261,4 +314,4 @@ class TestTheExemplarCannotBeMistakenForALiveRun:
         """
         is_initial_run = _mod().is_initial_run
         assert is_initial_run(tmp_path) is True
-        assert is_initial_run(_mod().COMMITTED_EXEMPLAR_ROOT) is False
+        assert is_initial_run(EXEMPLAR_ROOT) is False

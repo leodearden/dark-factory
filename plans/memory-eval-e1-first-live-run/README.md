@@ -45,9 +45,12 @@ independently checkable after the fact, by someone who was not there.
 provenance: the probe already reads one from here
 (`DEFAULT_CENSUS_PATH = _REPO_ROOT / 'plans' / 'memory-metadata-census-report.json'`),
 alongside `plans/bug-hotspot-survey-2026-07-06-full-findings.json` and the
-confusion censuses. The probe points back at this directory as
-`COMMITTED_EXEMPLAR_ROOT`, one line away from `DEFAULT_CENSUS_PATH`, so the
-two provenance pointers read as one convention.
+confusion censuses. The probe's `DEFAULT_OUT_ROOT` docstring points back here
+for exactly that reason — as the worked example of where a run worth keeping
+gets copied OUT to, and the precedent for where the next one goes. (It names
+the directory in prose rather than as a module constant: the probe never reads
+these bytes, and a constant it never used would be dead weight in the runtime
+script.)
 
 ## It is frozen provenance — NOT a test fixture, NOT live data
 
@@ -60,9 +63,10 @@ move is a matter of taste:
    (`memory_eval_retrieval_probe.py`) globs `metrics-*.json` under exactly
    that tree, so a committed artifact there would make **every fresh clone
    look like it had already run** and would permanently burn the one-shot D1
-   initial-state snapshot for the next genuine first run. The probe's
-   `COMMITTED_EXEMPLAR_ROOT` is deliberately disjoint from `DEFAULT_OUT_ROOT`,
-   and that disjointness is asserted in the test module named above.
+   initial-state snapshot for the next genuine first run. This directory is
+   deliberately disjoint from the probe's `DEFAULT_OUT_ROOT`, and that
+   disjointness is asserted in the test module named above rather than left to
+   this paragraph — prose cannot enforce it.
 
 2. **Do NOT fold it into `shared/tests/fixtures/memory_eval/`.** That corpus is
    hand-authored *synthetic* exemplars whose pooled anchors are hard-coded
