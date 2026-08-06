@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
 import pytest
+from _dashboard_helpers import apply_isolated_env, live_aiosqlite_worker_threads
 from fastapi import FastAPI
 from shared.async_sqlite_base import CheckpointResult
 
@@ -417,3 +420,170 @@ async def test_metrics_loop_checkpoint_respects_interval_gate(tmp_path: Path):
         f'Expected checkpoint_count <= 1 with 3600s interval over 5 iterations, '
         f'got {checkpoint_count}. Interval gate not working correctly.'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 3466: a DbPool.get() cancelled mid-connect must not orphan a worker thread
+# ---------------------------------------------------------------------------
+
+# How long the patched connect holds a landed read-only connection before
+# handing it back to DbPool.get().  Only has to outlast the lifespan teardown
+# path (a few cancel/await hops), and must stay well INSIDE
+# dashboard.data.db._INFLIGHT_DRAIN_TIMEOUT so close_all()'s drain reaps it.
+_CONNECT_HOLD_SECONDS = 0.3
+
+
+def _create_metrics_loop_db_files(config: DashboardConfig) -> list[Path]:
+    """Materialise every database ``_metrics_loop`` read-only-opens via DbPool.
+
+    ``DbPool.get()`` short-circuits with ``return None`` when
+    ``resolved.exists()`` is False, so without real files on disk the connect
+    path is never reached and any leak assertion built on it passes VACUOUSLY.
+
+    Paths are derived from *config* rather than hardcoded so a moved property
+    stops covering the connect path LOUDLY (the ``landed`` event below never
+    fires → ``asyncio.wait_for`` TimeoutError) instead of silently.
+    """
+    paths = [
+        config.reconciliation_db,  # _metrics_loop._run_once, 1st pool.get
+        config.tickets_db,  # _metrics_loop._run_once, 2nd pool.get
+        config.project_root / 'data' / 'orchestrator' / 'runs.db',  # _project_scoped_dbs_labeled
+    ]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sqlite3.connect(str(path)).close()
+    return paths
+
+
+def _holding_readonly_connect(
+    landed: asyncio.Event, opened: list[aiosqlite.Connection]
+):
+    """Build an ``aiosqlite.connect`` replacement that stalls DbPool opens.
+
+    Delegates to the real connect FIRST — so the worker thread is provably
+    started and the ``Connection`` object provably exists — and only THEN
+    sleeps.  Sleeping *before* delegating would be a vacuous test: cancelling
+    during that sleep means no thread was ever created, so nothing could leak
+    and the guard would pass even on the broken tree.
+
+    Only read-only URI opens (``?mode=ro``, i.e. exactly the ``DbPool.get()``
+    opens) are stalled.  ``lifespan()``'s writable ``_BurndownStore`` /
+    ``_MetricsStore`` opens go through untouched; stalling those would delay
+    startup by the same window and the metrics loop would never reach a
+    ``pool.get()`` at all.
+
+    Every stalled connection is appended to *opened*, which the test then holds
+    for the duration.  That strong reference is LOAD-BEARING, not bookkeeping:
+    ``aiosqlite.Connection.__del__`` (>=0.22.x) calls ``stop()``, so CPython
+    refcounting would otherwise reap an abandoned connection the instant its
+    last frame unwinds and hide the leak.  Depending on that is exactly the
+    silent fail-soft this task removes — ``__del__`` announces itself only as a
+    ``ResourceWarning``, it is not guaranteed prompt (or to run at all) off
+    CPython, and when it fires *after* the loop has closed its ``stop()`` is
+    what produces the ``RuntimeError: Event loop is closed`` escape from
+    ``_connection_worker_thread`` that this whole task exists to eliminate.
+    The pool must close what it opened, deterministically, before shutdown
+    returns.
+    """
+    real_connect = aiosqlite.connect
+
+    async def wrapper(*args, **kwargs):
+        conn = await real_connect(*args, **kwargs)
+        if args and 'mode=ro' in str(args[0]):
+            opened.append(conn)
+            landed.set()
+            # Hold the connection hostage: DbPool.get() is now suspended
+            # inside `await aiosqlite.connect(...)` with a LIVE worker thread
+            # the pool has never seen.
+            await asyncio.sleep(_CONNECT_HOLD_SECONDS)
+        return conn
+
+    return wrapper
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_leaves_no_aiosqlite_worker_threads(
+    tmp_path: Path, monkeypatch
+):
+    """Cancelling ``_metrics_loop`` mid-``DbPool.get()`` must not leak a thread.
+
+    End-to-end reduction of the reported cross-file pytest ERROR (task 3466).
+    ``lifespan()`` cancels ``metrics_task`` at shutdown; when that task is
+    suspended inside ``await aiosqlite.connect(...)`` the ``Connection`` is
+    never returned to ``DbPool.get()``, so it never lands in ``_conns`` and
+    ``close_all()`` cannot see it.  ``aiosqlite.Connection._connect()`` catches
+    only ``Exception`` — never ``CancelledError`` — so it never calls
+    ``_stop_running()`` either.  The daemon worker thread is orphaned, and once
+    this loop closes its ``call_soon_threadsafe`` raises ``RuntimeError: Event
+    loop is closed`` OUT of ``_connection_worker_thread``, where pytest's
+    ``threadexception`` plugin attributes it to whatever test happens to be
+    running at that instant — hence "roaming target", "cross-file only",
+    "passes standalone".
+
+    Deterministic by construction: the patched connect signals ``landed`` only
+    after a real ``Connection`` (and therefore a real worker thread) exists,
+    and the test does not leave the lifespan block until that signal arrives.
+    """
+    apply_isolated_env(monkeypatch, tmp_path)
+    config = DashboardConfig.from_env()
+    assert config.project_root == tmp_path.resolve(), (
+        f'isolation failed: config.project_root={config.project_root} is not '
+        f'{tmp_path.resolve()} — this test would open ambient databases'
+    )
+    db_paths = _create_metrics_loop_db_files(config)
+
+    landed = asyncio.Event()
+    opened: list[aiosqlite.Connection] = []
+    baseline = set(live_aiosqlite_worker_threads())
+
+    local_app = FastAPI(lifespan=lifespan)
+    with (
+        patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+        patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
+        patch('aiosqlite.connect', _holding_readonly_connect(landed, opened)),
+    ):
+        async with lifespan(local_app):
+            # Do not tear down until a read-only connect has provably landed —
+            # otherwise there is no thread to leak and this test is vacuous.
+            await asyncio.wait_for(landed.wait(), timeout=5.0)
+        # Lifespan teardown has now cancelled _metrics_loop mid-connect and run
+        # close_all().  Give the held connect time to land and be reaped.
+        await asyncio.sleep(_CONNECT_HOLD_SECONDS + 0.5)
+
+    try:
+        # Non-vacuity: a read-only connect must actually have happened.
+        assert opened, (
+            f'no read-only DbPool connect was observed for '
+            f'{[str(p) for p in db_paths]} — the metrics loop never reached '
+            f'aiosqlite.connect, so this guard asserted nothing'
+        )
+
+        leaked = [t for t in live_aiosqlite_worker_threads() if t not in baseline]
+        assert not leaked, (
+            f'cancelled DbPool.get() orphaned {len(leaked)} aiosqlite worker '
+            f'thread(s): {[t.name for t in leaked]}. Each will raise '
+            f"'Event loop is closed' out of _connection_worker_thread once this "
+            f'loop closes, which pytest attributes to an unrelated test. DbPool '
+            f'must own every in-flight connect for: {[str(p) for p in db_paths]}'
+        )
+
+        # Deterministic counterpart to the thread check: the pool must have
+        # CLOSED each connection it caused to be opened, while the loop was
+        # still running.  Verified against aiosqlite >=0.22.x — see the
+        # identical private-attribute pin in test_db.py.
+        for conn in opened:
+            assert conn._running is False, (
+                f'DbPool left a mid-flight connection running ({conn!r}); '
+                f'close_all() returned without draining its in-flight connects'
+            )
+    finally:
+        # MUST run even when the assertions above fail.  DbPool opens via plain
+        # `aiosqlite.connect`, whose worker thread inherits daemon=False from
+        # the main thread — so a surviving orphan does not merely leak, it
+        # blocks interpreter exit and hangs the whole pytest process AFTER the
+        # report is written.  Reap them here so a RED run fails fast and
+        # legibly instead of wedging CI.
+        for conn in opened:
+            if getattr(conn, '_running', False):
+                with contextlib.suppress(Exception):
+                    await conn.close()
