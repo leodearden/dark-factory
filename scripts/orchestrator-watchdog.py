@@ -1833,9 +1833,23 @@ def _print_fused_memory_liveness() -> None:
         like report()'s DEPLOY-AGE column, or 'unknown' when the fm clock has
         never been stamped / is unreadable (fail-open);
       - recon-busy via _fused_memory_recon_busy_verdict() (fail-soft
-        'unknown').
-    No systemctl mutation, no clock write, no restart — the DEPLOY-AGE read
-    and the recon-busy /health fetch are both read-only.
+        'unknown');
+      - streak from _read_fm_liveness_streak(), rendered
+        "<count>/<FM_LIVENESS_STREAK_THRESHOLD>" or 'none' (task 3764) — this
+        is what lets an operator answer "why didn't the watchdog restart
+        fused-memory" without hand-reading JSON;
+      - LIVENESS-RESTART-AGE from _read_last_fm_liveness_restart_epoch(),
+        rendered hours-to-one-decimal like DEPLOY-AGE, or 'unknown' when the
+        watchdog has never revived fm — i.e. how much of the min-interval cap
+        window remains.
+    No systemctl mutation, no clock write, no restart — the DEPLOY-AGE read,
+    the recon-busy /health fetch, and both task-3764 reads are read-only. In
+    particular, printing the streak must never create, modify or clear it:
+    running --report would otherwise itself change whether fused-memory gets
+    killed on the next tick.
+
+    Each task-3764 field is wrapped independently, so a failure degrades only
+    its own value rather than costing the operator the whole row.
 
     Informational only: called from _cli's --report branch AFTER report()'s
     own staleness table, and never affects report()'s staleness-only exit
@@ -1861,9 +1875,28 @@ def _print_fused_memory_liveness() -> None:
         else "unknown"
     )
     recon_busy = _fused_memory_recon_busy_verdict()
+    try:
+        streak = _read_fm_liveness_streak()
+        streak_str = (
+            f"{streak[0]}/{FM_LIVENESS_STREAK_THRESHOLD}" if streak is not None else "none"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not read the {FUSED_MEMORY_UNIT} liveness streak for --report: {exc}")
+        streak_str = "unknown"
+    try:
+        restart_epoch = _read_last_fm_liveness_restart_epoch()
+        restart_age_str = (
+            f"{(time.time() - restart_epoch) / 3600:.1f}h"
+            if restart_epoch is not None
+            else "unknown"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not read the {FUSED_MEMORY_UNIT} liveness restart clock: {exc}")
+        restart_age_str = "unknown"
     print(
         f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): "
-        f"{verdict} | DEPLOY-AGE: {deploy_age_str} | recon-busy: {recon_busy}"
+        f"{verdict} | DEPLOY-AGE: {deploy_age_str} | recon-busy: {recon_busy} "
+        f"| streak: {streak_str} | LIVENESS-RESTART-AGE: {restart_age_str}"
     )
 
 
