@@ -689,50 +689,32 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 41,
+    """All /static/redux/*?v= cache-busters must share a single version >= 42,
     and graph_layout.js / prd_grouping.js / task_status_counts.js /
     runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
     must all be among the versioned assets.
 
-    Mirrors the existing single-shared-version guards in test_tab_escalations.py,
-    test_tab_scheduler.py, and test_scheduler_page.py. Floor provenance: 30
-    proved the uniform bump from 29 alongside task 2637's runtime_format.js
-    addition; 37 proved the bump for task 3332's `const API` collision fix
-    (esc_flow_layout.js / graph_layout.js renamed to ESC_FLOW_LAYOUT_API /
-    GRAPH_LAYOUT_API); 38 was task 3216's memory-evals floor; 39 proved the
-    bump for task 3436's null-sample fix; 40 was task 3516's split of the
-    merged "N active" pip; 41 proves the bump for task 3442's parity-badge
-    change.
+    This is the sole home of the UNIFORMITY check ("all versions are the
+    same"); every other module asserts only its own `min(versions) >= N`
+    floor, which needs no uniformity precondition to be sound (the OLDEST
+    asset is the one that would still serve stale code).
 
-    Each of those raises matter more than a usual bump, for the same reason:
-    an already-open browser holds a cached copy of the BROKEN file, so without
-    a new ?v= the fix never reaches it. For 3436 the cached charts.jsx?v=38
-    keeps drawing missing samples as measured zeros at the chart floor. For
-    3516 the cached tab_tasks.jsx?v=39 keeps rendering the single merged pip
-    — i.e. keeps showing operators the exact number that triggered the
-    2026-07-30 false alarm. For 3442 the cached tab_memory_evals.jsx?v=40
-    renders every `*_open` parity state as a plain badge with no sign that an
-    escalation is open, and — worse — renders `unknown_verdict` as the muted
-    'no verdict' badge, reporting a present-but-unreadable verdict as an
-    absent one.
+    The floor tracks the newest bump — currently 42, for task 3470's
+    tab_memory_evals.jsx and tab_escalations.jsx fixes. Raising it matters
+    more than a routine bump for the usual reason: an already-open browser
+    holds a cached copy of the BROKEN file, so without a new ?v= the fix
+    never reaches it.
     """
-    versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
     assert len(versions) == 1, (
         f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
         'bump all of them uniformly to the same value.'
     )
-    v = int(next(iter(versions)))
-    assert v >= 41, (
-        f'index.html cache-buster version is {v}, expected >= 41 (proves the '
-        "uniform bump for task 3442's parity-badge change actually reaches "
-        'already-open browsers, which otherwise keep the cached '
-        'tab_memory_evals.jsx?v=40: it shows no `escalation open` affordance '
-        'on any `*_open` state but recovered_open, and renders an '
-        "unrecognised verdict as the muted 'no verdict' badge — reporting a "
-        'verdict that IS present but unreadable as one that was never made; '
-        "the previous floors were 40 for task 3516's split of the merged \"N "
-        "active\" pip, 39 for task 3436's null-sample fix, 38 for task 3216's "
-        "memory-evals work and 37 for task 3332's `const API` collision fix)."
+    v = next(iter(versions))
+    assert v >= 42, (
+        f'index.html cache-buster version is {v}, expected >= 42 — the bump '
+        "that carries task 3470's tab_memory_evals.jsx and tab_escalations.jsx "
+        'fixes to already-open browsers.'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
@@ -746,10 +728,8 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'task_status_counts.js is not present among the versioned '
         '/static/redux/* assets in index.html — tab_tasks.jsx destructures '
         'window.DF_TASK_STATUS_COUNTS at top level with no fallback, so a '
-        'missing tag blanks the Tasks tab, and an unversioned one would both '
-        'miss an already-open browser (still holding the tab_tasks.jsx that '
-        'renders the merged pip) and break the single-shared-version invariant '
-        'this test and five other modules assert.'
+        'missing tag blanks the Tasks tab; a tag added without a cache-buster '
+        'misses already-open browsers. Bump all /static/redux/* ?v= uniformly.'
     )
     assert re.search(r'/static/redux/runtime_format\.js\?v=\d+', index_html_body), (
         'runtime_format.js is not present among the versioned /static/redux/* '
@@ -757,23 +737,18 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     )
     assert re.search(r'/static/redux/orch_filter\.js\?v=\d+', index_html_body), (
         'orch_filter.js is not present among the versioned /static/redux/* '
-        'assets in index.html — a tag added without a cache-buster would both '
-        'miss an already-open browser and break the single-shared-version '
-        'invariant this test and four other modules assert.'
+        'assets in index.html — a tag added without a cache-buster misses '
+        'already-open browsers; bump all /static/redux/* ?v= uniformly.'
     )
     assert re.search(r'/static/redux/esc_flow_layout\.js\?v=\d+', index_html_body), (
         'esc_flow_layout.js is not present among the versioned /static/redux/* '
-        'assets in index.html — this test enumerated four of the six classic '
-        'scripts and omitted this one, the very file task 3332 fixes, so an '
-        'unversioned tag here would both miss an already-open browser (still '
-        'holding the copy that dies on load) and break the single-shared-version '
-        'invariant unnoticed.'
+        'assets in index.html — a tag added without a cache-buster misses '
+        'already-open browsers; bump all /static/redux/* ?v= uniformly.'
     )
     assert re.search(r'/static/redux/spark_path\.js\?v=\d+', index_html_body), (
         'spark_path.js is not present among the versioned /static/redux/* '
         'assets in index.html — charts.jsx destructures window.DF_SPARK_PATH at '
-        'top level with no fallback, so a missing tag blanks nearly every tab, '
-        'and an unversioned one would both miss an already-open browser and '
-        'break the single-shared-version invariant this test and four other '
-        'modules assert.'
+        'top level with no fallback, so a missing tag blanks nearly every tab; '
+        'a tag added without a cache-buster misses already-open browsers. Bump '
+        'all /static/redux/* ?v= uniformly.'
     )
