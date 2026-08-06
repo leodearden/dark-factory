@@ -6712,3 +6712,159 @@ def test_record_fm_liveness_failure_persists_across_module_instances(
         "counter would restart at 1 here"
     )
     assert json.loads(streak_path.read_text())["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Part D: fm-liveness restart clock trio (task 3764)
+#
+# Line-for-line siblings of the Part C fm deploy-clock trio above, reading the
+# liveness cap's OWN clock file against its OWN interval. The separation tests
+# at the bottom are the I5 guard: a liveness revive must not silence the fm
+# staleness backstop, and a scheduled deploy must not license an extra kill.
+# ---------------------------------------------------------------------------
+
+
+def test_stamp_and_read_fm_liveness_restart_clock_roundtrip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_stamp_fm_liveness_restart_clock writes {ts,iso} (creating the parent dir)
+    that _read_last_fm_liveness_restart_epoch reads back as float(ts)."""
+    wdog = _load_watchdog()
+    clock_file = (
+        tmp_path / "data" / "fused-memory" / "last_liveness_restart_fused_memory.json"
+    )
+    assert not clock_file.parent.exists()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.5)
+
+    wdog._stamp_fm_liveness_restart_clock()
+
+    assert clock_file.exists(), "stamp must create the clock file and its parent dir"
+    body = json.loads(clock_file.read_text())
+    assert "ts" in body and "iso" in body, f"clock body must carry ts+iso: {body}"
+    assert wdog._read_last_fm_liveness_restart_epoch() == pytest.approx(1783000000.0)
+    assert isinstance(wdog._read_last_fm_liveness_restart_epoch(), float)
+
+
+def test_read_last_fm_liveness_restart_epoch_missing_file_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A never-stamped liveness restart clock reads as None (fail-open)."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "absent.json")
+    )
+    assert wdog._read_last_fm_liveness_restart_epoch() is None
+
+
+def test_read_last_fm_liveness_restart_epoch_corrupt_json_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A truncated/corrupt liveness restart clock reads as None (fail-open)."""
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "corrupt.json"
+    clock_file.write_text('{"ts": 178300')  # truncated / partially written
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(clock_file))
+    assert wdog._read_last_fm_liveness_restart_epoch() is None
+
+
+def test_within_fm_liveness_restart_min_interval_true_when_recent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """True while now - last < FM_LIVENESS_RESTART_MIN_INTERVAL_SECS."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)
+
+    assert wdog._within_fm_liveness_restart_min_interval() is True
+
+
+def test_within_fm_liveness_restart_min_interval_false_when_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False once FM_LIVENESS_RESTART_MIN_INTERVAL_SECS has elapsed."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 3600.0 + 1.0)
+
+    assert wdog._within_fm_liveness_restart_min_interval() is False
+
+
+def test_within_fm_liveness_restart_min_interval_false_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FM_LIVENESS_RESTART_MIN_INTERVAL_SECS<=0 disables the cap outright.
+
+    The clock file must not even be READ — mirroring
+    test_within_fm_deploy_min_interval_false_when_disabled.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fm_liveness_restart_epoch",
+        lambda: pytest.fail("must not be consulted when the cap is disabled"),
+    )
+
+    assert wdog._within_fm_liveness_restart_min_interval() is False
+
+
+def test_within_fm_liveness_restart_min_interval_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent/unreadable clock means "outside the window" — never silence.
+
+    Failing the other way would let one unreadable file suppress every future
+    liveness revive indefinitely, which is a worse failure than an extra
+    restart the streak has already justified.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: None)
+
+    assert wdog._within_fm_liveness_restart_min_interval() is False
+
+
+def test_stamp_fm_liveness_restart_clock_does_not_touch_fm_deploy_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """I5: stamping the liveness clock must leave the fm DEPLOY clock untouched.
+
+    Sharing one file would mean a liveness revive silences the fm staleness
+    backstop for 8h — a merged fm change sitting undeployed because the
+    watchdog once revived a wedge.
+    """
+    wdog = _load_watchdog()
+    liveness_clock = tmp_path / "liveness.json"
+    deploy_clock = tmp_path / "deploy.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(liveness_clock))
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(deploy_clock))
+
+    wdog._stamp_fm_liveness_restart_clock()
+
+    assert liveness_clock.exists()
+    assert not deploy_clock.exists(), (
+        "a liveness revive must not advance fm's deploy clock (I5)"
+    )
+    assert wdog._read_last_fm_deploy_epoch() is None
+
+
+def test_stamp_fm_deploy_clock_does_not_touch_liveness_restart_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """I5, the other direction: a scheduled deploy must not arm/reset the liveness cap."""
+    wdog = _load_watchdog()
+    liveness_clock = tmp_path / "liveness.json"
+    deploy_clock = tmp_path / "deploy.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(liveness_clock))
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(deploy_clock))
+
+    wdog._stamp_fm_deploy_clock()
+
+    assert deploy_clock.exists()
+    assert not liveness_clock.exists(), (
+        "a scheduled fm deploy must not touch the liveness restart clock (I5)"
+    )
+    assert wdog._read_last_fm_liveness_restart_epoch() is None
