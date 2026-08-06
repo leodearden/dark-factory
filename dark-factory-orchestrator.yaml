@@ -338,6 +338,19 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # Both states were measured green, and the built-in set is a strict SUBSET of
 # {E,F,UP,B,SIM,I}, so 3457 landing cannot retroactively red-wall main.
 #
+# RE-CONFIRMED at base main 5078f6df15, which is 28 commits AHEAD of the
+# 7c6039327d the numbers above were first taken at, and skills/ was NOT
+# untouched in between (5 .md files changed: _shared/ticket-failure-handling.md,
+# escalation-watcher/SKILL.md, orchestrate/SKILL.md, review/references/
+# phase3-triage.md, unblock/SKILL.md). Both ruff forms re-run verbatim at the
+# handed-off base: `All checks passed!`, exit 0, ZERO findings, unchanged. The
+# original sha is kept rather than overwritten — rewriting it would falsely
+# claim the first observation was taken at the later base — but a stale base
+# behind an unqualified number is exactly the rot this block's own
+# FIXED-not-excluded discipline exists to prevent, so the re-measurement is
+# recorded rather than assumed. No .py under skills/ was added or changed
+# between the two bases, which is why the finding set could not move.
+#
 # RESIDUAL GAPS, stated plainly rather than left invisible — the decision is
 # "leave as-is", which makes it especially easy to read as "nothing is wrong":
 #   * skills/factory-init/scripts/find_escalation_port.py, the only tracked .py
@@ -364,9 +377,20 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # test_no_skills_prefixed_module_config_is_registered (the decision itself),
 # test_skills_has_no_tests_of_its_own (the revisit trigger),
 # test_skills_py_ruff_probe_is_collected_by_a_registered_module_config_test_command
-# (the deciding fact: the gate stays inside run_full_verification's gather) and
+# (the deciding fact, PATH half: some module config still collects the probe),
+# test_skills_py_ruff_probe_still_globs_skills_at_runtime (the deciding fact,
+# RUNTIME half: the probe still points ruff AT skills/ — narrowing
+# _guarded_py_files to REPO_ROOT.glob('*.py') deletes the gate with the PATH
+# half staying green, MEASURED as `1 failed, 5 passed`),
 # test_every_skills_consuming_test_stays_under_a_gated_directory (CORRECTION 1's
-# inventory stays real and stays covered). A documented-but-ungated invariant
+# inventory stays real and stays covered) and
+# test_no_unlisted_skills_mentioning_test_escapes_triage (the OPPOSITE drift: a
+# NEW skills/ consumer that never reaches the inventory, which would leave the
+# enumeration above silently under-describing the real set and weaken
+# CORRECTION 1's own cost argument). The last two are why the enumeration above
+# and that file's SKILLS_CONSUMING_TESTS tuple must be edited TOGETHER: each is
+# gated against drifting from the tree, neither against drifting from the
+# other. A documented-but-ungated invariant
 # is the same defect class this block's predecessor demonstrated: it was pure
 # prose, and was already carrying two falsified claims when re-measured.
 # Production code is cited BY SYMBOL throughout and never by file:line —

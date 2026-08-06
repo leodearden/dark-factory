@@ -72,6 +72,15 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # the carrier — scripts/orchestrator.yaml's test_command collects tests/scripts/
 # too, and task 3383's pending dedupe-by-command fix will legitimately change
 # that arrangement — only that SOME registered module config still carries it.
+#
+# That is only HALF the gate, and the other half is not this config's to keep:
+# collecting the probe's PATH is worthless if the probe stops globbing skills/.
+# test_skills_py_ruff_probe_still_globs_skills_at_runtime pins that half by
+# CALLING _guarded_py_files and inspecting its result. MEASURED at base main
+# 7c6039327d: narrowing that function to REPO_ROOT.glob('*.py') deletes the
+# skills/ lint gate outright while the path-level assertion above stays green
+# (`1 failed, 5 passed`). So an edit here can only break the half named above —
+# do not read a green run of that one test as the gate being intact.
 
 # KNOWN COST, recorded rather than left invisible (task 3350 amendment;
 # restated by task 3460, which falsified this block's original premise).

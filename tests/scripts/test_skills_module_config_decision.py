@@ -24,10 +24,52 @@ failure text observed against a named scratch mutation, following
 ``test_root_lint_covers_nonmember_py.py``'s "MEASURED RED at base main
 ``1f83dbed15``" precedent. The scratch artifacts are reverted before commit.
 
+RE-CONFIRMED at base main ``5078f6df15``, 28 commits ahead of the
+``7c6039327d`` every MEASURED RED below cites. Four of them were re-run against
+freshly recreated scratch mutations at the handed-off base — the direct-child
+``skills/test_probe.py`` trigger, the ``_guarded_py_files`` narrowing (still
+``1 failed, 5 passed``, the path-level sibling still green), the untriaged new
+consumer, and the ``-k some_expr`` phantom-target parse (still ``OLD
+['tests/scripts/', 'some_expr']`` vs ``NEW ['tests/scripts']``) — and every
+failure text reproduced VERBATIM. The original shas are kept rather than
+overwritten: rewriting them would claim a first observation that was not taken
+at that base.
+
 MUST NOT SKIP. No ``pytest.importorskip`` and no try/except-and-skip anywhere:
-a missing ``git`` or an unimportable ``orchestrator.config`` must FAIL this
-guard, not silently pass it. A guard against a vacuous gate that can itself go
-vacuous is worthless.
+a missing ``git``, an unimportable ``orchestrator.config`` or an unimportable
+``test_root_lint_covers_nonmember_py`` must FAIL this guard, not silently pass
+it. A guard against a vacuous gate that can itself go vacuous is worthless.
+
+DUPLICATED COMMAND-PARSING HELPERS, KNOWINGLY. ``_pytest_segment`` /
+``_pytest_collected_dirs`` / ``_is_collected`` are a THIRD hand-maintained
+copy of a trio that also exists as ``_ruff_segment`` / ``_ruff_targets`` /
+``_is_covered`` in ``test_root_lint_covers_nonmember_py.py`` and ``_segment``
+/ ``_pytest_targets`` in ``test_scripts_module_config.py``. This file's first
+draft justified that with "``tests/scripts/`` modules are not an importable
+package" — which is FALSE, and is corrected here rather than deleted (the
+house convention this file's own DECIDED block follows). ``conftest.py`` in
+this directory puts it on ``sys.path`` precisely so siblings import;
+``systemd_unit_invariants.py`` is that pattern in production, lifted by task
+3408 with the explicit rationale that duplicating a shared invariant "is how
+the two copies drift until one silently stops catching the defect". The
+copies HAVE already drifted: ``_is_covered`` normalises trailing slashes with
+``rstrip('/')``, ``_is_collected`` with ``posixpath.normpath``.
+
+The extraction into a shared ``verify_command_invariants.py`` is therefore
+correct and is NOT done here only because it requires editing the two sibling
+guards, which are outside this task's locks. Filed as
+[tkt_0RS47G1QXJ5XDPH4T0HKKA1A9S] — a curator TICKET id, not a task id: the
+curator runs asynchronously and decides create/combine/drop, so the resulting
+task number is not knowable at this commit (the DECIDED block's own convention
+for its two residual-gap follow-ups). That ticket carries the four behaviours
+the unified helper must not regress, since ``_pytest_collected_dirs`` is
+strictly richer than either sibling: ``--directory`` base resolution,
+``_PYTEST_VALUE_FLAGS`` consumption, the target-EXISTS assertion, and the
+``None``-not-assert contract for a non-pytest command. What
+IS done here: the false rationale is corrected, the drift is named, and the
+one cross-module dependency this file genuinely needs — the skills/ ruff
+probe's runtime target list — is taken by IMPORT rather than by re-derivation,
+demonstrating in-place that the sibling-import mechanism works.
 
 Production code is cited BY SYMBOL, deliberately never by file:line — task
 3445's explicit correction of the convention task 3350 established, after
@@ -48,6 +90,15 @@ import subprocess
 
 from orchestrator import verify_cmd
 from orchestrator.config import _discover_module_configs
+
+# The skills/ ruff probe itself, imported so the DECIDING FACT can be asserted
+# against its RUNTIME target list rather than only against its path. Resolves
+# because tests/scripts/conftest.py puts this directory on sys.path (pytest's
+# --import-mode=importlib deliberately does not) — the same mechanism
+# test_dashboard_service_template.py and test_systemd_restart_backoff.py use
+# for systemd_unit_invariants. A bare `import`, never an importorskip: if the
+# probe stops importing, this guard must fail loudly.
+import test_root_lint_covers_nonmember_py as skills_ruff_probe
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -102,6 +153,57 @@ SKILLS_CONSUMING_TESTS = (
     "scripts/tests/test_legibility_inventory.py",
 )
 
+# The literal token whose presence in a test file makes it a CANDIDATE consumer.
+_SKILLS_TOKEN = "skills/"
+
+# Tracked test files that contain the literal ``skills/`` but do NOT read or
+# execute any real path under the repo's skills/ tree. Every entry carries the
+# reason it is not a consumer, because a bare list of paths would be
+# indistinguishable from an unexamined suppression list.
+#
+# THIS SET EXISTS SO A NEW CONSUMER CANNOT ARRIVE SILENTLY. The inventory above
+# is hand-maintained, which catches a consumer that MOVES or DIES but is blind
+# to one that is ADDED. Requiring every ``skills/``-mentioning test to sit in
+# exactly one of the two sets turns "someone wrote a new test that reads
+# skills/" from invisible drift into a failure whose fix is a one-line triage
+# decision: real consumer -> inventory, prose/synthetic -> here, with a reason.
+_SKILLS_MENTION_NON_CONSUMERS = {
+    # Builds '/repo/skills/spawn/spawn-claude.sh' as a FAKE argv string against
+    # a synthetic repo root; never touches this repo's tree.
+    "cockpit/tests/test_app.py": "synthetic /repo/... argv string",
+    "cockpit/tests/test_spawn_bar.py": "synthetic /repo/... argv string",
+    # Writes a tmp_path 'skills/foo.md' FIXTURE to exercise the docs-only
+    # verify-scope branches. The path is fabricated under tmp_path.
+    "orchestrator/tests/test_verify.py": "tmp_path 'skills/foo.md' fixture",
+    "orchestrator/tests/test_verify_scope_inversion_boundary.py": (
+        "tmp_path 'skills/foo.md' fixture"
+    ),
+    "orchestrator/tests/test_verify_scope_kappa.py": (
+        "tmp_path 'skills/foo.md' fixture"
+    ),
+    "orchestrator/tests/test_verify_scope_lambda.py": (
+        "tmp_path 'skills/foo.md' fixture"
+    ),
+    # Mentions a skill directory or file only in PROSE — a docstring or a
+    # comment naming where a behaviour is documented. No filesystem access.
+    "escalation/tests/test_watcher_rearm.py": "prose docstring mention",
+    "fused-memory/tests/test_config_schema.py": "prose docstring mention",
+    "orchestrator/tests/test_harness_deterministic_recon_sweep.py": (
+        "prose comment mention"
+    ),
+    "scripts/tests/test_legibility_sampling.py": "prose comment mention",
+    "scripts/tests/test_legibility_transcript_persistence.py": (
+        "prose comment mention"
+    ),
+    # This guard. It reaches skills/ only THROUGH the probe module it gates
+    # (skills_ruff_probe._guarded_py_files), and passes skills/ pathspecs to
+    # git — it is not independent evidence of consumer coverage, so listing it
+    # in the inventory would make CORRECTION 1's cost argument self-referential.
+    "tests/scripts/test_skills_module_config_decision.py": (
+        "this guard; reaches skills/ only via the probe it gates"
+    ),
+}
+
 
 def _git_ls_files(*pathspecs: str) -> list[str]:
     """Tracked paths matching *pathspecs*, via real ``git ls-files``.
@@ -113,6 +215,23 @@ def _git_ls_files(*pathspecs: str) -> list[str]:
     match ``skills/foo/bar/test_probe.py``. Intent-to-add (``git add -N``)
     entries ARE listed, which is what lets the scratch mutations below be
     observed without committing them.
+
+    THE ASYMMETRY EVERY CALLER MUST HANDLE. ``skills/**/<x>`` does NOT match a
+    DIRECT child ``skills/<x>``: git's non-pathname wildmatch requires at
+    least one more ``/`` after ``skills/``. Measured in that same throwaway
+    repo, with all six paths ``git add -N``'d::
+
+        $ git ls-files -- 'skills/**/tests/**' 'skills/**/test_*.py' \
+              'skills/**/*_test.py'
+        skills/foo/bar_test.py
+        skills/foo/test_d.py
+        skills/foo/tests/test_c.py
+        skills/tests/test_a.py
+
+    ``skills/test_b.py`` and ``skills/tests/conftest.py`` are BOTH absent.
+    Adding the direct-child spellings (``skills/tests/**``, ``skills/test_*.py``,
+    ``skills/*_test.py``) returns all six. Every caller here therefore passes
+    both the nested and the direct-child spelling of each pattern.
 
     No try/except-and-skip: a missing or broken ``git`` must fail the caller.
     """
@@ -127,6 +246,47 @@ def _git_ls_files(*pathspecs: str) -> list[str]:
         f"pass vacuously; stderr: {proc.stderr.strip()!r}"
     )
     return [line for line in proc.stdout.splitlines() if line]
+
+
+def _git_grep_files(token: str, *pathspecs: str) -> list[str]:
+    """Tracked paths matching *pathspecs* that contain the LITERAL *token*.
+
+    ``-F`` so the token is a fixed string, not a regex — ``skills/`` has no
+    metacharacters today, but a future token with a ``.`` in it must not
+    quietly widen the sweep.
+
+    No try/except-and-skip, same contract as ``_git_ls_files``: exit status 0
+    means matches, 1 means none, anything else is a broken git and must FAIL
+    the caller rather than be read as "no matches".
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "grep", "-l", "-F", "--", token, *pathspecs],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode in (0, 1), (
+        f"`git grep -l -F -- {token!r} {' '.join(pathspecs)}` exited "
+        f"{proc.returncode} (task 3554) — expected 0 (matches) or 1 (none). A "
+        f"broken git must fail this guard rather than read as 'no matches'; "
+        f"stderr: {proc.stderr.strip()!r}"
+    )
+    return [line for line in proc.stdout.splitlines() if line]
+
+
+def _looks_like_a_test_module(rel_path: str) -> bool:
+    """``test_*.py`` / ``*_test.py`` by BASENAME, whatever directory it sits in.
+
+    The pathspec sweep that feeds this is deliberately over-broad
+    (``*test_*.py`` matches ``pytest_markers.py`` and
+    ``cleanup_test_collections.py``), because narrowing it at the git level
+    reintroduces the very wildmatch asymmetry ``_git_ls_files`` documents:
+    MEASURED at this base, ``git ls-files -- '*/tests/**/test_*.py'`` does NOT
+    match ``orchestrator/tests/test_skill_prompt.py``, since ``**`` needs one
+    more ``/`` after ``/tests/``. Sweeping wide and filtering by basename in
+    Python has no such edge.
+    """
+    name = pathlib.PurePosixPath(rel_path).name
+    return name.startswith("test_") or name.endswith("_test.py")
 
 
 def test_no_skills_prefixed_module_config_is_registered() -> None:
@@ -226,6 +386,16 @@ def test_skills_has_no_tests_of_its_own() -> None:
     first time, and the decision must be RE-TAKEN rather than inherited. This
     test failing is not a defect to route around — it is the trigger firing.
 
+    SIX PATHSPECS, NOT THREE. Each pattern is passed in both its nested
+    (``skills/**/...``) and its DIRECT-CHILD (``skills/...``) spelling, because
+    git's non-pathname wildmatch will not match a direct child through ``**``
+    — measured, with the raw output, in ``_git_ls_files``. Without the
+    direct-child half, a suite landing at ``skills/tests/`` with only a
+    ``conftest.py`` plus non-``test_``-prefixed modules, or a bare
+    ``skills/test_probe.py``, would leave this trigger silently unfired. This
+    mirrors what the module-config sweep above already does by passing both
+    ``skills/**/orchestrator.yaml`` and ``skills/orchestrator.yaml``.
+
     MEASURED RED at base main ``7c6039327d``, against an uncommitted scratch
     ``skills/_scratch/test_probe.py``, ``git add -N``'d::
 
@@ -233,9 +403,23 @@ def test_skills_has_no_tests_of_its_own() -> None:
         ['skills/_scratch/test_probe.py']. This is the REVISIT TRIGGER for the
         `DECIDED — skills/orchestrator.yaml` block in
         dark-factory-orchestrator.yaml, not a test to edit away.
+
+    RE-MEASURED RED for the direct-child half, against an uncommitted scratch
+    ``skills/test_probe.py`` (which the original three pathspecs did NOT
+    catch), ``git add -N``'d::
+
+        AssertionError: skills/ now has tests of its own (task 3554):
+        ['skills/test_probe.py']. This is the REVISIT TRIGGER for the
+        `DECIDED — skills/orchestrator.yaml` block in
+        dark-factory-orchestrator.yaml, not a test to edit away.
     """
     own_tests = _git_ls_files(
-        "skills/**/tests/**", "skills/**/test_*.py", "skills/**/*_test.py"
+        "skills/**/tests/**",
+        "skills/**/test_*.py",
+        "skills/**/*_test.py",
+        "skills/tests/**",
+        "skills/test_*.py",
+        "skills/*_test.py",
     )
 
     assert not own_tests, (
@@ -254,35 +438,75 @@ def test_skills_has_no_tests_of_its_own() -> None:
     )
 
 
-def _pytest_segment(cmd: str) -> str:
-    """The ``&&``-chained segment of *cmd* that actually invokes ``pytest``.
+def _pytest_segment(cmd: str) -> str | None:
+    """The ``&&``-chained segment of *cmd* that invokes ``pytest``, or ``None``.
 
     Uses the production splitter ``verify_cmd.split_top_level_and``
-    (quote-aware) rather than a naive ``str.split('&&')`` — DUPLICATED, with
-    this pointer comment, from ``_ruff_segment`` in
-    ``test_root_lint_covers_nonmember_py.py`` and ``_segment`` in
-    ``test_scripts_module_config.py``. That is the established convention here
-    rather than an oversight: ``tests/scripts/`` modules are not an importable
-    package, so these guards duplicate the helper and name their siblings.
+    (quote-aware) rather than a naive ``str.split('&&')`` — see the module
+    docstring's DUPLICATED COMMAND-PARSING HELPERS note for why this is a
+    third copy and why the extraction is a follow-up rather than a defect
+    left unnamed.
 
     Splitting matters for real commands in this repo, not hypothetically: the
     repo-root fleet ``test_command`` is a seven-segment ``&&`` chain of
     ``cd <dir> && uv run pytest ...`` clauses, so tokenising the whole string
     would read ``cd``, ``&&`` and directory names as pytest targets.
+
+    RETURNS ``None`` RATHER THAN ASSERTING. A module whose ``test_command``
+    runs something other than pytest contributes no pytest targets — that is
+    the correct semantic, not an error. Asserting here would make the first
+    module to declare ``cargo test`` fail BOTH ratchets in this file with a
+    message naming an unrelated module and saying nothing about ``skills/``,
+    which invites suppressing the guard instead of fixing anything. That
+    module is not hypothetical policy: ``verify._has_source_files`` already
+    keys on ``.py`` AND ``.rs``, and ``tests/scripts/orchestrator.yaml``
+    documents a ``config.test_command != 'pytest'`` branch.
+
+    Matched on the BARE ``pytest`` TOKEN after ``shlex.split``, not on a
+    substring: a segment mentioning ``pytest-timeout`` or a
+    ``--rootdir=/x/pytest`` value is not a pytest invocation.
+
+    MEASURED at base main ``7c6039327d``, against an uncommitted scratch
+    ``sampler/orchestrator.yaml`` whose ``test_command`` was replaced with
+    ``cargo test --workspace``. The PREVIOUS asserting form produced::
+
+        AssertionError: no `pytest` segment in 'cargo test --workspace'
+        (task 3554), so its collected targets cannot be located
+
+    — a message naming ``sampler`` and saying nothing about ``skills/``, from
+    BOTH ratchets in this file. With this form the same scratch leaves the
+    module GREEN (``6 passed``): ``sampler`` contributes no pytest targets,
+    which is the truth, and the ``skills/`` invariants are unaffected because
+    no ``skills/`` consumer lives under ``sampler/``.
     """
-    segments = verify_cmd.split_top_level_and(cmd)
-    matching = [s for s in segments if _PYTEST in s]
-    assert matching, (
-        f"no `{_PYTEST}` segment in {cmd!r} (task 3554), so its collected "
-        f"targets cannot be located"
-    )
-    return matching[0]
+    for segment in verify_cmd.split_top_level_and(cmd):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:  # unbalanced quotes in a segment — not parseable
+            continue
+        if _PYTEST in tokens:
+            return segment
+    return None
+
+
+# pytest flags whose VALUE is a SEPARATE token. Only the space-separated form
+# needs listing: the ``=`` form (``--timeout=300``) is already dropped whole by
+# the ``-``-prefix filter. Without this, ``-k some_expr`` and ``--timeout 300``
+# donate ``some_expr`` and ``300`` to the target list as phantom paths — and a
+# phantom target can only ever satisfy ``_is_collected`` spuriously, never
+# break it, so the failure direction is the SILENT one (a false PASS).
+_PYTEST_VALUE_FLAGS = frozenset({
+    "-c", "-k", "-m", "-n", "-o", "-p", "-r", "-W",
+    "--basetemp", "--color", "--deselect", "--dist", "--durations",
+    "--ignore", "--ignore-glob", "--import-mode", "--junitxml",
+    "--log-level", "--maxfail", "--rootdir", "--tb", "--timeout",
+})
 
 
 def _pytest_collected_dirs(cmd: str) -> list[str]:
-    """Repo-relative paths *cmd*'s pytest segment collects.
+    """Repo-relative paths *cmd*'s pytest segment collects; ``[]`` if not pytest.
 
-    Two things this must get right, both MEASURED against the real configs at
+    Three things this must get right, all MEASURED against the real configs at
     base main ``7c6039327d`` rather than assumed:
 
     1. ``--directory``. Most module ``test_command``s are
@@ -292,18 +516,60 @@ def _pytest_collected_dirs(cmd: str) -> list[str]:
        repo-root ``tests/`` that no consumer test lives under, silently
        breaking the coverage assertions. Both ``--directory X`` and
        ``--directory=X`` spellings are handled.
-    2. Positional targets only, never flag values. Anchoring at the ``pytest``
-       token drops the ``--project shared`` argument (it precedes ``pytest``),
-       and the ``-``-prefix filter drops ``--tb=short``, ``-q`` and
-       ``--timeout=300``. Exact TOKEN extraction, never a substring test:
-       ``pytest tests/scripts/ --ignore=scripts/tests/`` and
-       ``pytest scripts/tests/test_x.py`` both satisfy a naive
-       ``'scripts/tests/' in cmd`` while collecting something else — the first
-       collects the exact opposite of what the substring appears to prove
-       (``_pytest_targets``' documented contract in
-       ``test_scripts_module_config.py``).
+    2. Positional targets, with VALUE-TAKING FLAGS CONSUMED. Anchoring at the
+       ``pytest`` token drops the ``--project shared`` argument (it precedes
+       ``pytest``), and the ``-``-prefix filter drops ``--tb=short``, ``-q``
+       and ``--timeout=300``. What the ``-``-prefix filter does NOT drop is a
+       space-separated flag VALUE, so ``_PYTEST_VALUE_FLAGS`` is consulted and
+       the following token skipped. Note ``--ignore``/``--ignore-glob`` are in
+       that set for a second reason beyond parsing: an ignored path is
+       precisely NOT collected, so admitting its value as a target would
+       invert the meaning.
+
+       WHAT THIS GUARANTEES, stated no more strongly than it holds: every
+       token returned was a positional argument to ``pytest`` and survived
+       assertion (3). It is NOT a proof that no unlisted value-taking flag
+       exists — an unknown one would still donate its value, which is exactly
+       why (3) is an assertion and not a filter.
+    3. EVERY EXTRACTED TARGET EXISTS. Asserted, not filtered. A phantom target
+       ('300', 'some_expr') can only ever make ``_is_collected`` pass
+       spuriously, so silently discarding unresolvable tokens would preserve
+       the false-pass hazard the parsing above closes. Failing instead turns
+       both a mis-parse and a genuinely stale target in a module config into a
+       loud, named failure. ``::`` node-id suffixes are stripped before the
+       check, since ``tests/test_x.py::TestC::test_y`` is a legal target whose
+       full spelling is not a path.
+
+    Exact TOKEN extraction throughout, never a substring test:
+    ``pytest tests/scripts/ --ignore=scripts/tests/`` and
+    ``pytest scripts/tests/test_x.py`` both satisfy a naive
+    ``'scripts/tests/' in cmd`` while collecting something else — the first
+    collects the exact opposite of what the substring appears to prove
+    (``_pytest_targets``' documented contract in
+    ``test_scripts_module_config.py``).
+
+    BOTH HAZARDS MEASURED at base main ``7c6039327d``, against uncommitted
+    scratch edits to ``tests/scripts/orchestrator.yaml``. Inserting
+    ``-k some_expr`` into its pytest segment, parsed side by side::
+
+        OLD targets: ['tests/scripts/', 'some_expr']
+        NEW targets: ['tests/scripts']
+
+    ``'some_expr'`` is a phantom that the old ``-``-prefix-only filter admitted
+    silently — and a phantom can only ever make ``_is_collected`` pass, so
+    nothing would have gone red. Separately, adding a genuinely stale
+    positional target ``tests/scripts/does_not_exist/`` produced::
+
+        AssertionError: the pytest segment of 'uv run --project shared pytest
+        tests/scripts/ tests/scripts/does_not_exist/ --tb=short -q
+        --timeout=300' names target 'tests/scripts/does_not_exist', which does
+        not exist under /home/leo/src/dark-factory/.worktrees/3554 (task 3554).
+
+    confirming assertion (3) bites rather than filtering the token away.
     """
     segment = _pytest_segment(cmd)
+    if segment is None:
+        return []
     tokens = shlex.split(segment)
 
     base = ""
@@ -313,29 +579,61 @@ def _pytest_collected_dirs(cmd: str) -> list[str]:
         elif token.startswith("--directory="):
             base = token.split("=", 1)[1]
 
-    assert _PYTEST in tokens, (
-        f"no bare `{_PYTEST}` token in the pytest segment of {cmd!r} "
-        f"(task 3554), so the positional targets cannot be located"
-    )
-    tail = tokens[tokens.index(_PYTEST) + 1:]
-    targets = [t for t in tail if not t.startswith("-")]
-    return [posixpath.normpath(posixpath.join(base, t)) for t in targets]
+    targets: list[str] = []
+    skip_next = False
+    for token in tokens[tokens.index(_PYTEST) + 1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token.startswith("-"):
+            skip_next = token in _PYTEST_VALUE_FLAGS
+            continue
+        targets.append(token)
+
+    resolved = [posixpath.normpath(posixpath.join(base, t)) for t in targets]
+    for target in resolved:
+        assert (REPO_ROOT / target.split("::", 1)[0]).exists(), (
+            f"the pytest segment of {cmd!r} names target {target!r}, which "
+            f"does not exist under {REPO_ROOT} (task 3554). Either a module "
+            f"config carries a stale target — which makes pytest exit "
+            f"non-zero on every verify that runs it — or this parser admitted "
+            f"a value-taking flag's VALUE as a positional target, in which "
+            f"case add that flag to _PYTEST_VALUE_FLAGS. A phantom target can "
+            f"only ever satisfy _is_collected spuriously, so this is asserted "
+            f"rather than filtered out."
+        )
+    return resolved
 
 
-def _all_collected_dirs() -> dict[str, list[str]]:
-    """``{module prefix: repo-relative pytest targets}`` for every registered config.
+def _collected_by_prefix() -> tuple[dict[str, list[str]], list[str]]:
+    """``({prefix: pytest targets}, [prefixes skipped as non-pytest])``.
 
     Built from the real ``config._discover_module_configs`` walk, so the
     ratchets below track production discovery rather than a hand-mirrored copy
-    of it. A config with a falsy ``test_command`` contributes nothing — which
-    is itself the vacuous-gate hazard the DECIDED block cites, so it is skipped
-    rather than crashing the helper.
+    of it.
+
+    TWO KINDS OF NON-CONTRIBUTOR, both skipped rather than crashing the
+    helper, and the second REPORTED so a failure stays diagnosable:
+
+    * A falsy ``test_command`` — itself the vacuous-gate hazard the DECIDED
+      block cites as reason (1) for declining a ``skills/`` config.
+    * A ``test_command`` with no bare ``pytest`` token (see
+      ``_pytest_segment``). Its prefix is returned in the second element so
+      the assertions below can say "and these N configs declare no pytest
+      command" instead of reporting a bare empty set.
     """
-    return {
-        prefix: _pytest_collected_dirs(mc.test_command)
-        for prefix, mc in _discover_module_configs(REPO_ROOT).items()
-        if mc.test_command
-    }
+    collected: dict[str, list[str]] = {}
+    non_pytest: list[str] = []
+    for prefix, module_config in _discover_module_configs(REPO_ROOT).items():
+        command = module_config.test_command
+        if not command:
+            non_pytest.append(prefix)
+            continue
+        if _pytest_segment(command) is None:
+            non_pytest.append(prefix)
+            continue
+        collected[prefix] = _pytest_collected_dirs(command)
+    return collected, sorted(non_pytest)
 
 
 def _is_collected(rel_path: str, targets: list[str]) -> bool:
@@ -399,15 +697,23 @@ def test_skills_py_ruff_probe_is_collected_by_a_registered_module_config_test_co
 
     Narrowing only ONE of the two was also run, and correctly stayed GREEN —
     confirming the assertion pins the LEVER and not a particular collector.
-    """
-    collected = _all_collected_dirs()
 
-    # NON-VACUITY: an empty discovery result, or configs that declare no
-    # pytest targets at all, would let this pass while gating nothing.
+    THIS IS ONLY HALF THE DECIDING FACT. It pins that some config collects the
+    probe's PATH. That the probe still points ruff AT ``skills/`` is the other
+    half, and is pinned separately by
+    ``test_skills_py_ruff_probe_still_globs_skills_at_runtime`` — narrowing
+    ``_guarded_py_files`` would otherwise remove the gate with every assertion
+    here staying green.
+    """
+    collected, non_pytest = _collected_by_prefix()
+
+    # NON-VACUITY: an empty result — no configs discovered, or none declaring
+    # a pytest command — would let this pass while gating nothing.
     assert collected, (
-        f"config._discover_module_configs produced no module config with a "
-        f"test_command under {REPO_ROOT} (task 3554) — this coverage "
-        f"invariant would pass vacuously; discovery is broken."
+        f"no registered module config under {REPO_ROOT} declares a pytest "
+        f"test_command (task 3554) — this coverage invariant would pass "
+        f"vacuously. Either discovery is broken, or every config now runs a "
+        f"non-pytest runner; skipped prefixes: {non_pytest}."
     )
 
     carriers = sorted(
@@ -430,6 +736,77 @@ def test_skills_py_ruff_probe_is_collected_by_a_registered_module_config_test_co
         f"already holds, so removing it invalidates that decision rather than "
         f"merely losing coverage — re-open the `DECIDED — "
         f"skills/orchestrator.yaml` block in {DF_CONFIG_NAME}."
+    )
+
+
+def test_skills_py_ruff_probe_still_globs_skills_at_runtime() -> None:
+    """The collected probe must still point ruff AT ``skills/``, not just exist.
+
+    THE OTHER HALF OF THE DECIDING FACT. Its sibling above pins that some
+    registered module config collects
+    ``test_root_lint_covers_nonmember_py.py``. That is worth nothing if the
+    file stops probing ``skills/``: narrowing ``_guarded_py_files`` to
+    ``REPO_ROOT.glob('*.py')`` — an entirely reasonable-looking edit while
+    splitting the repo-root and ``skills/`` concerns apart — deletes the
+    ``skills/`` lint gate outright while every path-level assertion in this
+    module stays green. That is precisely the silent-removal failure mode this
+    file exists to prevent, so it is asserted on the probe's RUNTIME OUTPUT.
+
+    Asserted by IMPORT, not by re-deriving the glob: ``_guarded_py_files`` is
+    called and its result inspected, so this tracks whatever the probe
+    actually does rather than a mirrored copy that could drift from it. The
+    private name is used deliberately — the coupling is the point, and a
+    rename that breaks this import fails loudly at collection, which is the
+    correct outcome.
+
+    DELIBERATELY NOT ASSERTED: how many ``skills/`` files, or which ones. A
+    count rots on the next file added (task 3460), and the gate's meaning is
+    "``skills/`` is in the probe's scope", not "``skills/`` has N .py files".
+
+    MEASURED RED at base main ``7c6039327d``, against an uncommitted scratch
+    edit narrowing ``_guarded_py_files`` to
+    ``return sorted(REPO_ROOT.glob("*.py"))``::
+
+        AssertionError: test_root_lint_covers_nonmember_py._guarded_py_files()
+        no longer returns ANY path under
+        /home/leo/src/dark-factory/.worktrees/3554/skills (task 3554). It
+        returned 2 file(s), all outside skills/.
+
+    THE OTHER FIVE TESTS IN THIS MODULE ALL STAYED GREEN on that run
+    (``1 failed, 5 passed``) — including the path-level sibling above. That is
+    the whole justification for this assertion existing separately: the gate
+    was gone and only this test noticed.
+    """
+    skills_dir = REPO_ROOT / "skills"
+    probed = skills_ruff_probe._guarded_py_files()
+
+    # NON-VACUITY: an empty probe result would make the skills/ half below
+    # unfalsifiable AND means the probe itself is gating nothing. Its own
+    # non-vacuity assertion covers this too; duplicating it here keeps THIS
+    # failure message pointed at the decision rather than at the sibling.
+    assert probed, (
+        "test_root_lint_covers_nonmember_py._guarded_py_files() returned "
+        "NOTHING (task 3554) — the probe that carries the skills/ lint gate "
+        "into verify.run_full_verification is enumerating no files at all, "
+        "so the gate is vacuous regardless of which module config collects "
+        "it."
+    )
+
+    under_skills = [p for p in probed if p.is_relative_to(skills_dir)]
+    assert under_skills, (
+        f"test_root_lint_covers_nonmember_py._guarded_py_files() no longer "
+        f"returns ANY path under {skills_dir} (task 3554). It returned "
+        f"{len(probed)} file(s), all outside skills/. That function is the "
+        f"ONLY thing pointing ruff at skills/**/*.py inside "
+        f"verify.run_full_verification's gather over module_configs.values(), "
+        f"so narrowing it SILENTLY removes the skills/ lint gate — nothing "
+        f"reports skipped and nothing exits non-zero, and the sibling "
+        f"assertion that a module config still COLLECTS that file stays green "
+        f"while gating nothing. Task 3554 declined to register "
+        f"skills/orchestrator.yaml BECAUSE this gate already holds, so "
+        f"narrowing it invalidates that decision rather than merely losing "
+        f"coverage — re-open the `DECIDED — skills/orchestrator.yaml` block "
+        f"in {DF_CONFIG_NAME} and re-take it on the record."
     )
 
 
@@ -480,8 +857,12 @@ def test_every_skills_consuming_test_stays_under_a_gated_directory() -> None:
     ``'orchestrator': ['orchestrator/tests']``, not a repo-root ``['tests']``,
     which is what keeps the three orchestrator/tests/ entries above genuinely
     checked rather than accidentally uncovered.
+
+    THE OPPOSITE DRIFT — a NEW consumer that never reaches this tuple — is not
+    detectable here and is pinned separately by
+    ``test_no_unlisted_skills_mentioning_test_escapes_triage``.
     """
-    collected = _all_collected_dirs()
+    collected, non_pytest = _collected_by_prefix()
 
     # NON-VACUITY, both sides. Spelled `len(...) > 0` and NOT as a truthiness
     # test: the inventory is a tuple LITERAL in this module, so pyright folds
@@ -497,9 +878,10 @@ def test_every_skills_consuming_test_stays_under_a_gated_directory() -> None:
         f"{DF_CONFIG_NAME} would be asserting nothing."
     )
     assert collected, (
-        f"config._discover_module_configs produced no module config with a "
-        f"test_command under {REPO_ROOT} (task 3554) — this coverage "
-        f"invariant would pass vacuously; discovery is broken."
+        f"no registered module config under {REPO_ROOT} declares a pytest "
+        f"test_command (task 3554) — this coverage invariant would pass "
+        f"vacuously. Either discovery is broken, or every config now runs a "
+        f"non-pytest runner; skipped prefixes: {non_pytest}."
     )
 
     missing = [
@@ -532,4 +914,103 @@ def test_every_skills_consuming_test_stays_under_a_gated_directory() -> None:
         f"{DF_CONFIG_NAME} credits to the consumers' suites is no longer "
         f"there. Re-take the decision on the record in that block rather than "
         f"editing this tuple."
+    )
+
+
+def test_no_unlisted_skills_mentioning_test_escapes_triage() -> None:
+    """Every ``skills/``-mentioning test must be triaged into exactly one set.
+
+    THE OPPOSITE DRIFT from its sibling above. That test catches a listed
+    consumer that MOVES or DIES; this one catches a consumer that is ADDED and
+    never listed. Both matter because CORRECTION 1 of the DECIDED block argues
+    option (b) is too expensive on the strength of the consumer set spanning
+    three uv projects — an argument that weakens silently if the real set is
+    larger than the recorded one, and the recorded one is mirrored in PROSE in
+    that block.
+
+    HOW IT WORKS. Sweep every tracked ``test_*.py`` / ``*_test.py`` for the
+    literal ``skills/``; every hit must be in ``SKILLS_CONSUMING_TESTS`` or in
+    ``_SKILLS_MENTION_NON_CONSUMERS``. A new file in neither fails with a
+    one-line triage instruction. The exclusion set is not a free suppression
+    channel: each entry carries its reason, and a stale entry — one that no
+    longer mentions ``skills/`` at all — also fails, so the set cannot silently
+    accumulate.
+
+    A SUBSET ASSERTION, NOT AN EQUALITY, AND THE MEASUREMENT SAYS WHY. A
+    literal-token sweep is a LOWER BOUND on the consumer set, with a measured
+    counterexample at this base: ``orchestrator/tests/
+    test_harness_watcher_supervisor.py`` contains the string ``skills``
+    ZERO times (``git grep -n -- 'skills'`` over it returns nothing) yet is a
+    real consumer — it calls ``load_skill_system_prompt('escalation-watcher-
+    auto')``, which reads the in-repo ``skills/escalation-watcher-auto/
+    SKILL.md``. So the inventory legitimately EXCEEDS the sweep, and asserting
+    equality would go red on a correct inventory. Only the direction that can
+    hide a new consumer is asserted.
+
+    WHAT THIS COSTS, recorded rather than left for someone to hit. Dropping a
+    ``skills/`` mention from an excluded file (e.g. renaming the
+    ``skills/foo.md`` tmp_path fixture) fails this guard from another
+    project's diff. That is deliberate — a stale exclusion is how a
+    suppression list rots — and the fix is deleting one line, which the
+    failure message says outright.
+
+    MEASURED RED, both halves, at base main ``7c6039327d``, each against its
+    own uncommitted scratch mutation. An untriaged new consumer
+    (``orchestrator/tests/test_scratch_skills_consumer.py`` containing
+    ``skills/spawn/spawn-claude.sh``), ``git add -N``'d::
+
+        AssertionError: test file(s) mention 'skills/' but appear in NEITHER
+        the consumer inventory NOR the non-consumer exclusion set (task 3554):
+        ['orchestrator/tests/test_scratch_skills_consumer.py'].
+
+    And a stale exclusion, by removing the ``skills/`` mentions from
+    ``scripts/tests/test_legibility_sampling.py``::
+
+        AssertionError: _SKILLS_MENTION_NON_CONSUMERS lists file(s) that no
+        longer mention 'skills/' (task 3554):
+        ['scripts/tests/test_legibility_sampling.py'].
+    """
+    mentioning = sorted(
+        rel
+        for rel in _git_grep_files(_SKILLS_TOKEN, "*test_*.py", "*_test.py")
+        if _looks_like_a_test_module(rel)
+    )
+
+    # NON-VACUITY. This module itself contains the token and is a tracked
+    # test file, so an empty sweep means the pathspecs or the grep broke
+    # rather than that the repo genuinely has no mentions.
+    assert mentioning, (
+        f"the `{_SKILLS_TOKEN}` sweep over tracked test files returned NOTHING "
+        f"(task 3554) — impossible while this very module contains the token, "
+        f"so the pathspecs or `git grep` are broken and this drift detector "
+        f"would pass vacuously."
+    )
+
+    triaged = set(SKILLS_CONSUMING_TESTS) | set(_SKILLS_MENTION_NON_CONSUMERS)
+    untriaged = [rel for rel in mentioning if rel not in triaged]
+    assert not untriaged, (
+        f"test file(s) mention {_SKILLS_TOKEN!r} but appear in NEITHER the "
+        f"consumer inventory NOR the non-consumer exclusion set (task 3554): "
+        f"{untriaged}. Triage each into exactly one, in "
+        f"tests/scripts/test_skills_module_config_decision.py: if it READS or "
+        f"EXECUTES a real path under the repo's skills/ tree, add it to "
+        f"SKILLS_CONSUMING_TESTS *and* to the consumer enumeration in the "
+        f"`DECIDED — skills/orchestrator.yaml` block of {DF_CONFIG_NAME}, "
+        f"which must not drift from it. If the mention is prose, or a "
+        f"synthetic/tmp_path path that never touches this repo's skills/, add "
+        f"it to _SKILLS_MENTION_NON_CONSUMERS with its reason. A growing real "
+        f"consumer set makes CORRECTION 1's cost argument against option (b) "
+        f"stronger, not weaker — but only if it is recorded."
+    )
+
+    stale_exclusions = sorted(
+        rel for rel in _SKILLS_MENTION_NON_CONSUMERS if rel not in mentioning
+    )
+    assert not stale_exclusions, (
+        f"_SKILLS_MENTION_NON_CONSUMERS lists file(s) that no longer mention "
+        f"{_SKILLS_TOKEN!r} (task 3554): {stale_exclusions}. Either the file "
+        f"was deleted or renamed, or its mention was removed. DELETE the "
+        f"entry — an exclusion kept past its justification is how a "
+        f"suppression list rots into one nobody can audit, which is the same "
+        f"defect class as the ungated prose this whole file replaced."
     )
