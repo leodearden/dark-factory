@@ -4190,6 +4190,160 @@ class TestByQueryKindSplitsTheQueriesItClaimsToSplit:
         assert by_kind['claim']['claim_recall']['at_5'] is not None
 
 
+# ---------------------------------------------------------------------------
+# The transform-blind discoverability sub-metric
+# ---------------------------------------------------------------------------
+#
+# `apply_grouped_read` synthesises its grouped document wearing the
+# CANONICAL's `record_id`, and `topic_discoverability` identifies the
+# canonical by `record_id`.  So under `b_grouped` ANY child hit that folds
+# upward materialises a record carrying the canonical's id and is scored as
+# "the canonical was found" — whereas under `c_peers`/`status_quo` the
+# canonical's own stored record must itself have ranked.
+#
+# That is defensible (a grouped read genuinely does put the canonical body in
+# the reader's window) but it makes `canonical in top-5` a property of the
+# READ TRANSFORM, not purely of retrieval — and the table said nothing about
+# it.  The `stored_*` trio is the transform-blind counterpart, measured over
+# the RAW store hits before any read-side transform.  The gap between the two
+# columns IS the grouping effect, stated rather than folded in.
+#
+# This section covers the AGGREGATION half only.  `measure_arm` populating
+# the rows — and the b_grouped-vs-c_peers divergence itself — is the next.
+
+
+def _agg_row(*, canonical_in_5=1.0, canonical_rank=1, stored_in_5=1.0,
+             stored_rank=1, has_canonical=True, kind='claim', held_out=False,
+             recall_5=0.5, recall_10=0.5):
+    """One `measure_arm` row, in the shape `_aggregate_queries` consumes.
+
+    Hand-built: no store, no network, no embedder — so every expectation
+    below is exact.
+    """
+    return {
+        'kind': kind,
+        'held_out': held_out,
+        'recall_5': recall_5,
+        'recall_10': recall_10,
+        'canonical_in_5': canonical_in_5,
+        'canonical_rank': canonical_rank,
+        'stored_canonical_in_5': stored_in_5,
+        'stored_canonical_rank': stored_rank,
+        'has_canonical': has_canonical,
+        'tokens': 10.0,
+    }
+
+
+class TestTransformBlindDiscoverabilityAggregation:
+    """`_aggregate_queries` reports the canonical twice: credited, and raw."""
+
+    def test_the_stored_trio_is_computed_from_the_stored_fields(self):
+        """The two halves must come from DIFFERENT inputs, not be aliased.
+
+        Every row here has the transformed canonical at rank 1 and the
+        stored canonical either deep or absent — the divergence a grouped
+        read produces.  If the new keys ever read the transformed fields,
+        they would print the transformed answer and the disclosure would be
+        a duplicated column.
+        """
+        block = _mod()._aggregate_queries([
+            _agg_row(canonical_in_5=1.0, canonical_rank=1,
+                     stored_in_5=0.0, stored_rank=9),
+            _agg_row(canonical_in_5=1.0, canonical_rank=1,
+                     stored_in_5=1.0, stored_rank=3),
+            _agg_row(canonical_in_5=1.0, canonical_rank=1,
+                     stored_in_5=0.0, stored_rank=None),
+        ], limit=10)['discoverability']
+
+        # Transformed: every row found it in the top 5, at rank 1.
+        assert block['canonical_in_top_5_rate'] == 1.0
+        assert block['median_canonical_rank'] == 1.0
+        assert block['canonical_found_count'] == 3
+        # Transform-blind: one row in five, ranks 9 and 3, one never found.
+        assert block['stored_canonical_in_top_5_rate'] == pytest.approx(1 / 3)
+        assert block['stored_canonical_median_rank'] == 6.0
+        assert block['stored_canonical_found_count'] == 2
+
+    def test_an_unasked_subset_reports_none_rather_than_a_measured_zero(self):
+        """`queries: 0` is "not asked".  A `0.00` would claim it was asked.
+
+        Same discipline the existing keys already hold to — a new column that
+        printed a measured zero for an empty subset would put a lie in the
+        by-kind table's held-out row on any arm that had none.
+        """
+        block = _mod()._aggregate_queries([], limit=10)
+
+        assert block['queries'] == 0
+        disc = block['discoverability']
+        assert disc['stored_canonical_in_top_5_rate'] is None
+        assert disc['stored_canonical_median_rank'] is None
+        # A COUNT of successes over an empty subset is honestly zero — it is
+        # a denominator, not a rate, exactly as `canonical_found_count` is.
+        assert disc['stored_canonical_found_count'] == 0
+        assert disc['canonical_found_count'] == 0
+
+    def test_a_query_with_no_canonical_is_excluded_not_averaged_in_as_zero(self):
+        """`_mean`'s contract: `None` is a non-observation, never a 0.0.
+
+        A claim query whose cluster has no canonical was never asked the
+        discoverability question.  Averaging it in as zero would drag the
+        rate down for a question the arm was never posed.
+        """
+        block = _mod()._aggregate_queries([
+            _agg_row(stored_in_5=1.0, stored_rank=1),
+            _agg_row(stored_in_5=None, stored_rank=None, canonical_in_5=None,
+                     canonical_rank=None, has_canonical=False),
+        ], limit=10)['discoverability']
+
+        # 1.0 over the ONE row that had a canonical — not 0.5 over both.
+        assert block['stored_canonical_in_top_5_rate'] == 1.0
+        assert block['stored_canonical_found_count'] == 1
+        assert block['canonical_candidates'] == 1
+
+    def test_the_found_count_is_the_denominator_the_median_is_censored_over(self):
+        """Mirrors the `canonical_found_count`/`canonical_candidates` pairing.
+
+        The median is over the queries where the stored canonical surfaced AT
+        ALL.  Without the count beside it, an arm whose stored canonical
+        almost never ranks prints the best stored median in the table —
+        scored on the handful of queries where it did.  That is the exact
+        trap the module already documents for the transformed column, and it
+        must not reopen one column over.
+        """
+        block = _mod()._aggregate_queries([
+            _agg_row(stored_in_5=1.0, stored_rank=1),
+            _agg_row(stored_in_5=0.0, stored_rank=None),
+            _agg_row(stored_in_5=0.0, stored_rank=None),
+        ], limit=10)['discoverability']
+
+        # A flawless-looking median...
+        assert block['stored_canonical_median_rank'] == 1.0
+        # ...taken over exactly one of three queries that HAD a canonical.
+        assert block['stored_canonical_found_count'] == 1
+        assert block['canonical_candidates'] == 3
+
+    def test_no_existing_discoverability_key_changed_name_or_value(self):
+        """The new trio is purely ADDITIVE.
+
+        The headline decision table is read by gate η off these keys; a
+        rename or a shifted value would silently re-point the whole artifact.
+        """
+        rows = [
+            _agg_row(canonical_in_5=1.0, canonical_rank=2,
+                     stored_in_5=0.0, stored_rank=7),
+            _agg_row(canonical_in_5=0.0, canonical_rank=None,
+                     stored_in_5=0.0, stored_rank=None),
+        ]
+
+        block = _mod()._aggregate_queries(rows, limit=25)['discoverability']
+
+        assert block['canonical_in_top_5_rate'] == 0.5
+        assert block['median_canonical_rank'] == 2.0
+        assert block['canonical_found_count'] == 1
+        assert block['canonical_candidates'] == 2
+        assert block['canonical_rank_window'] == 25
+
+
 class TestReadPathHoldsTheWindowBudget:
     """Pin-on and pin-off must be scored over equal-size windows."""
 
