@@ -849,6 +849,99 @@ class TestRunReindex:
         assert call_kwargs.get('embedding_dim') == 768
 
     @pytest.mark.asyncio
+    async def test_creates_embedder_with_config_base_url(
+        self, standard_mock_config, make_fake_maintenance_service,
+    ):
+        """run_reindex() passes the configured endpoint to OpenAIEmbedderConfig.
+
+        The reindex tool was the outlier: backends/graphiti_client.py has
+        always passed base_url on its embedder path, so a re-embed run would
+        silently have gone to api.openai.com regardless of configuration.
+
+        NB this assertion alone is NOT sufficient evidence that the endpoint is
+        honoured — OpenAIEmbedderConfig is a pydantic model with the default
+        extra='ignore', so a MISSPELLED kwarg would be dropped silently and
+        this mock-based test would still pass while traffic went to
+        api.openai.com. That is the graphiti-#912 failure class this task
+        exists to prevent, and only a real socket disproves it; see
+        tests/test_local_endpoint_base_url_integration.py.
+        """
+        from fused_memory.config.schema import OpenAIProviderConfig
+
+        standard_mock_config.embedder.providers.openai = OpenAIProviderConfig(
+            api_key='test-key', api_url='http://127.0.0.1:5678/v1',
+        )
+
+        mock_service = AsyncMock()
+        mock_service.durable_queue = MagicMock()
+        mock_service.graphiti = MagicMock()
+
+        mock_result = {'reindex_result': ReindexResult(), 'replay_count': 0}
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.maintenance_service',
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
+            ),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls,
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            await run_reindex()
+
+        mock_cfg_cls.assert_called_once()
+        call_kwargs = mock_cfg_cls.call_args[1]
+        assert call_kwargs.get('base_url') == 'http://127.0.0.1:5678/v1'
+        # The pre-existing kwargs are still passed exactly as before.
+        assert call_kwargs.get('api_key') == 'test-key'
+        assert call_kwargs.get('embedding_model') == standard_mock_config.embedder.model
+        assert call_kwargs.get('embedding_dim') == standard_mock_config.embedder.dimensions
+
+    @pytest.mark.asyncio
+    async def test_none_provider_block_yields_base_url_none(
+        self, standard_mock_config, make_fake_maintenance_service,
+    ):
+        """Regression guard: the new plumbing must stay INSIDE the existing
+        `if openai_provider is not None` guard.
+
+        standard_mock_config has embedder.providers.openai = None (the case the
+        sibling tests already exercise with a real OpenAIEmbedderConfig), so
+        reaching for .api_url unguarded would raise AttributeError. base_url=None
+        yields the SDK default, preserving today's behaviour.
+        """
+        assert standard_mock_config.embedder.providers.openai is None
+
+        mock_service = AsyncMock()
+        mock_service.durable_queue = MagicMock()
+        mock_service.graphiti = MagicMock()
+
+        mock_result = {'reindex_result': ReindexResult(), 'replay_count': 0}
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.maintenance_service',
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
+            ),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls,
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            await run_reindex()  # must not raise AttributeError
+
+        mock_cfg_cls.assert_called_once()
+        call_kwargs = mock_cfg_cls.call_args[1]
+        assert call_kwargs.get('base_url') is None
+        assert call_kwargs.get('api_key') is None
+
+    @pytest.mark.asyncio
     async def test_embedder_constructor_failure_propagates(self, standard_mock_config, make_fake_maintenance_service):
         """When OpenAIEmbedderConfig raises inside the context, the exception propagates."""
         mock_service = AsyncMock()
