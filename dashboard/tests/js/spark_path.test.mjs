@@ -1013,6 +1013,32 @@ test('axisPaths: stepX derives from count (labels.length), not values.length', (
   assert.ok(!xs(short.line).includes(138), 'a short series must not reach the last slot');
 });
 
+test('axisPaths: the returned stepX IS the spacing between consecutive plotted xs', () => {
+  // The caller positions its label row with this number and its marks with the
+  // path. If the two could disagree the labels would name the wrong columns —
+  // and a mislabelled chart renders as a plausible chart, not as an error. So
+  // the builder returns the one x-mapping rather than leaving the call site to
+  // recompute `width / Math.max(count - 1, 1)` beside it.
+  const { line, stepX } = axisPaths([0, 1, 2, 3, 4], LINE_GEOM);
+  const plottedXs = xs(line);
+
+  assert.equal(stepX, 25, 'width 100 over 5 columns');
+  for (let i = 1; i < plottedXs.length; i++) {
+    assert.equal(plottedXs[i] - plottedXs[i - 1], stepX, `gap ${i} must equal the returned stepX`);
+  }
+  assert.equal(plottedXs[0], LINE_GEOM.x0, 'column 0 sits on the box origin');
+
+  // It survives the degenerate calls too, since the axes and labels render even
+  // when nothing is plotted.
+  assert.equal(axisPaths([], LINE_GEOM).stepX, 25, 'an empty series still yields the mapping');
+  assert.equal(axisPaths([null, null], LINE_GEOM).stepX, 25);
+  assert.equal(
+    axisPaths([1], { ...LINE_GEOM, count: 1 }).stepX,
+    100,
+    'a single column falls back to the full width, matching Math.max(count - 1, 1)',
+  );
+});
+
 test('axisPaths: a measured 0 is plotted on the floor, a hole is not plotted at all', () => {
   // The distinction the pre-fix code destroyed: both rendered as a point at
   // y=198. Now only the measurement does.
@@ -1371,10 +1397,16 @@ test('stackedAreaPaths: an all-hole layer yields an empty path rather than throw
 
   // Degenerate inputs must not throw either — a tab renders before its fetch
   // resolves.
-  assert.deepEqual(stackedAreaPaths([], STACK_GEOM_3), { max: 1, paths: [] });
-  assert.deepEqual(stackedAreaPaths(null, STACK_GEOM_3), { max: 1, paths: [] });
-  assert.deepEqual(stackedAreaPaths(undefined, STACK_GEOM_3), { max: 1, paths: [] });
-  assert.deepEqual(stackedAreaPaths([layer('a', undefined)], STACK_GEOM_3), { max: 1, paths: [''] });
+  // stepX comes back even from a degenerate call: the caller's label row and
+  // axes still render, so it still needs the x-mapping. STACK_GEOM_3 is
+  // width 100 over 3 columns -> 50.
+  assert.deepEqual(stackedAreaPaths([], STACK_GEOM_3), { max: 1, paths: [], stepX: 50 });
+  assert.deepEqual(stackedAreaPaths(null, STACK_GEOM_3), { max: 1, paths: [], stepX: 50 });
+  assert.deepEqual(stackedAreaPaths(undefined, STACK_GEOM_3), { max: 1, paths: [], stepX: 50 });
+  assert.deepEqual(
+    stackedAreaPaths([layer('a', undefined)], STACK_GEOM_3),
+    { max: 1, paths: [''], stepX: 50 },
+  );
 });
 
 test('stackedAreaPaths: undefined and NaN are holes too, and no NaN is ever emitted', () => {
@@ -1401,6 +1433,27 @@ test('stackedAreaPaths: undefined and NaN are holes too, and no NaN is ever emit
       assert.ok(Number.isFinite(y), `every coordinate must be finite — got ${y}`);
     }
   }
+});
+
+test('stackedAreaPaths: the returned stepX IS the spacing between consecutive band xs', () => {
+  // Same contract as axisPaths: StackedAreaChart positions its label row with
+  // this number and its bands with the polygons, so both must come from one
+  // x-mapping. A recomputed copy at the call site drifts silently.
+  const { paths, stepX } = stackedAreaPaths(
+    [layer('a', [1, 2, 1, 2, 1]), layer('b', [3, 2, 3, 2, 3])],
+    STACK_GEOM_5,
+  );
+
+  assert.equal(stepX, 25, 'width 100 over 5 columns');
+  // The forward half of a closed band walks the columns in order, so its first
+  // `count` xs are the column positions.
+  const forwardXs = xs(paths[0]).slice(0, STACK_GEOM_5.count);
+  for (let i = 1; i < forwardXs.length; i++) {
+    assert.equal(forwardXs[i] - forwardXs[i - 1], stepX, `gap ${i} must equal the returned stepX`);
+  }
+  assert.equal(forwardXs[0], STACK_GEOM_5.x0, 'column 0 sits on the box origin');
+
+  assert.equal(stackedAreaPaths([layer('a', [1, 2, 1])], STACK_GEOM_3).stepX, 50, '3 columns');
 });
 
 test('stackedAreaPaths: does not mutate its input stacks', () => {

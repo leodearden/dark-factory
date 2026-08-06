@@ -324,11 +324,19 @@ function axisY(value, geom) {
 // than being stretched across the full width), and the value axis spans
 // min..min+range.
 //
-// Returns { line, area }, each a space-joined set of subpaths — one per run of
-// consecutive real samples — so the line is genuinely discontinuous across a
-// hole and no fill is painted over a slot that holds no measurement. The
-// pre-fix LineChart closed its area at the full chart width unconditionally,
-// so the fill spanned gaps even where the line did not.
+// Returns { line, area, stepX }. `line` and `area` are each a space-joined set
+// of subpaths — one per run of consecutive real samples — so the line is
+// genuinely discontinuous across a hole and no fill is painted over a slot that
+// holds no measurement. The pre-fix LineChart closed its area at the full chart
+// width unconditionally, so the fill spanned gaps even where the line did not.
+//
+// `stepX` is returned for the same reason sparkScale returns it: the caller has
+// a LABEL ROW to position at the same x's as the marks, and a second copy of
+// `width / Math.max(count - 1, 1)` at the call site would silently desynchronise
+// the labels from the marks the first time the x-mapping changes (a half-step
+// inset, a different single-column rule). That drift renders as a plausible
+// chart rather than an error, so there is exactly one x-mapping and it lives
+// here.
 //
 // No plottable samples at all yields `{ line: '', area: '' }` rather than
 // throwing. Unlike Sparkline, the CALLER does not then render nothing: a
@@ -363,7 +371,7 @@ function axisPaths(values, geom) {
     if (areaCommands !== null) areas.push(areaCommands);
   }
 
-  return { line: lines.join(' '), area: areas.join(' ') };
+  return { line: lines.join(' '), area: areas.join(' '), stepX };
 }
 
 // ── Bar heights as a fraction of the axis max (`BarChart`, `HistBar`) ──────
@@ -401,9 +409,11 @@ function barFractions(values, max) {
 
 // ── Stacked band builder (charts.jsx's `StackedAreaChart`) ─────────────────
 // Takes the component's own `stacks` ([{ key, color, values }]) and
-// `geom` = { x0, y0, width, height, count }, and returns { max, paths }: the
-// axis maximum the caller needs for its y-ticks, and one polygon string per
-// layer IN LAYER ORDER (empty string for a layer with nothing to draw). Unlike
+// `geom` = { x0, y0, width, height, count }, and returns { max, paths, stepX }:
+// the axis maximum the caller needs for its y-ticks, one polygon string per
+// layer IN LAYER ORDER (empty string for a layer with nothing to draw), and the
+// x-mapping the caller's label row must share with the bands — returned for the
+// same reason axisPaths returns it, see that header. Unlike
 // the other builders this one derives its own value axis — min is 0 and range
 // is `max` — because a stack's height is a property of the whole stack, not of
 // any one layer.
@@ -505,7 +515,7 @@ function stackedAreaPaths(stacks, geom) {
     return polygons.join(' ');
   });
 
-  return { max, paths };
+  return { max, paths, stepX };
 }
 
 // Module-unique export const, never a bare `API` — see the

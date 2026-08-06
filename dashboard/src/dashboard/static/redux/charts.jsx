@@ -128,11 +128,25 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   const minV = 0;
   const range = maxV - minV || 1;
   const n = labels.length;
-  const stepX = chartW / Math.max(n - 1, 1);
   // The plot box every value is scaled into. `count` is the LABEL count, so a
   // series shorter than the label row stops at its own last x rather than being
   // stretched across the full width.
   const geom = { x0: padL, y0: padT, width: chartW, height: chartH, count: n, min: minV, range };
+  // One subpath per run of consecutive real samples, so the line is genuinely
+  // discontinuous across a hole and no fill is painted under a slot that holds
+  // no measurement (the pre-fix area closed at the full chart width regardless).
+  //
+  // Built HERE rather than inline in the series map so the LABEL ROW below can
+  // take its x from the same call that positions the marks. A second copy of
+  // `chartW / Math.max(n - 1, 1)` at the call site would silently desynchronise
+  // the labels from the marks the first time the x-mapping changes, and a chart
+  // whose labels no longer line up with its marks renders as a plausible chart
+  // rather than an error.
+  const built = series.map(s => axisPaths(s.values, geom));
+  // The axes and label row render even with no series at all (an empty frame
+  // reads as "no data in this window"), so the x-mapping is taken from a builder
+  // call either way — never recomputed here.
+  const { stepX } = built[0] ?? axisPaths([], geom);
   const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => minV + (range * i) / ticks);
   return (
@@ -156,11 +170,7 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
         })}
         {series.map((s, si) => {
           const color = s.color || PALETTE.accent;
-          // One subpath per run of consecutive real samples, so the line is
-          // genuinely discontinuous across a hole and no fill is painted under
-          // a slot that holds no measurement (the pre-fix area closed at the
-          // full chart width regardless).
-          const { line, area } = axisPaths(s.values, geom);
+          const { line, area } = built[si];
           // Skips THIS SERIES only, when it has no plottable sample at all.
           // The axes, gridlines and tick labels below are structural facts
           // about the requested window rather than measurements, so they keep
@@ -192,7 +202,6 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   const chartW = Math.max(w - padL - padR, 50);
   const chartH = height - padT - padB;
   const n = labels.length;
-  const stepX = chartW / Math.max(n - 1, 1);
   // One polygon per layer, plus the axis maximum they were all scaled against
   // (task 3489). The cumulative folds used to scrub every sample through a
   // `|| 0` fallback, which fabricated a zero-height band at a hole AND fed a
@@ -202,8 +211,12 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   // a hole as unknown: layer li is drawn at column i only if every layer BELOW
   // it is measured there — its base is their sum — while the bands below keep
   // drawing truthfully.
+  //
+  // `stepX` comes back from the builder rather than being recomputed for the
+  // label row: one x-mapping, so the labels can never drift out of line with
+  // the bands they name.
   const geom = { x0: padL, y0: padT, width: chartW, height: chartH, count: n };
-  const { max: maxV, paths } = stackedAreaPaths(stacks, geom);
+  const { max: maxV, paths, stepX } = stackedAreaPaths(stacks, geom);
 
   // The value axis the builder scaled every band against: 0..maxV.
   const tickGeom = { y0: padT, height: chartH, min: 0, range: maxV };
