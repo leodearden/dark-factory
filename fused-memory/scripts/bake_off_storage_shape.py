@@ -1817,6 +1817,21 @@ _REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
                        'probes', 'guard_covered_probes'),
 }
 
+#: What each ``by_query_kind`` subset must carry, on top of the kind names
+#: registered above.  The metric BLOCKS are named here; the keys inside them
+#: are the same tuples the pooled block is checked against, reused rather than
+#: retyped — a subset is the pooled block computed over fewer rows (one
+#: ``_aggregate_queries`` call for both), so a second key list here could
+#: drift into disagreeing with the code that produces both.
+#:
+#: Validating only the kind NAMES was a fail-obscure gap: the by-kind table
+#: subscripts ``subset['discoverability'][...]`` and ``subset['queries']``
+#: directly, so a subset missing one surfaced as a raw ``KeyError`` out of
+#: ``render_markdown`` instead of an :class:`IncompleteReportError` naming the
+#: arm, the kind and the key.
+_REQUIRED_SUBSET_KEYS: tuple[str, ...] = ('queries',)
+_REQUIRED_SUBSET_METRICS: tuple[str, ...] = ('claim_recall', 'discoverability')
+
 #: What the artifact must say about how it was produced.  An arbitration
 #: artifact whose provenance is not in it cannot be re-read six months later
 #: by somebody who was not in the room.
@@ -1955,6 +1970,33 @@ def _check_arms(arms: dict[str, Any]) -> None:
                     raise IncompleteReportError(
                         f"arm '{arm}' metric '{metric}' is missing '{key}'"
                     )
+
+        # The same rule, INSIDE each subset.  The loop above proves every kind
+        # name is present; a subset that is present but hollow renders a
+        # by-kind row out of `KeyError` rather than out of this error class,
+        # and the whole completeness discipline here is that a missing
+        # measurement is named, never discovered by a traceback.
+        by_kind = measurement['by_query_kind']
+        for kind in (*QUERY_KINDS, HELD_OUT_SUBSET):
+            subset = by_kind[kind]
+            for key in _REQUIRED_SUBSET_KEYS:
+                if key not in subset:
+                    raise IncompleteReportError(
+                        f"arm '{arm}' by_query_kind '{kind}' is missing "
+                        f"'{key}'"
+                    )
+            for metric in _REQUIRED_SUBSET_METRICS:
+                if metric not in subset:
+                    raise IncompleteReportError(
+                        f"arm '{arm}' by_query_kind '{kind}' is missing "
+                        f"metric '{metric}'"
+                    )
+                for key in _REQUIRED_ARM_METRICS[metric]:
+                    if key not in subset[metric]:
+                        raise IncompleteReportError(
+                            f"arm '{arm}' by_query_kind '{kind}' metric "
+                            f"'{metric}' is missing '{key}'"
+                        )
 
 
 def build_report(

@@ -2804,24 +2804,36 @@ def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
             'stored_canonical_median_rank': 5.0,
             'stored_canonical_found_count': 9,
         },
+        # EVERY subset carries different numbers — from the pooled block AND
+        # from each other.  Identical subsets would let a renderer that
+        # sourced every by-kind row from one subset (the first kind in
+        # iteration order, say) pass while printing `claim`'s numbers on the
+        # `held_out` row — which is precisely the row the transform-blind
+        # column exists for, since it is the only one measuring
+        # generalisation.  The per-kind offset is what makes that visible.
         'by_query_kind': {
             kind: {
-                'queries': 8,
-                'claim_recall': {'at_5': recall5, 'at_10': recall10},
+                'queries': 8 + index,
+                'claim_recall': {
+                    'at_5': round(recall5 - 0.01 * (index + 1), 2),
+                    'at_10': round(recall10 - 0.01 * (index + 1), 2),
+                },
                 'discoverability': {
-                    'canonical_in_top_5_rate': 0.7,
-                    'median_canonical_rank': 2.0,
-                    'canonical_found_count': 6,
-                    'canonical_candidates': 8,
+                    'canonical_in_top_5_rate': round(0.71 + 0.01 * index, 2),
+                    'median_canonical_rank': 2.0 + index,
+                    'canonical_found_count': 6 + index,
+                    'canonical_candidates': 8 + index,
                     'canonical_rank_window': 10,
                     # Distinct from the pooled block's stored values too, so
                     # a by-kind cell sourced from the pooled block is visible.
-                    'stored_canonical_in_top_5_rate': 0.3,
-                    'stored_canonical_median_rank': 4.0,
-                    'stored_canonical_found_count': 4,
+                    'stored_canonical_in_top_5_rate': round(0.31 + 0.01 * index, 2),
+                    'stored_canonical_median_rank': 4.0 + index,
+                    'stored_canonical_found_count': 4 + index,
                 },
             }
-            for kind in (*_mod().QUERY_KINDS, _mod().HELD_OUT_SUBSET)
+            for index, kind in enumerate(
+                (*_mod().QUERY_KINDS, _mod().HELD_OUT_SUBSET),
+            )
         },
         'tokens_per_query': {'mean': 412.0, 'estimator': estimator},
         'guard_adequacy': {
@@ -3028,6 +3040,56 @@ class TestBuildReportRefusesAPartialTable:
 
         assert 'b_grouped' in str(excinfo.value)
         assert 'by_query_kind' in str(excinfo.value)
+
+    @pytest.mark.parametrize('kind', ['claim', 'topic_phrasing', 'held_out'])
+    @pytest.mark.parametrize('metric,key', [
+        ('discoverability', 'stored_canonical_in_top_5_rate'),
+        ('discoverability', 'canonical_in_top_5_rate'),
+        ('claim_recall', 'at_5'),
+    ])
+    def test_a_missing_key_INSIDE_a_by_kind_subset_raises(self, kind, metric, key):
+        """One level deeper than the subset-name check above.
+
+        The by-kind table subscripts `subset['discoverability'][...]`
+        directly, so before this the failure mode was a raw `KeyError` out of
+        `render_markdown` — a traceback where every other missing measurement
+        in this module produces an error naming the arm, the kind and the key.
+        Fail-loud versus fail-obscure: the artifact is refused either way, but
+        only one of them tells the operator which subset broke.
+        """
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped']['by_query_kind'][kind][metric][key]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        message = str(excinfo.value)
+        assert 'b_grouped' in message
+        assert kind in message
+        assert key in message
+
+    @pytest.mark.parametrize('block', ['claim_recall', 'discoverability',
+                                       'queries'])
+    def test_a_hollow_by_kind_subset_raises(self, block):
+        """The subset is PRESENT — so the kind-name check passes — and empty.
+        A split that produced the right keys with nothing under them would
+        otherwise publish a by-kind row assembled out of a traceback."""
+        mod = _mod()
+        arms = _all_arms()
+        del arms['c_peers+pin']['by_query_kind']['held_out'][block]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        message = str(excinfo.value)
+        assert 'c_peers+pin' in message
+        assert 'held_out' in message
+        assert block in message
 
     def test_the_transform_blind_trio_is_registered_not_merely_produced(self):
         """Registration is what obliges the renderer to carry the column.
@@ -3317,12 +3379,24 @@ class TestTheTransformBlindColumnReachesTheTables:
 
         assert header.index('canonical in top-5') + 1 == column
         assert rows
+        by_arm: dict[str, set[str]] = {}
         for row in rows:
             cells = _cells(row)
             arm, kind = cells[0], cells[1]
             expected = report['arms'][arm]['by_query_kind'][kind][
                 'discoverability']['stored_canonical_in_top_5_rate']
             assert cells[column] == f'{expected:.2f}'
+            by_arm.setdefault(arm, set()).add(cells[column])
+
+        # Anti-vacuity: the fixture gives every subset a DIFFERENT stored
+        # rate, so a renderer sourcing all three rows from one subset prints
+        # one value three times.  If the fixture is ever re-flattened, this
+        # fails here rather than quietly reducing the loop above to a check
+        # that `claim`'s number appears on `held_out`'s row.
+        for arm, seen in by_arm.items():
+            assert len(seen) == len(rows) // len(by_arm), (
+                f'{arm}: by-kind rows are not distinguishable ({seen})'
+            )
 
     def test_every_data_row_has_exactly_as_many_cells_as_its_header(self):
         """A column added to a header but not to the row builder shifts every
