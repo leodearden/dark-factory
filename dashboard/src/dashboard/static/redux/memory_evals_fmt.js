@@ -47,6 +47,15 @@
 
 // Missing scalars render an em-dash, never `|| 0`: a synthetic zero reads as a
 // measured zero.  Same placeholder the Memory tab already uses (tabs.jsx:589).
+//
+// Spelled '\u2014' rather than as the raw character, which is what
+// tab_memory_evals.jsx used before task 3481 moved these two functions here.
+// Note that is NOT the wider static/redux convention — shell.jsx,
+// scheduler_utils.jsx and the scheduler tabs all write the raw character — so
+// the divergence is deliberate rather than an oversight: a moved function that
+// changes spelling is no longer a verbatim move, and a raw em-dash sitting
+// next to a hyphen or an en-dash is a near-miss no diff review reliably
+// catches.  Normalising all of them is a separate, repo-wide decision.
 function dash(v) {
   if (v === null || v === undefined) return '\u2014';
   return v;
