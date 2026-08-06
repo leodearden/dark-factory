@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -27,6 +27,12 @@ class _FakeScheduler:
         # Default None → no park unless a test sets a status.
         self.get_status = AsyncMock(return_value=status)
         self.set_task_status = AsyncMock()
+        # Reconcile-grace stamp.  MagicMock, NOT AsyncMock: the real
+        # ``Scheduler.note_workflow_cancelled`` is a plain sync ``def`` and
+        # callers invoke it without ``await``.  ``_FakeScheduler`` is a
+        # hand-written class (no auto-attribute magic), so without this
+        # attribute any path that stamps raises AttributeError.
+        self.note_workflow_cancelled = MagicMock()
 
 
 class _FakeHarness:
