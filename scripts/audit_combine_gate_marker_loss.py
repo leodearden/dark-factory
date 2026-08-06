@@ -68,7 +68,15 @@ from typing import NamedTuple
 # scripts/, and this script must NEVER be invoked via `python -m` — the CLI
 # tests shell out to the script path and resolve this import solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0].
-from _task_db_scan import discover_project_roots, tasks_db_path  # noqa: F401
+from _task_db_scan import (  # noqa: F401  (tasks_db_path/discover_project_roots re-exported)
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+    discover_project_roots,
+    run_audit_cli,
+    tasks_db_path,
+)
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
 # path, never a hardcoded absolute. An editable install puts the MAIN
@@ -1069,11 +1077,22 @@ def format_json(audits: list[ProjectAudit]) -> str:
 # returns can never drift into disagreeing about what a number means. Each
 # denotes EXACTLY ONE outcome -- that is the whole reason 3 exists rather than
 # being folded into 0.
-EXIT_OK = 0                # audited; no ACTIONABLE findings and no id mismatch
-EXIT_LIVE_FINDINGS = 1     # an actionable finding (is_actionable), or the
-                           # project_id guard fired
-EXIT_NO_ROOT = 2           # no project root resolved to a readable tasks.db
-EXIT_NOTHING_SCANNED = 3   # roots resolved but EVERY one failed to audit
+#
+# The per-script NAMES survive because the epilog wording is per-script (this
+# one is about ACTIONABLE findings and terminal-row suppression; wiped's is
+# about candidates), but since task 3616 the VALUES have ONE home: the returns
+# now live in _task_db_scan.run_audit_cli, so a local re-spelling would drift
+# from what actually gets returned. test_exit_constants_alias_the_shared_
+# tier_3_codes is what keeps these aliases honest.
+EXIT_OK = AUDIT_EXIT_OK                       # audited; no ACTIONABLE findings
+                                              # and no id mismatch
+EXIT_LIVE_FINDINGS = AUDIT_EXIT_FINDINGS      # an actionable finding
+                                              # (is_actionable), or the
+                                              # project_id guard fired
+EXIT_NO_ROOT = AUDIT_EXIT_NO_ROOT             # no project root resolved to a
+                                              # readable tasks.db
+EXIT_NOTHING_SCANNED = AUDIT_EXIT_NOTHING_AUDITED  # roots resolved but EVERY
+                                                   # one failed to audit
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1125,6 +1144,52 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
+    """Audit ONE project root under the (possibly overridden) project_id.
+
+    Raises ``sqlite3.Error`` for an unreadable project, which is what
+    :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip; every
+    other exception propagates. Returns exactly one audit, per that function's
+    one-audit-per-root contract.
+    """
+    return audit_project(root, args.project_id)
+
+
+def _render(audits: list[ProjectAudit], args: argparse.Namespace) -> str:
+    return format_json(audits) if args.json else format_report(audits)
+
+
+def _is_dirty(audits: list[ProjectAudit]) -> bool:
+    """Exit 1 keys on ACTIONABLE findings, or a fired project-id guard.
+
+    See :func:`main`'s docstring for why the excluded rows are excluded -- they
+    are still printed in full and still counted in COVERAGE.
+    """
+    actionable = any(is_actionable(f) for a in audits for f in a.findings)
+    mismatch = any(a.project_id_mismatch for a in audits)
+    return actionable or mismatch
+
+
+def _warn_project_id_across_roots(roots: list[str], args: argparse.Namespace) -> None:
+    """Warn once, up front, that ONE --project-id is being applied to MANY roots.
+
+    Runs on the RESOLVED root list, before the empty-roots exit-2 return -- the
+    position it has always occupied, preserved verbatim through the Tier-3
+    extraction (task 3616). It fits neither the per-root audit callback nor the
+    post-sweep renderer, which is why run_audit_cli takes an on_roots hook.
+    """
+    if len(roots) > 1 and args.project_id:
+        print(
+            f"warning: --project-id {args.project_id!r} is applied to ALL "
+            f"{len(roots)} resolved project roots, but a project_id is "
+            "per-project; any root whose real id differs will be audited "
+            "against the wrong tickets.db rows (and a root with no created "
+            "tickets will silently report '(no comparison source)' instead of "
+            "flagging the mismatch). Prefer one --project-id run per root.",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
@@ -1166,59 +1231,23 @@ def main(argv: list[str] | None = None) -> int:
     override is legitimate for a multi-root sweep over same-id checkouts (a
     main checkout plus its worktrees), which is a real use, and this script
     reports rather than gatekeeps.
+
+    The roots loop, the warn-and-continue skip and the exit-code ladder are
+    :func:`_task_db_scan.run_audit_cli` (Tier 3, task 3616), shared with
+    audit_wiped_metadata_files.py. What stays here is what genuinely differs:
+    this script's parser and epilog, its ``--project-id`` handling
+    (:func:`_audit_root` and :func:`_warn_project_id_across_roots`), its
+    object-shaped JSON, its report and its actionable-findings predicate
+    (:func:`_is_dirty`). Nothing in this file returns a bare integer any more.
     """
-    args = _build_parser().parse_args(argv)
-
-    roots = discover_project_roots(project_roots=args.project_roots)
-    if len(roots) > 1 and args.project_id:
-        print(
-            f"warning: --project-id {args.project_id!r} is applied to ALL "
-            f"{len(roots)} resolved project roots, but a project_id is "
-            "per-project; any root whose real id differs will be audited "
-            "against the wrong tickets.db rows (and a root with no created "
-            "tickets will silently report '(no comparison source)' instead of "
-            "flagging the mismatch). Prefer one --project-id run per root.",
-            file=sys.stderr,
-        )
-    if not roots:
-        print(
-            "no project root resolvable with a readable tasks.db (checked "
-            "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
-            "dark-factory default)",
-            file=sys.stderr,
-        )
-        return EXIT_NO_ROOT
-
-    audits: list[ProjectAudit] = []
-    unreadable: list[str] = []
-    for root in roots:
-        try:
-            audits.append(audit_project(root, args.project_id))
-        except sqlite3.Error as exc:
-            print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
-            unreadable.append(root)
-
-    if unreadable:
-        print(
-            f"warning: {len(unreadable)} project(s) skipped due to read errors "
-            "(see warnings above); results below are incomplete",
-            file=sys.stderr,
-        )
-
-    print(format_json(audits) if args.json else format_report(audits))
-
-    if unreadable and not audits:
-        # Nothing was scanned at all -- never report that as a clean sweep.
-        print(
-            "error: every resolved project was unreadable; NOTHING was "
-            "audited (this is not a clean result)",
-            file=sys.stderr,
-        )
-        return EXIT_NOTHING_SCANNED
-
-    actionable = any(is_actionable(f) for a in audits for f in a.findings)
-    mismatch = any(a.project_id_mismatch for a in audits)
-    return EXIT_LIVE_FINDINGS if (actionable or mismatch) else EXIT_OK
+    return run_audit_cli(
+        argv,
+        parser=_build_parser(),
+        audit_fn=_audit_root,
+        render=_render,
+        is_dirty=_is_dirty,
+        on_roots=_warn_project_id_across_roots,
+    )
 
 
 if __name__ == "__main__":
