@@ -286,6 +286,81 @@ def test_vllm_embedding_argv_carries_no_chat_completion_only_flags():
         assert flag not in joined, f'{flag} has no meaning for a pooling arm'
 
 
+def test_vllm_embedding_allowance_comes_from_the_declared_footprint():
+    """A pooling arm gets what it DECLARED, not every free byte on the card.
+
+    Measured 2026-08-06 on qwen3-embedding-0.6b: derived from free VRAM, the
+    arm was handed 0.682 (16.37 GiB) and vLLM filled it -- weights 1.12 GiB,
+    overhead 0.42 GiB, and a 14.56 GiB paged KV cache (136,272 tokens) that a
+    pooling model can never read.  A 0.6B embedder declaring est_vram_gib 2.0
+    took 16.2 GiB.  vLLM sizes KV to fill whatever --gpu-memory-utilization
+    allows, so for these arms the allowance IS the KV bound.
+    """
+    arm = _embedding_arm(est_vram_gib=2.0)
+
+    argv = lms_serve.build_launch_argv(arm, MEASURED_GPU)
+
+    expected = lms_vram.gpu_memory_utilization_for(
+        arm.est_vram_gib + lms_vram.SAFETY_MARGIN_GIB, MEASURED_GPU.total_gib,
+    )
+    assert _value_after(argv, '--gpu-memory-utilization') == str(expected)
+
+
+def test_vllm_embedding_allowance_does_not_balloon_on_an_emptier_card():
+    """The load-bearing regression property, and the inverse of the LLM case.
+
+    An LLM arm SHOULD take more KV when the card is emptier -- that is real
+    generation headroom.  A pooling arm taking more is pure waste, and it is
+    what made two embedding arms blow the budget while answering correctly.
+    """
+    roomier = lms_vram.GpuReading(total_mib=24576, used_mib=3300, free_mib=20800)
+
+    tight = float(_value_after(
+        lms_serve.build_launch_argv(_embedding_arm(), MEASURED_GPU),
+        '--gpu-memory-utilization'))
+    loose = float(_value_after(
+        lms_serve.build_launch_argv(_embedding_arm(), roomier),
+        '--gpu-memory-utilization'))
+
+    assert loose == tight, (
+        'a pooling arm must not claim more of an emptier card: its KV cache '
+        'is unusable, so the extra is taken from every other arm for nothing'
+    )
+
+
+def test_vllm_embedding_allowance_stays_inside_its_declared_footprint():
+    """est_vram_gib must be load-bearing, not decorative.
+
+    The pre-flight (`lms_vram.arm_fits`) admits an arm on the strength of this
+    number.  If the launch then ignores it, the pre-flight's arithmetic is
+    false the moment two arms are considered together.
+    """
+    arm = _embedding_arm(est_vram_gib=2.0)
+
+    argv = lms_serve.build_launch_argv(arm, MEASURED_GPU)
+
+    share = float(_value_after(argv, '--gpu-memory-utilization'))
+    granted_gib = share * MEASURED_GPU.total_gib
+    assert granted_gib <= arm.est_vram_gib + lms_vram.SAFETY_MARGIN_GIB + 0.01, (
+        f'launch grants {granted_gib:.2f} GiB to an arm that declared '
+        f'{arm.est_vram_gib} GiB'
+    )
+
+
+def test_vllm_llm_arm_keeps_the_free_vram_derived_share():
+    """Generation arms are deliberately NOT bounded this way.
+
+    A decoder serving completions needs its KV cache; capping an LLM arm at its
+    weight footprint would leave no room for context and is not this fix.
+    """
+    llm_argv = lms_serve.build_launch_argv(_arm(est_vram_gib=6.0), MEASURED_GPU)
+
+    expected = lms_vram.gpu_memory_utilization_for(
+        MEASURED_GPU.free_gib, MEASURED_GPU.total_gib,
+    )
+    assert _value_after(llm_argv, '--gpu-memory-utilization') == str(expected)
+
+
 # ---------------------------------------------------------------------------
 # llama.cpp — the MoE arm
 # ---------------------------------------------------------------------------

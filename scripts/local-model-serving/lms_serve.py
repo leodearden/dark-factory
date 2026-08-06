@@ -98,6 +98,46 @@ def _docker_preamble(arm: ArmEntry, mount: str) -> list[str]:
     ]
 
 
+def _memory_share_for(arm: ArmEntry, gpu: lms_vram.GpuReading) -> float:
+    """vLLM's ``--gpu-memory-utilization`` for this arm.
+
+    Never the 0.95 pod-era default: that came from dedicated 96 GB pods
+    (docs/vllm-eval-status.md:1037) and here would evict whisper-writer, which
+    Leo requires resident (PRD D10).
+
+    The share is what vLLM takes FOR ITSELF -- confirmed by measurement, not
+    read off the docs: derived 0.682 of a 24576 MiB card, the qwen3-embedding
+    -0.6b container's resident delta was 16603 MiB against the 16761 MiB the
+    share allows.  vLLM then sizes its paged KV cache to fill whatever is left
+    after weights, so this one number is also the arm's KV bound.
+
+    That splits the two axes, because they want opposite things:
+
+    * A **generate** arm needs KV -- it is the context window.  Its share comes
+      from the live free reading, so an emptier card buys real headroom.
+    * A **pooling** arm cannot read a KV cache at all, yet vLLM still hands a
+      DECODER-based embedder one sized to fill the share.  Measured on
+      qwen3-embedding-0.6b: weights 1.12 GiB, overhead 0.42 GiB, KV cache
+      14.56 GiB (136,272 tokens) -- a 0.6B model taking 16.2 GiB, all but
+      1.5 GiB of it unusable.  Encoder embedders (granite-r2, gte-modernbert)
+      never showed it, which is why the slate hid the effect until the two
+      decoder arms ran.  So a pooling arm is held to the footprint it declared
+      in ``arms.yaml``, plus the same safety margin the pre-flight uses.
+
+    Bounding it here rather than via ``--kv-cache-memory-bytes`` keeps
+    ``est_vram_gib`` load-bearing: the pre-flight (:func:`lms_vram.arm_fits`)
+    already admits an arm on the strength of that number, and an arm that then
+    ignored it would make the pre-flight's arithmetic false as soon as two arms
+    were considered together.  An arm whose declared footprint is genuinely too
+    small now fails LOUDLY at startup instead of silently eating the card.
+    """
+    if arm.axis == 'embedding':
+        return lms_vram.gpu_memory_utilization_for(
+            arm.est_vram_gib + lms_vram.SAFETY_MARGIN_GIB, gpu.total_gib,
+        )
+    return lms_vram.gpu_memory_utilization_for(gpu.free_gib, gpu.total_gib)
+
+
 def _vllm_argv(arm: ArmEntry, gpu: lms_vram.GpuReading) -> list[str]:
     argv = _docker_preamble(arm, f'{HOST_HF_CACHE}:{CONTAINER_HF_CACHE}')
     argv += ['-e', f'HF_HOME={CONTAINER_HF_CACHE}']
@@ -112,11 +152,7 @@ def _vllm_argv(arm: ArmEntry, gpu: lms_vram.GpuReading) -> list[str]:
     argv += [
         '--max-model-len', str(arm.max_model_len),
         '--max-num-seqs', str(arm.max_num_seqs),
-        # Derived from the LIVE reading, never the 0.95 pod-era default: that
-        # came from dedicated 96 GB pods (docs/vllm-eval-status.md:1037) and
-        # here would evict whisper-writer, which Leo requires resident (D10).
-        '--gpu-memory-utilization',
-        str(lms_vram.gpu_memory_utilization_for(gpu.free_gib, gpu.total_gib)),
+        '--gpu-memory-utilization', str(_memory_share_for(arm, gpu)),
         '--host', '0.0.0.0',
         '--port', str(CONTAINER_PORT),
     ]

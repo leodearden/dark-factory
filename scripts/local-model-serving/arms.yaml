@@ -183,7 +183,16 @@ arms:
     port: 8414
     served_model_name: qwen3-embedding-0.6b
     structured_output_mode: none
-    est_vram_gib: 2.0
+    # MEASURED 2026-08-06, not estimated.  This arm is a DECODER that emits
+    # embeddings, so vLLM gives it a paged KV cache; lms_serve bounds a pooling
+    # arm's --gpu-memory-utilization to est_vram_gib + 0.5, which makes this
+    # number the arm's real ceiling rather than a decorative annotation.
+    # Breakdown at that bound: 1.64 GiB non-KV (1.12 weights + 0.30 peak
+    # activation + 0.05 non-torch + 0.07 CUDA graph) and 0.88 GiB of KV to hold
+    # one 8192-token sequence.  The original 2.0 guess granted only 0.86 GiB of
+    # KV and vLLM refused to start -- loudly, naming the 8032-token ceiling it
+    # could actually serve.  3.0 leaves ~1.9 GiB of KV, room to batch.
+    est_vram_gib: 3.0
     max_model_len: 8192
     max_num_seqs: 32
     dims: 1024
@@ -225,7 +234,11 @@ arms:
     port: 8416
     served_model_name: qwen3-embedding-4b
     structured_output_mode: none
-    est_vram_gib: 9.0
+    # MEASURED 2026-08-06 (see qwen3-embedding-0.6b for the mechanism): a
+    # decoder embedder, so the pooling bound above applies here too.  ~8.0 GiB
+    # of fp16 weights plus ~0.5 GiB of overhead leaves the original 9.0 guess
+    # only ~1.0 GiB of KV, under the ~1.2 GiB one 8192-token sequence needs.
+    est_vram_gib: 10.0
     max_model_len: 8192
     max_num_seqs: 8
     dims: 2560

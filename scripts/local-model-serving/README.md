@@ -358,9 +358,10 @@ download anonymous and fail only later, only on the gated repos.
 Measured in step 22, unresolved here on purpose — it is a design question, not a
 bug to be quietly patched under an anti-fabrication gate.
 
-Every arm measured so far answers correctly, and **every vLLM arm nonetheless
-fails the VRAM verdict**, because two budget notions in this package disagree
-about their subject:
+Every arm measured so far answers correctly, and the **LLM** arms nonetheless
+fail the VRAM verdict, because two budget notions in this package disagree
+about their subject (the *embedding* arms listed here failed for a second,
+independent reason that has since been fixed — see below):
 
 | check | subject | ceiling | `qwen3-embedding-0.6b` |
 |---|---|---|---|
@@ -384,22 +385,73 @@ Under the total-usage reading the real per-arm allowance collapses to
 weights) and `moe-stretch` (13.27 GiB) off the slate on a technicality, while
 both fit the 16.4 GiB the card actually has free.
 
-Two changes are needed and neither is a one-line edit, which is why they are
-recorded rather than rushed:
+Two changes were needed. **The second has since landed**, and landing it
+changed the shape of the first — so read the two parts below in order.
 
-1. **`evaluate_budget` should judge the arm's footprint** (`used − baseline`)
-   against the measured operating budget, not total usage against the nominal
-   ceiling. `lms_vram.MEASURED_BASELINE_GIB` (7.19) already exists for this.
-   `test_lms_verification_artifact.py`'s `used_mib <= nominal_ceiling` assertion
-   moves with it — deliberately called out, because relaxing an assertion inside
-   the anti-fabrication gate is exactly the move that needs a reviewer, not an
-   agent acting alone.
-2. **vLLM arms need `--kv-cache-memory` bounded per arm** so a 0.6B embedder
-   cannot take 14.56 GiB of unusable KV cache. Until then `est_vram_gib` is
-   decorative for decoder-based arms and the pre-flight's arithmetic is false.
+### RESOLVED: the pooling arms' KV balloon (landed 2026-08-06)
 
-Until both land, `lms_healthcheck` exits 3 (budget) rather than 0 for any vLLM
-arm, and `verification/health-report.json` cannot honestly be greened. Hand-
+vLLM sizes its paged KV cache to fill whatever `--gpu-memory-utilization`
+allows, and it does that for a **decoder** model served under `--runner
+pooling` even though a pooling model can never read a KV cache. Derived from
+free VRAM, `qwen3-embedding-0.6b` was handed 0.682 (16.37 GiB) and filled it:
+1.12 GiB of weights, 0.42 GiB of overhead, and **14.56 GiB of unusable KV**.
+
+`lms_serve._memory_share_for` now bounds a **pooling** arm to
+`est_vram_gib + SAFETY_MARGIN_GIB`, while a **generate** arm keeps the
+free-VRAM-derived share — the two axes want opposite things, because for an
+LLM arm the KV cache *is* the context window. Bounding via the share rather
+than `--kv-cache-memory-bytes` keeps `est_vram_gib` load-bearing: the
+pre-flight already admits an arm on the strength of that number, so an arm that
+then ignored it made the pre-flight's arithmetic false as soon as two arms were
+considered together.
+
+Measured before → after, same chain, same probe:
+
+| arm | resident before | verdict before | resident after | verdict after |
+|---|---|---|---|---|
+| `qwen3-embedding-0.6b` | 16603 MiB | FAIL, 23.35 GiB | **3602 MiB** | **PASS**, 10.66 GiB |
+| `qwen3-embedding-4b` | 16078 MiB | FAIL, 23.35 GiB | **10102 MiB** | **PASS**, 17.00 GiB |
+
+Both still answer with a valid vector of their declared length (685 ms / 783 ms).
+**Both now pass under the existing total-usage semantics**, so this half needed
+no gate change at all — it was a bug, and it is fixed.
+
+It also made `est_vram_gib` honest for these two arms, which measurement showed
+were *under*-declared: the bound is real, so a too-small declaration now fails
+loudly at startup (`ValueError: To serve at least one request with the model's
+max seq len (8192), 0.88 GiB KV cache is needed, ... available 0.86 GiB`,
+naming the 8032-token ceiling it could actually serve) instead of silently
+eating the card. `0.6b` moved 2.0 → 3.0 and `4b` 9.0 → 10.0 on that evidence.
+
+### STILL OPEN: the verdict's subject, now purely an LLM-arm question
+
+What remains is **not** a KV bug and cannot be fixed the same way, because an
+LLM arm's KV cache is load-bearing. Measured on the cheapest LLM arm:
+
+| arm | resident | total card | probe | vram verdict |
+|---|---|---|---|---|
+| `qwen3.5-9b` | 14961 MiB | **21.75 GiB** | PASS, 3045 ms | **FAIL** (> 19.5) |
+
+So the conflict is real and survives the KV fix: this arm serves
+schema-constrained completions correctly and still fails, because the
+free-derived share (16.37 GiB) plus the 7.31 GiB desktop+whisper baseline
+exceeds the nominal 19.5 GiB ceiling. It is not specific to the big arms —
+a 9B AWQ declaring `est_vram_gib: 6.0` already blows it.
+
+The fix is the subject correction: **`evaluate_budget` should judge the arm's
+footprint** (`used − baseline`) against the measured operating budget, not
+total usage against the nominal ceiling. `lms_vram.MEASURED_BASELINE_GIB`
+(7.19) already exists for this. `test_lms_verification_artifact.py`'s
+`used_mib <= nominal_ceiling` assertion moves with it — deliberately called
+out, because changing an assertion inside the anti-fabrication gate is exactly
+the move that needs a reviewer, not an agent acting alone. (Its stated purpose
+is *internal consistency* — "the verdict and the numbers it was computed from
+disagree" — so the corrected form is the same check against the corrected
+subject rather than a weaker one. That reading still wants a second pair of
+eyes, which is why it is written here and not applied.)
+
+Until that lands, `lms_healthcheck` exits 3 (budget) rather than 0 for the LLM
+arms, and `verification/health-report.json` cannot honestly be greened. Hand-
 editing a PASS row to get there is precisely what the gate exists to prevent.
 
 ---
