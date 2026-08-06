@@ -42,6 +42,7 @@ from pathlib import Path
 
 import pytest
 
+import lms_vram
 from lms_healthcheck import REPORT_SCHEMA_VERSION, HealthReport
 from lms_manifest import load_arms
 
@@ -247,9 +248,31 @@ def test_vram_block_passes_within_the_recorded_budget(report: HealthReport) -> N
         f'reported footprint {vram.arm_footprint_mib}; the block was assembled, '
         'not measured'
     )
-    assert vram.total_mib == vram.used_mib + vram.free_mib, (
-        'total/used/free do not add up, so the block was not produced by a '
-        'single nvidia-smi reading'
+    # This assertion USED to read `total == used + free`, and that premise is
+    # false about the instrument.  nvidia-smi reserves memory for the driver/ECC
+    # that belongs to NEITHER `used` nor `free`: measured on this card,
+    # `memory.reserved` is 455 MiB against a 454 MiB shortfall in the artifact.
+    #
+    # The producer already knew.  lms_vram documents it verbatim -- "used + free
+    # never sums exactly to total (driver/ECC reserve ~450 MiB here)" -- and
+    # tolerates it with _COHERENCE_TOLERANCE.  The two halves of this package
+    # disagreed, and nothing could notice until an artifact existed to check.
+    # The constant is IMPORTED rather than restated so they cannot drift apart
+    # again.
+    #
+    # Bounded on BOTH sides, which the original was not: a NEGATIVE shortfall
+    # (used + free exceeding total) is impossible from one reading and is the
+    # signature of a block assembled from separate ones.  So this is a tighter
+    # fabrication check than the identity it replaces, not a looser one -- it
+    # rejects everything the old form rejected except the one case the old form
+    # got wrong.
+    shortfall = vram.total_mib - (vram.used_mib + vram.free_mib)
+    assert 0 <= shortfall <= lms_vram._COHERENCE_TOLERANCE * vram.total_mib, (
+        f'total={vram.total_mib} minus used={vram.used_mib} plus '
+        f'free={vram.free_mib} leaves {shortfall} MiB unaccounted for. A small '
+        'positive shortfall is the driver/ECC reserve; a negative or large one '
+        'means the block was assembled from separate readings, or the fields '
+        'were transposed'
     )
 
 
