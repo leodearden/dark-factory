@@ -1,0 +1,128 @@
+"""Flake ledger — occurrence trail and debt set (plans/flake-ledger-prd.md, task α).
+
+Two tables in the project's existing ``data/orchestrator/runs.db``:
+
+- ``flake_occurrence`` — append-only; MANY rows per test.  The evidence trail: every
+  time a discriminator judged a failing test, what it concluded, where it ran, and
+  what the host pressure was at that moment.
+- ``flake_debt`` — ONE row per test.  The set the invariant governs: a test that has
+  been suppressed owes a de-flake task, and the row carries the ledger-owned clock
+  (``opened_at``/``resolved_at``) that ``.taskmaster/tasks/tasks.db`` cannot supply
+  (§5.4 — that store has no ``created_at``, and ``planning_mode=True`` bypasses the
+  curator ticket store entirely).
+
+Living in the shared ``orchestrator`` package, on a DB every client project already
+has, is what hands this facility to all 8 projects with ZERO provisioning: the tables
+appear on first write via ``CREATE TABLE IF NOT EXISTS``, with no migration to sequence
+(§5.2).
+
+TWO BINDING CONTRACTS, both machine-checked:
+
+1. **Writes go only through this API** — ``record_flake_occurrence`` / ``open_debt`` /
+   ``resolve_debt``, never raw SQL at a call site (§5.2).  Four call sites hand-rolling
+   INSERTs is exactly how the two merge gates would drift into different notions of the
+   verdict vocabulary.
+2. **No public entry point ever raises** (§8.3, boundary row B12).  The merge path has
+   no ``VerifyInfraError`` handler, so an uncaught raise here stalls the merge queue —
+   a ledger failure must never fail a verify or a merge.  Every entry point degrades to
+   an honest value (``None`` / ``[]``) and logs LOUDLY with ``exc_info``; it never fails
+   silently.  This mirrors ``chronic_flake``'s catch-all-defensive contract.
+
+RETENTION — a named, accepted position, not an oversight (§5.2, §11 Q1).  ``flake_debt``
+is bounded by construction (one row per test); resolved rows are retained DELIBERATELY
+because the recurrence trigger reads them, so deleting one would silently disarm it.
+``flake_occurrence`` is append-only and UNPRUNED, bounded exactly the way ``events`` is
+— i.e. it isn't.  That is consistent with the rest of ``runs.db``, where nothing is
+pruned.  Do NOT add bespoke pruning for one table here; revisit repo-wide when ``events``
+retention is addressed.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from pathlib import Path
+
+from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
+
+logger = logging.getLogger(__name__)
+
+# PRD §5.3 verbatim.  Additive `CREATE TABLE IF NOT EXISTS` with no `PRAGMA
+# user_version` ladder — the event_store.py:23-41 / run_store.py:18-76 idiom, and
+# what makes the ledger a well-behaved fifth owner of an existing runs.db.
+_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS flake_occurrence (   -- append-only; many rows per test; the evidence trail
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    observed_at     TEXT    NOT NULL,   -- ISO-8601 UTC, LEDGER-OWNED (§5.4)
+    test_id         TEXT    NOT NULL,   -- pytest node-id, or script-suite test name
+    project_id      TEXT    NOT NULL,   -- denormalised: the dashboard aggregates across runs.db files
+    verdict         TEXT    NOT NULL,   -- passes_in_isolation | fails_in_isolation | unconfirmable
+    call_site       TEXT    NOT NULL,   -- merge_gate | main_probe | chronic_marker
+    runner          TEXT,               -- 'local' | remote host name — WHERE the discriminator ran
+    merge_sha       TEXT,
+    task_id         TEXT,
+    psi_cpu_some10  REAL,               -- host pressure AT observation (shared.psi), NULL if read_ok=False
+    detail          TEXT    DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS flake_debt (         -- ONE row per test; the set the invariant governs
+    test_id                 TEXT PRIMARY KEY,   -- runs.db is per-project, so test_id alone is the key
+    project_id              TEXT NOT NULL,
+    opened_at               TEXT NOT NULL,      -- LEDGER-OWNED
+    resolved_at             TEXT,               -- NULL while open
+    owner_task_id           TEXT,               -- the non-terminal de-flake task (§5.5)
+    open_count              INTEGER NOT NULL DEFAULT 1,
+    prior_resolved_at       TEXT,               -- previous cycle — feeds the recurrence trigger
+    prior_resolving_commit  TEXT,               -- cited verbatim in the regressed_after_resolution L2
+    last_occurrence_at      TEXT NOT NULL
+);
+
+-- §8.3's idempotency key, enforced declaratively: a replayed merge-path write must
+-- land one row, not two.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flake_occurrence_dedup
+    ON flake_occurrence(test_id, observed_at, call_site);
+
+-- Serves the windowed rate reads (unconfirmable rate, suppressions-in-window).
+CREATE INDEX IF NOT EXISTS idx_flake_occurrence_observed
+    ON flake_occurrence(observed_at);
+"""
+
+
+def ledger_db_path(project_root: Path) -> Path:
+    """The project's ``runs.db``.
+
+    One spelling of a literal that is hand-built at 5+ sites today (harness.py:2119 and
+    friends) with no shared helper, so the ledger's consumers do not each re-derive it.
+    """
+    return project_root / 'data' / 'orchestrator' / 'runs.db'
+
+
+def _connect(db_path: Path) -> sqlite3.Connection:
+    """Open a ledger connection with the full durability pragma triad applied.
+
+    Byte-identical to the two existing ``runs.db`` owners (event_store.py:512,
+    run_store.py:90) — no new pragma policy and no second durability story.  The 5s
+    ``busy_timeout`` is what absorbs concurrent merge-lane contention, in place of a
+    hand-rolled lock.
+    """
+    conn = sqlite3.connect(str(db_path))
+    apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+    return conn
+
+
+def ensure_schema(db_path: Path) -> None:
+    """Create both ledger tables and their indexes if absent.  Additive and idempotent.
+
+    Called by every public entry point rather than once in a constructor: the API is
+    free functions taking a ``db_path`` (§8.3) because the recorder is called from
+    stateless merge-path sites and a CLI, neither of which holds a long-lived store
+    object.  ``CREATE TABLE IF NOT EXISTS`` is cheap and merge-path call frequency is a
+    handful per hour, so this is deliberately NOT memoized — a per-path cache would go
+    stale the moment the DB file is replaced or removed.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _connect(db_path)
+    try:
+        conn.executescript(_SCHEMA)
+    finally:
+        conn.close()
