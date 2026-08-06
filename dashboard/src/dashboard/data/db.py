@@ -110,6 +110,17 @@ class DbPool:
         # Growth is bounded; see class docstring for the structural argument.
         self._open_locks: dict[Path, asyncio.Lock] = {}
         self._open_locks_lock: asyncio.Lock = asyncio.Lock()
+        # Fire-and-forget close tasks scheduled by _adopt_or_close, tracked
+        # PER INSTANCE as well as in the module-global _PENDING_CLOSES.  The two
+        # sets have distinct jobs and neither subsumes the other, so do not
+        # "tidy" either away:
+        #   * _PENDING_CLOSES (module-global) is what survives if the DbPool
+        #     itself is garbage-collected while a close is in flight — the event
+        #     loop holds only a WEAK reference to a Task.
+        #   * _pending_closes (this one) is the only handle close_all() has on
+        #     those tasks, and gathering them is what makes "close_all() has
+        #     returned" mean "every close it caused has finished".
+        self._pending_closes: set[asyncio.Task] = set()
 
     async def get(self, db_path: Path) -> aiosqlite.Connection | None:
         """Return a cached connection, opening one lazily if needed.
@@ -325,8 +336,18 @@ class DbPool:
             )
             return
         close_task = loop.create_task(self._close_once(conn, path))
+        # Registered in BOTH sets — see the __init__ comment for why neither is
+        # redundant.
         _PENDING_CLOSES.add(close_task)
+        self._pending_closes.add(close_task)
         close_task.add_done_callback(_discard_pending_close)
+        close_task.add_done_callback(self._discard_pending_close)
+
+    def _discard_pending_close(self, task: asyncio.Task) -> None:
+        """Per-instance mirror of the module-level :func:`_discard_pending_close`."""
+        self._pending_closes.discard(task)
+        if not task.cancelled():
+            task.exception()  # consume so "exception was never retrieved" isn't logged
 
     @property
     def open_count(self) -> int:
@@ -385,7 +406,20 @@ class DbPool:
             await self._close_once(task.result(), inflight[task])
 
     async def close_all(self) -> None:
-        """Close every managed connection and clear the pool."""
+        """Close every managed connection and clear the pool.
+
+        **Invariant on return**: every connection this pool caused to exist has
+        been CLOSED — including ones that were still being opened, and ones
+        adopted from a cancelled getter after the drain budget expired.  The
+        sole exception is an in-flight CONNECT that exceeded
+        ``_INFLIGHT_DRAIN_TIMEOUT``, which :meth:`_drain_inflight` reports at
+        WARNING with its path rather than dropping silently.
+
+        That invariant is what callers rely on to tear the event loop down
+        immediately afterwards: aiosqlite's worker signals completion via
+        ``call_soon_threadsafe``, so any close still in flight when the loop
+        closes leaves its (non-daemon) thread stranded.
+        """
         # Set before iterating so any concurrent get() that acquires a per-path
         # lock after we clear _conns will see _closed=True and return None rather
         # than re-populating a pool that is supposed to be drained.
@@ -398,6 +432,15 @@ class DbPool:
         self._conns.clear()
         # Clear per-path locks to prevent unbounded growth across distinct paths.
         self._open_locks.clear()
+        # Join the closes _adopt_or_close scheduled but nobody awaited.  A
+        # straggler connect that missed the drain budget lands in still_pending,
+        # not done, so _drain_inflight never awaits it; if it lands while the
+        # loop above is running, this is the ONLY handle on its close.
+        # return_exceptions=True so one failed close cannot abort the rest of
+        # shutdown.
+        pending = tuple(self._pending_closes)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def with_db(
