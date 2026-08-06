@@ -3200,6 +3200,145 @@ class TestRenderMarkdown:
         assert 'e2_arm_claims.jsonl' in rendered
 
 
+_STORED_COLUMN = 'canonical in top-5 (stored)'
+
+
+def _cells(row: str) -> list[str]:
+    """`| a | b |` -> `['a', 'b']`."""
+    return [cell.strip() for cell in row.strip().strip('|').split('|')]
+
+
+def _by_kind_table(rendered: str) -> tuple[list[str], list[str]]:
+    """The by-query-kind table's (header cells, data rows).
+
+    Located by the renderer-emitted `## By query kind` heading rather than by
+    a line index, so it does not move when a paragraph above it does.  The
+    decision table's header ALSO starts with `| arm `, which is why the
+    search starts at the heading.
+    """
+    lines = rendered.splitlines()
+    start = lines.index('## By query kind')
+    header_at = next(
+        i for i, line in enumerate(lines[start:], start)
+        if line.startswith('| arm ')
+    )
+    rows = []
+    for line in lines[header_at + 2:]:  # skip the header and its `| --- |`
+        if not line.startswith('| '):
+            break
+        rows.append(line)
+    return _cells(lines[header_at]), rows
+
+
+class TestTheTransformBlindColumnReachesTheTables:
+    """The disclosure has to be beside the number it qualifies.
+
+    A caveat three sections away from `canonical in top-5` is not a caveat on
+    that column — gate η reads the decision table, and the single biggest
+    number in it is the one the grouped read credits.  So the transform-blind
+    rate is a COLUMN, immediately after its transform-credited twin, in the
+    headline table and in the by-kind table both.
+    """
+
+    def test_the_stored_column_sits_immediately_after_the_one_it_qualifies(self):
+        columns = _mod().DECISION_TABLE_COLUMNS
+
+        assert _STORED_COLUMN in columns
+        assert columns.index(_STORED_COLUMN) == \
+            columns.index('canonical in top-5') + 1
+
+    def test_the_rendered_header_is_still_the_pinned_column_set(self):
+        """The invariant the committed artifact is already held to, asserted
+        here on a synthetic report so a column added to the constant without
+        being rendered fails at the unit level rather than at regeneration."""
+        mod = _mod()
+
+        rendered = mod.render_markdown(_report())
+        header = next(
+            line for line in rendered.splitlines() if line.startswith('| arm ')
+        )
+
+        assert header == '| ' + ' | '.join(mod.DECISION_TABLE_COLUMNS) + ' |'
+
+    def test_each_arms_cell_comes_from_the_stored_rate(self):
+        """Located by column NAME, never by a hardcoded index.
+
+        The fixture's stored rate (0.40) differs from its transform-credited
+        neighbour (0.70) on purpose: a cell wired to the wrong key would
+        otherwise print a plausible number and pass.
+        """
+        mod = _mod()
+        report = _report()
+        column = mod.DECISION_TABLE_COLUMNS.index(_STORED_COLUMN)
+        neighbour = mod.DECISION_TABLE_COLUMNS.index('canonical in top-5')
+
+        rows = _decision_table_rows(mod.render_markdown(report))
+
+        assert rows
+        for row in rows:
+            cells = _cells(row)
+            arm = cells[0]
+            expected = report['arms'][arm]['discoverability'][
+                'stored_canonical_in_top_5_rate']
+            # Same precision as the column it qualifies — two numbers a
+            # reader is meant to compare must not be formatted differently.
+            assert cells[column] == f'{expected:.2f}'
+            assert cells[column] != cells[neighbour]
+
+    def test_an_unmeasured_stored_rate_renders_as_no_measurement(self):
+        """`—`, never `0.00`.  On THIS column a printed zero would read as
+        "retrieval never found the canonical", which is a finding — and the
+        opposite of "we did not measure"."""
+        mod = _mod()
+        arms = _all_arms()
+        arms['status_quo']['discoverability'][
+            'stored_canonical_in_top_5_rate'] = None
+        report = mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+        column = mod.DECISION_TABLE_COLUMNS.index(_STORED_COLUMN)
+
+        row = next(
+            line for line in _decision_table_rows(mod.render_markdown(report))
+            if line.startswith('| status_quo |')
+        )
+
+        assert _cells(row)[column] == mod._NO_MEASUREMENT
+
+    def test_the_by_kind_table_carries_the_column_too(self):
+        """`held_out` is the row that measures generalisation, and it is
+        exactly the row where a transform-credited number is least safe to
+        read alone."""
+        mod = _mod()
+        report = _report()
+
+        header, rows = _by_kind_table(mod.render_markdown(report))
+        column = header.index(_STORED_COLUMN)
+
+        assert header.index('canonical in top-5') + 1 == column
+        assert rows
+        for row in rows:
+            cells = _cells(row)
+            arm, kind = cells[0], cells[1]
+            expected = report['arms'][arm]['by_query_kind'][kind][
+                'discoverability']['stored_canonical_in_top_5_rate']
+            assert cells[column] == f'{expected:.2f}'
+
+    def test_every_data_row_has_exactly_as_many_cells_as_its_header(self):
+        """A column added to a header but not to the row builder shifts every
+        cell after it one place left, and the table still LOOKS well-formed."""
+        mod = _mod()
+        rendered = mod.render_markdown(_report())
+
+        decision_rows = _decision_table_rows(rendered)
+        for row in decision_rows:
+            assert len(_cells(row)) == len(mod.DECISION_TABLE_COLUMNS)
+
+        header, by_kind_rows = _by_kind_table(rendered)
+        for row in by_kind_rows:
+            assert len(_cells(row)) == len(header)
+
+
 class TestTheTwoArtifactsAreWrittenAsAPair:
     """Each file is written atomically; the PAIR has to be atomic too.
 
