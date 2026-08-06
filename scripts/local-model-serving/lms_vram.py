@@ -67,6 +67,14 @@ _NVIDIA_SMI_QUERY = [
     '--format=csv,noheader,nounits',
 ]
 
+#: Deliberately NOT `nounits`: neither field is numeric, and a driver version
+#: is a dotted string that `nounits` would leave untouched anyway.
+_NVIDIA_SMI_IDENTITY_QUERY = [
+    'nvidia-smi',
+    '--query-gpu=name,driver_version',
+    '--format=csv,noheader',
+]
+
 _INTEGER = re.compile(r'^\d+$')
 
 #: used + free never sums exactly to total (driver/ECC reserve ~450 MiB here),
@@ -107,6 +115,30 @@ class GpuReading(BaseModel):
     @property
     def free_gib(self) -> float:
         return round(self.free_mib / MIB_PER_GIB, 2)
+
+
+class GpuIdentity(BaseModel):
+    """Which card and driver a measurement was taken on.
+
+    Not decoration.  Every verdict in a health report is relative to a specific
+    GPU -- the same manifest on a different card gives different answers -- so
+    an artifact that does not name its hardware cannot be compared with another
+    or trusted a month later.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    driver_version: str
+
+
+class GpuSnapshot(BaseModel):
+    """One atomic "what the GPU is and what it currently holds"."""
+
+    model_config = ConfigDict(frozen=True)
+
+    identity: GpuIdentity
+    reading: GpuReading
 
 
 class BudgetVerdict(BaseModel):
@@ -198,6 +230,65 @@ def probe_gpu(runner: GpuRunner | None = None) -> GpuReading:
             f'could not run {" ".join(_NVIDIA_SMI_QUERY)}: {exc}'
         ) from exc
     return parse_nvidia_smi_csv(output)
+
+
+def parse_nvidia_smi_identity_csv(text: str) -> GpuIdentity:
+    """Parse one `--query-gpu=name,driver_version --format=csv,noheader` row.
+
+    Held to the same standard as the memory parser: an unreadable identity
+    raises rather than defaulting to ``'unknown'``.  A health artifact whose
+    provenance says "unknown" is worse than one that does not exist -- the same
+    manifest measured on a different card produces different verdicts, so an
+    unattributed report invites exactly the cross-host comparison it cannot
+    support.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise VramProbeError(
+            'nvidia-smi returned no GPU identity row; refusing to attribute a '
+            'health report to an unidentified card'
+        )
+    if len(lines) > 1:
+        raise VramProbeError(
+            f'nvidia-smi returned {len(lines)} GPU identity rows ({lines!r}); this '
+            'rig assumes a single GPU'
+        )
+
+    fields = [field.strip() for field in lines[0].split(',')]
+    if len(fields) != 2:
+        raise VramProbeError(
+            f'expected 2 comma-separated fields (name, driver_version), got '
+            f'{len(fields)} in {lines[0]!r}'
+        )
+    if not all(fields) or any(field.startswith('[N/A') for field in fields):
+        raise VramProbeError(
+            f'nvidia-smi GPU identity row {lines[0]!r} carries an empty or [N/A] '
+            'field; the report would then name no card at all'
+        )
+
+    return GpuIdentity(name=fields[0], driver_version=fields[1])
+
+
+def probe_gpu_identity(runner: GpuRunner | None = None) -> GpuIdentity:
+    """Read which card and driver this host is measuring on."""
+    run = runner if runner is not None else _default_runner
+    try:
+        output = run(list(_NVIDIA_SMI_IDENTITY_QUERY))
+    except Exception as exc:
+        raise VramProbeError(
+            f'could not run {" ".join(_NVIDIA_SMI_IDENTITY_QUERY)}: {exc}'
+        ) from exc
+    return parse_nvidia_smi_identity_csv(output)
+
+
+def probe_gpu_snapshot(runner: GpuRunner | None = None) -> GpuSnapshot:
+    """Identity plus a live memory reading, as one value.
+
+    Two nvidia-smi calls rather than one wide query, so the strict three-field
+    memory parser -- the one whose failure would misreport the budget -- keeps
+    its exact shape and its existing coverage.
+    """
+    return GpuSnapshot(identity=probe_gpu_identity(runner), reading=probe_gpu(runner))
 
 
 def gpu_memory_utilization_for(budget_gib: float, total_gib: float) -> float:

@@ -38,15 +38,22 @@ provides, while `jsonschema` is declared by no workspace member.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import sys
 import time
+from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from lms_manifest import ArmEntry
+import lms_ctl
+import lms_vram
+from lms_manifest import ArmEntry, ArmManifestError, load_arms
 
 #: Per-request ceiling for the readiness/identity GET.  A plain float, never an
 #: `httpx.Timeout` object: the shared test fake (scripts/tests/conftest.py)
@@ -598,3 +605,307 @@ def probe_embedding_arm(arm: ArmEntry) -> ProbeResult:
         timeout_s=EMBEDDING_TIMEOUT_S,
         verify=verify_embedding_response,
     )
+
+
+def probe_arm(arm: ArmEntry) -> ProbeResult:
+    """Dispatch one arm to its axis's probe."""
+    if arm.axis == 'embedding':
+        return probe_embedding_arm(arm)
+    return probe_llm_arm(arm)
+
+
+# ---------------------------------------------------------------------------
+# The report
+#
+# ONE structure, rendered two ways.  The JSON artifact is what step 21's
+# verification test and the downstream eval tasks read; the table is what an
+# operator reads.  Both come from the object below and nothing else, so they
+# cannot disagree about what was measured.
+# ---------------------------------------------------------------------------
+
+#: Bump when the artifact's shape changes.  A consumer that finds an
+#: unrecognised version must refuse the file rather than reinterpret it.
+REPORT_SCHEMA_VERSION = 1
+
+EXIT_OK = 0
+#: At least one arm answered wrongly, or not at all.
+EXIT_ARM_FAILED = 1
+#: The manifest, or the arm id asked for, is wrong. Matches lms_ctl's code.
+EXIT_MANIFEST_ERROR = 2
+#: Every arm passed but total VRAM is outside the budget.  Distinct from
+#: EXIT_ARM_FAILED because the fix is different: stop something, don't debug a
+#: model.
+EXIT_VRAM_FAILED = 3
+#: nvidia-smi is missing or unreadable, so nothing was measured.
+EXIT_PROBE_ERROR = 4
+#: `--active` found no running units.  Non-zero on purpose: a sweep that
+#: measured NOTHING must never be mistaken for a sweep where everything passed.
+EXIT_NO_ACTIVE_ARMS = 5
+
+
+class GpuBlock(BaseModel):
+    """Which hardware these verdicts belong to."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    driver_version: str
+    total_mib: int
+
+
+class ArmRow(BaseModel):
+    """One arm's line in the report."""
+
+    model_config = ConfigDict(frozen=True)
+
+    arm_id: str
+    axis: str
+    stack: str
+    endpoint: str
+    served_model_name: str
+    verdict: Verdict
+    reason: Reason
+    detail: str
+    latency_ms: float
+
+
+class VramBlock(BaseModel):
+    """The budget answer, carrying both reference figures.
+
+    `nominal_ceiling_gib` is PRD D10's number and is what `verdict` is judged
+    against, because the PRD states its user-observable signal in those terms.
+    `operating_budget_gib` is what this host actually has free with
+    whisper-writer and the KDE/X11 desktop resident, and is what the per-arm
+    pre-flight enforces.  Reporting only one of the two would either hide the
+    deviation or assert capacity this host does not have.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    total_mib: int
+    used_mib: int
+    free_mib: int
+    used_gib: float
+    free_gib: float
+    nominal_ceiling_gib: float
+    operating_budget_gib: float
+    headroom_gib: float
+    verdict: Verdict
+    reason: str
+
+
+class HealthReport(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: int
+    measured_at: str
+    gpu: GpuBlock
+    arms: list[ArmRow]
+    vram: VramBlock
+    overall: Verdict
+
+
+def _now_iso() -> str:
+    """Timezone-AWARE UTC.  A naive stamp would make a stale artifact
+    indistinguishable from a fresh one, and this artifact's entire job is to
+    prove that a live run happened."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def run_healthcheck(
+    arms: Sequence[ArmEntry],
+    gpu_probe: Callable[[], lms_vram.GpuSnapshot] | None = None,
+    probe: Callable[[ArmEntry], ProbeResult] | None = None,
+) -> HealthReport:
+    """Probe every arm and assemble the report.
+
+    The GPU is read FIRST and its failure is allowed to propagate.  A swallowed
+    :class:`~lms_vram.VramProbeError` would produce a report whose vram block
+    reads `used 0 MiB, headroom 19.5 GiB` -- a passing budget with maximal
+    headroom off a dead probe, which is the most trustworthy-looking wrong
+    answer this rig can emit.  No report at all is strictly better.
+
+    Individual arm failures, by contrast, are recorded and the sweep continues:
+    aborting on the first dead arm would drop verdicts already measured for the
+    others and leave the report silently short of rows.
+    """
+    read_gpu = gpu_probe if gpu_probe is not None else lms_vram.probe_gpu_snapshot
+    probe_one = probe if probe is not None else probe_arm
+
+    snapshot = read_gpu()
+    reading = snapshot.reading
+
+    rows: list[ArmRow] = []
+    for arm in arms:
+        result = probe_one(arm)
+        rows.append(
+            ArmRow(
+                arm_id=arm.arm_id,
+                axis=arm.axis,
+                stack=arm.stack,
+                endpoint=arm.base_url,
+                served_model_name=arm.served_model_name,
+                verdict=result.verdict,
+                reason=result.reason,
+                detail=result.detail,
+                latency_ms=result.latency_ms,
+            )
+        )
+
+    budget = lms_vram.evaluate_budget(reading.used_mib, reading.total_mib)
+    vram = VramBlock(
+        total_mib=reading.total_mib,
+        used_mib=reading.used_mib,
+        free_mib=reading.free_mib,
+        used_gib=reading.used_gib,
+        free_gib=reading.free_gib,
+        nominal_ceiling_gib=budget.nominal_ceiling_gib,
+        operating_budget_gib=budget.operating_budget_gib,
+        headroom_gib=budget.headroom_gib,
+        verdict=budget.verdict,
+        reason=budget.reason,
+    )
+
+    everything_passed = (
+        all(row.verdict == 'PASS' for row in rows) and vram.verdict == 'PASS'
+    )
+    return HealthReport(
+        schema_version=REPORT_SCHEMA_VERSION,
+        measured_at=_now_iso(),
+        gpu=GpuBlock(
+            name=snapshot.identity.name,
+            driver_version=snapshot.identity.driver_version,
+            total_mib=reading.total_mib,
+        ),
+        arms=rows,
+        vram=vram,
+        overall='PASS' if everything_passed else 'FAIL',
+    )
+
+
+def exit_code_for(report: HealthReport) -> int:
+    """An arm failure outranks a budget failure: it is the more actionable of
+    the two, and the budget block is right there in the artifact either way."""
+    if any(row.verdict == 'FAIL' for row in report.arms):
+        return EXIT_ARM_FAILED
+    if report.vram.verdict == 'FAIL':
+        return EXIT_VRAM_FAILED
+    return EXIT_OK
+
+
+def render_table(report: HealthReport) -> str:
+    """Render the report for a human.
+
+    Takes the report and NOTHING else -- no arms, no manifest, no GPU -- so
+    there is nothing left for it to recompute and the text can never contradict
+    the JSON beside it.
+    """
+    headers = ('ARM', 'AXIS', 'STACK', 'ENDPOINT', 'VERDICT', 'REASON', 'MS')
+    rows = [
+        (
+            row.arm_id,
+            row.axis,
+            row.stack,
+            row.endpoint,
+            row.verdict,
+            str(row.reason),
+            f'{row.latency_ms:.0f}',
+        )
+        for row in report.arms
+    ]
+    widths = [
+        max(len(headers[i]), *(len(r[i]) for r in rows)) if rows else len(headers[i])
+        for i in range(len(headers))
+    ]
+
+    def line(cells: tuple[str, ...]) -> str:
+        return '  '.join(cell.ljust(widths[i]) for i, cell in enumerate(cells)).rstrip()
+
+    out = [
+        f'local model serving health — {report.measured_at}',
+        f'GPU: {report.gpu.name} (driver {report.gpu.driver_version}, '
+        f'{report.gpu.total_mib} MiB)',
+        '',
+        line(headers),
+        '  '.join('-' * w for w in widths),
+    ]
+    out.extend(line(row) for row in rows)
+    out.extend(
+        [
+            '',
+            f'VRAM {report.vram.verdict}: {report.vram.used_mib} MiB used / '
+            f'{report.vram.total_mib} MiB total, {report.vram.free_mib} MiB free',
+            f'  PRD D10 nominal ceiling: {report.vram.nominal_ceiling_gib} GiB '
+            f'(headroom {report.vram.headroom_gib} GiB)',
+            f'  measured operating budget on this host: '
+            f'{report.vram.operating_budget_gib} GiB',
+            f'  {report.vram.reason}',
+            '',
+            f'OVERALL: {report.overall}',
+        ]
+    )
+    for row in report.arms:
+        if row.verdict == 'FAIL':
+            out.append(f'  {row.arm_id}: {row.reason} — {row.detail}')
+    return '\n'.join(out)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog='lms_healthcheck',
+        description='Probe local model serving arms for VALID output (LME-alpha).',
+    )
+    selector = parser.add_mutually_exclusive_group(required=True)
+    selector.add_argument('--all', action='store_true', help='every arm in arms.yaml')
+    selector.add_argument('--arm', help='one arm by id')
+    selector.add_argument(
+        '--active', action='store_true',
+        help='only the arms whose lms-arm@ unit is currently running',
+    )
+    parser.add_argument('--output', help='write the JSON report to this path')
+    args = parser.parse_args(argv)
+
+    try:
+        manifest = load_arms()
+        if args.arm:
+            arms = [manifest.by_id(args.arm)]
+        elif args.active:
+            running = lms_ctl.active_arms()
+            arms = [a for a in manifest.arms if a.arm_id in running]
+        else:
+            arms = list(manifest.arms)
+    except ArmManifestError as exc:
+        print(f'lms_healthcheck: {exc}', file=sys.stderr)
+        return EXIT_MANIFEST_ERROR
+
+    if args.active and not arms:
+        # Deliberately not an empty PASS: nothing was measured, and saying so
+        # is the only honest outcome.  No artifact is written either — an
+        # empty report on disk would later read as "the slate was checked".
+        print('lms_healthcheck: no active arms — nothing was probed')
+        return EXIT_NO_ACTIVE_ARMS
+
+    try:
+        report = run_healthcheck(arms)
+    except lms_vram.VramProbeError as exc:
+        print(
+            f'lms_healthcheck: GPU probe failed, so no report was produced: {exc}',
+            file=sys.stderr,
+        )
+        return EXIT_PROBE_ERROR
+
+    print(render_table(report))
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        # `mode='json'` so the StrEnum reasons serialise as their string values:
+        # a python-mode dump emits a repr no downstream consumer can match on.
+        out_path.write_text(json.dumps(report.model_dump(mode='json'), indent=2) + '\n')
+        print(f'\nwrote {out_path}')
+
+    return exit_code_for(report)
+
+
+if __name__ == '__main__':  # pragma: no cover - process entry point
+    raise SystemExit(main())

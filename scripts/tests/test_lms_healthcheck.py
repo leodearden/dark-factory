@@ -34,12 +34,16 @@ No network is touched: every HTTP call goes through the shared
 """
 from __future__ import annotations
 
+import datetime as _datetime
+import inspect
 import json
 
 import pytest
 
+import lms_ctl
 import lms_healthcheck
 import lms_manifest
+import lms_vram
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -832,12 +836,6 @@ def test_probe_embedding_arm_fails_on_a_non_200(install_fake_httpx):
 # ===========================================================================
 
 
-import datetime as _datetime
-import inspect
-
-import lms_ctl
-import lms_vram
-
 MEASURED_TOTAL_MIB = 24576
 MEASURED_USED_MIB = 7362
 MEASURED_FREE_MIB = 16761
@@ -847,7 +845,7 @@ def _snapshot(
     used_mib=MEASURED_USED_MIB,
     total_mib=MEASURED_TOTAL_MIB,
     free_mib=MEASURED_FREE_MIB,
-) -> object:
+) -> lms_vram.GpuSnapshot:
     """The measured host reading, as one injected GPU snapshot."""
     return lms_vram.GpuSnapshot(
         identity=lms_vram.GpuIdentity(
@@ -859,7 +857,7 @@ def _snapshot(
     )
 
 
-def _over_budget_snapshot() -> object:
+def _over_budget_snapshot() -> lms_vram.GpuSnapshot:
     """21000 MiB used -- past PRD D10's 19.5 GiB nominal ceiling."""
     return _snapshot(used_mib=21000, free_mib=MEASURED_TOTAL_MIB - 21000)
 
