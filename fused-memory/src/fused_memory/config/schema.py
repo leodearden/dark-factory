@@ -483,13 +483,25 @@ class ProceduralTopicCluster(BaseModel):
     """One known-contradictory procedural_knowledge topic for the write-time topic guard.
 
     A cluster is matched deterministically: an incoming ``procedural_knowledge``
-    add_memory write whose (lowercased) content contains at least
-    ``min_phrase_hits`` DISTINCT ``phrases`` is soft-blocked, routing the writer
+    add_memory write is soft-blocked when its (lowercased) content contains
+    EITHER at least ``min_phrase_hits`` DISTINCT ``phrases``, OR any single
+    phrase listed in ``sufficient_phrases``. A blocked write routes the writer
     to consolidate/update the existing entries or add context to the human gate
     task named in ``hint`` -- instead of accumulating another paraphrased,
     below-cosine-threshold restatement the semantic near-dup guard cannot catch
     (task 2845). ``extra='forbid'`` so a mistyped cluster key fails loud at config
     load/reload, never silently matches nothing.
+
+    The ``sufficient_phrases`` arm (task 3054) exists because hits do NOT
+    aggregate across clusters: a write touching one distinctive phrase in each
+    of several clusters reached no cluster's ``min_phrase_hits`` and was blocked
+    by none, even though each phrase unambiguously identified its own topic.
+    Declaring a phrase sufficient is reserved for identifier-shaped names that
+    cannot appear incidentally -- a generic token promoted this way would turn
+    every passing mention into a false block. It is validated as a
+    case-insensitive SUBSET of ``phrases`` and fails loud at config load for the
+    same reason ``extra='forbid'`` does: the matcher only tests ``phrases``, so
+    a stray entry could never fire.
 
     ``topic_id`` shares ONE namespace with the ``metadata.topic`` memory
     vocabulary key (PRD ``docs/prds/memory-metadata-vocabulary.md`` D4):
@@ -527,6 +539,18 @@ class ProceduralTopicCluster(BaseModel):
             'Default 2 so a single incidental keyword never triggers a false block.'
         ),
     )
+    sufficient_phrases: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Opt-in subset of phrases that qualify this cluster ALONE, bypassing '
+            'min_phrase_hits (task 3054). Reserved for phrases so distinctive they '
+            'cannot appear incidentally -- identifier-shaped names like a tool or '
+            'handler name -- NEVER generic tokens or common commands, which would '
+            'turn every incidental mention into a false block. Every entry must '
+            'also appear in phrases (compared case-insensitively); a stray entry '
+            'is rejected at config load rather than silently matching nothing.'
+        ),
+    )
     hint: str = Field(
         default='',
         description=(
@@ -534,6 +558,41 @@ class ProceduralTopicCluster(BaseModel):
             'When empty, the guard substitutes a module-default hint.'
         ),
     )
+
+    @model_validator(mode='after')
+    def _validate_sufficient_phrases_subset(self) -> 'ProceduralTopicCluster':
+        """Reject a ``sufficient_phrases`` entry that is not also in ``phrases``.
+
+        Fails fast at config load/reload for the same reason
+        ``extra='forbid'`` and :meth:`_validate_topic_id_slug` do: the
+        matcher only ever tests ``phrases``, so a sufficient phrase absent
+        from that list can never fire. The cluster would load cleanly and
+        the operator's intent would be silently discarded -- a silent no-op
+        is strictly worse than a loud rejection an operator can fix. This
+        matters most because the cluster list is an operator-overridable,
+        green-tier hot-reloadable config leaf, so a typo there would quietly
+        disarm the sufficiency the operator just asked for.
+
+        Compared case-INsensitively because phrase matching itself is
+        (see :func:`~fused_memory.server.near_duplicate_guard.find_matching_topic_cluster`),
+        so a mere case mismatch is not a real error and must not be a
+        spurious config-load failure.
+
+        The message quotes the offending phrase, the owning ``topic_id``,
+        and the known phrase list, so an operator who trips this at load can
+        fix it without reading the source.
+        """
+        known = {phrase.lower() for phrase in self.phrases}
+        for phrase in self.sufficient_phrases:
+            if phrase.lower() not in known:
+                raise ValueError(
+                    f'sufficient_phrases entry {phrase!r} on topic cluster '
+                    f'{self.topic_id!r} is not present in that cluster\'s phrases '
+                    f'({self.phrases!r}). A sufficient phrase must also be a '
+                    f'matchable phrase, or it can never fire -- the matcher only '
+                    f'tests phrases. Comparison is case-insensitive.'
+                )
+        return self
 
     @field_validator('topic_id')
     @classmethod
@@ -587,6 +646,15 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     gate 3342 -- the first cluster whose corpus spans BOTH
     ``procedural_knowledge`` and ``preferences_and_norms`` (11 + 3 of its 14
     entries), which is how it grew uncaught.
+
+    Task 3054 then made per-phrase distinctiveness expressible: the
+    report_task_already_done cluster declares its two identifier-shaped
+    phrases ``sufficient_phrases``, so either qualifies that cluster ALONE.
+    Before that, a write naming one distinctive phrase from each of three
+    clusters reached no cluster's ``min_phrase_hits`` and was blocked by none.
+    The same task extended the plan-revalidation cluster with the warm-lane
+    reseed sub-case's vocabulary, which is caught at the ordinary 2-hit bar.
+
     Operator-overridable / tunable via config (green-tier hot-reloadable).
     """
     return [
@@ -684,10 +752,33 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # consolidation ruling, but this guard is forward-looking (it only
             # blocks NEW near-dup writes), so seeding it now stops that cluster
             # from growing further while 3011 is parked.
+            #
+            # SUFFICIENCY (task 3054): the comment above argues all four
+            # phrases are distinctive literal identifiers -- yet under
+            # count-only matching none of them could block a write ALONE, so
+            # a note naming report_task_already_done while ALSO touching the
+            # plan-tools and plan-revalidation vocabularies scored exactly 1
+            # hit in each of three clusters and was blocked by none (hits do
+            # not aggregate across clusters). The two identifier-shaped
+            # phrases -- a public tool name and a PRIVATE handler name --
+            # cannot plausibly appear in off-topic text, so they are declared
+            # sufficient and now qualify this cluster on their own.
+            #
+            # The other two are deliberately NOT sufficient. 'merge-base
+            # --is-ancestor' is a generic git command: a plain git-ancestry
+            # note must stay unblocked (test_does_not_match_unrelated_merge_
+            # base_note exists precisely to pin that), and promoting it would
+            # mis-route genuine git notes to gate 3011. 'main-reachable' is
+            # likewise too generic standalone. Each still counts normally
+            # toward min_phrase_hits.
             phrases=[
                 'report_task_already_done',
                 'main-reachable',
                 'merge-base --is-ancestor',
+                '_handle_already_done_report',
+            ],
+            sufficient_phrases=[
+                'report_task_already_done',
                 '_handle_already_done_report',
             ],
             min_phrase_hits=2,
@@ -712,20 +803,64 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # eval-worktree-plan-tools-missing cluster, and reusing them here
             # would blur the two clusters and risk mis-routing a write to the
             # wrong gate task.
+            #
+            # THIRD SUB-CASE (task 3054): warm-lane RESEED. A task dispatched
+            # into a recycled lane can find .task/plan.json a DANGLING symlink
+            # whose worktrees/.task-meta/<lane>/plan.json target was never
+            # written or was scrubbed -- the same architect-facing failure as
+            # the two canonical sub-cases, a different cause. 'lane reseed' is
+            # its distinctive vocabulary and is added as an ORDINARY phrase
+            # (not sufficient): paired with the plan-facing '.task/plan.json'
+            # above it reaches the existing min_phrase_hits=2, so a reseed
+            # note that never names an architect tool is catchable on its own.
+            #
+            # WHY THE BARE LANE PATH IS NOT A PHRASE (reviewer, robustness):
+            # 'worktrees/.task-meta' was first seeded alongside 'lane reseed'
+            # and then removed. It is lane-LIFECYCLE vocabulary, not
+            # architect-facing vocabulary -- the standard lane metadata path
+            # shared by the warm-lane, session-resume and transcript-archival
+            # subsystems -- so an ordinary note about lane recycling ('after a
+            # lane reseed, worktrees/.task-meta/<lane>/ is rewritten by ...')
+            # reached min_phrase_hits on those two phrases ALONE, with no plan
+            # involved at all. That write would have been soft-blocked and
+            # routed to gate 2973, whose hint tells the writer to consolidate
+            # into canonical entries describing the OTHER two sub-cases -- a
+            # remediation instruction that is simply wrong for the note that
+            # tripped it. Unlike every other seeded phrase this one was also
+            # not drawn verbatim from a cited canonical entry (this sub-case
+            # has none). Anchoring on '.task/plan.json' instead keeps the
+            # sub-case blockable while requiring the note to actually be about
+            # a plan, which is the failure the gate adjudicates.
+            #
+            # NESTING EXCLUSION (the invariant asserted over every seeded
+            # cluster): 'warm-lane reseed' is omitted because 'lane reseed'
+            # NESTS inside it, so seeding both would let ONE occurrence score
+            # two distinct hits and satisfy min_phrase_hits alone -- silently
+            # granting sufficiency without declaring it. Nothing is lost:
+            # 'lane reseed' already substring-matches the 'warm-lane reseed'
+            # spelling. Bare 'plan.json' is excluded for the same reason (it
+            # nests inside '.task/plan.json' above), and bare 'dangling' as a
+            # generic token that fires on unrelated symlink notes.
             phrases=[
                 '.task/plan.json',
                 'plan-revalidation',
                 'requeue rebase',
                 'lost-plan reconstruction',
                 'committed TDD steps',
+                'lane reseed',
             ],
             min_phrase_hits=2,
             hint=(
                 'Known-recurring topic (architect plan-revalidation after a '
-                'requeue rebase or lock loss) gated to human task 2973 -- see '
-                'canonical memory 6a96a020-6193-4a7e-82a6-4f27bcf5378e and '
-                '974b0adb-ed54-44bd-aa12-aeaeae8b3ea6. Do NOT add another entry '
-                '-- update/consolidate the existing entries, or add context to '
+                'requeue rebase, a lock loss, or a warm-lane reseed that left '
+                '.task/plan.json a dangling symlink) gated to human task 2973 '
+                '-- see canonical memory 6a96a020-6193-4a7e-82a6-4f27bcf5378e '
+                '(plan.json gitignore wipe) and 974b0adb-ed54-44bd-aa12-'
+                'aeaeae8b3ea6 (lost-plan reconstruction). The reseed sub-case '
+                'has no canonical entry yet, so if that is what you are writing '
+                'up, add it as context on gate task 2973 rather than merging it '
+                'into either entry above. Do NOT add another entry -- '
+                'update/consolidate the existing entries, or add context to '
                 'gate task 2973.'
             ),
         ),
@@ -1355,10 +1490,13 @@ class ReconciliationConfig(BaseModel):
         description=(
             'Known-contradictory procedural_knowledge topic clusters. An add_memory '
             "write whose content contains >= a cluster's min_phrase_hits distinct "
-            'phrases is soft-blocked (error_type='
-            'ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE the cosine '
-            'near-dup search. Seeded with the two known eval-worktree clusters '
-            '(gates 2841/2844); an empty list disables the topic guard. Green-tier '
+            "phrases -- OR any single one of that cluster's sufficient_phrases, for "
+            'phrases distinctive enough to qualify alone -- is soft-blocked '
+            '(error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE '
+            'the cosine near-dup search. Seeded with the two known eval-worktree '
+            'clusters (gates 2841/2844); an empty list disables the topic guard. '
+            'A sufficient_phrases entry absent from that cluster\'s phrases is '
+            'rejected at load/reload rather than silently matching nothing. Green-tier '
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
             'by resolve_topic_guard_clusters in server/near_duplicate_guard.py). '
             'Shares the procedural_knowledge_near_dup_guard_enabled kill-switch and '

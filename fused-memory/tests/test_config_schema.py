@@ -1374,6 +1374,94 @@ class TestProceduralTopicClusterModel:
             ProceduralTopicCluster(topic_id='t', phrases=['a', 'b'], min_phrase_hits=0)
 
 
+class TestProceduralTopicClusterSufficientPhrases:
+    """``sufficient_phrases``: phrases distinctive enough to qualify a cluster ALONE (task 3054).
+
+    Count-only matching cannot catch a write that straddles several clusters
+    at one hit each -- the reported defect: a single note scored exactly 1
+    distinct phrase in each of three registered clusters and was blocked by
+    none, because hits do not aggregate across clusters and each cluster's
+    remaining phrases are tuned to a different sub-case's vocabulary. An
+    identifier-shaped phrase (a tool name, a private handler name) cannot
+    appear incidentally, so it should qualify its own cluster on its own.
+
+    The field is opt-in and validated as a SUBSET of ``phrases``: a phrase
+    that is not itself matchable would silently match nothing, which is the
+    same silent-no-op failure ``extra='forbid'`` and ``_validate_topic_id_slug``
+    are already on this model to prevent.
+    """
+
+    def test_defaults_to_empty_list(self):
+        cluster = ProceduralTopicCluster(topic_id='t', phrases=['alpha', 'beta'])
+        assert cluster.sufficient_phrases == []
+
+    def test_accepts_a_subset_of_phrases(self):
+        cluster = ProceduralTopicCluster(
+            topic_id='t',
+            phrases=['alpha', 'beta', 'gamma'],
+            sufficient_phrases=['alpha', 'gamma'],
+        )
+        assert cluster.sufficient_phrases == ['alpha', 'gamma']
+
+    def test_accepts_all_phrases_as_sufficient(self):
+        cluster = ProceduralTopicCluster(
+            topic_id='t',
+            phrases=['alpha', 'beta'],
+            sufficient_phrases=['alpha', 'beta'],
+        )
+        assert cluster.sufficient_phrases == ['alpha', 'beta']
+
+    def test_rejects_a_sufficient_phrase_absent_from_phrases(self):
+        """The loud-fail-at-config-load contract.
+
+        A sufficient phrase that is not also a matchable phrase can never
+        fire, so the operator's intent is silently discarded. Fail at load
+        instead, quoting BOTH the offending phrase and the ``topic_id`` so
+        the operator can find the cluster in a long config list.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            ProceduralTopicCluster(
+                topic_id='some-topic',
+                phrases=['alpha', 'beta'],
+                sufficient_phrases=['delta'],
+            )
+        message = str(excinfo.value)
+        assert repr('delta') in message, 'must quote the offending phrase'
+        assert 'some-topic' in message, 'must name the cluster it belongs to'
+
+    def test_subset_check_is_case_insensitive(self):
+        """Phrase MATCHING is case-insensitive, so a case mismatch is not a real error.
+
+        Rejecting it would be a spurious config-load failure on a cluster
+        that would in fact match exactly as the operator intended.
+        """
+        cluster = ProceduralTopicCluster(
+            topic_id='t',
+            phrases=['Alpha', 'BETA'],
+            sufficient_phrases=['alpha'],
+        )
+        assert cluster.sufficient_phrases == ['alpha']
+
+    def test_still_rejects_unknown_key(self):
+        # The new field must not have been added by loosening extra='forbid'.
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(
+                topic_id='t',
+                phrases=['a', 'b'],
+                sufficient_phrase='boom',  # type: ignore[call-arg]
+            )
+
+    def test_still_rejects_min_phrase_hits_below_one(self):
+        # The new validator must not have displaced the existing ge=1 bound.
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(
+                topic_id='t',
+                phrases=['a', 'b'],
+                sufficient_phrases=['a'],
+                min_phrase_hits=0,
+            )
+
+
 class TestProceduralTopicClusterTopicIdSlug:
     """``topic_id`` shares ONE namespace with ``metadata.topic`` (PRD D4, task 3198).
 
@@ -1502,6 +1590,28 @@ def _seeded_cluster(topic_id: str) -> ProceduralTopicCluster:
     return next(c for c in clusters if c.topic_id == topic_id)
 
 
+# --- Topic-guard note fixtures shared with tests/server/test_add_memory_near_duplicate_gate.py
+#
+# These are module-level (not class attributes) because the end-to-end gate
+# suite imports them: the same note must drive both the pure-matcher assertions
+# here and the whole-tool assertions there, or an edit to one copy would leave
+# the other silently exercising a different scenario (task 3054, reviewer:
+# duplication).
+
+STRADDLING_WRITE_FIXTURE = (
+    'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
+    'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
+    'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
+    'was scrubbed. The architect then sees no plan and may wrongly call '
+    'report_task_already_done instead of replanning.'
+)
+
+MERGE_BASE_NEGATIVE_CONTROL_NOTE = (
+    'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
+    'commit is an ancestor of a branch tip before cherry-picking.'
+)
+
+
 class TestProceduralTopicGuardClustersDefault:
     """ReconciliationConfig seeds all known topic-guard clusters by default.
 
@@ -1609,11 +1719,7 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
         # Only 'merge-base --is-ancestor' occurs here (1 distinct hit) -- a
         # plain git-ancestry-check note unrelated to report_task_already_done
         # must NOT reach min_phrase_hits and mis-route to gate 3011.
-        unrelated_note = (
-            'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
-            'commit is an ancestor of a branch tip before cherry-picking.'
-        )
-        assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
+        assert find_matching_topic_cluster(MERGE_BASE_NEGATIVE_CONTROL_NOTE, [cluster]) is None
 
 
 class TestArchitectPlanRevalidationRequeueLockCluster:
@@ -1634,6 +1740,7 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
             'requeue rebase',
             'lost-plan reconstruction',
             'committed TDD steps',
+            'lane reseed',
         ]
         assert cluster.min_phrase_hits == 2
         assert '2973' in cluster.hint
@@ -1660,6 +1767,64 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         )
         assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
 
+    def test_matches_a_reseed_note_that_names_no_architect_tool(self):
+        """Third sub-case (task 3054): a reseed leaving a dangling .task/plan.json symlink.
+
+        Sibling of the two canonical sub-cases (plan_json_gitignore_wipe,
+        lost_plan_reconstruction) -- same failure for the architect, a
+        different cause: the lane was recycled and the symlink's
+        worktrees/.task-meta target was never written or was scrubbed.
+
+        A reseed note that never mentions report_task_already_done cannot
+        rely on that cluster's sufficient phrases, so 'lane reseed' paired
+        with the plan-facing '.task/plan.json' is what makes it blockable.
+        Matched against the FULL default list to prove it routes here rather
+        than to an earlier cluster.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'Warm-lane reseed: the .task/plan.json symlink dangles because '
+            'worktrees/.task-meta/<lane>/plan.json is absent after a lane reseed.'
+        )
+        result = find_matching_topic_cluster(note, clusters)
+        assert result is not None
+        assert result[0].topic_id == self.TOPIC_ID
+
+    def test_does_not_match_a_pure_lane_lifecycle_note(self):
+        """NEGATIVE CONTROL: lane vocabulary alone, with no plan involved, must not block.
+
+        'worktrees/.task-meta' is the standard lane metadata path shared by
+        the warm-lane / session-resume / transcript-archival subsystems, so
+        seeding it beside 'lane reseed' would have let an ordinary note about
+        lane recycling reach min_phrase_hits with no plan mentioned at all --
+        and routed it to gate 2973, whose hint is about lost plans. The
+        sub-case is anchored on '.task/plan.json' instead; this pins that the
+        lane path is NOT a phrase.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'After a lane reseed the whole worktrees/.task-meta/<lane>/ directory '
+            'is rewritten by the warm-lane claim path, so anything an operator '
+            'dropped there by hand is gone.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
+
+    def test_does_not_match_a_generic_dangling_symlink_note(self):
+        # Why bare 'dangling' was rejected as a phrase: it fires on ordinary
+        # symlink notes that have nothing to do with lane reseeds.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'A dangling symlink in /usr/local/bin can break a PATH lookup; use '
+            'readlink -f to resolve it.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
+
+    def test_bare_reseed_mention_alone_does_not_match(self):
+        # The additive phrases are ordinary phrases, NOT declared sufficient:
+        # one of them alone stays below min_phrase_hits.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert find_matching_topic_cluster('A warm-lane reseed happened.', clusters) is None
+
     def test_full_default_cluster_list_resolves_here_not_plan_tools_cluster(self):
         # eval-worktree-plan-tools-missing is seeded earlier in the default
         # list and find_matching_topic_cluster returns the FIRST qualifying
@@ -1677,6 +1842,68 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         result = find_matching_topic_cluster(note, clusters)
         assert result is not None
         assert result[0].topic_id == 'architect-plan-revalidation-requeue-lock'
+
+
+class TestStraddlingThreeClustersRegression:
+    """The reported task-3054 defect: a write that straddles three clusters at one hit each.
+
+    Hits do NOT aggregate across clusters, and each cluster's remaining
+    phrases are tuned to a DIFFERENT sub-case's vocabulary, so a note
+    scoring exactly one distinct phrase in each of three registered
+    clusters reached no cluster's ``min_phrase_hits`` and was blocked by
+    none -- even though ``report_task_already_done`` is an identifier that
+    unambiguously names cluster 3's topic on its own.
+
+    THE REPORTED SIGNATURE, for the record: against the phrase lists as they
+    stood before this task, :data:`STRADDLING_WRITE_FIXTURE` scored exactly
+    one distinct hit in each of three clusters -- ``plan.json`` in
+    eval-worktree-plan-tools-missing, ``report_task_already_done`` in
+    architect-report-task-already-done-main-reachability, and
+    ``.task/plan.json`` in architect-plan-revalidation-requeue-lock. All
+    three sat below ``min_phrase_hits=2``, which is precisely why nothing
+    fired. (Recorded here rather than asserted: an assertion would need
+    frozen copies of those three phrase lists, which exercise no production
+    code and rot silently as the seed evolves. The outcome test and the two
+    negative controls below all call ``find_matching_topic_cluster``.)
+
+    FIXTURE PROVENANCE: reconstructed from the task-3054 description
+    because reify Mem0 entry 5697ff2f-4f9b-49bb-be89-5643b94802ec now
+    returns ``found=false`` (deleted or consolidated since the 2026-07-25
+    filing), so its verbatim text is unrecoverable.
+    """
+
+    FIXTURE = STRADDLING_WRITE_FIXTURE
+
+    def test_fixture_is_now_blocked_and_routes_to_the_report_task_already_done_gate(self):
+        """OUTCOME: the identifier-shaped phrase now qualifies its cluster alone.
+
+        Routing is unambiguous precisely because sufficiency is per-phrase:
+        ``report_task_already_done`` belongs to exactly one cluster, so the
+        block names one gate task rather than guessing among three.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        result = find_matching_topic_cluster(self.FIXTURE, clusters)
+        assert result is not None, 'the straddling write must no longer slip through'
+        assert result[0].topic_id == 'architect-report-task-already-done-main-reachability'
+
+    def test_merge_base_note_alone_still_does_not_match(self):
+        """NEGATIVE CONTROL: widening cluster 3 must not promote a generic git command.
+
+        Mirrors ``test_does_not_match_unrelated_merge_base_note`` above, but
+        against the FULL default list -- a plain git-ancestry note must not
+        become blockable just because its cluster gained sufficient phrases.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert find_matching_topic_cluster(MERGE_BASE_NEGATIVE_CONTROL_NOTE, clusters) is None
+
+    def test_main_reachable_alone_still_does_not_match(self):
+        """NEGATIVE CONTROL: 'main-reachable' is too generic to be sufficient."""
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'The merge worker only advances to a main-reachable tip, so a '
+            'branch that has not landed yet is skipped this cycle.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
 
 
 class TestRuffFormatNotAnEnforcedGateCluster:
