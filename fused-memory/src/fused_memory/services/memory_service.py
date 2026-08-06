@@ -73,6 +73,7 @@ from fused_memory.services.memory_metadata_census import (
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.task_naming import canonicalize_task_node_name
+from fused_memory.utils.validation import require_full_uuid
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -4104,7 +4105,21 @@ class MemoryService:
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
     ) -> dict:
-        """Delete a memory from the specified store."""
+        """Delete a memory from the specified store.
+
+        ``memory_id`` must be a full 36-character UUID. A truncated id (e.g. an
+        8-char hex prefix lifted out of a search-result snippet) raises rather
+        than silently no-opping: both backends treat a miss as "already
+        deleted", so without this guard the caller got a confirming
+        ``{'status': 'deleted'}`` envelope, a ``success=True`` journal entry and
+        a ``memory_deleted`` event while nothing was removed.
+
+        The guard sits above the store branch so ONE check covers both the
+        Graphiti and Mem0 paths, and above the journal write and event emission
+        so a rejected delete leaves no false audit trail.
+        """
+        require_full_uuid(memory_id, field_name='memory_id')
+
         scope = Scope(project_id=project_id)
         source = SourceStore(store)
         write_op_id = str(uuid_mod.uuid4())
