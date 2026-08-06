@@ -1437,6 +1437,18 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     or auth failure is a PERMANENT, candidate-specific configuration error. A
     single "cap-excluded" total would let the latter masquerade as the former
     and hide a config that can never run behind ``n=0, mean=None``.
+
+    A THIRD treatment, disjoint from both (eval-revival σ, task 3628):
+    ``judged_without_reference`` counts the admitted cells whose score is the
+    LLM judge's own number produced from an EMPTY reference diff — graded on
+    plausibility, never against the landed change. Unlike the other two this
+    changes NO number: the cell is KEPT AND SCORED, stays in ``n``, and its
+    score stays in ``mean_plan_quality``. It is a VALIDITY bound, not an
+    exclusion. Averaging these cells out would discard real measurements, while
+    reporting them silently is the defect σ exists to remove — the v1 campaign
+    judged half its hard subset this way and it was findable only by
+    archaeology. So: transport refusal → EXCLUDED + ``cap_excluded``; content
+    failure → FLOORED + ``no_plan``; judged blind → KEPT, SCORED, and FLAGGED.
     """
     rows: list[dict[str, Any]] = []
     for result in results:
@@ -1451,6 +1463,11 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             'plan_steps': result.metrics.get('plan_steps'),
             'cap_tainted': bool(result.metrics.get('cap_tainted')),
             'invocation_error': result.metrics.get('invocation_error'),
+            # The σ validity marker (task 3628), read exactly like cap_tainted
+            # above so a metrics dict predating the field reads back False.
+            'judged_without_reference': bool(
+                result.metrics.get('judged_without_reference')
+            ),
             # The θ score this cell contributes to the aggregate, through THE
             # shared accessor (task 3302): the persisted float for a real plan,
             # a floored 0.0 for a cell that produced none, None when the cell is
@@ -1481,6 +1498,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     scored: dict[str, list[float]] = defaultdict(list)
     excluded: dict[str, int] = defaultdict(int)
     no_plan: dict[str, int] = defaultdict(int)
+    judged_blind: dict[str, int] = defaultdict(int)
     totals: dict[str, int] = defaultdict(int)
     by_cause: dict[str, int] = defaultdict(int)
     for row in rows:
@@ -1499,6 +1517,12 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
                 # DISJOINT from the exclusion above: this cell was measured and
                 # kept, at the 0.0 the accessor floored it to (task 3302).
                 no_plan[cfg] += 1
+            if row['judged_without_reference']:
+                # Counted inside THIS branch on purpose (task 3628): the count
+                # is a strict subset of the admitted pool ``n`` reports, never
+                # of the excluded cells — a cap-tainted cell has no
+                # plan_quality to bound, so it belongs to cap_excluded alone.
+                judged_blind[cfg] += 1
             # THE shared accessor's answer (task 3302), not the raw persisted
             # score: a cell whose architect produced no plan lands here as a
             # floored 0.0, identically to build_composite_report's pool, so
@@ -1514,6 +1538,11 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             # floored to 0.0 (task 3302). Disjoint from ``cap_excluded``: those
             # cells are not in ``n`` at all.
             'no_plan': no_plan[cfg],
+            # How many of those same ``n`` scored cells were judged WITHOUT a
+            # reference diff (task 3628). Unlike the two counts above this one
+            # subtracts nothing and floors nothing — the cells are in ``n`` and
+            # in the mean at their real scores; only the confidence is bounded.
+            'judged_without_reference': judged_blind[cfg],
             'total': totals[cfg],
             # The RELIABILITY figure over the very same admitted pool ``n``
             # counts and ``mean_plan_quality`` averages (task 3379), through THE
@@ -1531,6 +1560,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
         'configs': configs,
         'cap_excluded': sum(excluded.values()),
         'cap_excluded_by_cause': {c: by_cause[c] for c in sorted(by_cause)},
+        'judged_without_reference': sum(judged_blind.values()),
     }
 
 
