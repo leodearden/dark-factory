@@ -597,3 +597,87 @@ class TestRecordFlakeOccurrenceIdempotence:
         assert sorted(
             r['call_site'] for r in _rows(db_path, 'SELECT call_site FROM flake_occurrence')
         ) == ['main_probe', 'merge_gate']
+
+
+class TestRecordFlakeOccurrenceEmptyTestIds:
+    """§8: EMPTY ``test_ids`` is legal only for ``unconfirmable``.
+
+    The gate-blind signal must not vanish when it fires.  θ's class-1 health check is
+    an ``unconfirmable`` RATE, so an observation that could not even determine WHICH
+    tests failed still has to be counted — dropping it would reproduce the exact
+    blindness this PRD exists to end (6 unconfirmable lines sitting at INFO for a
+    month).  The mirror case, a CONFIRMED verdict about zero tests, is meaningless and
+    degrades loudly instead of becoming a sentinel that would corrupt θ's denominator.
+    """
+
+    def _record(self, db_path: Path, **overrides) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        record_flake_occurrence(
+            db_path,
+            'dark_factory',
+            _suppression(**overrides),
+            merge_sha='abc123',
+            task_id='3785',
+        )
+
+    def _unconfirmable(self, **overrides) -> dict:
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        kwargs = {
+            'verdict': FlakeVerdict.unconfirmable,
+            'test_ids': (),
+            'unconfirmable_reason': 'node-ids mapped to no discovered subproject',
+        }
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_unconfirmable_with_no_test_ids_is_still_counted(self, tmp_path: Path) -> None:
+        import json
+
+        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, **self._unconfirmable())
+
+        (row,) = read_occurrences(db_path)
+        assert row.test_id == UNKNOWN_TEST_ID
+        assert row.verdict == 'unconfirmable'
+        assert row.project_id == 'dark_factory'
+        assert row.call_site == 'merge_gate'
+        assert row.runner == 'local'
+        assert row.merge_sha == 'abc123'
+        assert row.task_id == '3785'
+        assert row.psi_cpu_some10 == 17.5
+        assert json.loads(row.detail)['unconfirmable_reason'] == (
+            'node-ids mapped to no discovered subproject'
+        )
+
+    def test_the_sentinel_row_still_dedups_on_the_triple(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, **self._unconfirmable())
+        self._record(db_path, **self._unconfirmable())
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 1
+
+    @pytest.mark.parametrize('verdict_name', ['passes_in_isolation', 'fails_in_isolation'])
+    def test_a_confirmed_verdict_about_zero_tests_degrades_loudly(
+        self, tmp_path: Path, caplog, verdict_name: str
+    ) -> None:
+        """Honest degrade: writes NOTHING, does not raise, and WARNS.  A confirmed
+        verdict about zero tests is meaningless; accepting it silently would be a
+        fabricated observation, and turning it into a sentinel row would corrupt the
+        unconfirmable denominator θ's class-1 check divides by."""
+        import logging
+
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        db_path = tmp_path / 'runs.db'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            self._record(db_path, verdict=FlakeVerdict(verdict_name), test_ids=())
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 0
+        warnings = [r for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+        assert len(warnings) == 1
+        assert warnings[0].levelno == logging.WARNING
+        assert verdict_name in warnings[0].getMessage()
