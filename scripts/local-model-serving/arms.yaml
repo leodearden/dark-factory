@@ -66,42 +66,69 @@ arms:
     # a parser vLLM fills the xgrammar bitmask from token 0 and the arm cannot
     # reason at all, which would make this field a lie.
     reasoning_parser: qwen3
-    est_vram_gib: 6.0
+    # MEASURED 2026-08-06, correcting a ~2x understatement. The original 6.0 was
+    # a guess from the model's parameter count; vLLM reports 11.21 GiB FOR
+    # WEIGHTS ALONE at this quant, and the arm's live resident footprint was
+    # 14444 MiB. 12.0 is weights plus non-KV overhead -- the ADMISSION FLOOR,
+    # i.e. the least this arm can serve within. It is not the resident figure:
+    # a generate arm sizes its KV cache to fill the share `_memory_share_for`
+    # derives from FREE VRAM, so residency is share-driven and always higher.
+    #
+    # Why this matters despite being "decorative" for generate arms: `arm_fits`
+    # admits on this number. At 6.0 the pre-flight would have admitted the arm
+    # with 6.5 GiB free, and vLLM would then have failed 450 s later, loudly but
+    # expensively. At 12.0 it refuses up front. Same class of correction as
+    # qwen3-embedding-0.6b (2.0 -> 3.0) and -4b (9.0 -> 10.0).
+    #
+    # phi-4-14b almost certainly carries the same understatement (declares 9.0,
+    # measured 15517 MiB resident) but its weight-only figure was not captured,
+    # so it is left alone rather than guessed at.
+    est_vram_gib: 12.0
     max_model_len: 32768
     max_num_seqs: 8
     notes: >-
       IFEval 91.5 / BFCL-V4 66.1 (official card) -- best published
-      conformance-adjacent scores on the slate.  ~6 GiB of weights against a
-      16.4 GiB budget leaves the largest KV headroom, hence the slate's only
-      32k context and its highest max_num_seqs.
+      conformance-adjacent scores on the slate.  11.21 GiB of weights (vLLM
+      -reported, measured 2026-08-06 -- NOT the ~6 GiB originally estimated)
+      against a 16.4 GiB budget; the 32k context and the slate's highest
+      max_num_seqs are affordable but no longer the roomiest margin on the
+      slate.
 
-  - arm_id: mistral-small-3.2-24b
-    axis: llm
-    stack: vllm
-    image: vllm/vllm-openai:v0.26.0
-    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
-    model_ref: jeffcookio/Mistral-Small-3.2-24B-Instruct-2506-awq-sym
-    # NOT `awq`, despite the repo name.  Measured from the downloaded weights'
-    # own config.json on 2026-08-06: quantization_config.quant_method is
-    # `compressed-tensors` (format pack-quantized, 4 bits).  Declaring `awq`
-    # made vLLM 0.26 refuse the model outright -- loudly, which is the right
-    # behaviour: a quant mismatch it guessed past would serve wrong numbers.
-    quant: compressed-tensors
-    port: 8411
-    served_model_name: mistral-small-3.2-24b
-    structured_output_mode: json_schema
-    # No thinking construct anywhere in this model's chat template (verified
-    # 2026-08-06 against the on-disk snapshot), so `off` is the only mode it
-    # has and no parser applies.
-    reasoning: 'off'
-    est_vram_gib: 14.0
-    max_model_len: 16384
-    max_num_seqs: 4
-    notes: >-
-      Mature quant ecosystem; the 3.2 release targeted stronger function
-      calling.  ~14 GiB of weights leaves only ~2 GiB for KV against the
-      measured budget, so context and concurrency are deliberately the
-      slate's tightest -- eta must verify graphiti's longest prompt still fits.
+  # ---------------------------------------------------------------------
+  # mistral-small-3.2-24b -- DROPPED FROM THE SLATE (Leo, 2026-08-06).
+  #
+  # The PRD commissioned it (line 127). It is removed after live measurement,
+  # deliberately and on the record, rather than left in to fail forever.
+  #
+  # Its declared quant WAS wrong and that was fixed: `awq` -> `compressed-
+  # tensors`, measured from the downloaded weights' own config.json, and vLLM
+  # 0.26 then accepted the model and resolved max_model_len 16384. That defect
+  # is closed. The arm still never reached weight loading, for an unrelated
+  # reason: Mistral-Small-3.2-24B is a VISION-language model (mistral3.py,
+  # Pixtral tower), vLLM unconditionally sizes a multimodal encoder budget at
+  # startup by pushing a dummy `[IMG]` prompt through PixtralProcessor, and
+  # jeffcookio's repacked tokenizer encodes it to ZERO image tokens while the
+  # text carries one:
+  #
+  #   ValueError: Mismatch in `image` token count between text and `input_ids`.
+  #   Got ids=[0] and text=[1].
+  #
+  # transformers also warns that repo needs `fix_mistral_regex=True`, pointing
+  # at the same object. Root cause is the quantizer's tokenizer, not the quant
+  # and not the weights -- the card never moved (7212 -> 7221 MiB).
+  #
+  # Leo's ruling: drop it. "It was never a favourite, and I think this is the
+  # alpha gate working as intended" -- the serving substrate refused an arm it
+  # cannot actually serve, loudly, before the eval could attribute numbers to
+  # it. Re-admitting it needs a different quantized repo (or an upstream
+  # tokenizer fix), NOT a flag that suppresses the multimodal path: the eval
+  # would then be measuring a model configured differently from the one the
+  # PRD costed.
+  #
+  # The LLM slate is therefore THREE arms, not four. eta's funnel narrows
+  # 3 -> at most 3, so its selectivity on this axis is now near-nil -- flagged
+  # for zeta/eta rather than silently absorbed.
+  # ---------------------------------------------------------------------
 
   - arm_id: phi-4-14b
     axis: llm

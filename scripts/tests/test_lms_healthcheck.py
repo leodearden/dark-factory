@@ -1300,7 +1300,7 @@ def test_cli_all_covers_every_arm_in_the_committed_manifest(cli_env, capsys):
 
     assert code == 0
     assert cli_env['probed'] == expected
-    assert len(expected) == 8
+    assert len(expected) == 7
 
 
 def test_cli_arm_selects_exactly_one(cli_env, capsys):
@@ -1871,3 +1871,72 @@ def test_merge_without_an_expected_set_still_merges():
     )
 
     assert [row.arm_id for row in merged.arms] == ['arm-a']
+
+
+def _extraction(entities) -> str:
+    return json.dumps({'entities': entities, 'summary': 'A summary.'})
+
+
+def test_an_entity_captured_as_an_attribute_value_counts_toward_the_floor():
+    """Measured on phi-4-14b, 2026-08-06: it returned `Dark Factory` and
+    `Graphiti` as top-level entities and `FalkorDB` as an attribute value
+    (`{"name": "Backend", "value": "FalkorDB"}`). That is a nested, relational
+    representation, not a refusal — and scoring it 2/4 made the floor adjudicate
+    representation QUALITY, which is theta's graph-sameness metric, not
+    alpha's question."""
+    body = _completion(_extraction([
+        {'name': 'Dark Factory', 'entity_type': 'Organization', 'attributes': []},
+        {
+            'name': 'Graphiti',
+            'entity_type': 'System',
+            'attributes': [{'name': 'Backend', 'value': 'FalkorDB'}],
+        },
+    ]))
+
+    result = lms_healthcheck.verify_llm_response(_arm(), body)
+
+    assert result.verdict == 'PASS'
+
+
+def test_the_summary_is_not_scanned_for_known_entities():
+    """Counting prose would let an arm that returned ZERO entities pass on the
+    strength of a well-written sentence — precisely the refusal this floor
+    exists to catch."""
+    body = _completion(json.dumps({
+        'entities': [],
+        'summary': 'Leo runs Dark Factory, which uses Graphiti backed by FalkorDB.',
+    }))
+
+    result = lms_healthcheck.verify_llm_response(_arm(), body)
+
+    assert result.verdict == 'FAIL'
+    assert result.reason == lms_healthcheck.Reason.EXTRACTION_MISSED_ENTITIES
+
+
+def test_a_passing_row_reports_its_top_level_count_separately():
+    """Reported, NON-gating. The gap between the floor and this number is the
+    representation signal alpha declines to judge and eta needs to see."""
+    result = lms_healthcheck.verify_llm_response(
+        _arm(),
+        _completion(_extraction([
+            {'name': 'Leo', 'entity_type': 'Person', 'attributes': []},
+            {'name': 'Dark Factory', 'entity_type': 'Org', 'attributes': []},
+            {
+                'name': 'Graphiti',
+                'entity_type': 'System',
+                'attributes': [{'name': 'Backend', 'value': 'FalkorDB'}],
+            },
+        ])),
+    )
+
+    assert result.verdict == 'PASS'
+    # four captured, but only three promoted to entities
+    assert result.top_level_entities_named == 3
+
+
+def test_top_level_count_is_none_when_the_question_does_not_apply():
+    """An unparseable response yields no count rather than a misleading zero."""
+    result = lms_healthcheck.verify_llm_response(_arm(), _completion('not json'))
+
+    assert result.reason == lms_healthcheck.Reason.NOT_JSON
+    assert result.top_level_entities_named is None

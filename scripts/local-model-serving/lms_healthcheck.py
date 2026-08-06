@@ -219,9 +219,18 @@ class ProbeResult(BaseModel):
     reason: Reason
     detail: str = ''
     latency_ms: float = 0.0
+    #: How many known entities were promoted to TOP-LEVEL entities, as opposed
+    #: to captured anywhere.  REPORTED, NON-GATING — the gap between this and
+    #: the floor is a representation-quality signal eta reads and alpha declines
+    #: to judge.  `None` where the question does not apply: an embedding arm, or
+    #: an LLM response that never parsed.
+    top_level_entities_named: int | None = None
 
     def with_latency(self, latency_ms: float) -> ProbeResult:
         return self.model_copy(update={'latency_ms': round(latency_ms, 1)})
+
+    def with_top_level(self, count: int) -> ProbeResult:
+        return self.model_copy(update={'top_level_entities_named': count})
 
 
 def _ok(detail: str = '') -> ProbeResult:
@@ -361,23 +370,48 @@ def _extract_reasoning(body: Any) -> str:
     return ''
 
 
-def _known_entities_found(extraction: ProbeExtraction) -> list[str]:
-    """Which of PROBE_KNOWN_ENTITIES this extraction actually named.
+def _norm(text: str) -> str:
+    return ''.join(ch for ch in text.lower() if ch.isalnum())
 
-    Compared on alphanumerics only and case-folded, and the ENTITY NAME must
-    contain the known name rather than the reverse: 'Dark Factory (software
-    factory)' counts as finding 'Dark Factory', while a bare 'Factory' does
-    not.  The floor asks whether the arm extracted, not how it spells — but a
-    containment test loose in both directions would let a one-character entity
-    name match everything and quietly restore the hole this closes.
+
+def _known_entities_found(
+    extraction: ProbeExtraction, *, top_level_only: bool = False
+) -> list[str]:
+    """Which of PROBE_KNOWN_ENTITIES this extraction captured ANYWHERE.
+
+    Attribute VALUES count, not just entity names.  Measured 2026-08-06:
+    phi-4-14b returned `Dark Factory` and `Graphiti` as top-level entities and
+    `FalkorDB` as an attribute value (`{"name": "Backend", "value":
+    "FalkorDB"}`) — a nested, relational representation rather than a refusal.
+    Scoring that 2/4 made the floor adjudicate representation QUALITY, which is
+    theta's `graph-sameness` metric, not alpha's question.  The floor asks only
+    whether the endpoint extracted at all.
+
+    The SUMMARY is deliberately not scanned.  It is prose, and counting it would
+    let an arm that returned zero entities pass on the strength of a
+    well-written sentence — which is the refusal this floor exists to catch.
+
+    Comparison is on alphanumerics, case-folded, and ONE-DIRECTIONAL: the
+    extracted string must contain the known name, never the reverse.  'Dark
+    Factory (software factory)' counts; a bare 'Factory' does not.  Loose in
+    both directions, a one-character value would match every known entity at
+    once and quietly restore the hole this closes.
+
+    `top_level_only` restricts the scan to entity names.  That variant is
+    REPORTED and NON-GATING — it is how eta sees whether an arm promoted the
+    entities to nodes or buried them in attributes, a real quality difference
+    that alpha declines to judge.
     """
-    def norm(text: str) -> str:
-        return ''.join(ch for ch in text.lower() if ch.isalnum())
-
-    named = {norm(entity.name) for entity in extraction.entities}
+    haystack = {_norm(entity.name) for entity in extraction.entities}
+    if not top_level_only:
+        haystack |= {
+            _norm(attribute.value)
+            for entity in extraction.entities
+            for attribute in entity.attributes
+        }
     return [
         known for known in PROBE_KNOWN_ENTITIES
-        if any(name and norm(known) in name for name in named)
+        if any(candidate and _norm(known) in candidate for candidate in haystack)
     ]
 
 
@@ -501,20 +535,22 @@ def verify_llm_response(arm: ArmEntry, body: Any) -> ProbeResult:
     # qwen3.5-9b returned on every non-reasoning configuration measured on
     # 2026-08-06, and it was recorded as a PASS.
     found = _known_entities_found(extraction)
+    top_level = len(_known_entities_found(extraction, top_level_only=True))
     if len(found) < PROBE_MIN_ENTITIES:
         missed = [k for k in PROBE_KNOWN_ENTITIES if k not in found]
         return _fail(
             Reason.EXTRACTION_MISSED_ENTITIES,
-            f'the completion is schema-valid but named only {len(found)} of the '
-            f'{len(PROBE_KNOWN_ENTITIES)} entities PROBE_TEXT contains '
+            f'the completion is schema-valid but captured only {len(found)} of '
+            f'the {len(PROBE_KNOWN_ENTITIES)} entities PROBE_TEXT contains '
             f'(found {found or "none"}, missed {missed}); '
             f'{len(extraction.entities)} entities were returned in total',
-        )
+        ).with_top_level(top_level)
 
     return _ok(
         f'valid {ProbeExtraction.__name__} for {arm.served_model_name}, '
-        f'naming {len(found)}/{len(PROBE_KNOWN_ENTITIES)} known entities'
-    )
+        f'capturing {len(found)}/{len(PROBE_KNOWN_ENTITIES)} known entities '
+        f'({top_level} as top-level entities)'
+    ).with_top_level(top_level)
 
 
 def check_model_identity(arm: ArmEntry, models_body: Any) -> ProbeResult:
@@ -811,7 +847,12 @@ def probe_arm(arm: ArmEntry) -> ProbeResult:
 #: measured in.  Without it a green slate is not interpretable — the two
 #: thinking-capable arms were measured in opposite modes by accident, and a
 #: report that omits the mode lets eta/theta inherit that choice invisibly.
-REPORT_SCHEMA_VERSION = 3
+#: v4 (2026-08-06, esc-3713-10): rows carry `top_level_entities_named`, the
+#: reported-and-non-gating count behind the extraction floor.  Added when the
+#: floor was widened to count attribute values: the widening is right for
+#: alpha's question but discards a real signal, and eta needs to see whether an
+#: arm promoted entities to nodes or buried them in attributes.
+REPORT_SCHEMA_VERSION = 4
 
 #: The delivered-check literal for task 3713.  Spelled once, here, and carried
 #: into the JSON artifact as a field.
@@ -872,6 +913,9 @@ class ArmRow(BaseModel):
     #: modes at very different cost, and a different arm passes in one and
     #: returns an empty extraction in the other.
     reasoning: str
+    #: Known entities promoted to TOP-LEVEL entities.  Reported, non-gating —
+    #: see ProbeResult.  `None` for an embedding arm or an unparseable response.
+    top_level_entities_named: int | None = None
 
 
 class VramBlock(BaseModel):
@@ -992,6 +1036,7 @@ def run_healthcheck(
                 measured_at=measured_at,
                 arm_footprint_mib=budget.arm_footprint_mib,
                 reasoning=arm.reasoning,
+                top_level_entities_named=result.top_level_entities_named,
             )
         )
 

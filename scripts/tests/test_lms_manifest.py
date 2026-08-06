@@ -29,7 +29,17 @@ _COMMITTED_MANIFEST = (
 # 122-137.  Held here as literals rather than derived from the manifest, so this
 # file is an independent statement of what the PRD commissioned: deriving the
 # expectation from the artifact under test would make the assertion vacuous.
-_PRD_DENSE_LLM_ARMS = {'qwen3.5-9b', 'mistral-small-3.2-24b', 'phi-4-14b'}
+# mistral-small-3.2-24b was commissioned by the PRD and DROPPED from the slate
+# on 2026-08-06 (Leo's ruling, esc-3713-10) after it proved unservable on this
+# host: it is a vision-language model and vLLM's unconditional Pixtral
+# multimodal budget dies on the quantized repo's broken tokenizer regex, before
+# weight loading. Removed from this literal DELIBERATELY rather than by deriving
+# the set from arms.yaml -- deriving it would make this assertion vacuous and
+# let a future arm vanish unnoticed, which is the whole reason these are
+# literals. The narrowing is recorded in arms.yaml and in ticket-tracked PRD
+# text corrections; the LLM slate is now THREE arms.
+_PRD_DENSE_LLM_ARMS = {'qwen3.5-9b', 'phi-4-14b'}
+_PRD_DROPPED_LLM_ARMS = {'mistral-small-3.2-24b'}
 _PRD_MOE_ARM = 'moe-stretch'
 _PRD_EMBEDDING_DIMS = {
     'qwen3-embedding-0.6b': 1024,
@@ -330,7 +340,7 @@ def test_unknown_field_raises_rather_than_being_ignored(tmp_path):
 def test_committed_manifest_loads():
     assert _COMMITTED_MANIFEST.exists(), _COMMITTED_MANIFEST
     manifest = lms_manifest.load_arms(_COMMITTED_MANIFEST)
-    assert len(manifest.arms) == 8
+    assert len(manifest.arms) == 7
 
 
 def test_committed_manifest_covers_the_prd_llm_slate():
@@ -340,7 +350,7 @@ def test_committed_manifest_covers_the_prd_llm_slate():
     assert {a.arm_id for a in llm_arms} == _PRD_DENSE_LLM_ARMS | {_PRD_MOE_ARM}
 
     dense = [a for a in llm_arms if a.arm_id in _PRD_DENSE_LLM_ARMS]
-    assert len(dense) == 3
+    assert len(dense) == 2
     assert all(a.stack == 'vllm' for a in dense)
     assert all(a.structured_output_mode == 'json_schema' for a in dense)
 
@@ -471,3 +481,22 @@ def test_the_committed_manifest_states_a_mode_for_every_llm_arm():
 
     for arm in manifest.by_axis('llm'):
         assert arm.reasoning in ('on', 'off'), arm.arm_id
+
+
+def test_a_dropped_prd_arm_stays_out_of_the_slate():
+    """Makes `_PRD_DROPPED_LLM_ARMS` load-bearing rather than a comment.
+
+    mistral-small-3.2-24b was commissioned by the PRD and removed after it
+    proved unservable on this host. Re-adding it must therefore be a DELIBERATE
+    act that turns this test red and forces the re-admission to be justified,
+    rather than something that can drift back in unremarked. Re-admitting it
+    needs a working tokenizer, not a flag that suppresses the multimodal path.
+    """
+    manifest = lms_manifest.load_arms(_COMMITTED_MANIFEST)
+
+    readmitted = _PRD_DROPPED_LLM_ARMS & set(manifest.arm_ids())
+    assert not readmitted, (
+        f'arms {sorted(readmitted)} were dropped from the slate after live '
+        'measurement and are back in arms.yaml. If that is intended, move them '
+        'out of _PRD_DROPPED_LLM_ARMS and record why they are servable now.'
+    )
