@@ -1748,6 +1748,52 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         )
         assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
 
+    def test_cluster_covers_the_warm_lane_reseed_subcase(self):
+        """Third sub-case (task 3054): a reseed leaving a dangling .task/plan.json symlink.
+
+        Sibling of the two canonical sub-cases (plan_json_gitignore_wipe,
+        lost_plan_reconstruction) -- same failure for the architect, a
+        different cause: the lane was recycled and the symlink's
+        worktrees/.task-meta target was never written or was scrubbed.
+        """
+        cluster = _seeded_cluster(self.TOPIC_ID)
+        assert 'worktrees/.task-meta' in cluster.phrases
+        assert 'lane reseed' in cluster.phrases
+
+    def test_matches_a_reseed_note_that_names_no_architect_tool(self):
+        """The sub-case must be caught on its OWN vocabulary, at the ordinary 2-hit bar.
+
+        A reseed note that never mentions report_task_already_done cannot
+        rely on that cluster's sufficient phrases, so these additive
+        phrases are what makes it blockable. Matched against the FULL
+        default list to prove it routes here rather than to an earlier
+        cluster.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'Warm-lane reseed: the .task/plan.json symlink dangles because '
+            'worktrees/.task-meta/<lane>/plan.json is absent after a lane reseed.'
+        )
+        result = find_matching_topic_cluster(note, clusters)
+        assert result is not None
+        assert result[0].topic_id == self.TOPIC_ID
+
+    def test_does_not_match_a_generic_dangling_symlink_note(self):
+        # Why bare 'dangling' was rejected as a phrase: it fires on ordinary
+        # symlink notes that have nothing to do with lane reseeds.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'A dangling symlink in /usr/local/bin can break a PATH lookup; use '
+            'readlink -f to resolve it.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
+
+    def test_bare_reseed_mention_alone_does_not_match(self):
+        # The additive phrases are ordinary phrases, NOT declared sufficient:
+        # one of them alone stays below min_phrase_hits.
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert find_matching_topic_cluster('A warm-lane reseed happened.', clusters) is None
+
     def test_full_default_cluster_list_resolves_here_not_plan_tools_cluster(self):
         # eval-worktree-plan-tools-missing is seeded earlier in the default
         # list and find_matching_topic_cluster returns the FIRST qualifying
