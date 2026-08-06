@@ -25,6 +25,7 @@ auto-resolve for every file in this directory, whereas a `from conftest import
 copies of one fake-httpx idiom spread across four of this directory's files.
 """
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -68,6 +69,59 @@ from df_pytest_isolation import (  # noqa: E402
 def pytest_configure(config):
     """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
     reject_unsafe_basetemp(config)
+
+
+_FLEET_DEPLOY_CLOCK_ENV = 'ORCH_FLEET_DEPLOY_CLOCK'
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_fleet_deploy_clock_redirect(tmp_path_factory):
+    """Point the fleet-deploy clock at a tmp file for this whole session (3797).
+
+    ``scripts/restart-all-orchestrators.sh`` resolves its ``CLOCK_FILE`` from
+    ``$ORCH_FLEET_DEPLOY_CLOCK``, falling back to
+    ``$REPO_DIR/data/orchestrator/last_redeploy_orchestrator.json`` — the
+    LIVE checkout the script sits in. Its exit-0 all-units-verified-fresh path
+    stamps that file unconditionally, and every fake-systemctl test in this
+    directory that drives a successful restart reaches it. The stamp is
+    indistinguishable from a genuine one:
+    ``scripts/orchestrator-watchdog.py`` reads it as "the fleet redeployed at
+    <ts>" and SKIPS its staleness backstop for
+    ``ORCH_RESTART_MIN_INTERVAL_SECS`` (28800s = 8h), so a green test run
+    silently disarms fleet staleness recovery for the rest of the day.
+
+    This is deliberately a conftest fixture rather than an extra assignment
+    inside ``_run_script``. The defect class is "a spawner that forgets the env
+    var", so fixing today's single spawner leaves the hole open for the next
+    one. Every spawner in this directory — present and future — inherits the
+    redirect for free, because a subprocess env built from ``dict(os.environ)``
+    picks it up automatically. A test that wants its OWN clock file still wins:
+    ``_run_script`` applies its ``env=`` overrides after copying ``os.environ``.
+
+    SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp``
+    documents (df_pytest_isolation.py) — cost (an autouse function-scoped
+    fixture runs once per test across ~50 files, times every xdist worker) and
+    coverage (module-/session-scoped fixtures that spawn the script must be
+    covered too). One shared file across the session is safe here because no
+    test in this directory asserts on clock CONTENT; those assertions live in
+    ``tests/scripts/test_restart_all_orchestrators.py``, whose harness takes
+    ``clock_file`` as a required per-test parameter.
+
+    Restores the previous value EXACTLY on teardown, popping the key when it
+    was absent rather than setting an empty string — an empty
+    ``ORCH_FLEET_DEPLOY_CLOCK`` is not "unset" to the script's ``${VAR:-…}``
+    default, and leaking one would be its own bug.
+    """
+    saved = os.environ.get(_FLEET_DEPLOY_CLOCK_ENV)
+    clock = tmp_path_factory.mktemp('fleet-deploy-clock') / 'last_redeploy_orchestrator.json'
+    os.environ[_FLEET_DEPLOY_CLOCK_ENV] = str(clock)
+    try:
+        yield clock
+    finally:
+        if saved is None:
+            os.environ.pop(_FLEET_DEPLOY_CLOCK_ENV, None)
+        else:
+            os.environ[_FLEET_DEPLOY_CLOCK_ENV] = saved
 
 
 # ---------------------------------------------------------------------------

@@ -183,7 +183,13 @@ def _write_heartbeat(fleet_dir, unit, **overrides):
 
 
 def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=20):
-    """Run restart-all-orchestrators.sh with the fake systemctl on PATH."""
+    """Run restart-all-orchestrators.sh with the fake systemctl on PATH.
+
+    ORCH_FLEET_DEPLOY_CLOCK is NOT set here: conftest.py's session-scoped
+    autouse `_df_fleet_deploy_clock_redirect` already points it at a tmp file
+    for every spawner in this directory (task 3797). A per-test override still
+    wins via `env=`, which is applied after the os.environ copy below.
+    """
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
