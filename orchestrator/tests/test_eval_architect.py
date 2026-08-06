@@ -1278,9 +1278,10 @@ class TestArchitectEvalConfigs:
         assert cfg.role == 'architect'
 
     def test_architect_fable_candidate_added_existing_byte_unchanged(self):
-        """eval-revival π: architect-fable-high joins ARCHITECT_EVAL_CONFIGS.
+        """eval-revival π/ρ: architect-fable-high and architect-fable-max join
+        ARCHITECT_EVAL_CONFIGS.
 
-        Parity discipline (eval-revival decision 11): the three pre-existing
+        Parity discipline (eval-revival decision 11): the four pre-existing
         candidates stay byte-unchanged (dataclass equality) when a new
         candidate is appended; the new candidate is config-only — it rides
         run_ofat_stage's existing generic role='architect' branch (task 2478).
@@ -1291,6 +1292,7 @@ class TestArchitectEvalConfigs:
             EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect'),
             EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role='architect'),
             EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect'),
+            EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role='architect'),
         ]
         by_name = {c.name: c for c in ARCHITECT_EVAL_CONFIGS}
         for expected in existing:
@@ -1302,11 +1304,51 @@ class TestArchitectEvalConfigs:
         assert fable.effort == 'high'
         assert fable.role == 'architect'
 
+        fable_max = by_name['architect-fable-max']
+        assert fable_max.backend == 'claude'
+        assert fable_max.model == 'claude-fable-5'
+        assert fable_max.effort == 'max'
+        assert fable_max.role == 'architect'
+
         assert {c.name for c in ARCHITECT_EVAL_CONFIGS} == {
             'architect-opus-high',
             'architect-opus-max',
             'architect-sonnet-high',
             'architect-fable-high',
+            'architect-fable-max',
+        }
+
+    def test_architect_fable_max_is_effort_matched_to_opus_incumbent(self):
+        """eval-revival ρ: architect-fable-max is the effort-matched fable variant.
+
+        Per the OFAT methodology (mirroring JUDGE_EVAL_CONFIGS: "effort fixed →
+        ONLY the model varies"), architect-fable-max holds effort/role/backend
+        equal to its architect-opus-max incumbent and varies EXACTLY the model
+        axis. v1's screen compared fable@high against opus@max — a confound —
+        so fable-trial-v2 δ's stage-2 screen needs this effort-matched pair to
+        isolate the model delta cleanly.
+        """
+        from orchestrator.evals.configs import get_config_by_name, ofat_candidates
+
+        cfg = get_config_by_name('architect-fable-max')
+        assert cfg is not None
+        assert cfg.backend == 'claude'
+        assert cfg.model == 'claude-fable-5'
+        assert cfg.effort == 'max'
+        assert cfg.role == 'architect'
+        # A native cloud claude candidate, never a proxied bundle (the same
+        # discriminator _cloud_implementer_incumbents uses).
+        assert not cfg.env_overrides
+
+        incumbent = get_config_by_name('architect-opus-max')
+        assert incumbent is not None
+        assert cfg.effort == incumbent.effort
+        assert cfg.role == incumbent.role
+        assert cfg.backend == incumbent.backend
+        assert cfg.model != incumbent.model
+
+        assert 'architect-fable-max' in {
+            c.name for c in ofat_candidates() if c.role == 'architect'
         }
 
 
