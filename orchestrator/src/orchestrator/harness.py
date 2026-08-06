@@ -7756,6 +7756,15 @@ class Harness:
             #   GENUINE {stale, no_transcript} → session_resume_fallback, feeds
             #                                  the streak, storm-escape at
             #                                  fallback_storm_threshold (INV-4).
+            #
+            # Both session_resume_fallback emits also carry archive_available
+            # (task 3727) — was this session still recoverable from the durable
+            # transcript archive? That is INSTRUMENTATION ONLY (D8 / INV-3
+            # instrument-before-acting): it reports the recoverable population
+            # so it can be MEASURED in production before anything is gated on
+            # it, and changes nothing about what resumes here. Leaf δ is what
+            # may later gate on the signal; task 3578 is what consumes
+            # durable_archive_path to perform an actual restore.
             if recovered_session is not None:
                 eligible, reason = self._session_resume_eligible(
                     recovered_session, recovered_config_dir
@@ -7790,60 +7799,70 @@ class Harness:
                                 task_id=assignment.task_id,
                                 data=resume_event_data,
                             )
-                    elif reason == 'reseeded':
-                        # By-design lane reseed (task 3256) — the acquire that
-                        # re-seeds from base wiped the transcript store, so this
-                        # fallback is EXPECTED, not a corroboration failure.
-                        # Keeps the session_resume_fallback event (the fallback
-                        # rate stays measurable — PRD open question 3) but, like
-                        # 'capped', neither feeds nor resets the storm streak:
-                        # a drip of reseeds must not mask a genuine systematic
-                        # failure interleaved between them.
-                        if self.event_store:
-                            self.event_store.emit(
-                                EventType.session_resume_fallback,
-                                task_id=assignment.task_id,
-                                data={**resume_event_data, 'reason': reason},
-                            )
-                    else:  # 'stale' / 'no_transcript' — genuine corroboration fail
-                        if self.event_store:
-                            self.event_store.emit(
-                                EventType.session_resume_fallback,
-                                task_id=assignment.task_id,
-                                data={
-                                    **resume_event_data,
-                                    'reason': reason,
-                                    # Read the session id off the snapshot taken
-                                    # above, NOT off recovered_session — that was
-                                    # set to None at the top of this else-branch,
-                                    # so re-reading it would raise AttributeError.
-                                    'archive_available': self._archive_available(
-                                        assignment.task_id,
-                                        resume_event_data['session_id'],
-                                    ),
-                                },
-                            )
-                        # Rolling-window decay (task 3256): "consecutive" means
-                        # CHAINED within storm_window_secs, not merely
-                        # cumulative-per-boot — which is what makes this a
-                        # storm DETECTOR rather than a running total. A gap at
-                        # least as long as the window means the previous run
-                        # ended, so start counting over. Monotonic, not
-                        # wall-clock: 'stale' is itself produced by clock skew.
-                        now = time.monotonic()
-                        window = self.config.session_resume.storm_window_secs
-                        if (
-                            self._last_session_resume_fallback_at is not None
-                            and (now - self._last_session_resume_fallback_at) >= window
-                        ):
-                            self._session_resume_fallback_streak = 0
-                        self._last_session_resume_fallback_at = now
-                        self._session_resume_fallback_streak += 1
-                        if (
-                            self._session_resume_fallback_streak
-                            >= self.config.session_resume.fallback_storm_threshold
-                        ):
-                            self._file_session_resume_storm_escalation()
+                    else:
+                        # Both remaining reasons emit session_resume_fallback:
+                        # 'reseeded' (by design) and {stale, no_transcript}
+                        # (genuine). ONE archive lookup, shared by both — one
+                        # filesystem glob per dispatch rather than two, and no
+                        # chance of the two emit sites drifting apart. Computed
+                        # HERE, on the fallback path only, so the eligible /
+                        # capped / disabled paths do no extra I/O and stay
+                        # byte-identical (D8).
+                        #
+                        # The session id comes off the snapshot taken above, NOT
+                        # off recovered_session — that was set to None at the top
+                        # of this else-branch, so re-reading it would raise.
+                        fallback_data = {
+                            **resume_event_data,
+                            'reason': reason,
+                            'archive_available': self._archive_available(
+                                assignment.task_id,
+                                resume_event_data['session_id'],
+                            ),
+                        }
+                        if reason == 'reseeded':
+                            # By-design lane reseed (task 3256) — the acquire that
+                            # re-seeds from base wiped the transcript store, so this
+                            # fallback is EXPECTED, not a corroboration failure.
+                            # Keeps the session_resume_fallback event (the fallback
+                            # rate stays measurable — PRD open question 3) but, like
+                            # 'capped', neither feeds nor resets the storm streak:
+                            # a drip of reseeds must not mask a genuine systematic
+                            # failure interleaved between them.
+                            if self.event_store:
+                                self.event_store.emit(
+                                    EventType.session_resume_fallback,
+                                    task_id=assignment.task_id,
+                                    data=fallback_data,
+                                )
+                        else:  # 'stale' / 'no_transcript' — genuine corroboration fail
+                            if self.event_store:
+                                self.event_store.emit(
+                                    EventType.session_resume_fallback,
+                                    task_id=assignment.task_id,
+                                    data=fallback_data,
+                                )
+                            # Rolling-window decay (task 3256): "consecutive" means
+                            # CHAINED within storm_window_secs, not merely
+                            # cumulative-per-boot — which is what makes this a
+                            # storm DETECTOR rather than a running total. A gap at
+                            # least as long as the window means the previous run
+                            # ended, so start counting over. Monotonic, not
+                            # wall-clock: 'stale' is itself produced by clock skew.
+                            now = time.monotonic()
+                            window = self.config.session_resume.storm_window_secs
+                            if (
+                                self._last_session_resume_fallback_at is not None
+                                and (now - self._last_session_resume_fallback_at) >= window
+                            ):
+                                self._session_resume_fallback_streak = 0
+                            self._last_session_resume_fallback_at = now
+                            self._session_resume_fallback_streak += 1
+                            if (
+                                self._session_resume_fallback_streak
+                                >= self.config.session_resume.fallback_storm_threshold
+                            ):
+                                self._file_session_resume_storm_escalation()
             # ──────────────────────────────────────────────────────────────────
 
             # Build steward factory — steward starts when the workflow
