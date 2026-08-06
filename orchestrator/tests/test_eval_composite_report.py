@@ -2451,3 +2451,125 @@ class TestAggregateRatingsUnion:
         from orchestrator.evals.report import compute_aggregate_ratings
 
         assert compute_aggregate_ratings(JudgeState(per_task={})) == {}
+
+
+# ---------------------------------------------------------------------------
+# Rendered surfaces for judged_without_reference (eval-revival σ, task 3628)
+#
+# A count that is loud only in JSON is still mute where an operator reads it.
+# Both tables gain a cell, and the θ table's trailer gains a summary line —
+# a mean_plan_quality printed WITHOUT saying how many of its cells were judged
+# blind is the same silent degradation one layer up.
+# ---------------------------------------------------------------------------
+
+class TestJudgedWithoutReferenceRendering:
+    @staticmethod
+    def _blind_results():
+        return [
+            _mresult('f1', 'arch-blind', 1, quality=1.0, cost_usd=0.30,
+                     duration_ms=60000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6,
+                     judged_without_reference=True),
+            _mresult('f2', 'arch-blind', 1, quality=1.0, cost_usd=0.30,
+                     duration_ms=60000, role_under_test='architect',
+                     plan_quality=0.6, plan_steps=6),
+        ]
+
+    @staticmethod
+    def _clean_results():
+        return [
+            _mresult('f1', 'arch-clean', 1, quality=1.0, cost_usd=0.30,
+                     duration_ms=60000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6),
+        ]
+
+    def test_composite_column_is_inserted_beside_its_siblings(self):
+        from orchestrator.evals.report import _COMPOSITE_COLUMNS
+
+        # Pin the column tuple FIRST (the file's established idiom), so a
+        # reorder fails here rather than silently re-aiming cell assertions.
+        # The new column is INSERTED after its two siblings, not appended away
+        # from them — the three counts describe one pool and must read together.
+        assert _COMPOSITE_COLUMNS[4:8] == (
+            'pq_excluded', 'pq_no_plan', 'pq_no_ref', 'plan_rate',
+        )
+        # …and the relative $/plan pin still holds across the insertion.
+        assert (
+            _COMPOSITE_COLUMNS[_COMPOSITE_COLUMNS.index('cost_usd') + 1]
+            == 'cost_per_plan'
+        )
+
+    def test_composite_table_renders_the_count(self):
+        from orchestrator.evals.report import (
+            build_composite_report,
+            format_composite_table,
+        )
+
+        out = format_composite_table(build_composite_report(self._blind_results()))
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-blind')
+
+        assert cells[header.index('pq_no_ref')] == '1'
+
+    def test_mean_columns_keep_the_mean_last(self):
+        from orchestrator.evals.report import _PLAN_QUALITY_MEAN_COLUMNS
+
+        assert 'judged_without_reference' in _PLAN_QUALITY_MEAN_COLUMNS
+        # BEFORE the mean it bounds…
+        assert (
+            _PLAN_QUALITY_MEAN_COLUMNS.index('judged_without_reference')
+            < _PLAN_QUALITY_MEAN_COLUMNS.index('mean_plan_quality')
+        )
+        # …and the mean stays LAST, which other tests depend on positionally
+        # (the mean-section `means[-1]` read, and the doomed-config line whose
+        # rendering must still `endswith('-')`).
+        assert _PLAN_QUALITY_MEAN_COLUMNS[-1] == 'mean_plan_quality'
+
+    def test_plan_quality_mean_section_renders_the_count(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._blind_results())
+        )
+        section = 'plan_quality by config:'
+        header = out.partition(section)[2].splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-blind', section=section)
+
+        assert cells[header.index('judged_without_reference')] == '1'
+
+    def test_trailer_reports_the_total_against_the_scored_pool(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._blind_results())
+        )
+        line = next(
+            ln for ln in out.splitlines()
+            if ln.startswith('judged without reference:')
+        )
+        # 1 of the 2 scored cells — the bound stated against its own pool,
+        # beside the existing `excluded: N ... of M architect cell(s)` line.
+        assert '1' in line and '2' in line
+        assert 'excluded:' in out
+
+    def test_a_clean_campaign_does_not_grow_a_scary_line(self):
+        """Absent, or reading 0 — never an alarming line on a healthy run."""
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._clean_results())
+        )
+        lines = [
+            ln for ln in out.splitlines()
+            if ln.startswith('judged without reference:')
+        ]
+        assert lines == [] or lines[0].split(':')[1].strip().startswith('0')
