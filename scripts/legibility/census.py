@@ -1942,23 +1942,38 @@ def _build_default_verify_fn(
     fires). When *headroom_probe* is supplied, two detectors fire at the
     FIRST corrupted cluster:
 
-    (a) a reply that FAILED TO PARSE as a verdict carries a blocking banner.
-        The scan is deliberately confined to the parse-failure path: **a reply
-        that parses into a verdict IS a verdict and must never be re-read as a
-        banner.** The loose OR-substring marker list is safe on the
-        ``"ping"`` -> ``"pong"`` preflight probe precisely because that reply
-        is fixed and contentless; it is unsafe the moment it is pointed at
-        arbitrary model output, because a verify reply is a model-authored
+    (a) a reply that FAILED TO PARSE as a verdict carries a blocking banner,
+        and ONE re-probe then confirms no capacity. Banner-matching CONTENT
+        may only TRIGGER a probe, never itself decide that the account is
+        capped -- which makes (a) structurally identical to (b): content or
+        exception triggers, the probe decides.
+
+        The scan is confined to the parse-failure path because **a reply that
+        parses into a verdict IS a verdict and must never be re-read as a
+        banner.** The loose OR-substring marker list is safe on the ``"ping"``
+        -> ``"pong"`` preflight probe precisely because that reply is fixed
+        and contentless; it is unsafe the moment it is pointed at arbitrary
+        model output, because a verify reply is a model-authored
         ``{"verified":..., "reason":...}`` whose reason legitimately QUOTES the
         cluster under adjudication -- and this repo's codebook is dominated by
         clusters ABOUT usage/weekly limits, so the markers match ordinary
         healthy content. Scanning pre-parse aborted the run on those clusters,
         and because the abort precedes ``advance_census_state`` the next run
         re-mined the same window and aborted again: a permanent census stall
-        plus a stream of false "the account is capped" escalations. Splitting
-        on parse success loses no detection -- a real CLI cap banner is plain
-        prose, and every entry of ``REAL_CLI_CAP_MESSAGES`` raises
-        ``CoderParseError``, so all of them still reach the scan.
+        plus a stream of false "the account is capped" escalations. The
+        probe-confirmation closes the residual half of that class, where the
+        model ignores the prompt's STRICT-JSON instruction and answers in
+        prose about a cap-themed cluster.
+
+        Splitting on parse success loses no detection -- a real CLI cap banner
+        is plain prose, and every entry of ``REAL_CLI_CAP_MESSAGES`` raises
+        ``CoderParseError``, so all of them still reach the scan. The probe is
+        reliable in BOTH directions here: ``preflight_headroom`` folds any
+        probe exception into ``HeadroomResult(ok=False)``, so a genuinely
+        capped account confirms whether its probe returns a banner or raises.
+        Cost is bounded and paid only on a path that has ALREADY failed to
+        parse AND matched a marker -- one trickle-tier probe, against a
+        cap-themed cluster permanently stalling the census.
     (b) a per-cluster invocation exception triggers ONE re-probe. No
         headroom means ``CensusHeadroomExhausted``, and the hitting cluster
         is NOT recorded as rejected. Headroom still available means the
@@ -1980,9 +1995,12 @@ def _build_default_verify_fn(
         misattributed verdicts in that residual case. No probe is spent after
         the last cluster, where it would guard a stage already over.
 
-    (b) and (c) are no-ops without a *headroom_probe*; (a) currently fires
-    ungated, which step-20 closes. Every existing call site otherwise keeps
-    its current behaviour exactly.
+    All three are no-ops without a *headroom_probe* -- literally, now that (a)
+    confirms rather than assumes -- so every existing call site keeps its
+    current behaviour exactly. Production reach is unaffected: ``main()``
+    wires ``headroom_probe=functools.partial(preflight_headroom,
+    verify_invoke, model=cfg.models.trickle)``, so every real run keeps full
+    detection.
     """
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
@@ -2019,15 +2037,29 @@ def _build_default_verify_fn(
             except Exception as exc:  # noqa: BLE001 - an unparseable verdict rejects, never crashes
                 # (a) Only a reply that failed to parse as a verdict is
                 # eligible for the banner scan. A parsed verdict is a verdict,
-                # however cap-themed the cluster it adjudicates.
+                # however cap-themed the cluster it adjudicates. And even
+                # here the marker only TRIGGERS: a probe decides.
                 marker = looks_like_blocking_banner(raw or "")
-                if marker is not None:
-                    raise CensusHeadroomExhausted(
-                        stage="verify",
-                        reason=f"verify reply carries a banner marker: {marker!r}",
-                        verified=len(verified),
-                        unverified=remaining,
-                    ) from exc
+                if marker is not None and headroom_probe is not None:
+                    probe = headroom_probe()
+                    if not probe.ok:
+                        raise CensusHeadroomExhausted(
+                            stage="verify",
+                            reason=(
+                                "verify reply failed to parse and carries a banner "
+                                f"marker {marker!r}; headroom probe confirms no "
+                                f"capacity: {probe.reason or 'no headroom'}"
+                            ),
+                            verified=len(verified),
+                            unverified=remaining,
+                        ) from exc
+                    logger.warning(
+                        "census: verify reply for cluster %r carries banner marker %r "
+                        "but the headroom probe reports capacity available -- "
+                        "treating it as an ordinary unparseable verdict",
+                        cluster.get("title"),
+                        marker,
+                    )
                 logger.warning(
                     "census: verify failed for cluster %r: %s", cluster.get("title"), exc,
                 )
