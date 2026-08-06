@@ -527,6 +527,79 @@ def test_the_derivation_excludes_submodules_and_foreign_checkouts(
     )
 
 
+def test_the_sweep_actually_finds_a_shadow_it_should_report(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The sweep must FIND real shadows, not merely stay quiet.
+
+    WHY THIS EXISTS AS A SEPARATE TEST. Every other assertion against
+    ``_shadowing_configs`` in this file is ``assert not shadows`` — a NEGATIVE
+    claim, which a sweep that has silently stopped finding anything satisfies
+    perfectly. Measured: injecting ``entries = []`` at the top of
+    ``_shadowing_configs`` — nulling the sweep outright — left the whole file
+    GREEN (3 passed) before this test existed. That is the exact failure mode the
+    shadow half is here to prevent, one level up: a gate reporting "All checks
+    passed!" while running no check at all.
+
+    So this pins the POSITIVE direction, and pins it as an EXACT set so it doubles
+    as the discrimination test: each planted file below is a distinct boundary the
+    sweep must get right, and the fixture's own exempt/foreign configs must still
+    be absent from the same result.
+    """
+    root = _hostile_fixture_repo(tmp_path)
+
+    # Untracked-but-not-ignored on purpose: `git ls-files --others
+    # --exclude-standard` must see a config the moment it lands on disk, not only
+    # once it is committed — a shadow is live for ruff before it is ever staged.
+    planted = {
+        # Depth 1, the obvious case.
+        'tooling/ruff.toml': 'the plainest shadow there is',
+        # Arbitrary depth AND the dotted spelling: the sweep is documented as
+        # depth-independent, which is what makes a scripts/legibility/ruff.toml
+        # (re-scoping half of `ruff check scripts/`) catchable.
+        'tooling/deep/nested/.ruff.toml': 'depth-independence and the dotted name',
+        # Only the REPO-ROOT pyproject.toml is exempt; a non-member one at any
+        # other path shadows exactly like a ruff.toml does.
+        'tooling/sub/pyproject.toml': 'a non-root pyproject.toml is not exempt',
+    }
+    for relative in planted:
+        _write(root, relative, '[tool.ruff]\nline-length = 120\n')
+
+    # A root ruff.toml is deliberately NOT exempt: ruff PREFERS ruff.toml over a
+    # pyproject.toml in the SAME directory, so one here would replace the very
+    # table this file pins rather than merge with it.
+    _write(root, 'ruff.toml', 'line-length = 120\n')
+
+    # NOT a shadow: the sweep queries git with the pathspec `*ruff.toml`, whose
+    # `*` spans separators (that is what buys depth-independence) but also matches
+    # this basename. _shadowing_configs re-checks the basename for exactly this
+    # reason; without that re-check this file lands in the result below.
+    _write(root, 'tooling/myruff.toml', 'line-length = 120\n')
+
+    shadows = set(_shadowing_configs(root=root))
+    expected = set(planted) | {'ruff.toml'}
+
+    missed = sorted(expected - shadows)
+    assert not missed, (
+        f'The sweep did NOT report {missed}, each of which genuinely shadows the repo-root '
+        f'[tool.ruff] table. Reasons they must each be reported: {planted!r}, plus a root '
+        'ruff.toml because ruff prefers it over the pyproject.toml beside it. A sweep that '
+        'under-reports is INVISIBLE: every other _shadowing_configs assertion in this file is '
+        '`assert not shadows`, so a sweep that finds nothing passes them all while the rule set '
+        'for a whole directory tree is silently decided by a file nobody is watching.'
+    )
+
+    extra = sorted(shadows - expected)
+    assert not extra, (
+        f'The sweep over-reported {extra}. Nothing else in the fixture is a live shadow: the root '
+        'pyproject.toml IS the table under test, memberpkg/pyproject.toml is a workspace member '
+        'and is subtracted, tooling/myruff.toml only matches the `*ruff.toml` pathspec and is '
+        'rejected by the basename re-check, and the vendored/ nested/ .eval-worktrees/ configs '
+        'are not files of this repository. Over-reporting fails the guard in the canonical clone '
+        'for a reason no operator can act on.'
+    )
+
+
 def test_root_ruff_config_matches_every_workspace_member() -> None:
     """The DECLARED root config must equal every member's, and nothing may shadow it."""
     root_toml = _root_pyproject()
