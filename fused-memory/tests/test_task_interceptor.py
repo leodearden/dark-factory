@@ -4535,6 +4535,106 @@ async def test_validate_done_provenance_does_not_stamp_other_kinds(
 
 
 @pytest.mark.asyncio
+async def test_validate_done_provenance_discards_caller_supplied_stamp(
+    tmp_path, frozen_provenance_stamp, caplog
+):
+    """A caller-supplied stamped_at is overwritten by the server value — loudly.
+
+    Warn-and-overwrite rather than reject: the same-status repair seam
+    re-submits a previously-STORED blob, which post-3576 carries its own
+    stamped_at, so a hard rejection would break every repair of a stamped
+    blob. The warning keeps the override visible instead of silent.
+    """
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+    forged = '1999-01-01T00:00:00+00:00'
+
+    with caplog.at_level(logging.WARNING):
+        err, resolved = await _validate_done_provenance(
+            '4242',
+            {
+                'kind': 'found_on_main',
+                'commit': sha,
+                'note': 'sibling task 99 landed this',
+                'stamped_at': forged,
+            },
+            str(tmp_path),
+            require=False,
+        )
+
+    assert err is None
+    assert resolved is not None
+    assert resolved['stamped_at'] == frozen_provenance_stamp
+    assert resolved['stamped_at'] != forged
+
+    warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    matching = [m for m in warnings if 'stamped_at' in m]
+    assert matching, f'expected a stamped_at override warning, got: {warnings}'
+    assert '4242' in matching[0], 'warning must name the task id'
+    assert forged in matching[0], 'warning must name the discarded value'
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_no_stamp_warning_when_absent(
+    tmp_path, frozen_provenance_stamp, caplog
+):
+    """The ordinary path (no caller-supplied stamp) stays quiet."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        err, resolved = await _validate_done_provenance(
+            '1',
+            {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
+            str(tmp_path),
+            require=False,
+        )
+
+    assert err is None
+    assert resolved is not None
+    assert not [
+        r.message
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'stamped_at' in r.message
+    ]
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_found_on_main_stamp_reaches_storage(
+    taskmaster, reconciler, event_buffer, tmp_path, frozen_provenance_stamp
+):
+    """End-to-end: stamped_at survives into the persisted done_provenance blob.
+
+    Proves the field reaches storage, not merely the resolver return value —
+    the predicate reads it back off stored task metadata.
+    """
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': sha,
+            'note': 'sibling task 99 landed this on main',
+        },
+    )
+
+    assert 'error' not in result
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    dp = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
+    assert dp['stamped_at'] == frozen_provenance_stamp
+    # The stamp is additive — it must not displace the existing evidence.
+    assert dp['kind'] == 'found_on_main'
+    assert dp['commit'] == sha
+    assert dp['note'] == 'sibling task 99 landed this on main'
+
+
+@pytest.mark.asyncio
 async def test_done_provenance_accepts_operational_verified_end_to_end(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
