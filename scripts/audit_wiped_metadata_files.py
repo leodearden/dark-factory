@@ -31,12 +31,16 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-# Tier 1 (tasks.db discovery) ONLY. This module deliberately keeps its own
-# format_report/format_json/_build_parser/main: its fourth exit code (3 = roots
-# resolved but every one failed to audit, kept distinct from 0 per
-# docs/legibility/design-invariants.md's no-silent-fail-soft rule), its
-# --min-fidelity filter and its object-shaped JSON are genuinely different
-# behaviour, not duplication.
+# Tier 1 (tasks.db discovery) and Tier 3 (audit-script CLI plumbing: the roots
+# loop, the warn-and-continue skip, the exit-code ladder and the two reporting
+# layout primitives), shared with audit_combine_gate_marker_loss.py as of task
+# 3616. Tier 2 is the LEAK-SCANNER skeleton and does not apply here — it sweeps
+# db paths and accumulates matches, not one audit per project root.
+#
+# This module deliberately keeps its own format_report/format_json/_build_parser:
+# its --min-fidelity filter, its object-shaped JSON, its epilog wording and its
+# COVERAGE caveat/labels are genuinely different behaviour, not duplication.
+# Exit 3 is NOT among those differences any more — it is Tier 3's, shared.
 from _task_db_scan import (  # noqa: F401  (discover_project_roots re-exported for the tests)
     discover_project_roots,
     format_coverage_block,

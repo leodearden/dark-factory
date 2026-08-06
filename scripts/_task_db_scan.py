@@ -1,29 +1,47 @@
 """Shared plumbing for the READ-ONLY tasks.db sweep scripts.
 
-Home of the tasks.db discovery ladder and the leak-scanner CLI skeleton that
-were previously copied into ``scan_task_toolcall_leaks.py``,
-``scan_provenance_note_log_leaks.py`` and ``audit_wiped_metadata_files.py``
-(task 3336, closing task 3286's "~134 identical lines" finding). Every
-function body here was lifted from those copies verbatim, so "pure extraction,
-no behaviour change" stays checkable by diff.
+Home of the tasks.db discovery ladder, the leak-scanner CLI skeleton and the
+audit-script CLI skeleton that were previously copied across
+``scan_task_toolcall_leaks.py``, ``scan_provenance_note_log_leaks.py``,
+``audit_wiped_metadata_files.py`` and ``audit_combine_gate_marker_loss.py``
+(tasks 3336 and 3616, closing task 3286's "~134 identical lines" finding).
+Every function body here was lifted from those copies verbatim, so "pure
+extraction, no behaviour change" stays checkable by diff.
 
 This module is NOT a CLI in its own right — the leading underscore marks it as
-importable-by-sibling-scripts only. It hosts two tiers:
+importable-by-sibling-scripts only. It hosts three tiers:
 
 * **Tier 1, discovery** (``_DEFAULT_PROJECT_ROOTS``, :func:`tasks_db_path`,
   :func:`resolve_project_roots`, :func:`discover_project_roots`,
-  :func:`discover_db_paths`) — adopted by ALL THREE sweep scripts.
-* **Tier 2, leak-scanner CLI plumbing** — adopted by the two leak scanners
-  only. ``audit_wiped_metadata_files.py`` deliberately keeps its own
-  ``format_report``/``format_json``/``_build_parser``/``main``: its
-  ``--min-fidelity`` filter, its object-shaped rather than array-shaped JSON
-  and its different no-roots message are genuinely different behaviour, not
-  duplication. Folding them in here would silently delete those semantics.
-  Its exit 3 is NOT among those differences any more — task 3474 gave
-  :func:`run_scan_cli` the same "nothing was scanned/audited, so this is not
-  a clean run" semantics, so ``docs/legibility/design-invariants.md``'s
-  no-silent-fail-soft rule is now honoured by BOTH tiers rather than only by
-  the script that opted out of the shared plumbing.
+  :func:`discover_db_paths`) — adopted by ALL FOUR sweep scripts.
+* **Tier 2, leak-scanner CLI plumbing** (:func:`sweep_databases`,
+  :func:`run_scan_cli`, :func:`add_db_discovery_args`,
+  :data:`NO_DB_RESOLVED_MESSAGE`, :func:`format_json`, :func:`truncate`,
+  :func:`group_matches_by_db`) — adopted by the two LEAK SCANNERS only. It
+  sweeps DB PATHS and collects MATCHES; the audit scripts sweep PROJECT ROOTS
+  and collect one audit per root, which is Tier 3.
+* **Tier 3, audit-script CLI plumbing** (:func:`run_audit_cli`,
+  :func:`sweep_project_roots`, the ``AUDIT_EXIT_*`` codes,
+  :data:`NO_PROJECT_ROOT_RESOLVED_MESSAGE`, :func:`format_kv_line`,
+  :func:`format_coverage_block`) — adopted by ``audit_wiped_metadata_files.py``
+  and ``audit_combine_gate_marker_loss.py`` (task 3616).
+
+Both audit scripts deliberately keep their own ``format_report`` /
+``format_json`` / ``_build_parser``. What remains genuinely per-script, and
+must NOT be folded in here: the two ``--project-root``/``--json`` parsers and
+their two epilogs (one speaks of candidates, the other of ACTIONABLE findings
+and terminal-row suppression); wiped's ``--min-fidelity`` filter; both scripts'
+object-shaped rather than array-shaped JSON; combine's ``--project-id``
+handling; and each COVERAGE block's caveat PROSE and label set — only the
+block's alignment is shared, because those labels say what each script could
+not see. Folding any of them in would silently delete those semantics.
+
+Exit 3 is NOT among the differences: task 3474 gave :func:`run_scan_cli` the
+same "nothing was scanned/audited, so this is not a clean run" semantics that
+the audit scripts had, so ``docs/legibility/design-invariants.md``'s
+no-silent-fail-soft rule is honoured by every tier here. Tiers 2 and 3 spell
+the exit-3 GATE differently on purpose — see :func:`run_audit_cli`'s docstring
+for why the audit spelling does not port to Tier 2 and vice versa.
 
 IMPORT-RESOLUTION CONTRACT — read before moving this file.
 This module MUST stay a flat sibling at ``scripts/_task_db_scan.py``. The
@@ -136,16 +154,17 @@ def discover_db_paths(
 # ---------------------------------------------------------------------------
 # Tier 2 — leak-scanner CLI plumbing (the two leak scanners only).
 #
-# audit_wiped_metadata_files.py deliberately does NOT adopt this tier: its
-# main() carries a --min-fidelity filter, object-shaped rather than
-# array-shaped JSON, and a different no-roots message.
+# The AUDIT scripts do not adopt THIS tier, and should not: it sweeps db
+# PATHS and accumulates MATCHES, while they sweep project ROOTS and collect
+# exactly one audit object per root. That difference is load-bearing rather
+# than cosmetic — it is why the two tiers' exit-3 gates are spelled
+# differently (see run_scan_cli's comment below and run_audit_cli's
+# docstring). Their shared main() body is Tier 3 instead.
 #
-# Its exit 3 (roots resolved but every one failed to audit, kept distinct
-# from 0 per docs/legibility/design-invariants.md's no-silent-fail-soft rule)
-# used to be listed here too. It is no longer a differentiator: run_scan_cli
-# returns 3 for the same condition as of task 3474, which is what makes this
-# shared plumbing consistent with the invariant rather than an exception to
-# it.
+# Exit 3 (every resolved target failed, kept distinct from 0 per
+# docs/legibility/design-invariants.md's no-silent-fail-soft rule) is common
+# to both tiers as of task 3474, which is what makes this shared plumbing
+# consistent with the invariant rather than an exception to it.
 # ---------------------------------------------------------------------------
 
 # The exit-2 signal, emitted verbatim by both leak scanners.

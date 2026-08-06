@@ -1,18 +1,26 @@
 """Tests for scripts/_task_db_scan.py — the shared plumbing extracted out of
-the three READ-ONLY tasks.db sweep scripts (task 3336, following task 3286's
-"~134 identical lines" finding).
+the four READ-ONLY tasks.db sweep scripts (tasks 3336 and 3616, following task
+3286's "~134 identical lines" finding).
 
 Tier 1 (discovery: _DEFAULT_PROJECT_ROOTS / tasks_db_path /
 resolve_project_roots / discover_project_roots / discover_db_paths) is adopted
-by ALL THREE sweep scripts. Tier 2 (leak-scanner CLI plumbing) is adopted by
-the two leak scanners only — audit_wiped_metadata_files.py keeps its own
-CLI layer, whose --min-fidelity filter, object-shaped rather than
-array-shaped JSON and different no-roots message are genuinely different
-behaviour rather than duplication. Its exit 3 is NOT one of those
-differences any more: task 3474 gave run_scan_cli the same "nothing was
-scanned, so this is not a clean run" semantics (see
-test_run_scan_cli_exits_3_when_every_db_is_unreadable below), so that
-exit code is now shared by both tiers rather than a differentiator.
+by ALL FOUR sweep scripts. Tier 2 (leak-scanner CLI plumbing) is adopted by the
+two LEAK SCANNERS only; Tier 3 (audit-script CLI plumbing: run_audit_cli /
+sweep_project_roots / the AUDIT_EXIT_* codes / format_kv_line /
+format_coverage_block) by the two AUDIT scripts only. The split is
+load-bearing rather than cosmetic: Tier 2 sweeps db PATHS and accumulates
+MATCHES, Tier 3 sweeps project ROOTS and collects exactly one audit per root,
+which is why their exit-3 gates are spelled differently (see
+test_run_audit_cli_exits_0_when_some_roots_unreadable_and_rest_clean and its
+Tier-2 sibling).
+
+Both audit scripts keep their own format_report/format_json/_build_parser,
+whose --min-fidelity filter, --project-id handling, object-shaped JSON, epilog
+wording and COVERAGE caveat/labels are genuinely different behaviour rather
+than duplication. Exit 3 is NOT one of those differences: task 3474 gave
+run_scan_cli the same "nothing was scanned, so this is not a clean run"
+semantics (see test_run_scan_cli_exits_3_when_every_db_is_unreadable below), so
+that exit code is shared by every tier rather than a differentiator.
 
 The precedence cases below are the consolidated single home for assertions
 that previously lived duplicated across test_scan_task_toolcall_leaks.py,

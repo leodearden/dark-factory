@@ -57,12 +57,19 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-# Tier 1 (tasks.db discovery) ONLY, imported as a flat sibling. This module
-# deliberately keeps its own format_report/format_json/_build_parser/main, for
-# the same reasons audit_wiped_metadata_files.py does: a fourth exit code
-# (3 = roots resolved but every one failed to audit, kept distinct from 0 per
-# docs/legibility/design-invariants.md's no-silent-fail-soft rule) and
-# object-shaped rather than array-shaped JSON.
+# Tier 1 (tasks.db discovery) and Tier 3 (audit-script CLI plumbing: the roots
+# loop, the warn-and-continue skip, the exit-code ladder and the two reporting
+# layout primitives), imported as a flat sibling and shared with
+# audit_wiped_metadata_files.py as of task 3616. Tier 2 is the LEAK-SCANNER
+# skeleton and does not apply here — it sweeps db paths and accumulates
+# matches, not one audit per project root.
+#
+# This module deliberately keeps its own format_report/format_json/_build_parser,
+# for the same reasons audit_wiped_metadata_files.py does: its object-shaped
+# rather than array-shaped JSON, its --project-id handling, its epilog wording
+# (ACTIONABLE findings and terminal-row suppression) and its COVERAGE
+# caveat/labels are genuinely different behaviour, not duplication. main() is
+# no longer among them, and neither is exit 3 — both are Tier 3's, shared.
 #
 # IMPORT-RESOLUTION CONTRACT: _task_db_scan.py must stay a flat sibling in
 # scripts/, and this script must NEVER be invoked via `python -m` — the CLI
