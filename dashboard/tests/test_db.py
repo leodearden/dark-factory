@@ -3,13 +3,46 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import sqlite3
+from collections.abc import Callable
 from unittest.mock import patch
 
 import aiosqlite
 import pytest
 
 from dashboard.data.db import DbPool, with_db
+
+
+async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 2.0) -> None:
+    """Poll *predicate* until it is true, or fail the enclosing wait_for.
+
+    Used to await a done-callback that runs on the event loop but that the test
+    holds no future for (``DbPool``'s in-flight connect bookkeeping).  Polling
+    rather than sleeping a fixed interval keeps the tests race-free.
+    """
+
+    async def _poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout=timeout)
+
+
+async def _reap(conns: list[aiosqlite.Connection]) -> None:
+    """Close any still-running connection so a RED run does not wedge pytest.
+
+    ``DbPool`` opens via plain ``aiosqlite.connect``, whose worker thread
+    inherits ``daemon=False`` from the main thread.  A connection these tests
+    deliberately strand therefore blocks interpreter exit — the pytest process
+    hangs AFTER writing its report.  Every test below that can strand one calls
+    this from a ``finally``.
+    """
+    for conn in conns:
+        if getattr(conn, '_running', False):
+            with contextlib.suppress(Exception):
+                await conn.close()
 
 
 class TestDbPool:
@@ -340,7 +373,7 @@ class TestDbPool:
         assert pool.open_count == 0
 
     async def test_get_suspended_in_connect_during_close_all_does_not_leak(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         """get() suspended inside aiosqlite.connect() when close_all() runs must
         close the freshly-opened connection and return None — not install a stranded
@@ -360,6 +393,11 @@ class TestDbPool:
         aiosqlite.connect() → result is None, open_count==0, and the
         mid-flight connection is closed (use-after-close raises) → GREEN.
         """
+        # This test holds its connect open until AFTER close_all() returns, so
+        # close_all()'s in-flight drain (task 3466) necessarily waits out its
+        # full budget.  Shrink the budget rather than pay the production 5s on
+        # every suite run; the choreography and assertions are unaffected.
+        monkeypatch.setattr('dashboard.data.db._INFLIGHT_DRAIN_TIMEOUT', 0.05)
         db_path = tmp_path / 'test.db'
         sqlite3.connect(str(db_path)).close()
 
@@ -446,6 +484,108 @@ class TestDbPool:
             '(mid-open connection was not properly closed by the '
             'post-connect _closed re-check)'
         )
+
+    async def test_cancelled_get_adopts_connection_into_pool(self, tmp_path):
+        """A get() cancelled mid-connect must hand the landing connection to the pool.
+
+        This is the production ``/healthz`` abandoned-probe path: ``_probe_db``
+        (dashboard/app.py) cancels its probe task at the deadline and does NOT
+        await the unwinding, so ``pool.get()`` can be cancelled while suspended
+        inside ``aiosqlite.connect()`` with the pool still very much OPEN.
+
+        Distinct from the close_all() race above: nothing is draining the pool
+        here, so ``close_all()``'s in-flight drain can never see this connect.
+        The only place ownership can land is the connect task's own
+        done-callback.
+
+        Pre-fix (step-2 only): the shielded connect runs to completion and its
+        ``Connection`` is dropped on the floor — open_count stays 0, the worker
+        thread lives on, and the next get() for the same path opens a SECOND
+        connection → RED.
+
+        Post-fix: the pool ADOPTS the landed connection into ``_conns``, so it
+        is reused by the next get() and reaped by close_all() → GREEN.
+        """
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        opened: list[aiosqlite.Connection] = []
+
+        # Same two-Event choreography as the close_all race test above.
+        inside_connect = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def wrapper(*args, **kwargs):
+            inside_connect.set()      # signal: get() is now suspended mid-open
+            await resume.wait()       # hold until the test has cancelled get()
+            conn = await real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        try:
+            with patch('aiosqlite.connect', wrapper):
+                getter = asyncio.create_task(pool.get(db_path))
+                await asyncio.wait_for(inside_connect.wait(), timeout=2.0)
+
+                # The interposed event: cancel the CALLER (not close_all).
+                getter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await getter
+
+                # Let the shielded connect land, now that nobody is awaiting it.
+                resume.set()
+                await _wait_until(lambda: pool.inflight_count == 0)
+
+                assert len(opened) == 1, (
+                    f'expected exactly 1 physical connect, got {len(opened)}'
+                )
+
+                # (1) The landed connection was ADOPTED, not discarded.
+                assert pool.open_count == 1, (
+                    f'expected open_count=1 (connection adopted after the '
+                    f'getter was cancelled), got {pool.open_count} — the '
+                    f'connect landed with nobody owning it and its worker '
+                    f'thread is now stranded'
+                )
+                reused = await pool.get(db_path)
+                assert reused is opened[0], (
+                    f'expected the adopted connection to be reused, got '
+                    f'{reused!r} (is opened[0]: {reused is opened[0]})'
+                )
+                assert len(opened) == 1, (
+                    f'a second aiosqlite.connect() happened ({len(opened)} '
+                    f'total) — the adopted connection was not reused'
+                )
+
+            # (2) close_all() reaps the adopted connection and its worker thread.
+            await pool.close_all()
+            assert pool.open_count == 0, (
+                f'expected open_count=0 after close_all, got {pool.open_count}'
+            )
+            # Verified against aiosqlite >=0.22.x — see the private-attribute
+            # pin rationale on the close_all race test above.
+            assert (
+                hasattr(opened[0], '_connection')
+                and hasattr(opened[0], '_running')
+                and hasattr(opened[0], '_thread')
+            ), 'aiosqlite internal attribute names changed — update test'
+            assert opened[0]._connection is None, (
+                f'expected closed adopted connection (_connection is None), '
+                f'got {opened[0]._connection!r}'
+            )
+            assert opened[0]._running is False, (
+                f'expected worker-thread shutdown (_running is False), '
+                f'got {opened[0]._running!r}'
+            )
+            opened[0]._thread.join(timeout=2.0)
+            assert not opened[0]._thread.is_alive(), (
+                'aiosqlite worker thread did not exit after close_all — the '
+                'connection adopted from the cancelled getter was not reaped'
+            )
+        finally:
+            await _reap(opened)
 
 
 class TestWithDb:
