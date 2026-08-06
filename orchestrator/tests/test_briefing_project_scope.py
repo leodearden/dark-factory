@@ -185,3 +185,102 @@ class TestFilterFailsOpen:
         assert 'Fact with null metadata.' in text
         assert 'Fact with list metadata.' in text
         assert dropped == 0
+
+
+class TestForeignTagKeysAndSpelling:
+    """Tag extraction must recognise more than the bare ``project_id`` key,
+    prefer ``src_project`` for CGL-eta rehomed entries, and canonicalise
+    divergent spellings so ``dark-factory`` isn't mistaken for a foreign
+    project.
+    """
+
+    def test_group_id_tag_is_dropped(self):
+        payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'group_id': 'reify'})]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert 'Fact.' not in text
+        assert dropped == 1
+
+    def test_project_tag_is_dropped(self):
+        payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project': 'reify'})]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert 'Fact.' not in text
+        assert dropped == 1
+
+    def test_cgl_eta_rehome_production_case_is_dropped(self):
+        """The one foreign-tag channel demonstrably present in production data.
+
+        Task-2273 CGL-eta rehomed entries physically live in dst_project's
+        Mem0 collection but reference src_project's task numbers — src_project
+        is the authoritative origin.
+        """
+        payload = json.dumps({'results': [_result(
+            '1',
+            "A park on 'crates/reify-compiler/src' blocks acquire of 'crates/reify-compiler'.",
+            metadata={
+                'kind': 'cgl_eta_cross_target_rehome',
+                'src_project': 'reify',
+                'dst_project': 'dark_factory',
+                'src_entity': 'Task 2310',
+            },
+        )]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert 'crates/reify-compiler' not in text
+        assert dropped == 1
+
+    def test_src_project_wins_over_same_entry_project_id(self):
+        payload = json.dumps({'results': [_result(
+            '1', 'Fact.', metadata={'src_project': 'reify', 'project_id': 'dark_factory'},
+        )]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert 'Fact.' not in text
+        assert dropped == 1
+
+    def test_dst_project_alone_is_never_consulted_and_is_kept(self):
+        payload = json.dumps({'results': [_result(
+            '1', 'Fact.', metadata={'dst_project': 'dark_factory'},
+        )]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert 'Fact.' in text
+        assert dropped == 0
+
+    def test_first_present_key_precedence(self):
+        payload = json.dumps({'results': [_result(
+            '1', 'Fact.', metadata={'project_id': 'dark_factory', 'group_id': 'reify'},
+        )]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert 'Fact.' in text
+        assert dropped == 0
+
+    def test_canonicalisation_of_divergent_spellings(self):
+        for spelling in ('dark-factory', 'Dark_Factory', '  dark_factory  '):
+            payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project_id': spelling})]})
+
+            text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+            assert 'Fact.' in text, f'spelling {spelling!r} should be treated as own-project'
+            assert dropped == 0
+
+        payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project_id': 'reify'})]})
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        assert 'Fact.' not in text
+        assert dropped == 1
+
+    def test_non_string_tag_is_treated_as_untagged(self):
+        payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project_id': 123})]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert 'Fact.' in text
+        assert dropped == 0
