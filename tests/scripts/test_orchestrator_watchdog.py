@@ -5974,3 +5974,225 @@ def test_service_bounds_the_whole_tick() -> None:
         "legitimate multi-unit restart tick instead of only a genuine wedge"
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Part D: fm-liveness streak + restart cap constants (task 3764)
+#
+# The fm liveness pass previously restarted fused-memory on a SINGLE
+# non-healthy verdict, uncapped. Task 3764 adds the missing temporal
+# dimension in two independent layers, each with its own knobs:
+#
+#   Layer 1 (streak)  — FM_LIVENESS_STREAK_PATH / _THRESHOLD / _MAX_AGE_SECS
+#   Layer 2 (cap)     — FM_LIVENESS_RESTART_CLOCK_PATH /
+#                       FM_LIVENESS_RESTART_MIN_INTERVAL_SECS
+#
+# Every knob follows an existing precedent in this file: the three integer
+# knobs mirror FM_RESTART_MIN_INTERVAL_SECS's try/int/except env pattern
+# (a typo'd env var must not crash the oneshot watchdog), and the two path
+# knobs mirror FM_DEPLOY_CLOCK_PATH's os.environ.get(..., REPO_DIR/data/...)
+# pattern so tests can point them at tmp files.
+# ---------------------------------------------------------------------------
+
+
+def test_fm_liveness_streak_threshold_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_THRESHOLD defaults to 3 consecutive non-healthy verdicts."""
+    monkeypatch.delenv("FM_LIVENESS_STREAK_THRESHOLD", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 3
+
+
+def test_fm_liveness_streak_threshold_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_THRESHOLD honors a valid env override."""
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", "5")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 5
+
+
+def test_fm_liveness_streak_threshold_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed FM_LIVENESS_STREAK_THRESHOLD falls back to 3, not a crash."""
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", "three")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 3
+
+
+def test_fm_liveness_streak_max_age_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_MAX_AGE_SECS defaults to 300 (5x the 60s timer cadence)."""
+    monkeypatch.delenv("FM_LIVENESS_STREAK_MAX_AGE_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_MAX_AGE_SECS == 300
+
+
+def test_fm_liveness_streak_max_age_secs_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_MAX_AGE_SECS honors a valid env override."""
+    monkeypatch.setenv("FM_LIVENESS_STREAK_MAX_AGE_SECS", "42")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_MAX_AGE_SECS == 42
+
+
+def test_fm_liveness_streak_max_age_secs_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed FM_LIVENESS_STREAK_MAX_AGE_SECS falls back to 300, not a crash."""
+    monkeypatch.setenv("FM_LIVENESS_STREAK_MAX_AGE_SECS", "5m")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_MAX_AGE_SECS == 300
+
+
+def test_fm_liveness_restart_min_interval_secs_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FM_LIVENESS_RESTART_MIN_INTERVAL_SECS defaults to 3600 (1h)."""
+    monkeypatch.delenv("FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS == 3600
+
+
+def test_fm_liveness_restart_min_interval_secs_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FM_LIVENESS_RESTART_MIN_INTERVAL_SECS honors a valid env override."""
+    monkeypatch.setenv("FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", "60")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS == 60
+
+
+def test_fm_liveness_restart_min_interval_secs_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed FM_LIVENESS_RESTART_MIN_INTERVAL_SECS falls back to 3600.
+
+    A typo'd env var must not crash the oneshot watchdog — fall-safe ethos,
+    mirroring FM_RESTART_MIN_INTERVAL_SECS's malformed-env test.
+    """
+    monkeypatch.setenv("FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", "1h")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS == 3600
+
+
+def test_fm_liveness_streak_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_PATH defaults to fm_liveness_streak.json under REPO_DIR.
+
+    Mirrors FM_DEPLOY_CLOCK_PATH's default-path shape so both pieces of fm
+    watchdog state live in the same data/fused-memory/ directory.
+    """
+    monkeypatch.delenv("FM_LIVENESS_STREAK", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_PATH == os.path.join(
+        wdog.REPO_DIR, "data", "fused-memory", "fm_liveness_streak.json"
+    )
+
+
+def test_fm_liveness_streak_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_STREAK_PATH honors the FM_LIVENESS_STREAK env override.
+
+    Tests must be able to point the streak file at a tmp path so no test ever
+    touches the real data/fused-memory/ state.
+    """
+    monkeypatch.setenv("FM_LIVENESS_STREAK", "/tmp/custom_fm_streak.json")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_PATH == "/tmp/custom_fm_streak.json"
+
+
+def test_fm_liveness_restart_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_RESTART_CLOCK_PATH defaults under REPO_DIR/data/fused-memory."""
+    monkeypatch.delenv("FM_LIVENESS_RESTART_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_CLOCK_PATH == os.path.join(
+        wdog.REPO_DIR, "data", "fused-memory", "last_liveness_restart_fused_memory.json"
+    )
+
+
+def test_fm_liveness_restart_clock_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_LIVENESS_RESTART_CLOCK_PATH honors the FM_LIVENESS_RESTART_CLOCK override."""
+    monkeypatch.setenv("FM_LIVENESS_RESTART_CLOCK", "/tmp/custom_liveness_clock.json")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_CLOCK_PATH == "/tmp/custom_liveness_clock.json"
+
+
+def test_fm_liveness_restart_clock_separate_from_fm_deploy_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The liveness restart clock must be a DIFFERENT file than fm's deploy clock.
+
+    I5 ("brokenness is not a scheduled deploy") in BOTH directions: sharing one
+    file would mean a liveness revive silences the fm STALENESS backstop for 8h
+    (a merged fm change would sit undeployed because the watchdog once revived
+    a wedge), and conversely a scheduled deploy would license an immediate
+    extra liveness kill.
+    """
+    monkeypatch.delenv("FM_LIVENESS_RESTART_CLOCK", raising=False)
+    monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
+    monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_RESTART_CLOCK_PATH != wdog.FM_DEPLOY_CLOCK_PATH
+    assert wdog.FM_LIVENESS_RESTART_CLOCK_PATH != wdog.FLEET_DEPLOY_CLOCK_PATH
+    assert wdog.FM_LIVENESS_STREAK_PATH != wdog.FM_DEPLOY_CLOCK_PATH
+
+
+def test_fm_liveness_streak_threshold_exceeds_longest_observed_stall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DERIVED INVARIANT: the required non-response window must exceed the evidence.
+
+    The controlled experiment (2026-08-06 07:14-09:14Z, kill path disconnected)
+    recorded six /health stalls >=8s, four >15s, three exceeding a 25s probe
+    cap — and every single one SELF-RECOVERED. The watchdog ticks every 60s
+    (orchestrator-watchdog.timer's OnUnitActiveSec=60), so N consecutive
+    non-healthy verdicts demand N*60s of CONTINUOUS non-response. That window
+    must strictly exceed the longest observed transient stall, otherwise a
+    stall the system recovers from on its own can still get fused-memory
+    killed — which is the exact defect this task fixes.
+
+    Asserted as a derived property rather than only the literal default so the
+    load-bearing relationship survives a future retune of the number.
+    """
+    monkeypatch.delenv("FM_LIVENESS_STREAK_THRESHOLD", raising=False)
+    wdog = _load_watchdog()
+    longest_observed_stall_secs = 25
+    tick_cadence_secs = 60
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD * tick_cadence_secs > longest_observed_stall_secs, (
+        f"FM_LIVENESS_STREAK_THRESHOLD={wdog.FM_LIVENESS_STREAK_THRESHOLD} at a "
+        f"{tick_cadence_secs}s cadence requires only "
+        f"{wdog.FM_LIVENESS_STREAK_THRESHOLD * tick_cadence_secs}s of continuous "
+        f"non-response, which does not exceed the longest observed "
+        f"({longest_observed_stall_secs}s+) SELF-RECOVERING /health stall"
+    )
+
+
+def test_fm_liveness_restart_min_interval_exceeds_worst_observed_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DERIVED INVARIANT: the cap must exceed the worst observed instance lifetime.
+
+    The pathological behaviour this task bounds is fused-memory instances being
+    killed and re-killed; the worst observed lifetime was ~53 minutes (3180s).
+    The min-interval cap must strictly EXCEED that, so that even a WRONG
+    liveness verdict cannot reproduce the observed pathology. A cap SHORTER
+    than the observed lifetime (e.g. 900s) would make the failure mode worse,
+    not better — it would license a 15-minute lifetime.
+
+    Also pinned: the liveness cap stays well below the staleness pass's
+    deliberately-slow 8h deploy cadence, since a brokenness revive must react
+    faster than a scheduled deploy (I5).
+    """
+    monkeypatch.delenv("FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", raising=False)
+    monkeypatch.delenv("FM_RESTART_MIN_INTERVAL_SECS", raising=False)
+    wdog = _load_watchdog()
+    worst_observed_instance_lifetime_secs = 3180  # 53 min
+    assert (
+        wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS > worst_observed_instance_lifetime_secs
+    ), (
+        f"FM_LIVENESS_RESTART_MIN_INTERVAL_SECS="
+        f"{wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS} does not exceed the "
+        f"{worst_observed_instance_lifetime_secs}s worst observed pathological "
+        f"instance lifetime, so even a wrong verdict could reproduce it"
+    )
+    assert (
+        wdog.FM_LIVENESS_RESTART_MIN_INTERVAL_SECS < wdog.FM_RESTART_MIN_INTERVAL_SECS
+    ), (
+        "a brokenness revive must react faster than the scheduled fm deploy "
+        "cadence (I5)"
+    )
