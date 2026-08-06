@@ -1038,6 +1038,87 @@ def _stamp_fm_deploy_clock() -> None:
     )
 
 
+def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
+    """Persist the current consecutive-non-healthy-verdict streak (task 3764).
+
+    Writes ``{count, verdict, ts, iso}`` to FM_LIVENESS_STREAK_PATH via the
+    shared atomic writer. ``verdict`` and ``iso`` are diagnostic only — nothing
+    branches on them; they exist so an operator reading the file (or the
+    ``--report`` row) can see WHAT kind of failure is accumulating and WHEN,
+    rather than a bare integer.
+
+    Fail-soft by inheritance: _atomic_write_json logs and swallows any write
+    error. A write that does not land simply means the streak cannot
+    accumulate, which fails SAFE — the threshold is never reached and
+    fused-memory is left alone.
+    """
+    _atomic_write_json(
+        FM_LIVENESS_STREAK_PATH,
+        {
+            "count": int(count),
+            "verdict": verdict,
+            "ts": now,
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+        },
+    )
+
+
+def _read_fm_liveness_streak() -> tuple[int, float] | None:
+    """Return the persisted ``(count, ts)`` streak, or None when there is none.
+
+    FAIL-OPEN, and the direction is load-bearing: an unreadable, corrupt,
+    absent or nonsensical streak file means NO STREAK, which means NO RESTART.
+    This task exists precisely because the old code's only bias was toward
+    killing fused-memory on thin evidence — so every ambiguous case here must
+    resolve toward leaving the process alone, never toward "we must already
+    have enough failures".
+
+    A count that is not a positive integer is treated as no streak: zero and
+    negatives are nonsense for a "consecutive failures so far" counter, and
+    silently coercing them could only ever manufacture a restart.
+    """
+    state = _read_json_state(FM_LIVENESS_STREAK_PATH)
+    if state is None:
+        return None
+    try:
+        count = int(state["count"])
+        ts = float(state["ts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        log(
+            f"ignoring fm liveness streak at {FM_LIVENESS_STREAK_PATH} "
+            f"with unusable count/ts: {exc!r}"
+        )
+        return None
+    if count <= 0:
+        log(
+            f"ignoring fm liveness streak at {FM_LIVENESS_STREAK_PATH} "
+            f"with non-positive count {count}"
+        )
+        return None
+    return count, ts
+
+
+def _clear_fm_liveness_streak() -> None:
+    """Delete the persisted streak file, if any (task 3764).
+
+    Called when a 'healthy' verdict proves continuity is broken, and again
+    after a restart is actually issued so the NEXT kill demands a fresh
+    N-streak rather than one-verdict-per-kill afterwards.
+
+    An already-absent file is a silent no-op — that is the overwhelmingly
+    common case (fused-memory is healthy, so every 60s tick clears nothing) and
+    logging it would bury the journal. Any other OSError is logged and
+    swallowed: failing to clear can only ever leave stale evidence behind,
+    which the max-age expiry in _record_fm_liveness_failure then discards.
+    """
+    try:
+        os.unlink(FM_LIVENESS_STREAK_PATH)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log(f"failed to clear fm liveness streak at {FM_LIVENESS_STREAK_PATH}: {exc!r}")
+
+
 def main() -> None:
     """Probe each watched port; restart the unit if the port is not listening."""
     for port, unit in WATCHED:
