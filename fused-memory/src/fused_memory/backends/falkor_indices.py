@@ -123,6 +123,53 @@ def _fail(statement: str, why: str) -> UnparsedIndexStatementError:
     )
 
 
+_FULLTEXT_CALL_PREFIX = 'CALL db.idx.fulltext.createNodeIndex('
+_CONFIG_LABEL_RE = re.compile(r"\blabel\s*:\s*'(?P<label>[^']*)'")
+_QUOTED_ARG_RE = re.compile(r"'([^']*)'")
+
+
+def _parse_fulltext_call(statement: str) -> list[IndexSpec]:
+    """Parse ``CALL db.idx.fulltext.createNodeIndex(<config-map>, 'p1', 'p2', ...)``.
+
+    The config map is located by BRACE MATCHING rather than by a regex, and the
+    property arguments are taken only from AFTER its closing ``}``.  That split
+    point is the whole trick: the map embeds a 33-word quoted, comma-separated
+    ``stopwords`` list, so any pattern that scans the statement as a whole picks
+    the stopwords up as properties — roughly 36 bogus entries, each of which
+    would be reported as a permanently missing index that can never be created.
+    """
+    open_idx = statement.find('{')
+    if open_idx == -1:
+        raise _fail(statement, 'fulltext CALL has no { config map')
+
+    depth = 0
+    close_idx = -1
+    for i in range(open_idx, len(statement)):
+        if statement[i] == '{':
+            depth += 1
+        elif statement[i] == '}':
+            depth -= 1
+            if depth == 0:
+                close_idx = i
+                break
+    if close_idx == -1:
+        raise _fail(statement, 'fulltext CALL config map has unbalanced braces')
+
+    config = statement[open_idx:close_idx + 1]
+    label_match = _CONFIG_LABEL_RE.search(config)
+    if label_match is None or not label_match.group('label'):
+        raise _fail(statement, "fulltext CALL config map has no non-empty 'label:' key")
+
+    # Properties come strictly from AFTER the config map -- never from inside it.
+    tail = statement[close_idx + 1:]
+    props = [p for p in _QUOTED_ARG_RE.findall(tail) if p]
+    if not props:
+        raise _fail(statement, 'fulltext CALL listed no property arguments after the config map')
+
+    label = label_match.group('label')
+    return [(label, 'NODE', prop, 'FULLTEXT') for prop in props]
+
+
 def _split_properties(statement: str, var: str, props: str) -> list[str]:
     """Split an ``ON (n.a, n.b)`` property clause into bare property names."""
     names: list[str] = []
@@ -157,6 +204,11 @@ def parse_index_statement(statement: str) -> list[IndexSpec]:
         UnparsedIndexStatementError: The statement matched no known FalkorDB
             form.  See the class docstring for why this is not a warn-and-skip.
     """
+    # Statement-form dispatch is exhaustive-with-else-raise: no branch may fall
+    # through to an empty return (see UnparsedIndexStatementError).
+    if statement.lstrip().startswith(_FULLTEXT_CALL_PREFIX):
+        return _parse_fulltext_call(statement)
+
     for pattern, entity_type in (
         (_RANGE_OR_FULLTEXT_NODE_RE, 'NODE'),
         (_RANGE_OR_FULLTEXT_EDGE_RE, 'RELATIONSHIP'),
