@@ -7035,7 +7035,25 @@ class Scheduler:
                 'reconcile to recover.', task_id, e,
             )
             return False
-        self.lock_table.release(task_id)
+        # Route through Scheduler.release — the single path that emits
+        # lock_released (contract C5, task 3818).  The bare
+        # `self.lock_table.release(task_id)` this replaces was worse than a
+        # silent release: it emptied _held[task_id] FIRST, so the workflow's
+        # later teardown release() snapshotted modules == [] and skipped its
+        # emit too, leaving a lock_acquired with no matching lock_released
+        # anywhere in the stream (the stuck-lock artifact behind the false
+        # 96.5% occupancy figure, which reads as an infinite hold to any
+        # consumer measuring durations from acquire/release pairs).
+        # requeued=True is deliberate: this path IS a requeue (status was just
+        # set to 'pending' above), so it arms the existing requeue_cooldown_secs
+        # anti-hot-loop guard — without it the scheduler could re-dispatch
+        # instantly, re-hit the same contention and spin.  The reroute also
+        # restores the _dispatched / _dispatched_priority clear and the
+        # defensive clear_parks_for that the bypass skipped.  Stays AFTER the
+        # set_task_status(pending) above (INV-6) so no observer sees a freed
+        # lock on a still-in-progress task; the except-RuntimeError early
+        # return above keeps locks held when that status write fails.
+        self.release(task_id, requeued=True)
         return False
 
     def release(self, task_id: str, *, requeued: bool = False) -> None:
