@@ -574,7 +574,12 @@ class TestRunCliWiring:
         self, monkeypatch, capsys,
     ):
         report = _report([_detail('8888', 'misattributed', commit='d' * 40)])
-        tasks = [_task('8888', AFTER_SINCE)]  # stamp is fresh
+        # Stamp is fresh. Post-3576 that must be asserted with an actual
+        # stamped_at: a task carrying no done_provenance blob is `legacy`
+        # by construction (absence == predates the field), and legacy
+        # records report without gating — so a bare `_task` here would no
+        # longer be testing the exit-1 path it names.
+        tasks = [_stamped_task('8888', AFTER_SINCE, AFTER_SINCE, commit='d' * 40)]
         _install_fake_audit_module(monkeypatch, report)
         monkeypatch.setattr(
             'fused_memory.config.schema.FusedMemoryConfig',

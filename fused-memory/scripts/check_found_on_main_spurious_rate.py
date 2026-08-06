@@ -5,43 +5,33 @@ Thin, read-only wrapper around ``audit_found_on_main_provenance.py``
 (exercised live by task 2648's audit run) for use as a ``before_done``
 ``kind='predicate'`` script under the DeterministicRunner convention (see
 CLAUDE.md "Predicate exit-code contract"). It runs the existing audit, then
-considers only the ``found_on_main`` done-provenance stamps belonging to
-tasks whose ``updatedAt`` is strictly AFTER ``--since``, and asks whether
-any of *those* were flagged ``misattributed`` or ``deliverable_absent`` by
-the audit's classifier. Older stamps (already covered by a prior run, or
-predating the fix this predicate soaks) are not re-flagged on every
-invocation.
+considers only the ``found_on_main`` done-provenance stamps WRITTEN
+strictly after ``--since``, and asks whether any of *those* were flagged
+``misattributed`` or ``deliverable_absent`` by the audit's classifier.
+Older stamps (already covered by a prior run, or predating the fix this
+predicate soaks) are reported but do not gate, so they are not re-escalated
+on every invocation.
 
-Freshness caveat: ``updatedAt`` is an approximation, not a dedicated
-stamp-write timestamp — ``shared.task_metadata.DoneProvenance`` carries no
-such field for ``kind='found_on_main'``. Any subsequent write to the task
-(a re-tag, an unrelated metadata annotation, a dependency edit, ...) also
-bumps ``updatedAt``, so a task whose found_on_main stamp actually predates
-``--since`` but was touched afterwards for an unrelated reason can still
-surface here. Because this predicate re-runs on resume and escalates on
-any non-zero exit, a repeat escalation for an already-known/fixed task is
-possible and may be benign — it does not necessarily mean a fresh
-regression.
+Freshness (task 3576): the timestamp compared against ``--since`` is
+``metadata.done_provenance.stamped_at`` — the dedicated stamp-*write*
+instant recorded server-side by fused-memory's
+``_validate_done_provenance`` chokepoint — not ``updatedAt``. ``updatedAt``
+remains only as a fallback for blobs that carry no usable ``stamped_at``,
+and those records are marked ``stamp_class='legacy'``.
 
-Contract (exit code only — this script parses no output, per the
-DeterministicRunner predicate convention):
+That distinction is the point. ``updatedAt`` is bumped by ANY write to a
+task (a re-tag, an unrelated metadata annotation, a dependency edit, the
+sibling audit's own ``--apply`` annotation), so keying off it meant a
+stamp written months ago looked "fresh" forever and the same known
+offenders re-entered the window on every single run — guaranteeing a
+permanent EXIT 1 that said nothing about whether anything new had gone
+wrong. ``stamped_at`` answers the question this predicate actually asks:
+"was this attribution asserted after ``--since``?"
 
-  - Exit 0: zero found_on_main stamps updated after ``--since`` were
-    flagged ``misattributed``/``deliverable_absent``.
-  - Exit 1: one or more were flagged (see the freshness caveat above — a
-    repeat flag on an already-known/fixed task is possible and may be
-    benign, not necessarily a fresh regression) — OR the task backend is
-    not configured (an infra/config problem). This predicate's contract is
-    intentionally coarse: non-zero-for-any-reason means "did not pass"
-    (fail loud/closed rather than silently degrade), with no separate exit
-    code distinguishing a check failure from an infra failure. A
-    structured stdout summary is printed for the check-failure case — one
-    line per offending task (task_id, cited commit sha, flag class) — for
-    human/log triage; the DeterministicRunner itself never parses it, only
-    the exit code.
-  - Exit 2: ``--since`` could not be parsed — a caller usage error, kept
-    on its own code so it is never mistaken for "offenders found" (1) by
-    a caller branching on exit code alone.
+A blob with no ``stamped_at`` provably predates task 3576, because every
+write through the (non-bypassable) server chokepoint since then populates
+it. Such records are LEGACY BACKLOG by construction: they are still
+reported — printed with ``stamp_class=legacy`` — but they do not gate.
 
 Two orthogonal signals, deliberately kept separate (task 3576):
 
@@ -56,6 +46,29 @@ spurious bare-merge-commit sharing — those differ in citation SHAPE, not
 in time; two stamps written in the same second can be one legitimate and
 one spurious. Conversely fan-out says nothing about when a stamp was
 written. See :func:`classify_sub_patterns` for the fan-out rule.
+
+Contract (exit code only — this script parses no output, per the
+DeterministicRunner predicate convention):
+
+  - Exit 0: no NEW spurious found_on_main stamp was written since
+    ``--since`` — i.e. zero flagged records with
+    ``stamp_class='fresh'``. Legacy (pre-3576) offenders may still be
+    present and printed; exit 0 means "the freshness window no longer
+    re-admits legacy rows", NOT "the backlog was corrected".
+  - Exit 1: at least one flagged record is genuinely fresh (its
+    ``stamped_at`` is after ``--since``) — OR the task backend is not
+    configured (an infra/config problem). This predicate's contract is
+    intentionally coarse: non-zero-for-any-reason means "did not pass"
+    (fail loud/closed rather than silently degrade), with no separate exit
+    code distinguishing a check failure from an infra failure. A
+    structured stdout summary is printed for EVERY flagged record —
+    gating or not — one line per offending task (task_id, cited commit
+    sha, flag class, ``stamp_class``, ``sub_pattern``) for human/log
+    triage; the DeterministicRunner itself never parses it, only the exit
+    code.
+  - Exit 2: ``--since`` could not be parsed — a caller usage error, kept
+    on its own code so it is never mistaken for "offenders found" (1) by
+    a caller branching on exit code alone.
 
 Deliberately narrower than the audit's own ``_FLAGGED_VERDICTS``: this
 predicate's contract (PRD decomposition label ι) is specifically
@@ -373,17 +386,30 @@ async def _run(args: argparse.Namespace, since: datetime) -> int:
         report = await build_audit_report(tasks, git, ref=args.ref)
 
         offenders = find_spurious_since(report, tasks, since)
+        gating = gating_offenders(offenders)
         summary_lines = format_summary(offenders)
+
+        sub_pattern_counts: dict[str, int] = {}
+        for o in offenders:
+            key = str(o.get('sub_pattern'))
+            sub_pattern_counts[key] = sub_pattern_counts.get(key, 0) + 1
 
         logger.info(
             'found_on_main spurious-rate check: %d found_on_main task(s) audited, '
-            '%d flagged misattributed/deliverable_absent since %s',
+            '%d flagged misattributed/deliverable_absent since %s '
+            '(%d gating [fresh], %d legacy [pre-3576, reported only]); '
+            'sub-patterns: %s',
             report.get('total', 0), len(offenders), since.isoformat(),
+            len(gating), len(offenders) - len(gating),
+            ', '.join(f'{k}={v}' for k, v in sorted(sub_pattern_counts.items())) or 'none',
         )
+        # Print ALL offenders, not just the gating ones: a legacy record
+        # stops gating but must never stop being visible (see
+        # gating_offenders for the residual-risk argument).
         for line in summary_lines:
             print(line)
 
-        return 1 if offenders else 0
+        return 1 if gating else 0
     finally:
         await backend.close()
 
