@@ -7473,3 +7473,179 @@ def test_liveness_pass_http_error_is_healthy_and_never_restarts(
 
     assert restarted == [], f"a 503 must never lead to a restart; got {restarted}"
     assert not streak_file.exists(), "a 503 is 'healthy' and must CLEAR the streak"
+
+
+# ---------------------------------------------------------------------------
+# Part D: --report surfaces the new persisted state (task 3764)
+#
+# Introducing hidden persisted state that changes whether fused-memory gets
+# killed, with no doctor-mode way to inspect it, is exactly the silent
+# degradation the project's norms forbid. An operator must be able to answer
+# "why didn't the watchdog restart fused-memory" without hand-reading JSON.
+# Both fields are STRICTLY read-only, like every other --report field.
+# ---------------------------------------------------------------------------
+
+
+def _wire_report_row(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Point the fm report row's reads at tmp state with a known verdict."""
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "wedged")
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "no")
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
+    )
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(tmp_path / "deploy_clock.json"))
+
+
+def test_report_row_shows_streak_when_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """USER-SIGNAL: the fm row renders the streak as "<count>/<threshold>"."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    (tmp_path / "streak.json").write_text(
+        json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0})
+    )
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "2/3" in out, f"the row must show the streak position: {out!r}"
+
+
+def test_report_row_shows_streak_none_when_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No streak file renders as 'none', not a blank or a crash."""
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert re.search(r"streak:\s*none", out), f"absent streak must render 'none': {out!r}"
+
+
+def test_report_row_shows_liveness_restart_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The liveness-restart age renders hours-to-one-decimal, like DEPLOY-AGE."""
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    now = 1783000000.0
+    _stamp_clock_file(tmp_path / "liveness_clock.json", now - 7200.0)  # 2h ago
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "2.0h" in out, f"the row must show the liveness restart age: {out!r}"
+
+
+def test_report_row_shows_unknown_liveness_restart_age_when_never_stamped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A never-stamped liveness restart clock renders 'unknown'."""
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert re.search(r"LIVENESS-RESTART-AGE:\s*unknown", out), (
+        f"a never-stamped liveness clock must render 'unknown': {out!r}"
+    )
+
+
+def test_report_row_is_strictly_read_only_over_streak_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """I7/I8: the row must not restart, stamp a clock, or mutate the streak file.
+
+    --report is a doctor-mode read. If printing the streak could create, modify
+    or clear it, running --report would itself change whether fused-memory gets
+    killed on the next tick.
+    """
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda _u: pytest.fail("--report must never restart")
+    )
+    streak_file = tmp_path / "streak.json"
+    original = json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0})
+    streak_file.write_text(original)
+    before_mtime = streak_file.stat().st_mtime_ns
+
+    wdog._print_fused_memory_liveness()
+    capsys.readouterr()
+
+    assert streak_file.read_text() == original, "--report must not modify the streak file"
+    assert streak_file.stat().st_mtime_ns == before_mtime
+    assert not (tmp_path / "liveness_clock.json").exists(), (
+        "--report must not stamp the liveness restart clock"
+    )
+    assert not (tmp_path / "deploy_clock.json").exists(), (
+        "--report must not stamp the fm deploy clock"
+    )
+
+
+def test_report_row_absent_streak_stays_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Printing an absent streak must not CREATE one."""
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+
+    wdog._print_fused_memory_liveness()
+    capsys.readouterr()
+
+    assert not (tmp_path / "streak.json").exists(), (
+        "reading an absent streak must not materialise it"
+    )
+
+
+def test_report_row_degrades_single_field_on_streak_read_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An exception from the streak read degrades THAT FIELD, not all of --report.
+
+    The row must still print the verdict and the other fields — losing one
+    diagnostic must not cost an operator the whole doctor-mode line.
+    """
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    def boom():
+        raise RuntimeError("streak read exploded")
+
+    monkeypatch.setattr(wdog, "_read_fm_liveness_streak", boom)
+
+    # Must not raise.
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "wedged" in out, f"the rest of the row must survive a field failure: {out!r}"
+    assert "recon-busy" in out
+
+
+def test_cli_report_exit_code_unchanged_by_the_new_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_cli(["--report"]) still returns report()'s OWN staleness-only exit code.
+
+    The fm row is informational; the new fields must not leak into the exit
+    code any more than the existing ones do.
+    """
+    wdog = _load_watchdog()
+    _wire_report_row(wdog, monkeypatch, tmp_path)
+    (tmp_path / "streak.json").write_text(
+        json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0})
+    )
+    monkeypatch.setattr(wdog, "report", lambda: 1)
+
+    assert wdog._cli(["--report"]) == 1
+    assert "2/" in capsys.readouterr().out
