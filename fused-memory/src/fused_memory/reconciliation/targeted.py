@@ -1421,11 +1421,14 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     - ANY TRUTHY MEMBER of the ``supersedes`` list, as normalized by
       :func:`~fused_memory.memory_metadata.normalize_supersedes` (PRD D2 /
       task 3196) — the established superseding-memory convention. The writer
-      is ``harness.py:1175``, which emits the canonical list shape; the legacy
-      SCALAR shape stays tolerated on read for the ~81 pre-migration corpus
-      records (no corpus rewrite in this leaf — PRD D2 defers retro
-      normalization to leaf θ's stamping sweep), which is exactly what the
-      shared normalizer absorbs. Member-level truthiness (``any(...)``), not
+      is ``ReconciliationHarness._reconcile_status_correction``, which emits
+      the canonical list shape; the legacy SCALAR shape stays tolerated on
+      read for the ~81 pre-migration corpus records (no corpus rewrite in
+      this leaf — PRD D2 defers retro normalization to leaf θ's stamping
+      sweep), which is exactly what the shared normalizer absorbs. See that
+      normalizer's docstring for the full writer/reader map; THIS docstring
+      is the single home of the truthiness rationale that follows.
+      Member-level truthiness (``any(...)``), not
       container truthiness: ``normalize_supersedes('')`` returns ``['']``, so
       ``bool(...)`` of the container would flip a falsy legacy scalar to
       authoritative. ``any(...)`` reproduces the pre-3196 behaviour on every

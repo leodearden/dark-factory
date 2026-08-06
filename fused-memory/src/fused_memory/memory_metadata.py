@@ -103,17 +103,25 @@ EXPERIMENTAL_KEY_PREFIX = 'x_'
 def normalize_supersedes(value: Any) -> list[Any]:
     """Normalize a ``supersedes`` metadata value to a list (PRD D2).
 
+    This docstring is the SINGLE HOME of the ``supersedes`` writer/reader
+    map; the other sites that touch the key point here instead of
+    re-deriving it, and name SYMBOLS rather than line numbers (a pinned
+    line number is falsified by the next edit made above it — the churn
+    that motivated this consolidation).
+
     ``supersedes`` is a list in V1, but the corpus carries 81 records with
-    a **scalar** value and 65 with a list.  The writer at
-    ``reconciliation/harness.py:1175`` emitted a scalar until task 3196
+    a **scalar** value and 65 with a list.  The writer —
+    ``ReconciliationHarness._reconcile_status_correction`` in
+    ``reconciliation/harness.py`` — emitted a scalar until task 3196
     migrated it to the canonical list shape; the 81 measured records
     predate that migration and are not rewritten by it (PRD D2 defers
     retro normalization to leaf θ's stamping sweep), which is why read
     tolerance for the legacy scalar stays.  The readers are
-    ``reconciliation/targeted.py:1477`` (truthiness discriminator, which
-    tests ``any()`` of the normalized members) and leaf 3112's closure
-    predicate.  Both go through this helper — INV-5: never a second
-    ``supersedes`` parser.
+    ``reconciliation.targeted._is_authoritative_resolution`` (truthiness
+    discriminator, which tests ``any()`` of the normalized members — see
+    ITS docstring for why member-level and not container truthiness) and
+    leaf 3112's closure predicate.  Both go through this helper — INV-5:
+    never a second ``supersedes`` parser.
 
     Accepts ``None`` (→ ``[]``), a scalar (→ single-element list), or any
     non-``str`` sequence (→ list copy).  The returned list is always a
@@ -506,7 +514,8 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     # `enforce_kind_registry` flips.
     # ---------------------------------------------------------------
     'consolidated_scope_correction',  # reconciliation/scope_freshness.py:97 (declared), written :251, :495
-    'project_status_correction',      # reconciliation/harness.py:1166 (same dict as `supersedes` at :1175)
+    # ReconciliationHarness._reconcile_status_correction (same dict as `supersedes`)
+    'project_status_correction',
     'count_snapshot_cleanup_audit',   # scripts/cleanup_count_snapshots.py:210
     # No live Mem0 writer found — retained per esc-3194-1 pending the
     # PRD §10 open questions.  `entity_standing_decision` is a SQLite
@@ -841,8 +850,9 @@ def validate_memory_metadata(
     # `reconciliation/harness.py` wrote a SCALAR `supersedes` (81 live
     # records) for that whole window.  Rejecting the scalar form here would
     # have broken the recon harness's own writes until γ migrated it.  That
-    # window is now CLOSED — task 3196 (γ) migrated the writer to the
-    # canonical list shape at `harness.py:1175`.
+    # window is now CLOSED — task 3196 (γ) migrated that writer
+    # (`ReconciliationHarness._reconcile_status_correction`) to the canonical
+    # list shape.
     #
     # The in-place coercion below is nonetheless RETAINED as
     # defense-in-depth, not left over: no corpus rewrite shipped with γ, so

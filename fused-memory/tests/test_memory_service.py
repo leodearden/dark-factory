@@ -10471,8 +10471,8 @@ class TestMemoryMetadataValidationAtSeam:
     ):
         """The observable that proves the β-before-γ hazard is closed.
 
-        harness.py wrote a scalar until γ (task 3196) migrated it to a list at
-        :1175, and γ landed AFTER β. If the seam had rejected — or passed
+        The recon harness wrote a scalar until γ (task 3196) migrated it to a
+        list, and γ landed AFTER β. If the seam had rejected — or passed
         through — the scalar form, the window between the two leaves would
         either have broken the recon harness's own writes or left the list
         contract unmet.
