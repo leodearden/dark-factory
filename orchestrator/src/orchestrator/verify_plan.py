@@ -517,6 +517,61 @@ def deselecting_expression_for_command(
     )
 
 
+def widen_fallback_for_marker_deselection(
+    fallback: ModuleConfig,
+    worktree_reader: Callable[[str], str | None],
+) -> tuple[ModuleConfig, str | None]:
+    """Widen an EXECUTED fallback config whose file-scoped pytest run is fully deselected.
+
+    Returns ``(config, reason)``: the input *fallback* unchanged and a ``None``
+    reason whenever no widening is proven — the one-directional fail-safe task
+    3494 established, here closing its twin arm (task 3513).
+
+    WHAT IT IS GIVEN: the ALREADY-EXECUTED fallback ``ModuleConfig``, i.e. the
+    output of ``verify._build_fallback_config`` after ``_apply_cargo_scope``.
+    That is the whole point of the layering. :func:`_derive_fallback_runs` is a
+    pure DECISION function that cannot see the subproject rescoping
+    ``_build_fallback_config`` performs (its own "Fidelity caveat" paragraph),
+    so a probe there could read a ``pyproject.toml`` the executed command never
+    applies — the OVER-fire task 3494 forbids. Here the command's OWN SHAPE
+    decides, and the rescoping has already happened.
+
+    That is also where the feared over-fire is closed STRUCTURALLY rather than
+    by re-deriving "would ``_build_fallback_config`` rescope?" (which would
+    duplicate ``_single_subproject_prefix`` / ``_root_plus_single_subproject_prefix``
+    — a second copy of a filesystem decision, free to drift). Each guard below
+    refuses a shape whose rootdir or scoping is not recoverable from the string:
+
+    * ``test_command is None`` — the "no collectable tests" branch produced no
+      pytest run at all, so there is nothing to widen;
+    * NOT ``ToolKind.PYTEST`` — a pyproject's ``addopts`` describe a suite this
+      command never invokes;
+    * ``parsed.raw is not None`` — a raw-retained command (the task-2368 mixed
+      root+subproject chain, every ``uv run --extra ... pytest`` shape) hides
+      BOTH its effective rootdir and which clause the scoping applied to;
+    * ``not parsed.targets`` — a configured suite runs VERBATIM and unscoped
+      (``_build_fallback_config`` never file-scopes one), so it has no targets
+      to drop and cannot be the zero-collecting shape.
+
+    A directory target needs no guard of its own: ``verify._worktree_reader`` is
+    ``is_file()``-guarded and answers None for a directory, and
+    :func:`deselecting_expression_for_command` refuses any target it cannot
+    read. The conftest branch's directory targets are therefore unprovable, and
+    unprovable means unchanged.
+    """
+    if not fallback.test_command:
+        return fallback, None
+    parsed = parse_config_command(fallback.test_command)
+    if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None:
+        return fallback, None
+    if not parsed.targets:
+        return fallback, None
+    # The probe call and the widening itself land in step-6; until then every
+    # shape that survives the guards above still refuses, which is the
+    # pre-3513 FILE_SCOPED behaviour.
+    return fallback, None
+
+
 def _derive_module_runs(
     mc: ModuleConfig,
     existing_files: list[str],
