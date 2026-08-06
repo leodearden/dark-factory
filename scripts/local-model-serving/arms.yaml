@@ -59,7 +59,12 @@ arms:
     image: vllm/vllm-openai:v0.26.0
     image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
     model_ref: jeffcookio/Mistral-Small-3.2-24B-Instruct-2506-awq-sym
-    quant: awq
+    # NOT `awq`, despite the repo name.  Measured from the downloaded weights'
+    # own config.json on 2026-08-06: quantization_config.quant_method is
+    # `compressed-tensors` (format pack-quantized, 4 bits).  Declaring `awq`
+    # made vLLM 0.26 refuse the model outright -- loudly, which is the right
+    # behaviour: a quant mismatch it guessed past would serve wrong numbers.
+    quant: compressed-tensors
     port: 8411
     served_model_name: mistral-small-3.2-24b
     structured_output_mode: json_schema

@@ -353,106 +353,132 @@ download anonymous and fail only later, only on the gated repos.
 
 ---
 
-## OPEN: the budget verdict's subject is miscalibrated (blocks step 23)
+## RESOLVED: the budget verdict's subject (esc-3713-6, 2026-08-06)
 
-Measured in step 22, unresolved here on purpose — it is a design question, not a
-bug to be quietly patched under an anti-fabrication gate.
+Two budget notions in this package disagreed about their **subject**, and the
+disagreement failed arms that were serving correctly:
 
-Every arm measured so far answers correctly, and the **LLM** arms nonetheless
-fail the VRAM verdict, because two budget notions in this package disagree
-about their subject (the *embedding* arms listed here failed for a second,
-independent reason that has since been fixed — see below):
-
-| check | subject | ceiling | `qwen3-embedding-0.6b` |
+| check | subject | ceiling | `qwen3.5-9b` |
 |---|---|---|---|
-| `arm_fits` (pre-flight) | the **arm's** footprint | measured free, 16.37 GiB | 2.0 + 0.5 ≤ 16.37 → **admits** |
-| `evaluate_budget` (verdict) | **total** card usage | PRD nominal, 19.5 GiB | 23.35 > 19.5 → **FAILs** |
+| `arm_fits` (pre-flight) | the **arm's** footprint | measured free, 16.4 GiB | 6.0 + 0.5 <= 16.37 -> **admits** |
+| `evaluate_budget` (old) | **total** card usage | PRD nominal, 19.5 GiB | 21.75 > 19.5 -> **FAILed** |
 
-An arm therefore passes the pre-flight and then fails the verdict, having done
-nothing wrong. The PRD's own arithmetic says which subject is intended:
+An arm passed the pre-flight and then failed the verdict having done nothing
+wrong. The PRD's own arithmetic says which subject is intended:
 
 > l.192 — GPU headroom measured (24GB − ~4GB whisper-writer)
 > l.165 — whisper-writer stays resident: all capacity math against ~19–20GB, not 24GB
 
-19.5 GiB is what D10 derives as available **to the arm** (card minus
-whisper-writer). Applying it to *total* usage charges the arm for the 7.15 GiB
-desktop+whisper baseline a second time — and the desktop's ~3.2 GiB was not in
-D10's model at all, which is the same omission this README's *VRAM budget*
-section already records.
+19.5 GiB is what D10 derives as available **to the arm**. Applying it to *total*
+usage charged the arm for the 7.3 GiB desktop+whisper baseline a second time —
+and the desktop's ~3.2 GiB was never in D10's model at all. It was not a
+big-arm technicality either: measurement showed **every** LLM arm failing, a 9B
+AWQ included, because a generate arm legitimately takes the free-derived share
+and that share plus the baseline exceeds 19.5 regardless of model size.
 
-Under the total-usage reading the real per-arm allowance collapses to
-19.5 − 7.15 = **12.35 GiB**, which would knock `mistral-small-3.2-24b` (14 GiB of
-weights) and `moe-stretch` (13.27 GiB) off the slate on a technicality, while
-both fit the 16.4 GiB the card actually has free.
+The reviewer approved the correction (esc-3713-6) *before* the artifact existed,
+which is why re-pointing an assertion inside the anti-fabrication gate is
+legitimate here and would not have been on the agent's own initiative.
 
-Two changes were needed. **The second has since landed**, and landing it
-changed the shape of the first — so read the two parts below in order.
+### What changed
 
-### RESOLVED: the pooling arms' KV balloon (landed 2026-08-06)
+1. **`evaluate_budget` judges `used − baseline` against the live free reading**
+   taken at that same baseline. `arm_footprint_mib <= budget_mib`.
+2. **The baseline is live and per-arm.** `lms_ctl start` records the nvidia-smi
+   reading it just pre-flighted on, between the refusal path and the
+   `systemctl start`, into `$XDG_RUNTIME_DIR/lms-baselines/<arm>.json`
+   (`LMS_BASELINE_DIR` overrides). A missing baseline produces **no report at
+   all** — the same stance as a dead GPU probe. `MEASURED_BASELINE_GIB` and
+   `MEASURED_OPERATING_BUDGET_GIB` remain as documented reference values and
+   are never subtracted: a frozen baseline misattributes desktop drift to the
+   arm, in the direction that flatters it.
+3. **The safety margin is applied once**, at allocation time — not re-added in
+   the verdict, which would double-charge it.
+4. **The generate branch of `_memory_share_for` now reserves that margin too.**
+   It was deriving the share from the *whole* free reading, so the arms with the
+   largest allocations were the only ones sized to the last byte of free VRAM —
+   precisely what `SAFETY_MARGIN_GIB` exists to prevent, on a card that must
+   keep whisper-writer resident. This is also what makes the verdict satisfiable
+   by construction: the share bounds the footprint at `free − margin`, so
+   `footprint <= free` holds with headroom rather than by luck.
+5. **PRD D10's 19.5 GiB stays in every report as a reported, non-gating field**,
+   so the deviation this task measured remains legible.
+
+The gate assertion moved with it, and got stronger rather than weaker: it now
+re-derives `footprint == used − baseline`, requires `0 < baseline < used`, and
+requires a positive footprint for every row — three checks where there was one.
+
+### RESOLVED alongside: the pooling arms' KV balloon
 
 vLLM sizes its paged KV cache to fill whatever `--gpu-memory-utilization`
-allows, and it does that for a **decoder** model served under `--runner
-pooling` even though a pooling model can never read a KV cache. Derived from
-free VRAM, `qwen3-embedding-0.6b` was handed 0.682 (16.37 GiB) and filled it:
-1.12 GiB of weights, 0.42 GiB of overhead, and **14.56 GiB of unusable KV**.
+allows, and does so for a **decoder** model under `--runner pooling` even though
+a pooling model can never read one. `qwen3-embedding-0.6b` was handed 0.682
+(16.37 GiB) and filled it: 1.12 GiB of weights and **14.56 GiB of unusable KV**.
+`_memory_share_for` now bounds a pooling arm to `est_vram_gib +
+SAFETY_MARGIN_GIB`. Bounding via the share rather than
+`--kv-cache-memory-bytes` keeps `est_vram_gib` load-bearing for the pre-flight,
+so a too-small declaration fails loudly at startup instead of silently eating
+the card — which is how `0.6b` (2.0 -> 3.0) and `4b` (9.0 -> 10.0) were caught.
 
-`lms_serve._memory_share_for` now bounds a **pooling** arm to
-`est_vram_gib + SAFETY_MARGIN_GIB`, while a **generate** arm keeps the
-free-VRAM-derived share — the two axes want opposite things, because for an
-LLM arm the KV cache *is* the context window. Bounding via the share rather
-than `--kv-cache-memory-bytes` keeps `est_vram_gib` load-bearing: the
-pre-flight already admits an arm on the strength of that number, so an arm that
-then ignored it made the pre-flight's arithmetic false as soon as two arms were
-considered together.
+---
 
-Measured before → after, same chain, same probe:
+## Live slate run (measured, step 23 — 2026-08-06, IN PROGRESS)
 
-| arm | resident before | verdict before | resident after | verdict after |
-|---|---|---|---|---|
-| `qwen3-embedding-0.6b` | 16603 MiB | FAIL, 23.35 GiB | **3602 MiB** | **PASS**, 10.66 GiB |
-| `qwen3-embedding-4b` | 16078 MiB | FAIL, 23.35 GiB | **10102 MiB** | **PASS**, 17.00 GiB |
+Every arm run through the committed chain, one at a time, on a host whose
+baseline was confirmed clean first (7302 MiB used, whisper-writer the only
+compute app at 4050 MiB, no ollama model resident — esc-3713-7). Six of eight
+arms answer correctly and fit; two carry real, diagnosed defects.
 
-Both still answer with a valid vector of their declared length (685 ms / 783 ms).
-**Both now pass under the existing total-usage semantics**, so this half needed
-no gate change at all — it was a bug, and it is fixed.
+| arm | ready | resident (footprint) | budget | probe | verdict |
+|---|---|---|---|---|---|
+| `granite-embedding-english-r2` | 116 s | 762 MiB | 16814 MiB | 606 ms | **PASS** |
+| `gte-modernbert-base` | 114 s | 787 MiB | 16839 MiB | 102 ms | **PASS** |
+| `qwen3-embedding-0.6b` | 155 s | 3581 MiB | 16839 MiB | 706 ms | **PASS** |
+| `qwen3-embedding-4b` | 158 s | 10113 MiB | 16839 MiB | 828 ms | **PASS** |
+| `qwen3.5-9b` | 451 s | 14441 MiB | 16847 MiB | 2849 ms | **PASS** |
+| `phi-4-14b` | 196 s | 15456 MiB | 16831 MiB | 3054 ms | **PASS** |
+| `mistral-small-3.2-24b` | — | — | — | — | **start refused** |
+| `moe-stretch` | 31 s | 14611 MiB | 16820 MiB | 5600 ms | **`empty_completion`** |
 
-It also made `est_vram_gib` honest for these two arms, which measurement showed
-were *under*-declared: the bound is real, so a too-small declaration now fails
-loudly at startup (`ValueError: To serve at least one request with the model's
-max seq len (8192), 0.88 GiB KV cache is needed, ... available 0.86 GiB`,
-naming the 8032-token ceiling it could actually serve) instead of silently
-eating the card. `0.6b` moved 2.0 → 3.0 and `4b` 9.0 → 10.0 on that evidence.
+Every arm released **every** byte on stop: the card returned to 7275–7310 MiB
+after each one, and whisper-writer was undisturbed throughout.
 
-### STILL OPEN: the verdict's subject, now purely an LLM-arm question
+The subject correction is what makes the LLM arms reportable at all. Under the
+old total-usage reading `qwen3.5-9b` measured 21.75 GiB and failed; it takes
+14.10 GiB of the 16.45 GiB that was free before it started. The generate-branch
+safety margin is visible in the numbers too — the same arm's footprint fell from
+14961 MiB to 14441 MiB, and every LLM arm now lands ~1.4 GiB clear of its budget
+instead of at the last byte.
 
-What remains is **not** a KV bug and cannot be fixed the same way, because an
-LLM arm's KV cache is load-bearing. Measured on the cheapest LLM arm:
+### Two defects the live run found
 
-| arm | resident | total card | probe | vram verdict |
-|---|---|---|---|---|
-| `qwen3.5-9b` | 14961 MiB | **21.75 GiB** | PASS, 3045 ms | **FAIL** (> 19.5) |
+1. **`mistral-small-3.2-24b` — the manifest declared the wrong quant.**
+   `jeffcookio/Mistral-Small-3.2-24B-Instruct-2506-awq-sym` is named `awq` but
+   its own `config.json` says `quant_method: compressed-tensors` (format
+   `pack-quantized`, 4 bits). vLLM 0.26 refused the model outright:
+   `Quantization method specified in the model config (compressed-tensors) does
+   not match the quantization method specified in the 'quantization' argument
+   (awq)`. That refusal is the right behaviour — a mismatch guessed past would
+   serve numbers the eval would then attribute to a model it did not run.
+   `arms.yaml` is corrected to `compressed-tensors` from the measurement; the
+   arm has not yet been re-run under the correction.
 
-So the conflict is real and survives the KV fix: this arm serves
-schema-constrained completions correctly and still fails, because the
-free-derived share (16.37 GiB) plus the 7.31 GiB desktop+whisper baseline
-exceeds the nominal 19.5 GiB ceiling. It is not specific to the big arms —
-a 9B AWQ declaring `est_vram_gib: 6.0` already blows it.
+2. **`moe-stretch` — the probe's token budget is spent on thinking.**
+   The arm loads and serves (31 s to ready, 14611 MiB, 104 t/s), and llama.cpp's
+   own log shows it generating the full `PROBE_MAX_TOKENS` (512) and stopping on
+   length: `eval time = 4904.60 ms / 512 tokens`. `message.content` came back
+   empty, so the probe reports `empty_completion`. This is the failure step 19
+   predicted for this arm (see *Two findings for step 23* above) arriving in its
+   `empty_completion` rather than `not_json` form: a reasoning model's thinking
+   fills the cap before the answer begins. The fix belongs in the probe — a
+   reason code that distinguishes `finish_reason == "length"` from a genuinely
+   empty answer, and a token budget this arm can actually answer within — and it
+   must be written offline-first, not by widening the cap until the row turns
+   green.
 
-The fix is the subject correction: **`evaluate_budget` should judge the arm's
-footprint** (`used − baseline`) against the measured operating budget, not
-total usage against the nominal ceiling. `lms_vram.MEASURED_BASELINE_GIB`
-(7.19) already exists for this. `test_lms_verification_artifact.py`'s
-`used_mib <= nominal_ceiling` assertion moves with it — deliberately called
-out, because changing an assertion inside the anti-fabrication gate is exactly
-the move that needs a reviewer, not an agent acting alone. (Its stated purpose
-is *internal consistency* — "the verdict and the numbers it was computed from
-disagree" — so the corrected form is the same check against the corrected
-subject rather than a weaker one. That reading still wants a second pair of
-eyes, which is why it is written here and not applied.)
-
-Until that lands, `lms_healthcheck` exits 3 (budget) rather than 0 for the LLM
-arms, and `verification/health-report.json` cannot honestly be greened. Hand-
-editing a PASS row to get there is precisely what the gate exists to prevent.
+Neither is a budget failure and neither is hand-editable. `health-report.json`
+is therefore **not yet committed**: the anti-fabrication gate stays red until
+these two arms answer for real.
 
 ---
 
