@@ -22,8 +22,15 @@ this measurement twice produced 0 valid runs (2026-08-01, task 3454; again on
   without anyone noticing.
 - ``CROSS_ACCOUNT_EVIDENCE_PATH=/tmp/evidence.jsonl`` — also append each run's
   evidence record there.  One JSON line per run is written to stdout regardless
-  (visible under ``-s``, prefixed ``CROSS_ACCOUNT_RESUME_EVIDENCE``), including
-  for runs that fail or skip.
+  (visible under ``-s``, prefixed ``CROSS_ACCOUNT_RESUME_EVIDENCE``).  Emitted
+  once the cross-account test BODY runs, on every exit from it: green, red,
+  r2 capped/errored (``verdict`` ``void_capped``/``void_error``) and r1
+  capped/errored (``void_r1_capped``/``void_r1_error``) alike — a void round is
+  exactly the one worth recording, and two of the three attempts at this
+  question died at r1.  The one exit that leaves no record is a
+  COLLECTION-time skip, where the body never runs: no account at all, or an
+  unresolvable ``CROSS_ACCOUNT_RESUME_TOKENS``.  Both name themselves in the
+  skip reason, and a mis-set override also warns at import (below).
 
 **Probe which accounts are healthy BEFORE spending — through THIS code path.**
 An account is healthy iff it answers PONG; a "You've hit your weekly/session
@@ -105,14 +112,17 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _capacity_skip import result_looks_like_capacity_failure
 from _cross_account_evidence import (
+    PAIR_OVERRIDE_VAR,
     available_tokens,
     emit_run_evidence,
+    format_r1_failure_evidence,
     format_run_evidence,
     select_token_pair,
 )
@@ -148,6 +158,27 @@ except ValueError as exc:
 _ACCOUNT_A: tuple[str, str] | None = (
     _ACCOUNT_PAIR[0] if _ACCOUNT_PAIR else (_AVAILABLE_TOKENS[0] if _AVAILABLE_TOKENS else None)
 )
+
+# ...but SAY SO when that fallback fires because the override itself is mis-set.
+# ``select_token_pair`` deliberately refuses to fall back on a bad override — a
+# silent fall-back is how a run gets aimed at a capped account — and the line
+# above quietly re-introduces exactly that one layer up, for the single-account
+# tests.  That matters because the documented health probe drives them:
+# ``CROSS_ACCOUNT_RESUME_TOKENS='F,C' ... -k test_invoke_returns_session_id``.
+# With an unexpanded or typo'd letter, the probe answers for whichever account
+# happens to be first in env, and the operator reports THAT one healthy right
+# before spending the window on it.  The pair stays None (so the cross-account
+# test still skips with the reason, and collection still cannot crash), but the
+# mis-set override no longer passes unremarked.
+if _PAIR_ERROR is not None and os.environ.get(PAIR_OVERRIDE_VAR) is not None:
+    warnings.warn(
+        f'{PAIR_OVERRIDE_VAR}={os.environ[PAIR_OVERRIDE_VAR]!r} did not resolve: '
+        f'{_PAIR_ERROR} The cross-account test will SKIP. Single-account tests '
+        'fall back to '
+        + (_ACCOUNT_A[0] if _ACCOUNT_A else 'no account')
+        + ' — so a probe run answers for that account, NOT the one you named.',
+        stacklevel=2,
+    )
 
 _need_one_account = pytest.mark.skipif(
     _ACCOUNT_A is None,
@@ -244,6 +275,17 @@ class TestCrossAccountResume:
         )
         if not r1.success and result_looks_like_capacity_failure(r1):
             pytest.skip(f'Capacity failure: {r1.output!r}')
+        # Stamp RED here — BEFORE the first assertion that can raise.  Past the
+        # capacity skip the control has genuinely RUN, so every exit from here
+        # on that is not an explicit upgrade below is a FAILED control, and the
+        # cross-account record must then say False (ran, went red) rather than
+        # None (did not run).  Stamping only on the r2 path left a control that
+        # died at the r1 assertion — an API error, a timeout, a budget abort —
+        # recorded as `control_passed: null`, i.e. a red control mislabelled as
+        # unknown.  That weakens exactly the guarantee this field exists to
+        # provide: that the harness was sound while the cross-account result was
+        # taken.
+        _CONTROL_PASSED = False
         assert r1.success and r1.session_id
 
         # Resume and ask for the codeword
@@ -254,9 +296,12 @@ class TestCrossAccountResume:
             **_INVOKE_DEFAULTS,
         )
         if not r2.success and result_looks_like_capacity_failure(r2):
+            # Back to unknown: a capacity skip means the control did not
+            # complete, and "capped" is not "failed".
+            _CONTROL_PASSED = None
             pytest.skip(f'Capacity failure: {r2.output!r}')
-        # Stamp BEFORE asserting, so a red control is recorded as False rather
-        # than left at None (unknown) by the raised AssertionError.
+        # Stamp the real value BEFORE asserting, so a red control is recorded as
+        # False rather than left at False-by-default with no distinction.
         recalled = 'FLAMINGO' in r2.output.upper()
         _CONTROL_PASSED = bool(r2.success and recalled)
         assert r2.success
@@ -307,9 +352,30 @@ class TestCrossAccountResume:
             oauth_token=token_a,
             **_INVOKE_DEFAULTS,
         )
-        if not r1.success and result_looks_like_capacity_failure(r1):
-            pytest.skip(f'Capacity failure on {name_a} (r1): {r1.output!r}')
-        assert r1.success and r1.session_id
+        # A round that dies at r1 never reaches the resume, so it has no
+        # cross-account observation to score — but it still has to leave a
+        # RECORD.  These are the rounds this question keeps losing: account A
+        # capped is how two of the three attempts ended, and a bare pytest skip
+        # line is what made the 2026-08-01 round diagnosable only by hand.
+        if not (r1.success and r1.session_id):
+            r1_evidence = emit_run_evidence(
+                format_r1_failure_evidence(
+                    account_a=name_a,
+                    account_b=name_b,
+                    r1=r1,
+                    control_passed=_CONTROL_PASSED,
+                ),
+                os.environ,
+                sys.stdout,
+            )
+            if not r1.success and result_looks_like_capacity_failure(r1):
+                pytest.skip(
+                    f'Capacity failure on {name_a} (r1) — round is VOID before '
+                    f'the resume, not evidence of context loss: {r1_evidence}'
+                )
+            pytest.fail(
+                f'r1 did not start a resumable session on {name_a}: {r1_evidence}'
+            )
 
         # Probe r1's transcript on disk BEFORE the resume: "was it reachable"
         # is the alternative explanation for a failed resume, and it can only be

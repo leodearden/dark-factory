@@ -234,8 +234,9 @@ The reasoning that ties the verdict to the runs:
    answer, not a limit message and not the empty output of a budget abort. The
    two ways this measurement has previously produced a false reading (a capped
    account, a budget abort) are both excluded by the recorded fields, and both
-   now have their own verdict class (`void_capped`, `void_error`) that no run
-   in this round took.
+   now have their own verdict class (`void_capped`, `void_error`; joined later
+   by `void_r1_capped` / `void_r1_error` for a round that never reached the
+   resume) that no run in this round took.
 2. **The account really did change between r1 and r2.** `account_a` and
    `account_b` are distinct env vars, `select_token_pair` rejects a pair naming
    the same account twice, and both accounts were independently probed healthy
@@ -294,11 +295,21 @@ uv run --project shared --directory shared \
     pytest tests/test_cli_invoke_integration.py::TestCrossAccountResume -vs -m integration
 ```
 
-A run whose record says `verdict='void_capped'` or `verdict='void_error'` is
-VOID — it does not count, and it is **not** evidence of context loss. If a run
-is red with an unfamiliar limit message, add that phrasing to
-`REAL_CLI_CAP_MESSAGES` in `shared/tests/_capacity_skip.py` (single-homed and
-drift-guarded) rather than reasoning around it locally.
+A run whose record says `verdict='void_capped'`, `'void_error'`,
+`'void_r1_capped'` or `'void_r1_error'` is VOID — it does not count, and it is
+**not** evidence of context loss. The `void_r1_*` pair covers a round that died
+before the resume was ever issued (account A capped or errored at r1); those
+records carry `r1_output` / `r1_stderr` / `r1_subtype` and null `r2_*` fields,
+since there is no cross-account observation to score. If a run is red with an
+unfamiliar limit message, add that phrasing to `REAL_CLI_CAP_MESSAGES` in
+`shared/tests/_capacity_skip.py` (single-homed and drift-guarded) rather than
+reasoning around it locally.
+
+`preserved` outranks every void class: a recalled codeword cannot be produced
+without the prior context, so it is positive evidence whatever else the run
+carried — including a NEAR-cap annotation on stderr, which production treats as
+annotation-only and which can ride along on a healthy invocation. Only a run
+that recalled nothing can be scored void or `not_preserved`.
 
 ## See also
 
@@ -309,8 +320,8 @@ drift-guarded) rather than reasoning around it locally.
   `CROSS_ACCOUNT_RESUME_TOKENS` / `CROSS_ACCOUNT_EVIDENCE_PATH` knobs, and the
   regression guard.
 - `shared/tests/_cross_account_evidence.py` — `select_token_pair`,
-  `format_run_evidence`, `emit_run_evidence` (unit-tested by
-  `shared/tests/test_cross_account_evidence.py`).
+  `format_run_evidence`, `format_r1_failure_evidence`, `emit_run_evidence`
+  (unit-tested by `shared/tests/test_cross_account_evidence.py`).
 - `shared/tests/_capacity_skip.py` — the single-homed cap-message corpus
   (task 3483).
 - Tasks: **3454** (round 1, INCONCLUSIVE) · **3483** (cap corpus) · **3484**

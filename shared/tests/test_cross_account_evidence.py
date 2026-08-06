@@ -19,11 +19,18 @@ from __future__ import annotations
 
 import io
 import json
+import warnings
+from pathlib import Path
 
 import pytest
-from _capacity_skip import REAL_CLI_CAP_MESSAGES
+from _capacity_skip import (
+    REAL_CLI_CAP_HIT_MESSAGES,
+    REAL_CLI_CAP_MESSAGES,
+    REAL_CLI_NEAR_CAP_MESSAGES,
+)
 from _cross_account_evidence import (
     emit_run_evidence,
+    format_r1_failure_evidence,
     format_run_evidence,
     select_token_pair,
 )
@@ -55,6 +62,29 @@ def _record(**overrides) -> dict:
     }
     kwargs.update(overrides)
     return format_run_evidence(**kwargs)
+
+
+def _forbid_filesystem_writes(monkeypatch, tmp_path) -> None:
+    """Give "does not touch the filesystem" some teeth.
+
+    ``assert list(tmp_path.iterdir()) == []`` proves nothing on its own:
+    ``tmp_path`` is never handed to ``emit_run_evidence``, so nothing could
+    reference it whatever the implementation did — the assertion would stay green
+    against a hard-coded fallback path.  Two teeth: the CWD becomes ``tmp_path``,
+    so a RELATIVE fallback materialises there and trips the iterdir assertion;
+    and ``Path.open`` / ``Path.mkdir`` become tripwires, so an ABSOLUTE one is
+    caught too.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    def _boom(self, *args, **kwargs):
+        raise AssertionError(
+            f'emit_run_evidence touched the filesystem at {self} with no '
+            'CROSS_ACCOUNT_EVIDENCE_PATH set'
+        )
+
+    monkeypatch.setattr(Path, 'open', _boom)
+    monkeypatch.setattr(Path, 'mkdir', _boom)
 
 
 class TestSelectTokenPairDefault:
@@ -313,6 +343,53 @@ class TestFormatRunEvidenceVerdict:
         record = _record(r2=_result('ZEPPELIN', success=False, subtype='error_max_turns'))
         assert record['verdict'] == 'preserved'
 
+    def test_near_cap_warning_does_not_void_a_green_run(self):
+        """The record must not call a run void that the live test passes GREEN.
+
+        ``REAL_CLI_NEAR_CAP_MESSAGES`` is annotation-only in production
+        (``_handle_near_cap_warning``, not ``_handle_cap_detected``) and can ride
+        along on a perfectly healthy invocation.  The integration test's skip
+        guard is ``not r2.success and result_looks_like_capacity_failure(r2)``,
+        so an r2 that SUCCEEDED and answered ZEPPELIN with this on stderr passes
+        the assertion — and the emitted record, which is the deliverable of the
+        whole measurement, used to call the same run ``void_capped``.  A green
+        measurement silently recorded as void is the same class of mis-scoring
+        ``void_error`` was added to close.
+        """
+        record = _record(
+            r2=_result(
+                'ZEPPELIN', success=True, stderr=REAL_CLI_NEAR_CAP_MESSAGES[0]
+            )
+        )
+        assert record['codeword_recalled'] is True
+        assert record['verdict'] == 'preserved'
+
+    def test_recalled_codeword_outranks_void_capped(self):
+        """Same principle as ``void_error``, applied uniformly: positive evidence
+        wins.  The codeword could not have been produced without the prior
+        context, whatever else the run carried."""
+        record = _record(
+            r2=_result(
+                'ZEPPELIN', success=False, stderr=REAL_CLI_CAP_HIT_MESSAGES[0]
+            )
+        )
+        assert record['verdict'] == 'preserved'
+
+    def test_cap_message_voids_the_run_even_when_r2_reports_success(self):
+        """``void_capped`` is deliberately NOT gated on ``not r2.success``.
+
+        Gating it would also have fixed the near-cap case above, but it would
+        make a cap that arrives on a run the CLI marked successful score
+        ``not_preserved`` — reopening the exact 2026-08-01 trap (a cap read as
+        context loss) on the strength of an assumption about CLI exit semantics
+        this suite has never measured.  Ordering ``preserved`` first fixes the
+        disagreement without betting on it; this pins that the conservative
+        reading survives.
+        """
+        record = _record(r2=_result(REAL_CLI_CAP_HIT_MESSAGES[0], success=True))
+        assert record['codeword_recalled'] is False
+        assert record['verdict'] == 'void_capped'
+
     def test_void_capped_outranks_void_error(self):
         record = _record(
             r2=_result(REAL_CLI_CAP_MESSAGES[0], success=False, subtype='error')
@@ -351,6 +428,76 @@ class TestFormatRunEvidenceVerdict:
         assert _record(control_passed=True)['control_passed'] is True
 
 
+class TestFormatR1FailureEvidence:
+    """A round that dies at r1 must leave a record too — those are the lost ones.
+
+    Two of the three attempts at the cross-account question ended with account A
+    capped, and the live test used to return/raise before any record was built,
+    so the operator saw a one-line pytest skip and nothing else.  That is what
+    made the 2026-08-01 round diagnosable only by a human reading a transcript.
+    """
+
+    def _r1_record(self, r1, control_passed=True) -> dict:
+        return format_r1_failure_evidence(
+            account_a='CLAUDE_OAUTH_TOKEN_F',
+            account_b='CLAUDE_OAUTH_TOKEN_C',
+            r1=r1,
+            control_passed=control_passed,
+        )
+
+    def test_capped_r1_yields_void_r1_capped(self):
+        record = self._r1_record(_result(REAL_CLI_CAP_HIT_MESSAGES[0], success=False))
+        assert record['verdict'] == 'void_r1_capped'
+
+    def test_non_cap_r1_failure_yields_void_r1_error(self):
+        record = self._r1_record(
+            _result('', success=False, subtype='error_max_budget_usd')
+        )
+        assert record['verdict'] == 'void_r1_error'
+
+    def test_records_r1_diagnostics_verbatim(self):
+        """``verdict`` alone cannot say WHY the round died; the raw text is the
+        only thing that separates a capped account from a broken harness."""
+        r1 = _result(
+            "You've hit your weekly limit · resets Aug 7, 1pm",
+            success=False,
+            stderr='some stderr',
+            subtype='error',
+            session_id='sid-partial',
+        )
+        record = self._r1_record(r1)
+        assert record['r1_output'] == "You've hit your weekly limit · resets Aug 7, 1pm"
+        assert record['r1_stderr'] == 'some stderr'
+        assert record['r1_subtype'] == 'error'
+        assert record['r1_success'] is False
+        assert record['r1_session_id'] == 'sid-partial'
+
+    def test_r2_fields_are_none_because_the_resume_was_never_issued(self):
+        """None, not '' / False: "never issued" is a different finding from "ran
+        and returned nothing", and only the second says anything about context."""
+        record = self._r1_record(_result('', success=False))
+        assert record['r2_output'] is None
+        assert record['r2_stderr'] is None
+        assert record['r2_success'] is None
+        assert record['r2_subtype'] is None
+        assert record['codeword_recalled'] is False
+
+    def test_key_set_is_a_superset_of_the_normal_record(self):
+        """One JSONL file, read uniformly: every key of a normal record is here."""
+        r1_record = self._r1_record(_result('', success=False))
+        assert set(_record()) <= set(r1_record)
+
+    def test_carries_the_accounts_and_the_control_flag(self):
+        record = self._r1_record(_result('', success=False), control_passed=False)
+        assert record['account_a'] == 'CLAUDE_OAUTH_TOKEN_F'
+        assert record['account_b'] == 'CLAUDE_OAUTH_TOKEN_C'
+        assert record['control_passed'] is False
+
+    def test_round_trips_through_json(self):
+        record = self._r1_record(_result('boom', success=False))
+        assert json.loads(json.dumps(record)) == record
+
+
 class TestEmitRunEvidence:
     """One JSON line to the stream; also to the evidence file when asked."""
 
@@ -383,15 +530,49 @@ class TestEmitRunEvidence:
             'sid-2',
         ]
 
-    def test_does_not_touch_filesystem_when_path_unset(self, tmp_path):
+    def test_does_not_touch_filesystem_when_path_unset(self, tmp_path, monkeypatch):
+        _forbid_filesystem_writes(monkeypatch, tmp_path)
         emit_run_evidence(_record(), {}, io.StringIO())
         assert list(tmp_path.iterdir()) == []
 
-    def test_blank_evidence_path_is_treated_as_unset(self, tmp_path):
+    def test_blank_evidence_path_is_treated_as_unset(self, tmp_path, monkeypatch):
+        _forbid_filesystem_writes(monkeypatch, tmp_path)
         emit_run_evidence(
             _record(), {'CROSS_ACCOUNT_EVIDENCE_PATH': ''}, io.StringIO()
         )
         assert list(tmp_path.iterdir()) == []
+
+    def test_unwritable_evidence_path_does_not_void_the_run(self, tmp_path):
+        """A side-channel must never destroy the measurement it exists to record.
+
+        By the time this is called two real CLI invocations have been paid for,
+        inside a two-uncapped-accounts window that may not reopen for days.  An
+        ``OSError`` escaping here (read-only mount, a plain FILE at a parent
+        component, a permission the runner lacks) would turn that completed run
+        into a test ERROR before the assertions run.  The stdout copy is already
+        written and flushed, so the record survives — and the caller still gets
+        its line back for the assertion message.
+        """
+        blocker = tmp_path / 'not-a-dir'
+        blocker.write_text('I am a file, not a directory\n', encoding='utf-8')
+        stream = io.StringIO()
+        record = _record()
+
+        line = emit_run_evidence(
+            record,
+            {'CROSS_ACCOUNT_EVIDENCE_PATH': str(blocker / 'nested' / 'evidence.jsonl')},
+            stream,
+        )
+
+        assert json.loads(line) == record
+        written = stream.getvalue()
+        # The record itself still reached the stream...
+        payload = written.split('CROSS_ACCOUNT_RESUME_EVIDENCE ', 1)[1].splitlines()[0]
+        assert json.loads(payload) == record
+        # ...and the failure is REPORTED, not swallowed: an operator must not
+        # read a failed write as "I forgot to set the var".
+        assert 'CROSS_ACCOUNT_RESUME_EVIDENCE_WRITE_FAILED' in written
+        assert str(blocker) in written
 
     def test_verbatim_multiline_output_stays_on_one_line_in_the_file(self, tmp_path):
         """A record whose r2_output contains newlines must not split the JSONL."""
@@ -500,6 +681,48 @@ class TestIntegrationModuleUsesSelectTokenPair:
         assert 'F' in module._PAIR_ERROR
         # Single-account tests still have somebody to run on.
         assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_B', 'tok-b')
+
+    def test_mis_set_override_warns_about_the_account_a_fallback(
+        self, reload_integration_module
+    ):
+        """The ``_ACCOUNT_A`` fallback above must not be SILENT.
+
+        ``select_token_pair`` refuses to fall back on a bad override precisely
+        because a silent fall-back is how a run gets aimed at a capped account —
+        and ``_ACCOUNT_A`` re-introduces that fall-back one layer up, for the
+        single-account tests.  The documented health probe drives exactly those
+        (``CROSS_ACCOUNT_RESUME_TOKENS='F,C' ... -k test_invoke_returns_session_id``),
+        so a typo'd or unexpanded letter makes the operator probe a DIFFERENT
+        account and report it healthy right before spending the window on it.
+        """
+        with pytest.warns(UserWarning) as caught:
+            module = reload_integration_module(
+                CLAUDE_OAUTH_TOKEN_B='tok-b',
+                CLAUDE_OAUTH_TOKEN_C='tok-c',
+                CROSS_ACCOUNT_RESUME_TOKENS='F,C',  # F is unset here
+            )
+        messages = [str(w.message) for w in caught]
+        assert any('CROSS_ACCOUNT_RESUME_TOKENS' in m for m in messages), messages
+        # It must name the account the probe would actually answer for.
+        assert any('CLAUDE_OAUTH_TOKEN_B' in m for m in messages), messages
+        assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_B', 'tok-b')
+
+    def test_no_override_and_too_few_accounts_does_not_warn(
+        self, reload_integration_module
+    ):
+        """The warning is about a MIS-SET override, not about a small pool.
+
+        A one-token machine is an ordinary situation (CI, a dev box) and warning
+        there would train the operator to ignore the line that matters.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            module = reload_integration_module(CLAUDE_OAUTH_TOKEN_C='tok-c')
+        assert module._ACCOUNT_PAIR is None
+        assert module._PAIR_ERROR is not None
+        assert not [
+            w for w in caught if 'CROSS_ACCOUNT_RESUME_TOKENS' in str(w.message)
+        ]
 
     def test_single_token_leaves_pair_unset(self, reload_integration_module):
         module = reload_integration_module(CLAUDE_OAUTH_TOKEN_C='tok-c')
