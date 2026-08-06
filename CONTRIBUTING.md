@@ -134,7 +134,13 @@ Other top-level dirs:
   repo-root `pytest` instead collects everything into one process against
   only the root `pyproject.toml`, which is slower and less isolated. Mirror
   the fan-out when running the full suite yourself.
+<!-- lint-command-mirror:begin
+     Mirrors the `ruff check` leg of `lint_command` in
+     dark-factory-orchestrator.yaml. Pinned by
+     tests/scripts/test_contributing_lint_command_drift.py — widen the yaml
+     head and this line goes red until it is updated to match. -->
 - **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard`
+<!-- lint-command-mirror:end -->
 - **Type-check** (pyright, run from each configured package directory so it
   picks up that package's `[tool.pyright]` block):
   ```bash
