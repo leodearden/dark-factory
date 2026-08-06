@@ -246,6 +246,7 @@ class TestDurableArchivePathLookup:
 
         found = durable_archive_path(root, task_id, sid)
 
+        assert found is not None
         assert found == archived
         assert found.exists()
 
@@ -320,6 +321,7 @@ class TestDurableArchivePathLookup:
 
         found = durable_archive_path(root, task_id, sid)
 
+        assert found is not None
         assert found == main
         assert found.is_file()
 
@@ -451,14 +453,22 @@ class TestDurableArchivePathLookup:
         """B5 (I-A): an integer task_id is coerced, not a TypeError.
 
         Task ids are numeric strings, so a caller can easily hold the int.
+
+        The ``type: ignore``s below are the POINT of this test, not noise: the
+        declared signature stays strict (``archive_root: Path``, ``task_id:
+        str``) so real callers get a type error at the seam, and the coercion
+        inside the locator is defence-in-depth against a caller bug reaching it
+        anyway. Pinning that requires violating the annotation on purpose —
+        widening the signature instead would advertise the sloppy shapes as
+        supported and lose the static signal that keeps I-E's sole locator crisp.
         """
         root = tmp_path / 'archive'
         sid = 'sess-b5-int'
         archived = _write(root / '42' / ENC / f'{sid}.jsonl.gz', b'gz-bytes')
 
-        assert durable_archive_path(root, 42, sid) == archived
-        assert durable_archive_path(root, 99, sid) is None
-        assert durable_archive_path(str(root), '42', sid) == archived
+        assert durable_archive_path(root, 42, sid) == archived  # type: ignore[arg-type]
+        assert durable_archive_path(root, 99, sid) is None  # type: ignore[arg-type]
+        assert durable_archive_path(str(root), '42', sid) == archived  # type: ignore[arg-type]
 
     def test_i_d_lookup_leaves_the_archive_byte_identical(self, tmp_path):
         """I-D: the locator is strictly read-only — glob and stat only.
