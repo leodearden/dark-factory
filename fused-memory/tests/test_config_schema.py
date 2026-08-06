@@ -1722,6 +1722,8 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
             'requeue rebase',
             'lost-plan reconstruction',
             'committed TDD steps',
+            'worktrees/.task-meta',
+            'lane reseed',
         ]
         assert cluster.min_phrase_hits == 2
         assert '2973' in cluster.hint

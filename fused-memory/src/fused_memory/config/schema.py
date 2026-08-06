@@ -782,12 +782,34 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # eval-worktree-plan-tools-missing cluster, and reusing them here
             # would blur the two clusters and risk mis-routing a write to the
             # wrong gate task.
+            #
+            # THIRD SUB-CASE (task 3054): warm-lane RESEED. A task dispatched
+            # into a recycled lane can find .task/plan.json a DANGLING symlink
+            # whose worktrees/.task-meta/<lane>/plan.json target was never
+            # written or was scrubbed -- the same architect-facing failure as
+            # the two canonical sub-cases, a different cause. 'worktrees/
+            # .task-meta' and 'lane reseed' are its distinctive vocabulary and
+            # are added as ORDINARY phrases (not sufficient): together they
+            # reach the existing min_phrase_hits=2, so a reseed note that
+            # never names an architect tool is now catchable on its own.
+            #
+            # NESTING EXCLUSION (the invariant asserted over every seeded
+            # cluster): 'warm-lane reseed' is omitted because 'lane reseed'
+            # NESTS inside it, so seeding both would let ONE occurrence score
+            # two distinct hits and satisfy min_phrase_hits alone -- silently
+            # granting sufficiency without declaring it. Nothing is lost:
+            # 'lane reseed' already substring-matches the 'warm-lane reseed'
+            # spelling. Bare 'plan.json' is excluded for the same reason (it
+            # nests inside '.task/plan.json' above), and bare 'dangling' as a
+            # generic token that fires on unrelated symlink notes.
             phrases=[
                 '.task/plan.json',
                 'plan-revalidation',
                 'requeue rebase',
                 'lost-plan reconstruction',
                 'committed TDD steps',
+                'worktrees/.task-meta',
+                'lane reseed',
             ],
             min_phrase_hits=2,
             hint=(
