@@ -1038,6 +1038,76 @@ def _stamp_fm_deploy_clock() -> None:
     )
 
 
+def _read_last_fm_liveness_restart_epoch() -> float | None:
+    """Return the last watchdog-initiated fm LIVENESS restart epoch, or None.
+
+    Sibling of _read_last_fm_deploy_epoch reading a DIFFERENT file
+    (FM_LIVENESS_RESTART_CLOCK_PATH, task 3764) with the identical ``{ts, iso}``
+    schema and fail-open contract. Fail-open: a missing clock is the normal
+    "the watchdog has never revived fm" case; a corrupt one is logged by
+    _read_json_state. Callers must treat None as "the cap does not apply".
+    """
+    state = _read_json_state(FM_LIVENESS_RESTART_CLOCK_PATH)
+    if state is None:
+        return None
+    try:
+        return float(state["ts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        log(
+            f"ignoring fm liveness restart clock at "
+            f"{FM_LIVENESS_RESTART_CLOCK_PATH} with unusable 'ts': {exc!r}"
+        )
+        return None
+
+
+def _within_fm_liveness_restart_min_interval() -> bool:
+    """Return True iff we are still inside the fm LIVENESS restart cap window.
+
+    Line-for-line sibling of _within_fm_deploy_min_interval — same
+    disable-on-<=0 semantics (the clock is not even read) and same
+    fail-open-on-missing-clock semantics, so the two caps behave predictably
+    alike for an operator — but reading its OWN clock against its OWN interval.
+
+    I5 SEPARATION. FM_LIVENESS_RESTART_CLOCK_PATH is stamped ONLY by a liveness
+    revive and read ONLY here, so this cap can neither silence nor be silenced
+    by the fm staleness deploy cadence: reviving a wedge never delays a merged
+    fm change's deploy, and a scheduled deploy never licenses an extra kill.
+
+    Fail direction: an absent/unreadable clock counts as OUTSIDE the window.
+    Failing the other way would let one unreadable file suppress every future
+    revive indefinitely — worse than an extra restart the streak has already
+    justified.
+    """
+    if FM_LIVENESS_RESTART_MIN_INTERVAL_SECS <= 0:
+        return False
+    last = _read_last_fm_liveness_restart_epoch()
+    if last is None:
+        return False
+    return (time.time() - last) < FM_LIVENESS_RESTART_MIN_INTERVAL_SECS
+
+
+def _stamp_fm_liveness_restart_clock() -> None:
+    """Stamp FM_LIVENESS_RESTART_CLOCK_PATH with the current ``{ts, iso}`` time.
+
+    Arms the liveness restart cap. Sibling of _stamp_fm_deploy_clock over a
+    DIFFERENT file (task 3764) — writing fm's deploy clock here would silence
+    the fm staleness backstop for its full 8h window every time the watchdog
+    revived a wedge (I5).
+
+    Called from fused_memory_liveness_pass() immediately after restart_unit()
+    issues a revive, so the cap is armed even if the subsequent streak clear
+    fails. Fail-soft by inheritance from _atomic_write_json.
+    """
+    now = time.time()
+    _atomic_write_json(
+        FM_LIVENESS_RESTART_CLOCK_PATH,
+        {
+            "ts": int(now),
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+        },
+    )
+
+
 def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
     """Persist the current consecutive-non-healthy-verdict streak (task 3764).
 
