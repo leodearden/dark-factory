@@ -600,6 +600,92 @@ class TestRunCliWiring:
         assert f'commit={"d" * 40}' in captured.out
         assert 'flag_class=misattributed' in captured.out
 
+    async def test_exit_zero_when_only_legacy_offenders_despite_fresh_updated_at(
+        self, monkeypatch, capsys,
+    ):
+        """THE task-2683 regression: a backlog of legacy stamps whose
+        updatedAt keeps getting bumped must stop forcing EXIT 1 forever.
+
+        Exit 0 here means "the freshness window no longer re-admits legacy
+        rows", NOT "the backlog was corrected" — which is why every one of
+        them is still printed.
+        """
+        report = _report([_detail(str(700 + i), 'misattributed') for i in range(3)])
+        tasks = [_stamped_task(str(700 + i), AFTER_SINCE, None) for i in range(3)]
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, tasks)
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 0
+        # Loud, not silent: every legacy offender is still on stdout with
+        # its class, so an operator sees the backlog in the log.
+        captured = capsys.readouterr()
+        for i in range(3):
+            assert f'task_id={700 + i}' in captured.out
+        assert captured.out.count('stamp_class=legacy') == 3
+
+    async def test_exit_one_when_a_genuinely_fresh_stamp_is_flagged(
+        self, monkeypatch, capsys,
+    ):
+        """A stamp written after --since still gates — that is the whole
+        point of the soak gate."""
+        report = _report([_detail('800', 'misattributed', commit='d' * 40)])
+        tasks = [_stamped_task('800', BEFORE_SINCE, AFTER_SINCE, commit='d' * 40)]
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, tasks)
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert 'task_id=800' in captured.out
+        assert 'stamp_class=fresh' in captured.out
+
+    async def test_mixed_fresh_and_legacy_gates_on_the_fresh_one_and_prints_both(
+        self, monkeypatch, capsys,
+    ):
+        report = _report([
+            _detail('900', 'misattributed'),
+            _detail('901', 'misattributed'),
+        ])
+        tasks = [
+            _stamped_task('900', BEFORE_SINCE, AFTER_SINCE),  # fresh -> gates
+            _stamped_task('901', AFTER_SINCE, None),          # legacy -> reported
+        ]
+        _install_fake_audit_module(monkeypatch, report)
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        _install_fake_backend(monkeypatch, tasks)
+
+        args = argparse.Namespace(
+            project_root='/proj', config=None, ref='main', since='2026-07-16T00:00:00Z',
+        )
+        exit_code = await _mod._run(args, SINCE)
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert 'task_id=900' in captured.out
+        assert 'task_id=901' in captured.out
+        assert 'stamp_class=fresh' in captured.out
+        assert 'stamp_class=legacy' in captured.out
+
     async def test_missing_taskmaster_config_returns_1_without_creating_backend(
         self, monkeypatch,
     ):
