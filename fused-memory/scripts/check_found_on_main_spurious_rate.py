@@ -43,6 +43,20 @@ DeterministicRunner predicate convention):
     on its own code so it is never mistaken for "offenders found" (1) by
     a caller branching on exit code alone.
 
+Two orthogonal signals, deliberately kept separate (task 3576):
+
+  - ``stamped_at`` supplies FRESHNESS scoping (``stamp_class``), and is
+    what gates the exit code.
+  - Commit FAN-OUT supplies the sub-pattern A/B split (``sub_pattern``),
+    and is reporting only.
+
+They answer different questions and neither substitutes for the other. A
+timestamp cannot distinguish legitimate named-sibling attribution from
+spurious bare-merge-commit sharing — those differ in citation SHAPE, not
+in time; two stamps written in the same second can be one legitimate and
+one spurious. Conversely fan-out says nothing about when a stamp was
+written. See :func:`classify_sub_patterns` for the fan-out rule.
+
 Deliberately narrower than the audit's own ``_FLAGGED_VERDICTS``: this
 predicate's contract (PRD decomposition label ι) is specifically
 misattribution/deliverable-absence, the two verdict classes this PRD's
@@ -186,6 +200,9 @@ def find_spurious_since(
     Returns records sorted by ``int(task_id)`` for deterministic output.
     """
     by_id = {str(t.get('id', '')): t for t in tasks}
+    # Fan-out is computed over the FULL report, before the flagged-subset
+    # filter below — see classify_sub_patterns for why that matters.
+    sub_pattern_by_commit = classify_sub_patterns(report)
     offenders: list[dict[str, Any]] = []
     for detail in report.get('tasks', []):
         verdict = detail.get('verdict')
@@ -208,16 +225,51 @@ def find_spurious_since(
         if freshness_dt is None or freshness_dt <= since:
             continue
 
+        commit = detail.get('commit')
         offenders.append({
             'task_id': task_id,
-            'commit': detail.get('commit'),
+            'commit': commit,
             'verdict': verdict,
             'updated_at': updated_at,
             'stamped_at': stamped_at,
             'stamp_class': stamp_class,
+            'sub_pattern': sub_pattern_by_commit.get(commit) if commit else None,
         })
     offenders.sort(key=lambda o: _id_sort_key(o['task_id']))
     return offenders
+
+
+def classify_sub_patterns(report: dict[str, Any]) -> dict[str, str]:
+    """Map each cited commit to its sub-pattern, by fan-out over *report*.
+
+    Fan-out = how many DISTINCT found_on_main task ids cite a given commit:
+
+      - ``>= 2`` -> ``'shared_bare_merge'``: several unrelated tasks all
+        pointing at one bare "Merge task/X into main" commit. This is the
+        spurious sharing sub-pattern (8 of recon's 13 cases; corroborated
+        by esc-3398-1 for task 3301).
+      - ``== 1`` -> ``'named_sibling'``: one task citing one sibling's
+        commit — the legitimate attribution sub-pattern (the other 5).
+
+    Counted over the FULL ``report['tasks']`` list — every audited
+    found_on_main task, whatever its verdict — not just the flagged subset.
+    A spurious task sharing a commit with an ``ok`` task is still
+    ``shared_bare_merge``; the sharing is the signal, and counting only
+    flagged entries would misclassify it as ``named_sibling``.
+
+    Details with no ``commit`` are skipped rather than grouped under a
+    ``None`` key. Pure function; never raises.
+    """
+    tasks_by_commit: dict[str, set[str]] = {}
+    for detail in report.get('tasks', []):
+        commit = detail.get('commit')
+        if not commit:
+            continue
+        tasks_by_commit.setdefault(commit, set()).add(str(detail.get('task_id', '')))
+    return {
+        commit: ('shared_bare_merge' if len(task_ids) >= 2 else 'named_sibling')
+        for commit, task_ids in tasks_by_commit.items()
+    }
 
 
 def gating_offenders(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -250,10 +302,20 @@ def gating_offenders(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def format_summary(offenders: list[dict[str, Any]]) -> list[str]:
     """One structured stdout line per offending task: task_id, cited sha,
-    flag class. Human/log-triage only — the DeterministicRunner predicate
-    contract is exit-code-only and parses no output (see module docstring)."""
+    flag class, plus the two task-3576 annotations — ``stamp_class``
+    (fresh|legacy, which decides whether the record gates) and
+    ``sub_pattern`` (shared_bare_merge|named_sibling, which is reporting
+    only). Human/log-triage only — the DeterministicRunner predicate
+    contract is exit-code-only and parses no output (see module docstring).
+
+    Every offender is rendered, legacy ones included: a legacy record stops
+    gating but must never stop being visible. Annotations absent from a
+    record render as ``None`` rather than raising — this is triage output,
+    never a source of exceptions.
+    """
     return [
-        f'task_id={o["task_id"]} commit={o["commit"]} flag_class={o["verdict"]}'
+        f'task_id={o["task_id"]} commit={o["commit"]} flag_class={o["verdict"]} '
+        f'stamp_class={o.get("stamp_class")} sub_pattern={o.get("sub_pattern")}'
         for o in offenders
     ]
 
