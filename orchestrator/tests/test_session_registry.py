@@ -3124,6 +3124,58 @@ def test_normalize_escalations_dir_fail_soft_on_unresolvable_value() -> None:
     assert sr.normalize_escalations_dir('a\x00b') == 'a\x00b'
 
 
+def test_unknown_queue_sentinel_is_distinguishable_from_the_unset_sentinel() -> None:
+    """UNKNOWN_QUEUE is a THIRD queue state (task 3640), not a respelling of ''.
+
+    '' means "nobody told us" (legacy/unset -- the reaper falls back to
+    project-only scoping and MAY close the record). UNKNOWN_QUEUE means "we
+    investigated and could not determine the owning queue" -- the reaper must
+    refuse to close it. Collapsing the two would silently hand every
+    back-filled undeterminable record back to the false-closure hazard task
+    3528 exists to remove, so the values must never compare equal, and the
+    sentinel must be TRUTHY (the reaper's axis-2 guard is gated on
+    `if decision_dir and ...`).
+
+    The angle brackets are load-bearing, not decoration: a resolved queue path
+    always begins with '/', so a real queue and this sentinel can never
+    collide no matter what a project is named.
+    """
+    assert sr.UNKNOWN_QUEUE
+    assert sr.UNKNOWN_QUEUE != ''
+    assert not sr.UNKNOWN_QUEUE.startswith('/')
+
+
+def test_normalize_escalations_dir_preserves_the_unknown_sentinel_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE RED DRIVER (task 3640): the sentinel must round-trip unchanged.
+
+    Without a special case, `'<unknown>'` is a bare word and falls through to
+    `Path(raw).expanduser().resolve()`, which resolves it RELATIVE TO THE
+    CALLING PROCESS'S CWD -- so the same record normalizes to
+    `<cwd-A>/<unknown>` in the back-fill script and `<cwd-B>/<unknown>` in a
+    watcher's reaper. A stamp whose value depends on who reads it is not a
+    contract at all: the two would never compare equal, and worse, whichever
+    accidental absolute path got STORED would be an outright lie about where
+    the record's escalation lives.
+
+    Asserting under two different cwds is the point -- a single call would
+    pass against a buggy implementation that merely happened to be invoked
+    from the right directory.
+    """
+    (tmp_path / 'a').mkdir()
+    (tmp_path / 'b').mkdir()
+
+    monkeypatch.chdir(tmp_path / 'a')
+    from_a = sr.normalize_escalations_dir(sr.UNKNOWN_QUEUE)
+    monkeypatch.chdir(tmp_path / 'b')
+    from_b = sr.normalize_escalations_dir(sr.UNKNOWN_QUEUE)
+
+    assert from_a == sr.UNKNOWN_QUEUE
+    assert from_b == sr.UNKNOWN_QUEUE
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
@@ -3727,3 +3779,109 @@ def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-cli-badescdir'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_refuses_unknown_queue_but_still_closes_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """REGRESSION GUARD, not a RED driver (task 3640) -- and deliberately so.
+
+    Probed against the merged 3528 code before this test was written: a
+    decision stamped with ANY truthy non-matching value already survives the
+    axis-2 `if decision_dir and decision_dir != reaper_dir` compare, so an
+    UNKNOWN_QUEUE stamp is ALREADY safe today. A test asserting "the reaper
+    closes unknown-stamped records" would therefore be doomed-green and could
+    never drive an implementation. What this pins instead is that the safety
+    SURVIVES: it is currently an accident of string inequality, and a future
+    simplification of that compare (or of the explicit by-name guard step-2
+    adds) would silently make every back-filled undeterminable record closable
+    again, restoring the exact ~7-day invisible-close failure 3528 removed.
+
+    Both arms run in ONE reaper invocation against a queue holding a RESOLVED
+    escalation with the shared id, so the ONLY thing distinguishing them is
+    the queue stamp:
+      - the UNKNOWN_QUEUE-stamped record stays OPEN (refuse, never default to
+        close -- it stays a visible cockpit row for human closure);
+      - the legacy `escalations_dir=''` record on the SAME id still closes to
+        ANSWERED. That second assertion is the load-bearing one: task 3640
+        must NOT redefine '' under the human. '' keeps its 3528 meaning
+        (fall back to project-only scoping); the back-fill DRAINS that
+        population instead of changing what it means.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-unknown-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.UNKNOWN_QUEUE,
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-legacy-unset',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir='',
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-unknown-queue'] == sr.DecisionState.OPEN
+    assert listed['dec-legacy-unset'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_refuses_unknown_queue_even_when_reaper_passes_the_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The degenerate case the string-inequality compare alone does NOT cover.
+
+    If a reaper is invoked with the sentinel as its own ``--escalations-dir``
+    (an operator copy-pasting a stamped value out of a record, or a wrapper
+    threading the field straight through), then `decision_dir == reaper_dir`
+    and the axis-2 guard does not fire at all. Today the record still survives
+    only because read_escalation_status finds no queue at that bogus path and
+    returns None -- safety by lucky accident, one directory named
+    ``<unknown>`` away from failing. Step-2's explicit by-name guard is what
+    makes the refusal intentional, and this pins it.
+
+    Note the sentinel must reach the record VERBATIM for this to be a real
+    test, which is exactly what step-2's normalize_escalations_dir case
+    guarantees.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    # A real directory literally named '<unknown>', holding a RESOLVED
+    # escalation for the shared id -- so a reaper that resolved the sentinel
+    # as a relative path WOULD find a close-worthy status there.
+    monkeypatch.chdir(tmp_path)
+    bogus = tmp_path / sr.UNKNOWN_QUEUE
+    bogus.mkdir()
+    (bogus / 'esc-3036-1.json').write_text(json.dumps({'status': 'resolved'}))
+    assert (orch / 'archive' / '2026-07-26' / 'esc-3036-1.json').is_file()
+    sr.write_decision(
+        _make_decision(
+            id='dec-unknown-selfmatch',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.UNKNOWN_QUEUE,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', sr.UNKNOWN_QUEUE])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-unknown-selfmatch'] == sr.DecisionState.OPEN
