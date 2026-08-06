@@ -25,6 +25,9 @@ coverage; ``main()`` gets subprocess coverage.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -39,6 +42,8 @@ from backfill_decision_queue_stamp import (
     queues_holding,
     resolve_queue_for_decision,
 )
+
+SCRIPT = Path(__file__).resolve().parent.parent.parent / 'scripts' / 'backfill_decision_queue_stamp.py'
 
 
 # ---------------------------------------------------------------------------
@@ -382,3 +387,271 @@ def test_resolve_returns_a_normalized_path(tmp_path: Path) -> None:
 
     assert resolved == sr.normalize_escalations_dir(tmp_path / 'orch')
     assert Path(resolved).is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# main() -- subprocess coverage (the repo convention for CLI entry points)
+# ---------------------------------------------------------------------------
+
+
+def _run(fleet_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Drive main() out-of-process against a SYNTHETIC fleet root.
+
+    CLAUDE_FLEET_ROOT is set in the CHILD env only, so a stray absolute-path
+    bug in the script surfaces as a failed assertion here rather than as a
+    write against the operator's real ~/.claude/fleet.
+    """
+    env = {**os.environ, 'CLAUDE_FLEET_ROOT': str(fleet_root)}
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _fixture_fleet(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A synthetic fleet root + two queues, seeded with the full record matrix.
+
+    Records, and why each is here:
+      dec-unique      OPEN, unstamped, id held ONLY by orch      -> stamped orch
+      dec-nothing     OPEN, unstamped, no escalation_id          -> stamped UNKNOWN
+      dec-ambiguous   OPEN, unstamped, id in BOTH queues, session_id shape the
+                      discriminator says nothing about           -> stamped UNKNOWN
+      dec-answered    ANSWERED, unstamped                        -> untouched
+      dec-dropped     DROPPED, unstamped                         -> untouched
+      dec-prestamped  OPEN, stamped with a queue that does NOT hold its id
+                                                                 -> untouched
+    The last is the important one: this script must never "correct" an existing
+    stamp. The watchers' stamps are first-hand evidence from the filer; these
+    are inference, and inference must not overwrite evidence — even when the
+    inference looks better.
+    """
+    fleet = tmp_path / 'fleet'
+    orch = _make_queue(tmp_path, 'orch', root_ids=('esc-uni-1',), archive_ids=('esc-amb-1',))
+    recon = _make_queue(tmp_path, 'recon', root_ids=('esc-amb-1',))
+
+    for rec in (
+        _record(id='dec-unique', escalation_id='esc-uni-1', session_id=None),
+        _record(id='dec-nothing', escalation_id=None),
+        _record(id='dec-ambiguous', escalation_id='esc-amb-1',
+                session_id='unblock-df-2085-4242'),
+        _record(id='dec-answered', escalation_id='esc-uni-1',
+                state=sr.DecisionState.ANSWERED),
+        _record(id='dec-dropped', escalation_id='esc-uni-1',
+                state=sr.DecisionState.DROPPED),
+        _record(id='dec-prestamped', escalation_id='esc-uni-1',
+                escalations_dir=sr.normalize_escalations_dir(recon)),
+    ):
+        assert sr.write_decision(rec, root=fleet)
+    return fleet, orch, recon
+
+
+def _queue_args(orch: Path, recon: Path) -> list[str]:
+    return [
+        '--queue', str(orch),
+        '--queue', str(recon),
+        '--recon-queue', str(recon),
+        '--orch-queue', f'df={orch}',
+    ]
+
+
+def _stamps(fleet: Path) -> dict[str, str]:
+    return {d.id: d.escalations_dir for d in sr.list_decisions(root=fleet)}
+
+
+def test_main_dry_run_is_the_default_and_writes_nothing(tmp_path: Path) -> None:
+    """No --apply -> inert. The single most important property of a migration
+    over live fleet state that no test may assert against: an operator must be
+    able to see exactly what WOULD happen before anything happens.
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+    before = _stamps(fleet)
+
+    proc = _run(fleet, *_queue_args(orch, recon))
+
+    assert proc.returncode == 0, proc.stderr
+    assert _stamps(fleet) == before
+    # Every candidate gets a disposition line naming the id and the outcome.
+    for decision_id in ('dec-unique', 'dec-nothing', 'dec-ambiguous'):
+        assert decision_id in proc.stdout
+    assert str(orch) in proc.stdout
+    assert sr.UNKNOWN_QUEUE in proc.stdout
+
+
+def test_main_apply_stamps_exactly_what_the_dry_run_predicted(tmp_path: Path) -> None:
+    """--apply must be the dry run made real, not a second, different decision.
+
+    A dry run whose output does not predict the apply is worse than no dry run
+    at all: it manufactures confidence for a review that never happened. Both
+    runs go against identically-seeded fixtures and the resolved values are
+    compared.
+    """
+    fleet_a, orch_a, recon_a = _fixture_fleet(tmp_path / 'a')
+    fleet_b, orch_b, recon_b = _fixture_fleet(tmp_path / 'b')
+
+    dry = _run(fleet_a, *_queue_args(orch_a, recon_a))
+    applied = _run(fleet_b, *_queue_args(orch_b, recon_b), '--apply')
+
+    assert dry.returncode == 0, dry.stderr
+    assert applied.returncode == 0, applied.stderr
+    stamps = _stamps(fleet_b)
+    assert stamps['dec-unique'] == sr.normalize_escalations_dir(orch_b)
+    assert stamps['dec-nothing'] == sr.UNKNOWN_QUEUE
+    assert stamps['dec-ambiguous'] == sr.UNKNOWN_QUEUE
+    # The dry run named the same two outcomes for the same two ids.
+    assert dry.stdout.replace(str(tmp_path / 'a'), 'X') == applied.stdout.replace(
+        str(tmp_path / 'b'), 'X'
+    )
+
+
+def test_main_apply_never_touches_out_of_scope_records(tmp_path: Path) -> None:
+    """Scope is OPEN + unstamped, and nothing else -- asserted byte-for-byte.
+
+    ANSWERED/DROPPED records are not false-closable (the reaper skips any
+    non-OPEN record before consulting the queue at all), so stamping them would
+    be pure churn on immutable history. The pre-stamped record is the one that
+    matters: its stamp is deliberately a queue that does NOT hold its id, so a
+    script that "corrected" stamps would visibly change it here.
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+    paths = {
+        decision_id: sr.decision_path_for_id(decision_id, root=fleet)
+        for decision_id in ('dec-answered', 'dec-dropped', 'dec-prestamped')
+    }
+    before = {k: p.read_bytes() for k, p in paths.items()}
+
+    proc = _run(fleet, *_queue_args(orch, recon), '--apply')
+
+    assert proc.returncode == 0, proc.stderr
+    assert {k: p.read_bytes() for k, p in paths.items()} == before
+
+
+def test_main_apply_is_idempotent(tmp_path: Path) -> None:
+    """A second --apply finds zero candidates and changes nothing.
+
+    Re-runnability is a hard requirement, not a nicety: the operator runs this
+    against live state, and the honest response to a partial or interrupted run
+    must be "run it again", never "work out what it already did".
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+
+    first = _run(fleet, *_queue_args(orch, recon), '--apply')
+    after_first = _stamps(fleet)
+    second = _run(fleet, *_queue_args(orch, recon), '--apply')
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert _stamps(fleet) == after_first
+    assert 'candidates: 0' in second.stdout
+
+
+def test_main_verify_exits_nonzero_before_and_zero_after_apply(tmp_path: Path) -> None:
+    """--verify is task WORK item 4's actual confirmation, in both directions.
+
+    Pinning only the post-apply exit-0 would pass against a --verify that
+    always returns 0 — a check that cannot fail is not a check. So the same
+    fixture is verified before the back-fill (must FAIL, naming the residue)
+    and after (must pass).
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+
+    before = _run(fleet, *_queue_args(orch, recon), '--verify')
+    applied = _run(fleet, *_queue_args(orch, recon), '--apply')
+    after = _run(fleet, *_queue_args(orch, recon), '--verify')
+
+    assert before.returncode == 2, before.stdout
+    assert 'dec-unique' in before.stdout
+    assert applied.returncode == 0, applied.stderr
+    assert after.returncode == 0, after.stdout
+
+
+def test_main_prints_a_summary_with_counts_by_disposition(tmp_path: Path) -> None:
+    """The summary is the audit report's raw material, so it must break the run
+    down by REASON rather than reporting a single total -- 'stamped 39' hides
+    whether the script attributed 39 records or gave up on 39.
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+
+    proc = _run(fleet, *_queue_args(orch, recon), '--apply')
+
+    assert proc.returncode == 0, proc.stderr
+    assert '---- summary ----' in proc.stdout
+    assert 'unique-hit' in proc.stdout
+    assert 'no-escalation-id' in proc.stdout
+    assert 'ambiguous-uncorroborated' in proc.stdout
+
+
+def test_main_reports_the_tiebreak_reasons_distinctly(tmp_path: Path) -> None:
+    """A tiebreak-resolved record must be labelled as such, never merged into
+    the unique-hit count. They are different grades of evidence: one is the id
+    being in exactly one queue, the other is a measured regularity choosing
+    among several. A reviewer reading the report has to be able to tell which
+    records rest on which -- that distinction is the whole reason the report
+    exists.
+    """
+    fleet = tmp_path / 'fleet'
+    orch = _make_queue(tmp_path, 'orch', root_ids=('esc-t-1',))
+    recon = _make_queue(tmp_path, 'recon', root_ids=('esc-t-1',))
+    assert sr.write_decision(
+        _record(id='dec-tb-recon', escalation_id='esc-t-1', session_id=None), root=fleet
+    )
+    assert sr.write_decision(
+        _record(id='dec-tb-orch', escalation_id='esc-t-1', session_id='watcher-df-1'), root=fleet
+    )
+
+    proc = _run(fleet, *_queue_args(orch, recon), '--apply')
+
+    assert proc.returncode == 0, proc.stderr
+    assert 'tiebreak-recon' in proc.stdout
+    assert 'tiebreak-orch' in proc.stdout
+    stamps = _stamps(fleet)
+    assert stamps['dec-tb-recon'] == sr.normalize_escalations_dir(recon)
+    assert stamps['dec-tb-orch'] == sr.normalize_escalations_dir(orch)
+
+
+def test_main_fail_soft_on_a_corrupt_decision_file(tmp_path: Path) -> None:
+    """One unreadable record must not abort a fleet-wide migration.
+
+    list_decisions already skips a corrupt body; this pins that the script
+    inherits that rather than crashing partway through, which would leave the
+    population half-stamped with no record of where it stopped.
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+    (sr.decisions_dir(root=fleet) / 'corrupt.json').write_text('{not valid json')
+
+    proc = _run(fleet, *_queue_args(orch, recon), '--apply')
+
+    assert proc.returncode == 0, proc.stderr
+    assert _stamps(fleet)['dec-unique'] == sr.normalize_escalations_dir(orch)
+
+
+def test_main_requires_at_least_one_queue(tmp_path: Path) -> None:
+    """No usable queue argument is its OWN exit code, never a clean run.
+
+    Without it, an operator who fat-fingers the flags gets exit 0 and a
+    zero-candidate report that reads exactly like "everything is already
+    stamped" -- the failure mode where a migration is believed to have run and
+    did not.
+    """
+    fleet, _orch, _recon = _fixture_fleet(tmp_path)
+
+    proc = _run(fleet, '--apply')
+
+    assert proc.returncode != 0
+    assert proc.returncode != 2  # not to be confused with --verify's residue code
+
+
+def test_main_rejects_a_malformed_orch_queue_pair(tmp_path: Path) -> None:
+    """--orch-queue must be PROJECT=PATH, and a malformed pair fails LOUDLY.
+
+    Silently ignoring it would drop the rule-5 tiebreak for that project and
+    quietly downgrade every one of its ambiguous records to UNKNOWN -- a
+    strictly-worse outcome wearing a clean exit code.
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+
+    proc = _run(fleet, '--queue', str(orch), '--orch-queue', str(recon))
+
+    assert proc.returncode != 0
+    assert 'orch-queue' in (proc.stderr + proc.stdout)
