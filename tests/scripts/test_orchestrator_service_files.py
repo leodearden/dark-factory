@@ -1,14 +1,36 @@
-"""File-content tests for the orchestrator systemd service files.
+"""File-content tests for the orchestrator systemd units and how they reach a host.
 
-These tests read the source-controlled service definition files directly —
-no systemd runtime is required.  They guard the shape of:
-  - scripts/orchestrator-dark-factory.service
-  - scripts/orchestrator-reify.service
-  - scripts/orchestrator-watchdog.service
-  - scripts/orchestrator-watchdog.timer
+These tests read source-controlled files directly — no systemd runtime is
+required.  Three suites live here, in this order:
+
+1. Per-unit shape (named units, then fleet-wide parametrized invariants):
+     - scripts/orchestrator-dark-factory.service
+     - scripts/orchestrator-reify.service
+     - scripts/orchestrator-watchdog.service
+     - scripts/orchestrator-watchdog.timer
+     - every scripts/orchestrator-*.service, via ALL_ORCHESTRATOR_SERVICE_FILES
+       (ORCH_UNIT self-identification; canonical --config filename)
+
+2. scripts/setup-host.sh installer coverage (task 3641) — every committed
+   template must be `cp`'d to $UNIT_DIR, and every template with an [Install]
+   section must be `systemctl --user enable`d.
+
+3. SETUP.md operator-remediation coverage (task 3641) — the copy-paste
+   `systemctl --user disable --now` block must name exactly the foreign
+   orchestrator units setup-host.sh enables.
+
+Suites 2 and 3 do not read .service files as their subject, but they are
+here rather than in their own module because they are checked AGAINST
+ALL_ORCHESTRATOR_SERVICE_FILES and reuse this module's ``_parse_sections``:
+a unit template only "exists" for an operator once the installer copies it
+and the docs account for it, so template / installer / doc form one
+invariant.  Splitting them out would mean extracting those helpers into a
+shared module (cf. tests/scripts/systemd_unit_invariants.py) first.
 
 See also:
   - tests/scripts/test_dashboard_service_template.py — pattern reference
+  - tests/scripts/test_systemd_restart_backoff.py — content-discovered
+    restart-backoff sweep over every unit in the tree
 """
 
 import pathlib
@@ -521,26 +543,134 @@ def test_orchestrator_service_sets_own_orch_unit(
 CANONICAL_CONFIG_BASENAME = "dark-factory-orchestrator.yaml"
 
 
-def _exec_start_config_arg(content: str) -> str | None:
-    """Return the `--config` argument of the unit's ExecStart=, or None if absent.
 
-    None is a real answer, not a parse failure: orchestrator-watchdog.service
-    runs a probe script that takes no --config at all.  Callers must skip on
-    None rather than fail, or the watchdog gets dragged into an invariant that
-    does not apply to it.
+class MalformedExecStart(ValueError):
+    """A unit's ExecStart= is broken — never a legitimate "no --config" answer.
+
+    Kept distinct from the ``None`` return below because the two outcomes want
+    opposite handling.  ``None`` means "this unit takes no ``--config``", which
+    is true of orchestrator-watchdog.service and must SKIP.  A missing
+    ``ExecStart=`` line, or a ``--config`` flag with no value after it, is a
+    malformed unit (or a regressed parser) and must FAIL: collapsing those into
+    the same ``None`` is how a guard silently waves through the very drift it
+    was written to catch.
+    """
+
+
+def _exec_start_line(content: str, unit_name: str = "<unit>") -> str:
+    """The unit's ExecStart= line, stripped.  Raises if it has none.
+
+    ``lstrip()`` before matching because systemd permits leading whitespace on
+    a directive; the trailing ``=`` in the prefix is what keeps ExecStartPre=
+    out of the match.
     """
     exec_line = next(
-        (ln for ln in content.splitlines() if ln.startswith("ExecStart=")), None
+        (
+            stripped
+            for ln in content.splitlines()
+            if (stripped := ln.strip()).startswith("ExecStart=")
+        ),
+        None,
     )
     if exec_line is None:
-        return None
-    tokens = exec_line.split()
+        raise MalformedExecStart(
+            f"{unit_name} declares no ExecStart= line. Every orchestrator unit "
+            "must have one — systemd refuses to start a Type=simple service "
+            "without it. Treating this as 'takes no --config' would silently "
+            "skip the unit out of the canonical-config-filename guard below."
+        )
+    return exec_line
+
+
+def _exec_start_config_arg(content: str, unit_name: str = "<unit>") -> str | None:
+    """Return the `--config` argument of the unit's ExecStart=, or None if absent.
+
+    None now means exactly ONE thing: the ExecStart= carries no ``--config``
+    flag at all.  That is a real answer, not a parse failure —
+    orchestrator-watchdog.service runs a probe script that takes no
+    ``--config`` — and callers skip on it, so the watchdog is not dragged into
+    an invariant that does not apply to it.
+
+    Every other way this could previously have produced None now raises
+    MalformedExecStart (see that class): no ExecStart= line at all, and a
+    dangling ``--config`` as the final token with nothing after it.  The
+    dangling case in particular is a unit that would start the orchestrator
+    with no config path — a hard defect, not something to skip past.
+    """
+    tokens = _exec_start_line(content, unit_name).split()
     for i, token in enumerate(tokens):
         if token == "--config":
-            return tokens[i + 1] if i + 1 < len(tokens) else None
+            if i + 1 >= len(tokens):
+                raise MalformedExecStart(
+                    f"{unit_name} ends its ExecStart= with a dangling `--config` "
+                    "and no value after it. The orchestrator would start with no "
+                    f"config path at all. ExecStart line: {' '.join(tokens)!r}"
+                )
+            return tokens[i + 1]
         if token.startswith("--config="):
             return token.split("=", 1)[1]
     return None
+
+
+# Marker identifying a unit that launches the orchestrator CLI proper (as
+# opposed to orchestrator-watchdog.service, which runs a bare probe script).
+# `orchestrator run` REQUIRES a --config, so this is the mechanical predicate
+# for "must be asserted, must not skip" in the coverage guard below.
+_ORCHESTRATOR_RUN_MARKER = "orchestrator run"
+
+
+def test_exec_start_config_parser_answers_for_every_orchestrator_run_unit() -> None:
+    """Coverage guard: the --config parser must ANSWER, not skip, for real units.
+
+    Mirrors test_orchestrator_service_glob_covers_all_known_units and
+    test_setup_host_install_predicate_discriminates.  The parametrized guard
+    below is CONDITIONAL — it skips whenever _exec_start_config_arg returns
+    None — so a parser regression (a change in ExecStart= line shape, a
+    continuation-line variant, a renamed flag) would return None for all eight
+    templates, skip every case, and report green while checking nothing.
+
+    The expectation is DERIVED, not a hard-coded count that rots the day an
+    eighth project lands: a unit whose ExecStart= invokes ``orchestrator run``
+    needs a --config by construction, and one that does not (the watchdog probe
+    script) legitimately has none.  Both directions are asserted so the skip
+    branch stays genuinely exercised rather than becoming the only branch.
+    """
+    assert ALL_ORCHESTRATOR_SERVICE_FILES, (
+        "glob discovered no orchestrator-*.service templates"
+    )
+
+    parsed: dict[str, str | None] = {}
+    runs_orchestrator: set[str] = set()
+    for path in ALL_ORCHESTRATOR_SERVICE_FILES:
+        content = path.read_text(encoding="utf-8")
+        # A malformed ExecStart= raises out of here — deliberately, so it is a
+        # hard failure of this guard rather than a skipped parametrized case.
+        parsed[path.name] = _exec_start_config_arg(content, path.name)
+        if _ORCHESTRATOR_RUN_MARKER in _exec_start_line(content, path.name):
+            runs_orchestrator.add(path.name)
+
+    assert runs_orchestrator, (
+        "no orchestrator template has an ExecStart= invoking "
+        f"{_ORCHESTRATOR_RUN_MARKER!r}, so this guard has nothing to check and "
+        f"the parametrized test below would skip everything. Parsed: {parsed}"
+    )
+
+    silent = sorted(name for name in runs_orchestrator if parsed[name] is None)
+    assert not silent, (
+        f"{', '.join(silent)} run `{_ORCHESTRATOR_RUN_MARKER}` but no --config "
+        "argument could be parsed from their ExecStart=. Either the unit really "
+        "lost its --config (the orchestrator cannot start without one), or "
+        "_exec_start_config_arg has regressed — in which case "
+        "test_orchestrator_service_points_at_canonical_config_filename is "
+        f"silently skipping instead of asserting. Parsed: {parsed}"
+    )
+
+    assert any(value is None for value in parsed.values()), (
+        "every orchestrator template yielded a --config argument, so the skip "
+        "branch of test_orchestrator_service_points_at_canonical_config_filename "
+        "is never exercised. orchestrator-watchdog.service is expected to have "
+        f"none (it runs a probe script, not the orchestrator). Parsed: {parsed}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -575,10 +705,15 @@ def test_orchestrator_service_points_at_canonical_config_filename(
     The ``--config`` predicate is load-bearing: orchestrator-watchdog.service
     runs a probe script with no ``--config``, so it is skipped rather than
     failed.  Keying on the flag's presence (rather than naming the watchdog as
-    an exception) means a future unit is covered the day it lands.
+    an exception) means a future unit is covered the day it lands.  That skip
+    is itself guarded — see
+    test_exec_start_config_parser_answers_for_every_orchestrator_run_unit,
+    which fails if a unit that runs the orchestrator ever lands in it — and a
+    MALFORMED ExecStart= raises MalformedExecStart out of here rather than
+    skipping, because "broken unit" is not "unit takes no --config".
     """
     content = service_path.read_text(encoding="utf-8")
-    config_arg = _exec_start_config_arg(content)
+    config_arg = _exec_start_config_arg(content, service_path.name)
     if config_arg is None:
         pytest.skip(f"{service_path.name} has no ExecStart --config argument")
 
@@ -633,6 +768,19 @@ def _shell_statements(script_text: str) -> list[str]:
         for line in script_text.splitlines()
         if (stripped := line.strip()) and not stripped.startswith("#")
     ]
+
+
+# Parsed once at import and shared by every consumer below (the parametrized
+# installer guard, one case per template, plus the SETUP.md parity guard) —
+# setup-host.sh does not change under a test run, so re-reading and re-parsing
+# it per case bought nothing.
+SETUP_HOST_STATEMENTS = _shell_statements(SETUP_HOST_SH.read_text(encoding="utf-8"))
+
+# Destination the installer must copy units into: ~/.config/systemd/user, via
+# the $UNIT_DIR variable setup-host.sh defines.  Asserted explicitly because a
+# `cp` to anywhere else leaves the unit uninstalled just as surely as no `cp`
+# at all — which is the failure class this whole section exists to close.
+_UNIT_DIR_VAR = "$UNIT_DIR"
 
 
 def test_setup_host_install_predicate_discriminates() -> None:
@@ -694,15 +842,20 @@ def test_setup_host_installs_every_orchestrator_unit(
     loudly at run time, so it needs no test.
     """
     basename = service_path.name
-    statements = _shell_statements(SETUP_HOST_SH.read_text(encoding="utf-8"))
 
-    expected_cp = f'cp "$REPO_ROOT/scripts/{basename}" "$UNIT_DIR/"'
+    expected_cp = f'cp "$REPO_ROOT/scripts/{basename}" "{_UNIT_DIR_VAR}/"'
     copied = any(
-        stmt.startswith("cp ") and f"scripts/{basename}" in stmt for stmt in statements
+        stmt.startswith("cp ")
+        and f"scripts/{basename}" in stmt
+        and _UNIT_DIR_VAR in stmt
+        for stmt in SETUP_HOST_STATEMENTS
     )
     assert copied, (
-        f"{SETUP_HOST_SH.name} never copies {basename} into $UNIT_DIR, so a fresh "
-        f"host never gets that unit. Add a line to the cp block:\n    {expected_cp}"
+        f"{SETUP_HOST_SH.name} never copies {basename} into {_UNIT_DIR_VAR}, so a "
+        "fresh host never gets that unit. The destination is asserted, not just "
+        "the source: a cp of the template to a staging path or any other "
+        "directory leaves the unit just as uninstalled as no cp at all. Add a "
+        f"line to the cp block:\n    {expected_cp}"
     )
 
     content = service_path.read_text(encoding="utf-8")
@@ -710,7 +863,7 @@ def test_setup_host_installs_every_orchestrator_unit(
         return
 
     expected_enable = f"systemctl --user enable {basename}"
-    enabled = any(stmt.startswith(expected_enable) for stmt in statements)
+    enabled = any(stmt.startswith(expected_enable) for stmt in SETUP_HOST_STATEMENTS)
     assert enabled, (
         f"{basename} declares an [Install] section but {SETUP_HOST_SH.name} never "
         "enables it, so it is copied to the host and then never starts at boot. "
@@ -733,8 +886,9 @@ def test_setup_host_installs_every_orchestrator_unit(
 # running on a non-maintainer's host with a --config path that does not exist:
 # at the next login/default.target it crash-loops until StartLimitBurst is
 # exhausted, then sits failed.  And every unit the doc names but the installer
-# does NOT install breaks the operator's copy-paste outright, because
-# `systemctl --user disable --now` on a nonexistent unit file exits non-zero.
+# does NOT install as a foreign unit breaks the operator's copy-paste outright:
+# `systemctl --user disable --now` on a nonexistent unit file exits non-zero,
+# and on THIS repo's own orchestrator it turns off the one the operator wants.
 # So both drift directions are real defects and both are asserted, separately.
 
 SETUP_MD = REPO_ROOT / "SETUP.md"
@@ -763,10 +917,9 @@ def _enabled_orchestrator_service_units() -> set[str]:
     which setup-host.sh also enables and which SETUP.md correctly tells the
     reader to KEEP enabled (it skips disabled units, so it is harmless).
     """
-    statements = _shell_statements(SETUP_HOST_SH.read_text(encoding="utf-8"))
     prefix = "systemctl --user enable "
     units = set()
-    for stmt in statements:
+    for stmt in SETUP_HOST_STATEMENTS:
         if not stmt.startswith(prefix):
             continue
         unit = stmt.split()[-1]
@@ -849,6 +1002,15 @@ def test_setup_md_disable_block_covers_every_foreign_orchestrator_unit() -> None
     and buys nothing this block-level assertion does not already give.  That
     prose is corrected by hand.  Do not "helpfully" extend this test into a
     wording pin.
+
+    Note the asymmetry in how _OWN_PROJECT_UNIT is used: it is excluded when
+    DERIVING the foreign set (setup-host.sh enables it, but it is not foreign),
+    and deliberately NOT excluded from the ``extra`` check.  The block naming
+    this repo's own orchestrator would directly contradict the sentence right
+    above it — "orchestrator-dark-factory.service itself is genuinely yours and
+    is fine to run" — and hand the operator a copy-paste that shuts off the one
+    orchestrator they actually want.  That is drift this bidirectional guard
+    exists to catch, so it is reported like any other extra.
     """
     foreign = _enabled_orchestrator_service_units() - {_OWN_PROJECT_UNIT}
     block = _setup_md_disable_blocks()[0]
@@ -867,14 +1029,26 @@ def test_setup_md_disable_block_covers_every_foreign_orchestrator_unit() -> None
         f"`{_DISABLE_COMMAND}` block in {SETUP_MD.name}."
     )
 
-    extra = sorted(named - foreign - {_OWN_PROJECT_UNIT})
+    extra = sorted(named - foreign)
+    own_unit_note = (
+        (
+            f" {_OWN_PROJECT_UNIT} in particular is THIS repo's own orchestrator: "
+            f"{SETUP_MD.name} tells the reader two sentences earlier that it "
+            "'is genuinely yours and is fine to run', so naming it here makes "
+            "the doc contradict itself and shuts off the one orchestrator the "
+            "operator actually wants."
+        )
+        if _OWN_PROJECT_UNIT in extra
+        else ""
+    )
     assert not extra, (
         f"{SETUP_MD.name}'s `{_DISABLE_COMMAND}` block names "
-        f"{', '.join(extra)}, which {SETUP_HOST_SH.name} does not enable. "
-        "`systemctl --user disable --now` on a unit file that does not exist "
-        "fails with 'Unit file does not exist' and returns NON-ZERO, so a stale "
-        "entry breaks the whole copy-paste command for the operator — this is a "
-        f"real defect, not cosmetic. Fix: remove {', '.join(extra)} from the "
-        f"block in {SETUP_MD.name} (or, if the unit should be installed after "
-        f"all, add it to {SETUP_HOST_SH.name}'s enable block)."
+        f"{', '.join(extra)}, which is not a foreign unit {SETUP_HOST_SH.name} "
+        "enables. `systemctl --user disable --now` on a unit file that does not "
+        "exist fails with 'Unit file does not exist' and returns NON-ZERO, so a "
+        "stale entry breaks the whole copy-paste command for the operator — this "
+        f"is a real defect, not cosmetic.{own_unit_note} Fix: remove "
+        f"{', '.join(extra)} from the block in {SETUP_MD.name} (or, if the unit "
+        f"should be installed after all, add it to {SETUP_HOST_SH.name}'s enable "
+        "block)."
     )
