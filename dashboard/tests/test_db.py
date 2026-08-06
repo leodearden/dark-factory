@@ -829,6 +829,143 @@ class TestDbPool:
                     )
             await _reap(opened)
 
+    async def test_close_all_waits_for_straggler_adopted_after_drain_budget(
+        self, tmp_path, monkeypatch
+    ):
+        """close_all() must also wait for a straggler that lands AFTER the budget.
+
+        The residual window the ``_close_once`` join does not cover: a connect
+        that misses ``_INFLIGHT_DRAIN_TIMEOUT`` is in ``still_pending``, not
+        ``done``, so ``_drain_inflight`` never awaits it.  If it lands while
+        ``close_all()`` is still inside its ``_conns`` loop, ``_adopt_or_close``
+        schedules a fire-and-forget close that nothing joins — and ``close_all()``
+        returns with that close in flight, stranding the worker thread if the
+        loop is torn down promptly (uvicorn, or a TestClient portal).
+
+        Choreography — X is a normal pooled connection whose close is gated so
+        ``close_all()`` can be held inside its ``_conns`` loop; Y is the
+        straggler.  Both closes are gated by replacing the INSTANCE ``close``
+        method: verified on the pinned aiosqlite that ``Connection`` has no
+        ``__slots__``, so per-instance assignment works and gives deterministic
+        control that patching the class would not.
+
+        Deterministic in BOTH directions.  RED: once ``release_x`` is set the
+        only work left in ``close_all()`` is a dict clear, so 0.1s is ample for
+        ``closer`` to finish.  GREEN: ``closer`` CANNOT finish, because it is
+        gathering Y's close task, which is blocked on ``release_y``.
+
+        The step-6 straggler WARNING fires here — Y misses the budget by
+        construction.  That is expected; this test does not assert against it.
+        """
+        monkeypatch.setattr('dashboard.data.db._INFLIGHT_DRAIN_TIMEOUT', 0.01)
+        db_x = tmp_path / 'x.db'
+        db_y = tmp_path / 'y.db'
+        sqlite3.connect(str(db_x)).close()
+        sqlite3.connect(str(db_y)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        opened: list[aiosqlite.Connection] = []
+
+        x_close_started = asyncio.Event()
+        release_x = asyncio.Event()
+        y_close_started = asyncio.Event()
+        release_y = asyncio.Event()
+        inside_y = asyncio.Event()
+        gate_y = asyncio.Event()
+
+        # X opens through the UNPATCHED connect, so _conns is non-empty and
+        # close_all() has something to iterate.
+        conn_x = await pool.get(db_x)
+        assert conn_x is not None
+        opened.append(conn_x)
+        real_close_x = conn_x.close
+
+        async def gated_close_x():
+            x_close_started.set()
+            await release_x.wait()
+            await real_close_x()
+
+        conn_x.close = gated_close_x
+
+        async def wrapper(*args, **kwargs):
+            inside_y.set()
+            await gate_y.wait()
+            conn = await real_connect(*args, **kwargs)
+            real_close_y = conn.close
+
+            async def gated_close_y():
+                y_close_started.set()
+                await release_y.wait()
+                await real_close_y()
+
+            conn.close = gated_close_y
+            opened.append(conn)
+            return conn
+
+        try:
+            with patch('aiosqlite.connect', wrapper):
+                getter_y = asyncio.create_task(pool.get(db_y))
+                await asyncio.wait_for(inside_y.wait(), timeout=2.0)
+                getter_y.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await getter_y
+
+                closer = asyncio.create_task(pool.close_all())
+                # close_all() has now blown the 0.01s drain budget (Y is a
+                # logged straggler) and is suspended inside the _conns loop.
+                await asyncio.wait_for(x_close_started.wait(), timeout=2.0)
+
+                # Y lands late; _adopt_or_close sees _closed=True and schedules
+                # its close, which then enters conn.close().
+                gate_y.set()
+                await asyncio.wait_for(y_close_started.wait(), timeout=2.0)
+
+                # Let X's close finish.  Everything close_all() itself still has
+                # to do is now synchronous.
+                release_x.set()
+                await asyncio.sleep(0.1)
+
+                assert not closer.done(), (
+                    'close_all() returned while a straggler connection adopted '
+                    'during shutdown was still being closed; if the loop is torn '
+                    'down now its aiosqlite worker thread is stranded'
+                )
+
+                release_y.set()
+                await asyncio.wait_for(closer, timeout=2.0)
+
+            assert len(opened) == 2, (
+                f'expected 2 connections (pooled X, straggler Y), got '
+                f'{len(opened)}'
+            )
+            conn_y = opened[1]
+            assert conn_y._running is False, (
+                f'straggler Y not closed (_running is {conn_y._running!r})'
+            )
+            assert conn_y._connection is None, (
+                f'straggler Y not closed (_connection is {conn_y._connection!r})'
+            )
+            conn_y._thread.join(timeout=2.0)
+            assert not conn_y._thread.is_alive(), (
+                'the straggler aiosqlite worker thread did not exit after '
+                'close_all returned'
+            )
+        finally:
+            gate_y.set()
+            release_x.set()
+            release_y.set()
+            # As in the in-flight-close test above: never reap blind while a
+            # close may still be running — a second concurrent close() queues a
+            # STOP sentinel nothing will resolve.
+            for conn in opened:
+                with contextlib.suppress(TimeoutError):
+                    await _wait_until(
+                        lambda c=conn: not getattr(c, '_running', False),
+                        timeout=2.0,
+                    )
+            await _reap(opened)
+
     async def test_close_all_warns_when_inflight_connect_exceeds_drain_budget(
         self, tmp_path, caplog, monkeypatch
     ):
