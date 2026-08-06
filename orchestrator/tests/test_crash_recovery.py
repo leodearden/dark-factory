@@ -2723,3 +2723,175 @@ class TestSessionResumeArchiveAvailable:
         assert kwargs['data']['reason'] == 'stale'
         assert kwargs['data']['archive_available'] is True
         assert harness._session_resume_fallback_streak == 1
+
+    async def test_reseeded_also_carries_the_field(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The OTHER fallback emit carries it too (task 3256 split it in two).
+
+        This is the branch where the field matters MOST: a reseeded lane is
+        precisely the population task 3619 will move, so it has to be
+        measurable from day one. Wiring only one of the two emit sites would
+        half-ship the signal AND bias it.
+        """
+        session = {
+            'session_id': 'uuid-arch-reseed',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        gone = tmp_path / 'gone-arch' / 'claude-config-x'
+        assert not gone.exists()  # the reseed already swept the lane
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        _make_archive(harness.config.project_root, 'ar4', 'uuid-arch-reseed')
+
+        resume_id = await _drive_session_slot(harness, 'ar4', session, config_dir=gone)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'reseeded'
+        assert kwargs['data']['archive_available'] is True
+        # D8: 'reseeded' still does NOT feed the storm streak.
+        assert harness._session_resume_fallback_streak == 0
+
+    async def test_reseeded_reports_absent_archive(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Same branch, empty archive root → False."""
+        session = {
+            'session_id': 'uuid-arch-reseed-no',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        gone = tmp_path / 'gone-arch-no' / 'claude-config-x'
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        resume_id = await _drive_session_slot(harness, 'ar5', session, config_dir=gone)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'reseeded'
+        assert kwargs['data']['archive_available'] is False
+
+    async def test_unconfigured_transcript_archive_degrades_to_false(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """FAIL-SAFE: a config regression must not become a dispatch fault.
+
+        ``transcript_archive`` is left as the bare spec_set MagicMock the
+        conftest fixture yields (it never assigns the field), so
+        ``project_root / <MagicMock>.root`` raises TypeError. _run_slot must
+        still complete, the fallback must still be emitted with its correct
+        reason, and the instrument must read False — never propagate.
+        """
+        session = {
+            'session_id': 'uuid-arch-mock',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-empty-mock'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig()
+        # DELIBERATELY not assigning harness.config.transcript_archive.
+
+        resume_id = await _drive_session_slot(
+            harness, 'ar6', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['archive_available'] is False
+
+    async def test_archive_available_is_total_against_broken_config(
+        self, harness: Harness
+    ):
+        """The helper itself is total, called directly, on a broken config."""
+        # Bare conftest MagicMock for transcript_archive → Path / MagicMock.
+        assert harness._archive_available('42', 'sid') is False
+
+        # A nonsense project_root composes just as badly.
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        harness.config.project_root = None  # type: ignore[assignment]
+        assert harness._archive_available('42', 'sid') is False
+
+    async def test_null_session_id_reports_false_without_raising(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A recovered session with no session_id still emits, reporting False."""
+        session = {
+            'session_id': None,
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-unrelated')
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        resume_id = await _drive_session_slot(harness, 'ar7', session, config_dir=cfg)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['archive_available'] is False
+
+    async def test_eligible_and_capped_events_do_not_carry_the_field(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """D8 blast radius: the instrument went onto EXACTLY one event.
+
+        event_store.py's documented ratio recipe reads attempts as the sum of
+        the three outcome events; session_resume and session_resume_capped
+        must stay byte-identical so that denominator keeps its meaning — and
+        so neither path pays for a filesystem glob it does not use.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        # Eligible → session_resume.
+        elig = {
+            'session_id': 'uuid-arch-elig',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-arch-elig')
+        _make_archive(harness.config.project_root, 'ar8', 'uuid-arch-elig')
+        assert await _drive_session_slot(harness, 'ar8', elig, config_dir=cfg) is elig
+
+        # Capped → session_resume_capped.
+        real = SessionResumeConfig()
+        capped = {
+            'session_id': 'uuid-arch-capped',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': real.max_resumes_per_task,
+        }
+        cfg2 = _make_transcript(tmp_path, 'uuid-arch-capped')
+        _make_archive(harness.config.project_root, 'ar9', 'uuid-arch-capped')
+        assert await _drive_session_slot(harness, 'ar9', capped, config_dir=cfg2) is None
+
+        emits = _session_resume_emits(harness)
+        assert [et for et, _ in emits] == [
+            EventType.session_resume,
+            EventType.session_resume_capped,
+        ]
+        for _et, kwargs in emits:
+            assert 'archive_available' not in kwargs['data']
