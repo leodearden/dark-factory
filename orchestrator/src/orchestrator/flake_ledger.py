@@ -423,3 +423,62 @@ async def open_debt(
     finally:
         conn.close()
     return read_debt(db_path, test_id)
+
+
+async def resolve_debt(
+    db_path: Path,
+    project_id: str,
+    test_id: str,
+    *,
+    resolving_commit: str | None,
+    now: datetime | None = None,
+) -> None:
+    """Close *test_id*'s current debt cycle (PRD §8.3).  Called when the owning task
+    goes terminal.
+
+    The row is RETAINED, not deleted (§5.2) — η's recurrence trigger reads resolved
+    rows, so reaping one would silently disarm it.  Resolution's observable effect is
+    that the test leaves :func:`list_open_debt` while :func:`read_debt` still finds it.
+
+    ``prior_resolving_commit`` is written HERE, not on the next re-open: after a
+    resolution there is no "current" cycle for it to describe, and writing it now is
+    what lets step-18's re-entry carry it forward untouched for η's
+    ``regressed_after_resolution`` citation.
+
+    The lookup keys on ``test_id`` ALONE — §5.3: runs.db is per-project, so test_id is
+    the primary key.  *project_id* is accepted per the §8.3 signature and used only in
+    log messages; it is NOT a dropped filter.
+
+    A zero-rowcount UPDATE (no debt for this test) is a legitimate no-op, not an error.
+    ``async`` for the same forward-compat reason as :func:`open_debt` — η adds the
+    recurrence escalation inside this function.
+    """
+    stamp = (now or datetime.now(UTC)).isoformat()
+    ensure_schema(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            'UPDATE flake_debt SET resolved_at = ?, prior_resolving_commit = ? WHERE test_id = ?',
+            (stamp, resolving_commit, test_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_open_debt(db_path: Path) -> list[DebtRow]:
+    """Every test currently in debt, oldest first.
+
+    Ordering is part of the contract (``opened_at`` then ``test_id``) because ι prints
+    this list.
+    """
+    ensure_schema(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            'SELECT * FROM flake_debt WHERE resolved_at IS NULL ORDER BY opened_at, test_id'
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_to_debt_row(r) for r in rows]
