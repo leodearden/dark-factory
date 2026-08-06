@@ -881,6 +881,31 @@ this module is deliberately stdlib-only with no intra-orchestrator imports
 Kept in sync by hand with that constant."""
 
 
+UNKNOWN_QUEUE = '<unknown>'
+"""The THIRD queue state for DecisionRecord.escalations_dir (task 3640).
+
+Distinct from BOTH a real queue path and the ``''`` unset/legacy sentinel:
+
+- ``''``          -- "nobody told us". A record filed before the field
+                     existed, or by a caller that omitted it. The reaper
+                     falls back to project-only scoping and MAY close it.
+- ``'<unknown>'`` -- "we investigated and could NOT determine the owning
+                     queue". The reaper REFUSES to close it; it stays a
+                     visible cockpit row for human closure.
+- ``'/abs/path'`` -- a normalized queue path. Reaped only by that queue.
+
+The two sentinels are deliberately NOT collapsed. 3528 defined ``''``'s
+meaning and an existing test asserts a ``''`` record still closes; redefining
+it would change behaviour for every future omitted-flag caller under the
+human. Separating them lets task 3640 back-fill the undeterminable records
+with an honest value instead of leaving them in the false-closable ``''``
+population.
+
+The angle brackets are load-bearing rather than decorative: a resolved queue
+path always begins with ``'/'``, so this sentinel can never collide with a
+real queue no matter what a project is named or where it is checked out."""
+
+
 def normalize_escalations_dir(value: str | Path) -> str:
     """The ONE canonical spelling of an escalation-queue path (task 3528).
 
@@ -897,10 +922,11 @@ def normalize_escalations_dir(value: str | Path) -> str:
     Returns ``''`` -- the "unset/legacy queue" sentinel, never a path -- for
     an empty or whitespace-only *value*, mirroring the sibling
     ``DecisionRecord.severity`` convention; the reaper reads that sentinel as
-    "fall back to project-only scoping". Otherwise returns
-    ``str(Path(raw).expanduser().resolve())``. ``Path.resolve()`` is
-    non-strict on Python 3.11+, so a well-formed queue path that does not
-    exist yet still normalizes rather than faulting.
+    "fall back to project-only scoping". Returns ``UNKNOWN_QUEUE`` VERBATIM
+    for that sentinel (task 3640) -- the reaper reads it as "refuse to close".
+    Otherwise returns ``str(Path(raw).expanduser().resolve())``.
+    ``Path.resolve()`` is non-strict on Python 3.11+, so a well-formed queue
+    path that does not exist yet still normalizes rather than faulting.
 
     Stdlib-only and fail-soft: never raises. A value the OS cannot resolve
     (an embedded NUL, an unreadable cwd) degrades to the stripped raw string,
@@ -911,6 +937,15 @@ def normalize_escalations_dir(value: str | Path) -> str:
     raw = str(value).strip()
     if not raw:
         return ''
+    # BEFORE the resolve(): UNKNOWN_QUEUE is a bare word, so Path.resolve()
+    # would treat it as a path RELATIVE TO THE CALLING PROCESS'S CWD and
+    # return '<cwd>/<unknown>' -- a different string in the back-fill script
+    # than in a watcher's reaper. The stamp would stop being deterministic
+    # across processes (the two sides of the join could never compare equal)
+    # and the stored value would be an outright lie about where the record's
+    # escalation lives. It is a sentinel, not a path: it round-trips verbatim.
+    if raw == UNKNOWN_QUEUE:
+        return UNKNOWN_QUEUE
     try:
         return str(Path(raw).expanduser().resolve())
     except (OSError, ValueError, RuntimeError):
@@ -2391,9 +2426,25 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     filed before that field existed) falls back to axis 1 alone, keeping
     today's exact behaviour for the existing population rather than changing
     it under the human; the two watchers stamp the queue on newly-filed
-    decisions, so the unprotected set only shrinks. Otherwise the closure
-    defers to read_escalation_status against *escalations_dir*. Root
-    resolves via $CLAUDE_FLEET_ROOT, same as every other verb.
+    decisions, so the unprotected set only shrinks. Task 3640 then BACK-FILLED
+    the pre-existing open population, so that fallback set is drained rather
+    than merely shrinking. Otherwise the closure defers to
+    read_escalation_status against *escalations_dir*. Root resolves via
+    $CLAUDE_FLEET_ROOT, same as every other verb.
+
+    UNKNOWN QUEUE (task 3640). A decision stamped ``UNKNOWN_QUEUE`` is
+    refused by name: its owning queue was investigated and could not be
+    determined, so NO reaper may close it and it stays a visible cockpit row
+    until a human closes it. Honestly: the axis-2 compare above would already
+    refuse it, since it refuses ANY truthy stamp that is not this reaper's
+    queue -- so the by-name guard changes no outcome today. It is here so the
+    policy is INTENTIONAL and named rather than an accident of string
+    inequality that a future refactor of that compare could silently remove,
+    and because it closes the one degenerate case the compare genuinely does
+    not cover: a reaper invoked with the sentinel as its OWN
+    ``--escalations-dir`` makes both sides compare EQUAL, and the record then
+    survives only because read_escalation_status happens to find no queue at
+    that bogus relative path.
 
     Both guards are fail-OPEN: on any doubt the decision stays OPEN and
     visible in the cockpit queue, matching reap_answered_decisions' contract
@@ -2426,6 +2477,11 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
         # between checkouts, or written by a future caller), and a false
         # NON-match is how silent divergence creeps back in.
         decision_dir = normalize_escalations_dir(decision.escalations_dir)
+        # Task 3640: refuse an undeterminable-queue record BY NAME, before the
+        # inequality compare below -- see the UNKNOWN QUEUE paragraph above
+        # for why this deliberately-redundant-today guard exists.
+        if decision_dir == UNKNOWN_QUEUE:
+            return None
         if decision_dir and decision_dir != reaper_dir:
             return None
         # RAW escalations_dir here, deliberately: only the comparison needs a
