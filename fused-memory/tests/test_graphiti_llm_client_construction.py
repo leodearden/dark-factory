@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
+from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 
 import fused_memory.backends.graphiti_client as graphiti_client_module
 from fused_memory.backends.graphiti_client import build_llm_client
@@ -120,6 +121,96 @@ class TestBuildLLMClientDefaultOpenAIPath:
 
         with pytest.raises(RuntimeError, match='PREFLIGHT_SENTINEL'):
             build_llm_client(mock_config)
+
+
+class TestBuildLLMClientOpenAIGenericPath:
+    """client_class='openai_generic' → graphiti's OpenAIGenericClient.
+
+    Construction only — no request is issued, so the unroutable api_url below
+    is never dialled.
+    """
+
+    @pytest.fixture
+    def generic_config(self, mock_config):
+        mock_config.llm.client_class = 'openai_generic'
+        mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:9/v1'
+        return mock_config
+
+    def test_returns_openai_generic_client(self, generic_config):
+        client = build_llm_client(generic_config)
+        assert isinstance(client, OpenAIGenericClient)
+
+    def test_auto_mode_returns_stock_client_not_the_forcing_subclass(
+        self, generic_config,
+    ):
+        """structured_output_mode defaults to 'auto' → stock upstream client."""
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        assert generic_config.llm.structured_output_mode == 'auto'
+        client = build_llm_client(generic_config)
+        assert isinstance(client, OpenAIGenericClient)
+        assert not isinstance(client, ForceJsonObjectOpenAIGenericClient)
+
+    def test_plumbs_base_url_and_preserves_other_kwargs(
+        self, generic_config, monkeypatch,
+    ):
+        generic_config.llm.model = 'qwen3-30b-a3b'
+        generic_config.llm.max_tokens = 8192
+        generic_config.llm.temperature = 0.2
+        calls = _record_llm_config(monkeypatch)
+
+        build_llm_client(generic_config)
+
+        assert calls[0]['base_url'] == 'http://127.0.0.1:9/v1'
+        assert calls[0]['model'] == 'qwen3-30b-a3b'
+        assert calls[0]['small_model'] == 'qwen3-30b-a3b'
+        assert calls[0]['temperature'] == 0.2
+        assert calls[0]['max_tokens'] == 8192
+        assert calls[0]['api_key'] == 'test-key'
+
+    def test_does_not_run_responses_api_preflight(self, generic_config, monkeypatch):
+        """The preflight must NOT run on this arm.
+
+        check_openai_responses_api guards graphiti's OpenAIClient, which calls
+        client.responses.create. OpenAIGenericClient uses chat.completions and
+        never touches that surface, so running the check here would abort a
+        perfectly valid local-endpoint arm on an SDK requirement it does not
+        have. A raising sentinel pins the ordering so it cannot silently
+        regress.
+        """
+        def sentinel_check():
+            raise RuntimeError('PREFLIGHT_SENTINEL')
+
+        monkeypatch.setattr(
+            graphiti_client_module, 'check_openai_responses_api', sentinel_check,
+        )
+
+        client = build_llm_client(generic_config)  # must NOT raise
+        assert isinstance(client, OpenAIGenericClient)
+
+    def test_missing_api_key_still_returns_none(self, generic_config):
+        """The api_key guard is shared, not duplicated per client_class."""
+        generic_config.llm.providers.openai.api_key = ''
+        assert build_llm_client(generic_config) is None
+
+    def test_does_not_hijack_the_anthropic_branch(self, generic_config, monkeypatch):
+        """client_class selects among OpenAI-shaped clients ONLY."""
+        from fused_memory.config.schema import AnthropicProviderConfig
+
+        generic_config.llm.provider = 'anthropic'
+        generic_config.llm.providers.anthropic = AnthropicProviderConfig(
+            api_key='anthropic-test-key',
+        )
+
+        fake_anthropic_cls = MagicMock(name='AnthropicClient')
+        with patch(
+            'graphiti_core.llm_client.anthropic_client.AnthropicClient',
+            fake_anthropic_cls,
+        ):
+            client = build_llm_client(generic_config)
+
+        assert client is fake_anthropic_cls.return_value
+        assert not isinstance(client, OpenAIGenericClient)
 
 
 class TestBuildLLMClientBranchPreservation:
