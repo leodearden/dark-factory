@@ -37,7 +37,11 @@ from typing import NamedTuple
 # docs/legibility/design-invariants.md's no-silent-fail-soft rule), its
 # --min-fidelity filter and its object-shaped JSON are genuinely different
 # behaviour, not duplication.
-from _task_db_scan import discover_project_roots, tasks_db_path
+from _task_db_scan import (  # noqa: F401  (discover_project_roots re-exported for the tests)
+    discover_project_roots,
+    run_audit_cli,
+    tasks_db_path,
+)
 
 # The canonical meta-root directory name, per config.py:1343 TASK_META_DIRNAME
 # and artifacts.py:287 meta_root_for. It is a SIBLING of the worktrees inside
@@ -839,6 +843,30 @@ def _passes_min_fidelity(candidate: WipeCandidate, min_fidelity: str) -> bool:
     return candidate.plan_files_fidelity == FIDELITY_FILE_LEVEL
 
 
+def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
+    """Audit ONE project root, applying the per-root ``--min-fidelity`` filter.
+
+    Raises ``sqlite3.Error`` for an unreadable project, which is what
+    :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip; every
+    other exception propagates. Returns exactly one audit, per that function's
+    one-audit-per-root contract.
+    """
+    audit = audit_project(root)
+    filtered = [
+        c for c in audit.candidates
+        if _passes_min_fidelity(c, args.min_fidelity)
+    ]
+    return audit._replace(candidates=filtered)
+
+
+def _render(audits: list[ProjectAudit], args: argparse.Namespace) -> str:
+    return format_json(audits) if args.json else format_report(audits)
+
+
+def _is_dirty(audits: list[ProjectAudit]) -> bool:
+    return any(a.candidates for a in audits)
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
@@ -855,55 +883,20 @@ def main(argv: list[str] | None = None) -> int:
     A single unreadable project (a corrupt/locked tasks.db) does NOT abort the
     sweep: it is logged to stderr and skipped so every other project is still
     audited, and a trailing warning states that the results are incomplete.
+
+    The roots loop, the warn-and-continue skip and the exit-code ladder are
+    :func:`_task_db_scan.run_audit_cli` (Tier 3, task 3616), shared with
+    audit_combine_gate_marker_loss.py. What stays here is what genuinely
+    differs: this script's parser and epilog, its ``--min-fidelity`` per-root
+    filter (:func:`_audit_root`), its object-shaped JSON and its report.
     """
-    args = _build_parser().parse_args(argv)
-
-    roots = discover_project_roots(project_roots=args.project_roots)
-    if not roots:
-        print(
-            "no project root resolvable with a readable tasks.db (checked "
-            "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
-            "dark-factory default)",
-            file=sys.stderr,
-        )
-        return 2
-
-    audits: list[ProjectAudit] = []
-    unreadable: list[str] = []
-    for root in roots:
-        try:
-            audit = audit_project(root)
-        except sqlite3.Error as exc:
-            print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
-            unreadable.append(root)
-            continue
-        filtered = [
-            c for c in audit.candidates
-            if _passes_min_fidelity(c, args.min_fidelity)
-        ]
-        audits.append(audit._replace(candidates=filtered))
-
-    if unreadable:
-        print(
-            f"warning: {len(unreadable)} project(s) skipped due to read errors "
-            "(see warnings above); results below are incomplete",
-            file=sys.stderr,
-        )
-
-    if args.json:
-        print(format_json(audits))
-    else:
-        print(format_report(audits))
-
-    if unreadable and not audits:
-        # Nothing was scanned at all — never report that as a clean sweep.
-        print(
-            "error: every resolved project was unreadable; NOTHING was "
-            "audited (this is not a clean result)",
-            file=sys.stderr,
-        )
-        return 3
-    return 1 if any(a.candidates for a in audits) else 0
+    return run_audit_cli(
+        argv,
+        parser=_build_parser(),
+        audit_fn=_audit_root,
+        render=_render,
+        is_dirty=_is_dirty,
+    )
 
 
 if __name__ == "__main__":
