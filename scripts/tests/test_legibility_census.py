@@ -28,7 +28,7 @@ import digest as digest_mod
 import inventory
 import pytest
 from legibility import census_trigger
-from shared.cap_markers import REAL_CLI_CAP_MESSAGES
+from shared.cap_markers import BLOCKING_BANNER_MARKERS, REAL_CLI_CAP_MESSAGES
 
 import config as config_mod
 
@@ -3268,6 +3268,145 @@ def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner():
     assert exc.verified == 2, "the two clusters adjudicated before the cap"
     assert exc.unverified == 3, "the hitting cluster plus the two never attempted"
     assert probe.calls == [], "this detector must not spend a probe -- the reply was free"
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / REVIEW FIX, part 1/2: detector (a) must never re-read a
+# WELL-FORMED verdict as a cap banner.
+#
+# The verify reply is a model-authored {"verified":…, "reason":…} whose reason
+# legitimately QUOTES the cluster under adjudication -- and this repo's
+# codebook is dominated by clusters ABOUT usage/weekly limits
+# (docs/legibility/confusion-codebook.yaml carries ~15 such sightings at lines
+# 569, 575, 925, 985, 1048-1163). A loose OR-substring scan over the whole raw
+# reply therefore fires on ordinary healthy output.
+#
+# The consequence is worse than merely over-deferring: _defer returns before
+# every write AND before advance_census_state, so last_census_at is untouched,
+# the next run re-mines the same window, re-hits the same cluster and aborts
+# again -- a permanent census stall plus a stream of false infra_issue
+# escalations claiming the account is capped.
+# ---------------------------------------------------------------------------
+
+def _cap_themed_verdict(marker, *, verified=True):
+    """A WELL-FORMED verdict whose `reason` quotes a cap-themed cluster.
+
+    This is ordinary healthy verifier output, not a banner: the model is
+    adjudicating a confusion cluster that happens to be ABOUT usage limits.
+    """
+    return json.dumps(
+        {
+            "verified": verified,
+            "reason": (
+                "Confirmed against main: the watcher rotation was interrupted "
+                f"by a {marker}; the 'continue where you left off' resume "
+                "prompt appears at turns 17/27."
+            ),
+        }
+    )
+
+
+@pytest.mark.parametrize("marker", BLOCKING_BANNER_MARKERS)
+def test_default_verify_fn_does_not_read_a_cap_themed_verdict_as_a_banner(marker):
+    """A reply that PARSES into a verdict IS a verdict, whatever it quotes.
+
+    Parametrized over every marker in the shared contract, so the guarantee is
+    "no marker can be smuggled through a reason string", not "the two the test
+    author happened to think of".
+    """
+    def invoke(prompt, model):
+        return _cap_themed_verdict(marker)
+
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="must never be consulted on a parsed verdict")
+    )
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    result = verify_fn(_clusters(3), model="sonnet")
+
+    assert [c["title"] for c in result["verified"]] == ["cluster-0", "cluster-1", "cluster-2"]
+    assert result["rejected"] == []
+    assert probe.calls == [], "a parsed verdict is never a cap, so nothing to confirm"
+
+
+@pytest.mark.parametrize("marker", ["usage limit", "weekly limit"])
+def test_default_verify_fn_reads_a_cap_themed_refutation_as_an_ordinary_rejection(marker):
+    """`verified: false` about a cap-themed cluster is an ordinary verdict too.
+
+    The refutation half of the same class: a well-formed rejection must reject,
+    not abort the census.
+    """
+    def invoke(prompt, model):
+        return _cap_themed_verdict(marker, verified=False)
+
+    probe = _make_recording_probe(mod.HeadroomResult(ok=False, reason="must never be consulted"))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    result = verify_fn(_clusters(2), model="sonnet")
+
+    assert result["verified"] == []
+    assert [c["title"] for c in result["rejected"]] == ["cluster-0", "cluster-1"]
+    assert probe.calls == []
+
+
+def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts(tmp_path):
+    """END-TO-END: a cap-themed verdict must not stall the census.
+
+    Uses the REAL `_build_default_verify_fn`, not a fake, so the whole
+    detector -> _defer -> abort-before-persistence chain is in the loop.
+
+    The load-bearing assertions are that report_path / codebook_path /
+    census_state_path all EXIST -- i.e. advance_census_state ran and
+    last_census_at MOVED. That is what pins this defect as non-self-
+    perpetuating: with the pre-parse scan in place the run aborts before every
+    write, last_census_at is untouched, and the next run re-mines the same
+    window, re-hits the same cluster and aborts again, forever.
+    """
+    verdict = _cap_themed_verdict("usage limit")
+
+    def response_fn(prompt, model):
+        if prompt == mod._HEADROOM_PROBE_PROMPT:
+            return "pong"
+        if prompt.startswith("You are the periodic-census verifier"):
+            return verdict
+        return _happy_invoke_response(prompt, model)
+
+    fake_invoke = _make_fake_invoke(response_fn)
+    fake_submit_fn = _make_fake_submit_fn()
+    fake_escalate_fn = _make_fake_escalate_fn()
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
+        verify_fn=mod._build_default_verify_fn(str(tmp_path), fake_invoke),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=fake_submit_fn,
+        escalate_fn=fake_escalate_fn,
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status != "deferred", (
+        "a cap-themed verdict is healthy output, not a cap: "
+        f"deferred_stage={outcome.deferred_stage!r} reason={outcome.reason!r}"
+    )
+    assert outcome.deferred_stage is None
+    assert kwargs["report_path"].exists(), "the report was written"
+    assert kwargs["codebook_path"].exists(), "the codebook merge was persisted"
+    assert kwargs["census_state_path"].exists(), (
+        "advance_census_state ran: last_census_at MOVED, so the next run does "
+        "not re-mine this window and re-hit the same cluster forever"
+    )
+    assert len(fake_submit_fn.calls) == 1, "the verified cluster was filed"
+    assert not any(
+        c.get("category") == "infra_issue" for c in fake_escalate_fn.calls
+    ), "no false 'the account is capped' escalation"
 
 
 def test_default_verify_fn_raises_when_an_invocation_error_reprobes_capped():
