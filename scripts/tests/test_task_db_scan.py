@@ -61,7 +61,9 @@ from _task_db_scan import (
     add_db_discovery_args,
     discover_db_paths,
     discover_project_roots,
+    format_coverage_block,
     format_json,
+    format_kv_line,
     group_matches_by_db,
     resolve_project_roots,
     run_audit_cli,
@@ -899,6 +901,164 @@ def test_run_audit_cli_works_without_an_on_roots_hook(project_root_with_tasks_db
     )
 
     assert exit_code == 0
+
+
+# --- format_kv_line(pairs) -> str ------------------------------------------
+
+def test_format_kv_line_uses_a_two_space_indent_and_single_space_separator():
+    assert format_kv_line([("task_id", 7), ("tag", "master")]) == "  task_id=7 tag=master"
+
+
+def test_format_kv_line_leaves_no_trailing_space():
+    line = format_kv_line([("task_id", 7)])
+
+    assert line == "  task_id=7"
+    assert line == line.rstrip()
+
+
+def test_format_kv_line_reproduces_the_wiped_audit_candidate_line_byte_for_byte():
+    """audit_wiped_metadata_files.py's _format_candidate_line, exactly.
+
+    Asserted against the literal string rather than a regex: the acceptance bar
+    for the extraction is byte-for-byte identical output, and a regex would
+    happily accept a changed separator or indent.
+    """
+    line = format_kv_line([
+        ("task_id", 3264),
+        ("tag", "master"),
+        ("status", "done"),
+        ("signature", "null-merge-sha"),
+        ("source", "plan.files"),
+        ("fidelity", "file-level"),
+        ("plan_files", 3),
+    ])
+
+    assert line == (
+        "  task_id=3264 tag=master status=done signature=null-merge-sha "
+        "source=plan.files fidelity=file-level plan_files=3"
+    )
+
+
+def test_format_kv_line_reproduces_the_combine_audit_finding_line_byte_for_byte():
+    """audit_combine_gate_marker_loss.py's _format_finding_line, exactly."""
+    line = format_kv_line([
+        ("task_id", 3088),
+        ("tag", "master"),
+        ("status", "pending"),
+        ("key", "delivered_checks"),
+        ("severity", "gate_removing"),
+        ("source", "ticket"),
+    ])
+
+    assert line == (
+        "  task_id=3088 tag=master status=pending key=delivered_checks "
+        "severity=gate_removing source=ticket"
+    )
+
+
+def test_format_kv_line_renders_an_empty_pair_list_as_the_bare_indent():
+    assert format_kv_line([]) == "  "
+
+
+def test_format_kv_line_renders_every_value_with_str():
+    """An int, a str and a len() result must format identically to today's
+    f-strings, which interpolate all three through str()."""
+    assert format_kv_line([
+        ("count", 3),
+        ("name", "master"),
+        ("plan_files", len(["a.py", "b.py"])),
+    ]) == "  count=3 name=master plan_files=2"
+
+
+# --- format_coverage_block(caveat, rows, details) -> list[str] --------------
+
+def test_format_coverage_block_places_every_value_at_column_40():
+    """THE GUTTER CONTRACT, pinned from three different label widths.
+
+    These are the real padded literals from both audit scripts: labels of 30,
+    26 and 31 characters, all of which put their value at column 40 today. A
+    drifting gutter is the exact failure mode this helper exists to prevent, so
+    the rendered lines are asserted whole.
+    """
+    lines = format_coverage_block(
+        "  CAVEAT:",
+        [
+            ("with a file-level plan signal:", 3),
+            ("with NO comparison source:", 25),
+            ("manifests that failed to parse:", 2),
+        ],
+    )
+
+    assert lines[1:] == [
+        "    with a file-level plan signal:      3",
+        "    with NO comparison source:          25",
+        "    manifests that failed to parse:     2",
+    ]
+    for line in lines[1:]:
+        # Every value starts at column 40, i.e. after 4 spaces of indent plus a
+        # 36-character label gutter.
+        assert len(line) - len(line.split()[-1]) == 40
+
+
+def test_format_coverage_block_emits_a_multi_line_caveat_verbatim_above_the_rows():
+    """wiped's caveat is a 3-line list literal, including an em dash."""
+    caveat = [
+        "  COVERAGE (the candidate list above is an OBSERVABLE SUBSET, not the",
+        "  full damaged population — tasks with no recoverable plan scope are",
+        "  UNKNOWN, neither clean nor damaged):",
+    ]
+
+    lines = format_coverage_block(caveat, [("total tasks scanned:", 41)])
+
+    assert lines == caveat + ["    total tasks scanned:                41"]
+
+
+def test_format_coverage_block_accepts_a_single_pre_joined_caveat_string():
+    """combine's _COVERAGE_CAVEAT is one module-level string constant."""
+    caveat = (
+        "  COVERAGE (the findings above are an OBSERVABLE SUBSET, not the full "
+        "damaged population - a combine target with no comparison source is "
+        "UNKNOWN, neither clean nor damaged):"
+    )
+
+    lines = format_coverage_block(caveat, [("combine targets scanned:", 67)])
+
+    assert lines == [caveat, "    combine targets scanned:            67"]
+
+
+def test_format_coverage_block_renders_trailing_detail_lines():
+    """combine NAMES its unreadable sidecars rather than only counting them."""
+    lines = format_coverage_block(
+        "  CAVEAT:",
+        [("manifests that failed to parse:", 2)],
+        details=["plans/a.yaml: bad yaml", "plans/b.yaml: missing key"],
+    )
+
+    assert lines[-2:] == [
+        "      - plans/a.yaml: bad yaml",
+        "      - plans/b.yaml: missing key",
+    ]
+
+
+def test_format_coverage_block_omits_the_detail_section_entirely_when_none_given():
+    lines = format_coverage_block("  CAVEAT:", [("total tasks scanned:", 0)])
+
+    assert lines == ["  CAVEAT:", "    total tasks scanned:                0"]
+    assert not any(line.lstrip().startswith("- ") for line in lines)
+
+
+def test_format_coverage_block_keeps_a_separating_space_for_an_overlong_label():
+    """A label past the 36-char gutter must not collide with its value.
+
+    Every label in both scripts is <= 31 chars today, so this guards a FUTURE
+    long label against silently producing an unreadable ``label:12`` line.
+    """
+    label = "a label that is quite a lot longer than the gutter:"
+    assert len(label) > 36
+
+    lines = format_coverage_block("  CAVEAT:", [(label, 12)])
+
+    assert lines[1] == f"    {label} 12"
 
 
 # ---------------------------------------------------------------------------
