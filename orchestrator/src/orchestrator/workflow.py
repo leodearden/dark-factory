@@ -3701,7 +3701,10 @@ class TaskWorkflow:
         Returns ``None`` when the gate cleared and the caller should fall
         through to the merge retry loop IN-SLOT: no re-dispatch is burned and
         the row stays ``in-progress`` under the live claimant for the whole
-        wait (spec §4 — ``in-progress`` covers Path-A escalated-waiting).
+        wait (spec §4 — ``in-progress`` covers Path-A escalated-waiting).  That
+        exit STOPS AND CLEARS THE STEWARD FIRST — the merge tail runs git in
+        ``self.worktree`` and the steward's poll loop invokes its agent there
+        too; see the block comment at the return itself.
 
         **Bounded by construction (spec S5).**  The whole path costs at most
         ONE derived idle window: the post-wait gate re-check is SINGLE-SHOT,
@@ -3875,8 +3878,46 @@ class TaskWorkflow:
                 ),
                 escalate_to_human=True,
             )
-        # Gate cleared — resume the merge in this same slot.  BLOCKED →
-        # IN_PROGRESS is likewise legal for ActorClass.ORCHESTRATOR.
+        # Gate cleared — resume the merge in this same slot.  STOP THE STEWARD
+        # FIRST, before _enter_phase and before returning to the merge tail.
+        # Ordering is load-bearing, not tidiness, and this is the SAME safety
+        # requirement _wait_for_resolution's give-up branch states at :12546-
+        # 12565: TaskSteward._loop is a persistent poll loop (steward.py:
+        # 259-273) that keeps picking up fresh L0s and invoking its agent with
+        # cwd = self.worktree (steward.py:542, 590).  Everything downstream of
+        # this return — _recover_before_merge, `git rev-parse HEAD`,
+        # rebase_onto_main, run_scoped_verification, _submit_to_merge_queue —
+        # operates on that same worktree, so leaving the loop live is the
+        # two-agents-one-worktree hazard: a rebase onto a tree the steward
+        # agent is mid-write in either fails on a dirty tree / index.lock, or
+        # rides unreviewed steward commits onto main.
+        #
+        # This exposure is NEW with the bounded wait and unique to THIS exit.
+        # The pre-γ₁ gate returned ESCALATED without ever constructing a
+        # steward, so nothing was ever live in the worktree during a merge; and
+        # unlike run()'s ESCALATED branch — which resumes only the implementer
+        # and re-gates afterwards — there is no later gate here to catch a bad
+        # merge, and no re-dispatch can un-merge a branch.  The sibling exits
+        # above do not need it: they never reach the merge tail, and run()'s
+        # `finally` stops the steward on the way out of the slot.
+        #
+        # stop() cancels the loop task (steward.py:209-217) and on the stock
+        # `steward: "claude"` backend the resulting CancelledError propagates
+        # into cli_invoke.py:_run_subprocess, whose handler (:2240-2252)
+        # terminates the agent's whole process group — so an in-flight agent
+        # genuinely stops writing rather than merely being detached from.
+        # Clearing the reference is the existing stop-then-clear idiom
+        # (cf. :6807-6809 / :6851-6853 / :12579-12582): a later _mark_blocked
+        # on the merge tail then builds a FRESH steward through
+        # _ensure_steward_started rather than awaiting a cancelled loop that
+        # can never publish.  Suppressed because a failing stop() must not
+        # convert a cleared gate into a workflow crash — the merge is still
+        # safe to attempt if the loop was already dead.
+        if self._steward is not None:
+            with contextlib.suppress(Exception):
+                await self._steward.stop()
+            self._steward = None
+        # BLOCKED → IN_PROGRESS is likewise legal for ActorClass.ORCHESTRATOR.
         self._enter_phase(WorkflowState.MERGE)
         return None
 

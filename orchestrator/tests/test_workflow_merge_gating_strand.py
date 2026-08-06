@@ -86,7 +86,11 @@ from orchestrator.scheduler import TaskAssignment
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-from orchestrator.workflow_types import WorkflowState, outcome_allows_status
+from orchestrator.workflow_types import (
+    StewardResolved,
+    WorkflowState,
+    outcome_allows_status,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures (local — mirrors test_workflow_escalated_steward_stall.py:70-118)
@@ -613,6 +617,52 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
     return _FakeSteward
 
 
+def _make_journalling_resolving_steward(
+    queue: EscalationQueue, task_id: str, events: list[str],
+) -> type:
+    """``_make_resolving_steward`` plus a lifecycle journal.
+
+    Same behaviour as the shared helper — ``start()`` resolves the pending L0
+    and publishes ``StewardResolved`` — but both lifecycle edges append to
+    *events*, so a test can assert the stop edge lands BEFORE the first
+    worktree-touching merge step rather than merely observing the end state.
+
+    The ordering is the whole point: a real ``TaskSteward.stop()`` cancels a
+    persistent poll loop that invokes its agent with ``cwd = worktree``
+    (``steward.py:209-217``, ``:542``, ``:590``), the same worktree the merge
+    tail rebases and verifies in.
+    """
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def start(self) -> None:
+            events.append('steward:start')
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            assert pending, 'expected at least one pending L0 to resolve'
+            for esc in pending:
+                queue.resolve(
+                    esc.id, 'Resolved by journalling FakeSteward',
+                    resolved_by='fake-steward',
+                )
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardResolved(resolution_text='Resolved by FakeSteward'),
+                )
+
+        async def stop(self) -> None:
+            events.append('steward:stop')
+
+    return _FakeSteward
+
+
 def _make_chained_l2_steward(queue: EscalationQueue, task_id: str) -> type:
     """A steward that resolves its own L0 then files a fresh born-at-L2.
 
@@ -744,11 +794,25 @@ class TestMergeGateBailEntersBoundedWait:
             f'{submit.await_count}'
         )
         # The steward was actually started — _ensure_steward_started is on
-        # this path, not skipped (the resolving fake asserts a pending L0
-        # exists when its start() runs, so this also pins the ordering).
-        assert wf._steward is not None, (
+        # this path, not skipped.  Asserted through its EFFECT rather than
+        # `wf._steward is not None`, which the stop-before-merge below
+        # deliberately falsifies: the resolving fake asserts a pending L0
+        # exists when its start() runs and resolves it, so an empty pending
+        # set can only mean start() ran.
+        assert queue.get_by_task(task_id, status='pending', level=0) == [], (
             'the merge-entry gate must start a steward, exactly as run()\'s '
             'ESCALATED branch does'
+        )
+        # ...and it was STOPPED AND CLEARED before the merge tail ran.  A
+        # TaskSteward poll loop invokes its agent with cwd = the worktree the
+        # merge tail rebases/verifies/commits in, so leaving it live here is
+        # the two-agents-one-worktree hazard _wait_for_resolution's give-up
+        # branch calls out as a safety requirement.  Sibling assertion in
+        # test_steward_is_stopped_before_the_merge_tail_runs below pins the
+        # ORDERING; this one pins the end state.
+        assert wf._steward is None, (
+            'the gate-cleared fall-through must stop and clear the steward '
+            'before the merge tail touches the worktree'
         )
         # The steward consumed its own L0 — nothing left pending to re-strand
         # the next entry.
@@ -760,6 +824,91 @@ class TestMergeGateBailEntersBoundedWait:
         )
         assert 'blocked' not in written, (
             f'a resolved gate must not park the task; got {written}'
+        )
+
+    async def test_steward_is_stopped_before_the_merge_tail_runs(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """No steward agent can overlap the merge tail's work in the worktree.
+
+        ``TaskSteward._loop`` (``steward.py:259-273``) is a PERSISTENT poll
+        loop: once started it keeps picking up fresh L0s and invoking its agent
+        with ``cwd = self.worktree``.  Everything downstream of the gate-cleared
+        fall-through — ``_recover_before_merge``, ``git rev-parse HEAD``,
+        ``rebase_onto_main``, ``run_scoped_verification``,
+        ``_submit_to_merge_queue`` — runs in that same worktree.  Leaving the
+        loop live across the fall-through is therefore the
+        two-agents-one-git-worktree hazard ``_wait_for_resolution``'s own
+        give-up branch calls out as "a safety requirement, not tidiness"
+        (``workflow.py:12546-12565``): the rebase either fails on a dirty tree
+        / ``index.lock``, or unreviewed steward commits ride the branch onto
+        main.
+
+        The exposure is NEW with the bounded wait and worse here than anywhere
+        else: pre-γ₁ the gate returned ESCALATED without ever constructing a
+        steward, and unlike ``run()``'s ESCALATED branch (which only re-invokes
+        the implementer and re-gates later) a bad merge is irrecoverable — no
+        re-dispatch un-merges a branch.
+
+        Pins the ORDERING, not just the end state that the sibling test above
+        asserts: ``steward:stop`` must precede the FIRST worktree-touching
+        merge step.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, _scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        _stub_merge_internals(wf, monkeypatch)
+
+        events: list[str] = []
+
+        # Re-stub the merge steps that actually touch ``wf.worktree`` so their
+        # invocation order is journalled against the steward's lifecycle.
+        async def _recover(*_a, **_k) -> None:
+            events.append('merge:_recover_before_merge')
+
+        async def _rebase(*_a, **_k) -> bool:
+            events.append('merge:rebase_onto_main')
+            return True
+
+        async def _submit(*_a, **_k) -> WorkflowOutcome:
+            events.append('merge:_submit_to_merge_queue')
+            return WorkflowOutcome.DONE
+
+        wf._recover_before_merge = _recover  # type: ignore[method-assign]
+        wf.git_ops.rebase_onto_main = _rebase  # type: ignore[method-assign]
+        wf._submit_to_merge_queue = _submit  # type: ignore[method-assign]
+
+        _submit_gating_l0(queue, task_id)
+        wf._steward_factory = _make_journalling_resolving_steward(
+            queue, task_id, events,
+        )
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        assert outcome is None, (
+            f'the gate cleared, so the merge must run in-slot; got {outcome}'
+        )
+        assert 'steward:start' in events, 'the gate must start a steward'
+        assert 'steward:stop' in events, (
+            f'the gate-cleared fall-through must STOP the steward before '
+            f'handing the worktree to the merge tail; journal: {events}'
+        )
+        merge_steps = [i for i, e in enumerate(events) if e.startswith('merge:')]
+        assert merge_steps, f'the merge tail never ran; journal: {events}'
+        assert events.index('steward:stop') < merge_steps[0], (
+            f'the steward was still live when the merge tail began touching '
+            f'the worktree — two agents, one git worktree; journal: {events}'
+        )
+        # And the reference is cleared, so a later _mark_blocked on the merge
+        # tail builds a FRESH steward rather than awaiting a cancelled loop
+        # that can never publish.
+        assert wf._steward is None, (
+            'stop-then-CLEAR is the established idiom (workflow.py:6807-6809 '
+            '/ :6851-6853 / :12579-12582)'
         )
 
 
