@@ -6868,3 +6868,245 @@ def test_stamp_fm_deploy_clock_does_not_touch_liveness_restart_clock(
         "a scheduled fm deploy must not touch the liveness restart clock (I5)"
     )
     assert wdog._read_last_fm_liveness_restart_epoch() is None
+
+
+# ---------------------------------------------------------------------------
+# Part D: fused_memory_liveness_pass() streak wiring (task 3764)
+#
+# THE USER-OBSERVABLE SIGNAL. Before this task ONE non-healthy verdict killed
+# fused-memory. The measured evidence (2026-08-06 controlled experiment) says
+# that is wrong: six /health stalls >=8s, four >15s, three past a 25s probe cap
+# — all self-recovered, needing 0 restarts over 20 cycles.
+#
+# Every test here drives the pass against a REAL streak file under tmp_path,
+# and points the liveness restart clock at an absent tmp path so the cap (step
+# 13's concern) never confounds the streak assertions. No test may touch the
+# real data/fused-memory/ state.
+# ---------------------------------------------------------------------------
+
+
+def _wire_liveness_pass(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    verdicts: list[str] | None = None,
+) -> list[str]:
+    """Wire a liveness pass onto tmp state; return the list restart_unit appends to.
+
+    Gates open (unit enabled, outside the startup grace window), streak file
+    and liveness restart clock both under tmp_path (the clock absent, so the
+    min-interval cap never fires). When *verdicts* is given, the verdict
+    function pops from it left-to-right, one per pass() call.
+    """
+    restarted: list[str] = []
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
+    monkeypatch.setattr(
+        wdog, "FM_LIVENESS_RESTART_CLOCK_PATH", str(tmp_path / "liveness_clock.json")
+    )
+    if verdicts is not None:
+        queue = list(verdicts)
+        monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: queue.pop(0))
+    return restarted
+
+
+def test_liveness_pass_single_wedged_verdict_does_not_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(a) ONE non-healthy verdict must NOT restart fused-memory.
+
+    This is the whole defect: every observed /health stall self-recovered, and
+    a single 60s-cadence probe cannot distinguish a transient stall from a
+    genuine wedge.
+    """
+    wdog = _load_watchdog()
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
+
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], f"one wedged verdict must not restart fm; got {restarted}"
+    assert json.loads((tmp_path / "streak.json").read_text())["count"] == 1
+
+
+def test_liveness_pass_two_wedged_verdicts_do_not_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(b) Two consecutive non-healthy verdicts still issue no restart."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged", "wedged"])
+
+    wdog.fused_memory_liveness_pass()
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], f"two wedged verdicts must not restart fm; got {restarted}"
+    assert json.loads((tmp_path / "streak.json").read_text())["count"] == 2
+
+
+def test_liveness_pass_restarts_on_threshold_tick(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(c) The THIRD consecutive non-healthy verdict issues exactly one restart."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"expected exactly one restart on the threshold tick, got {restarted}"
+    )
+
+
+def test_liveness_pass_healthy_verdict_resets_the_streak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(d) A healthy verdict between failures RESETS the streak — no restart.
+
+    Exactly the observed transient-stall shape: fm stalls, recovers, stalls
+    again. Without the reset those unrelated stalls would accumulate into a
+    kill.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    streak_file = tmp_path / "streak.json"
+    restarted = _wire_liveness_pass(
+        wdog, monkeypatch, tmp_path, ["wedged", "healthy", "wedged", "wedged"]
+    )
+
+    wdog.fused_memory_liveness_pass()
+    assert streak_file.exists()
+
+    wdog.fused_memory_liveness_pass()  # healthy
+    assert not streak_file.exists(), "a healthy verdict must clear the streak file"
+
+    wdog.fused_memory_liveness_pass()
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], (
+        f"an interleaved healthy verdict must prevent the restart; got {restarted}"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 2
+
+
+def test_liveness_pass_clears_streak_after_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(e) After a restart the streak is CLEARED — the next kill needs a fresh N.
+
+    Otherwise the pass would degrade back to one-verdict-per-kill immediately
+    after the first restart, reintroducing the defect.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    streak_file = tmp_path / "streak.json"
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 4)
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+    assert restarted == ["fused-memory.service"]
+    assert not streak_file.exists(), "the consumed streak must be cleared"
+
+    wdog.fused_memory_liveness_pass()  # fourth wedged verdict
+
+    assert restarted == ["fused-memory.service"], (
+        f"the tick after a restart must not immediately re-restart; got {restarted}"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 1
+
+
+def test_liveness_pass_port_down_streaks_and_preserves_short_circuit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(f) 'port-down' streaks on the SAME counter, via the REAL verdict function.
+
+    Driven through the real _fused_memory_liveness_verdict() with probe_port
+    stubbed False and probe_health stubbed to pytest.fail, so this simultaneously
+    proves the port-probe SHORT-CIRCUIT is preserved: a dead port must still be
+    classified without waiting on the up-to-15s /health fetch.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: False)
+    monkeypatch.setattr(
+        wdog,
+        "probe_health",
+        lambda: pytest.fail("probe_health must not run when the port is down"),
+    )
+
+    wdog.fused_memory_liveness_pass()
+    wdog.fused_memory_liveness_pass()
+    assert restarted == [], f"port-down must also require a streak; got {restarted}"
+
+    wdog.fused_memory_liveness_pass()
+    assert restarted == ["fused-memory.service"], (
+        f"three consecutive port-down verdicts must revive fm exactly once; got {restarted}"
+    )
+
+
+def test_liveness_pass_mixed_non_healthy_verdicts_reach_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(g) A mixed wedged/port-down/wedged sequence reaches the threshold on tick 3.
+
+    Both are non-healthy verdicts for streak purposes; only 'healthy' proves
+    continuity is broken.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    restarted = _wire_liveness_pass(
+        wdog, monkeypatch, tmp_path, ["wedged", "port-down", "wedged"]
+    )
+
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == ["fused-memory.service"], (
+        f"mixed non-healthy verdicts must accumulate on one streak; got {restarted}"
+    )
+
+
+def test_liveness_pass_streak_survives_across_module_instances(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(h) PASS-LEVEL cross-invocation proof: the streak survives a process boundary.
+
+    The watchdog is a Type=oneshot on a 60s timer — each tick is a NEW process.
+    Here each tick runs through a separate _load_watchdog() module object with
+    entirely fresh globals, so nothing can be carried in memory. Instances 1
+    and 2 must not restart; instance 3 must, having read the two prior failures
+    off disk.
+    """
+    streak_path = tmp_path / "streak.json"
+    monkeypatch.setenv("FM_LIVENESS_STREAK", str(streak_path))
+    monkeypatch.setenv("FM_LIVENESS_RESTART_CLOCK", str(tmp_path / "liveness_clock.json"))
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", "3")
+    restarted: list[str] = []
+
+    def _tick() -> None:
+        wdog = _load_watchdog()
+        monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+        monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+        monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "wedged")
+        monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+        monkeypatch.setattr(wdog, "log", lambda _m: None)
+        wdog.fused_memory_liveness_pass()
+
+    _tick()
+    assert restarted == [], "instance 1 must not restart"
+    assert json.loads(streak_path.read_text())["count"] == 1
+
+    _tick()
+    assert restarted == [], "instance 2 must not restart"
+    assert json.loads(streak_path.read_text())["count"] == 2
+
+    _tick()
+    assert restarted == ["fused-memory.service"], (
+        f"instance 3 must restart, having read the streak off disk; got {restarted}"
+    )
+    assert not streak_path.exists(), "the consumed streak must be cleared"
