@@ -439,10 +439,20 @@ ARCHITECT_EVAL_CONFIGS = [
     # eval-revival π: the architect-fable candidate (serves
     # fable-architect-eval-admission PRD τ1's hard-subset campaign gate).
     # run_ofat_stage's architect branch (task 2478) already handles any
-    # role='architect' candidate — config-only, no runner edit. A
-    # 'architect-fable-max' variant is a tactical add only if the consumer
-    # campaign's effort-sensitivity screen calls for it (PRD open question 3).
+    # role='architect' candidate — config-only, no runner edit. π's
+    # effort-sensitivity screen measured the opus high→max step at +0.0317
+    # (plans/eval-architect-effort-verdict-2026-07-27.md), but the v1 screen
+    # itself ran fable at effort 'high' against opus at 'max' — a confound
+    # biased against fable. eval-revival ρ adds the effort-matched
+    # 'architect-fable-max' below so fable-trial-v2 δ's stage-2 screen
+    # (plans/eval-framework-revival-prd.md, plans/fable-architect-trial-v2-prd.md
+    # §Θ1) can isolate the model delta with effort/role/backend held equal.
     EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role='architect'),
+    # eval-revival ρ: effort-matched to architect-opus-max above — only the
+    # model axis varies. Config-only: run_ofat_stage's architect branch
+    # (evals/runner.py:1232, task 2478) already dispatches any role='architect'
+    # candidate, and get_config_by_name already searches this list.
+    EvalConfig('architect-fable-max', 'claude', 'claude-fable-5', 'max', role='architect'),
 ]
 
 
