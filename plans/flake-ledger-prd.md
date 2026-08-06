@@ -126,7 +126,7 @@ one discriminator with two call sites.
 
 | Assumed capability | Verified evidence |
 |---|---|
-| `runs.db` is WAL with a busy timeout | `event_store.py:512` / `run_store.py:89` → `apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)`, `shared/src/shared/sqlite_sync_base.py:26` |
+| `runs.db` is WAL with a busy timeout | `event_store.py:512` / `run_store.py:90` → `apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)`, `shared/src/shared/sqlite_sync_base.py:26` |
 | Schema is additive `CREATE TABLE IF NOT EXISTS` | `event_store.py:24`, `run_store.py:19/34/70` |
 | `runs.db` already hosts multiple owners' tables | live DB: `events`, `invocations`, `account_events`, `runs`, `task_results`, `scheduler_state` |
 | No event retention or pruning exists anywhere | no `DELETE FROM events` / prune / retention in `event_store.py` or `run_store.py` — **so ledger rows accumulate; §5.2 bounds them** |
@@ -223,7 +223,7 @@ evidence, leaving the diagnosis to the de-flake task.
 **Corollary, binding on every task in this batch:** do not widen a timeout as a fix for anything.
 
 The third verdict, **`unconfirmable`**, is the one that has been missing. `_group_node_ids_by_subproject`
-already computes it and already logs the literal word at INFO (`verify.py:7026`) — a textbook INV-2
+already computes it and already logs the literal word at INFO (`verify.py:7027`) — a textbook INV-2
 violation, since the emitter holds the fact in a variable and the only consumer would have to scrape a
 log to get it. Promoting it to a structured, counted fact is what makes gate-blindness detectable
 (§5.6 class 1) instead of invisible for a month.
@@ -343,12 +343,18 @@ first-class feed into the ledger without dark-factory reading reify's JSONL at a
 fence is therefore reciprocal and pre-agreed. Division: **3774 owns what the escalation tells a human;
 this PRD owns whether the escalation is filed at all.**
 
-**No dependency edge, and the reason is checked, not assumed.** 3774 edits `merge_queue.py` and
-`workflow.py`; this PRD's δ edits `verify.py:6472`. Different files — so no narrow-file-lock contention
-and no merge conflict. Either order is correct: if δ lands first, 3774's improved instruction applies
-to a smaller (truer) set of escalations; if 3774 lands first, its instruction is simply right sooner.
-A named relationship is not a dependency edge, and inventing one here would serialize two independent
-fixes for no gain.
+**No dependency edge, and the reason is checked, not assumed.** *(Amended at decompose, 2026-08-06 —
+the original wording overgeneralised from δ to the whole PRD and was wrong on the facts; the
+conclusion is unchanged, its grounds are narrower.)* The two touch **disjoint regions**, not disjoint
+files: 3774 works inside `_file_main_health_escalation` (`merge_queue.py:1458-1463`) and
+`workflow.py`; this PRD's δ edits `verify.py:6472`, and γ edits `merge_queue.py` at the
+**merge-request boundary** (`:2543` / `:2591`, per §8.2). So there is no merge conflict and no
+correctness coupling, and either order is correct: if δ lands first, 3774's improved instruction
+applies to a smaller (truer) set of escalations; if 3774 lands first, its instruction is simply right
+sooner. What the region overlap *does* mean, and what a naive file-level reading would miss, is that
+**γ and 3774 contend for the same narrow file lock on `merge_queue.py` and will serialize** — a
+scheduling cost, not a dependency. A named relationship is not a dependency edge, and inventing one
+here would serialize two independent fixes for no gain.
 
 ---
 
@@ -501,7 +507,7 @@ widen a timeout as a fix** (§5.5).
 | **η** | Resolution + recurrence: `resolve_debt`, prior-cycle carry-forward, `regressed_after_resolution` L2 | `orchestrator` | A test that re-enters debt after resolution produces an L2 whose detail **cites the prior resolving commit** | ζ |
 | **θ** | Ledger-health sweep as a `BackgroundService` + `FlakeLedgerConfig` (green-tier) + the three classes | `orchestrator` | Each of the three classes files a distinct, deduped L2; `T` and the thresholds change under `reload_config` with `applied` (not `restart_required`) | η |
 | **ι** | `orchestrator flake-ledger` — read-only operator report | `orchestrator` | **Leaf.** The command prints open debt with owning task id + age, per-test recurrence chains, and the three health counters | α |
-| **κ** | Migrate `chronic_flake.py` off JSONL; retire 3-in-20 as a gate; markers become occurrence producers | `orchestrator` | With a `CHRONIC-FLAKY` marker in verify stdout and **no** JSONL file present, an occurrence appears in the report and **no** duplicate de-flake task is filed | ζ |
+| **κ** | Migrate `chronic_flake.py` off JSONL; retire 3-in-20 as a gate; markers become occurrence producers | `orchestrator` | With a `CHRONIC-FLAKY` marker in verify stdout and **no** JSONL file present, an occurrence appears in the report and **no** duplicate de-flake task is filed | ζ, **ι** |
 | **λ** | Integration gate — the §9 boundary suite, both sides of the seam | `orchestrator` | **Leaf.** All 14 rows of §9 pass end-to-end | γ, δ, ε, η, θ, ι, κ |
 
 **Shape.** α+β are the foundation; γ, δ, ε are the three independent vertical slices that each fix one
@@ -552,7 +558,7 @@ Advisory walk at author time; the binding walk is at decompose, over **every** t
 | Inv | Assessment |
 |---|---|
 | **INV-1** `contracts-machine-checked` | **Satisfied by design.** §8 puts the seam in typed signatures + a schema, not prose. §8.2's helper makes local/remote agreement a *value* property (B2 asserts equality of the resolved sets) rather than a comment asking two sites to stay in step. |
-| **INV-2** `structured-facts-at-failure` | **This is the PRD's core move.** `unconfirmable` is today a fact the emitter holds in a variable and drops to an INFO log (`verify.py:7026`); §5.5 promotes it to a typed verdict and a counted row. The occurrence row separates raw observation (`observed_at`, `psi_cpu_some10`, `runner`) from any hypothesis. |
+| **INV-2** `structured-facts-at-failure` | **This is the PRD's core move.** `unconfirmable` is today a fact the emitter holds in a variable and drops to an INFO log (`verify.py:7027`); §5.5 promotes it to a typed verdict and a counted row. The occurrence row separates raw observation (`observed_at`, `psi_cpu_some10`, `runner`) from any hypothesis. |
 | **INV-3** `corroborate-before-acting` | **Satisfied.** Discriminator is SAME-TREE by contract (8.1 inv. 3). `open_debt` re-corroborates `owner_task_id` against **live** task status rather than trusting the stored value (B8 pins it). |
 | **INV-4** `storm-escape-required` | **Satisfied, and it repairs an existing breach.** Suppression is a fail-soft path; §5.6 gives it three counters. ε fixes the case where the streak silently **reset** on the remote path (§5.8) — today's escape hatch is disarmed exactly where load is highest. |
 | **INV-5** `no-lockstep-duplication` | **Central.** Two gates → one discriminator (8.1). Two module-set derivations → one helper (8.2). Both are extractions, not documented conventions. |
