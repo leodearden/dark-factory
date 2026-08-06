@@ -160,12 +160,17 @@ def _systemctl_user_show(unit: str, *properties: str) -> dict[str, str] | None:
 def test_installed_unit_file_restart_backoff_effective() -> None:
     """The INSTALLED unit file's RestartMaxDelaySec= must be paired with RestartSteps=.
 
-    Measured 2026-08-06: the installed copy at ~/.config/systemd/user/
-    orchestrator-know-live.service declares RestartMaxDelaySec=60 with no
+    Expected GREEN on arrival — a regression pin, not the RED signal this
+    module was originally written to add. Measured 2026-08-06, before task
+    3642's GREEN step: the installed copy at ~/.config/systemd/user/
+    orchestrator-know-live.service declared RestartMaxDelaySec=60 with no
     RestartSteps= line — the committed scripts/orchestrator-know-live.service
-    is ahead by exactly that directive (plus its two-line explanatory
-    comment), landed for the whole fleet by commit f7459a1c49 but never
-    propagated to this host for know-live. Reuses
+    was ahead by exactly that directive (plus its two-line explanatory
+    comment), landed for the whole fleet by commit f7459a1c49 but not yet
+    propagated to this host for know-live. Task 3642's step-2 reinstalled
+    the committed template and reloaded the manager, closing that gap; this
+    test now pins the reconciled state so a future stale re-install
+    regresses loudly instead of silently. Reuses
     systemd_unit_invariants.assert_restart_backoff_effective, the same
     RELATIONAL invariant test_systemd_restart_backoff.py already applies to
     the COMMITTED template — this is that same check applied to the
@@ -211,13 +216,16 @@ def test_installed_unit_file_execstart_config_is_canonical() -> None:
 def test_installed_unit_manager_restart_steps_effective() -> None:
     """systemd --user's LOADED view must report RestartSteps=4, not just the file.
 
-    Not redundant with the file-layer check above: `cp`-ing a corrected unit
-    into place without `systemctl --user daemon-reload` leaves the MANAGER
-    holding the old unit, so a file-only check would bless a host whose
-    backoff is still inert. Measured 2026-08-06: `systemctl --user show
-    orchestrator-know-live.service -p RestartSteps` reports RestartSteps=0 —
-    systemd's zero-value default, confirming the manager has not reloaded
-    the RestartSteps=4 line at all.
+    Expected GREEN on arrival — a regression pin, mirroring the file-layer
+    check above. Not redundant with it: `cp`-ing a corrected unit into place
+    without `systemctl --user daemon-reload` leaves the MANAGER holding the
+    old unit, so a file-only check would bless a host whose backoff is still
+    inert. Measured 2026-08-06, before task 3642's GREEN step: `systemctl
+    --user show orchestrator-know-live.service -p RestartSteps` reported
+    RestartSteps=0 — systemd's zero-value default, confirming the manager
+    had not reloaded the RestartSteps=4 line at all. Task 3642's step-2 ran
+    `daemon-reload` and restarted the unit, so this now pins RestartSteps=4
+    as the reconciled state rather than asserting the pre-fix RED.
     """
     _require_installed_unit()
     shown = _systemctl_user_show(UNIT_BASENAME, "RestartSteps")
