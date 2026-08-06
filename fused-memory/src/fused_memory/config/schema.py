@@ -808,11 +808,29 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # into a recycled lane can find .task/plan.json a DANGLING symlink
             # whose worktrees/.task-meta/<lane>/plan.json target was never
             # written or was scrubbed -- the same architect-facing failure as
-            # the two canonical sub-cases, a different cause. 'worktrees/
-            # .task-meta' and 'lane reseed' are its distinctive vocabulary and
-            # are added as ORDINARY phrases (not sufficient): together they
-            # reach the existing min_phrase_hits=2, so a reseed note that
-            # never names an architect tool is now catchable on its own.
+            # the two canonical sub-cases, a different cause. 'lane reseed' is
+            # its distinctive vocabulary and is added as an ORDINARY phrase
+            # (not sufficient): paired with the plan-facing '.task/plan.json'
+            # above it reaches the existing min_phrase_hits=2, so a reseed
+            # note that never names an architect tool is catchable on its own.
+            #
+            # WHY THE BARE LANE PATH IS NOT A PHRASE (reviewer, robustness):
+            # 'worktrees/.task-meta' was first seeded alongside 'lane reseed'
+            # and then removed. It is lane-LIFECYCLE vocabulary, not
+            # architect-facing vocabulary -- the standard lane metadata path
+            # shared by the warm-lane, session-resume and transcript-archival
+            # subsystems -- so an ordinary note about lane recycling ('after a
+            # lane reseed, worktrees/.task-meta/<lane>/ is rewritten by ...')
+            # reached min_phrase_hits on those two phrases ALONE, with no plan
+            # involved at all. That write would have been soft-blocked and
+            # routed to gate 2973, whose hint tells the writer to consolidate
+            # into canonical entries describing the OTHER two sub-cases -- a
+            # remediation instruction that is simply wrong for the note that
+            # tripped it. Unlike every other seeded phrase this one was also
+            # not drawn verbatim from a cited canonical entry (this sub-case
+            # has none). Anchoring on '.task/plan.json' instead keeps the
+            # sub-case blockable while requiring the note to actually be about
+            # a plan, which is the failure the gate adjudicates.
             #
             # NESTING EXCLUSION (the invariant asserted over every seeded
             # cluster): 'warm-lane reseed' is omitted because 'lane reseed'
@@ -829,16 +847,20 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'requeue rebase',
                 'lost-plan reconstruction',
                 'committed TDD steps',
-                'worktrees/.task-meta',
                 'lane reseed',
             ],
             min_phrase_hits=2,
             hint=(
                 'Known-recurring topic (architect plan-revalidation after a '
-                'requeue rebase or lock loss) gated to human task 2973 -- see '
-                'canonical memory 6a96a020-6193-4a7e-82a6-4f27bcf5378e and '
-                '974b0adb-ed54-44bd-aa12-aeaeae8b3ea6. Do NOT add another entry '
-                '-- update/consolidate the existing entries, or add context to '
+                'requeue rebase, a lock loss, or a warm-lane reseed that left '
+                '.task/plan.json a dangling symlink) gated to human task 2973 '
+                '-- see canonical memory 6a96a020-6193-4a7e-82a6-4f27bcf5378e '
+                '(plan.json gitignore wipe) and 974b0adb-ed54-44bd-aa12-'
+                'aeaeae8b3ea6 (lost-plan reconstruction). The reseed sub-case '
+                'has no canonical entry yet, so if that is what you are writing '
+                'up, add it as context on gate task 2973 rather than merging it '
+                'into either entry above. Do NOT add another entry -- '
+                'update/consolidate the existing entries, or add context to '
                 'gate task 2973.'
             ),
         ),

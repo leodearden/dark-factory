@@ -1590,6 +1590,28 @@ def _seeded_cluster(topic_id: str) -> ProceduralTopicCluster:
     return next(c for c in clusters if c.topic_id == topic_id)
 
 
+# --- Topic-guard note fixtures shared with tests/server/test_add_memory_near_duplicate_gate.py
+#
+# These are module-level (not class attributes) because the end-to-end gate
+# suite imports them: the same note must drive both the pure-matcher assertions
+# here and the whole-tool assertions there, or an edit to one copy would leave
+# the other silently exercising a different scenario (task 3054, reviewer:
+# duplication).
+
+STRADDLING_WRITE_FIXTURE = (
+    'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
+    'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
+    'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
+    'was scrubbed. The architect then sees no plan and may wrongly call '
+    'report_task_already_done instead of replanning.'
+)
+
+MERGE_BASE_NEGATIVE_CONTROL_NOTE = (
+    'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
+    'commit is an ancestor of a branch tip before cherry-picking.'
+)
+
+
 class TestProceduralTopicGuardClustersDefault:
     """ReconciliationConfig seeds all known topic-guard clusters by default.
 
@@ -1697,11 +1719,7 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
         # Only 'merge-base --is-ancestor' occurs here (1 distinct hit) -- a
         # plain git-ancestry-check note unrelated to report_task_already_done
         # must NOT reach min_phrase_hits and mis-route to gate 3011.
-        unrelated_note = (
-            'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
-            'commit is an ancestor of a branch tip before cherry-picking.'
-        )
-        assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
+        assert find_matching_topic_cluster(MERGE_BASE_NEGATIVE_CONTROL_NOTE, [cluster]) is None
 
 
 class TestArchitectPlanRevalidationRequeueLockCluster:
@@ -1722,7 +1740,6 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
             'requeue rebase',
             'lost-plan reconstruction',
             'committed TDD steps',
-            'worktrees/.task-meta',
             'lane reseed',
         ]
         assert cluster.min_phrase_hits == 2
@@ -1750,26 +1767,19 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         )
         assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
 
-    def test_cluster_covers_the_warm_lane_reseed_subcase(self):
+    def test_matches_a_reseed_note_that_names_no_architect_tool(self):
         """Third sub-case (task 3054): a reseed leaving a dangling .task/plan.json symlink.
 
         Sibling of the two canonical sub-cases (plan_json_gitignore_wipe,
         lost_plan_reconstruction) -- same failure for the architect, a
         different cause: the lane was recycled and the symlink's
         worktrees/.task-meta target was never written or was scrubbed.
-        """
-        cluster = _seeded_cluster(self.TOPIC_ID)
-        assert 'worktrees/.task-meta' in cluster.phrases
-        assert 'lane reseed' in cluster.phrases
-
-    def test_matches_a_reseed_note_that_names_no_architect_tool(self):
-        """The sub-case must be caught on its OWN vocabulary, at the ordinary 2-hit bar.
 
         A reseed note that never mentions report_task_already_done cannot
-        rely on that cluster's sufficient phrases, so these additive
-        phrases are what makes it blockable. Matched against the FULL
-        default list to prove it routes here rather than to an earlier
-        cluster.
+        rely on that cluster's sufficient phrases, so 'lane reseed' paired
+        with the plan-facing '.task/plan.json' is what makes it blockable.
+        Matched against the FULL default list to prove it routes here rather
+        than to an earlier cluster.
         """
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         note = (
@@ -1779,6 +1789,25 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         result = find_matching_topic_cluster(note, clusters)
         assert result is not None
         assert result[0].topic_id == self.TOPIC_ID
+
+    def test_does_not_match_a_pure_lane_lifecycle_note(self):
+        """NEGATIVE CONTROL: lane vocabulary alone, with no plan involved, must not block.
+
+        'worktrees/.task-meta' is the standard lane metadata path shared by
+        the warm-lane / session-resume / transcript-archival subsystems, so
+        seeding it beside 'lane reseed' would have let an ordinary note about
+        lane recycling reach min_phrase_hits with no plan mentioned at all --
+        and routed it to gate 2973, whose hint is about lost plans. The
+        sub-case is anchored on '.task/plan.json' instead; this pins that the
+        lane path is NOT a phrase.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'After a lane reseed the whole worktrees/.task-meta/<lane>/ directory '
+            'is rewritten by the warm-lane claim path, so anything an operator '
+            'dropped there by hand is gone.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
 
     def test_does_not_match_a_generic_dangling_symlink_note(self):
         # Why bare 'dangling' was rejected as a phrase: it fires on ordinary
@@ -1825,64 +1854,25 @@ class TestStraddlingThreeClustersRegression:
     none -- even though ``report_task_already_done`` is an identifier that
     unambiguously names cluster 3's topic on its own.
 
+    THE REPORTED SIGNATURE, for the record: against the phrase lists as they
+    stood before this task, :data:`STRADDLING_WRITE_FIXTURE` scored exactly
+    one distinct hit in each of three clusters -- ``plan.json`` in
+    eval-worktree-plan-tools-missing, ``report_task_already_done`` in
+    architect-report-task-already-done-main-reachability, and
+    ``.task/plan.json`` in architect-plan-revalidation-requeue-lock. All
+    three sat below ``min_phrase_hits=2``, which is precisely why nothing
+    fired. (Recorded here rather than asserted: an assertion would need
+    frozen copies of those three phrase lists, which exercise no production
+    code and rot silently as the seed evolves. The outcome test and the two
+    negative controls below all call ``find_matching_topic_cluster``.)
+
     FIXTURE PROVENANCE: reconstructed from the task-3054 description
     because reify Mem0 entry 5697ff2f-4f9b-49bb-be89-5643b94802ec now
     returns ``found=false`` (deleted or consolidated since the 2026-07-25
-    filing), so its verbatim text is unrecoverable. The reconstruction is
-    made SELF-VALIDATING by the characterization test below, which asserts
-    the fixture reproduces the reported one-hit-in-each-of-three signature
-    before the outcome test asserts it is now blocked -- so this pins the
-    defect SHAPE rather than trusting the reconstruction.
+    filing), so its verbatim text is unrecoverable.
     """
 
-    FIXTURE = (
-        'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
-        'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
-        'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
-        'was scrubbed. The architect then sees no plan and may wrongly call '
-        'report_task_already_done instead of replanning.'
-    )
-
-    # The three clusters' phrase lists AS THEY STOOD BEFORE this task, pinned as
-    # LITERALS rather than read from the live seed on purpose: the
-    # plan-revalidation cluster gains two phrases that this fixture also matches,
-    # so a characterization written against the live seed would pass here and
-    # then silently stop characterizing the defect.
-    PRE_FIX_PHRASES = {
-        'eval-worktree-plan-tools-missing': [
-            'plan-tools',
-            'plan_tools',
-            'plan.json',
-            'eval-worktree',
-            'eval worktree',
-            'create_plan',
-            'add_plan_step',
-        ],
-        'architect-report-task-already-done-main-reachability': [
-            'report_task_already_done',
-            'main-reachable',
-            'merge-base --is-ancestor',
-            '_handle_already_done_report',
-        ],
-        'architect-plan-revalidation-requeue-lock': [
-            '.task/plan.json',
-            'plan-revalidation',
-            'requeue rebase',
-            'lost-plan reconstruction',
-            'committed TDD steps',
-        ],
-    }
-
-    def test_fixture_reproduces_the_reported_one_hit_per_cluster_signature(self):
-        """CHARACTERIZATION: exactly one distinct phrase hits in each of three clusters.
-
-        This is what made the write unblockable under count-only matching:
-        three clusters at 1 hit each, all below ``min_phrase_hits=2``.
-        """
-        content_lower = self.FIXTURE.lower()
-        for topic_id, phrases in self.PRE_FIX_PHRASES.items():
-            hits = sorted({p.lower() for p in phrases if p.lower() in content_lower})
-            assert len(hits) == 1, f'{topic_id} expected exactly 1 pre-fix hit, got {hits}'
+    FIXTURE = STRADDLING_WRITE_FIXTURE
 
     def test_fixture_is_now_blocked_and_routes_to_the_report_task_already_done_gate(self):
         """OUTCOME: the identifier-shaped phrase now qualifies its cluster alone.
@@ -1904,11 +1894,7 @@ class TestStraddlingThreeClustersRegression:
         become blockable just because its cluster gained sufficient phrases.
         """
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        note = (
-            'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
-            'commit is an ancestor of a branch tip before cherry-picking.'
-        )
-        assert find_matching_topic_cluster(note, clusters) is None
+        assert find_matching_topic_cluster(MERGE_BASE_NEGATIVE_CONTROL_NOTE, clusters) is None
 
     def test_main_reachable_alone_still_does_not_match(self):
         """NEGATIVE CONTROL: 'main-reachable' is too generic to be sufficient."""

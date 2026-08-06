@@ -12,6 +12,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+# Shared note fixtures, owned by the pure-matcher suite. Imported rather than
+# copied so the two suites cannot drift: an edit to the straddling note (e.g.
+# adding or removing a phrase hit) must move BOTH the matcher assertions there
+# and the whole-tool assertions here, instead of leaving one silently
+# exercising a different scenario (task 3054, reviewer: duplication).
+# ``tests/`` is on sys.path for anything under it (no ``tests/__init__.py``),
+# which is how pytest's prepend import mode already imports this file.
+from test_config_schema import (
+    MERGE_BASE_NEGATIVE_CONTROL_NOTE,
+    STRADDLING_WRITE_FIXTURE,
+)
+
 from fused_memory.config.schema import ProceduralTopicCluster, ReconciliationConfig
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -756,19 +768,14 @@ class TestAddMemorySufficientPhraseGate:
     rather than the synthetic ``_topic_cluster()``, so the clusters agents
     actually hit in production are exercised through the whole tool path.
 
-    The content is the reconstructed straddling-write fixture from
-    ``tests/test_config_schema.py::TestStraddlingThreeClustersRegression`` --
-    one distinct phrase in each of three clusters, which under count-only
-    matching was blocked by none.
+    The content is the reconstructed straddling-write fixture IMPORTED from
+    ``tests/test_config_schema.py`` -- one distinct phrase in each of three
+    clusters, which under count-only matching was blocked by none. Importing
+    rather than copying keeps this end-to-end assertion and the pure-matcher
+    assertions pinned to the same scenario.
     """
 
-    STRADDLING_CONTENT = (
-        'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
-        'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
-        'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
-        'was scrubbed. The architect then sees no plan and may wrongly call '
-        'report_task_already_done instead of replanning.'
-    )
+    STRADDLING_CONTENT = STRADDLING_WRITE_FIXTURE
 
     @staticmethod
     def _configure_real_clusters(mock_service: AsyncMock) -> None:
@@ -879,10 +886,7 @@ class TestAddMemorySufficientPhraseGate:
         result = await server._tool_manager.call_tool(
             'add_memory',
             {
-                'content': (
-                    'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
-                    'commit is an ancestor of a branch tip before cherry-picking.'
-                ),
+                'content': MERGE_BASE_NEGATIVE_CONTROL_NOTE,
                 'category': 'procedural_knowledge',
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
