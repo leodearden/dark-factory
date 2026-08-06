@@ -28,6 +28,7 @@ from graphiti_core.helpers import validate_group_ids
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
+from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_fulltext import build_query
@@ -159,9 +160,23 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 # dropped in favour of the openai SDK default.
                 base_url=cfg.llm.providers.openai.api_url,
             )
-            check_openai_responses_api()
-            llm_client = OpenAIClient(config=llm_config)
-            logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
+            llm_client: LLMClient
+            if cfg.llm.client_class == 'openai_generic':
+                # No preflight on this arm — deliberately. Its sole purpose is
+                # to guard OpenAIClient's client.responses.create call (see
+                # check_openai_responses_api above); OpenAIGenericClient drives
+                # chat.completions and never resolves that SDK surface, so the
+                # check is both unnecessary here and actively harmful — it
+                # would abort an otherwise-valid local endpoint on a
+                # requirement that endpoint does not have.
+                llm_client = OpenAIGenericClient(config=llm_config)
+            else:
+                check_openai_responses_api()
+                llm_client = OpenAIClient(config=llm_config)
+            logger.info(
+                f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
+                f'({type(llm_client).__name__})'
+            )
             return llm_client
     elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
         api_key = cfg.llm.providers.anthropic.api_key
