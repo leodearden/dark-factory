@@ -410,13 +410,33 @@ async def open_debt(
     ensure_schema(db_path)
     conn = _connect(db_path)
     try:
+        # ONE statement, deliberately.  SQL evaluates every SET right-hand side against
+        # the PRE-UPDATE row, so all three CASE guards observe the OLD `resolved_at`
+        # even though the same clause sets it to NULL — which is what lets a re-entry
+        # (was resolved) and an ordinary repeat (still open) be distinguished without a
+        # prior SELECT.  Verified empirically on SQLite 3.50.4: open_count=2,
+        # prior_resolved_at=the old resolved_at, resolved_at=NULL, opened_at advanced.
+        #
+        # Splitting this into SELECT-then-UPDATE would reintroduce exactly the
+        # read-modify-write race §5.1 chose SQLite to avoid, inside the ledger itself:
+        # two merge lanes suppressing the same test could interleave and lose a cycle.
+        #
+        # `prior_resolving_commit` is deliberately NOT touched — `resolve_debt` already
+        # wrote it, and it must survive the re-open verbatim for η's
+        # regressed_after_resolution citation.
         conn.execute(
             'INSERT INTO flake_debt (test_id, project_id, opened_at, open_count, '
             ' last_occurrence_at) '
             'VALUES (?, ?, ?, 1, ?) '
             'ON CONFLICT(test_id) DO UPDATE SET '
-            '    last_occurrence_at = excluded.last_occurrence_at',
-            # step-18 completes the DO UPDATE with the re-entry carry-forward.
+            '    last_occurrence_at = excluded.last_occurrence_at, '
+            '    open_count        = open_count '
+            '                        + (CASE WHEN resolved_at IS NOT NULL THEN 1 ELSE 0 END), '
+            '    opened_at         = CASE WHEN resolved_at IS NOT NULL '
+            '                        THEN excluded.opened_at ELSE opened_at END, '
+            '    prior_resolved_at = CASE WHEN resolved_at IS NOT NULL '
+            '                        THEN resolved_at ELSE prior_resolved_at END, '
+            '    resolved_at       = NULL',
             (test_id, project_id, stamp, stamp),
         )
         conn.commit()
