@@ -11,12 +11,15 @@ structurally unreachable from these tests rather than merely monkeypatched
 away. No FalkorDriver, no Graphiti client, no real graph is touched here.
 """
 
-from unittest.mock import MagicMock, patch
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+from graphiti_core.prompts.models import Message
+from pydantic import BaseModel
 
 import fused_memory.backends.graphiti_client as graphiti_client_module
 from fused_memory.backends.graphiti_client import build_llm_client
@@ -211,6 +214,169 @@ class TestBuildLLMClientOpenAIGenericPath:
 
         assert client is fake_anthropic_cls.return_value
         assert not isinstance(client, OpenAIGenericClient)
+
+
+class _Inner(BaseModel):
+    """Nested submodel — its presence is what makes model_json_schema() emit
+    ``$defs``/``$ref``, which is the exact shape llama.cpp#21228 silently
+    ignores."""
+
+    name: str
+
+
+class _Outer(BaseModel):
+    items: list[_Inner]
+    note: str
+
+
+def _fake_openai_client(content: str = '{"ok": true}') -> MagicMock:
+    """A stand-in for AsyncOpenAI, injected via OpenAIGenericClient(client=...).
+
+    That constructor argument bypasses AsyncOpenAI construction entirely, so
+    the client under test issues no network call.
+    """
+    message = MagicMock()
+    message.content = content
+    choice = MagicMock()
+    choice.message = message
+    response = MagicMock()
+    response.choices = [choice]
+
+    fake = MagicMock()
+    fake.chat.completions.create = AsyncMock(return_value=response)
+    return fake
+
+
+def _messages() -> list[Message]:
+    return [
+        Message(role='system', content='You extract entities.'),
+        Message(role='user', content='Alice knows Bob.'),
+    ]
+
+
+class TestForceJsonObjectOpenAIGenericClient:
+    """The json_object forcing wrapper.
+
+    Driven through the client's own ``client=`` injection seam rather than the
+    network — construction and request shaping only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_forces_json_object_despite_a_response_model(self):
+        """The whole point: a response_model is passed, yet the request still
+        asks for json_object."""
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        fake = _fake_openai_client()
+        client = ForceJsonObjectOpenAIGenericClient(
+            config=GraphitiLLMConfig(api_key='k', model='m'), client=fake,
+        )
+
+        await client.generate_response(_messages(), response_model=_Outer)
+
+        kwargs = fake.chat.completions.create.call_args.kwargs
+        assert kwargs['response_format'] == {'type': 'json_object'}
+
+    @pytest.mark.asyncio
+    async def test_stock_client_sends_json_schema_with_refs(self):
+        """Control assertion — pins that the wrapper changes REAL upstream
+        behaviour, and that the schema genuinely contains $defs/$ref.
+
+        Without this, a future graphiti-core wheel that inlined the schema (or
+        stopped using json_schema at all) would make the wrapper silently
+        pointless while every other assertion here stayed green.
+        """
+        fake = _fake_openai_client()
+        client = OpenAIGenericClient(
+            config=GraphitiLLMConfig(api_key='k', model='m'), client=fake,
+        )
+
+        await client.generate_response(_messages(), response_model=_Outer)
+
+        response_format = fake.chat.completions.create.call_args.kwargs['response_format']
+        assert response_format['type'] == 'json_schema'
+        schema = response_format['json_schema']['schema']
+        assert '$defs' in schema, (
+            'expected a nested-model schema to carry $defs — if upstream started '
+            'inlining it, the forcing wrapper is no longer load-bearing'
+        )
+        assert '$ref' in json.dumps(schema)
+
+    @pytest.mark.asyncio
+    async def test_override_changes_nothing_but_the_response_format(self):
+        """Everything else the request carries is untouched by the override —
+        so retry, tracing and message construction are unaffected."""
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        config = GraphitiLLMConfig(api_key='k', model='m', temperature=0.3)
+
+        stock_fake = _fake_openai_client()
+        forced_fake = _fake_openai_client()
+        stock = OpenAIGenericClient(config=config, client=stock_fake)
+        forced = ForceJsonObjectOpenAIGenericClient(config=config, client=forced_fake)
+
+        await stock.generate_response(_messages(), response_model=_Outer)
+        await forced.generate_response(_messages(), response_model=_Outer)
+
+        stock_kwargs = dict(stock_fake.chat.completions.create.call_args.kwargs)
+        forced_kwargs = dict(forced_fake.chat.completions.create.call_args.kwargs)
+        stock_kwargs.pop('response_format')
+        forced_kwargs.pop('response_format')
+        assert stock_kwargs == forced_kwargs
+
+    @pytest.mark.asyncio
+    async def test_returns_the_parsed_payload(self):
+        """The response is still json.loads'd and returned normally."""
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        fake = _fake_openai_client('{"ok": true}')
+        client = ForceJsonObjectOpenAIGenericClient(
+            config=GraphitiLLMConfig(api_key='k', model='m'), client=fake,
+        )
+
+        result = await client.generate_response(_messages(), response_model=_Outer)
+
+        assert result == {'ok': True}
+
+
+class TestStructuredOutputModeSelection:
+    """build_llm_client wiring for llm.structured_output_mode."""
+
+    def test_json_object_mode_selects_the_forcing_subclass(self, mock_config):
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        mock_config.llm.client_class = 'openai_generic'
+        mock_config.llm.structured_output_mode = 'json_object'
+
+        client = build_llm_client(mock_config)
+
+        assert isinstance(client, ForceJsonObjectOpenAIGenericClient)
+
+    def test_auto_mode_selects_the_stock_client(self, mock_config):
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        mock_config.llm.client_class = 'openai_generic'
+        mock_config.llm.structured_output_mode = 'auto'
+
+        client = build_llm_client(mock_config)
+
+        assert isinstance(client, OpenAIGenericClient)
+        assert not isinstance(client, ForceJsonObjectOpenAIGenericClient)
+
+    def test_mode_is_inert_on_the_default_openai_arm(self, mock_config, monkeypatch):
+        """structured_output_mode applies ONLY to the generic client."""
+        from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+
+        monkeypatch.setattr(
+            graphiti_client_module, 'check_openai_responses_api', lambda: None,
+        )
+        mock_config.llm.client_class = 'openai'
+        mock_config.llm.structured_output_mode = 'json_object'
+
+        client = build_llm_client(mock_config)
+
+        assert isinstance(client, OpenAIClient)
+        assert not isinstance(client, ForceJsonObjectOpenAIGenericClient)
 
 
 class TestBuildLLMClientBranchPreservation:
