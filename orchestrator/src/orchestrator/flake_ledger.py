@@ -41,11 +41,22 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 logger = logging.getLogger(__name__)
+
+# Sentinel test_id for an `unconfirmable` observation that identified no node-ids.
+# The observation is still COUNTED — θ's class-1 health check is an `unconfirmable`
+# RATE, so dropping the row because no node-ids were resolved would make "could not
+# even determine which tests failed" invisible, reproducing the exact blindness this
+# PRD exists to end.  The angle-bracket form cannot collide with a real pytest
+# node-id.  It must NEVER be passed to `open_debt`: a sentinel names no test, so it
+# can own no de-flake task.
+UNKNOWN_TEST_ID = '<unknown>'
 
 # PRD §5.3 verbatim.  Additive `CREATE TABLE IF NOT EXISTS` with no `PRAGMA
 # user_version` ladder — the event_store.py:23-41 / run_store.py:18-76 idiom, and
@@ -86,6 +97,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_flake_occurrence_dedup
 CREATE INDEX IF NOT EXISTS idx_flake_occurrence_observed
     ON flake_occurrence(observed_at);
 """
+
+
+class FlakeVerdict(StrEnum):
+    """What a discriminator concluded about a failing test (PRD §8).
+
+    §5.5: the vocabulary names the OBSERVATION, never the remedy — ``passes_in_isolation``,
+    never ``flaky_test: true``.  One discriminator serves both merge gates, so this is
+    what keeps them from drifting into different notions of "passes in isolation".
+    """
+
+    passes_in_isolation = 'passes_in_isolation'  # re-ran clean, isolated + serial → suppressible
+    fails_in_isolation = 'fails_in_isolation'  # re-ran and failed → a real red
+    unconfirmable = 'unconfirmable'  # could not map node-ids / could not re-run
+
+
+@dataclass(frozen=True)
+class FlakeSuppression:
+    """Discriminator output. Produced WHEREVER the worktree is (local or remote);
+    consumed ONLY on the dispatcher. Rides VerifyResult across the wire."""
+
+    verdict: FlakeVerdict
+    test_ids: tuple[str, ...]  # node-ids examined — EMPTY is legal only for `unconfirmable`
+    observed_at: str  # ISO-8601 UTC, stamped by the DISCRIMINATOR at observation
+    call_site: str  # 'merge_gate' | 'main_probe' | 'chronic_marker'
+    runner: str  # 'local' | remote host name — WHERE the re-run ran
+    psi_cpu_some10: float | None  # shared.psi at observation; None when read_ok is False
+    unconfirmable_reason: str | None  # populated iff verdict is unconfirmable
 
 
 def ledger_db_path(project_root: Path) -> Path:
