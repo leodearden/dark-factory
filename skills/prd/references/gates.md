@@ -163,7 +163,7 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 **Level:** **block** (decompose) when the project has adopted an invariant list; **advisory** when it has not (see *Application* below), and advisory in author mode either way (walk the sketch against the questions early — cheapest fix point).
 
-**What it catches.** Designs that re-introduce a project's known cross-cutting root causes. Dark-factory's five come from the agent-legibility survey (§3): prose contracts, log-scraped stories, uncorroborated action, silent fail-soft, lock-step duplication. Another project's list is derived from *its* own failure history and will name different causes.
+**What it catches.** Designs that re-introduce a project's known cross-cutting root causes. Five of dark-factory's eight come from the agent-legibility survey (§3): prose contracts, log-scraped stories, uncorroborated action, silent fail-soft, lock-step duplication. The later three come from incident investigations rather than the survey — stale ownership status (INV-6, 2026-08-02), unowned or unbounded holds (INV-7, 2026-08-02), unbounded event-loop occupancy (INV-8, 2026-08-06). Another project's list is derived from *its* own failure history and will name different causes.
 
 **Application (decompose).** After the G6 re-check, Read **the decomposing project's own** `docs/legibility/design-invariants.md` — the path is project-relative, and that project's file is the single normative list for its batches; do **not** restate the invariants in this section beyond their slugs, per `no-lockstep-duplication`. Walk **every task in the batch** (not only leaves — violations attach to mechanisms, which intermediates introduce too) against each invariant's checkable question.
 
@@ -171,16 +171,16 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 | Project | Family |
 |---|---|
-| dark-factory | INV-1..7 — `contracts-machine-checked`, `structured-facts-at-failure`, `corroborate-before-acting`, `storm-escape-required`, `no-lockstep-duplication`, `status-matches-liveness`, `holds-owned-and-bounded` (the doc is normative — walk whatever it contains, this row is illustrative) |
+| dark-factory | INV-1..8 — `contracts-machine-checked`, `structured-facts-at-failure`, `corroborate-before-acting`, `storm-escape-required`, `no-lockstep-duplication`, `status-matches-liveness`, `holds-owned-and-bounded`, `loop-thread-occupancy-bounded` (the doc is normative — walk whatever it contains, this row is illustrative) |
 | reify | INV-SF-1..6 (silent-failure) — `undef-has-provenance`, `error-severity-exits-nonzero`, `declared-intent-consumed-or-diagnosed`, `indeterminate-attributable-transient`, `placeholders-owned-and-loud`, `diagnostics-carry-codes` |
 
 **If the project has no such file** — most targets don't — G7 is **advisory, not blocking**: screen the batch against the dark-factory trigger shapes below, record any hit in the decomposition record, and do not block on a list the project never adopted. Note the fallback explicitly rather than skipping G7 silently.
 
-Trigger shapes (dark-factory's family — illustrative of the *method*; re-derive the equivalents from whichever list is normative): adds a detector/suppressor/fallback without a storm escape (`storm-escape-required`)? a tool without a declared filter/envelope convention (`contracts-machine-checked`)? a contract in prose (`contracts-machine-checked`)? a log-scrape of emitter-known facts (`structured-facts-at-failure`)? action on snapshot state without corroboration (`corroborate-before-acting`)? duplicated lock-step logic (`no-lockstep-duplication`)?
+Trigger shapes (dark-factory's family — illustrative of the *method*; re-derive the equivalents from whichever list is normative): adds a detector/suppressor/fallback without a storm escape (`storm-escape-required`)? a tool without a declared filter/envelope convention (`contracts-machine-checked`)? a contract in prose (`contracts-machine-checked`)? a log-scrape of emitter-known facts (`structured-facts-at-failure`)? action on snapshot state without corroboration (`corroborate-before-acting`)? duplicated lock-step logic (`no-lockstep-duplication`)? a coroutine doing blocking or unbounded per-item work on the event-loop thread (`loop-thread-occupancy-bounded`)?
 
 **Resolution.** Redesign the task (add the streak counter, move the contract to a schema field/lint, add the corroboration step, extract the helper) — or **waive**: record `G7 waiver: <slug> — <rationale>` in the PRD's decomposition-plan row AND stamp `metadata.g7_waivers: [{"invariant": <slug>, "rationale": <text>}]` on the filed task. An unresolved, unwaived hit blocks the batch.
 
-**Calibration:** `docs/legibility/design-invariants-fixtures.md` (dark-factory; landed 2026-07-14, commit `df9f4dcf9d`) holds the seeded-violation fixtures — one PRD-leaf-shaped (`INV-N-PRD`) and one code-snippet-shaped (`INV-N-CODE`) per invariant — plus the rehearsal verdict table (10 rows for INV-1..5; a 2026-08-02 addendum walk covers INV-6..7), for calibrating this walk against dark-factory's family. A project with its own invariant family has its own fixtures or none.
+**Calibration:** `docs/legibility/design-invariants-fixtures.md` (dark-factory; landed 2026-07-14, commit `df9f4dcf9d`) holds the seeded-violation fixtures — one PRD-leaf-shaped (`INV-N-PRD`) and one code-snippet-shaped (`INV-N-CODE`) per invariant — plus the rehearsal verdict table (10 rows for INV-1..5; a 2026-08-02 addendum walk covers INV-6..7; a 2026-08-06 addendum walk covers INV-8), for calibrating this walk against dark-factory's family. A project with its own invariant family has its own fixtures or none.
 
 ---
 
