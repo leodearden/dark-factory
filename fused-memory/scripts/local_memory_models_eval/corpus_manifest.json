@@ -1,0 +1,1332 @@
+{
+  "criteria": {
+    "allocation_rule": "min-1-floor + largest-remainder proportional, capped at cell size",
+    "builder_version": 1,
+    "graph": "dark_factory",
+    "n": 200,
+    "n_rationale": "N=200 is delta (δ)'s provisional choice: the midpoint of the PRD's 150-300 band, checked against the measured census so that all 16 non-empty cells receive at least one seat. PRD Open Q4 defers the FINAL corpus size to zeta (ζ), to be settled from measured control variance and wall-clock. Because selection is a prefix of a per-cell seeded permutation, zeta can re-run this builder at a different N without invalidating replays epsilon (ε) has already completed.",
+    "population_size": 2775,
+    "seed": "local-memory-models-eval:corpus:v1",
+    "selection_rule": "per cell: canonical uuid sort -> seeded permutation -> take the first allocate() entries (a PREFIX, so growing N only appends)",
+    "stratification_dimensions": [
+      "month(created_at)",
+      "payload_kind(source_description)"
+    ],
+    "window": {
+      "max_created_at": "2026-08-05T23:36:02.230302+00:00",
+      "min_created_at": "2026-04-06T00:19:33.967261+00:00"
+    }
+  },
+  "episodes": [
+    {
+      "content_hash": "296a0e8364d0c43c069f40859053281fdaa60dacde133a65e03ebc26219b3170",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "8ed66f45-dde5-4c43-9812-9136d45beb6e"
+    },
+    {
+      "content_hash": "94708084634a54e0e22310c12204fb73ec29e589c3fce7fd0d65224fbd5c36e6",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "62f8f47b-42b5-47a3-95f6-64a8f1c8cead"
+    },
+    {
+      "content_hash": "f1b370c0f1a3cc8d60cdf91c0e704442a0206763fec91897e8b96708aa74368c",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "026c9418-e82c-4793-a6a3-ab1421e5eff3"
+    },
+    {
+      "content_hash": "afcaea48ec8db82fc5de7e5d44141c7d5557aec264d6e297ac16412fba80d51e",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "3137f2d8-0e96-4269-a91f-a199f50a96ad"
+    },
+    {
+      "content_hash": "ed9e72363050c56d5d19af47e74afa6bf9a9b6db848fc47a3f138708725c4f33",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "32589460-bc9c-43e0-ac07-440933459352"
+    },
+    {
+      "content_hash": "3bb5def91c6a61e6113e7ae9932c1b9f70f14000ec6497aaf97dec214d0959ec",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "b802d45a-c2a6-4280-b57e-6a8d4028c8de"
+    },
+    {
+      "content_hash": "58d2ca67f58c2382b3af89fdb1ec0f3215defd1a4d420a120919d5654c8bf099",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "64b321da-682d-4f77-8e08-03519297dda1"
+    },
+    {
+      "content_hash": "11f98fc62009574a4ba3ba0736742a0e098e94e2e3987b736e9aeb735e273441",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "d70d0823-a301-4338-aa6e-892e0e606d19"
+    },
+    {
+      "content_hash": "5426e75c24dfb45f79051f56382d8609140b3f007085c284373307b22b6e90ad",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "165d9abb-81d4-413c-9a62-64eb766e7c5e"
+    },
+    {
+      "content_hash": "15bb15733860993d679e32b78421a654c20254e4f45f00b4febf404f2fb351d6",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "8ae5fcb9-c3b9-4800-953b-de7d69e6e076"
+    },
+    {
+      "content_hash": "2696a13fa672897fd66111a423acffd2401a6cd31c3748bac7498671420ce219",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "61902ad3-f65e-4006-9cde-fc24d2bd471d"
+    },
+    {
+      "content_hash": "130af3d029508d2bd8f59d192ef4213c48e121c89c3b255c719d03533ce54d0a",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "75953add-52fa-4d1b-9d7a-46f0f46f6c11"
+    },
+    {
+      "content_hash": "9e05126af1b9e37d2a3e5a8e4af8f63f3f19ab493a29a71a7e6caedd1926980d",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "a31c41da-1d5f-47f8-8e24-0fbbde88730e"
+    },
+    {
+      "content_hash": "66c28308fe26b707adc4418082faf9e895a9d6aadf48cd2ca85bca27c54d96fd",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "9d64ef76-c7b9-4f89-97cb-3c38197b7333"
+    },
+    {
+      "content_hash": "29fcef7fa91be7c0b093c7dc3118cb178897d28532edd49551ef7ac3512c4ea3",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "5bc03dd2-8b8b-497a-af0c-b21cd588dbfa"
+    },
+    {
+      "content_hash": "2db52e14fe8cd2a2976d728ab38aa4b042554e89f0e54c70c660a33c5d81925c",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "54d29441-2736-4c8b-8c6f-b29f4d9ab3e9"
+    },
+    {
+      "content_hash": "f4cf8364cbe6dceef416adc887dc0e8a3458141c5af18282c973362f1eb07be8",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "36a29883-4d90-4e8d-8b2b-ce3216957fb3"
+    },
+    {
+      "content_hash": "d1287efaf1ae117ff96883739f212ac70dfcf35fec44f3d81f7a9811ddf8f66e",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "202366f4-73fb-4d0e-b1e8-5ed67c78736f"
+    },
+    {
+      "content_hash": "9f5056a3e2288f637b324265365d6fc7c20726909157db4ae3d198acafbca3e3",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "aaf1c209-307a-46d6-9a26-faa296c2e090"
+    },
+    {
+      "content_hash": "bff70c5f17acddabb1a1966cf118a7ed7947d18684989222eb7d22abd48a7e60",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "1b3fb06c-ace7-4ee9-8812-5e2675fdf0e4"
+    },
+    {
+      "content_hash": "141b3837245dfc730a36027addcf03ef815a9f42d0883cbf372f9dc4b7b2c976",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "fcfaa603-d74e-48f8-996f-385dfd554e63"
+    },
+    {
+      "content_hash": "bfa97e2beb46ea481f5f271a102a038aca0f127a36f7d6b3035bf281c469b50b",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "068f1cda-0292-45db-8a31-895a472b614a"
+    },
+    {
+      "content_hash": "47562089efa44908d02f81680d4ea7acfb37d7cfc3727c295f5ab050463c7b87",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "cc37ccbe-63c6-4b63-8378-58c095a81cd8"
+    },
+    {
+      "content_hash": "cd6278b5c0c0037e5a8d438ea719bb1f04241a81d6d2a39972e71133b80323a5",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "a2b7b84d-e8ad-4c3d-9511-93820f0cf176"
+    },
+    {
+      "content_hash": "fa544a2d597fb684164b6cc4fcbf0b0e2e7f695a698f47a4635bae3f75033a1c",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "dd72b482-2f9c-4039-bfe2-6321980ab5ae"
+    },
+    {
+      "content_hash": "8c68bfb3016fc32af143939fa1153e7b8293d24df2e8fe04cd1aa93e90a92d41",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "5a633a18-cedb-41cb-bdc1-90e89b686357"
+    },
+    {
+      "content_hash": "93cca814441eda1cb887b7a71b9abfa82075abccc8628b1e4c6d7bfc9b56611e",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "a73f6e36-ef74-420d-9daf-820e828282e4"
+    },
+    {
+      "content_hash": "a4e3ba6755236ad61fe723ea4491e6768c2ea176ddd05ca9eaf9a980de4bbdad",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "f09863e6-6548-4adc-8c36-4d56459b2c21"
+    },
+    {
+      "content_hash": "03ee89ef5156b138d969825b967fd1530481c573b362a1d72790e54e5feb5895",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "e701d129-05fd-4840-99b3-926a38639f13"
+    },
+    {
+      "content_hash": "a53adbe3e3d37cf44e1e347e2030ec610b695cb08b317b4604c3e15c5a344501",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "f559591e-0bf9-4421-a769-3c20efddf1f9"
+    },
+    {
+      "content_hash": "ca43f85ccc8156acf3932b805af883eac5d8c8163857e2dd5c22a254de87a9d1",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "0b84a844-43e9-4d39-a814-b72326b089ad"
+    },
+    {
+      "content_hash": "dc3c7a6aef9efc09faa2d6ca89abc9c1a1a6bcec90df79b1d0703b67e324d0a8",
+      "month": "2026-04",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "53d42fec-e970-4d54-8eca-d5d02384995d"
+    },
+    {
+      "content_hash": "2ecef6509ad8159c62dcdc47f78117508304969b6a2ce21930eb00d558ee6f1c",
+      "month": "2026-04",
+      "payload_kind": "entities_and_relations",
+      "uuid": "ca67d37d-3f4a-4e9e-a0dc-2d178680132f"
+    },
+    {
+      "content_hash": "37297643fa000825d4d9a81c2564ac48f12d5e0f164754a5a7a303e30978635a",
+      "month": "2026-04",
+      "payload_kind": "entities_and_relations",
+      "uuid": "effb681e-59c3-4ed3-aa90-d34b91eab8f1"
+    },
+    {
+      "content_hash": "395cfb889f972771b88583f77d51a04e3f2596b786db5cf449990392d61a2fb0",
+      "month": "2026-04",
+      "payload_kind": "entities_and_relations",
+      "uuid": "8eb20b1c-8f92-4c83-8450-138a532f145a"
+    },
+    {
+      "content_hash": "1dfda1cd1fb504be183dc571d33c83d62f52d71de489e2cc641358f9755baa70",
+      "month": "2026-04",
+      "payload_kind": "entities_and_relations",
+      "uuid": "5832834e-26a8-45c1-996b-5b5121275a0c"
+    },
+    {
+      "content_hash": "844159a44e865382fe650d3fa9556e0ddfe0278af13df8ebfdc1de1c1706b0aa",
+      "month": "2026-04",
+      "payload_kind": "entities_and_relations",
+      "uuid": "bc2336a3-8780-47f3-aa97-f8b6055ad007"
+    },
+    {
+      "content_hash": "2ca6c59fc382751b23d4321da7b172f9b75f65c50f0066550e02bfccde36dff4",
+      "month": "2026-04",
+      "payload_kind": "procedural_knowledge",
+      "uuid": "9687c543-b6f1-4b60-871a-21f7f6eaadf5"
+    },
+    {
+      "content_hash": "b6dc1f5e7abc965647ebde2f80192d847944f3a0afb5f04bd655b134f28407f0",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "423f1f84-2b45-4b39-8b91-677b7aa3634a"
+    },
+    {
+      "content_hash": "adc0232d00adae89493e7c06f066e088364561ed274c3e8fb3df6311f3e03d5e",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "19b98f5a-49f1-4744-b1df-b9b88245985e"
+    },
+    {
+      "content_hash": "465f34e218f607fcda6037287044eabc8557c87f3be889c035804396be94c06a",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "3a6f293a-829c-413f-8384-3169e404c822"
+    },
+    {
+      "content_hash": "c5f746200b411d009f1e4460e6113a05daf5b1746e87e835be11fbdc3b639da7",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "db2fa9ad-55e6-4a3d-a749-b88babcbe0b1"
+    },
+    {
+      "content_hash": "a5f8ed61fd728ba8e58a0698e14e94a782b61300ec5241625904379c72f73b9c",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "b92b6488-0fb5-42cd-82b5-e562abccbe8d"
+    },
+    {
+      "content_hash": "d83d33c36cfe95e5f54e93c09d0ac17524d80dd9a38a264cc6e2a2ed1afda8a9",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "47b14589-9892-4f8b-b694-c5cfffcc7116"
+    },
+    {
+      "content_hash": "eb5708f411a7dbe43062f7652f98e6caf3a1936d244bc2d5ba340d3d648831b9",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "2536c818-c7f1-4e5b-a82f-bcd32f372a63"
+    },
+    {
+      "content_hash": "39eb2a7054ec47cd83e28325c09efa3cb7b89ef0da1e4a3c9bdaf95998448dbd",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "b3359143-4e9c-4e9f-84b2-03bd7f843011"
+    },
+    {
+      "content_hash": "a16770bfea7271c9db4204bc027c80e381865e01111d8de83dcb22134c1f5d0e",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "88674b68-987c-42f9-b5c7-f1d4ea08d7e8"
+    },
+    {
+      "content_hash": "244f841ba7555ee65b79be64e32b0f7d68815a58a365f37f0ddec92680d6c248",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "f3b2a1ba-1345-462a-a541-f9f42bb8a959"
+    },
+    {
+      "content_hash": "e9132ac6bab4ace7742bd465531d634c437903f3019b077a3c9db7b6d22a82f3",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "630664e8-7546-4f2f-9f73-f69d87989f19"
+    },
+    {
+      "content_hash": "d43af0256de6d9e0006230735893bec86c755ca48a50f44a3240b85fcc8bb6f6",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "066bbbe3-c03b-4d2e-b5bf-5a2aaf6e8746"
+    },
+    {
+      "content_hash": "9da44fee2df4cb7a82427c850e6a6f8c7a9cb521064c5a2baebabd6b3b17df59",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "14ad1ebe-f6ad-4810-8ac6-2f0c629c5236"
+    },
+    {
+      "content_hash": "bed135ea56ff5d74cf1a093072de4b180c7368460f9d3d1f5e773ad872f57f17",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "56b7a425-4af1-4db2-98fa-9b1205f464c9"
+    },
+    {
+      "content_hash": "de36fc3885e191e09f3757abd18c38faa35d70c3cff163d66ed31f0b4e2565a0",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "85cd8b71-eeb9-4ad0-86e9-4e6a24b9d60a"
+    },
+    {
+      "content_hash": "52bc59b445b7bd79c46878389dae1617a2a5126b7f922c3c60b37acb220513d0",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "acf3b21e-9d16-4602-9fbc-4b7806f53d93"
+    },
+    {
+      "content_hash": "8cf4b85bc72f5a22ded551e225d25d2c527405aef2e6d89c9032357d137ff28f",
+      "month": "2026-04",
+      "payload_kind": "temporal_facts",
+      "uuid": "a2846c41-ca4c-4267-b2d0-829b80c779cd"
+    },
+    {
+      "content_hash": "03ce81cdb2cf2f99d2decfac80247d16361a4588577c1da21d9c61715d4a43bf",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "3e3115d2-1c6f-49bd-a007-ef481dcc9dca"
+    },
+    {
+      "content_hash": "7fe9516e11741854eb5c13d1263bead1f4f4fe0840e19ff771cddbd4997b5143",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "174be8b7-a21a-4a0f-8e98-eeebd5553313"
+    },
+    {
+      "content_hash": "581ee034285f725d6357f3c0f543328c5f35403b99d44e2c2f6ef8dc9c89709c",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "84000c23-9266-46d6-b9f5-c0033044fcab"
+    },
+    {
+      "content_hash": "dec1d6cde8a8ed0a311e70fadea4ce34e52350a1894a887da35586df2f69d04f",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "3c1fd4d8-1eb3-4d97-be7e-05e86295aae1"
+    },
+    {
+      "content_hash": "2d67dd2a1903079dbea8dd5c34e0948ae963f0ace91bd0b7930dac062be7b504",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "d1daba9e-a70a-4043-a50d-828c0d0a824c"
+    },
+    {
+      "content_hash": "5c3d4c75f0f4ff08306deb362faa0d915219d16f723a79b88dd638cf97ba8845",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "3a47cdc1-026d-4110-8e14-94c253a552c4"
+    },
+    {
+      "content_hash": "a341ca04841e35e3f904d037fdc3950eff8db43ac57ffe7c44f57197df9c600f",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "1d65a06e-782e-4dbc-8eb2-6d407002f0fc"
+    },
+    {
+      "content_hash": "b69cb606145b36a34ed791bd6b2be789190a6a1dfbd86e34b96b5910e8c6fa39",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "8917e7d7-4c06-4068-806c-e44fd7ef33ac"
+    },
+    {
+      "content_hash": "ee4e0b29de1fb444f77ae17013cd241e9fc00c82f0b9016371be454be9604802",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "89d6ed27-d5b4-40c4-a839-821644b06e6a"
+    },
+    {
+      "content_hash": "3692b58393f1ce2c91f6c41758d801703d8d70e8fccf1bd51aab8dc4d4ecdbcd",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "f27989a1-699c-4159-85e9-fb9988027714"
+    },
+    {
+      "content_hash": "c54e1a6d0433b8e16a7a262d7cfd6eb9c332218f089c756ddf1ab151df16799a",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "8c615bae-ed3e-4cbb-8c0a-8cd3917cf0da"
+    },
+    {
+      "content_hash": "c529b1f5c58ae4697df3382f5c72b9a95979a0135315b303a7f93810af7a5297",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "481bc631-e5f0-4058-93fd-831f883410cd"
+    },
+    {
+      "content_hash": "4d042128201fa7c9a63f9b10b70af2f8f6c817ff166b351b197ba1d08445261e",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "b0091c54-d11d-4de5-b664-8aa8cd65eeef"
+    },
+    {
+      "content_hash": "59a39ae89205c318acc7f12941e60339a8457002198446f4e5b45d44e437b38b",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "cd120e8a-59d4-4da6-b468-7e0618e93553"
+    },
+    {
+      "content_hash": "787833729f42da2bc6aa8839358a6bede730784357cd295ba941d6534feb9924",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "de83db52-fa3f-45a7-8c0d-be2d89524777"
+    },
+    {
+      "content_hash": "aede85053f78ba4705b6824d3aed0dd70dc78781cf9e17627c51900edb83bc5b",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "f8c488cf-2e54-496f-9dee-1d314ec4b3fc"
+    },
+    {
+      "content_hash": "64538eb3fe1a44338fb7591213e362aebd1cc7d115167e899d84b350a9200308",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "6cdb601e-b6b9-4b13-b648-a80f71d9c746"
+    },
+    {
+      "content_hash": "937f4511a4121516bca65060dd7f9c38a20c43d4c823154ddb70b982de6bedb2",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "1b3f7bf7-6bd2-46c1-af15-f826a8870f9c"
+    },
+    {
+      "content_hash": "1d0c53f2f2a72ab55e2ef4c9df9e71cd5eb604aa2d96af41e2639947bdeca5e6",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "2fa13b66-d7a6-47c0-83cb-d1913f43948f"
+    },
+    {
+      "content_hash": "29346d3bdf7710b7717b0389d22af19da18e35689dc4249914ae226ff1d8f758",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "e51ac461-1852-4996-8d4d-b9616710f6ef"
+    },
+    {
+      "content_hash": "facdb12a86ae0ca9a711945c3e8fb964cfde33b670026efa3add74df786e1178",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "2b21f714-daf4-4147-972a-7e5c585d960a"
+    },
+    {
+      "content_hash": "fbe2fa65a02cd79eddd257bd29c0a1cf2fefeda845b9e45b8128d4ebe96a3451",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "c543b2f0-550d-4fdf-8b83-e031b707b872"
+    },
+    {
+      "content_hash": "46ccdfa455fbd68082141c1805a67eb2fba1a221803246c78a1b4c8e7d76754c",
+      "month": "2026-05",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "031ae639-1771-4b36-b369-8640df7f4371"
+    },
+    {
+      "content_hash": "ebfc3ecf8a6b5f19cccf73a76114eb16795c834dfe522410642c0f232412441f",
+      "month": "2026-05",
+      "payload_kind": "entities_and_relations",
+      "uuid": "09fd434f-5f93-4401-bc2e-4e2c13aa28a0"
+    },
+    {
+      "content_hash": "f154f2bbca7d09ea8aba20e7b9128d50d02790087bcdb839ba2240a8cc4f3b64",
+      "month": "2026-05",
+      "payload_kind": "entities_and_relations",
+      "uuid": "bc1d13b0-ad44-4ccc-a45b-253543d13f94"
+    },
+    {
+      "content_hash": "146aefe8fe88ee0986bb5cf9d0c0e220380e6115d5192bcff186acb99b8e577c",
+      "month": "2026-05",
+      "payload_kind": "entities_and_relations",
+      "uuid": "91936de6-fdfe-4fc7-9762-d8a59e10b7df"
+    },
+    {
+      "content_hash": "0081fcf1a245cbac2de79ad77f577c5d7279312990a1d4c627655139a73f8e19",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "879d2720-b5b9-4a71-917b-a7cc12794292"
+    },
+    {
+      "content_hash": "e21170186032a1ea0c592c7c9dedc9a060d0b0d561dd764bf5a73738879f7f33",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "3ad3adef-ed7e-4bae-9041-3f1149951ca8"
+    },
+    {
+      "content_hash": "3457d954fd13d046ab7898057b4bca0b1839e237724c3b1d9a915658c667f111",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "0f2e8155-215a-45da-9e0a-9641e216ef41"
+    },
+    {
+      "content_hash": "cef6cf4c961f5c4e5631a00bdcc427346eb76e7d022419e956af62e670674523",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "5ba53ead-e03f-4ce7-9c4e-4ffac3d22b2b"
+    },
+    {
+      "content_hash": "cfc0c8f020feda08b0bb6321809d7f34dc982b648961290d9ef003fdbae2bb07",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "f198f640-c8ae-40bd-8af3-13490ae0895e"
+    },
+    {
+      "content_hash": "108aded7401ceb7bdef559a3e043ea757603d6b27f60844fd823879429253225",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "d36ff036-fad4-43dc-90ed-5fa96ad68d70"
+    },
+    {
+      "content_hash": "d99975f78cf3a13f1bb48d0f13c2522b665fc100312618d81b9ce08349cf02a5",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "bbcc9ba5-5f70-4f41-8167-571e6888b70c"
+    },
+    {
+      "content_hash": "a8f6db06dd40ddc85dd52d705185ba6a69863c3f99fe02e41c01301dda3a82c6",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "1166e549-4017-4f4a-8d77-06c6b468d966"
+    },
+    {
+      "content_hash": "8653893b13602734d5362f4abb95908406e1668482cdf681779914cd8d1fd27f",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "87effbc1-2297-4fd7-91d9-fe43cecc57c6"
+    },
+    {
+      "content_hash": "2c73551aec30e6545460db8d76c5f2e343db9fb6f49cdaf3a1c0b4e8e5e130fe",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "20a87530-293c-42c3-ab21-57b0f03f0fb8"
+    },
+    {
+      "content_hash": "170d868a4da8e97a9a6f0ac0742ce828ab4a093346467d92b51b8ed126a7738d",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "31c64c52-10a3-4488-996e-4fbc767a93d2"
+    },
+    {
+      "content_hash": "dd1f0e211962c40ecfc6a7821045139540e89ded92576b1996b03dcea2cb461e",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "6ec0c51e-93eb-4955-8812-151538eca715"
+    },
+    {
+      "content_hash": "4db9eb95d3b40ad78f03e4a3d736bdd0733361df637c763ca89709845ca37a4d",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "b438b4ad-acab-4f21-b1bf-35f58134edcd"
+    },
+    {
+      "content_hash": "b4025bebb336762f180ab18bc68e9b73d8b486f7c29b9b1cb9ec6d04bb015df9",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "93d5bc80-c746-43b2-8a65-c88e1c69a5aa"
+    },
+    {
+      "content_hash": "8f798f0a9a6b26e6dd33bf3fbe34d6a4978d556bcc773d70993259e5bf090b4e",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "aadc606f-c387-4bfd-b388-19b97b256670"
+    },
+    {
+      "content_hash": "a1c2e55f37416d6661a8987801f088d8dfcf26386bf1c9f53d71758bc8ee310d",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "cf265f44-ca37-4198-9fdb-b1b851b4428b"
+    },
+    {
+      "content_hash": "c65d5c4e1a1e34f5938b33381aa000bbfa25056bbe8e2203cc97ce7903ffb095",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "945f4711-236d-44e5-9783-189553e14598"
+    },
+    {
+      "content_hash": "481df2df6cf73a5943619d7b5e6247e3e0c22ad702df834295a94616b18f5711",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "77f614f4-3e82-468c-9a5e-7e004dbac12f"
+    },
+    {
+      "content_hash": "648e452d976bb98130c763fc02cac139ba1cc230e521e2b3715ac16ba48e837e",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "4b17f776-5e2c-4c74-a997-bd83479d6dd4"
+    },
+    {
+      "content_hash": "2664b363226d9b29eda90c7ede6c89f8d5fcf90b3c0a5dd4d8d3d9b5f396bf68",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "85729697-a526-48b6-8177-5e6d77164aa9"
+    },
+    {
+      "content_hash": "5fcfe64746b20c411a30851521d83f164452bd907eba53530019b3383b1e4e3f",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "17916f1d-29e7-4c10-add8-ccc0bcf3127c"
+    },
+    {
+      "content_hash": "aef64b2ee9bdeb739f1c236ce2058f71b89bdf97e5348dbd4d62a02ea7f4a987",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "174b5f0f-2162-459b-8636-0d5f39c65b5e"
+    },
+    {
+      "content_hash": "1504252505aebf19b50a94f6f3c4bb5bc22bcb14ee2154e1227929b7347a2d98",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "5630686c-c460-4ed5-a259-9f94c7e1a7a3"
+    },
+    {
+      "content_hash": "98439d66876c97dceb4a840aa5a1927dd6a4dbc5dc9143635037f6c6a30630ff",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "0dd26058-05af-4447-88e8-fb2c2cabbf8e"
+    },
+    {
+      "content_hash": "b3e47a298a86072215c9b51b5566a5f05fc6d762c58037ecea9608427fb855cc",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "9b34ad5f-cef5-42db-860e-af0ce6a178ef"
+    },
+    {
+      "content_hash": "13469aebf27fb22126b08058f3efcf75f3649993b38395e497019dfe4e03e955",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "77317e68-a36b-41bc-9335-bd503c082a99"
+    },
+    {
+      "content_hash": "7d3a3cc7893c74c71eefc910cf6a425f936b4a59919f4e690c33e00416dee769",
+      "month": "2026-05",
+      "payload_kind": "temporal_facts",
+      "uuid": "22dac24c-e60e-404a-835f-12b05bfc926c"
+    },
+    {
+      "content_hash": "64e81927584aabb4c08ce377f4ff57716c78344d41d17f51f7b61497746f073f",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "af9e1054-4aae-43de-81c9-93951c50edd2"
+    },
+    {
+      "content_hash": "43c405882a9027783f05e5f81c0a5364c426a176eabd66aa5be0acf754f6b91b",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "8a52d2fb-3460-4023-bc00-217d36223645"
+    },
+    {
+      "content_hash": "ad101b5e627c82eddc0e1f03b0180a7a2400be60f8b914f7aa4f4e8e3c3f68c1",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "fb7a49c6-d6d7-418f-82e3-f31027abbe46"
+    },
+    {
+      "content_hash": "3470eb69635ef772030d71e1d54a141c4c15e49d3d0929aa9162f23d012148d4",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "5e87eedf-d00e-48d8-9f31-0cc992c43a33"
+    },
+    {
+      "content_hash": "5caf8a641cd6ff38a4a57a2d5f8d697fff1d04b543296f323457270ea9e11ac5",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "101dd986-5d6e-42bf-b55b-66e6a3ffd63e"
+    },
+    {
+      "content_hash": "3a194d77e9b99b9abd30b4386f90d2816433ade9586df89eb9c2a2fad75989e6",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "95539986-f342-45b0-a167-fea538d39c82"
+    },
+    {
+      "content_hash": "2a59d115b5be98dbcc12bd6b08b373d753be41f40ac0cc7bc662cfc753046cda",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "0c648888-0d6f-41f6-bf29-7e13eea74231"
+    },
+    {
+      "content_hash": "b8d4e2c4105f908ded5dd6079df76761132710f8ec6360eaa3e5127e5b72bfe7",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "52e00523-1697-4563-84ba-61bfff351dd6"
+    },
+    {
+      "content_hash": "c123a8d2b740c631df3871254ac3fd2c9d53a2c630b4417629f439bded7114fd",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "7683dd1d-190a-4021-acee-bcdce6c497b9"
+    },
+    {
+      "content_hash": "3040f936978831dff1887a3f38013197fb17aaa6cf99eea16097cab803b31614",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "6399976a-09b6-4546-8eaa-5d8966efa39c"
+    },
+    {
+      "content_hash": "9bf07c4a2f1adf77c7aba140c737ac93408c682b636cd804a5cd65e8587c41b2",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "4b1047e7-d6fd-4b23-9236-b69e350e9242"
+    },
+    {
+      "content_hash": "ea3478bc1ed8349ce9b58c2bfb0339154ff515e71156eae1f4de42ccaea62137",
+      "month": "2026-06",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "25d21600-68a7-4ed9-85ff-ff6d2edb55ee"
+    },
+    {
+      "content_hash": "2d0213176643844102c24d78c4c9ea694b115040c15c446e0bfa45b2e0c49ce4",
+      "month": "2026-06",
+      "payload_kind": "entities_and_relations",
+      "uuid": "04467c3e-0606-4606-a7a4-102feae06cec"
+    },
+    {
+      "content_hash": "ad4369434d508458a876b4de9c8ea37af81b1b7ec2d479276675c8c0ba1a4647",
+      "month": "2026-06",
+      "payload_kind": "entities_and_relations",
+      "uuid": "143799e0-4e55-4551-9a1f-9372ed042d35"
+    },
+    {
+      "content_hash": "e5d2d8e7dcff862b7de44d859653254be92c1d1c34559b9ca19df8c46b151231",
+      "month": "2026-06",
+      "payload_kind": "temporal_facts",
+      "uuid": "961b001f-6a25-4102-8ae8-bedcc740f4fe"
+    },
+    {
+      "content_hash": "bc4e05f9822c2de594963f04ed35e69a67dde60bfcf3701ed6c60f8adad8db65",
+      "month": "2026-06",
+      "payload_kind": "temporal_facts",
+      "uuid": "404179c7-f225-4506-a921-628fd49777a0"
+    },
+    {
+      "content_hash": "98880dc0ecd10ff6b6dd7e7793e5758c2df3a0b31e835f68dd9600a29b19b6f3",
+      "month": "2026-06",
+      "payload_kind": "temporal_facts",
+      "uuid": "606a13e8-f28a-48c5-a571-c9698cb2c689"
+    },
+    {
+      "content_hash": "7ac1c3586b343cb99614ad6afb08ec539031a6efbc73fc1c8470f8ef129e8bc5",
+      "month": "2026-06",
+      "payload_kind": "temporal_facts",
+      "uuid": "4e9ef727-695b-4416-a21e-cd11e40637e3"
+    },
+    {
+      "content_hash": "5bcee384053468ba3e1d088f9ee4fa992a7815bed797cde2e35825efd97bfd97",
+      "month": "2026-06",
+      "payload_kind": "temporal_facts",
+      "uuid": "d831ee4f-caf1-4544-98b3-00956ab339f2"
+    },
+    {
+      "content_hash": "d983f81625a10d62266f6734c985b07be328b33ba78ed362fdbb37418dabc67d",
+      "month": "2026-06",
+      "payload_kind": "temporal_facts",
+      "uuid": "51c46ac7-2c75-46ee-bdac-4edb62c600d3"
+    },
+    {
+      "content_hash": "afa862f9c7db58d8749dc92a098d664cc1622ad5d237a42c66a07159fd7875d2",
+      "month": "2026-06",
+      "payload_kind": "temporal_facts",
+      "uuid": "45e7420d-6fdb-4737-89c5-010ad98206ad"
+    },
+    {
+      "content_hash": "2943b242e082554eb159183fa33e236c4fba673ca494d63b8a8f8fc025cd5bb7",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "2eaa0a17-89ae-41ab-96bc-50ef7ec85ff1"
+    },
+    {
+      "content_hash": "dc1aa436da60ab6adf774996091a980a61705d792eec3e8ca907f5d0a988ca9e",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "6176a690-63ba-4f87-83d4-176dc03ab7fd"
+    },
+    {
+      "content_hash": "ce21f08a8e399b32edd732eea275aee1479a04f0619bf5d8751e1a5688af5483",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "7dd7955d-8b98-45ed-aa51-8dffec22b430"
+    },
+    {
+      "content_hash": "f1e8a9d07f5d2fbc1e6fb6eb07aeb176339c76b409b39e91c59ff354ceb05888",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "9e202e62-5d4d-45eb-b170-6c8eb6162e2e"
+    },
+    {
+      "content_hash": "1ca57bcc9e67dcaaf2ccdf0245cd23300ee04930e4b65d269ad4d1b7c403e076",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "56823b66-ac81-45e1-a561-e8752b7222ff"
+    },
+    {
+      "content_hash": "32ce0eb6e735d9f69cf1573d7007ce31fd79f7f1a210b3d991d18c3e6e43ec7a",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "669d66d7-5ec6-4854-b305-95153f637281"
+    },
+    {
+      "content_hash": "9989ba73fdfc21e6524fc036d6a442f3b51f250f1095af89a443150b05c3b194",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "4f0bf435-d729-45fd-9342-624e82fdf904"
+    },
+    {
+      "content_hash": "66c0410a632353471130c77dffccf86defe698364727a80a8896e6765be2bf9e",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "00686715-188a-489b-800d-8705950e5a01"
+    },
+    {
+      "content_hash": "aaa062e98f71046978225275e4f3fa7d751d02f4e5b850f9e9351dc31b1f6428",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "9ebf19d4-7d90-47a7-8e73-e441bac57329"
+    },
+    {
+      "content_hash": "e8a5dbafe7eb309686c0f79fa6641c585d901f092c83bb58484ee8ed41083380",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "6149d88d-a3a0-4ed7-b43a-85293bf2c344"
+    },
+    {
+      "content_hash": "59729a25ace08496338f3f55b4e33b1e0bda8d13734205589f7f768db2e46e12",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "c08fba9f-b01b-49cf-a493-573a2bb7ab6b"
+    },
+    {
+      "content_hash": "3f60ffcf5b7ae3b9281279cba81de49de958b80a17a0cad811e3c8e17592f951",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "3b072f93-a7ab-4853-a25f-316262000b05"
+    },
+    {
+      "content_hash": "66226d8515b849204df510d48a5ae9f4c57d05543cd7de29cee626b60d166f7e",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "b8ff2d1a-78ac-4a8c-90b3-1d7ed885f421"
+    },
+    {
+      "content_hash": "edd07e799e24beea162b549c654822ed921cc1de32debff9981b29e4e6f14b64",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "fb49b84d-3b55-4c57-9fd6-ffb5e6758180"
+    },
+    {
+      "content_hash": "53639af2882f36869a78e1d4ea5bdfaebbcbd4e855c97f15bd76f47fcfc95377",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "c4e4d73a-49dc-4249-b191-9139fb5350a0"
+    },
+    {
+      "content_hash": "bc2b3e4fe70b7e69d694d2b2e211ae2e1fd03f1ab06515850d48646c3a3d4a5a",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "40ad829c-12fa-4679-a582-ae57d3fe9007"
+    },
+    {
+      "content_hash": "a33f65b188b35dcd3c4737ce9666a7d408fc66e02e1c9cdcc1cc9bfedece9a3b",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "639164b3-7a05-49da-a070-42bf585b7525"
+    },
+    {
+      "content_hash": "6ca58b8479474f9913b4194e48ce19e914702c89e2bf9ecc49fd631bdf79c559",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "869cefda-a7ac-438e-8975-acf1799717bb"
+    },
+    {
+      "content_hash": "ba3ad69275a4fa452aa505e5a394c57987446762a01e2ac58ad1957494f5aec5",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "2d83839f-3d28-4a69-9f7d-01ac46718871"
+    },
+    {
+      "content_hash": "075dd3efd238aca7efeec06f48b17604367ddd185ce6a69d13672cc5ff9f9014",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "e4703c84-597a-488c-83f7-7be249a7f593"
+    },
+    {
+      "content_hash": "65d5b921aa902598aeac22427406345f2ce3ba1e65165cfc022807c52b697862",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "2fad5efe-62ea-46cd-b78e-001fe31dd872"
+    },
+    {
+      "content_hash": "c1416295fd014cffae1aa28fa658dc6319acff61ed88b618b270875a7f8dab88",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "ff386a67-135b-4add-b3cd-aa56b9f409df"
+    },
+    {
+      "content_hash": "b45a40f117baa1692b4eb5826fc28571ab6d458496f372208b1c3e32dbee6dae",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "299bd7e6-c0ae-4e07-b604-40cfb5359ebb"
+    },
+    {
+      "content_hash": "707467428cdb8993ca08584f50103db562910fa5b886adc8c50e2a284a456346",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "8692bbe8-ff8a-4fa9-845a-159248947cf4"
+    },
+    {
+      "content_hash": "7069105922ea513228ddba24eb4a98c42a9a52cd07c80e72e54d424f2eb4b54c",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "ee8c025f-3cc6-495d-abed-5d01e54a6ffd"
+    },
+    {
+      "content_hash": "496b16029f2692150e458a3157f12a4929744a6a7a2e64a5e4cb33b19c8fdb65",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "7f0bac1a-30fa-434c-9fee-ca8bec106833"
+    },
+    {
+      "content_hash": "bf574dec1ab48ca7088bb2b0e2b572e3c9838852612cccd445fab8c22b405574",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "375e833c-6e1a-421b-906f-a0305019f05b"
+    },
+    {
+      "content_hash": "f924157680e99cf4f48a8d5470a65f57146107a734be6a142f6088e4970174aa",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "a256fe3f-077e-4877-ae67-fa012f590f71"
+    },
+    {
+      "content_hash": "941c41a8da32cee330995aeb746d4a3225dd4e12d08e5ddfe6eb65c4288deca5",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "6d464997-4197-4ce8-a095-950f39fc0e2c"
+    },
+    {
+      "content_hash": "bb90ce6b457bafaa971ee69e576e7cf19e3e0f07c48c65ce835324f07b35f889",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "73259b4c-4dfb-4f74-9d3a-1d25b9a4848e"
+    },
+    {
+      "content_hash": "ce94198d7077b585db958b3fa664d3eb18ce9ed6e268231652b13929ac57d6d9",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "e7beea69-478f-4de3-b363-26e2fbce7643"
+    },
+    {
+      "content_hash": "c5b9043e6eb3a5e934b18d810441f92c829007da0bc54a4cb6e11a731b05f9bf",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "7274d64c-d669-49e1-a539-c5fd62326d45"
+    },
+    {
+      "content_hash": "d39fcda3fb5cbd14f8ccda7695c5427af9b1a4b649a7b248791c9705db4e3b36",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "38935f81-39e1-4664-bc82-61f32916a5c9"
+    },
+    {
+      "content_hash": "8a8f3187baa79bff0642be1944da56803a98a4bdc911d5abab47f46e77b30f1b",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "31a3a739-f6f7-4e35-b21b-250afb5c6cb5"
+    },
+    {
+      "content_hash": "96b77838bf0deb34237e6814e90bbaa0cbc3ab0eb2c57c6abdad0d2f36bb1109",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "ba525613-0fb8-407c-8be3-6589a20cdf00"
+    },
+    {
+      "content_hash": "e410f0297af3274a58b43623ea5e76db50a4f24f26352e0e4481c1af1251fbf0",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "157cd161-6902-498d-925f-0931695b876a"
+    },
+    {
+      "content_hash": "232f0a69e943dd5d1c281a614957608bc64739c8442ce188036c2dde0a8d69f1",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "6eb3d837-eec6-440b-87a1-1602bc75fd6c"
+    },
+    {
+      "content_hash": "232af7749903db295391f1e53af235f9c1835b522bed45557e4ef631dcac4c7a",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "8bc327b4-80fe-47f5-9d1d-fcfcad24b4a5"
+    },
+    {
+      "content_hash": "08fd4253c3474c3bdd4ca5f1f355280cc371329efa00dae4465ee97712e05eca",
+      "month": "2026-07",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "c11f181e-5436-4f79-a1ad-8e9b3a793064"
+    },
+    {
+      "content_hash": "23804183e0199a68ef011e323d0ec827225f4ee5b33f82e07e6d4da38c0d8147",
+      "month": "2026-07",
+      "payload_kind": "entities_and_relations",
+      "uuid": "d114d18e-186f-48d9-8020-df6da2e18ef8"
+    },
+    {
+      "content_hash": "80c5b4d9544f3054c1eab1d783f41e929418260f31fb989ab6cdf348fcddc7fa",
+      "month": "2026-07",
+      "payload_kind": "entities_and_relations",
+      "uuid": "3581f775-8567-45b8-bfff-0fb051ae629e"
+    },
+    {
+      "content_hash": "535dde951ef8f5edec67b7c12f5351e5625348fbce1da61a800be25cda3a4183",
+      "month": "2026-07",
+      "payload_kind": "entities_and_relations",
+      "uuid": "e2066ec6-13a1-4628-82a3-0b9386ce3bc9"
+    },
+    {
+      "content_hash": "69705d151d03d7322d8e536466c725b3a67fce027ca08b54ee55bee3552c03cd",
+      "month": "2026-07",
+      "payload_kind": "entities_and_relations",
+      "uuid": "8ddc381e-3aac-4480-9502-eb2538db40a4"
+    },
+    {
+      "content_hash": "0328fb9e103e137fa440ccaebfe8b36f72b685a4c3e2daf8c4ef98cee657db27",
+      "month": "2026-07",
+      "payload_kind": "entities_and_relations",
+      "uuid": "a08c58d9-d257-4eda-badb-4bdd472c4d8f"
+    },
+    {
+      "content_hash": "8e6646e7ef3a1a5c58df82ebf9b6d7841166e547635be2e07d8849f3aef3ec5b",
+      "month": "2026-07",
+      "payload_kind": "entities_and_relations",
+      "uuid": "4271d24f-664c-4d5f-b26d-4ee7b3badb01"
+    },
+    {
+      "content_hash": "9083dec7bcfed525a1178d701bacd8123d16adbb642a44207fde3bc26a2b4c16",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "a4df1f30-d891-4278-a196-3f068dbfad4f"
+    },
+    {
+      "content_hash": "51eb22794d703e97ff6cbc974484c62dd78af383b829aa07a40fd6d807ae5974",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "8060b644-5b56-43bb-a31a-39c1e9d109cb"
+    },
+    {
+      "content_hash": "533a65004a0e4ac2a7507478bee672f3c3c39fd8ac57ba7b2160e955cac01398",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "7fcc5273-54b0-43a1-b56e-89bb48c09253"
+    },
+    {
+      "content_hash": "cd896c2dde0ffb9860fa573861165ceb599d56939b21b5170c00859a2c14ba0d",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "96467fb3-3d13-4db1-95b1-ffe331ff46a4"
+    },
+    {
+      "content_hash": "280b63156c476f08d81b05c71bcba71a95a07d318cb704d53bc9dfe25c37dfc0",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "343d7fa8-e5b7-4d99-98a3-cb8203431399"
+    },
+    {
+      "content_hash": "389702e4755f753a854498c8be535d2e7a77f4d2f4a3fae227ab2929e27fc16f",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "d8dc5cb1-0a07-4edb-9718-8d95d5c7278e"
+    },
+    {
+      "content_hash": "fd8a030ae8aa9e39500b790c7cfa3ee5db1d030c5c4f9209ee7efe3697442d76",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "95863a12-6c2c-464d-a488-796667e0afd2"
+    },
+    {
+      "content_hash": "d62eaf1aea62345bc0df2420d2d5c49184c97e66c351872a1eba9d43c83fd07b",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "a37446dc-8000-40a4-b603-9019cde23eed"
+    },
+    {
+      "content_hash": "947c94317625d47835f1681952332dbaedd61865e87e96e56b88cbd9b08d6952",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "79fc82ea-b36d-4368-b6ca-1be7dac602fa"
+    },
+    {
+      "content_hash": "8774994d9027eeac204a54c4ef4e61d2b9e925d6cafe6aed77301d4bf6b0cf75",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "c70d34f1-9e22-4e0c-bdee-56e60e17c162"
+    },
+    {
+      "content_hash": "17e23bd678682debc9da67d8cc7a0e2bae3906c19350179a3e4f59d7dd2bf673",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "bbc2caca-cbc1-4525-9f0c-f43a5d794b00"
+    },
+    {
+      "content_hash": "3de7e294b3af06d21859b46ffe854b847260cf90b683e5a87fff4b49a4b89ec0",
+      "month": "2026-07",
+      "payload_kind": "temporal_facts",
+      "uuid": "9fca5ee4-46f2-46b9-bd08-7a863c996e15"
+    },
+    {
+      "content_hash": "3de3157194118bc1e3218904a0449407f867ffbba6401c6d18d076399ce2597f",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "0de1e4b9-cc95-4d3b-8006-7ce20ddd6441"
+    },
+    {
+      "content_hash": "46970e6f1de848d2fa8046e68b26eac5437c4b30c83db65bf4c4daa5003c4fba",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "68dca3e3-72e3-4140-8824-6420bb12eab9"
+    },
+    {
+      "content_hash": "4048a962c2b34c4ea15549533c6a4318473a65ad1e8a349f5cd1c06579a3d964",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "92d358ae-7e6d-476a-b695-8523ec66730f"
+    },
+    {
+      "content_hash": "c5c8190c2a56d519a49322a09abedce11d302bca8520e61d59cabefe6b4a1ccf",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "0d5c0f2d-39ad-4ecb-b7a7-0bef880c5288"
+    },
+    {
+      "content_hash": "90416f39bc629aa139b38983a1bad0f1d3bf91b83ba2f212c8fdb40a4afea499",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "2cb10869-edb9-4db8-99f8-336ba8fef86b"
+    },
+    {
+      "content_hash": "8b1a2a8888dea19eaebee46cfd9fe2593fa32945cce6a3879a1710fd160df0a1",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "45e539a4-77cd-46ed-a809-e94878f4e9b9"
+    },
+    {
+      "content_hash": "6bc3259dd8cd345d5b2fc3b1aef2aef40ca43f7772b1ad87151da8ec020b6044",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "79a647f7-fec4-4512-bcb2-5d61fefc2db9"
+    },
+    {
+      "content_hash": "5daaf1c9a0e7de58a733abf88e549bf093a7c837ecc5f90b0d35972fac4faf8f",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "342245fa-389c-476f-9a8a-e9a8f7700fdc"
+    },
+    {
+      "content_hash": "0fea7a3207a1d1413320b3b9b1275646b14e0d776d25a2a6fa7db26f369b81f0",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "2f55e6db-9895-4189-978d-c40332644f14"
+    },
+    {
+      "content_hash": "a9692928053b43f89c42e7535e463d44f8eb20a735252750a055713465e97c27",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "20883ad9-b8a6-480c-b11c-baa20232da86"
+    },
+    {
+      "content_hash": "bfed6c27962454cdf0eaed871e974abbec4fd18df85e9c6c0af0bdff0a66d77e",
+      "month": "2026-08",
+      "payload_kind": "decisions_and_rationale",
+      "uuid": "ba736b21-f7da-47b6-a90b-cc8fc31d85d0"
+    },
+    {
+      "content_hash": "80971f99f6e70d9e2a9f9911589c2bd64cdc2b2509d1de2cf4803826ec652d46",
+      "month": "2026-08",
+      "payload_kind": "entities_and_relations",
+      "uuid": "6a952378-02b8-43f0-8c9c-fdf281cac71d"
+    },
+    {
+      "content_hash": "8ff0a2457d4b5c7053d1cf4e6ede275e795e620c235c85b22a88dfddcba2e2c5",
+      "month": "2026-08",
+      "payload_kind": "temporal_facts",
+      "uuid": "527541f6-8fee-4bae-8957-3261a61c6936"
+    },
+    {
+      "content_hash": "5c26761f6a42e81fe904c2c61d2e0d9a73cb8b602e166d65ccaab3946a57ae94",
+      "month": "2026-08",
+      "payload_kind": "temporal_facts",
+      "uuid": "fc55374e-f4bc-478c-846b-c9d45dd4585c"
+    }
+  ],
+  "no_outcome_filter": {
+    "entity_edges_queried": false,
+    "entity_edges_used_as_filter": false,
+    "entity_edges_used_as_stratum": false,
+    "population_query": "MATCH (e:Episodic) RETURN e.uuid, e.name, e.group_id, e.source_description, e.created_at, e.content",
+    "projected_fields": [
+      "uuid",
+      "name",
+      "group_id",
+      "source_description",
+      "created_at",
+      "content"
+    ],
+    "statement": "Corpus membership is NEVER conditioned on the incumbent extraction pipeline's outcome. The population query projects only the six fields listed in projected_fields and applies no WHERE clause, no LIMIT and no ranking of any kind; e.entity_edges — the per-episode record of what the incumbent produced — is never read, never filtered on, and never used as a stratification dimension. Within each stratum the draw is an unconditioned seeded permutation, not a score-ranked take. An episode the incumbent extracted zero edges from is exactly as eligible as any other.",
+    "stratification_dimensions": [
+      "month(created_at)",
+      "payload_kind(source_description)"
+    ]
+  },
+  "prd_marker": "PRD-MARKER:local-memory-models-eval corpus-manifest",
+  "stratification_report": {
+    "cells": {
+      "2026-04|decisions_and_rationale": {
+        "allocated": 32,
+        "population": 464,
+        "selected": 32
+      },
+      "2026-04|entities_and_relations": {
+        "allocated": 5,
+        "population": 56,
+        "selected": 5
+      },
+      "2026-04|procedural_knowledge": {
+        "allocated": 1,
+        "population": 1,
+        "selected": 1
+      },
+      "2026-04|temporal_facts": {
+        "allocated": 17,
+        "population": 237,
+        "selected": 17
+      },
+      "2026-05|decisions_and_rationale": {
+        "allocated": 23,
+        "population": 327,
+        "selected": 23
+      },
+      "2026-05|entities_and_relations": {
+        "allocated": 3,
+        "population": 38,
+        "selected": 3
+      },
+      "2026-05|temporal_facts": {
+        "allocated": 27,
+        "population": 391,
+        "selected": 27
+      },
+      "2026-06|decisions_and_rationale": {
+        "allocated": 12,
+        "population": 171,
+        "selected": 12
+      },
+      "2026-06|entities_and_relations": {
+        "allocated": 2,
+        "population": 10,
+        "selected": 2
+      },
+      "2026-06|temporal_facts": {
+        "allocated": 7,
+        "population": 85,
+        "selected": 7
+      },
+      "2026-07|decisions_and_rationale": {
+        "allocated": 39,
+        "population": 571,
+        "selected": 39
+      },
+      "2026-07|entities_and_relations": {
+        "allocated": 6,
+        "population": 77,
+        "selected": 6
+      },
+      "2026-07|temporal_facts": {
+        "allocated": 12,
+        "population": 163,
+        "selected": 12
+      },
+      "2026-08|decisions_and_rationale": {
+        "allocated": 11,
+        "population": 155,
+        "selected": 11
+      },
+      "2026-08|entities_and_relations": {
+        "allocated": 1,
+        "population": 9,
+        "selected": 1
+      },
+      "2026-08|temporal_facts": {
+        "allocated": 2,
+        "population": 20,
+        "selected": 2
+      }
+    },
+    "totals": {
+      "allocated": 200,
+      "not_selected": 2575,
+      "population": 2775,
+      "selected": 200
+    }
+  }
+}
