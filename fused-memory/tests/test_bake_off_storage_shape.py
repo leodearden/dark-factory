@@ -5527,7 +5527,13 @@ class TestCommittedReportJson:
 
     @pytest.mark.parametrize('metric,keys', [
         ('claim_recall', ('at_5', 'at_10')),
-        ('discoverability', ('canonical_in_top_5_rate',)),
+        # Both forms of the same column: the one measured over the read
+        # window, and the transform-blind one measured over the raw store
+        # hits.  A committed run missing the second leaves `b_grouped`'s
+        # headline rate readable only as though grouping were retrieval.
+        ('discoverability', ('canonical_in_top_5_rate',
+                             'stored_canonical_in_top_5_rate',
+                             'stored_canonical_found_count')),
         ('tokens_per_query', ('mean',)),
         # Both halves: the rank-based one and the flagged threshold replay.
         ('guard_adequacy', ('candidate_present_rate', 'guard_matched_rate')),
@@ -5558,10 +5564,54 @@ class TestCommittedReportJson:
                     assert by_kind[kind]['claim_recall'][key] is not None, (
                         f'{arm}.{kind}.claim_recall.{key}'
                     )
+                # The by-kind table renders the transform-blind column too,
+                # and `held_out` — the only subset that measures
+                # generalisation rather than recall of the derivation input
+                # — is the row where a transform-credited rate is least safe
+                # to read alone.
+                assert by_kind[kind]['discoverability'][
+                    'stored_canonical_in_top_5_rate'] is not None, (
+                    f'{arm}.{kind}.stored_canonical_in_top_5_rate'
+                )
             # held_out is a SUBSET of topic_phrasing, never a third kind, and
             # a strict one — the whole point is that some phrasings WERE the
             # registry's derivation input and so cannot measure generalisation.
             assert by_kind['held_out']['queries'] < by_kind['topic_phrasing']['queries']
+
+    def test_the_transform_blind_column_is_identical_across_a_shapes_pin_twins(self):
+        """Measured over the raw store hits, so it CANNOT depend on the pin.
+
+        The artifact-level statement of the unit-level property, and the one
+        that makes the column readable as retrieval rather than as any
+        read-side transform: a difference here would mean the column is
+        measuring something downstream of `read_path` after all.
+        """
+        report = _committed_report()
+
+        for shape in _mod().ARM_SHAPES:
+            off = report['arms'][shape]['discoverability']
+            on = report['arms'][f'{shape}+pin']['discoverability']
+            for key in ('stored_canonical_in_top_5_rate',
+                        'stored_canonical_median_rank',
+                        'stored_canonical_found_count'):
+                assert on[key] == off[key], f'{shape}.{key}'
+
+    def test_at_least_one_arm_reads_differently_before_and_after_the_transforms(self):
+        """Anti-vacuity, in the spirit of the `assert checked` guard below.
+
+        Pins NO rate, bound, direction or magnitude (G6) — only that a
+        difference EXISTS somewhere in the table.  Two columns that always
+        agreed would mean the disclosure column had been aliased to the one
+        it is supposed to qualify, and a future regeneration that quietly did
+        that would otherwise publish a duplicated number and pass.
+        """
+        report = _committed_report()
+
+        assert any(
+            measurement['discoverability']['stored_canonical_in_top_5_rate']
+            != measurement['discoverability']['canonical_in_top_5_rate']
+            for measurement in report['arms'].values()
+        ), 'no arm distinguishes the stored rate from the transform-credited one'
 
     def test_every_arm_carries_the_pin_diagnostic(self):
         """Both keys on all six rows. A `+pin` row identical to its twin is
