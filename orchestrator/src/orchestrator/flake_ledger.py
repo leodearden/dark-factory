@@ -43,8 +43,10 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
@@ -145,6 +147,22 @@ class FlakeOccurrenceRow:
     task_id: str | None
     psi_cpu_some10: float | None
     detail: str
+
+
+@dataclass(frozen=True)
+class DebtRow:
+    """The single ``flake_debt`` row for one test — its current cycle plus the
+    prior-cycle fields that feed η's recurrence trigger."""
+
+    test_id: str
+    project_id: str
+    opened_at: str
+    resolved_at: str | None
+    owner_task_id: str | None
+    open_count: int
+    prior_resolved_at: str | None
+    prior_resolving_commit: str | None
+    last_occurrence_at: str
 
 
 def ledger_db_path(project_root: Path) -> Path:
@@ -327,3 +345,81 @@ def read_occurrences(
     finally:
         conn.close()
     return [_to_occurrence_row(r) for r in rows]
+
+
+def _to_debt_row(row: sqlite3.Row) -> DebtRow:
+    return DebtRow(
+        test_id=row['test_id'],
+        project_id=row['project_id'],
+        opened_at=row['opened_at'],
+        resolved_at=row['resolved_at'],
+        owner_task_id=row['owner_task_id'],
+        open_count=row['open_count'],
+        prior_resolved_at=row['prior_resolved_at'],
+        prior_resolving_commit=row['prior_resolving_commit'],
+        last_occurrence_at=row['last_occurrence_at'],
+    )
+
+
+def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
+    """The debt row for *test_id*, or ``None`` if the test has never been suppressed.
+
+    A primary-key lookup — which is exactly the shape §5.3 says makes η's recurrence
+    trigger a lookup rather than a scan.  RESOLVED rows are returned too: they are
+    retained deliberately (§5.2) because the recurrence trigger reads them.
+    """
+    ensure_schema(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT * FROM flake_debt WHERE test_id = ?', (test_id,)).fetchone()
+    finally:
+        conn.close()
+    return _to_debt_row(row) if row is not None else None
+
+
+async def open_debt(
+    db_path: Path,
+    project_id: str,
+    test_id: str,
+    *,
+    task_client: Any = None,
+    now: datetime | None = None,
+) -> DebtRow | None:
+    """Open (or advance) the single ``flake_debt`` row for *test_id* (PRD §8.3).
+
+    Returns the resulting row, or ``None`` if the ledger was unavailable — the never-
+    raises invariant and a ``-> DebtRow`` return type are in direct conflict, so the
+    honest degrade is ``None`` rather than a fabricated row, and consumers must handle
+    ledger unavailability explicitly.
+
+    ``task_client`` is accepted for SIGNATURE STABILITY and is UNUSED in α.  Task ζ
+    adds the invariant enforcement here — re-corroborate ``owner_task_id``'s live
+    status and file a de-flake task if none is non-terminal — and declaring the
+    parameter (and the ``async`` colour) now means ζ never has to churn ``await`` at
+    ε's merge-path call sites.  The coupling rule ζ inherits: the ledger READS task
+    status but never WRITES it, except for the initial filing.
+
+    ``UNKNOWN_TEST_ID`` must never be passed here: a sentinel names no test, so it can
+    own no de-flake task.
+
+    *now* defaults to the current UTC time; it is injectable so §5.4's ledger-owned
+    timestamps are deterministically testable.
+    """
+    stamp = (now or datetime.now(UTC)).isoformat()
+    ensure_schema(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            'INSERT INTO flake_debt (test_id, project_id, opened_at, open_count, '
+            ' last_occurrence_at) '
+            'VALUES (?, ?, ?, 1, ?) '
+            'ON CONFLICT(test_id) DO UPDATE SET '
+            '    last_occurrence_at = excluded.last_occurrence_at',
+            # step-18 completes the DO UPDATE with the re-entry carry-forward.
+            (test_id, project_id, stamp, stamp),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return read_debt(db_path, test_id)
