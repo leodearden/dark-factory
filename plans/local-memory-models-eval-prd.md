@@ -13,18 +13,25 @@ not counted as G1 consumers of anything here.
 > Applied corrections (2026-08-06, task 3748):
 > - Task 3720 (LME-η, pending) — **correction**: VRAM-budget bullet + MoE-sizing sentence updated.
 > - Task 3721 (LME-θ, pending) — **insertion**: no VRAM figure existed; one bullet added.
-> - Task 3713 (LME-α, in-progress) — deliberately **not edited**; the earlier claim here was false
->   and is corrected now: `arm_fits` gates each arm against measured free VRAM (~16.37 GiB)
->   correctly, but the verdict actually applied (`evaluate_budget`, called from
->   `lms_healthcheck.py:755`) defaults to `NOMINAL_CEILING_GIB = 19.5` (`lms_vram.py:49,319`)
->   against **total** card usage — so the enforced threshold is still 19.5, not 16.4, and 3713's own
->   `description`/`metadata.user_observable_signal` still read "19–20GB" too (known, not silent).
->   Not edited because 3713 is in-progress/live-claimed and the fix is a verdict-**subject**
->   correction its own README defers to a reviewer, not a number swap — owner is
->   `scripts/local-model-serving/README.md` §`OPEN: the budget verdict's subject is miscalibrated
->   (blocks step 23)` on `task/3713`; landing it also updates 3713's description/signal. Until then
->   `lms_healthcheck` exits 3 for the LLM arms — hold α's review against this PRD's figure, not the
->   healthcheck's current PASS.
+> - Task 3713 (LME-α, in-progress) — its task **record** is deliberately not edited; its **code** no
+>   longer needs editing. Both claims below are pinned to `task/3713` @ `b3745f5a5c`
+>   (2026-08-06T06:35:56+01:00), which is **not yet on `main`** — re-read the branch tip before
+>   relying on them.
+>   - *Code — resolved.* α step 23 landed the verdict-**subject** correction (esc-3713-6).
+>     `lms_vram.evaluate_budget(used_mib, total_mib, *, baseline_mib, baseline_free_mib)` now judges
+>     the **arm's own footprint** (`used − baseline`) against the free VRAM measured immediately
+>     before that arm started. No nominal-ceiling parameter remains on that path, and
+>     `lms_healthcheck.py` passes a live per-arm baseline rather than relying on a default. This
+>     matches `arm_fits`, which already gated each arm against measured free VRAM. An earlier
+>     revision of this amendment asserted the opposite (that a `NOMINAL_CEILING_GIB = 19.5` default
+>     was still enforced against **total** card usage) and instructed α reviewers to disbelieve a
+>     healthcheck PASS on that basis. That instruction was wrong and is **withdrawn**: judge α's
+>     healthcheck output on its merits.
+>   - *Task record — still open.* 3713's `description` and `metadata.user_observable_signal` still
+>     read "19–20GB" (verified 2026-08-06 via `get_task`). Not edited here because 3713 is
+>     in-progress and live-claimed; rewriting a running task's description hands its agent
+>     instructions differing from what it has been executing against. Whoever closes 3713 should
+>     bring both fields to the measured ~16.4 GiB figure. Known, not silent.
 
 ## Goal
 
@@ -203,9 +210,11 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
       footprint draws from — and is **not** a ceiling on total card usage. Total usage necessarily
       includes the ~7.2 GiB whisper-writer + KDE/X11 desktop baseline, so a `total_used ≤ 16.4 GiB`
       reading is a different, much stricter claim that this correction does **not** make. Which of
-      the two readings α's health verdict should enforce is the open question at the task-α row's
-      Signal cell (Decomposition plan) and in `scripts/local-model-serving/README.md`'s
-      `OPEN: the budget verdict's subject is miscalibrated` section on `task/3713` — not decided here.
+      the two readings α's health verdict enforces was an open question when this correction was
+      written; α resolved it (esc-3713-6, step 23) in favour of the **arm-footprint** reading —
+      `evaluate_budget` judges `used − baseline` against the free VRAM measured just before that arm
+      started. Pinned to `task/3713` @ `b3745f5a5c`, **not yet on `main`**; re-read the branch tip
+      (and `scripts/local-model-serving/README.md`) rather than treating this line as current.
     - Cites: memory `c01e7d1b-2916-4a8d-8f6e-c5e42692ce3d` (authoritative measurement),
       `38a4fcf2-30ba-4884-82f9-412737ddda13` (contradiction resolution).
 11. **Long runs in transient `systemd --user` units**, never bare background shells.
@@ -307,7 +316,7 @@ manifest at decompose time.
 
 | # | Task | Modules | Kind | Signal (user-observable) | Prereqs |
 |---|---|---|---|---|---|
-| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` confirms the arm's own footprint fits the measured ~16.4 GiB of free VRAM (D10). NOTE: whether the health verdict judges arm-footprint-vs-free or total-card-usage-vs-ceiling is unresolved — see α's README `OPEN: the budget verdict's subject is miscalibrated`; this signal is not green until that lands. | — |
+| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` confirms the arm's own footprint fits the measured ~16.4 GiB of free VRAM (D10). NOTE: α resolved the verdict's subject in favour of arm-footprint-vs-free (esc-3713-6, step 23), pinned to `task/3713` @ `b3745f5a5c` — not yet on `main`, so confirm against the branch tip and α's README when judging this signal. | — |
 | **β** | Config + client plumbing: `llm.client_class` knob (`openai`\|`openai_generic`), LLM `base_url` honored (`graphiti_client.py:502-509`), Mem0 LLM/embedder `openai_base_url` + `embedding_model_dims` plumbed (`mem0_client.py:138-167`), reindex tool `base_url` (`reindex.py:160-165`); default config byte-identical behavior | `fused-memory/src/fused_memory` | normal | integration test: a config naming a local base_url + generic client constructs clients that hit a local mock server; with the shipped config, construction is behaviorally unchanged (existing tests green) | — |
 | **γ** | Durable write telemetry: `duration_ms` on `backend_ops` rows (`_journaled_backend_call`, `memory_service.py:1302-1337`) + per-write token usage surfaced from graphiti's `TokenUsageTracker` into the journal `result_summary` | `fused-memory/src/fused_memory` | normal | after any live memory write, the documented read-only sqlite query shows the new row carrying `duration_ms` and token counts — permanent operator observability, consumed by ε and by operators | — |
 | **δ** | Corpus builder: stratified sample (~150–300, size finalized in-task from control-variance needs) of real dark_factory episodes across time and payload kind, explicitly **not** conditioned on incumbent outcome; committed manifest (ids + content hashes + stratification report + the no-outcome-filter statement) | `fused-memory/scripts` (read-only against episode store) | normal | committed corpus manifest; a reviewer can re-derive the sample from the manifest's recorded criteria | — |
