@@ -55,6 +55,7 @@ network, no ``MemoryService``.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import uuid
 from pathlib import Path
@@ -175,8 +176,6 @@ def assert_store_mutation_allowed(*, operation: str) -> None:
         ) from exc
     finally:
         # Unconditional cleanup: the probe is scratch, never residue. A failed
-        # create leaves nothing to remove, hence the swallowed OSError.
-        try:
+        # create leaves nothing to remove, hence the suppressed OSError.
+        with contextlib.suppress(OSError):
             probe.unlink()
-        except OSError:
-            pass
