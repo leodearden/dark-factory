@@ -6196,3 +6196,183 @@ def test_fm_liveness_restart_min_interval_exceeds_worst_observed_lifetime(
         "a brokenness revive must react faster than the scheduled fm deploy "
         "cadence (I5)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Part D: shared persistence helpers _atomic_write_json / _read_json_state
+# (task 3764)
+#
+# This task adds THREE more persisted-state writers/readers to a file that
+# already had two (_stamp_fm_deploy_clock / _read_last_fm_deploy_epoch).
+# Without extraction the ~20-line makedirs/mkstemp/os.replace/unlink-on-error
+# dance would be copy-pasted a third and fourth time. The extraction is
+# behaviour-preserving; the existing Part C deploy-clock suite is its
+# regression net, re-asserted explicitly at the bottom of this section.
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_json_writes_body_and_creates_parent_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_atomic_write_json writes the JSON body, creating a missing parent dir.
+
+    Asserted against the REAL on-disk file (parsed back), never a mock.
+    """
+    wdog = _load_watchdog()
+    target = tmp_path / "deep" / "nested" / "state.json"
+    assert not target.parent.exists()
+
+    wdog._atomic_write_json(str(target), {"count": 2, "verdict": "wedged"})
+
+    assert target.exists(), "the write must create the target file and its parent dir"
+    assert json.loads(target.read_text()) == {"count": 2, "verdict": "wedged"}
+
+
+def test_atomic_write_json_leaves_no_stray_temp_file(tmp_path: pathlib.Path) -> None:
+    """A successful _atomic_write_json leaves ONLY the target file behind.
+
+    The write goes via tempfile.mkstemp + os.replace; the temp file must be
+    renamed away, not left accumulating in data/fused-memory/ on every tick.
+    """
+    wdog = _load_watchdog()
+    target = tmp_path / "state.json"
+
+    wdog._atomic_write_json(str(target), {"ts": 1})
+
+    survivors = sorted(p.name for p in tmp_path.iterdir())
+    assert survivors == ["state.json"], f"stray temp file(s) left behind: {survivors}"
+
+
+def test_atomic_write_json_fail_soft_on_replace_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A failed rename is logged and swallowed, and the temp file is unlinked.
+
+    Fail-soft: a persistence hiccup must never crash the oneshot watchdog.
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("cross-device link")
+
+    monkeypatch.setattr(wdog.os, "replace", boom)
+    target = tmp_path / "state.json"
+
+    # Must not raise.
+    wdog._atomic_write_json(str(target), {"ts": 1})
+
+    assert not target.exists(), "a failed write must not leave a partial target"
+    assert list(tmp_path.iterdir()) == [], (
+        f"the temp file must be unlinked on failure: "
+        f"{sorted(p.name for p in tmp_path.iterdir())}"
+    )
+    assert logged, "a swallowed write failure must be logged, not silent"
+
+
+def test_atomic_write_json_fail_soft_on_unwritable_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An unwritable target directory is logged and swallowed, not raised."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)  # r-x: cannot create the temp file inside
+    try:
+        # Must not raise.
+        wdog._atomic_write_json(str(locked / "state.json"), {"ts": 1})
+    finally:
+        locked.chmod(0o700)
+
+    assert not (locked / "state.json").exists()
+    assert logged, "a swallowed write failure must be logged, not silent"
+
+
+def test_read_json_state_returns_parsed_dict(tmp_path: pathlib.Path) -> None:
+    """_read_json_state parses a well-formed file into a dict."""
+    wdog = _load_watchdog()
+    target = tmp_path / "state.json"
+    target.write_text('{"ts": 1783000000, "iso": "2026-08-06T00:00:00+00:00"}')
+
+    assert wdog._read_json_state(str(target)) == {
+        "ts": 1783000000,
+        "iso": "2026-08-06T00:00:00+00:00",
+    }
+
+
+def test_read_json_state_missing_file_returns_none_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A missing file yields None with NO log line.
+
+    "The state does not exist yet" is the normal case on a fresh checkout — it
+    is not a degradation and must not spam the journal every tick.
+    """
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    assert wdog._read_json_state(str(tmp_path / "absent.json")) is None
+    assert logged == [], f"a missing state file must not log: {logged}"
+
+
+def test_read_json_state_corrupt_json_returns_none_and_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A truncated/corrupt body yields None (fail-open) AND a log line."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    target = tmp_path / "corrupt.json"
+    target.write_text('{"ts": 178300')  # truncated / partially written
+
+    assert wdog._read_json_state(str(target)) is None
+    assert logged, "a corrupt state file is a real degradation and must be logged"
+
+
+def test_read_json_state_oserror_returns_none_and_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A non-FileNotFoundError OSError yields None (fail-open) AND a log line."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    target = tmp_path / "state.json"
+    target.write_text('{"ts": 1}')
+    target.chmod(0o000)
+    try:
+        result = wdog._read_json_state(str(target))
+    finally:
+        target.chmod(0o600)
+
+    assert result is None
+    assert logged, "an unreadable state file must be logged, not silently ignored"
+
+
+def test_fm_deploy_clock_still_roundtrips_through_shared_helpers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """REGRESSION: the existing deploy-clock pair still round-trips unchanged.
+
+    _stamp_fm_deploy_clock / _read_last_fm_deploy_epoch are rewritten as thin
+    wrappers over the shared helpers in this task. Their observable contract —
+    a {ts, iso} body, read back as float(ts), with the parent dir created —
+    must not change, and the wrappers must read their module-global path at
+    CALL time so monkeypatching wdog.FM_DEPLOY_CLOCK_PATH keeps working.
+    """
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "data" / "fused-memory" / "last_redeploy_fused_memory.json"
+    assert not clock_file.parent.exists()
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.5)
+
+    wdog._stamp_fm_deploy_clock()
+
+    body = json.loads(clock_file.read_text())
+    assert "ts" in body and "iso" in body, f"clock body must still carry ts+iso: {body}"
+    assert wdog._read_last_fm_deploy_epoch() == pytest.approx(1783000000.0)
+    assert isinstance(wdog._read_last_fm_deploy_epoch(), float)
