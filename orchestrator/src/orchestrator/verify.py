@@ -4689,24 +4689,20 @@ async def run_verification(
         if junit_path is not None and label == 'test':
             cmd = _with_junitxml_str(cmd, str(junit_path))
             assert cmd is not None  # None only when the input is None; guarded above
-        # Wrap the command in cpu-governed-exec.sh when role=='merge' and
-        # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
-        # unchanged when governance is disabled or the path is non-executable,
-        # so a misconfig never makes a verify spawn fail.
-        cmd = _govern_cpu_str(cmd, _resolve_governed_exec_path(config, worktree, role))
-        assert cmd is not None  # _govern_cpu_str returns None only when cmd is None; guarded above
         # Admission gate (task 2390 T2): only the pytest ('test') leg is
         # gated by the shared.verify_admission flock semaphore + role nice
         # tier; lint/type ride alongside within the same verify, ungated.
+        # Resolved here rather than after the governance wrap below because
+        # the `-n` gate reads it and must itself precede that wrap; it
+        # depends on nothing but config/label, so the move is inert.
         admission = _verify_admission_active(config) and label == 'test'
         # -n cap (task 2394 T6): applies only to roles {task, background} —
         # 'merge' is never -n-capped (bypasses admission slot-counting,
         # latency-critical). No-op when the knob is '' or 'auto' (the
         # apply_pytest_numprocesses no-op guard) — byte-identical to today.
-        # Must precede the nice-prefix bash-wrap below, and config_cmd above
-        # intentionally stays un-rewritten (same treatment as the nice
-        # prefix: an execution detail layered onto cmd, not the persisted
-        # config command).
+        # config_cmd above intentionally stays un-rewritten (same treatment
+        # as the nice prefix: an execution detail layered onto cmd, not the
+        # persisted config command).
         #
         # Hoisted into ONE local (task 3478) because the segmented branch
         # below applies the same cap per segment: a second copy of this
@@ -4719,11 +4715,27 @@ async def run_verification(
         )
         # _with_pytest_numprocesses_str identity-checks the mutation before
         # rendering (mirrors _govern_cpu_str's `governed is parsed` guard
-        # above), so a no-op leaves cmd byte-identical rather than
+        # below), so a no-op leaves cmd byte-identical rather than
         # reformatting a command that wasn't actually touched.
+        #
+        # MUST run before the cpu-governance wrap immediately below and after
+        # the junitxml injection above — the same ordering constraint, for
+        # the same reason: once governed, cmd is an opaque outer `<exec> --
+        # /bin/bash -c '...'` string that parse_config_command can no longer
+        # see as pytest, so the cap would silently vanish. Both gates are
+        # disjoint today (governance resolves only for role=='merge', the cap
+        # only for role in {'task','background'}), so this is defence in
+        # depth; ordering it identically to _run_one_segment below is what
+        # keeps the two paths from disagreeing if either gate ever widens.
         if pytest_n_capped:
             cmd = _with_pytest_numprocesses_str(cmd, config.verify_admission_pytest_n)
             assert cmd is not None  # None only when the input is None; guarded above
+        # Wrap the command in cpu-governed-exec.sh when role=='merge' and
+        # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
+        # unchanged when governance is disabled or the path is non-executable,
+        # so a misconfig never makes a verify spawn fail.
+        cmd = _govern_cpu_str(cmd, _resolve_governed_exec_path(config, worktree, role))
+        assert cmd is not None  # _govern_cpu_str returns None only when cmd is None; guarded above
         if admission:
             prefix = _resolve_nice_prefix(config, role)
             if prefix:
@@ -4822,15 +4834,21 @@ async def run_verification(
                     # rewrite above lands on `cmd` while segments are built
                     # from `config_cmd`.
                     #
-                    # BEFORE _govern_cpu_str, the same ordering constraint the
-                    # junitxml site documents: a governed command is an opaque
-                    # outer `<exec> -- /bin/bash -c '...'` string that
-                    # parse_config_command can no longer see as pytest.
-                    # Governance is inert here (_resolve_governed_exec_path
-                    # returns None for role != 'merge', and segmentation only
-                    # happens for role != 'merge'), so ordering it first is
-                    # defence in depth against a future change to that gate
-                    # rather than a live dependency.
+                    # BEFORE _govern_cpu_str — the SAME order as the
+                    # unsegmented site above (and as the junitxml injection,
+                    # which documents the constraint first): a governed
+                    # command is an opaque outer `<exec> -- /bin/bash -c
+                    # '...'` string that parse_config_command can no longer
+                    # see as pytest. Governance is inert here
+                    # (_resolve_governed_exec_path returns None for role !=
+                    # 'merge', and segmentation only happens for role !=
+                    # 'merge'), so ordering it first is defence in depth
+                    # against a future change to that gate rather than a live
+                    # dependency — but it is deliberately the same defence the
+                    # unsegmented path takes, so widening the governance gate
+                    # cannot make one path honour the operator's cap while the
+                    # other silently discards it (the asymmetry task 3478
+                    # exists to remove).
                     capped = segment_cmd
                     if pytest_n_capped:
                         capped = _with_pytest_numprocesses_str(
