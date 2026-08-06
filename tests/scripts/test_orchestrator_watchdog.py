@@ -6541,3 +6541,174 @@ def test_clear_fm_liveness_streak_swallows_and_logs_oserror(
     wdog._clear_fm_liveness_streak()
 
     assert logged, "a swallowed unlink failure must be logged, not silent"
+
+
+# ---------------------------------------------------------------------------
+# Part D: _record_fm_liveness_failure() accumulation semantics (task 3764)
+# ---------------------------------------------------------------------------
+
+
+def test_record_fm_liveness_failure_starts_at_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """With no streak file, the first recorded failure returns 1 and persists it."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.0)
+
+    assert wdog._record_fm_liveness_failure("wedged") == 1
+
+    body = json.loads(streak_file.read_text())
+    assert body["count"] == 1
+    assert body["verdict"] == "wedged"
+
+
+def test_record_fm_liveness_failure_accumulates_monotonically(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Successive failures increment 1 -> 2 -> 3, with the file tracking each step."""
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    now = [1783000000.0]
+    monkeypatch.setattr(wdog.time, "time", lambda: now[0])
+
+    seen = []
+    for _ in range(3):
+        seen.append(wdog._record_fm_liveness_failure("wedged"))
+        assert json.loads(streak_file.read_text())["count"] == seen[-1]
+        now[0] += 60.0  # one timer tick
+
+    assert seen == [1, 2, 3]
+
+
+def test_record_fm_liveness_failure_tracks_latest_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A wedged-then-port-down sequence still accumulates; the file names the LATEST.
+
+    Both are non-healthy verdicts and stream onto the SAME streak (design
+    decision: uniformity avoids a second code path with its own untested
+    edges, and it closes a real race where an fm restart initiated elsewhere
+    leaves the port briefly down).
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    now = [1783000000.0]
+    monkeypatch.setattr(wdog.time, "time", lambda: now[0])
+
+    assert wdog._record_fm_liveness_failure("wedged") == 1
+    now[0] += 60.0
+    assert wdog._record_fm_liveness_failure("port-down") == 2
+
+    assert json.loads(streak_file.read_text())["verdict"] == "port-down"
+
+
+def test_record_fm_liveness_failure_expires_stale_streak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A streak entry older than FM_LIVENESS_STREAK_MAX_AGE_SECS restarts at 1, not 4.
+
+    Item 2's requirement: "a stale streak from hours ago cannot be mistaken for
+    a fresh one". A gap larger than the max age means >=4 ticks were missed
+    (watchdog stopped, timer disabled, host suspended), so the CONSECUTIVE
+    claim no longer holds and continuity must be re-established from scratch.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    stale_ts = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 3, "verdict": "wedged", "ts": stale_ts}))
+    # Hours later — far outside the max age.
+    monkeypatch.setattr(wdog.time, "time", lambda: stale_ts + 7200.0)
+
+    assert wdog._record_fm_liveness_failure("wedged") == 1, (
+        "an expired streak must restart the count at 1, not resume it"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 1
+
+
+def test_record_fm_liveness_failure_increments_just_inside_max_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """BOUNDARY: an entry just inside FM_LIVENESS_STREAK_MAX_AGE_SECS still increments.
+
+    A slightly-late tick (systemd timer jitter, a slow probe) must not silently
+    reset the evidence, or a genuinely wedged fm could never reach the
+    threshold.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    prior_ts = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 2, "verdict": "wedged", "ts": prior_ts}))
+    monkeypatch.setattr(wdog.time, "time", lambda: prior_ts + 299.0)
+
+    assert wdog._record_fm_liveness_failure("wedged") == 3
+
+
+def test_record_fm_liveness_failure_write_error_fails_safe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A write failure does not propagate, and nothing persists — so it fails SAFE.
+
+    Because nothing landed on disk, the NEXT call starts from 1 again and the
+    counter can never climb to FM_LIVENESS_STREAK_THRESHOLD. A watchdog that
+    cannot persist evidence therefore never restarts fused-memory, which is the
+    correct direction for this task.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.0)
+
+    def boom(_src, _dst):  # noqa: ANN001
+        raise OSError("disk full")
+
+    monkeypatch.setattr(wdog.os, "replace", boom)
+
+    # Must not raise.
+    assert wdog._record_fm_liveness_failure("wedged") == 1
+    assert not streak_file.exists(), "a failed write must not leave partial state"
+    assert wdog._record_fm_liveness_failure("wedged") == 1, (
+        "with nothing persisted the counter must restart, never silently climb"
+    )
+
+
+def test_record_fm_liveness_failure_persists_across_module_instances(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """THE KEY TEST: the streak lives on DISK, not in module memory.
+
+    orchestrator-watchdog.service is Type=oneshot driven by a 60s timer, so the
+    process EXITS between probes — a module-level in-memory counter could never
+    accumulate, and an in-fixture-only assertion would not catch that.
+
+    _load_watchdog() re-execs the module from its file path, producing a
+    genuinely FRESH module object with brand-new globals. Recording one failure
+    through instance A and another through instance B therefore proves the
+    count survived a process boundary: an in-memory implementation is
+    structurally incapable of returning 2 here.
+    """
+    streak_path = tmp_path / "streak.json"
+    monkeypatch.setenv("FM_LIVENESS_STREAK", str(streak_path))
+
+    mod_a = _load_watchdog()
+    assert mod_a.FM_LIVENESS_STREAK_PATH == str(streak_path)
+    assert mod_a._record_fm_liveness_failure("wedged") == 1
+    assert json.loads(streak_path.read_text())["count"] == 1
+
+    del mod_a  # the "process" exits; nothing in memory survives
+
+    mod_b = _load_watchdog()
+    assert mod_b is not None
+    assert mod_b._record_fm_liveness_failure("wedged") == 2, (
+        "a fresh module instance must resume the on-disk streak; an in-memory "
+        "counter would restart at 1 here"
+    )
+    assert json.loads(streak_path.read_text())["count"] == 2
