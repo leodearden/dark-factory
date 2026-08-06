@@ -211,7 +211,8 @@ Verified-existing substrate: vLLM structured outputs via OpenAI-compatible `json
 `structured_output_mode` in installed graphiti_core 0.28.2 wheel; embedder `base_url` plumbing
 (`graphiti_client.py:533-539`); `shared/memory_eval_metrics` schema home; transcript-query corpus
 tooling; `maintenance/reindex.py` re-embed machinery; episode store (~2,635 dark_factory episodes)
-readable; GPU headroom measured (24GB − ~4GB whisper-writer).
+readable; GPU headroom measured directly (~16.4 GiB free with whisper-writer and the desktop
+resident — see D10; the earlier 24GB − ~4GB derivation overstated it by ~3.3 GB).
 
 Gaps that are **prerequisite tasks in this batch** (not assumed): LLM `base_url` + client-class
 plumbing (β); Mem0 LLM/embedder `base_url` + `embedding_model_dims` plumbing (β); duration/token
@@ -283,7 +284,7 @@ manifest at decompose time.
 
 | # | Task | Modules | Kind | Signal (user-observable) | Prereqs |
 |---|---|---|---|---|---|
-| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` within the 19–20GB budget | — |
+| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` within the measured ~16.4 GiB operating budget (D10) | — |
 | **β** | Config + client plumbing: `llm.client_class` knob (`openai`\|`openai_generic`), LLM `base_url` honored (`graphiti_client.py:502-509`), Mem0 LLM/embedder `openai_base_url` + `embedding_model_dims` plumbed (`mem0_client.py:138-167`), reindex tool `base_url` (`reindex.py:160-165`); default config byte-identical behavior | `fused-memory/src/fused_memory` | normal | integration test: a config naming a local base_url + generic client constructs clients that hit a local mock server; with the shipped config, construction is behaviorally unchanged (existing tests green) | — |
 | **γ** | Durable write telemetry: `duration_ms` on `backend_ops` rows (`_journaled_backend_call`, `memory_service.py:1302-1337`) + per-write token usage surfaced from graphiti's `TokenUsageTracker` into the journal `result_summary` | `fused-memory/src/fused_memory` | normal | after any live memory write, the documented read-only sqlite query shows the new row carrying `duration_ms` and token counts — permanent operator observability, consumed by ε and by operators | — |
 | **δ** | Corpus builder: stratified sample (~150–300, size finalized in-task from control-variance needs) of real dark_factory episodes across time and payload kind, explicitly **not** conditioned on incumbent outcome; committed manifest (ids + content hashes + stratification report + the no-outcome-filter statement) | `fused-memory/scripts` (read-only against episode store) | normal | committed corpus manifest; a reviewer can re-derive the sample from the manifest's recorded criteria | — |
