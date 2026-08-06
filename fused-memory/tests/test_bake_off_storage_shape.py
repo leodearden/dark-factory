@@ -4398,13 +4398,24 @@ class TestByQueryKindSplitsTheQueriesItClaimsToSplit:
 # the rows — and the b_grouped-vs-c_peers divergence itself — is the next.
 
 
-def _agg_row(*, canonical_in_5=1.0, canonical_rank=1, stored_in_5=1.0,
-             stored_rank=1, has_canonical=True, kind='claim', held_out=False,
+def _agg_row(*, canonical_in_5: float | None = 1.0,
+             canonical_rank: int | None = 1,
+             stored_in_5: float | None = 1.0,
+             stored_rank: int | None = 1,
+             has_canonical=True, kind='claim', held_out=False,
              recall_5=0.5, recall_10=0.5):
     """One `measure_arm` row, in the shape `_aggregate_queries` consumes.
 
     Hand-built: no store, no network, no embedder — so every expectation
     below is exact.
+
+    The four canonical params are `| None`-typed because `measure_arm`
+    genuinely emits None for each: the RANK pair when the canonical never
+    ranked, the RATE pair when the cluster had no canonical to look for at
+    all (`bake_off_storage_shape.py:3111-3112`).  Both are non-observations
+    `_mean` must skip rather than average in as 0.0 — the distinction
+    several tests below exist to pin, so the defaults must not narrow it
+    away.
     """
     return {
         'kind': kind,
