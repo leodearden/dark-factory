@@ -308,6 +308,77 @@ def test_idle_unit_restarts_transparently_with_no_defer_line(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Hermeticity: this suite must never stamp the REAL fleet-deploy clock (3797)
+# ---------------------------------------------------------------------------
+
+def test_suite_never_stamps_the_repo_fleet_deploy_clock(tmp_path):
+    """Driving the script must not touch the live checkout's deploy clock.
+
+    ``restart-all-orchestrators.sh`` resolves ``CLOCK_FILE`` from
+    ``$ORCH_FLEET_DEPLOY_CLOCK``, falling back to
+    ``$REPO_DIR/data/orchestrator/last_redeploy_orchestrator.json`` where
+    ``REPO_DIR`` is the checkout the SCRIPT lives in -- i.e. this worktree.
+    Every exit-0 verified-fresh run in this file reaches
+    ``stamp_fleet_deploy_clock``, so without a redirect a fake-systemctl test
+    writes a REAL "the fleet just redeployed" stamp that
+    ``scripts/orchestrator-watchdog.py`` then believes, suppressing its
+    staleness backstop for ``ORCH_RESTART_MIN_INTERVAL_SECS`` (8h default).
+
+    Both halves matter. The first asserts the repo clock is untouched; the
+    second asserts the script DID stamp somewhere harmless, so a future "fix"
+    that merely stops stamping cannot pass this test.
+    """
+    repo_clock = SCRIPT.parent.parent / "data" / "orchestrator" / "last_redeploy_orchestrator.json"
+    before = (
+        (repo_clock.read_bytes(), repo_clock.stat().st_mtime_ns)
+        if repo_clock.exists() else None
+    )
+
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=True, ts_epoch=time.time())
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={"RESTART_VERIFY_TIMEOUT": "5"},
+    )
+
+    # Non-vacuity: the assertion below is only meaningful if the run actually
+    # reached the stamp, which happens only on the all-verified-fresh exit 0.
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    after = (
+        (repo_clock.read_bytes(), repo_clock.stat().st_mtime_ns)
+        if repo_clock.exists() else None
+    )
+    assert after == before, (
+        f"this suite falsified the REAL fleet-deploy clock at {repo_clock}: "
+        f"{before!r} -> {after!r}. scripts/orchestrator-watchdog.py reads that "
+        "file as 'the fleet was redeployed at <ts>' and skips its staleness "
+        "backstop for ORCH_RESTART_MIN_INTERVAL_SECS (8h default), so a test "
+        "stamp silently disarms fleet staleness recovery for the rest of the "
+        "day. Point ORCH_FLEET_DEPLOY_CLOCK at a tmp file "
+        "(scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect)."
+    )
+
+    redirected = Path(os.environ["ORCH_FLEET_DEPLOY_CLOCK"])
+    assert redirected.exists(), (
+        f"the script stamped nothing at all: {redirected} does not exist. "
+        "The clock must be REDIRECTED, not disabled -- stamping on a verified "
+        "fleet restart is the correct production behaviour (task 2396 I2)."
+    )
+    stamp = json.loads(redirected.read_text())
+    assert isinstance(stamp, dict) and "ts" in stamp and "iso" in stamp, (
+        f"redirected clock has the wrong schema: {stamp!r}; expected the "
+        "{ts, iso} shape both the coordinator and the watchdog read."
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-9: RED -- I4 (fail-toward-convergence), stale/absent branch
 # ---------------------------------------------------------------------------
 
