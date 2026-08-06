@@ -1159,6 +1159,52 @@ def test_format_report_always_prints_coverage_even_with_zero_candidates():
     assert "no plan signal" in lowered or "without plan signal" in lowered
 
 
+def test_format_report_renders_every_coverage_line_verbatim():
+    """(b2) THE WHOLE-LINE COVERAGE ASSERTION — closing the substring hole.
+
+    The sibling above asserts only ``"COVERAGE" in report`` plus bare
+    ``"3264" in report`` / ``"2049" in report``. Substring assertions on counts
+    are vacuous: test_audit_combine_gate_marker_loss.py:1208 records that
+    ``"2" in report`` went green off the "25" on the neighbouring line, so a
+    regression that DROPPED a whole coverage row still passed. Here the five
+    counts are pairwise non-substring (8123/415/662/1990/37) and each rendered
+    line is asserted whole, INCLUDING its padding — so a dropped row, a
+    reordered row, a relabelled row or a drifted gutter all fail.
+
+    This is a characterization test: it passes against the pre-extraction
+    formatter by design. That is the point — it is what makes the shared
+    format_coverage_block adoption checkable, and a red here would mean the
+    shared helper's column arithmetic is wrong.
+    """
+    report = format_report([
+        _audit(
+            [],
+            total_tasks=8123,
+            tasks_with_file_level_signal=415,
+            tasks_with_lock_level_signal_only=662,
+            tasks_without_plan_signal=1990,
+            plan_records_without_task=37,
+        )
+    ])
+    lines = report.splitlines()
+
+    caveat = [
+        "  COVERAGE (the candidate list above is an OBSERVABLE SUBSET, not the",
+        "  full damaged population — tasks with no recoverable plan scope are",
+        "  UNKNOWN, neither clean nor damaged):",
+    ]
+    start = lines.index(caveat[0])
+    assert lines[start:start + 3] == caveat
+    for expected in (
+        "    total tasks scanned:                8123",
+        "    with a file-level plan signal:      415",
+        "    with only a lock-level signal:      662",
+        "    with NO plan signal at all:         1990",
+        "    plan records with no such task:     37",
+    ):
+        assert expected in lines
+
+
 def test_format_report_marks_lock_level_candidates_with_an_explicit_caveat():
     """(c) a LOCK_LEVEL candidate's paths are MODULE paths, and the report
     must say so — a repair that backfilled them verbatim would corrupt
