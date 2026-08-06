@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import re
 import sys
@@ -74,11 +75,30 @@ ARTIFACT_GLOB = 'toolcall-xml-leak-sweep-*'
 def _load_module() -> types.ModuleType:
     """Load sweep_toolcall_xml_leak.py from its file path.
 
-    Verbatim reuse of test_sweep_toolcall_xml_leak.py's loader: scripts/ is not
-    a package and the script is not on PYTHONPATH, so importlib is how the
+    Reuse of test_sweep_toolcall_xml_leak.py's loader: scripts/ is not a
+    package and the script is not on PYTHONPATH, so importlib is how the
     production detector is reached without sys.path pollution.
+
+    One deliberate difference from that copy: an already-loaded module for the
+    SAME file is reused rather than re-executed. Both test modules register the
+    key ``sweep_toolcall_xml_leak`` in ``sys.modules``, so an unconditional
+    load makes the second import execute the 965-line script a second time and
+    silently REPLACE the first module object -- two live module objects whose
+    identity depends on collection order. Harmless while only pure functions
+    are used, but a latent hazard the moment anything holds module state.
+
+    The remaining half of the reviewer's ask -- hoisting this loader into
+    ``fused-memory/tests/conftest.py`` so the loading contract has ONE
+    definition -- is not applied here: conftest.py is outside this task's
+    locked module set.
     """
     mod_name = 'sweep_toolcall_xml_leak'
+    cached = sys.modules.get(mod_name)
+    cached_file = getattr(cached, '__file__', None)
+    if cached is not None and cached_file is not None and (
+        Path(cached_file).resolve() == SCRIPT_PATH.resolve()
+    ):
+        return cached
     spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
     if spec is None or spec.loader is None:
         raise ImportError(f'Cannot load {SCRIPT_PATH}')
@@ -97,6 +117,13 @@ _mod = _load_module()
 classify_record = _mod.classify_record
 CLASSIFICATIONS = _mod.CLASSIFICATIONS
 CLEAN = _mod.CLEAN
+# Sourced from the script, never re-typed. A literal 'manual_review' here would
+# make test_manual_review_records_were_never_mutated skip every record and pass
+# VACUOUSLY the day the name changes -- green, not red, which is the failure
+# direction this module exists to eliminate.
+MANUAL_REVIEW = _mod.MANUAL_REVIEW
+REPAIRABLE_TAIL = _mod.REPAIRABLE_TAIL
+REPAIRABLE_DUPLICATE = _mod.REPAIRABLE_DUPLICATE
 
 # The exact key set build_report() emits (script line ~508). Asserted as an
 # EQUALITY, not a subset: an aborted run adds 'aborted', and a report carrying
@@ -143,6 +170,18 @@ _SHA_RE = re.compile(r'\A[0-9a-f]{40}\Z')
 # remediation table) says a HUMAN must adjudicate. Lifted verbatim as a
 # vocabulary rather than re-derived, so this module's notion of "a mutation
 # somebody has to deal with" is the runbook's, not a fresh invention.
+#
+# There is no shared constant to import: the script spells the same four
+# inline in resolve_exit_code(). That makes this tuple a HAND COPY, and a hand
+# copy of a growth-prone list is a silent-drift hazard -- add a fifth danger
+# outcome to the sweep and _unrepaired_danger_records() would return [] for a
+# record carrying it, every test below would hit its "if not outstanding"
+# early exit, and the whole class would go GREEN while a real unrepaired live
+# mutation landed untracked. TestDangerFlagsMatchTheProductionScript pins this
+# tuple against resolve_exit_code's own source so that drift is RED, not
+# silent. (Exporting the constant FROM the script, as the reviewer suggested,
+# is the cleaner fix but edits scripts/sweep_toolcall_xml_leak.py, which is
+# outside this task's locked module set.)
 DANGER_FLAGS = (
     'record_error',
     'content_lost_in_flight',
@@ -152,8 +191,8 @@ DANGER_FLAGS = (
 
 # The two shapes repair_content() knows how to fix. Only these carry a
 # repaired_content, so only for these can the recovery payload be checked for
-# leak-freeness.
-REPAIRABLE_CLASSIFICATIONS = ('repairable_tail', 'repairable_duplicate')
+# leak-freeness. Imported, not re-typed -- see MANUAL_REVIEW above.
+REPAIRABLE_CLASSIFICATIONS = (REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE)
 
 # NAMING: deliberately NOT '*-report.json'. _report_paths() globs that suffix,
 # so a tracking file named that way would be swept into _REPORT_PATHS and fail
@@ -211,6 +250,93 @@ def _unrepaired_danger_records(report: dict) -> list[dict]:
         if any(record.get(flag) for flag in DANGER_FLAGS)
         and record.get('repaired') is not True
     ]
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary drift — the hand copy vs the production script
+# ---------------------------------------------------------------------------
+
+
+def _production_danger_flags() -> tuple[set[str], str]:
+    """The danger-flag set the SCRIPT actually acts on, plus where it came from.
+
+    Prefers a real exported constant if the script ever grows one (the clean
+    fix, which needs an edit outside this task's locked scope). Falls back to
+    reading the flag names straight out of ``resolve_exit_code``'s source: that
+    function IS the production consumer of these flags, so its own text is the
+    closest available substitute for a shared constant.
+    """
+    for name in ('HUMAN_ADJUDICATION_FLAGS', 'DANGER_FLAGS'):
+        exported = getattr(_mod, name, None)
+        if exported is not None:
+            return set(exported), f'{name} exported by the script'
+    source = inspect.getsource(_mod.resolve_exit_code)
+    # Only record.get(...) — report.get('counts'/'truncated'/'records') are the
+    # run-level conditions, not per-record human-adjudication outcomes.
+    names = re.findall(r"record\.get\(\s*'([A-Za-z_][A-Za-z0-9_]*)'", source)
+    return set(names), 'resolve_exit_code() source'
+
+
+class TestDangerFlagsMatchTheProductionScript:
+    """DANGER_FLAGS is a hand copy. This is what keeps it honest.
+
+    The script spells the same four names inline in ``resolve_exit_code`` and
+    exports no shared constant, so nothing structurally prevents the two lists
+    from diverging. Divergence here fails in the WORST direction: a fifth
+    danger outcome added upstream would make ``_unrepaired_danger_records()``
+    return ``[]`` for a record carrying it, every test in
+    ``TestUnrepairedMutationsAreTracked`` would take its ``if not outstanding``
+    early exit, and the suite would report all-green while a real unrepaired
+    live-corpus mutation landed with no tracking entry required — this module's
+    own failure class, reintroduced one level up.
+    """
+
+    def test_hand_copy_equals_what_the_script_acts_on(self) -> None:
+        production, origin = _production_danger_flags()
+        assert set(DANGER_FLAGS) == production, (
+            f'DANGER_FLAGS {sorted(DANGER_FLAGS)} != the flags the script acts '
+            f'on {sorted(production)} (read from {origin}).'
+            '\n  missing here: '
+            f'{sorted(production - set(DANGER_FLAGS))}'
+            '\n  stale here:   '
+            f'{sorted(set(DANGER_FLAGS) - production)}'
+            '\nRe-bind DANGER_FLAGS. Do NOT delete this assertion: while the '
+            'two lists disagree, an unrepaired mutation carrying a flag this '
+            'module does not know about is tracked by nobody and the whole '
+            'TestUnrepairedMutationsAreTracked class silently no-ops.'
+        )
+
+    def test_no_duplicates_in_the_hand_copy(self) -> None:
+        assert len(set(DANGER_FLAGS)) == len(DANGER_FLAGS), (
+            f'DANGER_FLAGS {DANGER_FLAGS} repeats a name'
+        )
+
+    @pytest.mark.parametrize('flag', DANGER_FLAGS)
+    def test_each_flag_forces_a_non_zero_exit(self, flag: str) -> None:
+        """Behavioural confirmation, independent of how the source is parsed.
+
+        Each name must be one the production exit-code predicate genuinely
+        treats as needing a human — not merely a string that appears in the
+        file.
+        """
+        clean_apply = {
+            'dry_run': False,
+            'truncated': False,
+            'counts': dict.fromkeys(CLASSIFICATIONS, 0),
+            'records': [{'id': 'synthetic', 'classification': CLEAN}],
+        }
+        assert _mod.resolve_exit_code(clean_apply) == 0, (
+            'baseline synthetic apply report should exit 0; the fixture, not '
+            'the flag, is wrong'
+        )
+        flagged = json.loads(json.dumps(clean_apply))
+        flagged['records'][0][flag] = True
+        assert _mod.resolve_exit_code(flagged) == 1, (
+            f'{flag!r} does not force a non-zero exit in resolve_exit_code, so '
+            'it is not one of the outcomes the script escalates to a human. '
+            'Either it is misspelled here or it no longer belongs in '
+            'DANGER_FLAGS.'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +524,7 @@ class TestDetectorReproducesEveryClassification:
         """
         report = _load(path)
         for record in report['records']:
-            if record['classification'] != 'manual_review':
+            if record['classification'] != MANUAL_REVIEW:
                 continue
             assert not record.get('repaired'), (
                 f'manual_review record {record.get("id")!r} is marked '
