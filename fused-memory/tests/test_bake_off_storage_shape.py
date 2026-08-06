@@ -3017,6 +3017,41 @@ class TestBuildReportRefusesAPartialTable:
         assert 'b_grouped' in str(excinfo.value)
         assert 'by_query_kind' in str(excinfo.value)
 
+    def test_the_transform_blind_trio_is_registered_not_merely_produced(self):
+        """Registration is what obliges the renderer to carry the column.
+
+        `_REQUIRED_ARM_METRICS` is "enumerated ONCE and used by both the
+        completeness check and the renderer, so a metric cannot be validated
+        into the JSON and then quietly dropped from the table".  A
+        transform-blind measurement that lived only in the JSON would leave
+        the artifact gate η actually reads exactly as undisclosed as before.
+        """
+        required = _mod()._REQUIRED_ARM_METRICS['discoverability']
+
+        assert 'stored_canonical_in_top_5_rate' in required
+        assert 'stored_canonical_median_rank' in required
+        assert 'stored_canonical_found_count' in required
+
+    @pytest.mark.parametrize('key', ['stored_canonical_in_top_5_rate',
+                                     'stored_canonical_median_rank',
+                                     'stored_canonical_found_count'])
+    def test_a_missing_transform_blind_key_raises(self, key):
+        """The nested case again: `discoverability` is present, so a shallow
+        check passes and the new column renders blank — reading as "measured,
+        and equal to its neighbour", which for THIS column is precisely the
+        conflation it exists to disclose."""
+        mod = _mod()
+        arms = _all_arms()
+        del arms['c_peers+pin']['discoverability'][key]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'c_peers+pin' in str(excinfo.value)
+        assert key in str(excinfo.value)
+
     def test_an_unknown_arm_name_raises(self):
         """A typo would otherwise drop a real arm AND add a phantom one, and
         the table would still look complete."""
