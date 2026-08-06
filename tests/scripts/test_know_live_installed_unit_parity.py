@@ -417,3 +417,62 @@ def test_argv_from_exec_start_show_extracts_argv_segment() -> None:
 def test_argv_from_exec_start_show_returns_none_without_argv_segment() -> None:
     """An unexpected struct shape with no argv[]= segment yields None, not a crash."""
     assert _argv_from_exec_start_show("{ path=/usr/bin/uv ; ignore_errors=no }") is None
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        pytest.param(
+            subprocess.TimeoutExpired(cmd=["systemctl"], timeout=30),
+            id="timeout-expired-wedged-manager",
+        ),
+        pytest.param(
+            FileNotFoundError("systemctl missing"),
+            id="file-not-found-oserror-branch",
+        ),
+        pytest.param(
+            PermissionError("systemctl not executable"),
+            id="permission-error-oserror-branch",
+        ),
+        pytest.param(
+            subprocess.CalledProcessError(1, "systemctl"),
+            id="called-process-error-future-check-true",
+        ),
+    ],
+)
+def test_systemctl_user_show_returns_none_when_subprocess_raises(
+    monkeypatch: pytest.MonkeyPatch, raised: BaseException
+) -> None:
+    """_systemctl_user_show's docstring promises "Returns None — never raises".
+
+    Regression pin for a swallowed-exception gap (reviewer_comprehensive,
+    robustness): the only handler was `except OSError`, but
+    subprocess.TimeoutExpired — raised when a wedged systemd --user manager
+    or a stuck D-Bus leaves `systemctl show` hung past its 30s timeout — is
+    NOT an OSError subclass (verified MRO: TimeoutExpired -> SubprocessError
+    -> Exception), so it propagated uncaught instead of degrading to the
+    documented skip, i.e. the exact "false failure on a degraded
+    environment" the module docstring promises never to produce.
+    subprocess.CalledProcessError is pinned for the same reason, as a
+    forward-guard: it cannot arise today (the call uses check=False) but
+    would hit the identical gap if a future edit flips that flag.
+    FileNotFoundError and PermissionError are already-green regression pins
+    for the existing, correctly-handled OSError branch.
+
+    Portable by construction — subprocess.run is fully monkeypatched, so no
+    host or live systemd is needed — which is why this lives in the PARSER
+    layer section (see its header comment) rather than only being covered
+    by the host-coupled MANAGER-layer tests above, which are deselected by
+    default and would give this helper zero protection on CI or any other
+    dev box.
+    """
+
+    def fake_run(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise raised
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _systemctl_user_show(UNIT_BASENAME, "RestartSteps") is None, (
+        "_systemctl_user_show's docstring promises None, never raises — a "
+        f"{type(raised).__name__} from subprocess.run must degrade to a "
+        "skip via None, not propagate uncaught"
+    )
