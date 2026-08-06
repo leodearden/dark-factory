@@ -1588,8 +1588,11 @@ def test_the_report_carries_the_delivered_check_marker():
 
 
 def test_cli_merge_writes_the_combined_artifact(cli_env, tmp_path):
+    """The whole slate merges. Every arm the manifest declares, because the CLI
+    now enforces coverage — see the partial-set test below."""
+    expected = lms_healthcheck.load_arms().arm_ids()
     parts = []
-    for arm_id in ('qwen3.5-9b', 'phi-4-14b'):
+    for arm_id in expected:
         path = tmp_path / f'{arm_id}.json'
         assert lms_healthcheck.main(['--arm', arm_id, '--output', str(path)]) == 0
         parts.append(str(path))
@@ -1599,8 +1602,23 @@ def test_cli_merge_writes_the_combined_artifact(cli_env, tmp_path):
 
     assert code == 0
     written = json.loads(out.read_text())
-    assert {row['arm_id'] for row in written['arms']} == {'qwen3.5-9b', 'phi-4-14b'}
+    assert {row['arm_id'] for row in written['arms']} == set(expected)
     assert written['prd_marker'] == 'PRD-MARKER:local-memory-models-eval serving'
+
+
+def test_cli_merge_refuses_a_partial_slate_and_writes_nothing(cli_env, tmp_path):
+    """An arm that never became ready leaves NO per-arm file, so a partial merge
+    is what a failed slate run actually looks like — and it must not produce an
+    artifact that reads as complete. Measured 2026-08-06: a 7-row artifact came
+    out of an 8-arm manifest and nothing objected."""
+    path = tmp_path / 'one.json'
+    assert lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(path)]) == 0
+    out = tmp_path / 'merged.json'
+
+    code = lms_healthcheck.main(['--merge', str(path), '--output', str(out)])
+
+    assert code == lms_healthcheck.EXIT_MERGE_ERROR
+    assert not out.exists()
 
 
 def test_cli_merge_reports_a_refusal_loudly_and_writes_nothing(cli_env, tmp_path):
@@ -1813,3 +1831,43 @@ def test_the_probe_cap_is_the_products_own_output_budget():
     config = yaml.safe_load(config_path.read_text())
 
     assert lms_healthcheck.PROBE_MAX_TOKENS == config['llm']['max_tokens']
+
+
+def test_merge_refuses_a_set_that_does_not_cover_the_manifest():
+    """Absence is the one failure a report cannot describe.
+
+    An arm that never becomes ready produces NO per-arm report, so it goes
+    missing from the merge rather than red in it. Measured 2026-08-06: a 7-row
+    artifact came out of an 8-arm manifest because mistral-small-3.2-24b never
+    started, and nothing in merge_reports noticed.
+    """
+    report = _report([_arm(arm_id='arm-a', served_model_name='arm-a')])
+
+    with pytest.raises(lms_healthcheck.ReportMergeError) as excinfo:
+        lms_healthcheck.merge_reports([report], expected_arm_ids=['arm-a', 'arm-b'])
+
+    assert 'arm-b' in str(excinfo.value)
+    assert 'NARROWER' in str(excinfo.value)
+
+
+def test_merge_accepts_a_set_that_covers_the_manifest():
+    """The check must not fire on a complete slate."""
+    merged = lms_healthcheck.merge_reports(
+        [
+            _report([_arm(arm_id='arm-a', served_model_name='arm-a')]),
+            _report([_arm(arm_id='arm-b', served_model_name='arm-b', port=8411)]),
+        ],
+        expected_arm_ids=['arm-a', 'arm-b'],
+    )
+
+    assert {row.arm_id for row in merged.arms} == {'arm-a', 'arm-b'}
+
+
+def test_merge_without_an_expected_set_still_merges():
+    """`expected_arm_ids=None` keeps the old behaviour for callers with no
+    manifest in hand — the CLI passes one, library callers need not."""
+    merged = lms_healthcheck.merge_reports(
+        [_report([_arm(arm_id='arm-a', served_model_name='arm-a')])]
+    )
+
+    assert [row.arm_id for row in merged.arms] == ['arm-a']

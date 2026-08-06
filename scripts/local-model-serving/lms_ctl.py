@@ -132,6 +132,35 @@ def status(arm: ArmEntry | str) -> int:
     return _systemctl('status', unit_name(arm), capture=True).returncode
 
 
+def unit_has_failed(arm: ArmEntry | str) -> bool:
+    """True when this arm's unit has already given up.
+
+    Read from `is-active`, and treat ONLY the literal `failed` as terminal.
+
+    `inactive` is deliberately NOT a failure, even though a cleanly-exited unit
+    reports it: `systemctl is-active` also answers `inactive` for a unit that
+    was never started and for one that is not installed at all.  Folding those
+    in would make this function abort a wait for reasons that have nothing to do
+    with the arm dying, and would turn any caller that polls before starting
+    into an instant false negative.  `failed` is unambiguous — the unit ran and
+    exited non-zero — and it is what the measured incident produced
+    (`Result=exit-code`, `ExecMainStatus=1`).
+
+    `activating` and `active` are likewise not failures: an arm can sit in
+    `activating` for seven minutes while vLLM loads weights, and treating that
+    as dead would abort every legitimate slow start on the slate.
+
+    Fails SAFE: any systemctl error, timeout, or unrecognised state reads as
+    "not failed", so a broken probe makes `wait_ready` fall back to its ordinary
+    deadline instead of aborting a healthy arm on bad information.
+    """
+    try:
+        result = _systemctl('is-active', unit_name(arm), capture=True)
+    except Exception:
+        return False
+    return (result.stdout or '').strip() == 'failed'
+
+
 def stop_all() -> list[str]:
     stopped = sorted(active_arms())
     for arm_id in stopped:
@@ -154,11 +183,20 @@ def wait_ready(
     eval run (the 2026-04-08 404 bug, scripts/run_vllm_eval.py:541-553).  In a
     rig that starts and stops units repeatedly on a fixed port block, that is
     not a hypothetical.
+
+    A DEAD unit short-circuits the wait.  The units are ``Restart=no``, so once
+    the container has exited the endpoint can never come up and every remaining
+    poll is spent on a foregone conclusion.  Measured 2026-08-06:
+    mistral-small-3.2-24b's container exited 82 s in and `wait_ready` polled the
+    dead port for its full 900 s default, burning 14 minutes of a 39-minute
+    slate run on an arm that had already failed.
     """
     import httpx  # lazy: keeps import cost off every consumer of this module
 
     deadline = time.monotonic() + timeout_s
     while True:
+        if unit_has_failed(arm):
+            return False
         try:
             health = httpx.get(f'{arm.base_url}/health', timeout=READY_PROBE_TIMEOUT_S)
             if health.status_code == 200:

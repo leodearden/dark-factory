@@ -476,3 +476,75 @@ def test_installer_never_pipes_systemctl_into_grep():
         if line.strip().startswith('#'):
             continue
         assert not ('systemctl' in line and '| grep' in line), line
+
+
+def test_wait_ready_gives_up_once_the_unit_has_failed(monkeypatch, install_fake_httpx):
+    """The units are Restart=no, so a dead container can never come up.
+
+    Measured 2026-08-06: mistral-small-3.2-24b's container exited 82 s in and
+    wait_ready polled the dead port for its full 900 s default — 14 minutes of
+    a 39-minute slate run spent on a foregone conclusion.
+    """
+    monkeypatch.setattr(lms_ctl, 'unit_has_failed', lambda arm: True)
+
+    def explode(*args, **kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError('wait_ready probed the endpoint of a dead unit')
+
+    install_fake_httpx(post=None, get=explode)
+
+    assert lms_ctl.wait_ready(_arm(), timeout_s=30.0, interval_s=0.0) is False
+
+
+def test_wait_ready_keeps_polling_while_the_unit_is_merely_slow(
+    monkeypatch, install_fake_httpx
+):
+    """`activating` is NOT failure. An arm can sit there for seven minutes while
+    vLLM loads weights, and aborting on it would kill every legitimate slow
+    start on the slate."""
+    monkeypatch.setattr(lms_ctl, 'unit_has_failed', lambda arm: False)
+
+    def fake_get(url, **kwargs):
+        if url.endswith('/health'):
+            return _Resp(200)
+        return _Resp(200, _models_payload('qwen3.5-9b'))
+
+    install_fake_httpx(post=None, get=fake_get)
+
+    assert lms_ctl.wait_ready(_arm(), timeout_s=0.0, interval_s=0.0) is True
+
+
+def test_unit_has_failed_reads_only_the_literal_failed_state(monkeypatch):
+    """`inactive` must NOT count. systemctl answers `inactive` for a unit that
+    was never started AND for one that is not installed, so folding it in would
+    abort waits for reasons unrelated to the arm dying."""
+    seen = {}
+
+    class _Done:
+        def __init__(self, out):
+            self.stdout = out
+            self.returncode = 0
+
+    def fake_systemctl(*args, **kwargs):
+        seen['args'] = args
+        return _Done(seen['reply'])
+
+    monkeypatch.setattr(lms_ctl, '_systemctl', fake_systemctl)
+
+    for state, expected in (
+        ('failed', True), ('inactive', False), ('active', False),
+        ('activating', False), ('', False), ('unknown', False),
+    ):
+        seen['reply'] = state + chr(10)
+        assert lms_ctl.unit_has_failed(_arm()) is expected, state
+    assert seen['args'][0] == 'is-active'
+
+
+def test_unit_has_failed_fails_safe_when_systemctl_itself_breaks(monkeypatch):
+    """A broken probe must fall back to the ordinary deadline, never abort a
+    healthy arm on bad information."""
+    def boom(*args, **kwargs):
+        raise OSError('systemctl unavailable')
+
+    monkeypatch.setattr(lms_ctl, '_systemctl', boom)
+
+    assert lms_ctl.unit_has_failed(_arm()) is False

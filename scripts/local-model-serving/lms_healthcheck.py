@@ -1035,7 +1035,9 @@ class ReportMergeError(Exception):
     """Two per-arm reports cannot be combined into one slate artifact."""
 
 
-def merge_reports(reports: Sequence[HealthReport]) -> HealthReport:
+def merge_reports(
+    reports: Sequence[HealthReport], expected_arm_ids: Sequence[str] | None = None
+) -> HealthReport:
     """Combine per-arm runs into the one committed slate artifact.
 
     The PRD's funnel does not run all units simultaneously and this card cannot
@@ -1047,6 +1049,15 @@ def merge_reports(reports: Sequence[HealthReport]) -> HealthReport:
     * A duplicate `arm_id` does not merge.  Silently keeping one of two runs
       would let a failed arm be papered over by a re-run appended to the same
       file, which is the single cheapest way to fake this artifact.
+    * A set that does not COVER the manifest does not merge.  An arm that never
+      became ready produces no per-arm report at all, so it goes MISSING from
+      the merge rather than red in it — the "slate is quietly narrower than the
+      PRD commissioned" hazard this package names for `load_arms`, reappearing
+      in the assembly path.  Measured 2026-08-06: a 7-row artifact was produced
+      from an 8-arm manifest because mistral-small-3.2-24b never started, and
+      nothing in this function noticed.  Absence is the one failure a report
+      cannot describe, which is exactly why the check belongs here and not only
+      in the commit-time gate.
     * The surviving vram block is the FIRST FAILING one if any input failed, and
       otherwise the one with the LARGEST arm footprint -- the binding
       measurement.  Keeping only a passing block while an input failed would put
@@ -1089,6 +1100,17 @@ def merge_reports(reports: Sequence[HealthReport]) -> HealthReport:
                 )
             seen[row.arm_id] = row
             rows.append(row)
+
+    if expected_arm_ids is not None:
+        uncovered = sorted(set(expected_arm_ids) - set(seen))
+        if uncovered:
+            raise ReportMergeError(
+                f'arms {uncovered} are declared in the manifest but carry no row '
+                'in any input report. They were never measured, so this artifact '
+                'would describe a NARROWER slate than the manifest commissions '
+                'while reading as a complete one. Re-run the missing arms, or '
+                'escalate with the reason they cannot be served'
+            )
 
     failing = [r for r in reports if r.vram.verdict == 'FAIL']
     binding = (
@@ -1216,8 +1238,12 @@ def main(argv: list[str] | None = None) -> int:
                 HealthReport.model_validate_json(Path(p).read_text())
                 for p in args.merge
             ]
-            report = merge_reports(parts)
-        except (ReportMergeError, ValidationError, OSError) as exc:
+            # The manifest is the authority on what a complete slate is, so the
+            # coverage check reads it here rather than trusting the caller to
+            # pass every part — an operator who forgets one file would otherwise
+            # produce a short artifact that looks whole.
+            report = merge_reports(parts, expected_arm_ids=load_arms().arm_ids())
+        except (ReportMergeError, ValidationError, OSError, ArmManifestError) as exc:
             # Nothing is written on refusal: a partially-merged artifact on disk
             # would later read as "the slate was checked".
             print(f'lms_healthcheck: cannot merge: {exc}', file=sys.stderr)
