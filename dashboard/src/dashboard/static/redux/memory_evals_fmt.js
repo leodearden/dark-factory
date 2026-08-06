@@ -226,6 +226,33 @@ const PARITY_PLAIN = [
   'grandfathered',
   'unjudged',
 ];
+
+// ── The verdict vocabulary, in ONE place ──
+//
+// Same discipline as the parity tables above, for the other axis: the four
+// persisted verdicts and the base badge each earns, declared as data and
+// EXPORTED, so both suites drive off the real vocabulary instead of a copy.
+// Three copies of this list existed before task 3481's review — this table,
+// a tuple in test_tab_memory_evals.py, and the producer's own
+// `memory_evals._KNOWN_VERDICTS` — and only the producer's was authoritative.
+// A fifth verdict added there would have rendered as 'unreadable verdict'
+// with a `badge bad` while every test stayed green.
+// test_tab_memory_evals.py::test_verdict_vocabulary_fully_covered now compares
+// these keys against that frozenset, in both directions.
+//
+// Keys are QUOTED for the same reason PARITY_REFINEMENT's are: they are the
+// producer's vocabulary strings, looked up by string and greppable in the form
+// the payload carries.
+//
+// A verdict OUTSIDE this table is not defaulted into it — see verdictBadge's
+// absent/unreadable split below, which is deliberately NOT table-driven
+// because neither of those two states is a member of the vocabulary.
+const VERDICT_BASES = {
+  'alarm':             { base: 'alarm',             cls: 'badge bad' },
+  'no_alarm':          { base: 'no_alarm',          cls: 'badge ok' },
+  'grandfathered':     { base: 'grandfathered',     cls: 'badge info' },
+  'insufficient_data': { base: 'insufficient_data', cls: 'badge muted' },
+};
 function verdictBadge(metric) {
   const verdict = metric.verdict;
   const parity = metric.parity;
@@ -255,20 +282,26 @@ function verdictBadge(metric) {
   // to no_alarm, and the two carry DIFFERENT labels — mirroring
   // memory_evals._verdict_class(), which buckets an absent value to `unjudged`
   // and a present-but-out-of-vocabulary one to `unknown_verdict`.
+  //
+  // The four in-vocabulary verdicts come from the VERDICT_BASES table; the two
+  // states that are NOT verdicts — absent, and present-but-unreadable — are
+  // branches here, because neither is a member of the vocabulary and putting
+  // them in the table would make the completeness check against
+  // `memory_evals._KNOWN_VERDICTS` report them as dead branches.
+  //
+  // `hasOwnProperty` rather than a bare `VERDICT_BASES[verdict]`, for the same
+  // reason the parity lookup below uses it: a payload carrying verdict
+  // 'constructor' / 'toString' would otherwise find a truthy INHERITED member
+  // and render `base: undefined` — a value the operator reads as broken
+  // tooling rather than as the unreadable verdict it actually is.
   let base = 'no verdict';
   let cls = 'badge muted';
-  if (verdict === 'alarm') {
-    base = 'alarm';
-    cls = 'badge bad';
-  } else if (verdict === 'no_alarm') {
-    base = 'no_alarm';
-    cls = 'badge ok';
-  } else if (verdict === 'grandfathered') {
-    base = 'grandfathered';
-    cls = 'badge info';
-  } else if (verdict === 'insufficient_data') {
-    base = 'insufficient_data';
-    cls = 'badge muted';
+  const knownVerdict = Object.prototype.hasOwnProperty.call(VERDICT_BASES, verdict)
+    ? VERDICT_BASES[verdict]
+    : null;
+  if (knownVerdict) {
+    base = knownVerdict.base;
+    cls = knownVerdict.cls;
   } else if (verdict !== null && verdict !== undefined) {
     // Present, but outside the closed vocabulary — the bucket
     // memory_evals._verdict_class() calls `unknown_verdict`.  'no verdict' is
@@ -326,12 +359,13 @@ const MEMORY_EVALS_FMT_API = {
   unmatchedReasonText,
   chartForKind,
   verdictBadge,
-  // The parity vocabulary is EXPORTED, not merely used: the node suite
+  // BOTH badge vocabularies are EXPORTED, not merely used: the node suite
   // enumerates its verdict×parity matrix off these tables so a state the
   // producer adds is covered the moment it lands here, rather than off a
   // hand-pinned copy that can go blind to states nobody remembered to add.
   PARITY_REFINEMENT,
   PARITY_PLAIN,
+  VERDICT_BASES,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

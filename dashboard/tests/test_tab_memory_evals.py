@@ -973,9 +973,16 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
 # ---------------------------------------------------------------------------
 
 
-# The four persisted verdict strings, passed through unmapped by the builder.
-_VERDICTS = ('alarm', 'no_alarm', 'insufficient_data', 'grandfathered')
-
+# The verdict vocabulary is deliberately NOT restated here either, for the same
+# reason as the parity one below.  A local four-member tuple lived here until
+# task 3481's review pointed out it was the THIRD copy — alongside
+# `memory_evals_fmt.js`'s `VERDICT_BASES` table and the producer's
+# `memory_evals._KNOWN_VERDICTS` — of which only the producer's is
+# authoritative.  A fifth verdict added there would render as 'unreadable
+# verdict' with a `badge bad` while this file stayed green.  Tests that need the
+# vocabulary import the frozenset; `test_verdict_vocabulary_fully_covered` is
+# the completeness contract between it and the JS table.
+#
 # The parity vocabulary is deliberately NOT restated here.  It is imported from
 # the producer (`memory_evals.PARITY_STATES`) inside each test that needs it —
 # a local copy is exactly the rot this suite now exists to prevent, and one
@@ -984,6 +991,68 @@ _VERDICTS = ('alarm', 'no_alarm', 'insufficient_data', 'grandfathered')
 # `test_parity_vocabulary_fully_covered` for the completeness contract, and
 # test_memory_evals_data.py::TestParityVocabularyIsClosedAndExported for the
 # proof that the exported frozenset matches what the builder actually emits.
+
+
+def test_verdict_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
+    """`memory_evals_fmt.js`'s `VERDICT_BASES` is exactly `_KNOWN_VERDICTS`.
+
+    The verdict axis of the badge matrix, held to the same contract as the
+    parity axis below and for the same reason.  Both directions are separate
+    failures:
+
+    * a `_KNOWN_VERDICTS` member with no `VERDICT_BASES` entry is a verdict the
+      server persists today and the browser has never been told about — it
+      falls to the present-but-unreadable branch and renders 'unreadable
+      verdict' with a `badge bad`, i.e. a healthy metric displayed as broken
+      tooling, with nothing failing;
+    * a declared verdict OUTSIDE `_KNOWN_VERDICTS` is a dead branch no payload
+      can reach, since `memory_evals._verdict_class()` buckets anything not in
+      that frozenset to `unknown_verdict` before it ever reaches this table.
+
+    This is the half node cannot do — it cannot import a Python frozenset.  The
+    WELL-FORMEDNESS of the table (distinct base labels, no borrowed
+    'no verdict' / 'unreadable verdict', exactly one healthy badge) is asserted
+    executably in memory_evals_fmt.test.mjs instead, by CALLING verdictBadge.
+    """
+    from dashboard.data.memory_evals import _KNOWN_VERDICTS
+
+    table = _extract_const_object(memory_evals_fmt_js_code, 'VERDICT_BASES')
+    assert table, (
+        'memory_evals_fmt.js must declare `const VERDICT_BASES = {...}` at '
+        'module scope in CODE (not in a comment). It is the one place the file '
+        'says which verdicts it can render, and what this test compares against '
+        'memory_evals._KNOWN_VERDICTS.'
+    )
+
+    # Top-level keys only — same one-level-of-nesting removal `_parity_tables`
+    # uses, so the `base`/`cls` keys of each entry are not read as verdicts.
+    declared = set(
+        re.findall(r'[\'"](\w+)[\'"]\s*:', re.sub(r'\{[^{}]*\}', '', table[1:-1]))
+    )
+    assert declared, (
+        'VERDICT_BASES is declared but holds no quoted entries — this test '
+        'would pass vacuously in both directions. Keys are QUOTED on purpose '
+        '(producer vocabulary strings, greppable in the form the payload '
+        'carries); fix the quoting rather than loosening this parse.'
+    )
+
+    unhandled = _KNOWN_VERDICTS - declared
+    assert unhandled == set(), (
+        f'memory_evals._KNOWN_VERDICTS member(s) {sorted(unhandled)} have no '
+        'VERDICT_BASES entry in memory_evals_fmt.js. The server persists these '
+        'today, so each falls to the present-but-unreadable branch and renders '
+        "'unreadable verdict' with a `badge bad` — a judged metric displayed as "
+        'broken tooling. Add the base label and badge class it should earn.'
+    )
+
+    dead = declared - _KNOWN_VERDICTS
+    assert dead == set(), (
+        f'VERDICT_BASES in memory_evals_fmt.js declares {sorted(dead)}, which '
+        'are not in memory_evals._KNOWN_VERDICTS — `_verdict_class()` buckets '
+        'anything outside that frozenset to `unknown_verdict` before it reaches '
+        'this table, so these are dead branches no payload can reach. Delete '
+        'them, or fix the spelling if the producer renamed the verdict.'
+    )
 
 
 def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
@@ -1250,34 +1319,36 @@ def test_verdict_badges_driven_by_persisted_verdict(
         'and the other two were exported only so this suite could see them.'
     )
 
+    # The per-VERDICT half of this loop moved to
+    # `test_verdict_vocabulary_fully_covered`, which makes the stronger claim:
+    # not merely that each persisted verdict appears somewhere in the code, but
+    # that VERDICT_BASES' keys are EXACTLY memory_evals._KNOWN_VERDICTS, in both
+    # directions. The vocabulary is passed through unmapped by the builder;
+    # there is no client-side translation table.
+    from dashboard.data.memory_evals import PARITY_STATES
+
     # Grepped against COMMENT-STRIPPED source: every one of these strings also
     # appears in the prose above verdictBadge, so a whole-file grep would stay
     # green after the branch itself was deleted.
-    for verdict in _VERDICTS:
-        assert f"'{verdict}'" in code, (
-            f"tab_memory_evals.jsx must name the persisted verdict '{verdict}' "
-            'in CODE (not merely in a comment). The vocabulary is passed '
-            'through unmapped by the builder; there is no client-side '
-            'translation table.'
-        )
-    from dashboard.data.memory_evals import PARITY_STATES
-
     for parity in sorted(PARITY_STATES):
         assert f"'{parity}'" in code, (
-            f"tab_memory_evals.jsx must name the server-derived parity state "
+            f'memory_evals_fmt.js must name the server-derived parity state '
             f"'{parity}' in CODE, as a quoted string literal — the comment "
             'block above verdictBadge names all of them, so a whole-file grep '
             'proves nothing, and PARITY_REFINEMENT quotes its keys precisely '
-            'so they are greppable in the form the payload carries. Iterated '
-            'from the PRODUCER, so a state added there fails here rather than '
-            'rendering through an unwritten branch.'
+            'so they are greppable in the form the payload carries (this is '
+            'the assertion `_parity_tables` defers the quoted-form contract '
+            'to). Iterated from the PRODUCER, so a state added there fails '
+            'here rather than rendering through an unwritten branch.'
         )
 
     # Existing .badge vocabulary — no new CSS needed for four verdict states.
     for cls in ('badge bad', 'badge ok', 'badge warn', 'badge info', 'badge muted'):
         assert cls in code, (
-            f"tab_memory_evals.jsx must use the existing '{cls}' class "
-            '(styles.css:239-261) rather than inventing badge styling.'
+            f"memory_evals_fmt.js must use the existing '{cls}' class "
+            '(styles.css:239-261) rather than inventing badge styling. The '
+            'badge tables moved there with verdictBadge (task 3481); the .jsx '
+            'renders whatever class they return.'
         )
 
     # A null/absent verdict renders its own state, not a defaulted one.

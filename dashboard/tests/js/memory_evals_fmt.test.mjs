@@ -56,6 +56,7 @@ const {
   verdictBadge,
   PARITY_REFINEMENT,
   PARITY_PLAIN,
+  VERDICT_BASES,
 } = mef;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/memory_evals_fmt.js';
@@ -73,12 +74,14 @@ const EXPECTED_FUNCTION_NAMES = [
   'unmatchedReasonText',
   'verdictBadge',
 ];
-// The parity vocabulary TABLES are exported as data so this suite can drive its
-// verdict×parity matrix off the REAL vocabulary the module ships, rather than a
-// copy pinned here. tab_memory_evals.jsx records why that matters: "a
-// hand-picked three-member copy DID live in that test, and went blind to six
-// states". A state the producer adds is covered the moment it lands in the table.
-const EXPECTED_DATA_NAMES = ['PARITY_PLAIN', 'PARITY_REFINEMENT'];
+// BOTH badge vocabularies — parity AND verdict — are exported as data so this
+// suite can drive its verdict×parity matrix off the REAL vocabulary the module
+// ships, rather than a copy pinned here. memory_evals_fmt.js records why that
+// matters on each table: a hand-picked three-member parity copy once went blind
+// to six states, and the verdict list existed in three places of which only the
+// producer's was authoritative. A state added to either table is covered the
+// moment it lands.
+const EXPECTED_DATA_NAMES = ['PARITY_PLAIN', 'PARITY_REFINEMENT', 'VERDICT_BASES'];
 
 function expectedSurface() {
   return EXPECTED_FUNCTION_NAMES.concat(EXPECTED_DATA_NAMES).slice().sort();
@@ -440,21 +443,37 @@ test('trendGaps: counts holes WITHOUT dropping them from the series', () => {
 // EXPECTED_DATA_NAMES above.
 // ---------------------------------------------------------------------------
 
-// The verdict axis, with the base label and class each verdict must yield on
-// its own. Asserted directly in the base-label test below, then reused as the
+// The verdict axis: the base label and class each verdict must yield on its
+// own. Asserted directly in the base-label test below, then reused as the
 // expected PREFIX for every parity combination — which is what makes
 // "compose, never replace" checkable across the whole matrix at once.
-const VERDICT_BASES = [
-  { verdict: 'alarm', base: 'alarm', cls: 'badge bad' },
-  { verdict: 'no_alarm', base: 'no_alarm', cls: 'badge ok' },
-  { verdict: 'grandfathered', base: 'grandfathered', cls: 'badge info' },
-  { verdict: 'insufficient_data', base: 'insufficient_data', cls: 'badge muted' },
-  // Genuinely ABSENT — memory_evals._verdict_class() buckets this to `unjudged`.
-  { verdict: null, base: 'no verdict', cls: 'badge muted' },
-  { verdict: undefined, base: 'no verdict', cls: 'badge muted' },
-  // PRESENT but outside the closed vocabulary — the `unknown_verdict` bucket.
-  { verdict: 'wat', base: 'unreadable verdict', cls: 'badge bad' },
-];
+//
+// DERIVED from the module's exported VERDICT_BASES table, never pinned here.
+// A hand-written copy would be the same anti-pattern this suite's header
+// condemns for parity, one axis over: a fifth verdict added by the producer
+// would render as 'unreadable verdict' with a `badge bad` and this matrix would
+// never notice, because it would still be enumerating the four it remembered.
+//
+// The two rows the table CANNOT supply are appended: absent and
+// present-but-unreadable are not members of the vocabulary (they are what
+// happens to a value that is not in it), so they are not table entries — see
+// test_tab_memory_evals.py::test_verdict_vocabulary_fully_covered, which would
+// report either as a dead branch against memory_evals._KNOWN_VERDICTS.
+const ABSENT_VERDICT = { base: 'no verdict', cls: 'badge muted' };
+const UNREADABLE_VERDICT = { base: 'unreadable verdict', cls: 'badge bad' };
+const VERDICT_AXIS = Object.keys(VERDICT_BASES)
+  .map(verdict => ({
+    verdict,
+    base: VERDICT_BASES[verdict].base,
+    cls: VERDICT_BASES[verdict].cls,
+  }))
+  .concat([
+    // Genuinely ABSENT — memory_evals._verdict_class() buckets this to `unjudged`.
+    { verdict: null, ...ABSENT_VERDICT },
+    { verdict: undefined, ...ABSENT_VERDICT },
+    // PRESENT but outside the closed vocabulary — the `unknown_verdict` bucket.
+    { verdict: 'wat', ...UNREADABLE_VERDICT },
+  ]);
 
 function allParityStates() {
   return Object.keys(PARITY_REFINEMENT).concat(PARITY_PLAIN);
@@ -477,11 +496,70 @@ test('verdictBadge: the exported parity vocabulary is the full 13-state split', 
   assert.equal(new Set(allParityStates()).size, 13, 'parity states must be unique');
 });
 
+test('verdictBadge: the exported verdict vocabulary is a closed set of distinct badges', () => {
+  // The cross-language half — that these keys are exactly the producer's
+  // `memory_evals._KNOWN_VERDICTS` — stays in Python
+  // (test_verdict_vocabulary_fully_covered), the only place that frozenset can
+  // be imported. What is checkable here is that the table is WELL-FORMED, which
+  // no source grep could establish.
+  const verdicts = Object.keys(VERDICT_BASES);
+  assert.ok(verdicts.length > 0, 'VERDICT_BASES is empty — the matrix below would be vacuous');
+
+  const bases = verdicts.map(v => VERDICT_BASES[v].base);
+  for (const v of verdicts) {
+    assert.equal(typeof VERDICT_BASES[v].base, 'string', `${v} has no base label`);
+    assert.ok(VERDICT_BASES[v].base.length > 0, `${v} has a blank base label`);
+    assert.ok(VERDICT_BASES[v].cls, `${v} has no badge class`);
+    // A base label is composed onto by the parity suffix, so it may not already
+    // contain the separator — that would render as two suffixes.
+    assert.ok(!VERDICT_BASES[v].base.includes(' · '), `${v} base already carries a suffix`);
+  }
+
+  // Two verdicts sharing a label would make the producer's distinction
+  // invisible on the badge, which is the only thing the operator reads.
+  assert.equal(new Set(bases).size, bases.length, 'verdict base labels must be distinct');
+
+  // Neither of the two NON-vocabulary states may be borrowed by a real verdict:
+  // 'no verdict' asserts the value is absent and 'unreadable verdict' asserts it
+  // is present but outside the set, and a table entry is neither.
+  for (const reserved of ['no verdict', 'unreadable verdict']) {
+    assert.ok(!bases.includes(reserved), `a real verdict must not render as '${reserved}'`);
+  }
+});
+
 test('verdictBadge: each verdict alone yields its own base label and class', () => {
-  for (const { verdict, base, cls } of VERDICT_BASES) {
+  // Table-driven, so this also asserts verdictBadge actually CONSULTS
+  // VERDICT_BASES: a stale if/else chain that ignored the table would diverge
+  // here the moment the two disagreed.
+  for (const { verdict, base, cls } of VERDICT_AXIS) {
     const out = verdictBadge({ verdict, parity: null });
     assert.equal(out.label, base, `verdict ${JSON.stringify(verdict)} label`);
     assert.equal(out.cls, cls, `verdict ${JSON.stringify(verdict)} class`);
+  }
+});
+
+test('verdictBadge: only an explicit no_alarm renders the healthy badge', () => {
+  // Derived over the WHOLE axis rather than asserted about one verdict: the
+  // load-bearing claim is that nothing ELSE can reach 'badge ok', so "we do not
+  // know" can never be displayed as "we checked and it is fine". A fifth
+  // verdict added to the table with `badge ok` fails here.
+  const healthy = VERDICT_AXIS.filter(
+    row => verdictBadge({ verdict: row.verdict, parity: null }).cls === 'badge ok',
+  ).map(row => row.verdict);
+  assert.deepEqual(healthy, ['no_alarm'], 'exactly one verdict may render as healthy');
+});
+
+test('verdictBadge: an inherited Object.prototype member is not a verdict', () => {
+  // The verdict lookup has the same hazard as the parity one: VERDICT_BASES is
+  // a plain object literal, so a BARE `VERDICT_BASES[verdict]` resolves through
+  // Object.prototype and a payload carrying verdict 'constructor' / 'toString'
+  // would find a truthy INHERITED member, then read `.base` off a function and
+  // render `undefined`. Such a value is PRESENT and out-of-vocabulary, so it
+  // must take the unreadable branch like any other unknown string.
+  for (const verdict of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+    const out = verdictBadge({ verdict, parity: null });
+    assert.equal(out.label, 'unreadable verdict', `verdict '${verdict}' label`);
+    assert.equal(out.cls, 'badge bad', `verdict '${verdict}' class`);
   }
 });
 
@@ -509,7 +587,7 @@ test('verdictBadge: no parity branch can discard the verdict (compose, never rep
   // branch returning a FIXED label would collapse distinctions the producer
   // drew deliberately.
   let checked = 0;
-  for (const { verdict, base } of VERDICT_BASES) {
+  for (const { verdict, base } of VERDICT_AXIS) {
     for (const parity of allParityStates()) {
       const out = verdictBadge({ verdict, parity });
       assert.ok(
@@ -521,7 +599,7 @@ test('verdictBadge: no parity branch can discard the verdict (compose, never rep
       checked += 1;
     }
   }
-  assert.equal(checked, VERDICT_BASES.length * 13, 'the matrix must be fully enumerated');
+  assert.equal(checked, VERDICT_AXIS.length * 13, 'the matrix must be fully enumerated');
 });
 
 test('verdictBadge: an escalation-open parity on a never-measured metric is NOT a recovery', () => {
@@ -596,7 +674,7 @@ test('verdictBadge: a PARITY_PLAIN state adds nothing to the verdict badge', () 
   // nothing to add" is a different decision from "no branch for it", and only
   // one of them is safe to leave undocumented.
   for (const parity of PARITY_PLAIN) {
-    for (const { verdict, base, cls } of VERDICT_BASES) {
+    for (const { verdict, base, cls } of VERDICT_AXIS) {
       const out = verdictBadge({ verdict, parity });
       assert.equal(out.label, base, `plain parity '${parity}' must render the bare base`);
       assert.equal(out.cls, cls, `plain parity '${parity}' must keep the verdict's class`);
@@ -619,7 +697,7 @@ test('verdictBadge: an unrecognised parity is MARKED, not passed through', () =>
   // browser is holding a cached bundle. Rendering it as the bare verdict badge
   // would be indistinguishable from a state that DECLINED refinement, i.e. the
   // unknown would fail toward the healthy label.
-  for (const { verdict, base } of VERDICT_BASES) {
+  for (const { verdict, base } of VERDICT_AXIS) {
     const out = verdictBadge({ verdict, parity: 'brand_new_parity' });
     assert.equal(out.label, base + ' · unrecognised parity');
     assert.equal(out.cls, 'badge bad', 'an unknown parity must fail toward "something is wrong"');
