@@ -76,9 +76,19 @@ def _producer_wire_entry(
     }
 
 
-def _producer_wire_dict(*, offline: bool = False, tasks: list[dict] | None = None) -> dict:
-    """The exact get_task_runtime_state JSON envelope shape."""
-    return {'offline': offline, 'tasks': tasks or []}
+def _producer_wire_dict(
+    *,
+    offline: bool = False,
+    offline_reason: str | None = None,
+    tasks: list[dict] | None = None,
+) -> dict:
+    """The exact get_task_runtime_state JSON envelope shape.
+
+    ``offline_reason`` is dashboard-synthesized (task 3517) — the producer
+    itself always emits ``None`` — but it travels through this SAME envelope
+    and must decode through the SAME shared contract, so it belongs here.
+    """
+    return {'offline': offline, 'offline_reason': offline_reason, 'tasks': tasks or []}
 
 
 def _decode(wire: dict) -> TaskRuntimeSnapshot:
@@ -133,6 +143,7 @@ async def test_b5_producer_wire_entry_populates_row_via_join(dummy_client, monke
     assert row['agent'] == 'claude-task-42'
     assert row['started'] == 7
     assert row['runtime_offline'] is False
+    assert row['runtime_status'] == 'ok'
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +166,37 @@ async def test_b6_offline_snapshot_yields_none_not_zero(dummy_client, monkeypatc
 
     assert len(active) == 1
     row = active[0]
+    assert row['runtime_offline'] is True
+    for key in ('loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
+        assert row[key] is None, f'expected {key} is None when offline, got {row[key]!r}'
+    # No reason on the snapshot -> the honest sentinel, not a guessed diagnosis.
+    assert row['runtime_status'] == 'unknown'
+
+
+@pytest.mark.asyncio
+async def test_b6_wire_offline_reason_reaches_the_row(dummy_client, monkeypatch, tmp_path):
+    """A wire envelope carrying offline_reason decodes through the SAME shared
+    contract and lands on the row as runtime_status (task 3517).
+
+    Ropes the new discriminator end-to-end — decode -> _probe_status ->
+    _runtime_fields -> row — rather than only against hand-built models.
+    """
+    snapshot = _decode(_producer_wire_dict(
+        offline=True, offline_reason='deadline_exceeded',
+    ))
+    assert snapshot.offline_reason == 'deadline_exceeded'
+
+    _register_fetch_tasks(monkeypatch, [_shape_task(5, 'stuck task', 'in-progress')])
+    root = _project_root(tmp_path, 'starvedlane')
+    config = DashboardConfig(project_root=root)
+
+    active, _, _ = await _shape_one_project(
+        dummy_client, config, root, runtime=snapshot,
+    )
+
+    assert len(active) == 1
+    row = active[0]
+    assert row['runtime_status'] == 'deadline_exceeded'
     assert row['runtime_offline'] is True
     for key in ('loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
         assert row[key] is None, f'expected {key} is None when offline, got {row[key]!r}'
@@ -181,6 +223,7 @@ async def test_b6_online_but_task_absent_gets_honest_zero_contrast(dummy_client,
     assert len(active) == 1
     row = active[0]
     assert row['runtime_offline'] is False
+    assert row['runtime_status'] == 'ok'
     assert row['loops'] == 0
     assert row['attempts'] == 0
     assert row['started'] == 0

@@ -300,6 +300,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
         'meta_files': [], 'train': None, 'external_deps': [], 'prd': None,
         'lane': None, 'phase': None, 'lane_state': None, 'runtime_offline': False,
+        'runtime_status': 'ok',
     }]
 
 
@@ -391,6 +392,10 @@ async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
         assert row[key] is None, f'expected {key}=None when runtime offline, got {row[key]!r}'
     assert row['runtime_offline'] is True
+    # offline=True with NO reason is out-of-contract for a dashboard-synthesized
+    # snapshot. Report it as an honest 'unknown' — never guess 'unreachable',
+    # which is precisely the fabricated diagnosis task 3517 exists to prevent.
+    assert row['runtime_status'] == 'unknown'
 
 
 @pytest.mark.asyncio
@@ -419,6 +424,9 @@ async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
         assert row[key] is None, f'expected {key}=None when no escalation URL, got {row[key]!r}'
     assert row['runtime_offline'] is True
+    # ...but the CAUSE is separable now: nothing was ever probed here, so this
+    # is the expected/permanent case, not an orchestrator fault.
+    assert row['runtime_status'] == 'not_configured'
 
 
 @pytest.mark.asyncio
@@ -454,6 +462,112 @@ async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
     assert row['runtime_offline'] is False, (
         'a per-task read failure is an honest error, not an offline project'
     )
+    assert row['runtime_status'] == 'ok', (
+        'the PROBE succeeded — the failure is per-task, not a probe fault domain'
+    )
+
+
+# ---------------------------------------------------------------------------
+# runtime_status probe discriminator (task 3517)
+# ---------------------------------------------------------------------------
+
+
+async def _one_task_row_with_snapshot(
+    tmp_path, monkeypatch, dummy_client, snapshot: TaskRuntimeSnapshot | None,
+) -> dict:
+    """Collect a single-task project whose runtime map holds *snapshot*.
+
+    ``None`` means the label is absent from the map entirely (no escalation
+    URL configured for it) — the never-probed case.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='probe',
+        tasks=[{'id': 3, 'title': 'probed task', 'status': 'in-progress', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    async def _fake_fetch_task_runtime(client, escalation_urls):
+        return {} if snapshot is None else {'probe': snapshot}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    monkeypatch.setattr(
+        'dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime,
+    )
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=DashboardConfig(project_root=root),
+    )
+    assert len(active) == 1
+    return active[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reason', ['deadline_exceeded', 'unreachable'])
+async def test_collect_active_tasks_row_carries_probe_reason(
+    tmp_path, monkeypatch, dummy_client, reason,
+):
+    """The probe's fault-domain discriminator reaches the task row intact.
+
+    Without this an operator sees identical blank cells whether the
+    orchestrator is down or the dashboard was too starved to ask — the
+    2026-07-30 misdiagnosis.
+    """
+    row = await _one_task_row_with_snapshot(
+        tmp_path, monkeypatch, dummy_client,
+        TaskRuntimeSnapshot(offline=True, offline_reason=reason),
+    )
+    assert row['runtime_status'] == reason
+    # Back-compat: runtime_offline keeps its exact prior meaning, and degraded
+    # rows still carry honest Nones rather than fabricated zeros.
+    assert row['runtime_offline'] is True
+    for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
+        assert row[key] is None, f'expected {key}=None when probe failed, got {row[key]!r}'
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_online_snapshot_with_entry_is_ok(
+    tmp_path, monkeypatch, dummy_client,
+):
+    row = await _one_task_row_with_snapshot(
+        tmp_path, monkeypatch, dummy_client,
+        TaskRuntimeSnapshot(tasks=[_runtime_entry(3, loops=4)]),
+    )
+    assert row['runtime_status'] == 'ok'
+    assert row['runtime_offline'] is False
+    assert row['loops'] == 4
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_terminal_rows_carry_runtime_status(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """Terminal (done) rows get the discriminator too — the row shape must not
+    diverge between the active loop and the terminal bucket."""
+    root, shaped = _make_done_project(
+        tmp_path, project_dir='term',
+        active_tasks=[{'id': 1, 'title': 'active', 'status': 'in-progress', 'dependencies': []}],
+        done_tasks=[{'id': 60, 'title': 'finished', 'status': 'done', 'dependencies': [],
+                     'updated_at': '2026-05-29T12:00:00+00:00'}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    async def _fake_fetch_task_runtime(client, escalation_urls):
+        return {'term': TaskRuntimeSnapshot(offline=True, offline_reason='unreachable')}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    monkeypatch.setattr(
+        'dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime,
+    )
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=DashboardConfig(project_root=root),
+        max_done_per_project=1,
+    )
+    done_row = next(r for r in active if r['id'] == 'term/T-60')
+    assert done_row['runtime_status'] == 'unreachable'
+    assert all('runtime_status' in r for r in active)
 
 
 @pytest.mark.asyncio
