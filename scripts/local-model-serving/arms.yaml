@@ -52,11 +52,19 @@ arms:
     # all four probe entities in 2639 tokens (~35 s). So the mode is NOT a
     # detail here -- it is the difference between an extraction and an empty
     # object, and the cost of the good one is ~100x the cost of the empty one.
-    # Held at `off` pending zeta's pre-registered ruling (task 3719).
-    reasoning: 'off'
-    # Recorded, not yet used: _vllm_argv emits it only when reasoning is `on`.
-    # Kept here so flipping the mode is a one-word change and the enabling flag
-    # cannot be forgotten -- lms_manifest REFUSES reasoning: on without it.
+    # RULED `on` (Leo, 2026-08-06, esc-3713-10): alpha certifies each arm in the
+    # mode where it can actually do the job. This arm has exactly one such mode.
+    # Confirmed on the 13:50Z slate run at reasoning: off -- 39 tokens,
+    # `entities: []`, FAIL extraction_missed_entities, 0 of 4.
+    #
+    # Whether the EVAL crosses reasoning modes as a factor is zeta's separate
+    # call (task 3719); this field only states the mode alpha certified in, and
+    # the report row records it so nothing is inherited invisibly.
+    reasoning: 'on'
+    # Load-bearing, not decorative: _vllm_argv emits it only when reasoning is
+    # `on`, and lms_manifest REFUSES reasoning: on without it -- because without
+    # a parser vLLM fills the xgrammar bitmask from token 0 and the arm cannot
+    # reason at all, which would make this field a lie.
     reasoning_parser: qwen3
     est_vram_gib: 6.0
     max_model_len: 32768
