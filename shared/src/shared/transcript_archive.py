@@ -212,5 +212,14 @@ def durable_archive_path(
        (the blanket guard and input coercion) respectively.
     """
     archive_root = Path(archive_root)
-    matches = list(archive_root.glob(f'{task_id}/*/{session_id}.jsonl.gz'))
+    # Two load-bearing details in this one line:
+    #   * the trailing `*` on `.jsonl*` spans task 3618's gzip drop — it
+    #     matches today's `.jsonl.gz` AND tomorrow's plain `.jsonl`, so the
+    #     cutover needs no flag day and this locator no dependency on it;
+    #   * `is_file()` excludes the SUBAGENT directory, which _archive_one
+    #     names for the session itself (`<enc>/<sid>/subagents/agent-*.gz`).
+    #     That dir carries no `.jsonl` suffix so the pattern misses it by
+    #     luck today; the filter makes returning a directory as "the
+    #     transcript" structurally impossible instead of incidentally avoided.
+    matches = [p for p in archive_root.glob(f'{task_id}/*/{session_id}.jsonl*') if p.is_file()]
     return matches[0] if matches else None
