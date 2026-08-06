@@ -332,3 +332,104 @@ class TestProbeReasonDiscriminator:
         assert not any('unreachable' in m for m in messages), (
             'a fired deadline must not be reported as an unreachable orchestrator'
         )
+
+
+class TestAllProjectsDeadlineWarning:
+    """fetch_task_runtime must flag the all-projects-at-once pattern.
+
+    The 2026-07-30 discriminator: a genuine orchestrator outage is
+    PER-PROJECT, whereas a starved dashboard event loop blows the probe
+    deadline for EVERY probed project simultaneously. That aggregate signal
+    is the one piece of evidence that was entirely missing at diagnosis time.
+    """
+
+    @staticmethod
+    def _aggregate_records(caplog) -> list[str]:
+        """Only the aggregate lines — per-project WARNINGs name a single URL."""
+        return [
+            rec.getMessage() for rec in caplog.records
+            if 'probed' in rec.getMessage()
+        ]
+
+    async def test_all_projects_timing_out_warns_self_inflicted(self, caplog):
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(slow_ports={8105: 0.5, 8106: 0.5, 8107: 0.5})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('WARNING'):
+                result = await fetch_task_runtime(
+                    client, _urls(8105, 8106, 8107), per_call_timeout=0.05,
+                )
+
+        aggregate = self._aggregate_records(caplog)
+        assert len(aggregate) == 1, f'expected exactly one aggregate WARNING, got {aggregate}'
+        text = aggregate[0]
+        assert 'all 3 probed projects' in text, text
+        # The whole point: point the operator at the dashboard, not at three
+        # healthy orchestrators.
+        assert 'dashboard' in text.lower(), text
+        # Mapping is unchanged — the aggregate signal is additive.
+        assert set(result) == {'proj8105', 'proj8106', 'proj8107'}
+        assert all(s.offline_reason == 'deadline_exceeded' for s in result.values())
+
+    async def test_one_of_two_timing_out_does_not_warn(self, caplog):
+        """One project down while the other answers IS a per-project outage."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(
+            {8100: TaskRuntimeSnapshot().model_dump(mode='json')},
+            slow_ports={8105: 0.5},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('WARNING'):
+                result = await fetch_task_runtime(
+                    client, _urls(8100, 8105), per_call_timeout=0.05,
+                )
+
+        assert self._aggregate_records(caplog) == []
+        assert result['proj8100'].offline is False
+        assert result['proj8105'].offline_reason == 'deadline_exceeded'
+
+    async def test_all_failing_with_mixed_reasons_does_not_warn(self, caplog):
+        """Every project failing but for DIFFERENT reasons is not the
+        starvation signature — one of them really is unreachable."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(slow_ports={8105: 0.5}, fail_ports={8102})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('WARNING'):
+                result = await fetch_task_runtime(
+                    client, _urls(8102, 8105), per_call_timeout=0.05,
+                )
+
+        assert self._aggregate_records(caplog) == []
+        assert result['proj8102'].offline_reason == 'unreachable'
+        assert result['proj8105'].offline_reason == 'deadline_exceeded'
+
+    async def test_single_project_timing_out_does_not_warn(self, caplog):
+        """With ONE configured project the all-at-once pattern is degenerate —
+        it is equally consistent with that one orchestrator being down, so
+        blaming the dashboard would be an unfounded diagnosis."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(slow_ports={8105: 0.5})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('WARNING'):
+                result = await fetch_task_runtime(
+                    client, _urls(8105), per_call_timeout=0.05,
+                )
+
+        assert self._aggregate_records(caplog) == []
+        assert result['proj8105'].offline_reason == 'deadline_exceeded'
+
+    async def test_all_healthy_does_not_warn(self, caplog):
+        from dashboard.data.task_runtime import fetch_task_runtime
+        empty = TaskRuntimeSnapshot().model_dump(mode='json')
+        handler = _PerPortHandler({8100: empty, 8101: empty})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('WARNING'):
+                result = await fetch_task_runtime(client, _urls(8100, 8101))
+
+        assert self._aggregate_records(caplog) == []
+        assert all(s.offline is False for s in result.values())
