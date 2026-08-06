@@ -1773,6 +1773,36 @@ class TestParseMetadataFailurePolicy:
             f'Expected no unknown_key warning for human_curator_adjudicated_at; got: {sorted(unknown_key_fields)}'
         )
 
+    def test_last_blocked_at_metadata_key_is_blessed(self):
+        """The orchestrator's block stamp must not census-warn (task 3697).
+
+        Promoted to Tier-A rather than renamed under `x_`, which is the
+        non-obvious part. `last_blocked_at` is MACHINE-written by the
+        orchestrator on every block (orchestrator/src/orchestrator/workflow.py,
+        _record_block) and READ back by
+        orchestrator/src/orchestrator/agents/briefing.py to decide whether a
+        briefing is stale — so it is load-bearing, not decorative. A census
+        over .taskmaster/tasks/tasks.db counts 78 tasks carrying it (measured
+        2026-08-06), so x_-renaming it on one task would fork the vocabulary
+        against 77 siblings, blind the briefing reader, and be silently undone
+        the next time the orchestrator wrote the canonical spelling anyway.
+
+        docs/task-authoring.md "Promoting a convention" prescribes exactly this
+        remedy for exactly this profile, and the key's shape matches the
+        already-blessed machine-written *_at stamps (files_tagged_at,
+        gate_escalated_at, combined_at, before_done_ran_at). RED until
+        'last_blocked_at' is added to _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata(
+            {'last_blocked_at': '2026-08-01T07:31:13.914220+00:00'}, direction='read'
+        )
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'last_blocked_at'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for last_blocked_at; got: {offending}'
+        )
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
