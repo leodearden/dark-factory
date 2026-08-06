@@ -876,7 +876,7 @@ def test_update_and_set_boost_fail_soft_when_absent(tmp_path: Path) -> None:
     assert sr.set_manual_boost('no-such-id', 5, root=tmp_path) is None
 
 
-def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
+def test_all_decision_setters_fail_soft_when_lock_acquisition_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -888,6 +888,11 @@ def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
     Regression guard for the `with decision_id_lock(...)` placement: if it
     were ever moved outside (or above) the helpers' existing try/except, this
     would start raising instead of returning None.
+
+    Covers ALL THREE writers, including task 3640's set_decision_escalations_dir
+    -- the back-fill iterates the whole live decision population, so a single
+    unabsorbed lock fault there would abort a migration mid-way and leave it
+    half-stamped.
     """
     rec = _make_decision(id='dec-lockfault', state=sr.DecisionState.OPEN, manual_boost=0)
     sr.write_decision(rec, root=tmp_path)
@@ -902,9 +907,11 @@ def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
     with caplog.at_level(logging.ERROR):
         state_result = sr.update_decision_state('dec-lockfault', sr.DecisionState.ANSWERED, root=tmp_path)
         boost_result = sr.set_manual_boost('dec-lockfault', 5, root=tmp_path)
+        stamp_result = sr.set_decision_escalations_dir('dec-lockfault', '/tmp/q', root=tmp_path)
 
     assert state_result is None
     assert boost_result is None
+    assert stamp_result is None
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
@@ -975,8 +982,14 @@ class TestDecisionIdLock:
 
 class TestDecisionHelpersAdoptLock:
     """Spy tests (mirror TestSubmitResolveAdoptLock, test_queue.py:2913):
-    update_decision_state and set_manual_boost must each acquire
-    decision_id_lock for the correct decision id.
+    update_decision_state, set_manual_boost and set_decision_escalations_dir
+    must EACH acquire decision_id_lock for the correct decision id.
+
+    One case per public helper, deliberately, even though all three now share
+    _mutate_decision: the lock is a per-helper CONTRACT, and a future setter
+    that grows its own body (or a wrapper that mutates before delegating)
+    would slip past a single shared-implementation test. TestDecisionIdLock
+    covers the lock primitive itself; these cover its ADOPTION.
     """
 
     def test_update_decision_state_acquires_lock_for_decision_id(
@@ -1020,6 +1033,36 @@ class TestDecisionHelpersAdoptLock:
         sr.set_manual_boost('dec-spy-2', 5, root=tmp_path)
 
         assert 'dec-spy-2' in acquired, f'Expected lock acquisition for dec-spy-2; got {acquired}'
+
+    def test_set_decision_escalations_dir_acquires_lock_for_decision_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The queue-stamp setter is the THIRD writer on a decision id.
+
+        Its docstring makes the lock the central claim -- the task-3640
+        back-fill runs against live records while the C8 watchers and the
+        cockpit are up, so an unserialized read-modify-write here would drop
+        a concurrent state transition. Without this spy, deleting the
+        `with decision_id_lock(...)` span would leave every other test in the
+        suite green.
+        """
+        rec = _make_decision(id='dec-spy-3', escalations_dir='')
+        sr.write_decision(rec, root=tmp_path)
+
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        sr.set_decision_escalations_dir('dec-spy-3', '/tmp/some-queue', root=tmp_path)
+
+        assert 'dec-spy-3' in acquired, f'Expected lock acquisition for dec-spy-3; got {acquired}'
 
 
 @pytest.mark.timeout(30)

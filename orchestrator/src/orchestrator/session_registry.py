@@ -763,6 +763,50 @@ def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
     return decisions
 
 
+def _mutate_decision(
+    decision_id: str,
+    mutate: Callable[[DecisionRecord], None],
+    *,
+    caller: str,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Lock-serialized, fail-soft read-modify-write of one decision record.
+
+    The single implementation of the field-setter body shared by
+    update_decision_state, set_manual_boost and set_decision_escalations_dir
+    (task 3640 amendment). Those three are the public, caller-facing names and
+    keep their own docstrings; this holds the parts that MUST NOT diverge
+    between them -- the lock placement, the read, the write, and the
+    fail-soft except-tuple.
+
+    That is not merely tidiness. The lock has to sit INSIDE the try/except for
+    a lock-acquisition fault to be absorbed rather than raised at a C8/cockpit
+    caller, and the except-tuple has to cover exactly the read/parse/write
+    fault set. Copied per-setter, a fix to either is a fix that has to be
+    remembered three times, and a missed copy fails silently in production
+    while every test stays green.
+
+    *mutate* is applied to the freshly-read record in-place; *caller* names the
+    public helper in the ERROR log so a fail-soft None is still attributable to
+    the API the caller actually invoked.
+
+    Returns the mutated record, or None on ANY fault (missing file, corrupt
+    body, lock-acquisition fault, write failure), never raising -- matching
+    write_decision's contract.
+    """
+    path = decision_path_for_id(decision_id, root=root)
+    try:
+        with decision_id_lock(decision_id, root=root):
+            record = DecisionRecord.from_json(path.read_text())
+            mutate(record)
+            if not write_decision(record, root=root):
+                return None
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('%s: failed to read %s', caller, path, exc_info=True)
+        return None
+    return record
+
+
 def update_decision_state(
     decision_id: str,
     state: str,
@@ -781,17 +825,12 @@ def update_decision_state(
     a concurrent set_manual_boost (or a second update_decision_state) racing
     on the SAME decision id no longer drops either call's field mutation.
     """
-    path = decision_path_for_id(decision_id, root=root)
-    try:
-        with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
-            record.state = state
-            if not write_decision(record, root=root):
-                return None
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('update_decision_state: failed to read %s', path, exc_info=True)
-        return None
-    return record
+    def _set(record: DecisionRecord) -> None:
+        record.state = state
+
+    return _mutate_decision(
+        decision_id, _set, caller='update_decision_state', root=root
+    )
 
 
 def set_manual_boost(
@@ -812,17 +851,10 @@ def set_manual_boost(
     a concurrent update_decision_state (or a second set_manual_boost) racing
     on the SAME decision id no longer drops either call's field mutation.
     """
-    path = decision_path_for_id(decision_id, root=root)
-    try:
-        with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
-            record.manual_boost = boost
-            if not write_decision(record, root=root):
-                return None
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('set_manual_boost: failed to read %s', path, exc_info=True)
-        return None
-    return record
+    def _set(record: DecisionRecord) -> None:
+        record.manual_boost = boost
+
+    return _mutate_decision(decision_id, _set, caller='set_manual_boost', root=root)
 
 
 def set_decision_escalations_dir(
@@ -862,17 +894,12 @@ def set_decision_escalations_dir(
     and the atomic tmp+os.replace writer and reintroduce the race 1609/3528
     fixed.
     """
-    path = decision_path_for_id(decision_id, root=root)
-    try:
-        with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
-            record.escalations_dir = normalize_escalations_dir(escalations_dir)
-            if not write_decision(record, root=root):
-                return None
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('set_decision_escalations_dir: failed to read %s', path, exc_info=True)
-        return None
-    return record
+    def _set(record: DecisionRecord) -> None:
+        record.escalations_dir = normalize_escalations_dir(escalations_dir)
+
+    return _mutate_decision(
+        decision_id, _set, caller='set_decision_escalations_dir', root=root
+    )
 
 
 @contextlib.contextmanager
@@ -928,11 +955,19 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
         os.close(fd)
 
 
-_ESCALATION_ARCHIVE_SUBDIR = 'archive'
+ESCALATION_ARCHIVE_SUBDIR = 'archive'
 """Mirrors escalation.archive.ARCHIVE_SUBDIR BY CONVENTION, not by import:
 this module is deliberately stdlib-only with no intra-orchestrator imports
 (see module docstring), so it cannot import escalation.archive directly.
-Kept in sync by hand with that constant."""
+Kept in sync by hand with that constant.
+
+PUBLIC (task 3640 amendment) because it defines half of what "this queue
+holds that escalation id" MEANS: read_escalation_status looks at the queue
+root and then under this subdir, and scripts/backfill_decision_queue_stamp.py
+must search exactly the same two tiers or it can stamp a record with a queue
+the reaper would never match against -- pinning that record OPEN forever.
+Out-of-module searchers reference this name rather than re-spelling 'archive',
+so the two notions cannot drift."""
 
 
 UNKNOWN_QUEUE = '<unknown>'
@@ -1042,7 +1077,7 @@ def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> s
     base = Path(escalations_dir)
     candidate = base / f'{escalation_id}.json'
     if not candidate.is_file():
-        matches = sorted((base / _ESCALATION_ARCHIVE_SUBDIR).rglob(f'{escalation_id}.json'))
+        matches = sorted((base / ESCALATION_ARCHIVE_SUBDIR).rglob(f'{escalation_id}.json'))
         candidate = matches[-1] if matches else None
     if candidate is None:
         return None
