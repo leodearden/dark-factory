@@ -86,3 +86,4 @@ ignore = ["E501"]
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
+docstring-code-format = true
