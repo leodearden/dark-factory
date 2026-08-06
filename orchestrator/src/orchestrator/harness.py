@@ -25,6 +25,7 @@ from shared.cli_invoke import (
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.task_metadata import RoutingState
+from shared.transcript_archive import durable_archive_path
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -3164,6 +3165,51 @@ class Harness:
                 pass  # unreadable/faulted != wiped — stay loud
             return (False, 'no_transcript')
         return (True, 'eligible')
+
+    def _archive_available(self, task_id: str, session_id: str | None) -> bool:
+        """Was *session_id* recoverable from the durable transcript archive?
+
+        Pure INSTRUMENTATION for the ``session_resume_fallback`` event (task
+        3727, plans/session-resume-eligibility-seam-prd.md §8 / D8): it reports
+        whether the session that just failed to resume still exists in the
+        durable archive, and changes NOTHING about what dispatches. Leaf δ is
+        what may later gate on this signal; task 3578 is what consumes
+        :func:`~shared.transcript_archive.durable_archive_path` for the actual
+        restore. Because it is an instrument, False-on-any-fault is the correct
+        degradation — an instrument must never be able to break dispatch.
+
+        Total, and the guard is NOT redundant with ``durable_archive_path``'s
+        own totality: the LOOKUP is total, but the archive-root COMPOSITION
+        feeding it is not. ``self.config.transcript_archive.root`` can be a
+        MagicMock (the test conftest's spec_set ``mock_orch_config`` never
+        assigns ``transcript_archive``) or otherwise non-str under a config
+        regression, and ``Path.__truediv__`` then raises TypeError — here,
+        inside ``_run_slot``, on the production dispatch path. Unguarded, a
+        mere config regression would escalate into a dispatch fault. This is
+        the same reasoning git_ops.py already records for the identical
+        ``project_root / transcript_archive.root`` composition at its archival
+        backstop.
+
+        Deliberately does NOT consult ``transcript_archive.enabled``: with
+        archival off there is simply nothing on disk to find, so the lookup
+        already answers False. Gating on the flag would add a second source of
+        truth that can disagree with the filesystem (archival on last week
+        leaves recoverable archives behind today), and the config-derived
+        answer is the one that would mislead an operator triaging a storm.
+        """
+        try:
+            if not session_id:
+                return False  # nothing to look up
+            archive_root = self.config.project_root / self.config.transcript_archive.root
+            return durable_archive_path(archive_root, str(task_id), session_id) is not None
+        except Exception:
+            logger.debug(
+                'archive_available: lookup failed for task %s session %s',
+                task_id,
+                session_id,
+                exc_info=True,
+            )
+            return False
 
     async def _recover_crashed_tasks(self) -> None:
         """Scan surviving worktrees and recover plans with completed work.
@@ -7764,7 +7810,18 @@ class Harness:
                             self.event_store.emit(
                                 EventType.session_resume_fallback,
                                 task_id=assignment.task_id,
-                                data={**resume_event_data, 'reason': reason},
+                                data={
+                                    **resume_event_data,
+                                    'reason': reason,
+                                    # Read the session id off the snapshot taken
+                                    # above, NOT off recovered_session — that was
+                                    # set to None at the top of this else-branch,
+                                    # so re-reading it would raise AttributeError.
+                                    'archive_available': self._archive_available(
+                                        assignment.task_id,
+                                        resume_event_data['session_id'],
+                                    ),
+                                },
                             )
                         # Rolling-window decay (task 3256): "consecutive" means
                         # CHAINED within storm_window_secs, not merely
