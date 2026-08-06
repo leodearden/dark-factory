@@ -55,6 +55,8 @@ build_update_payload = _mod.build_update_payload
 build_parser = _mod.build_parser
 DEFAULT_KEYS = _mod.DEFAULT_KEYS
 MigrationCollisionError = _mod.MigrationCollisionError
+assert_write_accepted = _mod.assert_write_accepted
+WriteRejectedError = _mod.WriteRejectedError
 
 
 # The six ad-hoc keys measured on task 3083's live blob (2026-08-06) that are
@@ -282,6 +284,58 @@ def test_default_keys_are_exactly_the_six_measured_targets():
     # `last_blocked_at` is NOT a migration target — it was promoted to Tier-A
     # (task 3697 step-2) because the orchestrator writes and reads it.
     assert 'last_blocked_at' not in DEFAULT_KEYS
+
+
+# --- tool-level rejection must not read as an accepted write ---------------
+
+def test_done_provenance_rejection_is_detected():
+    """The VERBATIM rejection observed against the live server on 2026-08-06.
+
+    `update_task` refuses any metadata payload containing `done_provenance`
+    (sqlite_task_backend.py, presence-only write-authority floor, checked
+    BEFORE metadata_mode is resolved) — and returns that refusal inside a
+    normal JSON-RPC success envelope. The shared client only raises on an
+    envelope-level error, so without this assertion the script printed
+    'write submitted' for a write that never happened.
+    """
+    observed = {
+        'success': False,
+        'error': 'done_provenance_via_update_task',
+        'task_id': '3083',
+        'hint': (
+            'update_task cannot write metadata.done_provenance. Use '
+            'set_task_status(status="done", done_provenance={...}) instead'
+        ),
+    }
+    with pytest.raises(WriteRejectedError) as excinfo:
+        assert_write_accepted(observed)
+
+    message = str(excinfo.value)
+    # The true cause and the remedy must both reach the operator.
+    assert 'done_provenance_via_update_task' in message
+    assert 'set_task_status' in message
+
+
+def test_generic_error_shaped_reply_is_detected():
+    """@mcp_tool_errors converts any escaping exception into
+    {'error': ..., 'error_type': ...} — also a rejection, also invisible."""
+    with pytest.raises(WriteRejectedError):
+        assert_write_accepted({'error': 'boom', 'error_type': 'ValueError'})
+
+
+def test_successful_write_shape_is_accepted():
+    """The real success shape must NOT trip the guard."""
+    assert_write_accepted({
+        'id': '3083', 'message': 'Task 3083 updated',
+        'updated': True, 'updated_task': {'id': '3083'},
+    })
+
+
+def test_non_dict_reply_is_not_treated_as_a_rejection():
+    """Fail-safe: an unrecognized reply shape is left to the read-back diff
+    rather than being misreported as a rejection."""
+    assert_write_accepted('unexpected')
+    assert_write_accepted(None)
 
 
 def test_cli_requires_an_explicit_task_id():

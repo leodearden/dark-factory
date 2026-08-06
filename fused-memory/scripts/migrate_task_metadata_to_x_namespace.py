@@ -84,6 +84,17 @@ DEFAULT_KEYS: tuple[str, ...] = (
 )
 
 
+class WriteRejectedError(RuntimeError):
+    """The server returned a tool-level rejection inside a success-shaped reply.
+
+    The shared JSON-RPC client only raises on an ENVELOPE-level error, and
+    fused-memory returns backend write-authority rejections as an ordinary
+    result dict (``{'success': False, 'error': ..., 'hint': ...}``) — so a
+    refused write otherwise looks exactly like an accepted one. Surfacing it
+    here is what turns "the x_ keys are missing" into the actual cause.
+    """
+
+
 class MigrationCollisionError(RuntimeError):
     """Both ``k`` and ``x_k`` exist with DIFFERENT values.
 
@@ -151,6 +162,34 @@ def build_update_payload(task_id: str, project_root: str, meta: dict) -> dict:
         'metadata': json.dumps(meta),
         'metadata_mode': 'replace',
     }
+
+
+def assert_write_accepted(result: object, *, tool: str = 'update_task') -> None:
+    """Raise :class:`WriteRejectedError` on a tool-level rejection.
+
+    A successful backend write returns ``{'id', 'message', 'updated',
+    'updated_task'}``; a rejection returns ``{'success': False, 'error':
+    <code>, 'hint': ...}`` with the SAME JSON-RPC envelope. Without this check
+    the caller cannot tell the two apart, which is how a refused write reads
+    as an accepted one.
+
+    Known rejection that applies to this migration: ``update_task`` refuses
+    any metadata payload containing ``done_provenance``
+    (``error='done_provenance_via_update_task'``) — a presence-only
+    write-authority floor that fires before ``metadata_mode`` is resolved. It
+    therefore rejects a whole-blob ``replace`` of ANY done/merged task, since
+    those all carry that key.
+    """
+    if not isinstance(result, dict):
+        return
+    if result.get('success') is False or result.get('error'):
+        raise WriteRejectedError(
+            f'{tool} was REJECTED by the server (the JSON-RPC envelope was still '
+            f'a success, so this would otherwise be invisible): '
+            f'error={result.get("error")!r} '
+            f'error_type={result.get("error_type")!r} '
+            f'hint={result.get("hint")!r}'
+        )
 
 
 def _sha256(text: str | None) -> str:
@@ -302,10 +341,15 @@ async def main_async(args: argparse.Namespace) -> int:
             print('  DRY RUN — nothing written. Re-run with --apply to write.')
             return 0
 
-        await client.call_tool(
+        write_result = await client.call_tool(
             'update_task', build_update_payload(args.task_id, project_root, migrated),
         )
-        print('  write submitted; verifying read-back...')
+        try:
+            assert_write_accepted(write_result)
+        except WriteRejectedError as exc:
+            print(f'  [error] {exc}', file=sys.stderr)
+            return 1
+        print('  write accepted; verifying read-back...')
 
         after_task = await _fetch_task(client, args.task_id, project_root)
         problems = _verify_read_back(
