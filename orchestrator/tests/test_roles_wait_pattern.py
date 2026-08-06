@@ -128,7 +128,7 @@ def test_wait_pattern_guidance_is_nonempty() -> None:
 
 
 def test_session_idle_bound_config_drift_tripwire() -> None:
-    """``working_idle_secs`` still matches the bound the wait guidance was sized to.
+    """The config bounds the wait guidance was sized to have not moved.
 
     ``shared.cli_invoke``'s working-regime watchdog kills a whole session once
     ``idle_elapsed >= max(working_idle_secs, timeout_seconds)`` with no NEW
@@ -138,6 +138,10 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     — guidance that used 3900000 as its background-vs-foreground threshold told
     agents to size a 45-minute foreground verify to a 2700000 timeout and lose
     the whole session at 30 minutes.
+
+    That idle mechanism is NOT uniform across the spliced roles, so two bounds
+    are pinned here rather than one — see the second assertion for why
+    ``timeouts.steward`` binds the steward through a different code path.
 
     ``WAIT_PATTERN_GUIDANCE`` / ``WAIT_PATTERN_REMINDER`` state a ~25-minute
     background threshold derived from that 1800s bound. This test does NOT
@@ -164,10 +168,13 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     value below both of these; that is out of reach of any unit test and is
     accepted — the prose is sized to the SHIPPED bound.
     """
-    field_default = OrchestratorConfig.model_fields['timeouts'].default_factory().working_idle_secs  # type: ignore[misc]
-    shipped = yaml.safe_load(
+    field_timeouts = OrchestratorConfig.model_fields['timeouts'].default_factory()  # type: ignore[misc]
+    shipped_timeouts = yaml.safe_load(
         (pkg_resources.files('orchestrator') / 'defaults.yaml').read_text()
-    )['timeouts']['working_idle_secs']
+    )['timeouts']
+
+    field_default = field_timeouts.working_idle_secs
+    shipped = shipped_timeouts['working_idle_secs']
 
     assert (field_default, shipped) == (1800, 1800), (
         f'The session idle bound moved: defaults.yaml={shipped}s, '
@@ -177,6 +184,29 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
         'two now DISAGREE, defaults.yaml is the one that binds a dispatched '
         'session — fix the drift first. Then update both constants in roles.py '
         'to stay under the new bound, and update this assertion.'
+    )
+
+    # ``timeouts.steward`` is pinned SEPARATELY because it binds through a
+    # different mechanism, not merely a different number. The steward is not
+    # dispatched via ``workflow._invoke``: ``steward.py:806`` passes
+    # ``timeout_seconds`` but NEITHER ``working_idle_secs`` nor
+    # ``absolute_cap_secs``, so ``cli_invoke``'s ``extension_engaged`` never
+    # latches and it falls to the ``else`` arm — a FLAT ``elapsed >=
+    # timeout_seconds`` measured from watchdog start, which no ``BashOutput``
+    # poll resets. So this, not ``working_idle_secs``, is the bound the steward
+    # bullet in WAIT_PATTERN_GUIDANCE is sized against, and it is the tightest
+    # real ceiling among the spliced roles precisely because it has no idle
+    # slack to reclaim.
+    field_steward = field_timeouts.steward
+    shipped_steward = shipped_timeouts['steward']
+
+    assert (field_steward, shipped_steward) == (1800, 1800), (
+        f'The steward ceiling moved: defaults.yaml={shipped_steward}s, '
+        f'config.py Field default={field_steward}s (both were 1800s). '
+        'WAIT_PATTERN_GUIDANCE tells the steward its ceiling is a FLAT 1800s / '
+        '30 minutes from session start that nothing resets — update that bullet '
+        'in roles.py, and re-check that the ~25-minute background threshold '
+        'still leaves margin under the new value.'
     )
 
 

@@ -369,21 +369,41 @@ half-done tree that is falsely recorded as a completed, successful run.
 # it on the theory that the roles cannot reach them -- they can.
 #
 # THE ~25-MINUTE BACKGROUND THRESHOLD is deliberate and is NOT the harness Bash
-# cap; do not "simplify" it back to 3900000.  The operative limit on a
-# dispatched session is the working-regime watchdog in
-# shared/src/shared/cli_invoke.py (~line 2450), which kills the session once
-# `idle_elapsed >= max(working_idle_secs, timeout_seconds)` where progress is
-# measured ONLY by NEW transcript turns (`count_transcript_turns`).  A blocking
-# foreground Bash call emits no turn while it runs.  At stock config
-# (defaults.yaml `timeouts`: working_idle_secs=1800; implementer/debugger/
-# reviewer=1200, merger=600, steward=1800) that bound is 1800s = 30 minutes for
-# every role except architect (2400s) and simple_task (7200s) -- so 30 minutes
-# is the floor the guidance must be safe under, and ~25 leaves the margin.
-# Polling a BACKGROUNDED command is exempt in practice because each
-# `BashOutput` poll is itself a new turn and resets `last_progress_monotonic`.
-# The 120000 default / 3900000 max remain true harness facts and are still
-# stated as such -- they are just not the background-vs-foreground decision
-# threshold.  (Task 3607 review, reviewer_comprehensive.)
+# cap; do not "simplify" it back to 3900000.  But the watchdog mechanism differs
+# by DISPATCH SITE, and the prompt text says so explicitly, because assuming it
+# is uniform is the error the task-3607 review caught (round 5).  Measured, not
+# assumed -- cli_invoke.py gates the whole idle regime on
+# `extension_engaged = seen_turn and working_idle_secs is not None and
+# absolute_cap_secs is not None`:
+#
+#   * workflow._invoke (workflow.py:11791-11792) passes BOTH extension params,
+#     so extension_engaged latches True and the watchdog measures IDLE time: it
+#     kills only after no NEW transcript turn for
+#     max(working_idle_secs, timeout_seconds).  Polling a backgrounded command
+#     genuinely resets that clock, since each `BashOutput` poll is a new turn.
+#     Covers architect (2400s), implementer/debugger (1800s), merger (1800s),
+#     simple_task (7200s) -- each being max(working_idle_secs=1800, role).
+#   * steward.py:806 passes `timeout_seconds=timeouts.steward` and NEITHER
+#     extension param, so extension_engaged is False and cli_invoke takes the
+#     `else` arm: a FLAT `elapsed >= timeout_seconds` measured from
+#     watchdog_start, i.e. 1800s from session start.  Polling resets NOTHING
+#     for the steward.  Do not tell the steward otherwise.
+#   * review_checkpoint.py:211 passes no timeout_seconds at all, so the else
+#     arm's own `timeout_seconds is not None` guard is False and NO watchdog
+#     kill fires for deep_reviewer; only the harness Bash cap binds it.
+#
+# ~25 minutes is the safe default because 1800s = 30 min is the tightest real
+# ceiling among the roles that have one, and it is the FLAT one, so it has no
+# slack to reclaim.  The 120000 default / 3900000 max remain true harness facts
+# and are still stated as such -- they are just not the background-vs-foreground
+# decision threshold.
+#
+# Threading the extension params into the steward/deep_reviewer dispatch sites
+# so the idle mechanism engages uniformly is a deliberate NON-goal here: it
+# would change steward's effective budget from a flat 1800s to
+# invocation_timeout (7200s), a real operational change that belongs in its own
+# task rather than riding along in a prompt-wording one.
+# (Task 3607 review rounds 1 and 5, reviewer_comprehensive.)
 WAIT_PATTERN_GUIDANCE = """
 ## CRITICAL: How to wait for something
 
@@ -400,15 +420,23 @@ SANCTIONED
 - BACKGROUND anything that will not produce a NEW assistant turn for more than
   ~25 minutes. Sizing a long run to a big foreground `timeout` does NOT buy you
   that time. The binding constraint is not the harness Bash cap (3900000 ms /
-  65 minutes) — it is the orchestrator's working-regime watchdog, which kills
-  your entire SESSION once no new transcript turn has appeared for
-  max(working_idle_secs, your role's timeout), stock 1800s = 30 minutes. A
-  blocking foreground Bash call emits NO turn while it runs, so a 45-minute
+  65 minutes) — it is the orchestrator watchdog that kills your entire SESSION.
+  A blocking foreground Bash call emits NO turn while it runs, so a 45-minute
   verify sized to a 2700000 timeout sits well under the harness cap and still
-  gets the session killed at 30 minutes, losing everything it observed — the
-  same lose-all-observations failure the `until`-loop bullet warns about.
-  Polling is safe for exactly the inverse reason: every `BashOutput` poll IS a
-  new turn and resets that idle clock.
+  gets the session killed around 30 minutes, losing everything it observed —
+  the same lose-all-observations failure the `until`-loop bullet warns about.
+  KNOW WHICH CEILING YOU ARE UNDER, because it decides what polling buys you:
+  - architect, implementer, debugger, merger, simple_task are watched on IDLE
+    time — the kill fires only after no new transcript turn for
+    max(working_idle_secs, your role timeout), stock 1800s = 30 minutes. Here
+    polling genuinely helps: every `BashOutput` poll IS a new turn and resets
+    that clock, which is what makes a long backgrounded run survivable.
+  - As STEWARD your ceiling is FLAT wall clock — 1800s = 30 minutes from
+    session start — and NOTHING resets it. Polling does not extend it. Work
+    that cannot finish inside that window must be sized down or handed off; no
+    wait strategy rescues it, so do not start a 40-minute job and plan to poll.
+  - As deep_reviewer no watchdog ceiling fires at all; only the harness Bash
+    cap binds you. The don't-end-your-turn rule above still applies in full.
   So: `Bash` with `run_in_background=true`, then poll it to completion with
   `BashOutput` and READ the result BEFORE ending your turn. Launching it
   detached with `setsid` and polling its log file is the same sanctioned shape;
