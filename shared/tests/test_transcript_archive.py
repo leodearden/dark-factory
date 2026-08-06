@@ -381,3 +381,111 @@ class TestDurableArchivePathLookup:
 
         assert len(answers) == 1
         assert answers.pop() in {a, b}
+
+    def test_b5_missing_root_returns_none(self, tmp_path):
+        """B5 (I-A): an archive root that does not exist at all."""
+        assert durable_archive_path(tmp_path / 'nope', '42', 'sess-b5') is None
+
+    def test_b5_root_is_a_file_returns_none(self, tmp_path):
+        """B5 (I-A): an archive root that is a FILE, not a directory."""
+        root = _write(tmp_path / 'archive', b'not a directory')
+
+        assert durable_archive_path(root, '42', 'sess-b5') is None
+
+    def test_b5_absent_task_subtree_returns_none(self, tmp_path):
+        """B5 (I-A): the root exists but holds no subtree for this task."""
+        root = tmp_path / 'archive'
+        _write(root / '99' / ENC / 'sess-other.jsonl.gz', b'gz-bytes')
+
+        assert durable_archive_path(root, '42', 'sess-b5') is None
+
+    def test_b5_raising_glob_returns_none(self, tmp_path, monkeypatch):
+        """B5 (I-A): a glob that raises yields None, never a propagated error.
+
+        The equivalent of the blanket ``except Exception`` that
+        :func:`shared.cli_invoke._resolve_transcript_path` carries — the
+        property callers on the dispatch path lean on to stay total.
+        """
+        root = tmp_path / 'archive'
+        _write(root / '42' / ENC / 'sess-b5.jsonl.gz', b'gz-bytes')
+
+        def _boom(self, pattern):
+            raise OSError(errno.EIO, 'boom')
+
+        monkeypatch.setattr(Path, 'glob', _boom)
+
+        assert durable_archive_path(root, '42', 'sess-b5') is None
+
+    def test_b5_raising_stat_returns_none(self, tmp_path, monkeypatch):
+        """B5 (I-A): a concurrent unlink between glob and stat yields None.
+
+        Models task 2731's GC sweep unlinking an archive in the window between
+        the glob listing it and the newest-mtime key stat-ing it.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b5-stat'
+        _write(root / '42' / ENC / f'{sid}.jsonl.gz', b'a')
+        _write(root / '42' / ENC_B / f'{sid}.jsonl.gz', b'b')
+
+        real_stat = Path.stat
+        # Let the is_file() filter's stats through (both matches are real
+        # files), then unlink underneath the newest-mtime selection key — the
+        # window the GC actually races. Failing earlier would be caught by
+        # is_file()'s own OSError swallow and would not exercise max().
+        survived = {'calls': 0}
+
+        def _boom(self, *args, **kwargs):
+            if self.name.startswith(sid):
+                survived['calls'] += 1
+                if survived['calls'] > 2:
+                    raise FileNotFoundError(errno.ENOENT, 'gone')
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'stat', _boom)
+
+        assert durable_archive_path(root, '42', sid) is None
+        # The selection key really did get reached (2 is_file() stats + more).
+        assert survived['calls'] > 2
+
+    def test_b5_non_str_ids_do_not_raise(self, tmp_path):
+        """B5 (I-A): an integer task_id is coerced, not a TypeError.
+
+        Task ids are numeric strings, so a caller can easily hold the int.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b5-int'
+        archived = _write(root / '42' / ENC / f'{sid}.jsonl.gz', b'gz-bytes')
+
+        assert durable_archive_path(root, 42, sid) == archived
+        assert durable_archive_path(root, 99, sid) is None
+        assert durable_archive_path(str(root), '42', sid) == archived
+
+    def test_i_d_lookup_leaves_the_archive_byte_identical(self, tmp_path):
+        """I-D: the locator is strictly read-only — glob and stat only.
+
+        Restoration (decompressing, moving a transcript back into a config
+        dir) is task 3578's, under task 3619's archive-before-delete guard.
+        Nothing here may create, move, delete or decompress a file.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-ro'
+        task_id = '42'
+        _write(root / task_id / ENC / f'{sid}.jsonl.gz', b'gz-bytes')
+        _write(root / task_id / ENC_B / 'sess-other.jsonl', b'other-bytes')
+
+        def _snapshot():
+            return sorted(
+                (
+                    str(p.relative_to(root)),
+                    p.is_file(),
+                    p.read_bytes() if p.is_file() else None,
+                    p.stat().st_mtime_ns,
+                )
+                for p in root.rglob('*')
+            )
+
+        before = _snapshot()
+
+        assert durable_archive_path(root, task_id, sid) is not None
+
+        assert _snapshot() == before
