@@ -731,10 +731,33 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # consolidation ruling, but this guard is forward-looking (it only
             # blocks NEW near-dup writes), so seeding it now stops that cluster
             # from growing further while 3011 is parked.
+            #
+            # SUFFICIENCY (task 3054): the comment above argues all four
+            # phrases are distinctive literal identifiers -- yet under
+            # count-only matching none of them could block a write ALONE, so
+            # a note naming report_task_already_done while ALSO touching the
+            # plan-tools and plan-revalidation vocabularies scored exactly 1
+            # hit in each of three clusters and was blocked by none (hits do
+            # not aggregate across clusters). The two identifier-shaped
+            # phrases -- a public tool name and a PRIVATE handler name --
+            # cannot plausibly appear in off-topic text, so they are declared
+            # sufficient and now qualify this cluster on their own.
+            #
+            # The other two are deliberately NOT sufficient. 'merge-base
+            # --is-ancestor' is a generic git command: a plain git-ancestry
+            # note must stay unblocked (test_does_not_match_unrelated_merge_
+            # base_note exists precisely to pin that), and promoting it would
+            # mis-route genuine git notes to gate 3011. 'main-reachable' is
+            # likewise too generic standalone. Each still counts normally
+            # toward min_phrase_hits.
             phrases=[
                 'report_task_already_done',
                 'main-reachable',
                 'merge-base --is-ancestor',
+                '_handle_already_done_report',
+            ],
+            sufficient_phrases=[
+                'report_task_already_done',
                 '_handle_already_done_report',
             ],
             min_phrase_hits=2,
