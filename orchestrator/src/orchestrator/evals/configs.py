@@ -450,8 +450,12 @@ ARCHITECT_EVAL_CONFIGS = [
     EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role='architect'),
     # eval-revival ρ: effort-matched to architect-opus-max above — only the
     # model axis varies. Config-only: run_ofat_stage's architect branch
-    # (evals/runner.py:1232, task 2478) already dispatches any role='architect'
-    # candidate, and get_config_by_name already searches this list.
+    # (evals/runner.py, task 2478) already dispatches any role='architect'
+    # candidate, and get_config_by_name already searches this list. Cost note:
+    # ARCHITECT_EVAL_CONFIGS is consumed wholesale by ofat_candidates(), so
+    # this is a 5th architect candidate screened by EVERY OFAT run (not just
+    # fable-trial-v2 δ's stage-2 screen) — one extra live architect invocation
+    # per fixture/trial cell for any campaign that pulls the full candidate set.
     EvalConfig('architect-fable-max', 'claude', 'claude-fable-5', 'max', role='architect'),
 ]
 
