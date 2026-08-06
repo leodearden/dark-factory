@@ -61,6 +61,7 @@ module that drives the bounded steward wait deterministically) crossed with
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -363,7 +364,12 @@ def _stub_merge_internals(
     ``_check_scope_invariant`` is likewise left REAL: ``FakeScheduler.get_task``
     returns ``None`` for an untracked task, which the tripwire's documented
     fail-safe treats as "cannot check" and skips — so it files no escalation of
-    its own and cannot contaminate the gate under test.
+    its own and cannot contaminate the gate under test.  That default is what
+    lets every OTHER test hand-submit its own record; populating
+    ``scheduler.task_data[task_id]`` with a divergent ``metadata.files`` turns
+    the tripwire back on, which is exactly what
+    :class:`TestScopeInvariantTripwireGatesTheMerge` does to pin the
+    escalate-then-gate coupling itself.
 
     Returns the ``_submit_to_merge_queue`` mock.
     """
@@ -1457,6 +1463,263 @@ class TestGateReFireIsBounded:
         assert len(chained.instances) <= 1, (
             f'the handler must not loop back into the machinery and build a '
             f'second steward; built {len(chained.instances)}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# The task-2505 scope tripwire's OWN L0 gates the merge (not observational)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScopeInvariantTripwireGatesTheMerge:
+    """The escalate-then-gate coupling the merge-entry comments now assert.
+
+    ``workflow.py``'s merge-entry comment and ``_check_scope_invariant``'s
+    docstring were corrected by this task to say the tripwire is **NOT**
+    observational: ``_escalate_scope_invariant_violation`` files
+    ``severity='blocking'``, ``level=0``, which ``_is_gating_escalation``
+    classifies as GATING, and the gate sits ~20 lines below the call.
+
+    Every other test in this module hand-submits an equivalent L0 via
+    :func:`_submit_gating_l0`, so the coupling itself went unpinned: if the
+    tripwire's severity/level ever changed (making it non-gating), or the
+    check moved BELOW the gate, both docs would be wrong and nothing would
+    fail.  This drives the real chain end to end — real
+    ``_check_scope_invariant``, real ``_escalate_scope_invariant_violation``,
+    real ``_is_gating_escalation`` — with NO hand-submitted record at all.
+    """
+
+    async def test_divergent_metadata_files_gates_this_dispatch(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        store = _RecordingEventStore()
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree, event_store=store,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+        timing = _time_the_wait(wf)
+
+        # The ONLY setup: make the backend's metadata.files derive a DIFFERENT
+        # lock-module set from PLAN['files'].  `_stamp_merge_phase_entered`
+        # reads this blob and threads it straight into _check_scope_invariant,
+        # so this is the same read production performs.
+        assert PLAN['files'] == ['lib.py']
+        scheduler.task_data[task_id] = {
+            'id': task_id,
+            'metadata': {'files': ['other_pkg/src/other_pkg/thing.py']},
+        }
+        # No _submit_gating_l0 here — the record under test is the one the
+        # tripwire files for itself.
+        assert queue.get_by_task(task_id, status='pending') == []
+        wf._steward_factory = _make_silent_steward()
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        # ── the tripwire fired, and what it filed is a GATING record ────
+        timeouts = _steward_wait_timeouts(store)
+        assert timeouts, (
+            'the tripwire\'s own blocking L0 must reach the merge-entry gate '
+            'and enter the bounded steward wait — if it did not, the "NOT '
+            'observational" comments at workflow.py:3447+ and the '
+            '_check_scope_invariant docstring are lying again'
+        )
+        assert timing.get('calls') == 1
+        # The record the wait timed out on is the tripwire's, by content.
+        orphan_ids = timeouts[0]['escalation_ids']
+        assert len(orphan_ids) == 1
+        tripwire = queue.get(orphan_ids[0])
+        assert tripwire is not None
+        assert tripwire.severity == 'blocking'
+        assert tripwire.level == 0
+        assert tripwire.category == 'infra_issue'
+        assert 'plan.files/metadata.files divergence' in tripwire.summary
+
+        # ── and it stopped the line for this dispatch ───────────────────
+        assert submit.await_count == 0, (
+            'a scope divergence stops the line: the merge must not be '
+            'submitted on the dispatch that detected it'
+        )
+        assert outcome is not None
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked']
+
+
+# ---------------------------------------------------------------------------
+# _steward_wait_expired is per-wait state, not a sticky workflow flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardWaitExpiredDoesNotLeak:
+    """``_steward_wait_expired`` is reset by EVERY wait, so a stale True from
+    an earlier one cannot park a later, legitimately-cleared gate.
+
+    The flag is a mutable cross-method signal: ``_wait_for_resolution`` sets
+    it, and only the merge-entry gate reads it.  Its correctness rests entirely
+    on the reset landing after the no-queue early return (``workflow.py:12489``)
+    — a property a later refactor of that method's early returns could drop
+    silently.  The consequence would be specific and bad: a task whose gate the
+    steward genuinely cleared parks as ``blocked`` with a spurious L1, because
+    a wait that expired back in EXECUTE/VERIFY left the flag True.
+    """
+
+    async def test_expiry_in_an_earlier_wait_does_not_park_a_cleared_gate(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+
+        # (1) An EARLIER wait expires — the execute/verify-phase shape, where
+        # run()'s ESCALATED branch deliberately ignores the flag and resumes.
+        # No steward is wired, so _steward_progress_counter() is None and the
+        # wait degrades to a plain deadline, then dismisses its orphan.
+        stale = _submit_gating_l0(queue, task_id)
+        await asyncio.wait_for(wf._wait_for_resolution(), 10)
+        assert wf._steward_wait_expired is True, (
+            'precondition: the first wait must really have expired, otherwise '
+            'this test proves nothing about a stale True'
+        )
+        assert queue.get_by_task(task_id, status='pending', level=0) == []
+        assert queue.get(stale.id).resolved_by == 'auto-dismissed'
+
+        # (2) A LATER merge entry whose gate the steward genuinely clears.
+        _submit_gating_l0(queue, task_id)
+        wf._steward_factory = _make_resolving_steward(queue, task_id)
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 20)
+
+        assert wf._steward_wait_expired is False, (
+            'the second wait must report its OWN outcome — it resolved'
+        )
+        assert outcome is None, (
+            'the gate cleared, so the handler must fall through to the merge '
+            'retry loop in-slot; a terminal outcome here means the stale True '
+            'leaked into the expiry branch'
+        )
+        assert submit.await_count == 1
+        assert 'blocked' not in scheduler.statuses.get(task_id, []), (
+            'a leaked stale expiry would park a task whose gate was cleared, '
+            'with an L1 for a human who has nothing to decide'
+        )
+        assert not queue.has_open_l1(task_id)
+
+    async def test_flag_is_reset_by_a_wait_that_resolves(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """The reset itself, isolated from the merge phase: any wait that
+        returns without expiring must leave the flag False, whatever it was
+        beforehand.  This is the property the reset's PLACEMENT (after the
+        no-queue early return, before the loop) exists to deliver."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, _scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+
+        wf._steward_wait_expired = True  # as if an earlier wait had expired
+        esc = _submit_gating_l0(queue, task_id)
+        queue.resolve(esc.id, 'resolved before the wait', resolved_by='test')
+
+        await asyncio.wait_for(wf._wait_for_resolution(), 10)
+
+        assert wf._steward_wait_expired is False
+
+
+# ---------------------------------------------------------------------------
+# The expiry park reports MEASURED elapsed time, not the configured window
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestExpiryDetailReportsMeasuredElapsed:
+    """A refreshed idle window makes "the gate waited <window>s" a lie.
+
+    ``_wait_for_resolution``'s deadline is an IDLE one: it is extended by
+    another full window every time ``_steward_progress_counter()`` advances
+    (``workflow.py:12578-12586``), so a steward that keeps invoking its agent
+    without resolving holds the slot for N windows.  The L1 the expiry park
+    files is what a human triaging the hold reasons from, so it must report the
+    time that actually elapsed — with the configured window kept as a secondary
+    figure, since the two answer different questions.
+
+    Every other test in this module shrinks both terms to 0.5s and wires fakes
+    with no progress counter, so the extension branch never runs; this is the
+    one that exercises it.
+    """
+
+    async def test_refreshed_window_still_terminates_and_reports_real_elapsed(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        worktree = await _make_advanced_worktree(git_ops, task_id)
+        wf, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, worktree,
+        )
+        _wire_resolve_callback(queue, wf)
+        submit = _stub_merge_internals(wf, monkeypatch)
+        timing = _time_the_wait(wf)
+
+        _submit_gating_l0(queue, task_id)
+        wf._steward_factory = _make_silent_steward()
+
+        # Advance the progress counter exactly ONCE: read at wait entry (0),
+        # then 1 at the first expiry — an advance, so the deadline refreshes —
+        # then 1 again at the second, which is no advance and gives up.  Two
+        # windows of ~1.0s each, so ~2s of real wait against a detail line that
+        # would otherwise claim 1s.
+        counter = iter([0, 1, 1, 1, 1])
+        wf._steward_progress_counter = lambda: next(counter, 1)  # type: ignore[method-assign]
+
+        outcome = await asyncio.wait_for(wf._run_merge_phase(f'task/{task_id}'), 30)
+
+        # It still TERMINATES — a refreshed window is bounded by the steward's
+        # own attempt ceiling, not unbounded.
+        assert outcome is not None
+        assert submit.await_count == 0
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked']
+
+        # The refresh really happened: one window is 1.0s, so a wait that did
+        # NOT extend could not have taken this long.
+        elapsed = timing.get('elapsed', 0.0)
+        assert elapsed >= 1.5, (
+            f'expected the deadline to be refreshed for a second window '
+            f'(~2.0s total); the wait took {elapsed}s, so the extension branch '
+            f'never ran and this test is not exercising what it claims'
+        )
+
+        # And the L1 a human reads reports the MEASURED time, not the 1s
+        # configured window.
+        l1s = [
+            e for e in queue.get_by_task(task_id, status='pending') if e.level == 1
+        ]
+        assert l1s, 'the expiry park must file an L1'
+        match = re.search(r'waited ([0-9.]+)s of wall clock', l1s[0].detail)
+        assert match, (
+            f'the expiry detail must report measured wall clock; got:\n'
+            f'{l1s[0].detail}'
+        )
+        reported = float(match.group(1))
+        assert reported >= 1.5, (
+            f'the detail reported {reported}s but the wait really took '
+            f'{elapsed}s — a human triaging this park would under-estimate the '
+            f'hold by a whole multiple of the configured window'
+        )
+        assert 'configured idle window' in l1s[0].detail, (
+            'the configured window stays in the detail as a SECONDARY figure — '
+            'it is what an operator would tune, just not what elapsed'
         )
 
 
