@@ -1243,7 +1243,9 @@ def _clear_fm_liveness_streak() -> None:
         log(f"failed to clear fm liveness streak at {FM_LIVENESS_STREAK_PATH}: {exc!r}")
 
 
-def _record_fm_liveness_failure(verdict: str) -> int:
+def _record_fm_liveness_failure(
+    verdict: str, unit_elapsed_secs: float | None = None
+) -> int:
     """Record one non-healthy fm liveness verdict; return the new streak count.
 
     PERSISTENCE IS MANDATORY, NOT STYLISTIC. orchestrator-watchdog.service is
@@ -1260,6 +1262,28 @@ def _record_fm_liveness_failure(verdict: str) -> int:
     fresh one. Ticks are ~60s apart, so a larger gap means several were missed
     and the "consecutive" claim is no longer true.
 
+    INSTANCE-BOUNDARY EXPIRY. *unit_elapsed_secs* is the caller's already-
+    computed ``_unit_start_elapsed_secs(FUSED_MEMORY_UNIT)``. When it is known,
+    an entry whose ``ts`` predates ``now - unit_elapsed_secs`` describes a
+    PREVIOUS fused-memory process and the count restarts at 1. Without this the
+    max-age window alone is not enough, and the gap is reachable with the
+    shipped constants rather than only in principle: two wedged ticks at T-120
+    and T-60 leave count=2 ts=T-60; an EXTERNAL restart (the staleness
+    redeploy, restart-fused-memory.sh, an operator) lands at T; the ticks at
+    T+60 and T+120 return early on STARTUP_GRACE_SECS=120 without clearing
+    anything; and the first post-grace tick at T+180 sees age=240s < 300s,
+    increments to 3, and kills an instance that has been up for three minutes
+    and is merely slow to serve /health during warm-up. Evidence about a
+    process that no longer exists must never count toward killing its
+    successor.
+
+    The comparison deliberately mixes clocks — ``ts`` is wall-clock
+    (time.time) while *unit_elapsed_secs* is a CLOCK_MONOTONIC-derived
+    duration — because only the DURATION is needed and monotonic is the
+    suspend-proof source. The one divergence, a host suspend, makes
+    ``now - unit_elapsed_secs`` later than the true start and so expires MORE
+    streaks: the safe direction.
+
     WRITE FAILURES ARE SAFE. _write_fm_liveness_streak inherits
     _atomic_write_json's fail-soft contract, so a write that does not land is
     logged and swallowed. The returned count is still correct for THIS tick,
@@ -1270,10 +1294,18 @@ def _record_fm_liveness_failure(verdict: str) -> int:
     """
     now = time.time()
     prior = _read_fm_liveness_streak()
-    if prior is None or (now - prior[1]) > FM_LIVENESS_STREAK_MAX_AGE_SECS:
-        count = 1
-    else:
-        count = prior[0] + 1
+    count = 1
+    if prior is not None:
+        prior_count, prior_ts = prior
+        if (now - prior_ts) > FM_LIVENESS_STREAK_MAX_AGE_SECS:
+            pass  # expired: continuity is unprovable, start over at 1
+        elif unit_elapsed_secs is not None and prior_ts < (now - unit_elapsed_secs):
+            log(
+                f"discarding fm liveness streak of {prior_count}: it predates the "
+                f"current {FUSED_MEMORY_UNIT} instance (up {unit_elapsed_secs:.0f}s)"
+            )
+        else:
+            count = prior_count + 1
     _write_fm_liveness_streak(count, verdict, now)
     return count
 
@@ -1348,13 +1380,19 @@ def fused_memory_liveness_pass() -> None:
         restart-fused-memory.sh nor touches FM_DEPLOY_CLOCK_PATH, so reviving
         a wedge can never silence the fm staleness deploy backstop.
 
-    RESIDUAL EDGE CASE, stated rather than hidden: an fm restart initiated
-    EXTERNALLY (the staleness redeploy, restart-fused-memory.sh, an operator)
-    mid-streak can leave a persisted entry describing a previous process
-    instance, so the surviving count may be attributed to the new one. The
-    120s startup grace covers the common case, FM_LIVENESS_STREAK_MAX_AGE_SECS
-    expires anything older, and the min-interval cap bounds the consequence to
-    at most one restart per window.
+    EXTERNAL RESTARTS mid-streak (the staleness redeploy,
+    restart-fused-memory.sh, an operator) leave a persisted entry describing a
+    process that no longer exists. Three defences, in order: the 120s startup
+    grace skips the ticks right after the restart, the INSTANCE-BOUNDARY
+    EXPIRY discards any entry predating the current instance's start (the
+    ``elapsed`` this pass already computes is threaded into
+    _record_fm_liveness_failure for exactly this), and
+    FM_LIVENESS_STREAK_MAX_AGE_SECS expires anything older still. The residual,
+    stated rather than hidden: when _unit_start_elapsed_secs cannot determine a
+    start time (returns None — no recorded PID, an unparseable property, a
+    systemctl failure) the instance boundary is unknown and only the grace
+    window plus the max-age expiry apply. The min-interval cap bounds that
+    consequence to at most one restart per window.
 
     Wrapped in a single try/except Exception (mirroring main()'s per-unit
     isolation) so a probe/verdict/persistence failure is logged and swallowed
@@ -1380,7 +1418,10 @@ def fused_memory_liveness_pass() -> None:
             # a kill.
             _clear_fm_liveness_streak()
             return
-        streak = _record_fm_liveness_failure(verdict)
+        # `elapsed` is threaded in so evidence recorded against a PREVIOUS
+        # fused-memory process cannot count toward killing its successor —
+        # see _record_fm_liveness_failure's INSTANCE-BOUNDARY EXPIRY.
+        streak = _record_fm_liveness_failure(verdict, elapsed)
         if streak < FM_LIVENESS_STREAK_THRESHOLD:
             log(
                 f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "

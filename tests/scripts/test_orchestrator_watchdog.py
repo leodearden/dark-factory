@@ -6853,6 +6853,118 @@ def test_record_fm_liveness_failure_increments_just_inside_max_age(
     assert wdog._record_fm_liveness_failure("wedged") == 3
 
 
+def test_record_fm_liveness_failure_discards_streak_predating_the_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Evidence recorded against a PREVIOUS fm process must not kill its successor.
+
+    Reachable with the shipped constants, not just in principle: wedged ticks
+    at T-120 and T-60 leave count=2 ts=T-60; an EXTERNAL restart lands at T;
+    the T+60 and T+120 ticks return early on STARTUP_GRACE_SECS=120 without
+    clearing anything; and the first post-grace tick at T+180 sees age=240s,
+    still inside FM_LIVENESS_STREAK_MAX_AGE_SECS=300, so the max-age window
+    alone would increment to 3 and kill an instance that has been up for
+    three minutes and is merely slow to serve /health during warm-up.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    restart_ts = 1783000000.0  # the external fm restart
+    now = restart_ts + 180.0  # first post-grace tick
+    streak_file.write_text(
+        json.dumps({"count": 2, "verdict": "wedged", "ts": restart_ts - 60.0})
+    )
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    # fm has been up 180s: the persisted ts (restart_ts - 60) predates that.
+    assert wdog._record_fm_liveness_failure("wedged", 180.0) == 1, (
+        "a streak predating the current instance must restart the count at 1"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 1
+    assert any("predates" in m for m in logged), (
+        f"discarding cross-instance evidence must leave journal evidence: {logged!r}"
+    )
+
+
+def test_record_fm_liveness_failure_keeps_streak_from_the_same_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """BOUNDARY: evidence recorded DURING the current instance still accumulates.
+
+    The instance-boundary check must not become a second, stricter max-age
+    that stops a genuinely wedged long-running fm from ever reaching N.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    now = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 2, "verdict": "wedged", "ts": now - 60.0}))
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    # fm has been up an hour — the 60s-old entry is comfortably inside it.
+    assert wdog._record_fm_liveness_failure("wedged", 3600.0) == 3
+
+
+def test_record_fm_liveness_failure_unknown_instance_age_still_accumulates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An unknown instance start (None) leaves the max-age expiry as the only gate.
+
+    _unit_start_elapsed_secs fails open to None (no recorded PID, unparseable
+    property, systemctl failure). That must not silently disable the streak —
+    the pass would then never restart a genuinely wedged fm. Documented as the
+    residual in fused_memory_liveness_pass's docstring.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    now = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 2, "verdict": "wedged", "ts": now - 60.0}))
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    assert wdog._record_fm_liveness_failure("wedged", None) == 3
+    assert wdog._record_fm_liveness_failure("wedged") == 4, (
+        "the instance argument must stay optional for existing callers"
+    )
+
+
+def test_liveness_pass_does_not_kill_on_evidence_from_a_prior_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """END-TO-END: a streak written before an fm restart cannot reach the threshold.
+
+    Replays the reachable sequence through the real pass: two pre-restart
+    wedged ticks, an external restart, then post-grace wedged ticks. The
+    surviving count must not be credited to the new instance, so the tick that
+    WOULD have been the third does not restart.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    streak_file = tmp_path / "streak.json"
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 4)
+    restart_ts = 1783000000.0
+    streak_file.write_text(
+        json.dumps({"count": 2, "verdict": "wedged", "ts": restart_ts - 60.0})
+    )
+    now = restart_ts + 180.0
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    # fm restarted 180s ago, so it is out of the 120s grace window but every
+    # persisted tick predates it.
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 180.0)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], (
+        f"cross-instance evidence must not reach the threshold; got {restarted}"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 1
+
+
 def test_record_fm_liveness_failure_write_error_fails_safe(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
