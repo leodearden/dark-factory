@@ -174,6 +174,98 @@ class TestLLMConfigProvider:
             LLMConfig(provider='cohere')  # type: ignore[arg-type]
 
 
+class TestLLMConfigClientClass:
+    """Tests for LLMConfig.client_class / structured_output_mode Literal validation.
+
+    Both knobs are restart-tier by omission (config/reload.py RELOADABLE_FIELDS
+    carries no ``llm.*`` leaf) and BOTH default to today's behaviour — the task's
+    binding acceptance condition is that the shipped config stays byte-identical.
+    """
+
+    def test_default_client_class_is_openai(self):
+        config = LLMConfig()
+        assert config.client_class == 'openai'
+
+    def test_valid_client_class_openai(self):
+        config = LLMConfig(client_class='openai')
+        assert config.client_class == 'openai'
+
+    def test_valid_client_class_openai_generic(self):
+        config = LLMConfig(client_class='openai_generic')
+        assert config.client_class == 'openai_generic'
+
+    def test_invalid_client_class_ollama_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            LLMConfig(client_class='ollama')  # type: ignore[arg-type]
+
+    def test_invalid_client_class_empty_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            LLMConfig(client_class='')  # type: ignore[arg-type]
+
+    def test_default_structured_output_mode_is_auto(self):
+        config = LLMConfig()
+        assert config.structured_output_mode == 'auto'
+
+    def test_valid_structured_output_mode_json_object(self):
+        config = LLMConfig(structured_output_mode='json_object')
+        assert config.structured_output_mode == 'json_object'
+
+    def test_invalid_structured_output_mode_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            LLMConfig(structured_output_mode='json_schema_strict')  # type: ignore[arg-type]
+
+    def test_shipped_config_yaml_does_not_opt_in(self, monkeypatch):
+        """The shipped deployment YAML must leave BOTH knobs at their defaults.
+
+        Byte-identical guard: uncommenting either knob in config.yaml would
+        change the constructed graphiti LLM client for every existing
+        deployment. The examples in that file are deliberately commented out.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.llm.client_class == 'openai', (
+            'fused-memory/config/config.yaml must leave llm.client_class at its '
+            "'openai' default — the openai_generic example must stay commented out."
+        )
+        assert cfg.llm.structured_output_mode == 'auto', (
+            'fused-memory/config/config.yaml must leave llm.structured_output_mode '
+            "at its 'auto' default — the json_object example must stay commented out."
+        )
+
+    def test_shipped_config_yaml_shares_one_openai_api_url_default(self, monkeypatch):
+        """llm and embedder provider blocks must resolve to the SAME api_url.
+
+        Both are ``${OPENAI_API_URL:https://api.openai.com/v1}`` today. Independent
+        LLM/embedder endpoints come from setting the two blocks to different
+        literals — but the shipped DEFAULT must stay shared, so a deployment that
+        sets only OPENAI_API_URL keeps pointing both at one endpoint.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+
+        # Unset so the ${...:default} branch is exercised deterministically,
+        # independent of the developer's environment.
+        monkeypatch.delenv('OPENAI_API_URL', raising=False)
+        cfg = FusedMemoryConfig()
+        assert cfg.llm.providers.openai is not None
+        assert cfg.embedder.providers.openai is not None
+        assert cfg.llm.providers.openai.api_url == 'https://api.openai.com/v1'
+        assert (
+            cfg.llm.providers.openai.api_url == cfg.embedder.providers.openai.api_url
+        ), 'llm and embedder api_url defaults must stay identical in config.yaml'
+
+        # And when it IS set, both blocks follow it together.
+        monkeypatch.setenv('OPENAI_API_URL', 'http://127.0.0.1:1234/v1')
+        cfg2 = FusedMemoryConfig()
+        assert cfg2.llm.providers.openai is not None
+        assert cfg2.embedder.providers.openai is not None
+        assert cfg2.llm.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
+        assert cfg2.embedder.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
+
+
 class TestEmbedderConfigProvider:
     """Tests for EmbedderConfig.provider Literal validation."""
 
