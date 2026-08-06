@@ -7318,3 +7318,158 @@ def test_liveness_pass_restart_does_not_touch_fm_deploy_clock(
     assert not deploy_clock.exists(), (
         "a liveness revive must leave fm's DEPLOY clock untouched (I5)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Part D: preserved invariants after the rewrite (task 3764, item 5)
+#
+# The gates and fail-directions this task must NOT change, re-asserted with
+# streak-file side-effect checks the pre-3764 tests could not make.
+# ---------------------------------------------------------------------------
+
+
+def test_liveness_pass_disabled_unit_creates_no_streak_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A DISABLED unit: no probe, no restart, and NO streak file is created.
+
+    Disabling is explicit operator intent. Recording it as accumulating failure
+    evidence would mean re-enabling the unit later starts from a poisoned
+    streak.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    probed: list[int] = []
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: probed.append(port) or True)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert probed == [], f"a disabled unit must not be probed; probed {probed}"
+    assert restarted == []
+    assert not streak_file.exists(), (
+        "operator intent must not be recorded as failure evidence"
+    )
+
+
+def test_liveness_pass_grace_window_leaves_streak_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Inside STARTUP_GRACE_SECS: no probe, no restart, streak file untouched.
+
+    The grace branch must return BEFORE any streak read or write — it neither
+    accumulates evidence (a unit that has not bound its port yet is not a
+    wedge) nor clears it (that would let a restart loop reset the evidence on
+    every cycle).
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    original = json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0})
+    streak_file.write_text(original)
+    probed: list[int] = []
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)
+    monkeypatch.setattr(wdog, "probe_port", lambda port: probed.append(port) or True)
+
+    wdog.fused_memory_liveness_pass()
+
+    assert probed == [], f"no probe inside the grace window; probed {probed}"
+    assert restarted == []
+    assert streak_file.read_text() == original, (
+        "the grace branch must neither write nor clear the streak file"
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "probe_port",
+        "_fused_memory_liveness_verdict",
+        "_read_fm_liveness_streak",
+        "_record_fm_liveness_failure",
+        "_clear_fm_liveness_streak",
+        "_within_fm_liveness_restart_min_interval",
+        "_stamp_fm_liveness_restart_clock",
+    ],
+)
+def test_liveness_pass_isolates_exception_from_any_internal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, target: str
+) -> None:
+    """An exception from ANY probe/verdict/persistence internal is swallowed.
+
+    Every new persistence call must sit inside the pass's existing
+    try/except Exception, exactly like the probe calls: a hiccup writing or
+    reading a JSON file must never crash the oneshot watchdog.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 1)
+    _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
+
+    def boom(*_a, **_k):  # noqa: ANN002, ANN003
+        raise RuntimeError(f"{target} exploded")
+
+    monkeypatch.setattr(wdog, target, boom)
+
+    # Must not raise.
+    wdog.fused_memory_liveness_pass()
+
+
+def test_cli_continues_past_a_liveness_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """WIRE-LEVEL: a liveness persistence hiccup must not stop the rest of the tick.
+
+    Extends the _cli ordering test: with the liveness pass's own internals
+    raising, staleness_pass() and fused_memory_staleness_pass() must still run,
+    so a corrupt streak file can never silently stall the fm deploy backstop.
+    """
+    wdog = _load_watchdog()
+    calls: list[str] = []
+    monkeypatch.setattr(wdog, "main", lambda: calls.append("main"))
+    monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+    monkeypatch.setattr(
+        wdog, "fused_memory_staleness_pass", lambda: calls.append("fm_staleness_pass")
+    )
+    _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
+
+    def boom(*_a, **_k):  # noqa: ANN002, ANN003
+        raise RuntimeError("streak persistence exploded")
+
+    monkeypatch.setattr(wdog, "_record_fm_liveness_failure", boom)
+
+    assert wdog._cli([]) == 0
+    assert calls == ["main", "staleness_pass", "fm_staleness_pass"], (
+        f"the tick must continue past a liveness persistence failure; got {calls}"
+    )
+
+
+def test_liveness_pass_http_error_is_healthy_and_never_restarts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """PRESERVED: a 503 (HTTPError) still means ALIVE — no streak, no restart.
+
+    probe_health()'s deliberately inverted fail-direction is NOT touched by
+    this task: fused-memory's /health returns 503 when a backing store is
+    degraded, but a 503 proves the asyncio event loop IS serving requests.
+    Restarting would not fix a down store, would flap the single instance all
+    orchestrators depend on, and would cancel in-flight reconciliation work.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    streak_file.write_text(json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0}))
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+
+    def fake_urlopen(*_a, **_k):  # noqa: ANN002, ANN003
+        raise wdog.urllib.error.HTTPError(
+            wdog.FUSED_MEMORY_HEALTH_URL, 503, "Service Unavailable", {}, None  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+
+    for _ in range(5):
+        wdog.fused_memory_liveness_pass()
+
+    assert restarted == [], f"a 503 must never lead to a restart; got {restarted}"
+    assert not streak_file.exists(), "a 503 is 'healthy' and must CLEAR the streak"
