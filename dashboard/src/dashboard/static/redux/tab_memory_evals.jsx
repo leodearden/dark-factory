@@ -4,12 +4,10 @@
    The JSX/React wiring here is verified via Python source-assertion tests in
    dashboard/tests/test_tab_memory_evals.py — no JSX runner exists (this file
    is transformed by CDN Babel at runtime and the repo has no node_modules).
-   The pure, JSX-free logic that used to live here — chartForKind, trendGaps,
-   dash, ageText, verdictBadge, unmatchedReasonText and the parity tables — was
-   moved to /static/redux/memory_evals_fmt.js (task 3481) precisely so it could
-   escape that limitation: it is now BEHAVIOURALLY tested by `node --test` in
-   dashboard/tests/js/memory_evals_fmt.test.mjs, which executes the verdict x
-   parity matrix instead of grepping for it.
+   The pure, JSX-free logic that used to live here was moved to
+   /static/redux/memory_evals_fmt.js (task 3481) so it could escape that
+   limitation; WHY, in full, is in that file's header, which is the one place
+   that account is kept.
 
    LOAD ORDER IS THE CONTRACT, in both directions.
 
@@ -51,17 +49,14 @@ const MEDF = window.DF_DATA;
 // "fixing" this.
 const { useState: MEuS } = React;
 
-// The pure, JSX-free helpers live in memory_evals_fmt.js (task 3481) so
-// `node --test` can EXECUTE their branching rather than this repo grepping
-// their source text; their behavioural suite is
-// dashboard/tests/js/memory_evals_fmt.test.mjs.  index.html loads that classic
-// script before this file, exactly as this file loads before tabs.jsx.
+// The pure, JSX-free helpers live in memory_evals_fmt.js (task 3481); their
+// behavioural suite is dashboard/tests/js/memory_evals_fmt.test.mjs.
+// index.html loads that classic script before this file, exactly as this file
+// loads before tabs.jsx.
 //
-// NOTE `chartForKind` returns a TAG ('step' | 'spark' | null), NOT a component:
-// it used to return MEStep/MESpark directly, and that dependency on
-// window.DF_CHARTS is precisely what pinned it inside this .jsx and out of
-// reach of any runner.  ME_CHART_BY_TAG below is the two-entry lookup that
-// turns the tag back into a primitive.
+// NOTE `chartForKind` returns a TAG ('step' | 'spark' | null), NOT a component
+// — see its comment in memory_evals_fmt.js.  ME_CHART_BY_TAG below is the
+// two-entry lookup that turns the tag back into a primitive.
 const {
   chartForKind,
   trendGaps,

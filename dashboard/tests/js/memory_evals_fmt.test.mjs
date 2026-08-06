@@ -5,35 +5,22 @@
 // surfaces this suite in CI via its `**/*.test.mjs` glob — no wrapper change
 // needed for this new file).
 //
-// WHY THIS FILE EXISTS (task 3481) — tab_memory_evals.jsx is JSX transformed by
-// CDN Babel at runtime and this repo has no node_modules, so node cannot parse
-// it and React cannot be rendered in any harness here. Six JSX-FREE helpers
-// nonetheless lived inside that .jsx — a verdict×parity badge matrix, an age
-// formatter, a null-vs-zero placeholder, a trend-hole counter, a chart-kind
-// vocabulary and an unmatched-reason branch — and the only reachable test for
-// them was a Python suite that read the .jsx AS TEXT and asserted regexes over
-// it. That idiom absorbed review cycles 3-6 of task 3216 and is structurally
-// weak in three ways this suite fixes:
-//
-//   1. It never EXECUTES the code. `verdictBadge` composes a base label with a
-//      parity suffix across the 7 verdict inputs that produce a distinct base
-//      (the 4 in-vocabulary verdicts, absent-as-null, absent-as-undefined, and
-//      a present-but-unreadable one) × 13 parity states = 91 combinations; a
-//      regex can see that a `+ ' · ' +` exists, never that the right string
-//      comes out of the right pair.
-//   2. A regex that matches NOTHING passes silently. Two regexes in that file
-//      were in fact found matching nothing at all (hence the `assert body` /
-//      "would pass vacuously" guards littered through it).
-//   3. Vocabulary assertions drifted from a hand-pinned COPY of the parity
-//      table rather than the real one — tab_memory_evals.jsx records that "a
-//      hand-picked three-member copy DID live in that test, and went blind to
-//      six states". This suite drives its matrix off the module's EXPORTED
-//      tables, so a state the producer adds is covered the moment it lands.
+// WHY THIS SUITE EXISTS: see the header of memory_evals_fmt.js (task 3481).
+// That is the CANONICAL account — why these helpers were unreachable while
+// they lived inside a Babel-transformed .jsx, and the three structural
+// weaknesses of the source-as-text Python suite that was the only alternative.
+// It is deliberately not restated here: four independently-maintained copies
+// of one explanation drift, and the alarm-derivation guard in
+// test_tab_memory_evals.py scans comments, so that prose is load-bearing for
+// CI too. The short version is that these assertions EXECUTE the branching
+// (91 verdict × parity combinations, not a grep for `+ ' · ' +`), and both
+// badge vocabularies are driven off the module's EXPORTED tables rather than
+// a copy pinned here.
 //
 // What stays in Python is exactly what node cannot do: cross-language
-// completeness against the PYTHON frozenset `memory_evals.PARITY_STATES`, the
-// PRD-section-8 G6/INV-5 source guard, index.html load order, and JSX/React
-// render wiring.
+// completeness against the PYTHON frozensets `memory_evals.PARITY_STATES` and
+// `memory_evals._KNOWN_VERDICTS`, the PRD-section-8 G6/INV-5 source guard,
+// index.html load order, and JSX/React render wiring.
 //
 // memory_evals_fmt.js has no package.json in the repo, so it resolves as
 // CommonJS (`module.exports = <object>`). Node's cjs-module-lexer cannot
@@ -75,21 +62,21 @@ const EXPECTED_FUNCTION_NAMES = [
   'verdictBadge',
 ];
 // BOTH badge vocabularies — parity AND verdict — are exported as data so this
-// suite can drive its verdict×parity matrix off the REAL vocabulary the module
-// ships, rather than a copy pinned here. memory_evals_fmt.js records why that
-// matters on each table: a hand-picked three-member parity copy once went blind
-// to six states, and the verdict list existed in three places of which only the
-// producer's was authoritative. A state added to either table is covered the
-// moment it lands.
+// suite can drive its matrix off the REAL vocabulary the module ships rather
+// than a copy pinned here. Each table's own comment in memory_evals_fmt.js
+// records what a copy cost last time.
 const EXPECTED_DATA_NAMES = ['PARITY_PLAIN', 'PARITY_REFINEMENT', 'VERDICT_BASES'];
 
 function expectedSurface() {
   return EXPECTED_FUNCTION_NAMES.concat(EXPECTED_DATA_NAMES).slice().sort();
 }
 
-// The em-dash placeholder, spelled by codepoint so a copy-paste of a hyphen or
-// an en-dash into either file fails here rather than rendering as a near-miss.
-const EM_DASH = '—';
+// The em-dash placeholder, spelled as the ESCAPE to match the module. The two
+// spellings are indistinguishable at runtime (assert.equal compares exact
+// strings either way); the escape is used because a raw em-dash sitting next
+// to a hyphen or an en-dash is a near-miss no diff review reliably catches,
+// and dash()/ageText() returned the escape form before task 3481 moved them.
+const EM_DASH = '\u2014';
 
 // ---------------------------------------------------------------------------
 // Module surface and dual export

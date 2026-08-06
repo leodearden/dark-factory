@@ -48,7 +48,7 @@
 // Missing scalars render an em-dash, never `|| 0`: a synthetic zero reads as a
 // measured zero.  Same placeholder the Memory tab already uses (tabs.jsx:589).
 function dash(v) {
-  if (v === null || v === undefined) return '—';
+  if (v === null || v === undefined) return '\u2014';
   return v;
 }
 
@@ -56,7 +56,7 @@ function dash(v) {
 // THRESHOLD lives server-side and is deliberately absent from the payload, so
 // nothing here can re-derive `stale`.
 function ageText(seconds) {
-  if (seconds === null || seconds === undefined) return '—';
+  if (seconds === null || seconds === undefined) return '\u2014';
   const h = seconds / 3600;
   if (h < 1) return `${Math.round(seconds / 60)}m ago`;
   if (h < 48) return `${Math.round(h)}h ago`;

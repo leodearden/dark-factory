@@ -95,22 +95,19 @@ def tab_memory_evals_jsx_code(tab_memory_evals_jsx_body):
 def memory_evals_fmt_js_body(_client):
     """`memory_evals_fmt.js` — the plain-JS module holding the pure helpers.
 
-    Task 3481 moved chartForKind/trendGaps/dash/ageText/verdictBadge/
-    unmatchedReasonText and the two parity tables out of the .jsx and into a
-    classic script node can actually EXECUTE
-    (dashboard/tests/js/memory_evals_fmt.test.mjs).  The assertions that
-    remain in this file are the ones node cannot make: cross-language
-    completeness against the producer's Python frozenset, and the
-    source-level G6/INV-5 exclusion.  Both must follow the code they are
-    about, so they read this fixture rather than the .jsx.
+    Task 3481 moved the six helpers and both parity tables out of the .jsx and
+    into a classic script node can actually EXECUTE
+    (dashboard/tests/js/memory_evals_fmt.test.mjs); WHY is recorded once, in
+    that module's own header.  What matters HERE is only that the assertions
+    node cannot make — cross-language completeness against the producer's
+    Python frozensets, and the source-level G6/INV-5 exclusion — must follow
+    the code they are about, so they read this fixture rather than the .jsx.
 
     Served by the same static mount as the .jsx — that is how runtime_format.js
     and spark_path.js are already loaded.
 
     Every consumer reads the comment-stripped `memory_evals_fmt_js_code`
-    derivative below rather than this raw text: roughly three quarters of this
-    file is explanatory prose ABOUT verdicts, limits, alarms and thresholds, so
-    a raw-text scan for any of that vocabulary is answered by a comment.
+    derivative below rather than this raw text.
     """
     return _client.get('/static/redux/memory_evals_fmt.js').text
 
