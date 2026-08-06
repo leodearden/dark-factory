@@ -317,9 +317,27 @@ class DbPool:
         inflight = dict(self._inflight)
         if not inflight:
             return
-        done, _still_pending = await asyncio.wait(
+        done, still_pending = await asyncio.wait(
             set(inflight), timeout=_INFLIGHT_DRAIN_TIMEOUT
         )
+        if still_pending:
+            # The budget is the fail-soft; this WARNING is what stops it being a
+            # SILENT one.  Nothing downstream can recover these paths, so name
+            # them (INV-2, structured-facts-at-failure).
+            logger.warning(
+                'DbPool.close_all: %d in-flight connect(s) did not land within '
+                '%.1fs; their aiosqlite worker threads may outlive this event '
+                'loop: %s',
+                len(still_pending),
+                _INFLIGHT_DRAIN_TIMEOUT,
+                ', '.join(sorted(str(inflight[t]) for t in still_pending)),
+            )
+        # Deliberately NOT cancelled.  Cancelling an in-flight aiosqlite connect
+        # re-creates the exact orphan this drain exists to prevent: the worker
+        # thread is already started, and a cancel just abandons the half-built
+        # Connection by a different route.  The _adopt_or_close callback from
+        # get() stays attached instead, so a late arrival is still closed if the
+        # loop is still alive.  Do NOT "tidy" this by cancelling still_pending.
         for task in done:
             if task.cancelled() or task.exception() is not None:
                 # A connect that raised already stopped its own worker thread
