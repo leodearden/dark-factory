@@ -368,22 +368,31 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
 # `done_provenance` kinds, so the kind="found_on_main" site just references it
 # by name instead of repeating ~1.1 kB of prose a second time. Kept factual
 # rather than aspirational: `_validate_done_provenance` rev-parses BEFORE it
-# merge-bases. Task 3455 made the merge-base failure wording honest --
-# `_verify_commit_on_main` now returns a (confirmed_off_main, detail) pair
-# and the caller emits one of two distinct prefixes depending on it, rather
-# than reporting every failure mode under a single "is not on main" prefix.
+# merge-bases. Task 3455 made BOTH probes' failure wording honest --
+# `_resolve_commit_sha` and `_verify_commit_on_main` each return a
+# (confirmed, detail) NamedTuple, and the caller emits one of two distinct
+# prefixes per probe depending on it, rather than reporting every failure
+# mode (timeout, missing binary, unexpected error) under the single
+# assertive "not found" / "is not on main" wording. So the prefix is now
+# the verdict at BOTH steps and this note can describe it as such.
 SERVER_BACKSTOP_NOTE = """\
 The server runs the same checks as a backstop, in this order:
 
-1. `git rev-parse --verify <commit>^{commit}` resolves the SHA first. An
-   unresolvable or mistyped SHA is rejected HERE, before merge-base ever runs,
-   with `commit <x> not found in <project_root>: ...`. That message is the
-   server's rc=128 analogue -- fetch and re-run; do not re-derive the SHA on
-   the strength of this message alone.
+1. `git rev-parse --verify <commit>^{commit}` resolves the SHA first, so an
+   unresolvable or mistyped SHA is rejected HERE, before merge-base ever runs.
+   Failure is reported under one of two distinct prefixes:
+     - `commit <x> not found in <project_root>: <detail>` -> rev-parse ran and
+       rejected the ref against this checkout. This is the server's rc=128
+       analogue: usually a stale/unfetched <project_root> or a mistyped SHA,
+       so `git -C <project_root> fetch --all` and re-run before re-deriving.
+     - `commit <x> could not be resolved in <project_root>: <detail>` ->
+       rev-parse never rendered a verdict on the ref (5s timeout, missing git
+       binary, unexpected error). NOT-YET-CONFIRMED, not a bad SHA: fix the
+       checkout and retry.
 2. `git merge-base --is-ancestor <sha> main` runs only if step 1 resolved. rc=0
-   accepts. Failure is reported under one of two distinct prefixes, so the
-   prefix itself is now the verdict -- no need to interpret the trailing
-   detail to tell them apart:
+   accepts. Failure is likewise reported under one of two distinct prefixes,
+   so the prefix itself is the verdict at both steps -- no need to interpret
+   the trailing detail to tell them apart:
      - `kind=<k> but commit <sha> is not on main: commit is not an ancestor of
        main.` -> rc=1. Git affirmatively determined the SHA is off main;
        re-derive the landing commit.
