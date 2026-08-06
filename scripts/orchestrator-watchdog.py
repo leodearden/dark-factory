@@ -1260,15 +1260,53 @@ def fused_memory_liveness_pass() -> None:
     from main(), and _fused_memory_liveness_verdict() (B2) for the combined
     port+/health verdict.
 
-    Both 'port-down' and 'wedged' trigger a restart via restart_unit() called
-    DIRECTLY — uncapped, with no fleet-deploy clock and no delegation to
-    restart-all-orchestrators.sh (I5: brokenness is not a scheduled deploy),
-    exactly like main()'s wedged-orchestrator revive path.
+    THE KILL DECISION IS BOUNDED IN TIME (task 3764). A restart requires
+    FM_LIVENESS_STREAK_THRESHOLD CONSECUTIVE non-healthy verdicts — 'port-down'
+    and 'wedged' both count, streaked on the same counter — and a 'healthy'
+    verdict clears the streak outright. The count is PERSISTED in
+    FM_LIVENESS_STREAK_PATH because this is a ``Type=oneshot`` unit on a 60s
+    timer: the process exits between probes, so an in-memory counter could
+    never accumulate. Independently, restart_unit() is capped to at most one
+    liveness revive per FM_LIVENESS_RESTART_MIN_INTERVAL_SECS via its OWN clock
+    (FM_LIVENESS_RESTART_CLOCK_PATH). The two layers are complementary: the
+    streak makes a wrong verdict RARE, the cap makes a wrong verdict HARMLESS.
+
+    EVIDENCE. The pass previously restarted on a SINGLE non-healthy verdict,
+    uncapped. A controlled experiment (2026-08-06 07:14-09:14Z, kill path
+    disconnected) recorded six /health stalls >=8s, four >15s, three past a 25s
+    probe cap — every one SELF-RECOVERED, with 0 restarts and 0 interrupted
+    runs needed across 20 cycles. N=3 at the 60s cadence demands ~180s of
+    CONTINUOUS non-response, ~7x the longest observed transient, while a
+    genuinely wedged asyncio loop (wedged by definition) still reaches it on
+    the third tick.
+
+    DELIBERATELY UNCHANGED:
+      - probe_health()'s inverted fail-direction — an HTTP response INCLUDING
+        a 503 means alive, since a degraded backing store is not something a
+        restart fixes;
+      - _fused_memory_liveness_verdict()'s port-probe short-circuit, so a
+        fully-dead unit is still classified without waiting on the up-to-15s
+        /health fetch;
+      - the is_unit_enabled and STARTUP_GRACE_SECS gates above, which still
+        return before any streak read or write (operator intent and a
+        not-yet-bound port are neither failure evidence nor recovery);
+      - I5: this pass calls restart_unit() DIRECTLY and never delegates to
+        restart-fused-memory.sh nor touches FM_DEPLOY_CLOCK_PATH, so reviving
+        a wedge can never silence the fm staleness deploy backstop.
+
+    RESIDUAL EDGE CASE, stated rather than hidden: an fm restart initiated
+    EXTERNALLY (the staleness redeploy, restart-fused-memory.sh, an operator)
+    mid-streak can leave a persisted entry describing a previous process
+    instance, so the surviving count may be attributed to the new one. The
+    120s startup grace covers the common case, FM_LIVENESS_STREAK_MAX_AGE_SECS
+    expires anything older, and the min-interval cap bounds the consequence to
+    at most one restart per window.
 
     Wrapped in a single try/except Exception (mirroring main()'s per-unit
-    isolation) so a probe/verdict failure is logged and swallowed rather than
-    raising — a hiccup here must never crash the oneshot watchdog or prevent
-    staleness_pass() from running afterward.
+    isolation) so a probe/verdict/persistence failure is logged and swallowed
+    rather than raising — a hiccup here must never crash the oneshot watchdog
+    or prevent staleness_pass() / fused_memory_staleness_pass() from running
+    afterward.
     """
     try:
         if not is_unit_enabled(FUSED_MEMORY_UNIT):
