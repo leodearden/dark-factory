@@ -860,6 +860,23 @@ test('axisY: reproduces the legacy padded y expression on hole-free input', () =
   }
 });
 
+test('axisY: a degenerate value axis yields null, never ±Infinity or NaN', () => {
+  // `range` is the divisor and the only part of geom derived from DATA. A zero
+  // range divides by zero (±Infinity), a NaN range poisons the result — either
+  // one lands verbatim in an SVG coordinate. A caller that cannot be told "no
+  // pixel here" would draw the mark off-canvas or blank the whole path, which
+  // is the failure this module exists to remove; so a broken axis is answered
+  // the same way a broken sample is.
+  for (const range of [0, NaN, Infinity, -Infinity, undefined, null]) {
+    const y = axisY(1, { y0: 8, height: 190, min: 0, range });
+    assert.equal(y, null, `range=${String(range)} must not produce a plotted y (got ${y})`);
+  }
+
+  // A real 0 sample against a real axis is still plotted — the guard must not
+  // swallow the measured-zero case it sits next to.
+  assert.equal(axisY(0, AXIS_GEOM), 198);
+});
+
 test('axisY: honours a non-zero min', () => {
   // Not used by charts.jsx today (LineChart hard-codes minV = 0 and that is
   // deliberately preserved), but the parameter is part of the contract and a
@@ -1055,6 +1072,41 @@ test('barFractions: undefined and NaN yield null, and no entry is ever NaN', () 
   for (const f of fractions) {
     assert.ok(f === null || Number.isFinite(f), `every entry must be null or finite — got ${f}`);
   }
+});
+
+test('barFractions: a degenerate max yields all nulls, never Infinity or NaN', () => {
+  // The samples were always guarded; the DENOMINATOR was not. HistBar reaches
+  // this directly — `maxOverride ?? plottableMax(values, 1)` falls back only on
+  // null/undefined, so a `maxOverride={0}` (a natural empty-histogram guard)
+  // arrives here as a real zero and used to produce `height: 'Infinity%'`, and
+  // a NaN override `height: 'NaN%'`.
+  for (const max of [0, NaN, Infinity, -Infinity, undefined, null, '4']) {
+    const { fractions } = barFractions([1, 2], max);
+
+    assert.deepEqual(
+      fractions,
+      [null, null],
+      `max=${String(max)} is not an axis — every bar is unknowable, not zero-height`,
+    );
+  }
+
+  // The property the test above only claimed: with the denominator guarded, no
+  // entry can be non-finite for ANY (values, max) pair, not just a good one.
+  for (const max of [0, NaN, Infinity, undefined, null, 4]) {
+    for (const f of barFractions([1, null, 0, undefined, NaN, 2], max).fractions) {
+      assert.ok(f === null || Number.isFinite(f), `entry must be null or finite — got ${f}`);
+    }
+  }
+});
+
+test('barFractions: a degenerate max still preserves length and index alignment', () => {
+  // All-null is the right answer, but it must be an all-null of the SAME shape:
+  // the caller positions each slot by index and keeps the category label even
+  // where it draws no bar.
+  const values = [1, null, 3, 4];
+
+  assert.deepEqual(barFractions(values, 0).fractions, [null, null, null, null]);
+  assert.equal(barFractions(values, NaN).fractions.length, values.length);
 });
 
 test('barFractions: plain fractions are exact on divisible input', () => {

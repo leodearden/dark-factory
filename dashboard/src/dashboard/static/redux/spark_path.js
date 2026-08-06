@@ -297,8 +297,22 @@ function plottableMax(values, seed) {
 // so a MISSING measurement was plotted as a real point at the bottom of the
 // chart. Handing the caller a null instead forces the decision — draw nothing
 // here — to be made explicitly.
+//
+// A DEGENERATE AXIS IS A HOLE TOO. `range` is the divisor, and it is the one
+// piece of `geom` derived from DATA rather than from the caller's layout
+// constants: `range === 0` maps every value to ±Infinity and a NaN range maps
+// every value to NaN. Either lands verbatim in an SVG coordinate or a CSS
+// length — exactly the failure class this module exists to remove, so it gets
+// the same answer (there is no pixel here) rather than a fabricated one.
+// Unreachable from charts.jsx today, where both callers derive range from a
+// plottableMax seeded with 1 and so always have range >= 1; guarded anyway
+// because this is a public builder that outlives its first two callers.
+// `y0`/`height`/`min` are the caller's own frame constants and are deliberately
+// NOT re-validated per call — passing a non-finite one is a caller bug about
+// layout, not a statement about a measurement.
 function axisY(value, geom) {
   if (!isPlottable(value)) return null;
+  if (!isPlottable(geom.range) || geom.range === 0) return null;
   return geom.y0 + geom.height - ((value - geom.min) / geom.range) * geom.height;
 }
 
@@ -370,9 +384,19 @@ function axisPaths(values, geom) {
 //
 // `max` is an explicit argument rather than folded here so HistBar's
 // `maxOverride ?? plottableMax(...)` precedence survives unchanged and both
-// paths run the same arithmetic.
+// paths run the same arithmetic. Because it is an ARGUMENT it is also the one
+// input a caller can get wrong, so it is guarded on the same terms as the
+// samples: a non-finite or ZERO max is not an axis, and every bar becomes
+// unknowable rather than zero-height. Unguarded, `max = 0` gave
+// `height: 'Infinity%'` and `max = NaN` gave `height: 'NaN%'` — HistBar reaches
+// this directly, since its `maxOverride ?? plottableMax(...)` falls back only
+// on null/undefined and passes a `maxOverride={0}` (a natural empty-histogram
+// guard) straight through.
 function barFractions(values, max) {
-  return { fractions: (values || []).map(v => (isPlottable(v) ? v / max : null)) };
+  const usableMax = isPlottable(max) && max !== 0;
+  return {
+    fractions: (values || []).map(v => (usableMax && isPlottable(v) ? v / max : null)),
+  };
 }
 
 // ── Stacked band builder (charts.jsx's `StackedAreaChart`) ─────────────────
