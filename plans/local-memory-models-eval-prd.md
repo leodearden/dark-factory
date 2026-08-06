@@ -11,7 +11,9 @@ not counted as G1 consumers of anything here.
 > the nominal 19–20GB this PRD was authored against. See D10.
 >
 > Applied corrections (2026-08-06, task 3748):
-> - Task 3720 (LME-η, pending) — **correction**: VRAM-budget bullet + MoE-sizing sentence updated.
+> - Task 3720 (LME-η, pending) — **correction**: VRAM-budget bullet updated to the measured figure;
+>   MoE-sizing sentence updated twice — first to record the sizing question the correction opened,
+>   then (once α step 22 ruled) to the pinned Gemma QAT arm at 13.27 GiB. See Open Q3.
 > - Task 3721 (LME-θ, pending) — **insertion**: no VRAM figure existed; one bullet added.
 > - Task 3713 (LME-α, in-progress) — its task **record** is deliberately not edited; its **code** no
 >   longer needs editing. Both claims below are pinned to `task/3713` @ `b3745f5a5c`
