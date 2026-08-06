@@ -13,8 +13,18 @@ not counted as G1 consumers of anything here.
 > Applied corrections (2026-08-06, task 3748):
 > - Task 3720 (LME-η, pending) — **correction**: VRAM-budget bullet + MoE-sizing sentence updated.
 > - Task 3721 (LME-θ, pending) — **insertion**: no VRAM figure existed; one bullet added.
-> - Task 3713 (LME-α, in-progress) — deliberately **not edited**: it is running, and its own
->   `lms_vram.py` already implements the corrected ~16.4 GiB budget as a live measurement.
+> - Task 3713 (LME-α, in-progress) — deliberately **not edited**; the earlier claim here was false
+>   and is corrected now: `arm_fits` gates each arm against measured free VRAM (~16.37 GiB)
+>   correctly, but the verdict actually applied (`evaluate_budget`, called from
+>   `lms_healthcheck.py:755`) defaults to `NOMINAL_CEILING_GIB = 19.5` (`lms_vram.py:49,319`)
+>   against **total** card usage — so the enforced threshold is still 19.5, not 16.4, and 3713's own
+>   `description`/`metadata.user_observable_signal` still read "19–20GB" too (known, not silent).
+>   Not edited because 3713 is in-progress/live-claimed and the fix is a verdict-**subject**
+>   correction its own README defers to a reviewer, not a number swap — owner is
+>   `scripts/local-model-serving/README.md` §`OPEN: the budget verdict's subject is miscalibrated
+>   (blocks step 23)` on `task/3713`; landing it also updates 3713's description/signal. Until then
+>   `lms_healthcheck` exits 3 for the LLM arms — hold α's review against this PRD's figure, not the
+>   healthcheck's current PASS.
 
 ## Goal
 
