@@ -909,3 +909,118 @@ class TestOpenDebt:
         assert client.submit_calls == []
         assert row is not None
         assert row.owner_task_id is None
+
+
+@pytest.mark.asyncio
+class TestResolveDebt:
+    """``resolve_debt`` closes the current cycle.  ASYNC-ONLY CLASS."""
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    LATER = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    LATEST = datetime(2026, 8, 6, 14, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+
+    async def test_stamps_resolved_at_and_the_resolving_commit(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        assert (
+            await resolve_debt(
+                db_path,
+                'dark_factory',
+                self.TEST_ID,
+                resolving_commit='deadbee',
+                now=self.LATER,
+            )
+            is None
+        )
+
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['resolved_at'] == self.LATER.isoformat()
+        assert raw['prior_resolving_commit'] == 'deadbee'
+        # The cycle's own clock is untouched — resolution ends a cycle, it does not
+        # start one.
+        assert raw['opened_at'] == self.NOW.isoformat()
+        assert raw['open_count'] == 1
+
+    async def test_the_resolved_row_is_retained(self, tmp_path: Path) -> None:
+        """§5.2: resolved rows are kept DELIBERATELY because η's recurrence trigger
+        reads them.  Deleting one here would silently disarm class 2(a)."""
+        from orchestrator.flake_ledger import open_debt, read_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        await resolve_debt(
+            db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=self.LATER
+        )
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_debt')[0]['n'] == 1
+        row = read_debt(db_path, self.TEST_ID)
+        assert row is not None
+        assert row.resolved_at == self.LATER.isoformat()
+
+    async def test_resolution_removes_the_row_from_the_open_set(self, tmp_path: Path) -> None:
+        """Resolution's observable effect: it disappears from ``list_open_debt`` while
+        ``read_debt`` still finds it."""
+        from orchestrator.flake_ledger import list_open_debt, open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        assert [r.test_id for r in list_open_debt(db_path)] == [self.TEST_ID]
+
+        await resolve_debt(
+            db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=self.LATER
+        )
+        assert list_open_debt(db_path) == []
+
+    async def test_list_open_debt_is_deterministically_ordered(self, tmp_path: Path) -> None:
+        """ι prints this list, so its order is a contract."""
+        from orchestrator.flake_ledger import list_open_debt, open_debt
+
+        db_path = tmp_path / 'runs.db'
+        # Opened out of order; two share an opened_at so the test_id tiebreak shows.
+        await open_debt(db_path, 'dark_factory', 'c::t', now=self.LATER)
+        await open_debt(db_path, 'dark_factory', 'b::t', now=self.NOW)
+        await open_debt(db_path, 'dark_factory', 'a::t', now=self.NOW)
+
+        assert [r.test_id for r in list_open_debt(db_path)] == ['a::t', 'b::t', 'c::t']
+
+    async def test_list_open_debt_on_a_missing_db_is_empty(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import list_open_debt
+
+        assert list_open_debt(tmp_path / 'absent' / 'runs.db') == []
+
+    async def test_resolving_an_unknown_test_is_a_safe_no_op(self, tmp_path: Path) -> None:
+        """A zero-rowcount UPDATE is legitimate, not an error: ζ's caller may resolve a
+        test whose debt was never opened."""
+        from orchestrator.flake_ledger import list_open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        assert (
+            await resolve_debt(
+                db_path, 'dark_factory', 'never-seen', resolving_commit='deadbee', now=self.NOW
+            )
+            is None
+        )
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_debt')[0]['n'] == 0
+        assert list_open_debt(db_path) == []
+
+    async def test_resolving_twice_is_idempotent(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        await resolve_debt(
+            db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=self.LATER
+        )
+        await resolve_debt(
+            db_path, 'dark_factory', self.TEST_ID, resolving_commit='c0ffee', now=self.LATEST
+        )
+
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['resolved_at'] == self.LATEST.isoformat()
+        assert raw['prior_resolving_commit'] == 'c0ffee'
+        # Resolving does not re-enter: only `open_debt` opens a cycle.
+        assert raw['open_count'] == 1
