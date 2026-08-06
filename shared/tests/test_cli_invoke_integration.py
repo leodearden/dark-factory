@@ -8,8 +8,11 @@ TestCrossAccountResume takes ~6 min of wall clock and costs real money.
 **Aiming the cross-account measurement (task 3484).** By default the pair is the
 first two available tokens in ``B,C,D,E,F,G`` order — but the accounts that are
 UNCAPPED at any given moment are not the first two, and hard-coding them is why
-this measurement has twice produced 0 valid runs (2026-08-01, task 3454; again
-2026-08-05).  Two env vars, both read via ``_cross_account_evidence``:
+this measurement twice produced 0 valid runs (2026-08-01, task 3454; again on
+2026-08-05 during the day).  Aiming the pair at ``F,C`` is what made the
+2026-08-05T20:04Z round land its 3 valid runs and settle the question
+(``plans/cross-account-resume-measurement.md``).  Two env vars, both read via
+``_cross_account_evidence``:
 
 - ``CROSS_ACCOUNT_RESUME_TOKENS='F,C'`` — measure on those accounts, in that
   order (first starts the session, second issues the ``--resume``).  Bare letters
@@ -263,20 +266,27 @@ class TestCrossAccountResume:
 
     @_need_two_accounts
     async def test_session_resume_preserves_context_across_accounts(self):
-        """Probe: does a resume issued on account B recall context started on A?
+        """A resume issued on account B recalls context started on account A.
 
-        The name of the thing being probed is deliberately a QUESTION, not a
-        claim.  As of 2026-08-01 (claude CLI 2.1.220, task 3454) this has NOT
-        been answered: 4 of the 5 accounts in env were capped, and the probe
-        needs two simultaneously-uncapped accounts, so there were 0 valid runs.
-        What IS established is that the transcript-reachability explanation is
-        ruled out — the r1 transcript was on disk both times, and a resume on a
-        different account appended to that same local file — so a failure here
-        would NOT be explained by an unreachable session.  Full measurement:
+        ANSWERED — this is now a REGRESSION GUARD, not an open probe.  MEASURED
+        2026-08-05T20:04-20:05Z (claude CLI 2.1.222, task 3484) on
+        ``CLAUDE_OAUTH_TOKEN_F`` -> ``CLAUDE_OAUTH_TOKEN_C``: 3 valid runs, 0
+        void, across 3 distinct r1 sessions, every one with the transcript
+        present after r1 (11 records), r2 succeeding ON THE OTHER ACCOUNT with
+        output "ZEPPELIN", and the same-account control passing in the same
+        pytest process.  The earlier 2026-08-01 round (CLI 2.1.220, task 3454)
+        got 0 valid runs: its one cross-account attempt was VOID on a capped
+        account, not negative.  Verbatim per-run evidence:
+        ``plans/cross-account-resume-measurement.md``; the verdict in code is
         the comment above the cap-hit resume branch in ``shared.cli_invoke``.
 
-        The ZEPPELIN assertion is retained deliberately and must not be weakened:
-        it is the only signal that would distinguish outcome (a) from (b).
+        The ZEPPELIN assertion must NOT be weakened.  Context survives because
+        the resume replays r1's own local transcript — observed appending
+        11 -> 19 records across the account switch — which is a property of the
+        CURRENT CLI mechanism, not a promise from the API.  A red run here means
+        either that mechanism changed under a CLI upgrade, or the resume lost
+        transcript reachability; both deserve investigation, not a relaxed
+        assertion.
 
         READING A RED RUN.  A capped account now SKIPS: the guard is
         ``_capacity_skip.result_looks_like_capacity_failure``, pinned (task

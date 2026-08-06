@@ -1400,7 +1400,9 @@ async def invoke_with_cap_retry(
                             logger.warning('Failed to save cap_hit event', exc_info=True)
 
                     # ------------------------------------------------------------------
-                    # MEASURED 2026-08-01, claude CLI 2.1.220 (task 3454).
+                    # MEASURED 2026-08-01 (task 3454, claude CLI 2.1.220), and
+                    # RE-MEASURED to a verdict 2026-08-05 (task 3484, CLI
+                    # 2.1.222).
                     #
                     # MECHANISM (confirmed empirically, and it reframes the
                     # question).  Claude CLI sessions are LOCAL JSONL transcripts
@@ -1424,45 +1426,66 @@ async def invoke_with_cap_retry(
                     # attempt.  The guard below ENFORCES that invariant instead of
                     # assuming it.
                     #
-                    # RUNS.  Same-account control (CLAUDE_OAUTH_TOKEN_B, 1 run):
-                    #   r1 sid=8e4d1819-db90-4b69-8f42-f8ef09facd52,
-                    #   transcript present after r1 (12 records), r2 recalled the
-                    #   codeword.  PASS — the harness itself is sound.
-                    # Cross-account (A=CLAUDE_OAUTH_TOKEN_B, B=CLAUDE_OAUTH_TOKEN_C,
-                    # 1 attempt): r1 sid=eeec059e-be5d-413d-bae7-15274dd758c3,
-                    #   transcript PRESENT after r1 (12 records); r2 did NOT recall
-                    #   the codeword — but r2's transcript turn is literally
-                    #   "You've hit your weekly limit · resets Aug 5, 11am", i.e.
-                    #   account B was CAPPED and no model turn ever ran.  That
-                    #   attempt is VOID for the context question.
+                    # VERDICT (2026-08-05, task 3484): a cross-account resume
+                    # DOES PRESERVE conversation context.  Measured
+                    # 20:04:11–20:05:15Z on claude CLI 2.1.222 with accounts
+                    # CLAUDE_OAUTH_TOKEN_F (r1 — starts the session) ->
+                    # CLAUDE_OAUTH_TOKEN_C (r2 — issues the --resume), both
+                    # probed healthy 6 minutes earlier.  3 valid runs, 0 void,
+                    # 3 distinct r1 sessions:
+                    #   6a259899-315b-4cd3-94cd-8448c982daaf
+                    #   75f9c167-7e91-4743-995e-5d943fac2326
+                    #   362bb71e-0489-4f61-b930-0cf772982d04
+                    # In every one: transcript present after r1 (11 records);
+                    # r2 succeeded on the OTHER account (subtype='success',
+                    # empty stderr) and answered "ZEPPELIN" — the codeword
+                    # planted in r1; and the same-account control PASSED in the
+                    # same pytest process, so the harness was sound while the
+                    # cross-account result was taken.  The transcripts confirm
+                    # the mechanism above carried it: r2 appended to r1's own
+                    # local file (11 -> 19 records), r2's turn and its answer
+                    # among the appended records.
+                    # Full record, with the verbatim per-run evidence and the
+                    # pre-1 gate: plans/cross-account-resume-measurement.md.
                     #
-                    # VERDICT: INCONCLUSIVE between (a) preserved and (b)
-                    # account-scoped rejection — but the transcript-ABSENT
-                    # explanation is definitively RULED OUT (it was present both
-                    # times), and the single cross-account observation is fully
-                    # explained by a capped account, so it is NOT evidence for (b).
-                    # 0 valid cross-account runs: at measurement time 4 of the 5
-                    # accounts in env were capped (weekly limits resetting Aug 5 /
-                    # Aug 6, one session limit) and a cross-account resume needs
-                    # two healthy accounts.
+                    # CONSEQUENCE: the resume below is doing what it intends,
+                    # and the reachability guard that follows is load-bearing
+                    # for the OTHER failure mode — a transcript that is GONE,
+                    # not an account that changed.
                     #
-                    # WHAT WOULD SETTLE IT: re-run
+                    # SCOPE of the claim: this is a property of the CURRENT
+                    # mechanism (local transcript + --resume) on CLI 2.1.222,
+                    # not a guarantee from the API.  If a future CLI moves
+                    # sessions server-side and scopes them per account, the
+                    # answer can change with it.  The regression guard is
                     # tests/test_cli_invoke_integration.py::TestCrossAccountResume
-                    # (with `-m integration`, which pyproject deselects by default)
-                    # when two accounts are simultaneously uncapped, and record
-                    # whether r2 recalls the codeword given a transcript that is
-                    # present after r1.
+                    # — re-run it after a CLI upgrade that touches session
+                    # handling (needs `-m integration`, which pyproject
+                    # deselects by default, and two simultaneously-uncapped
+                    # accounts aimed at via CROSS_ACCOUNT_RESUME_TOKENS).
                     #
-                    # That re-run is now trustworthy: when this measurement was
-                    # taken, the cap message above was NOT matched by the test
-                    # module's skip guard (its marker was "you've hit your usage",
-                    # the real text is "you've hit your weekly limit"), so a
-                    # capped second account failed the ZEPPELIN assertion loudly
-                    # and looked exactly like lost context. Task 3483 closed that
-                    # gap — the guard now lives in tests/_capacity_skip.py, is
-                    # pinned against this exact string, and is cross-checked
-                    # against invocation_outcome.classify_invocation so the two
-                    # cannot drift apart again. A capped account SKIPS.
+                    # THE 2026-08-01 ROUND (task 3454), kept because it is why
+                    # the skip guard exists.  Same-account control PASSED
+                    # (CLAUDE_OAUTH_TOKEN_B, r1
+                    # sid=8e4d1819-db90-4b69-8f42-f8ef09facd52, 12 records,
+                    # codeword recalled).  The single cross-account attempt
+                    # (A=CLAUDE_OAUTH_TOKEN_B, B=CLAUDE_OAUTH_TOKEN_C, r1
+                    # sid=eeec059e-be5d-413d-bae7-15274dd758c3, transcript
+                    # PRESENT after r1, 12 records) did NOT recall the codeword
+                    # — but it was VOID, not negative: r2's transcript turn is
+                    # literally "You've hit your weekly limit · resets Aug 5,
+                    # 11am", i.e. account B was CAPPED and no model turn ever
+                    # ran.  It read as context loss only because the test
+                    # module's skip guard matched "you've hit your usage" while
+                    # the real text is "you've hit your weekly limit".  Task
+                    # 3483 closed that gap — the corpus now lives single-homed
+                    # in tests/_capacity_skip.py, pinned against this exact
+                    # string and cross-checked against
+                    # invocation_outcome.classify_invocation so the two cannot
+                    # drift apart again.  A capped account SKIPS, and task 3484
+                    # added a second void class (verdict='void_error') so a
+                    # budget abort or API error cannot masquerade as context
+                    # loss either.
                     # ------------------------------------------------------------------
                     # Resume the capped session on the next account if possible.
                     #
