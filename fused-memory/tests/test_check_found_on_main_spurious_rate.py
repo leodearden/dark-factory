@@ -42,6 +42,7 @@ parse_since = _mod.parse_since
 find_spurious_since = _mod.find_spurious_since
 format_summary = _mod.format_summary
 gating_offenders = _mod.gating_offenders
+classify_sub_patterns = _mod.classify_sub_patterns
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +354,77 @@ class TestStampClassAndGatingOffenders:
         assert len(offenders) == 1, 'the helper must be a pure filter'
 
 
+class TestSubPatternClassification:
+    """Commit fan-out separates the two structurally distinct failure classes.
+
+    Recon found 13 offenders splitting into two sub-patterns: 8 where
+    several unrelated tasks all cite ONE bare 'Merge task/X into main'
+    commit (spurious sharing), and 5 where one task cites one named
+    sibling's commit (legitimate attribution). A timestamp cannot tell
+    these apart — they differ in citation SHAPE, not in time; two stamps
+    written in the same second can be one legitimate and one spurious.
+    Fan-out measures exactly the difference. So stamped_at does freshness
+    (which gates) and fan-out does the A/B split (which reports) — the two
+    signals are orthogonal and both are delivered.
+    """
+
+    SHARED = 'e' * 40
+    SOLO = 'f' * 40
+
+    def test_commit_cited_by_two_tasks_is_shared_bare_merge(self):
+        report = _report([
+            _detail('600', 'misattributed', commit=self.SHARED),
+            _detail('601', 'misattributed', commit=self.SHARED),
+        ])
+        assert classify_sub_patterns(report) == {self.SHARED: 'shared_bare_merge'}
+
+    def test_commit_cited_by_one_task_is_named_sibling(self):
+        report = _report([_detail('602', 'misattributed', commit=self.SOLO)])
+        assert classify_sub_patterns(report) == {self.SOLO: 'named_sibling'}
+
+    def test_fanout_counts_distinct_task_ids_not_repeated_entries(self):
+        # The same task appearing twice is fan-out of 1, not 2.
+        report = _report([
+            _detail('603', 'misattributed', commit=self.SHARED),
+            _detail('603', 'deliverable_absent', commit=self.SHARED),
+        ])
+        assert classify_sub_patterns(report) == {self.SHARED: 'named_sibling'}
+
+    def test_fanout_computed_over_full_report_not_just_flagged_subset(self):
+        # A spurious task sharing a commit with an `ok` task is STILL
+        # shared_bare_merge — the sharing is the signal, regardless of the
+        # sibling's verdict. Computing fan-out over only the flagged subset
+        # would misclassify this as named_sibling.
+        report = _report([
+            _detail('604', 'misattributed', commit=self.SHARED),
+            _detail('605', 'ok', commit=self.SHARED),
+        ])
+        assert classify_sub_patterns(report)[self.SHARED] == 'shared_bare_merge'
+
+    def test_offender_records_carry_sub_pattern(self):
+        report = _report([
+            _detail('606', 'misattributed', commit=self.SHARED),
+            _detail('607', 'ok', commit=self.SHARED),
+            _detail('608', 'misattributed', commit=self.SOLO),
+        ])
+        tasks = [
+            _stamped_task('606', AFTER_SINCE, None, commit=self.SHARED),
+            _stamped_task('607', AFTER_SINCE, None, commit=self.SHARED),
+            _stamped_task('608', AFTER_SINCE, None, commit=self.SOLO),
+        ]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        by_id = {o['task_id']: o for o in offenders}
+        assert by_id['606']['sub_pattern'] == 'shared_bare_merge'
+        assert by_id['608']['sub_pattern'] == 'named_sibling'
+
+    def test_empty_report_classifies_to_empty_mapping(self):
+        assert classify_sub_patterns(_report([])) == {}
+
+    def test_detail_without_commit_is_skipped(self):
+        report = _report([{'task_id': '609', 'verdict': 'misattributed', 'reasons': []}])
+        assert classify_sub_patterns(report) == {}
+
+
 # ===========================================================================
 # format_summary — one line per offender
 # ===========================================================================
@@ -370,6 +442,26 @@ class TestFormatSummary:
         assert 'task_id=3' in lines[0]
         assert f'commit={"c" * 40}' in lines[0]
         assert 'flag_class=misattributed' in lines[0]
+
+    def test_line_carries_stamp_class_and_sub_pattern(self):
+        offenders = [{
+            'task_id': '3',
+            'commit': 'c' * 40,
+            'verdict': 'misattributed',
+            'stamp_class': 'legacy',
+            'sub_pattern': 'shared_bare_merge',
+        }]
+        lines = format_summary(offenders)
+        assert 'stamp_class=legacy' in lines[0]
+        assert 'sub_pattern=shared_bare_merge' in lines[0]
+        # Existing fields and their order are preserved.
+        assert lines[0].startswith(f'task_id=3 commit={"c" * 40} flag_class=misattributed')
+
+    def test_missing_annotations_render_without_raising(self):
+        # format_summary is triage output, never a source of exceptions.
+        lines = format_summary([{'task_id': '4', 'commit': None, 'verdict': 'misattributed'}])
+        assert len(lines) == 1
+        assert 'task_id=4' in lines[0]
 
 
 # ===========================================================================
