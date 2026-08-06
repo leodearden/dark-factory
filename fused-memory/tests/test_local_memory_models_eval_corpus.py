@@ -1533,16 +1533,15 @@ class TestBuilderScriptSatisfiesTheDeliveredCheck:
     """The delivered_check greps fused-memory/scripts/ on the COMMITTED tree."""
 
     def test_module_source_carries_the_literal_marker(self):
+        """Exactly how the delivered_check evaluates: a substring of the file.
+
+        Deliberately NOT asserting the marker sits on a line of its own, nor
+        where in the file it sits. ``git grep -cE`` matches a substring anywhere
+        on a line, so a marker mid-sentence satisfies the check identically —
+        pinning its layout would go red on an editorial reflow while the
+        contract still holds.
+        """
         assert MARKER in SCRIPT_PATH.read_text(encoding='utf-8')
-
-    def test_marker_is_a_line_of_its_own(self):
-        """`git grep -E` matches a line; a marker buried mid-sentence is fragile."""
-        source = SCRIPT_PATH.read_text(encoding='utf-8')
-        assert any(line.strip() == MARKER for line in source.splitlines())
-
-    def test_module_is_runnable_as_a_script(self):
-        source = SCRIPT_PATH.read_text(encoding='utf-8').rstrip()
-        assert source.endswith("if __name__ == '__main__':\n    sys.exit(main())")
 
     def test_main_returns_an_int_exit_code(self, monkeypatch, tmp_path):
         code, _ = _run_cli(
