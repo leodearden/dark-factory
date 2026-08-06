@@ -203,14 +203,14 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   const chartH = height - padT - padB;
   const n = labels.length;
   // One polygon per layer, plus the axis maximum they were all scaled against
-  // (task 3489). The cumulative folds used to scrub every sample through a
-  // `|| 0` fallback, which fabricated a zero-height band at a hole AND fed a
-  // hole-as-zero partial sum to the axis. (The exact pre-fix expression is not
-  // quoted here on purpose: test_charts_null_samples.py greps this body for it,
-  // and prose repeating it would trip that probe.) The builder instead carries
-  // a hole as unknown: layer li is drawn at column i only if every layer BELOW
-  // it is measured there — its base is their sum — while the bands below keep
-  // drawing truthfully.
+  // (task 3489). The column totals and both cumulative folds used to scrub
+  // every sample through `(st.values[i] || 0)`, which fabricated a zero-height
+  // band at a hole — indistinguishable from a measured zero — AND fed that
+  // hole-as-zero PARTIAL SUM to the axis maximum, understating the scale every
+  // other band was drawn against. The builder instead carries a hole as
+  // unknown: layer li is drawn at column i only if every layer BELOW it is
+  // measured there (its base is their sum), while the bands below keep drawing
+  // truthfully.
   //
   // `stepX` comes back from the builder rather than being recomputed for the
   // label row: one x-mapping, so the labels can never drift out of line with

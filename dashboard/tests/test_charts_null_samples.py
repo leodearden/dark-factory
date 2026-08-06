@@ -40,6 +40,15 @@ single module-level probe tuple could not express what each component must no
 longer contain.  Each entry in ``_CONTRACTS`` therefore carries its own probe
 set, its own required builders, and — via ``_PRE_FIX_BODIES`` — its own
 verbatim pre-fix body for the negative control at the bottom.
+
+WHY THE PROBES SEE CODE ONLY — every probe here is a plain substring/regex
+search, so ``_component_body`` blanks comments (``_strip_comments``) before any
+of them run, and the negative control strips its frozen pre-fix bodies
+identically.  Without that, a maintainer documenting the defect they just fixed,
+in the component they just fixed, gets a CI failure whose message says the
+component "still contains hole-blind scale/path arithmetic" — pointing at a
+comment.  charts.jsx carried a parenthetical apologising for exactly that until
+the stripper landed.
 """
 
 from __future__ import annotations
@@ -270,12 +279,91 @@ def _extract_function_body(src: str, fn_name: str) -> str:
     return ''
 
 
+def _strip_comments(src: str) -> str:
+    """Return ``src`` with every JS/JSX comment blanked, string literals intact.
+
+    EVERY probe in this file is a plain substring/regex search, so without this
+    they also match PROSE.  That coupling deformed the production source once
+    already: charts.jsx carried a comment whose content was an apology for what
+    it could not say, because naming the very expression the component had just
+    stopped using would fail CI with a message claiming the component "still
+    contains hole-blind scale/path arithmetic" — pointing at a comment.  A
+    comment is exactly where that expression SHOULD be quotable, so the probes
+    are scoped to code and the comment now names ``(st.values[i] || 0)``
+    directly.
+
+    Quote-aware rather than a bare regex: blanking from a ``//`` inside a string
+    literal (a URL, say) to end-of-line would delete real CODE, and an absence
+    assertion over deleted code is a permanent false GREEN — the exact failure
+    mode the negative control at the bottom of this file exists to prevent.
+    Each comment is replaced by a single space rather than removed outright, so
+    two previously separated tokens can never be spliced into a new match.
+
+    Deliberately not a full JS lexer: a regex literal containing ``//``, or a
+    quote nested inside a template's ``${...}``, would confuse it.  Neither
+    occurs in these component bodies, and the negative control would catch the
+    silent-GREEN direction if one ever did.
+    """
+    out: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(src)
+
+    while i < n:
+        ch = src[i]
+
+        if quote is not None:
+            out.append(ch)
+            if ch == '\\' and i + 1 < n:  # an escaped char cannot close the string
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch in '\'"`':
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == '/' and src[i : i + 2] == '//':
+            end = src.find('\n', i)
+            out.append(' ')
+            i = n if end == -1 else end
+            continue
+
+        if ch == '/' and src[i : i + 2] == '/*':
+            end = src.find('*/', i + 2)
+            out.append(' ')
+            i = n if end == -1 else end + 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return ''.join(out)
+
+
 def _banned_arithmetic_hits(body: str, banned: tuple[tuple[str, str], ...]) -> list[str]:
-    """Return the probes from ``banned`` that are present in ``body``."""
+    """Return the probes from ``banned`` that are present in ``body``.
+
+    ``body`` must already be comment-stripped — ``_component_body`` does that for
+    live source, and the negative control strips its frozen pre-fix bodies the
+    same way, so both sides of that control see the identical treatment.
+    """
     return [probe for probe, _ in banned if probe in body]
 
 
 def _component_body(charts_jsx: str, name: str) -> str:
+    """The named component's body, with comments blanked (see ``_strip_comments``).
+
+    Every caller here asks a question about CODE — "does this component still
+    scale raw samples itself", "does it actually call this builder" — so the
+    single choke point strips prose once rather than leaving each probe to
+    accidentally match a comment.
+    """
     body = _extract_function_body(charts_jsx, name)
     assert body, (
         f'Could not locate the `function {name}(` body in charts.jsx — either '
@@ -284,7 +372,7 @@ def _component_body(charts_jsx: str, name: str) -> str:
         f'This test cannot silently skip: without a body to inspect it proves '
         f'nothing.'
     )
-    return body
+    return _strip_comments(body)
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +767,10 @@ def test_banned_arithmetic_probes_actually_fire_on_pre_fix_source(name: str) -> 
     while the defect sat untouched in charts.jsx.
     """
     banned = _CONTRACTS[name].banned
-    hits = _banned_arithmetic_hits(_PRE_FIX_BODIES[name], banned)
+    # Stripped exactly as the live source is, so this control proves the probes
+    # fire on the pre-fix CODE — not on the `// build cumulative stacks` prose
+    # that came with it, and not on a treatment the live side never gets.
+    hits = _banned_arithmetic_hits(_strip_comments(_PRE_FIX_BODIES[name]), banned)
 
     assert sorted(hits) == sorted(probe for probe, _ in banned), (
         f'the banned-arithmetic probes for {name} did NOT all fire on a '
@@ -688,6 +779,67 @@ def test_banned_arithmetic_probes_actually_fire_on_pre_fix_source(name: str) -> 
         f'test_component_no_longer_carries_the_defective_arithmetic a '
         f'permanent false GREEN for {name}.'
     )
+
+
+def test_strip_comments_removes_prose_without_touching_code_or_strings() -> None:
+    """The probes must see code only — and must still see ALL of the code.
+
+    Both directions matter.  If prose were probed, documenting the defect in the
+    component that fixed it would fail CI (the reason this stripper exists).  If
+    the stripper over-reached — blanking from a ``//`` inside a string literal to
+    end-of-line — it would delete real code, and an absence assertion over
+    deleted code is a permanent false GREEN.
+    """
+    prose = _strip_comments('const a = 1; // st.values[i] || 0 is the old scrub\nconst b = 2;')
+    assert 'st.values[i] || 0' not in prose, 'a line comment must not be probed'
+    assert 'const a = 1;' in prose and 'const b = 2;' in prose, 'code either side survives'
+
+    block = _strip_comments('const a = 1; /* Math.max(...values, 1) */ const b = 2;')
+    assert 'Math.max(...values' not in block, 'a block comment must not be probed'
+    assert 'const a = 1;' in block and 'const b = 2;' in block
+
+    jsx = _strip_comments('<g>{/* (v / max) * 100 */}<rect /></g>')
+    assert '(v / max) * 100' not in jsx, 'a JSX comment must not be probed'
+    assert '<rect />' in jsx
+
+    # The over-reach direction: a `//` inside a string is NOT a comment, so
+    # nothing after it may be blanked.
+    for literal in ('"https://x/y"', "'https://x/y'", '`https://x/y`'):
+        kept = _strip_comments(f'const u = {literal}; const h = (v / max) * chartH;')
+        assert '(v / max) * chartH' in kept, (
+            f'a `//` inside the string literal {literal} was treated as a comment, '
+            f'blanking the code after it — that silently disarms every probe on '
+            f'the rest of the line'
+        )
+
+    # Two tokens separated only by a comment must not be spliced into a match.
+    assert 'ab' not in _strip_comments('a/* */b')
+
+
+def test_prose_quoting_the_defect_does_not_trip_its_own_probe(charts_jsx: str) -> None:
+    """A comment may name the expression the component stopped using.
+
+    This is the contract that lets charts.jsx's StackedAreaChart comment say
+    ``(st.values[i] || 0)`` outright instead of apologising for not being able
+    to.  Asserted against a synthetic body AND against the real one, so it holds
+    even if that comment is later reworded.
+    """
+    synthetic = _strip_comments(
+        '{\n'
+        '  // The cumulative folds used to scrub every sample through\n'
+        '  // `(st.values[i] || 0)`, and the axis through `Math.max(...totals, 1)`.\n'
+        '  const { max: maxV, paths } = stackedAreaPaths(stacks, geom);\n'
+        '}'
+    )
+    assert _banned_arithmetic_hits(synthetic, _STACKED_AREA_BANNED) == [], (
+        'a comment NAMING the pre-fix expression tripped the banned-arithmetic '
+        'probe, which is what forced charts.jsx to document its own fix by '
+        'refusing to quote it'
+    )
+    assert 'stackedAreaPaths(stacks, geom)' in synthetic, 'the code around it survives'
+
+    body = _component_body(charts_jsx, 'StackedAreaChart')
+    assert 'stackedAreaPaths' in body, 'the delegation is still visible after stripping'
 
 
 def test_every_probe_set_has_a_pre_fix_control() -> None:
