@@ -1590,7 +1590,9 @@ class TestStewardWaitExpiredDoesNotLeak:
             'this test proves nothing about a stale True'
         )
         assert queue.get_by_task(task_id, status='pending', level=0) == []
-        assert queue.get(stale.id).resolved_by == 'auto-dismissed'
+        archived = queue.get(stale.id)
+        assert archived is not None
+        assert archived.resolved_by == 'auto-dismissed'
 
         # (2) A LATER merge entry whose gate the steward genuinely clears.
         _submit_gating_l0(queue, task_id)
