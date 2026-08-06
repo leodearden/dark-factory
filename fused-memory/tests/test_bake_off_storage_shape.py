@@ -4344,6 +4344,198 @@ class TestTransformBlindDiscoverabilityAggregation:
         assert block['canonical_rank_window'] == 25
 
 
+def _credit_arm(shape, *, canonical_at=None, fillers=2):
+    """One canonical, one CHILD of it, and filler hits on another topic.
+
+    The canonical always exists in the arm (so a grouped read can resolve the
+    child upward into it) but appears among the fetched hits only when
+    *canonical_at* names its 1-based position.  ``canonical_at=None`` is the
+    case the credit mechanism turns on: the store never returned the
+    canonical's own record, and only the read transform can put it in the
+    window.
+    """
+    canonical = _rec(PARENT, topic='t', canonical=True, claim_ids=['k-canon'])
+    child = _rec('child-1', parent_id=PARENT, kind='amendment', topic='t',
+                 claim_ids=['k0'])
+    filler = [_rec(f'f{i}', topic='other', claim_ids=[f'kf{i}'])
+              for i in range(fillers)]
+    ranked = [child, *filler]
+    if canonical_at is not None:
+        ranked.insert(canonical_at - 1, canonical)
+    hits = [_sh(record, 0.9 - i / 100.0) for i, record in enumerate(ranked)]
+    seeded = _seeded(
+        shape,
+        [canonical, child, *filler],
+        canonical_by_topic={'t': canonical},
+        canonical_by_cluster={'c1': PARENT},
+        siblings_by_cluster={'c1': {'child-1'}},
+    )
+    return seeded, hits
+
+
+class TestGroupedReadCanonicalCreditIsDisclosed:
+    """The mechanism behind `b_grouped`'s headline discoverability number.
+
+    A grouped document is synthesised with ``record_id=canonical.record_id``
+    (apply_grouped_read), and `topic_discoverability` identifies the canonical
+    by ``record_id`` — so a child folding upward is scored as "the canonical
+    was found" even when the store never returned the canonical's own record.
+    Under `c_peers`/`status_quo` there is no such transform and the canonical's
+    own record must itself have ranked.
+
+    This is not a bug to be corrected — a grouped read genuinely does put the
+    canonical body in the reader's window, and the numbers are recorded as
+    measured (G6/D10 assert no threshold).  It is a mechanism to be
+    DISCLOSED, and the transform-blind column is the disclosure.
+    """
+
+    def test_a_child_folding_upward_is_credited_as_the_canonical(self):
+        """The conflation, stated as an executable difference.
+
+        The canonical's own record is absent from the fetch entirely; only
+        its child ranked.  The transformed column says "found, at rank 1".
+        The transform-blind column says "never returned" — and both are true
+        statements about different questions.
+        """
+        seeded, hits = _credit_arm('b_grouped')
+
+        disc = _measure(seeded, hits, pin=False)['discoverability']
+
+        assert disc['canonical_in_top_5_rate'] == 1.0
+        assert disc['median_canonical_rank'] == 1.0
+        assert disc['canonical_found_count'] == 1
+        assert disc['stored_canonical_in_top_5_rate'] == 0.0
+        assert disc['stored_canonical_found_count'] == 0
+        assert disc['stored_canonical_median_rank'] is None
+        # The query DID have a canonical to look for, so the 0.0 above is a
+        # measured miss and not a non-observation.
+        assert disc['canonical_candidates'] == 1
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers'])
+    @pytest.mark.parametrize('canonical_at', [None, 2])
+    def test_without_grouping_the_two_columns_agree(self, shape, canonical_at):
+        """No grouping transform, so there is nothing for the credit to come
+        from and the two columns must report the same thing — whether the
+        canonical ranked (``canonical_at=2``) or never did (``None``).
+
+        This is what makes the divergence above attributable to grouping
+        specifically rather than to the new column being wired to a different
+        window, and it is what keeps the column from being always-zero.
+        """
+        seeded, hits = _credit_arm(shape, canonical_at=canonical_at)
+
+        disc = _measure(seeded, hits, pin=False)['discoverability']
+
+        assert disc['stored_canonical_in_top_5_rate'] == \
+            disc['canonical_in_top_5_rate']
+        assert disc['stored_canonical_median_rank'] == \
+            disc['median_canonical_rank']
+        assert disc['stored_canonical_found_count'] == \
+            disc['canonical_found_count']
+        # Not vacuous: a canonical that DID rank reads as found, at its rank.
+        expected_rate = 0.0 if canonical_at is None else 1.0
+        assert disc['stored_canonical_in_top_5_rate'] == expected_rate
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers', 'b_grouped'])
+    def test_the_stored_column_is_blind_to_the_pin_as_well(self, shape):
+        """Transform-blind means blind to EVERY read-side transform.
+
+        `apply_topic_anchor` also injects the canonical into the window, so a
+        column blind only to grouping would still credit the pin for a
+        retrieval the ANN never performed — the same defect one transform
+        over.  Measured over the raw hits, the trio cannot depend on the pin,
+        which is what makes it comparable across all six arms.
+        """
+        seeded, hits = _credit_arm(shape)
+
+        off = _measure(seeded, hits, pin=False)['discoverability']
+        on = _measure(seeded, hits, pin=True)['discoverability']
+
+        for key in ('stored_canonical_in_top_5_rate',
+                    'stored_canonical_median_rank',
+                    'stored_canonical_found_count'):
+            assert on[key] == off[key], key
+
+    def test_the_pin_moves_the_transformed_column_and_not_the_stored_one(self):
+        """The anti-vacuity half of the test above.
+
+        Equality across pin variants is only meaningful if the pin actually
+        FIRED, so this pins a fixture where it does: the window has headroom,
+        the pin appends the canonical, and the transformed rate moves 0 -> 1
+        while the transform-blind rate stays where retrieval left it.
+        """
+        seeded, hits = _credit_arm('c_peers')
+
+        off = _measure(seeded, hits, pin=False)
+        on = _measure(seeded, hits, pin=True)
+
+        assert on['pin']['window_changed_rate'] > 0.0
+        assert off['discoverability']['canonical_in_top_5_rate'] == 0.0
+        assert on['discoverability']['canonical_in_top_5_rate'] == 1.0
+        assert on['discoverability']['stored_canonical_in_top_5_rate'] == 0.0
+
+    def test_the_stored_rank_is_not_censored_at_the_read_window(self):
+        """"Outside the top 5" and "absent entirely" stay different findings.
+
+        Exactly the contract the transformed rank already holds — a stored
+        rank censored at 5 would collapse a canonical that came NEARLY there
+        into the same None as one the store never returned.
+        """
+        deep_seeded, deep_hits = _credit_arm('c_peers', canonical_at=7,
+                                             fillers=7)
+        absent_seeded, absent_hits = _credit_arm('c_peers', fillers=7)
+
+        deep = _measure(deep_seeded, deep_hits, pin=False)['discoverability']
+        absent = _measure(absent_seeded, absent_hits,
+                          pin=False)['discoverability']
+
+        assert deep['stored_canonical_median_rank'] == 7.0
+        assert deep['stored_canonical_found_count'] == 1
+        assert deep['stored_canonical_in_top_5_rate'] == 0.0
+        assert absent['stored_canonical_median_rank'] is None
+        assert absent['stored_canonical_found_count'] == 0
+        assert absent['stored_canonical_in_top_5_rate'] == 0.0
+
+    def test_the_new_fields_add_keys_and_change_no_existing_measurement(self):
+        """Purely additive at the `measure_arm` seam, not only at aggregation.
+
+        Every block's key set is pinned by equality and every pre-existing
+        discoverability/claim_recall/pin value is hand-computed, so a change
+        that re-pointed an existing column while adding the new one cannot
+        pass.  The fixture is three plain records of `'body'` (4 chars) under
+        `c_peers`, with the canonical itself ranked first.
+        """
+        seeded, hits = _credit_arm('c_peers', canonical_at=1, fillers=1)
+
+        measurement = _measure(seeded, hits, pin=False)
+
+        assert set(measurement) == {
+            'pin', 'claim_recall', 'discoverability', 'by_query_kind',
+            'tokens_per_query', 'guard_adequacy',
+        }
+        assert measurement['pin'] == {'enabled': False,
+                                      'window_changed_rate': None}
+        assert measurement['claim_recall'] == {'at_5': 1.0, 'at_10': 1.0}
+        assert measurement['discoverability'] == {
+            'canonical_in_top_5_rate': 1.0,
+            'median_canonical_rank': 1.0,
+            'canonical_found_count': 1,
+            'canonical_candidates': 1,
+            'canonical_rank_window': 10,
+            'stored_canonical_in_top_5_rate': 1.0,
+            'stored_canonical_median_rank': 1.0,
+            'stored_canonical_found_count': 1,
+        }
+        assert measurement['tokens_per_query'] == {
+            'mean': 12.0, 'estimator': 'injected:chars', 'window': 10,
+        }
+        assert set(measurement['guard_adequacy']) == {
+            'candidate_present_rate', 'guard_matched_rate', 'threshold_replay',
+            'threshold', 'max_observed_score', 'probes', 'guard_covered_probes',
+            'guard_covered_category',
+        }
+
+
 class TestReadPathHoldsTheWindowBudget:
     """Pin-on and pin-off must be scored over equal-size windows."""
 
