@@ -975,10 +975,9 @@ class TestDisallowListForMergeEntities:
 # shape, not FalkorDB's actual per-uuid-count(*) semantics or whether ID()
 # enumeration + WHERE ID(old)=$eid keying genuinely rewrites the intended
 # edges. The reachability probe, connection constants and per-run graph name
-# come from _fm_helpers (task 3502) — which sidesteps the
-# `sys.modules['conftest']` collision by not being conftest.py. Only the
-# fixture body below is per-module; do not re-fork the probe or the constants
-# back into this file.
+# come from _fm_helpers (task 3502) — see its module docstring for why it is
+# not conftest.py. Only the fixture body below is per-module; do not re-fork
+# the shared helpers back into this file.
 #
 # Skipped automatically when FalkorDB is not reachable; the step-1/step-3
 # mock tests above guarantee coverage in that case.
