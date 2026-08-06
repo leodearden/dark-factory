@@ -1774,8 +1774,20 @@ _REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
     # The rate, AND the censored denominator the median rank is taken over:
     # a median over successes only lets an arm that rarely finds the
     # canonical print the best rank, so the two must travel together.
+    #
+    # The `stored_` trio travels with them for the same class of reason.  The
+    # first four are measured over the READ window, so under `b_grouped` they
+    # credit a synthesised document wearing the canonical's `record_id` — any
+    # child folding upward scores as "the canonical was found".  The trio is
+    # the transform-blind counterpart, measured over the raw store hits.  They
+    # answer different questions about the same column, and a table carrying
+    # only the transform-credited one is the undisclosed state this metric
+    # exists to fix: registered, so the renderer cannot drop it.
     'discoverability': ('canonical_in_top_5_rate', 'median_canonical_rank',
-                        'canonical_found_count', 'canonical_candidates'),
+                        'canonical_found_count', 'canonical_candidates',
+                        'stored_canonical_in_top_5_rate',
+                        'stored_canonical_median_rank',
+                        'stored_canonical_found_count'),
     # eval-design §5 E2 names claim recall and discoverability as DISTINCT
     # metrics, and the fixture splits its queries accordingly. Required, not
     # optional: a pooled-only report cannot tell a shape that wins on claim

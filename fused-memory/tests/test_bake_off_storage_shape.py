@@ -2796,6 +2796,13 @@ def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
             'canonical_candidates': 20,
             'canonical_rank_window': 10,
             'mean_topic_member_count': 3.0,
+            # Deliberately DIFFERENT from the transform-credited values above.
+            # Still arbitrary — but a renderer wired to the wrong key would
+            # print a number that matches its neighbour, and equal fixtures
+            # would let that pass.
+            'stored_canonical_in_top_5_rate': 0.4,
+            'stored_canonical_median_rank': 5.0,
+            'stored_canonical_found_count': 9,
         },
         'by_query_kind': {
             kind: {
@@ -2807,6 +2814,11 @@ def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
                     'canonical_found_count': 6,
                     'canonical_candidates': 8,
                     'canonical_rank_window': 10,
+                    # Distinct from the pooled block's stored values too, so
+                    # a by-kind cell sourced from the pooled block is visible.
+                    'stored_canonical_in_top_5_rate': 0.3,
+                    'stored_canonical_median_rank': 4.0,
+                    'stored_canonical_found_count': 4,
                 },
             }
             for kind in (*_mod().QUERY_KINDS, _mod().HELD_OUT_SUBSET)
