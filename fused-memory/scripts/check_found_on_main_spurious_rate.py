@@ -220,6 +220,34 @@ def find_spurious_since(
     return offenders
 
 
+def gating_offenders(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter *records* to the ones that gate the exit code — the fresh ones.
+
+    A record is ``stamp_class='legacy'`` when its freshness had to fall back
+    to ``updatedAt`` because the blob carries no usable
+    ``done_provenance.stamped_at``. Absence of that field is sound proof the
+    stamp predates task 3576: fused-memory's ``_validate_done_provenance``
+    is the single server-side write site for ``kind='found_on_main'``
+    provenance, and every write through it since 3576 landed populates the
+    field — so a blob lacking it cannot have been written since. (That
+    chokepoint is not bypassable by callers: ``update_task`` refuses to let
+    ``metadata.done_provenance`` be written around it — task 2201/C1.)
+
+    Legacy records are excluded from the GATE but never from the REPORT:
+    :func:`find_spurious_since` still returns them and ``_run`` still prints
+    them with their ``stamp_class``. That is deliberate. The residual risk
+    this design carries is a future found_on_main write path that bypasses
+    ``_validate_done_provenance`` — its stamps would carry no ``stamped_at``,
+    be classed legacy, and not gate. Printing them loudly rather than
+    dropping them is the mitigation: an operator still sees the offender in
+    the log, so the failure is visible rather than silent.
+
+    Pure filter — never mutates *records*, and preserves their order (which
+    :func:`find_spurious_since` already sorted by numeric task id).
+    """
+    return [r for r in records if r.get('stamp_class') == 'fresh']
+
+
 def format_summary(offenders: list[dict[str, Any]]) -> list[str]:
     """One structured stdout line per offending task: task_id, cited sha,
     flag class. Human/log-triage only — the DeterministicRunner predicate
