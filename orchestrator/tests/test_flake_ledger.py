@@ -524,3 +524,76 @@ class TestRecordFlakeOccurrence:
 
         assert db_path.exists()
         assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 1
+
+
+class TestRecordFlakeOccurrenceIdempotence:
+    """§8.3: idempotent per ``(test_id, observed_at, call_site)``.
+
+    A merge-path write is retried in the normal course of events, so a replay must be
+    a silent no-op.  These assertions are written so that "let the catch-all swallow an
+    IntegrityError" is NOT enough to pass — see the partial-batch and no-warning cases.
+    """
+
+    def _record(self, db_path: Path, **overrides) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        record_flake_occurrence(
+            db_path,
+            'dark_factory',
+            _suppression(**overrides),
+            merge_sha='abc123',
+            task_id='3785',
+        )
+
+    def test_replay_writes_one_row_per_test_id(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, test_ids=('A', 'B'))
+        self._record(db_path, test_ids=('A', 'B'))
+
+        assert [r['test_id'] for r in _rows(db_path, 'SELECT test_id FROM flake_occurrence')] == [
+            'A',
+            'B',
+        ]
+
+    def test_partial_batch_replay_keeps_the_new_rows(self, tmp_path: Path) -> None:
+        """The assertion that forces declarative ``INSERT OR IGNORE`` rather than an
+        exception swallow: a plain INSERT would abort the second batch on A's duplicate
+        and silently LOSE B, which is a dropped observation, not a dedup."""
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, test_ids=('A',))
+        self._record(db_path, test_ids=('A', 'B'))
+
+        assert sorted(
+            r['test_id'] for r in _rows(db_path, 'SELECT test_id FROM flake_occurrence')
+        ) == ['A', 'B']
+
+    def test_replay_logs_no_warning(self, tmp_path: Path, caplog) -> None:
+        """A retried merge-path write is normal, not a fault.  Warning on every replay
+        would train operators to ignore the very log line B12 depends on being
+        meaningful."""
+        import logging
+
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            self._record(db_path)
+
+        assert [r for r in caplog.records if r.name == 'orchestrator.flake_ledger'] == []
+
+    def test_a_different_observed_at_is_a_new_observation(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, observed_at='2026-08-06T12:00:00+00:00')
+        self._record(db_path, observed_at='2026-08-06T13:00:00+00:00')
+
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 2
+
+    def test_a_different_call_site_is_a_new_observation(self, tmp_path: Path) -> None:
+        """The dedup key is the TRIPLE, not the test_id: the same test judged by the
+        merge gate and by the main probe at the same instant is two observations."""
+        db_path = tmp_path / 'runs.db'
+        self._record(db_path, call_site='merge_gate')
+        self._record(db_path, call_site='main_probe')
+
+        assert sorted(
+            r['call_site'] for r in _rows(db_path, 'SELECT call_site FROM flake_occurrence')
+        ) == ['main_probe', 'merge_gate']
