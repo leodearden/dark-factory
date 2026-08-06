@@ -9,6 +9,12 @@ not counted as G1 consumers of anything here.
 
 > **Amendment 2026-08-06 (task 3748)** — the operating VRAM budget is the MEASURED ~16.4 GiB, not
 > the nominal 19–20GB this PRD was authored against. See D10.
+>
+> Applied corrections (2026-08-06, task 3748):
+> - Task 3720 (LME-η, pending) — **correction**: VRAM-budget bullet + MoE-sizing sentence updated.
+> - Task 3721 (LME-θ, pending) — **insertion**: no VRAM figure existed; one bullet added.
+> - Task 3713 (LME-α, in-progress) — deliberately **not edited**: it is running, and its own
+>   `lms_vram.py` already implements the corrected ~16.4 GiB budget as a live measurement.
 
 ## Goal
 
