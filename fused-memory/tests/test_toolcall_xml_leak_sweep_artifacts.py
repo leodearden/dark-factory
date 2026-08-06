@@ -695,6 +695,127 @@ class TestProvenanceSidecar:
 
 
 # ---------------------------------------------------------------------------
+# The gate's own gate: cover the predicate everything below early-returns on
+# ---------------------------------------------------------------------------
+
+
+class TestUnrepairedDangerRecordPredicate:
+    """Direct cover for ``_unrepaired_danger_records``.
+
+    Every test in ``TestUnrepairedMutationsAreTracked`` and the phantom-entry
+    class begins ``if not outstanding: return``. That makes this one helper
+    load-bearing for the entire anti-fabrication gate: invert its ``dry_run``
+    guard, mistype a flag name, or read ``repaired`` the wrong way round, and
+    it returns ``[]`` for a real unrepaired mutation — every gated test takes
+    its early exit and the suite still reports all-green. The gate needs proof
+    it can FIRE, so the predicate is exercised here over synthetic reports,
+    hermetically and independent of what is committed.
+    """
+
+    @staticmethod
+    def _apply_report(record: dict, dry_run: bool = False) -> dict:
+        return {'dry_run': dry_run, 'records': [record]}
+
+    @pytest.mark.parametrize('flag', DANGER_FLAGS)
+    def test_flagged_and_unrepaired_is_outstanding(self, flag: str) -> None:
+        report = self._apply_report({'id': 'm1', flag: True, 'repaired': False})
+        assert [r['id'] for r in _unrepaired_danger_records(report)] == ['m1'], (
+            f'{flag!r} on an unrepaired apply record must be outstanding; if '
+            'it is not, every gated test silently no-ops for that flag.'
+        )
+
+    @pytest.mark.parametrize('flag', DANGER_FLAGS)
+    def test_dry_run_is_never_outstanding(self, flag: str) -> None:
+        """A dry run mutates nothing, so a flag on one owes nobody anything."""
+        report = self._apply_report(
+            {'id': 'm1', flag: True, 'repaired': False}, dry_run=True
+        )
+        assert _unrepaired_danger_records(report) == []
+
+    def test_repaired_is_not_outstanding(self) -> None:
+        """The mutation completed; there is nothing left to recover."""
+        report = self._apply_report(
+            {'id': 'm1', 'record_error': True, 'repaired': True}
+        )
+        assert _unrepaired_danger_records(report) == []
+
+    def test_unflagged_record_is_not_outstanding(self) -> None:
+        report = self._apply_report({'id': 'm1', 'repaired': False})
+        assert _unrepaired_danger_records(report) == []
+
+    def test_falsy_flag_value_is_not_outstanding(self) -> None:
+        """The sweep writes the key only on failure; a False must not count."""
+        report = self._apply_report(
+            {'id': 'm1', 'record_error': False, 'repaired': False}
+        )
+        assert _unrepaired_danger_records(report) == []
+
+    def test_missing_repaired_key_still_counts_as_unrepaired(self) -> None:
+        """Absent is not True. A record that never claimed success is owed."""
+        report = self._apply_report({'id': 'm1', 'record_error': True})
+        assert [r['id'] for r in _unrepaired_danger_records(report)] == ['m1']
+
+    def test_report_without_a_dry_run_key_is_not_treated_as_an_apply(
+        self,
+    ) -> None:
+        """Only an explicit ``dry_run: false`` means the store was touched."""
+        assert _unrepaired_danger_records(
+            {'records': [{'id': 'm1', 'record_error': True}]}
+        ) == []
+
+    def test_only_the_flagged_records_are_returned(self) -> None:
+        report = {
+            'dry_run': False,
+            'records': [
+                {'id': 'clean', 'repaired': True},
+                {'id': 'flagged', 'content_lost_in_flight': True},
+                {'id': 'ok', 'record_error': True, 'repaired': True},
+            ],
+        }
+        assert [r['id'] for r in _unrepaired_danger_records(report)] == ['flagged']
+
+
+class TestTheTrackingGateIsNotVacuous:
+    """Proof that the committed corpus actually EXERCISES the gate today.
+
+    The synthetic tests above prove the predicate can fire. This proves it does
+    fire on real artifacts — without it, the whole tracking class could be a
+    no-op against this repo's evidence while still reporting passed.
+    """
+
+    def test_a_committed_report_records_an_unrepaired_mutation(self) -> None:
+        outstanding = {
+            record['id']
+            for report_path in _REPORT_PATHS
+            for record in _unrepaired_danger_records(_load(report_path))
+        }
+        assert outstanding, (
+            'No committed report records an unrepaired live-corpus mutation, '
+            'so every test in TestUnrepairedMutationsAreTracked takes its '
+            'early exit and asserts NOTHING. Task 3567 committed exactly one '
+            '(the record --apply deleted and did not re-add). Either that '
+            'capture has been deleted from docs/ — which is the evidence loss '
+            'this module exists to make loud — or _unrepaired_danger_records() '
+            'has stopped recognising it.'
+        )
+
+    def test_tracking_file_is_not_swept_into_the_report_glob(self) -> None:
+        """The naming trap, asserted rather than left as a comment.
+
+        ``_report_paths()`` globs ``*-report.json``. A tracking file named that
+        way would be validated as a sweep report and fail every shape and
+        provenance test in this module.
+        """
+        validated = {p.resolve() for p in _REPORT_PATHS}
+        for artifact_dir in _ARTIFACT_DIRS:
+            tracking_path = _recovery_tracking_path(artifact_dir)
+            assert tracking_path.parent == artifact_dir
+            assert tracking_path.name == RECOVERY_TRACKING_NAME
+            assert not tracking_path.name.endswith('-report.json')
+            assert tracking_path.resolve() not in validated
+
+
+# ---------------------------------------------------------------------------
 # Unrepaired live-corpus mutations: named owner + still-recoverable payload
 # ---------------------------------------------------------------------------
 
