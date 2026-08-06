@@ -106,6 +106,11 @@ def memory_evals_fmt_js_body(_client):
 
     Served by the same static mount as the .jsx — that is how runtime_format.js
     and spark_path.js are already loaded.
+
+    Every consumer reads the comment-stripped `memory_evals_fmt_js_code`
+    derivative below rather than this raw text: roughly three quarters of this
+    file is explanatory prose ABOUT verdicts, limits, alarms and thresholds, so
+    a raw-text scan for any of that vocabulary is answered by a comment.
     """
     return _client.get('/static/redux/memory_evals_fmt.js').text
 
@@ -307,7 +312,7 @@ def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
 
 
 # ---------------------------------------------------------------------------
-# Helper: the JSX's two parity declarations, parsed once
+# Helper: memory_evals_fmt.js's two parity declarations, parsed once
 # ---------------------------------------------------------------------------
 
 
@@ -318,7 +323,13 @@ _PARITY_ENTRY_RE = r'[\'"]?(\w+)[\'"]?\s*:\s*\{([^{}]*)\}'
 
 
 def _parity_tables(code: str) -> tuple[dict[str, str], set[str]]:
-    """Parse tab_memory_evals.jsx's parity vocabulary into ``(entries, declined)``.
+    """Parse memory_evals_fmt.js's parity vocabulary into ``(entries, declined)``.
+
+    Reads the .js MODULE, not the .jsx: task 3481 moved ``verdictBadge`` and
+    both parity tables there so node could execute them, and every message
+    below names that file, because a failure that sends the reader to
+    tab_memory_evals.jsx — which no longer contains either declaration — is the
+    wrong-file misdirection this migration set out to remove.
 
     ``entries`` maps a refined parity state to the raw body of its
     ``{ suffix, cls }`` object; ``declined`` is the set of states listed in
@@ -335,14 +346,14 @@ def _parity_tables(code: str) -> tuple[dict[str, str], set[str]]:
     """
     refinement = _extract_const_object(code, 'PARITY_REFINEMENT')
     assert refinement, (
-        'tab_memory_evals.jsx must declare `const PARITY_REFINEMENT = {...}` at '
+        'memory_evals_fmt.js must declare `const PARITY_REFINEMENT = {...}` at '
         'module scope in CODE (not in a comment). It is the one place the file '
         'says which parity states change the badge, and what these tests '
         'compare against memory_evals.PARITY_STATES.'
     )
     plain = _extract_const_object(code, 'PARITY_PLAIN', open_char='[')
     assert plain, (
-        'tab_memory_evals.jsx must declare `const PARITY_PLAIN = [...]` at '
+        'memory_evals_fmt.js must declare `const PARITY_PLAIN = [...]` at '
         'module scope — the EXPLICIT opt-out list. Without it, a state that is '
         'merely unhandled is indistinguishable from one deliberately left to '
         'the plain verdict badge, and these tests cannot tell a considered '
@@ -1058,11 +1069,11 @@ def test_verdict_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None
 def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
     """Every `PARITY_STATES` member is handled, and nothing else is.
 
-    The JSX declares its whole view of the vocabulary in two module-scope
-    names — `PARITY_REFINEMENT` (states whose badge is refined) and
-    `PARITY_PLAIN` (states that deliberately decline refinement) — precisely so
-    this can be checked against the PRODUCER rather than against a subset
-    copied into this file.  Both directions are separate failures:
+    `memory_evals_fmt.js` declares its whole view of the vocabulary in two
+    module-scope names — `PARITY_REFINEMENT` (states whose badge is refined)
+    and `PARITY_PLAIN` (states that deliberately decline refinement) —
+    precisely so this can be checked against the PRODUCER rather than against a
+    subset copied into this file.  Both directions are separate failures:
 
     * a member in NEITHER declaration is a state the server can emit today and
       the browser has never been told about;
@@ -1082,8 +1093,8 @@ def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
     # `_parity_tables` also asserts both declarations exist and that every
     # table value is a `{ suffix, cls }` pair — the composition invariant in
     # its structural form: table values are SUFFIXES, never whole labels, so
-    # there is no expression in this file capable of returning a label that
-    # discards the verdict-derived base.
+    # there is no expression in memory_evals_fmt.js capable of returning a
+    # label that discards the verdict-derived base.
     entries, declined = _parity_tables(code)
     handled = set(entries)
 
@@ -1097,8 +1108,9 @@ def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
     unhandled = PARITY_STATES - (handled | declined)
     assert unhandled == set(), (
         f'memory_evals.PARITY_STATES member(s) {sorted(unhandled)} appear in '
-        'neither PARITY_REFINEMENT nor PARITY_PLAIN. The server can emit these '
-        'today and this file has never been told about them, so they render '
+        'neither PARITY_REFINEMENT nor PARITY_PLAIN in memory_evals_fmt.js. '
+        'The server can emit these today and that file has never been told '
+        'about them, so they render '
         'through whatever the fall-through happens to be. Add each to the '
         'table (with the fact its badge should carry) or to the plain list '
         '(if the verdict badge already says everything there is to say).'
@@ -1106,7 +1118,7 @@ def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
 
     dead = (handled | declined) - PARITY_STATES
     assert dead == set(), (
-        f'{sorted(dead)} are declared here but are not in '
+        f'{sorted(dead)} are declared in memory_evals_fmt.js but are not in '
         'memory_evals.PARITY_STATES — the producer cannot emit them, so they '
         'are dead branches no render can reach. Delete them, or fix the '
         'spelling if the producer renamed the state.'
@@ -1473,8 +1485,7 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
 
 
 def test_no_client_side_alarm_derivation(
-    tab_memory_evals_jsx_body: str,
-    memory_evals_fmt_js_body: str,
+    tab_memory_evals_jsx_code: str,
     memory_evals_fmt_js_code: str,
 ) -> None:
     """THE load-bearing exclusion (PRD section 8 / G6 / INV-5).
@@ -1500,13 +1511,31 @@ def test_no_client_side_alarm_derivation(
     without false-firing on `ageText`'s legitimate `h < 1` / `h < 48` display
     boundaries — which are unit thresholds for rendering, not comparisons of a
     metric value against a limit.
+
+    Every scan below runs over COMMENT-STRIPPED source, for the reason part (1)
+    already gave: an operator-facing `<`/`>` in prose is not a comparison, and
+    failing on one would push the next author to reword a correct comment
+    rather than fix real code.  That matters most for memory_evals_fmt.js,
+    which is mostly explanatory prose ABOUT verdicts, limits, alarms and
+    thresholds — exactly the vocabulary these patterns hunt for.  Nothing is
+    given up: a violation is by definition executable, so it cannot hide in a
+    comment.
     """
-    # (file label, raw body) — the label is what a failure names, so a reader
-    # is told WHICH file violated the exclusion.
+    # (file label, comment-stripped source) — the label is what a failure
+    # names, so a reader is told WHICH file violated the exclusion.
     sources = (
-        ('tab_memory_evals.jsx', tab_memory_evals_jsx_body),
-        ('memory_evals_fmt.js', memory_evals_fmt_js_body),
+        ('tab_memory_evals.jsx', tab_memory_evals_jsx_code),
+        ('memory_evals_fmt.js', memory_evals_fmt_js_code),
     )
+    # Anti-vacuity: these are all NEGATIVE assertions, so a fixture that came
+    # back empty (a 404 page, a renamed static route) would satisfy every one
+    # of them while scanning nothing at all.
+    for label, src in sources:
+        assert src.strip(), (
+            f'the {label} fixture is empty — every scan below is a negative '
+            'assertion and would pass vacuously. Check the static route before '
+            'trusting a green run here.'
+        )
     code = memory_evals_fmt_js_code
 
     # (1) The badge helper reads verdict/parity and performs NO comparison.
@@ -1926,7 +1955,8 @@ def test_escalation_links_and_storm_aggregate_banner(
     reasons = ('no_matching_verdict', 'storm_suppressed', 'no_fingerprint')
     for reason in reasons:
         assert f"'{reason}'" in memory_evals_fmt_js_code, (
-            f"unmatchedReasonText must name the '{reason}' reason. "
+            f"unmatchedReasonText (memory_evals_fmt.js) must name the "
+            f"'{reason}' reason. "
             'Collapsing the three into one undifferentiated "unexplained" list '
             'would fire on escalations that are in fact fully explained and '
             'train operators to ignore the one signal that catches a real '
@@ -1971,7 +2001,7 @@ _LIMITS_KEYS = (
 def test_limits_provenance_rendered(
     tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
-    memory_evals_fmt_js_body: str,
+    memory_evals_fmt_js_code: str,
 ) -> None:
     """Every limits-provenance key must be rendered, the staleness of the
     provenance itself must be disclosed, and a null limits artifact must say so.
@@ -2036,11 +2066,13 @@ def test_limits_provenance_rendered(
     # EXTENDED to both files for the same reason the primary guard is (task
     # 3481): the badge logic now lives in memory_evals_fmt.js, so a scan of the
     # .jsx alone would no longer cover the code most likely to grow a
-    # comparison.
+    # comparison.  COMMENT-STRIPPED for the same reason the primary guard is:
+    # both files discuss alpha and min_samples at length in prose, and a
+    # comparison is by definition executable, so it cannot hide in a comment.
     for field in ('alpha', 'min_samples'):
         for label, src in (
-            ('tab_memory_evals.jsx', body),
-            ('memory_evals_fmt.js', memory_evals_fmt_js_body),
+            ('tab_memory_evals.jsx', code),
+            ('memory_evals_fmt.js', memory_evals_fmt_js_code),
         ):
             assert not re.search(rf'\.\s*{field}\b\s*(<=|>=|<|>)', src), (
                 f'`{field}` is compared somewhere in {label}. '
