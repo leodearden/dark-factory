@@ -17,6 +17,7 @@ See ``orchestrator/src/orchestrator/agents/briefing.py``:
 from __future__ import annotations
 
 import json
+import logging
 
 from orchestrator.agents.briefing import filter_foreign_project_results
 
@@ -115,3 +116,72 @@ class TestFilterForeignProjectResults:
 
         assert [r['id'] for r in parsed['results']] == ['1', '3']
         assert dropped == 1
+
+
+class TestFilterFailsOpen:
+    """The filter must never destroy context on a malformed payload.
+
+    It fails OPEN — returns the original text unchanged and drops nothing —
+    and logs loudly (WARNING) rather than silently blanking the # Context
+    block on a serialisation surprise.
+    """
+
+    def test_non_json_text_fails_open(self, caplog):
+        text_in = 'not json at all'
+
+        with caplog.at_level(logging.WARNING):
+            text, dropped = filter_foreign_project_results(text_in, 'dark_factory')
+
+        assert (text, dropped) == (text_in, 0)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_json_array_not_object_fails_open(self, caplog):
+        text_in = '[1, 2, 3]'
+
+        with caplog.at_level(logging.WARNING):
+            text, dropped = filter_foreign_project_results(text_in, 'dark_factory')
+
+        assert (text, dropped) == (text_in, 0)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_missing_results_key_fails_open(self, caplog):
+        text_in = json.dumps({'degraded': True})
+
+        with caplog.at_level(logging.WARNING):
+            text, dropped = filter_foreign_project_results(text_in, 'dark_factory')
+
+        assert (text, dropped) == (text_in, 0)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_non_list_results_fails_open(self, caplog):
+        text_in = json.dumps({'results': 'oops'})
+
+        with caplog.at_level(logging.WARNING):
+            text, dropped = filter_foreign_project_results(text_in, 'dark_factory')
+
+        assert (text, dropped) == (text_in, 0)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_non_dict_entry_is_kept_without_raising(self):
+        payload = json.dumps({
+            'results': ['stray', _result('1', 'Own fact.', metadata={'project_id': 'dark_factory'})],
+        })
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        parsed = json.loads(text)
+
+        assert 'stray' in parsed['results']
+        assert dropped == 0
+
+    def test_non_dict_metadata_is_kept_without_raising(self):
+        entry_none_meta = _result('1', 'Fact with null metadata.')
+        entry_none_meta['metadata'] = None
+        entry_list_meta = _result('2', 'Fact with list metadata.')
+        entry_list_meta['metadata'] = ['oops']
+        payload = json.dumps({'results': [entry_none_meta, entry_list_meta]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert 'Fact with null metadata.' in text
+        assert 'Fact with list metadata.' in text
+        assert dropped == 0
