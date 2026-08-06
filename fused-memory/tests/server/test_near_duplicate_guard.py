@@ -337,6 +337,41 @@ class TestFindMatchingTopicClusterSufficientPhrases:
         assert match is not None
         assert match[0].topic_id == 'topic-a'
 
+    def test_earlier_count_match_wins_over_a_later_sufficient_match(self):
+        """The converse precedence, pinned deliberately rather than left incidental.
+
+        Sufficiency decides WHETHER a cluster qualifies, never WHICH
+        qualifying cluster wins: the scan is a single pass in list order, so
+        an earlier cluster reaching ``min_phrase_hits`` on ordinary phrases
+        beats a later cluster whose declared-sufficient phrase also fired.
+        Seed order stays the single priority knob.
+        """
+        cluster_a = _cluster(topic_id='topic-a', phrases=['alpha', 'beta'], min_phrase_hits=2)
+        cluster_b = _cluster(
+            topic_id='topic-b',
+            phrases=['gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['gamma'],
+        )
+        match = find_matching_topic_cluster('alpha beta gamma', [cluster_a, cluster_b])
+        assert match is not None
+        assert match[0].topic_id == 'topic-a'
+        assert match[1] == ['alpha', 'beta']
+
+    def test_reordering_the_same_clusters_hands_the_win_to_the_sufficient_one(self):
+        """Confirms the previous test pins ORDER, not a count-beats-sufficiency rule."""
+        cluster_a = _cluster(topic_id='topic-a', phrases=['alpha', 'beta'], min_phrase_hits=2)
+        cluster_b = _cluster(
+            topic_id='topic-b',
+            phrases=['gamma'],
+            min_phrase_hits=2,
+            sufficient_phrases=['gamma'],
+        )
+        match = find_matching_topic_cluster('alpha beta gamma', [cluster_b, cluster_a])
+        assert match is not None
+        assert match[0].topic_id == 'topic-b'
+        assert match[1] == ['gamma']
+
 
 class TestResolveTopicGuardClusters:
     """Defensive config resolver: real list from config, else empty list."""

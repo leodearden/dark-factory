@@ -122,6 +122,14 @@ def find_matching_topic_cluster(
     cluster's ``min_phrase_hits``. That is correct, not a guard bug: it
     reports exactly what fired.
 
+    PRECEDENCE (deliberate): sufficiency decides WHETHER a cluster qualifies,
+    never WHICH qualifying cluster wins. The scan is a single pass in list
+    order, so an EARLIER cluster qualifying on a plain count beats a LATER
+    cluster qualifying on a declared-sufficient phrase. Seed order stays the
+    one priority knob rather than gaining a second, implicit axis -- and both
+    candidates are on-topic by construction, so the cost of the arbitration
+    is at most routing a soft block to the neighbouring human gate task.
+
     A phrase repeated in *content* counts once (distinct-phrase membership,
     not occurrence count); an empty phrase is ignored (it would otherwise
     substring-match everything). Returns ``None`` when *content* is empty,
@@ -141,16 +149,7 @@ def find_matching_topic_cluster(
             for phrase in cluster.phrases
             if phrase and phrase.lower() in content_lower
         }
-        # Read defensively, matching this module's posture for every other
-        # config leaf (`_reconciliation_attr`, `resolve_topic_guard_clusters`):
-        # an operator-supplied or older cluster object without the field
-        # degrades to today's count-only behaviour rather than raising
-        # AttributeError inside the add_memory hot path.
-        sufficient = {
-            phrase.lower()
-            for phrase in (getattr(cluster, 'sufficient_phrases', None) or [])
-            if phrase
-        }
+        sufficient = {phrase.lower() for phrase in cluster.sufficient_phrases if phrase}
         if matched and (len(matched) >= cluster.min_phrase_hits or matched & sufficient):
             return cluster, sorted(matched)
     return None
