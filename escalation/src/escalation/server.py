@@ -1784,11 +1784,13 @@ def create_server(
             }
         was_active = harness.is_workflow_active(task_id)
         released = harness.cancel_workflow(task_id)
-        if not was_active:
-            return {
-                'released': False, 'was_active': False, 'slot_cleared': True,
-                'parked': None,
-            }
+        # No early-return on `not was_active`: an orphaned task (lane already
+        # reaped, no slot registered, row still 'in-progress') is exactly the
+        # shape that most needs the park below.  Falling through costs nothing
+        # — with no slot the wait loop's condition is false on its first
+        # evaluation, so it never sleeps, `slot_cleared` computes True and
+        # `released` stays False: the same values the old early-return
+        # hardcoded, minus the skipped park.
         # Wait up to timeout_secs for the slot to clear
         loop = asyncio.get_event_loop()
         deadline = loop.time() + max(0, int(timeout_secs))
