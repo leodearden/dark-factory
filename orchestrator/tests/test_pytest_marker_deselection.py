@@ -1066,3 +1066,104 @@ class TestWidenFallbackRefuses:
         self._refuses(
             'pytest mod/tests/test_a.py', {'pyproject.toml': _PLAIN_PYPROJECT},
         )
+
+
+class TestWidenFallbackWidensOnFullDeselection:
+    """``widen_fallback_for_marker_deselection`` — the POSITIVE half.
+
+    The remedy mirrors task 3494's arm 4a exactly: drop the file targets and
+    run the same command's full suite, rather than SKIP.  The task-1852 SKIP
+    precedent applies only where there is NO suite at all to run; here the very
+    existence of an ``-m`` expression at the command's rootdir is evidence of a
+    real marker-partitioned suite.  Skipping would turn a false RED into a
+    silent no-coverage GREEN.
+
+    Widening is DEGRADATION, not verification: the widened run applies the SAME
+    addopts, so the trigger files stay deselected.  The reason is the only
+    channel that can say so (FULL_SUITE forbids ``scoped_targets``), so every
+    assertion below checks it names the files as NOT executed.
+    """
+
+    def test_the_root_shape_widens_and_preserves_every_other_command(self):
+        """THE defect: a bare ``pytest <file>`` under a deselecting repo root."""
+        reads: list[str] = []
+        fallback = _fallback_mc('pytest tests/test_smoke.py')
+        read = _permissive_reader(reads, {
+            'pyproject.toml': _pyproject('"-m \'not smoke\'"'),
+            'tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.smoke\n',
+        })
+        widened, reason = widen_fallback_for_marker_deselection(fallback, read)
+
+        assert widened.test_command == 'pytest', 'targets dropped, command otherwise intact'
+        assert reason is not None
+        # Marker deselection is a pytest-only concern: nothing else may move.
+        assert widened.prefix == fallback.prefix
+        assert widened.lint_command == fallback.lint_command
+        assert widened.type_check_command == fallback.type_check_command
+
+    def test_the_reason_names_the_files_this_run_still_does_not_execute(self):
+        """Mirrors arm 4a's wording, so ONE operator-facing phrase covers the class."""
+        reads: list[str] = []
+        read = _permissive_reader(reads, {
+            'pyproject.toml': _pyproject('"-m \'not smoke\'"'),
+            'tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.smoke\n',
+        })
+        _, reason = widen_fallback_for_marker_deselection(
+            _fallback_mc('pytest tests/test_smoke.py'), read,
+        )
+        assert reason is not None
+        assert reason.startswith('pytest: ')
+        assert 'tests/test_smoke.py' in reason
+        assert 'not smoke' in reason
+        assert 'NOT executed' in reason
+        assert 'rc=5' in reason
+
+    def test_multiple_marked_targets_widen_and_are_all_named(self):
+        """ALL deselected — and the reason accounts for every file that goes unrun."""
+        reads: list[str] = []
+        widened, reason = widen_fallback_for_marker_deselection(
+            _fallback_mc('pytest tests/test_a.py tests/test_b.py'), _permissive_reader(reads),
+        )
+        assert widened.test_command == 'pytest'
+        assert reason is not None
+        assert 'tests/test_a.py' in reason
+        assert 'tests/test_b.py' in reason
+
+    def test_the_subproject_shape_widens_against_its_own_rootdir(self):
+        """``cd sub && uv run pytest <file>`` — task 2344's rescoping, unscoped in place.
+
+        The executed command's targets are SUB-relative while the reader is
+        worktree-ROOT-relative, so the widener must resolve them through
+        ``cwd_rel`` before handing them to the probe.
+        """
+        reads: list[str] = []
+        read = _permissive_reader(reads, {
+            # ONLY the subproject deselects; the root declares no -m at all.
+            'pyproject.toml': _PLAIN_PYPROJECT,
+            'sub/tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.slow\n',
+        })
+        widened, reason = widen_fallback_for_marker_deselection(
+            _fallback_mc('cd sub && uv run pytest tests/test_smoke.py'), read,
+        )
+        assert widened.test_command == 'cd sub && uv run pytest'
+        assert reason is not None
+        assert 'sub/tests/test_smoke.py' in reason, 'reason names the root-relative path'
+        assert 'sub/tests/test_smoke.py' in reads, 'target resolved into the reader\'s frame'
+        assert 'sub/pyproject.toml' in reads
+
+    def test_a_root_only_addopts_never_widens_a_subproject_command(self):
+        """THE anti-over-fire pin: the config a ``cd sub`` command's rootdir may not see.
+
+        pytest would walk UP to the repo root when ``sub/pyproject.toml``
+        declares no ini_options — a walk this probe deliberately does not model.
+        Refusing is an UNDER-fire, the one direction task 3494 permits.
+        """
+        reads: list[str] = []
+        read = _permissive_reader(reads, {
+            'sub/pyproject.toml': _PLAIN_PYPROJECT,
+            'sub/tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.slow\n',
+        })
+        fallback = _fallback_mc('cd sub && uv run pytest tests/test_smoke.py')
+        widened, reason = widen_fallback_for_marker_deselection(fallback, read)
+        assert widened is fallback
+        assert reason is None
