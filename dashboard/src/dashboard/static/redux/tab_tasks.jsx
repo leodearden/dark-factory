@@ -7,7 +7,7 @@ const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, u
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
 const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
-const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 
 // Dot colour per activity pip. activityPips is pure and owns ORDER and
 // zero-suppression; colour is the caller's concern. Each reuses the hue
@@ -521,6 +521,12 @@ function TaskDetail({ task, allTasks }) {
   }
   const deps = task.deps || [];
   const dependents = allTasks.filter(t => (t.deps || []).some(d => d.id === task.id));
+  // Why the runtime cells below are dashed. Three separable cases the operator
+  // must not confuse: the orchestrator is unreachable, OUR probe deadline fired
+  // (a starved dashboard event loop looks exactly like this), or no runtime
+  // endpoint is configured at all. Produced by task_runtime._probe_one ->
+  // active_tasks._probe_status. null on the healthy path — nothing renders.
+  const probe = rtProbe(task.runtime_status);
   return (
     <div className="task-detail">
       <h4>{task.title}</h4>
@@ -535,6 +541,15 @@ function TaskDetail({ task, allTasks }) {
         <span className="k">lane</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane)}</span>
         <span className="k">phase</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.phase)}</span>
         <span className="k">state</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane_state)}</span>
+        {probe && (
+          <React.Fragment>
+            <span className="k">runtime</span>
+            <span data-testid="task-runtime-probe" title={probe.hint}>
+              <span className={`badge ${probe.tone}`}>{probe.label}</span>
+              <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 6 }}>{probe.hint}</span>
+            </span>
+          </React.Fragment>
+        )}
       </div>
 
       <div className="section-lbl">Description</div>
@@ -665,6 +680,15 @@ function TasksTab({ projectFilter, search }) {
   const tasksOffline = !!DF_T.TASKS_OFFLINE;
   const offlineProjects = DF_T.TASKS_OFFLINE_PROJECTS || [];
 
+  // Runtime-probe health, derived frontend-side from the ACTIVE_TASKS rows
+  // (deliberately not a new top-level payload key — the per-project fact is
+  // already fully recoverable from `runtime_status`, so a new key would carry
+  // zero extra information). Independent of tasksOffline above: fused-memory
+  // being reachable says nothing about whether we could probe the
+  // orchestrators, and gating this on tasksOffline would hide a probe failure
+  // in the common case where fused-memory is up. Both banners can show at once.
+  const probeSummary = rtProbeSummary(allTasks);
+
   function statusMatches(s) {
     if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
     if (filters.pending   && s === 'pending')    return true;
@@ -698,6 +722,21 @@ function TasksTab({ projectFilter, search }) {
              }}>
           fused-memory offline — task data unavailable
           {offlineProjects.length > 0 && ` (${offlineProjects.join(', ')})`}
+        </div>
+      )}
+      {probeSummary && (
+        <div className="col-span-12" data-testid="tasks-runtime-probe-banner"
+             style={{
+               padding: '8px 12px',
+               border: '1px solid var(--line)',
+               borderLeft: `3px solid ${probeSummary.selfInflicted ? 'var(--warn)' : 'var(--bad)'}`,
+               borderRadius: 4,
+               background: 'var(--bg-2)',
+               color: 'var(--fg-2)',
+               fontFamily: 'var(--mono)',
+               fontSize: 11,
+             }}>
+          {probeSummary.text}
         </div>
       )}
       {/* Filter bar */}
