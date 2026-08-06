@@ -23,7 +23,15 @@ makes it sound (its receiving role really does carry the block).
 Its real effect is on model behaviour and is not unit-testable, but silent
 removal during a prompt refactor is a genuine safety regression — the repo
 sanctions exactly this kind of "mandated token present in each role prompt"
-guard. Each assertion is an existence / containment / ordering / count check
+guard. Read "token" there STRICTLY as a named constant: the sanctioned shape is
+``SOME_CONSTANT in ROLES[name].system_prompt``, never a string literal asserted
+against a constant's prose. The latter has no correctness content in either
+direction — it passes on prose reworded to say the opposite and fails on a
+legitimate tightening — so it only taxes future prompt edits. Two such literal
+pins were tried here and removed (task 3607 review); do not reintroduce them,
+and do not "strengthen" one into a regex.
+
+Each assertion is an existence / containment / ordering / count check
 against a named constant, not a prose or regex pin — including the placement
 check, which compares against the prompt's first ``##`` heading rather than any
 particular heading's text. The one exception in KIND is the config-drift
@@ -84,8 +92,28 @@ _MARKDOWN_HEADING = '\n## '
 
 
 def test_wait_pattern_guidance_is_nonempty() -> None:
-    """The mandated constant is a non-empty string."""
-    assert WAIT_PATTERN_GUIDANCE.strip()
+    """The mandated constant is a non-empty string.
+
+    Mirrors ``test_roles_background_warning.py::test_background_warning_is_nonempty``
+    for the sibling constant. NOT redundant with the containment tests, though it
+    reads that way: ``test_combined_guidance_composes_both_rules`` asserts
+    ``WAIT_PATTERN_GUIDANCE in BACKGROUND_WAIT_GUIDANCE``, and the empty string is
+    a substring of every string, so that assertion holds vacuously if this
+    constant is ever emptied. Nor does the up-front placement check cover it:
+    ``BACKGROUND_TASK_WARNING`` carries its own ``## `` heading, so the combined
+    block still opens with one when this half contributes nothing.
+
+    Emptying ``WAIT_PATTERN_GUIDANCE`` therefore passes every other test in this
+    file — which is exactly the silent-removal-during-a-prompt-refactor
+    regression the module docstring names as the motivating risk. This one-line
+    assertion is the only thing standing between that edit and a green CI run.
+    """
+    assert WAIT_PATTERN_GUIDANCE.strip(), (
+        'WAIT_PATTERN_GUIDANCE is empty. Every containment test in this file '
+        'still passes when it is — the empty string is a substring of anything — '
+        'so this assertion is the sole guard against the census-R3 guidance being '
+        'silently dropped in a prompt refactor.'
+    )
 
 
 def test_session_idle_bound_config_drift_tripwire() -> None:
@@ -117,31 +145,6 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
         'guidance quotes 1800s / 30 minutes as the session idle bound and derives its '
         '~25-minute background threshold from it — update both constants in roles.py '
         'to stay under the new bound, then update this assertion.'
-    )
-
-
-@pytest.mark.parametrize(
-    'name',
-    ['WAIT_PATTERN_GUIDANCE', 'WAIT_PATTERN_REMINDER'],
-)
-def test_wait_pattern_constants_name_the_polling_tool(name: str) -> None:
-    """Both constants name ``BashOutput`` — a mandated TOKEN, not a wording pin.
-
-    Backgrounding is only safe because each ``BashOutput`` poll is itself a new
-    transcript turn and resets ``last_progress_monotonic``. Guidance that tells
-    an agent to background a long run without naming the tool that drains it
-    leaves the agent with the prohibition and no mechanism. Unlike a prose pin,
-    a tool name has exactly one correct spelling, so this cannot fail on a
-    stylistic rewrite.
-    """
-    text = {
-        'WAIT_PATTERN_GUIDANCE': WAIT_PATTERN_GUIDANCE,
-        'WAIT_PATTERN_REMINDER': WAIT_PATTERN_REMINDER,
-    }[name]
-    assert 'BashOutput' in text, (
-        f'{name} no longer names `BashOutput`. Polling is what makes a backgrounded '
-        'long run safe — each poll is a new transcript turn and resets the idle '
-        'clock — so the escape hatch must be named alongside the threshold.'
     )
 
 
