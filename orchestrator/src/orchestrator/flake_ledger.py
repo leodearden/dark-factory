@@ -39,6 +39,7 @@ retention is addressed.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -126,6 +127,26 @@ class FlakeSuppression:
     unconfirmable_reason: str | None  # populated iff verdict is unconfirmable
 
 
+@dataclass(frozen=True)
+class FlakeOccurrenceRow:
+    """One ``flake_occurrence`` row — a single test's observation at a single moment.
+
+    A ``FlakeSuppression`` naming N tests fans out to N of these.
+    """
+
+    id: int
+    observed_at: str
+    test_id: str
+    project_id: str
+    verdict: str
+    call_site: str
+    runner: str | None
+    merge_sha: str | None
+    task_id: str | None
+    psi_cpu_some10: float | None
+    detail: str
+
+
 def ledger_db_path(project_root: Path) -> Path:
     """The project's ``runs.db``.
 
@@ -164,3 +185,85 @@ def ensure_schema(db_path: Path) -> None:
         conn.executescript(_SCHEMA)
     finally:
         conn.close()
+
+
+def record_flake_occurrence(
+    db_path: Path,
+    project_id: str,
+    s: FlakeSuppression,
+    *,
+    merge_sha: str | None,
+    task_id: str | None,
+) -> None:
+    """Append one ``flake_occurrence`` row per test named in *s* (PRD §8.3).
+
+    ``observed_at`` comes from *s* — the DISCRIMINATOR stamps it at observation, which
+    is both semantically right for the remote path (the observation happens on the
+    remote host; the write happens later on the dispatcher) and mechanically required:
+    §8.3's idempotency key is ``(test_id, observed_at, call_site)``, and a write-time
+    stamp would make every retry a distinct row.
+    """
+    ensure_schema(db_path)
+    detail = (
+        json.dumps({'unconfirmable_reason': s.unconfirmable_reason})
+        if s.unconfirmable_reason
+        else '{}'
+    )
+    # Columns are named explicitly, never a positional `INSERT INTO t VALUES (...)`:
+    # run_store.py:53-58's ALTER-parity note — a migrated DB and a fresh one must both
+    # accept the same statement.
+    rows = [
+        (
+            s.observed_at,
+            test_id,
+            project_id,
+            s.verdict.value,
+            s.call_site,
+            s.runner,
+            merge_sha,
+            task_id,
+            s.psi_cpu_some10,  # bound directly, so None becomes SQL NULL, never 0.0
+            detail,
+        )
+        for test_id in s.test_ids
+    ]
+    conn = _connect(db_path)
+    try:
+        conn.executemany(
+            'INSERT INTO flake_occurrence '
+            '(observed_at, test_id, project_id, verdict, call_site, runner, '
+            ' merge_sha, task_id, psi_cpu_some10, detail) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _to_occurrence_row(row: sqlite3.Row) -> FlakeOccurrenceRow:
+    return FlakeOccurrenceRow(
+        id=row['id'],
+        observed_at=row['observed_at'],
+        test_id=row['test_id'],
+        project_id=row['project_id'],
+        verdict=row['verdict'],
+        call_site=row['call_site'],
+        runner=row['runner'],
+        merge_sha=row['merge_sha'],
+        task_id=row['task_id'],
+        psi_cpu_some10=row['psi_cpu_some10'],
+        detail=row['detail'],
+    )
+
+
+def read_occurrences(db_path: Path) -> list[FlakeOccurrenceRow]:
+    """Every recorded occurrence, oldest first."""
+    ensure_schema(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('SELECT * FROM flake_occurrence ORDER BY id').fetchall()
+    finally:
+        conn.close()
+    return [_to_occurrence_row(r) for r in rows]
