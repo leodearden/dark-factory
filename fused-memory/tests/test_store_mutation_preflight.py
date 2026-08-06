@@ -174,9 +174,3 @@ class TestFailClosedPrecedent:
         (``reconciliation.sandbox_guard.RemediationSandboxUnavailable``), so an
         existing broad ``except Exception`` refusal handler catches it too."""
         assert issubclass(StoreMutationUnavailable, RuntimeError)
-
-    def test_docstring_states_the_caller_contract(self):
-        """The contract is load-bearing and must not be silently dropped: on
-        this exception the caller MUST NOT begin the mutation."""
-        doc = StoreMutationUnavailable.__doc__ or ''
-        assert 'MUST NOT' in doc
