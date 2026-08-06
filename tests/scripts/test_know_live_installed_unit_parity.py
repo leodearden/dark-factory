@@ -121,6 +121,28 @@ def _config_arg_from_exec_start(exec_start_value: str) -> str | None:
     return None
 
 
+def _argv_from_exec_start_show(exec_start_value: str) -> str | None:
+    """Extract the `argv[]=...` segment from a `systemctl show -p ExecStart` struct.
+
+    Measured shape (systemd 255.4, this host, 2026-08-06): `{ path=... ;
+    argv[]=<full argv> ; ignore_errors=no ; start_time=... ; stop_time=... ;
+    pid=... ; code=... ; status=... }` — a `" ; "`-delimited sequence of
+    `key=value` segments. Isolating the `argv[]=` segment before handing the
+    remainder to _config_arg_from_exec_start (rather than scanning the whole
+    raw struct blob for a `--config` token) keeps both parser layers asking
+    the identical question — "what is argv[i + 1] after --config" — of the
+    actual argument vector, not of struct metadata that happens not to
+    collide with it today but is not guaranteed to stay that way. Returns
+    None, never raises, if no `argv[]=` segment is present, so callers can
+    skip/fail explicitly on an unexpected shape rather than mis-parse one.
+    """
+    for segment in exec_start_value.split(" ; "):
+        segment = segment.strip()
+        if segment.startswith("argv[]="):
+            return segment[len("argv[]=") :]
+    return None
+
+
 def _systemctl_user_show(unit: str, *properties: str) -> dict[str, str] | None:
     """Run `systemctl --user show <unit> -p <prop> ...`, parsed to a dict.
 
@@ -248,7 +270,7 @@ def test_installed_unit_manager_restart_steps_effective() -> None:
 @pytest.mark.integration
 @pytest.mark.skipif(shutil.which("systemctl") is None, reason=_SYSTEMCTL_SKIP_REASON)
 def test_installed_unit_manager_execstart_config_is_canonical() -> None:
-    """systemd --user's LOADED ExecStart= must carry the canonical --config path.
+    """systemd --user's LOADED ExecStart= argv must carry the canonical --config basename.
 
     Expected GREEN on arrival, mirroring the file-layer config check above —
     the manager already agrees with the (already-canonical) installed file.
@@ -256,6 +278,16 @@ def test_installed_unit_manager_execstart_config_is_canonical() -> None:
     only reaches the file (an install without a daemon-reload) or only
     reaches the manager (a hand-edited drop-in) is still caught by whichever
     layer it actually lands in.
+
+    Asserts EXACT basename equality via the same _config_arg_from_exec_start
+    token parser the file layer uses, applied to the argv[] field of the
+    manager's struct view (_argv_from_exec_start_show) — not a substring
+    check on the raw ExecStart= blob. A substring check would also accept a
+    drop-in that repointed --config at, say,
+    backup-dark-factory-orchestrator.yaml, since that value still CONTAINS
+    the canonical basename as a substring; exact-basename equality is what
+    the drop-in-only regression this layer exists to catch actually
+    requires.
     """
     _require_installed_unit()
     shown = _systemctl_user_show(UNIT_BASENAME, "ExecStart")
@@ -265,8 +297,21 @@ def test_installed_unit_manager_execstart_config_is_canonical() -> None:
             "session in this runner)"
         )
     exec_start = shown.get("ExecStart", "")
-    assert CANONICAL_CONFIG_BASENAME in exec_start, (
-        f"systemctl --user show {UNIT_BASENAME} -p ExecStart reports "
-        f"{exec_start!r}, which does not contain the canonical config "
-        f"basename {CANONICAL_CONFIG_BASENAME!r} (CLAUDE.md; task 3641)."
+    argv = _argv_from_exec_start_show(exec_start)
+    assert argv is not None, (
+        f"systemctl --user show {UNIT_BASENAME} -p ExecStart returned a "
+        f"struct with no argv[]= segment: {exec_start!r}"
+    )
+    config_arg = _config_arg_from_exec_start(argv)
+    assert config_arg is not None, (
+        f"systemctl --user show {UNIT_BASENAME} -p ExecStart's argv[] "
+        f"carries no --config argument: {argv!r}"
+    )
+    actual = pathlib.PurePosixPath(config_arg).name
+    assert actual == CANONICAL_CONFIG_BASENAME, (
+        f"systemctl --user show {UNIT_BASENAME} -p ExecStart's argv[] "
+        f"points --config at {config_arg!r}, whose basename is {actual!r}. "
+        f"It must be the canonical {CANONICAL_CONFIG_BASENAME!r} (CLAUDE.md; "
+        "task 3641) — the dashboard's _discover_escalation_urls keys on "
+        "that exact filename."
     )
