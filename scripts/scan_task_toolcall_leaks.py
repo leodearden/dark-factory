@@ -195,6 +195,16 @@ def _build_parser() -> argparse.ArgumentParser:
             'serialized <parameter name="..."> tool-call fragment). '
             "Detection/reporting only -- never mutates task text."
         ),
+        # The 0/1/2/3 codes below are RETURNED BY run_scan_cli() in
+        # _task_db_scan.py, not by anything in this file -- this epilog is only
+        # a --help-visible copy of that contract. It is the fourth copy, beside
+        # run_scan_cli()'s docstring, main()'s docstring below, and the
+        # byte-parallel epilog in scan_provenance_note_log_leaks.py. Nothing
+        # enforces the lockstep, so change all four together. The standing fix
+        # is to hoist the shared wording into a SCAN_EXIT_CODE_EPILOG constant
+        # beside NO_DB_RESOLVED_MESSAGE in _task_db_scan.py, which task 3547
+        # held no lock on. (audit_wiped_metadata_files.py's epilog is NOT a
+        # copy -- it documents its own main()'s distinct codes.)
         epilog=(
             "exit codes: 0 = clean, no leaks found; 1 = at least one leak "
             "found; 2 = no tasks.db could be resolved from --db / "
