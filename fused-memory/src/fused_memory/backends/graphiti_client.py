@@ -3014,6 +3014,32 @@ class GraphitiBackend:
 
         Each record is a dict with keys: label, field, type, entity_type.
 
+        Columns are resolved BY NAME from ``result.header``, not positionally.
+        The measured live header (2026-08-06, task 3706) is 9 two-tuples::
+
+            [label, properties, types, options, language, stopwords,
+             entitytype, status, info]
+
+        This method previously bound ``entity_type`` to ``row[3]`` — the
+        ``options`` column, an ``OrderedDict`` like ``{'uuid': {}}`` — instead of
+        ``entitytype`` (``row[6]``, the string ``'NODE'``/``'RELATIONSHIP'``).
+        The fix is by-name resolution rather than a corrected index: switching to
+        ``row[6]`` would repair today's symptom while leaving the same silent
+        degradation armed for the next FalkorDB column reorder.  Mirrors
+        ``tests/_fm_helpers.await_index_operational``, which resolves ``status``
+        by name for exactly this reason.
+
+        A missing required column raises rather than returning a record with a
+        silently-wrong or absent value.
+
+        Note the returned ``type`` value is the ``types`` COLUMN — a dict of
+        property -> list of index-type strings, e.g. ``{'uuid': ['RANGE']}`` —
+        NOT a scalar.  ``fused_memory.backends.falkor_indices.normalize_index_record``
+        models that shape.  (``drop_vector_indices`` still compares that dict
+        against the string ``'VECTOR'`` and is therefore a latent no-op; that is
+        pre-existing, deliberately out of scope for task 3706, and filed as a
+        separate follow-up.)
+
         Note on the CALL db.indexes() procedure and the read-only path:
         ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
         read-only path in this file — all other ``ro_query`` callers use plain
@@ -3033,14 +3059,28 @@ class GraphitiBackend:
         # CALL db.indexes() is a read-only procedure; FalkorDB accepts it via
         # GRAPH.RO_QUERY (verified via test_list_indices_integration.py).
         result = await graph.ro_query('CALL db.indexes()')
+
+        # Resolve columns by name, so a FalkorDB column reorder fails loudly
+        # here instead of silently reading the wrong column (see the docstring).
+        header_names = [col[1] for col in (result.header or [])]
+        wanted = {
+            'label': 'label',
+            'field': 'properties',
+            'type': 'types',
+            'entity_type': 'entitytype',
+        }
+        missing = [column for column in wanted.values() if column not in header_names]
+        if missing:
+            raise ValueError(
+                f'CALL db.indexes() is missing required column(s) {missing}; '
+                f'FalkorDB changed its result shape (header={header_names}). '
+                'Refusing to return index records with silently-wrong values.'
+            )
+        positions = {key: header_names.index(column) for key, column in wanted.items()}
+
         indices = []
         for row in (result.result_set or []):
-            indices.append({
-                'label': row[0],
-                'field': row[1],
-                'type': row[2],
-                'entity_type': row[3],
-            })
+            indices.append({key: row[idx] for key, idx in positions.items()})
         return indices
 
     @_canonicalize_group_args
