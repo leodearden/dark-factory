@@ -58,6 +58,9 @@ from __future__ import annotations
 
 import re
 
+from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
+
 # The PRD normal form: (label, entity_type, field, index_type).
 IndexSpec = tuple[str, str, str, str]
 
@@ -222,3 +225,38 @@ def parse_index_statement(statement: str) -> list[IndexSpec]:
         return [(label, entity_type, prop, index_type) for prop in props]
 
     raise _fail(statement, 'matched no known FalkorDB index form')
+
+
+def expected_index_set() -> set[IndexSpec]:
+    """The SINGLE home for "what indices should exist" on a FalkorDB graph.
+
+    Derived by parsing what graphiti itself emits, never by restating it (INV-5,
+    PRD D3).  β (``ensure_indices``) and δ (``summarize_index_health``) both
+    consume this rather than keeping their own copy, so a graphiti upgrade that
+    changes the index set is picked up automatically, and one that changes the
+    statement SYNTAX fails loudly via :class:`UnparsedIndexStatementError`
+    instead of silently shortening the set.
+
+    Deliberately PARAMETERLESS and hard-bound to ``GraphProvider.FALKORDB``.
+    MEASURED 2026-08-06: ``GraphProvider`` is a plain ``Enum``, so
+    ``GraphProvider.FALKORDB == 'falkordb'`` is **False** and
+    ``get_range_indices('falkordb')`` returns 27 NEO4J statements with **no
+    error** — the ``(provider: GraphProvider)`` annotation is not enforced at
+    runtime.  A ``provider=`` argument would therefore exist only to let a caller
+    pass the one value that silently produces the wrong answer.  This repo
+    targets FalkorDB, so the parameter buys nothing and costs a live footgun.
+
+    Results are intentionally NOT cached: the call is a handful of regex passes,
+    and a cached set would complicate a graphiti upgrade taking effect.
+
+    Returns:
+        Every ``(label, entity_type, field, index_type)`` that should exist.
+
+    Raises:
+        UnparsedIndexStatementError: graphiti emitted a statement form this
+            module does not recognise — see the class docstring.
+    """
+    statements = list(get_range_indices(GraphProvider.FALKORDB)) + list(
+        get_fulltext_indices(GraphProvider.FALKORDB)
+    )
+    return {spec for statement in statements for spec in parse_index_statement(statement)}
