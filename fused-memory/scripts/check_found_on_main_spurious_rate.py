@@ -74,6 +74,8 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from shared.task_metadata import parse_metadata
+
 logger = logging.getLogger('check_found_on_main_spurious_rate')
 
 # Verdicts this predicate gates on — a strict subset of the audit module's
@@ -130,6 +132,25 @@ def _id_sort_key(task_id: str) -> int:
     return int(task_id) if str(task_id).isdecimal() else 0
 
 
+def _stamped_at_of(task: dict[str, Any]) -> str | None:
+    """Read ``metadata.done_provenance.stamped_at`` off a raw task dict, or
+    ``None`` when absent/unreadable — never raises.
+
+    ``parse_metadata`` accepts metadata as either a dict or a JSON string
+    (both shapes come back from ``get_tasks()``) and is itself warn-and-omit
+    rather than raising on malformed input, so a corrupt blob degrades to
+    ``None`` here and the caller falls back to ``updatedAt``.
+    """
+    try:
+        meta, _warnings = parse_metadata(task.get('metadata'), direction='read')
+    except Exception:  # noqa: BLE001 - never-raises contract; any parse
+        return None      # failure just means "no usable stamp".
+    provenance = meta.done_provenance
+    if provenance is None:
+        return None
+    return getattr(provenance, 'stamped_at', None)
+
+
 def find_spurious_since(
     report: dict[str, Any], tasks: list[dict[str, Any]], since: datetime,
 ) -> list[dict[str, Any]]:
@@ -141,34 +162,59 @@ def find_spurious_since(
     return value; *tasks* is the raw task list already fetched for that
     call (same ``get_tasks()`` shape), reused here rather than refetched —
     ``build_audit_report``'s ``tasks`` detail entries don't carry
-    ``updatedAt`` through. A task with a missing or unparseable
-    ``updatedAt`` is conservatively excluded (timing can't be confirmed,
-    so it is never silently counted as "after") rather than raising.
+    ``updatedAt`` through. A task whose freshness timestamp is missing or
+    unparseable is conservatively excluded (timing can't be confirmed, so it
+    is never silently counted as "after") rather than raising.
 
-    Freshness caveat: ``updatedAt`` over-approximates "the found_on_main
-    stamp was (re)written after *since*" — any write to the task bumps it,
-    so a task touched for an unrelated reason after *since* can still be
-    included even if its stamp itself predates *since* (see module
-    docstring "Freshness caveat"; ``done_provenance`` carries no dedicated
-    stamp-write timestamp to key off of instead).
+    Freshness (task 3576): the timestamp compared against *since* is
+    ``metadata.done_provenance.stamped_at`` — the dedicated stamp-*write*
+    instant recorded server-side by fused-memory's
+    ``_validate_done_provenance`` chokepoint — falling back to ``updatedAt``
+    only when no usable ``stamped_at`` is present. That fallback is what
+    ``updatedAt`` alone used to do for every task, and it over-approximates:
+    ANY write to a task bumps ``updatedAt`` (a re-tag, an unrelated metadata
+    annotation, a dependency edit, the audit's own ``--apply`` annotation),
+    so an old stamp touched later for an unrelated reason re-entered the
+    window on every run. ``stamped_at`` answers the question this predicate
+    actually asks — "was this attribution asserted after *since*?" — exactly
+    rather than by approximation.
+
+    Each record is annotated with ``stamp_class``: ``'fresh'`` when its
+    freshness came from ``stamped_at``, ``'legacy'`` when it fell back to
+    ``updatedAt``. See :func:`gating_offenders` for what that gates.
 
     Returns records sorted by ``int(task_id)`` for deterministic output.
     """
-    updated_at_by_id = {str(t.get('id', '')): t.get('updatedAt') for t in tasks}
+    by_id = {str(t.get('id', '')): t for t in tasks}
     offenders: list[dict[str, Any]] = []
     for detail in report.get('tasks', []):
         verdict = detail.get('verdict')
         if verdict not in _SPURIOUS_VERDICTS:
             continue
         task_id = detail['task_id']
-        updated_dt = _parse_task_timestamp(updated_at_by_id.get(task_id))
-        if updated_dt is None or updated_dt <= since:
+        task = by_id.get(task_id)
+        if task is None:
             continue
+
+        updated_at = task.get('updatedAt')
+        stamped_at = _stamped_at_of(task)
+        # Prefer the dedicated stamp-write instant; fall back to updatedAt
+        # when it is absent (a pre-3576 blob) or unparseable (corrupt).
+        freshness_dt = _parse_task_timestamp(stamped_at)
+        stamp_class = 'fresh'
+        if freshness_dt is None:
+            freshness_dt = _parse_task_timestamp(updated_at)
+            stamp_class = 'legacy'
+        if freshness_dt is None or freshness_dt <= since:
+            continue
+
         offenders.append({
             'task_id': task_id,
             'commit': detail.get('commit'),
             'verdict': verdict,
-            'updated_at': updated_at_by_id.get(task_id),
+            'updated_at': updated_at,
+            'stamped_at': stamped_at,
+            'stamp_class': stamp_class,
         })
     offenders.sort(key=lambda o: _id_sort_key(o['task_id']))
     return offenders
