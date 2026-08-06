@@ -1119,6 +1119,41 @@ def _clear_fm_liveness_streak() -> None:
         log(f"failed to clear fm liveness streak at {FM_LIVENESS_STREAK_PATH}: {exc!r}")
 
 
+def _record_fm_liveness_failure(verdict: str) -> int:
+    """Record one non-healthy fm liveness verdict; return the new streak count.
+
+    PERSISTENCE IS MANDATORY, NOT STYLISTIC. orchestrator-watchdog.service is
+    ``Type=oneshot`` triggered by orchestrator-watchdog.timer's
+    ``OnUnitActiveSec=60``: the process EXITS between probes. A module-level
+    in-memory counter could therefore never accumulate past 1, and "N
+    consecutive failures" would silently degrade to "one failure" — the exact
+    behaviour this task removes. The count lives in FM_LIVENESS_STREAK_PATH.
+
+    MAX-AGE EXPIRY. A persisted entry older than
+    FM_LIVENESS_STREAK_MAX_AGE_SECS restarts the count at 1 rather than
+    incrementing it, so an hours-old streak (watchdog stopped, timer disabled,
+    host suspended, unit disabled and re-enabled) can never masquerade as a
+    fresh one. Ticks are ~60s apart, so a larger gap means several were missed
+    and the "consecutive" claim is no longer true.
+
+    WRITE FAILURES ARE SAFE. _write_fm_liveness_streak inherits
+    _atomic_write_json's fail-soft contract, so a write that does not land is
+    logged and swallowed. The returned count is still correct for THIS tick,
+    but nothing persisted — so the next tick starts from 1 again and the
+    counter can never climb to FM_LIVENESS_STREAK_THRESHOLD. A watchdog that
+    cannot persist evidence simply never restarts fused-memory, which is the
+    correct fail direction for this task.
+    """
+    now = time.time()
+    prior = _read_fm_liveness_streak()
+    if prior is None or (now - prior[1]) > FM_LIVENESS_STREAK_MAX_AGE_SECS:
+        count = 1
+    else:
+        count = prior[0] + 1
+    _write_fm_liveness_streak(count, verdict, now)
+    return count
+
+
 def main() -> None:
     """Probe each watched port; restart the unit if the port is not listening."""
     for port, unit in WATCHED:
