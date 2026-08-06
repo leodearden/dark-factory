@@ -30,6 +30,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
 # subproject directories (orchestrator/, shared/, ...) resolve as namespace
@@ -38,11 +40,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
+import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     PROTECTED_DEPLOY_CLOCK_RELPATHS,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
 )
+
+# NOT `from df_pytest_isolation import _df_deploy_clocks_unwritten`. Importing a
+# fixture into a TEST module binds it as a module-scoped fixture that SHADOWS
+# the conftest's — which would make the liveness test below resolve its own
+# import and pass even with the conftest wiring removed, i.e. exactly the dead
+# defence it exists to detect. Reach it through the module instead.
+_GUARD_NAME = '_df_deploy_clocks_unwritten'
 
 _FLEET_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 _FM_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
@@ -239,3 +249,52 @@ class TestDeployClockViolationReason:
         _write(tmp_path, _FLEET_RELPATH, b'stamped by a test\n')
 
         assert deploy_clock_violation_reason(clean, deploy_clock_snapshot(tmp_path)) is not None
+
+
+class TestGuardIsLiveInThisRun:
+    """The fixture is WIRED, not merely defined.
+
+    Everything above tests pure functions against ``tmp_path`` roots; all of it
+    would stay green if the fixture were never loaded by any conftest.  This
+    class is the only assertion that the defence is actually armed in the
+    process running it — the difference between a wired defence and a dead one.
+    """
+
+    def test_the_guard_fixture_exists(self) -> None:
+        assert hasattr(df_pytest_isolation, _GUARD_NAME), (
+            f'df_pytest_isolation defines no {_GUARD_NAME}; the pure helpers '
+            'above protect nothing on their own.'
+        )
+
+    def test_the_guard_fixture_is_session_scoped_and_autouse(self) -> None:
+        """Both properties pinned STRUCTURALLY, not by inspection of behaviour.
+
+        A function-scoped or non-autouse variant would still import cleanly and
+        keep every test above green while protecting nothing: function scope
+        would miss writes from module-/session-scoped fixtures (where expensive
+        subprocess setup tends to live), and without ``autouse`` nothing would
+        ever request it.
+        """
+        marker = getattr(df_pytest_isolation, _GUARD_NAME)._pytestfixturefunction
+
+        assert marker.scope == 'session', f'scope is {marker.scope!r}, expected session'
+        assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
+
+    def test_the_guard_fixture_is_registered_in_this_run(self, request) -> None:
+        """The conftest binding is real WIRING, not a dormant definition.
+
+        pytest only collects fixtures bound into a conftest's namespace, which
+        is why df_pytest_isolation's fixtures are imported there under
+        ``# noqa: F401 — the binding IS the wiring``. Deleting that import
+        breaks nothing visible except this assertion.
+        """
+        try:
+            request.getfixturevalue(_GUARD_NAME)
+        except pytest.FixtureLookupError:
+            pytest.fail(
+                f'{_GUARD_NAME} is not registered for this rootdir. Wire the '
+                'test-root conftest to import it from df_pytest_isolation '
+                '(`# noqa: F401 — the binding IS the wiring`); without that, '
+                'this whole suite runs with no deploy-clock guard.',
+                pytrace=False,
+            )
