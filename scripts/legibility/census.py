@@ -2051,6 +2051,14 @@ def _build_default_verify_fn(
             Matching ``preflight_headroom``'s own fail-safe stance turns that
             into the deferral this guard exists to produce.
             """
+            if headroom_probe is None:
+                # Unreachable -- every call site below is guarded by
+                # `headroom_probe is not None`. Stated rather than asserted so
+                # a future caller that forgets the guard gets the DOCUMENTED
+                # no-probe behaviour (the detectors are no-ops; nothing says
+                # the account is capped) and spends no probe, instead of a
+                # TypeError escaping mid-verification.
+                return HeadroomResult(ok=True, reason=None)
             probes[0] += 1
             try:
                 return headroom_probe()
