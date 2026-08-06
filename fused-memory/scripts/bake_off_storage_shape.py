@@ -1861,7 +1861,11 @@ DEFAULT_REPORT_MD = _PACKAGE_ROOT.parent / 'plans' / 'e2-storage-shape-bakeoff-r
 
 #: Bumped when the JSON's shape changes, so a reader of an old artifact is
 #: never silently comparing two different schemas.
-REPORT_SCHEMA_VERSION = 1
+#: v2 — the `discoverability` block gained the transform-blind trio
+#: (`stored_canonical_in_top_5_rate` / `_median_rank` / `_found_count`), so a
+#: v1 artifact and a v2 one answer different questions in the same column
+#: names and must not be diffed as if they were the same schema.
+REPORT_SCHEMA_VERSION = 2
 
 
 class IncompleteReportError(RuntimeError):
@@ -2160,6 +2164,18 @@ def render_markdown(report: dict[str, Any]) -> str:
         'arm, pin, window or threshold was re-tuned to move either column, '
         'and both numbers are recorded exactly as measured (gate G6/D10 '
         'assert no threshold on any of them).',
+        '',
+        'What that reads as in THIS run: the two columns agree exactly for '
+        '`status_quo` and for `c_peers`, neither of which runs a grouping '
+        'transform, and diverge only under `b_grouped` — whose '
+        'transform-blind rate lands on `c_peers`\'.  So `b_grouped`\'s '
+        'discoverability lead in the table above is the read transform\'s '
+        'contribution, not a retrieval difference: the same records were '
+        'retrieved, and grouping put the canonical\'s body in the window '
+        'anyway.  Whether that is worth crediting is gate η\'s call, and it '
+        'is a different call from "grouping retrieves the canonical better".  '
+        'The same split shows on the `held_out` rows of the by-kind table, '
+        'which are the only ones measuring generalisation.',
         '',
         '`pin changed window` is the diagnostic that makes the `+pin` rows '
         'readable.  Every variant is scored over a window of the SAME size '
