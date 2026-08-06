@@ -31,7 +31,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _task_db_scan import (
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+)
 from audit_combine_gate_marker_loss import (
+    EXIT_LIVE_FINDINGS,
+    EXIT_NO_ROOT,
+    EXIT_NOTHING_SCANNED,
+    EXIT_OK,
     NO_COMPARISON_SOURCE_KEY,
     SOURCE_MANIFEST,
     SOURCE_NONE,
@@ -1627,11 +1637,28 @@ def test_main_exit_0_when_a_gate_removing_loss_is_terminal(tmp_path, make_tasks_
     assert f"severity={SEVERITY_GATE_REMOVING}" in result.stdout
 
 
+def test_exit_constants_alias_the_shared_tier_3_codes():
+    """The per-script EXIT_* names must stay the SHARED values, not copies.
+
+    audit_combine_gate_marker_loss.py:1068 states the constants are named "so
+    the epilog, main()'s docstring and the returns can never drift into
+    disagreeing about what a number means". Since task 3616 the returns live in
+    _task_db_scan.run_audit_cli, so that no-drift property now spans a module
+    boundary and nothing else enforces it: this script could redefine EXIT_OK =
+    9 and its epilog would keep promising 0 while run_audit_cli kept returning
+    it. This assertion is what keeps the alias honest.
+    """
+    assert EXIT_OK == AUDIT_EXIT_OK
+    assert EXIT_LIVE_FINDINGS == AUDIT_EXIT_FINDINGS
+    assert EXIT_NO_ROOT == AUDIT_EXIT_NO_ROOT
+    assert EXIT_NOTHING_SCANNED == AUDIT_EXIT_NOTHING_AUDITED
+
+
 def test_main_exit_2_when_no_project_root_resolves(tmp_path):
     """Nothing resolvable -> exit 2, empty stdout, reason on stderr."""
     result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
 
-    assert result.returncode == 2
+    assert result.returncode == EXIT_NO_ROOT
     assert result.stdout.strip() == ""
     assert "no project root" in result.stderr.lower()
 
@@ -1645,7 +1672,8 @@ def test_main_exit_3_when_roots_resolve_but_nothing_is_scanned(tmp_path):
 
     result = _run_cli("--project-root", str(root))
 
-    assert result.returncode == 3
+    assert result.returncode == EXIT_NOTHING_SCANNED
+    assert result.returncode != EXIT_OK
     assert "not a clean result" in result.stderr.lower()
 
 
