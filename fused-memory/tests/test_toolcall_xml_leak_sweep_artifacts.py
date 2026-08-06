@@ -332,13 +332,16 @@ class TestDangerFlagsMatchTheProductionScript:
 
     def test_hand_copy_equals_what_the_script_acts_on(self) -> None:
         production, origin = _production_danger_flags()
-        assert set(DANGER_FLAGS) == production, (
+        # Widened to set[str]: the tuple's inferred literal type makes the
+        # difference operator ill-typed against a set[str] read at runtime.
+        hand_copy: set[str] = set(DANGER_FLAGS)
+        assert hand_copy == production, (
             f'DANGER_FLAGS {sorted(DANGER_FLAGS)} != the flags the script acts '
             f'on {sorted(production)} (read from {origin}).'
             '\n  missing here: '
-            f'{sorted(production - set(DANGER_FLAGS))}'
+            f'{sorted(production - hand_copy)}'
             '\n  stale here:   '
-            f'{sorted(set(DANGER_FLAGS) - production)}'
+            f'{sorted(hand_copy - production)}'
             '\nRe-bind DANGER_FLAGS. Do NOT delete this assertion: while the '
             'two lists disagree, an unrepaired mutation carrying a flag this '
             'module does not know about is tracked by nobody and the whole '
