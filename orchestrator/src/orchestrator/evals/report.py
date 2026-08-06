@@ -647,6 +647,7 @@ def build_composite_report(
             'plan_quality_scores': [],
             'plan_quality_cap_excluded': 0,
             'plan_quality_no_plan': 0,
+            'plan_quality_judged_without_reference': 0,
             # The $/usable-plan NUMERATOR (task 3379): spend over admitted
             # plan-only cells, summed under the SAME condition that fills
             # plan_quality_scores — see the accumulation site.
@@ -742,6 +743,17 @@ def build_composite_report(
             # discount. A no-plan cell's spend DOES land here — that is what
             # makes the figure $/usable plan rather than $/cell.
             acc['plan_cost_usd'] += cost
+            # …and the σ VALIDITY bound (task 3628) is counted under that SAME
+            # one admission decision, which is what makes it a strict subset of
+            # plan_quality_n and keeps it in lockstep with the θ surface's pool.
+            # Alone among the three counts this one changes NO number: the cell
+            # contributes its real score to the quality axis, the composite and
+            # the cost pools exactly as a healthy cell does. It neither excludes
+            # (cap_excluded) nor floors (no_plan) — it reports that the score,
+            # while real, was produced without ground truth to grade against, so
+            # only the CONFIDENCE attached to it is reduced.
+            if m.get('judged_without_reference'):
+                acc['plan_quality_judged_without_reference'] += 1
         # Counted over ARCHITECT trials only, matching
         # build_plan_quality_report's architect-scoped cap_excluded — the two
         # exclusion surfaces describe the same cells and must not disagree. (A
@@ -819,6 +831,12 @@ def build_composite_report(
             # and were scored 0.0 — the content-failure counterpart of the
             # transport-failure count above.
             'plan_quality_no_plan': acc['plan_quality_no_plan'],
+            # …and how many of that same admitted pool were judged WITHOUT a
+            # reference diff (task 3628) — a validity bound on the
+            # plan_quality above, not a third way of removing cells from it.
+            'plan_quality_judged_without_reference': acc[
+                'plan_quality_judged_without_reference'
+            ],
             # The ADMITTED θ pool's size — the denominator both derived figures
             # below are taken over, carried on the row so each is verifiable
             # from the row ALONE rather than by re-deriving it from the θ
