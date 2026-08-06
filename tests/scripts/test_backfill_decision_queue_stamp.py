@@ -39,8 +39,14 @@ import pytest  # pyright: ignore[reportMissingImports]
 from orchestrator import session_registry as sr
 
 from backfill_decision_queue_stamp import (
+    EXIT_BAD_ARGS,
+    EXIT_NO_QUEUE,
+    EXIT_OK,
+    EXIT_UNSTAMPED,
+    EXIT_UNUSABLE_QUEUE,
     queues_holding,
     resolve_queue_for_decision,
+    unusable_queues,
 )
 
 SCRIPT = Path(__file__).resolve().parent.parent.parent / 'scripts' / 'backfill_decision_queue_stamp.py'
@@ -142,7 +148,14 @@ def test_queues_holding_skips_a_missing_queue_dir(tmp_path: Path) -> None:
 
     The live invocation passes six project queues; a project checked out on
     another machine, renamed, or not yet escalated-in must not abort a
-    migration over the whole fleet.
+    migration over the whole fleet. A queue can also vanish MID-RUN under a
+    concurrent watcher, which is why the per-queue skip stays here.
+
+    SKIPPED IS NOT SILENT: the loudness lives one level up, in main(), which
+    reports every unusable --queue once up front (rather than once per record)
+    and REFUSES to --apply over one. See
+    test_main_is_loud_about_an_unusable_queue_in_a_dry_run and
+    test_main_refuses_to_apply_with_an_unusable_queue.
     """
     present = _make_queue(tmp_path, 'orch', root_ids=('esc-1-1',))
     missing = tmp_path / 'never-created'
@@ -196,12 +209,16 @@ def test_resolve_no_escalation_id_is_unknown(tmp_path: Path) -> None:
     q = _make_queue(tmp_path, 'orch', root_ids=('esc-1-1',))
 
     for empty in (None, ''):
-        assert resolve_queue_for_decision(
+        resolved, holders = resolve_queue_for_decision(
             _record(escalation_id=empty),
             queues=[q],
             recon_queue=None,
             orch_queue_for_project={},
-        ) == sr.UNKNOWN_QUEUE
+        )
+        assert resolved == sr.UNKNOWN_QUEUE
+        # No id means no lookup was even attempted, so the reported evidence
+        # must be empty rather than whatever a queue happens to contain.
+        assert holders == []
 
 
 @pytest.mark.parametrize('tier', ['root', 'archive'])
@@ -216,7 +233,7 @@ def test_resolve_single_holder_wins_outright(tmp_path: Path, tier: str) -> None:
     q = _make_queue(tmp_path, 'orch', **kwargs)  # pyright: ignore[reportArgumentType]
     decoy = _make_queue(tmp_path, 'recon')
 
-    resolved = resolve_queue_for_decision(
+    resolved, holders = resolve_queue_for_decision(
         _record(session_id=None),
         queues=[q, decoy],
         recon_queue=decoy,
@@ -232,12 +249,15 @@ def test_resolve_zero_holders_is_unknown(tmp_path: Path) -> None:
     """
     empty = _make_queue(tmp_path, 'orch')
 
-    assert resolve_queue_for_decision(
+    resolved, holders = resolve_queue_for_decision(
         _record(escalation_id='esc-vanished-1'),
         queues=[empty],
         recon_queue=empty,
         orch_queue_for_project={'df': empty},
-    ) == sr.UNKNOWN_QUEUE
+    )
+
+    assert resolved == sr.UNKNOWN_QUEUE
+    assert holders == []
 
 
 def test_resolve_ambiguous_null_session_id_corroborated_picks_recon(tmp_path: Path) -> None:
@@ -253,7 +273,7 @@ def test_resolve_ambiguous_null_session_id_corroborated_picks_recon(tmp_path: Pa
     recon = _make_queue(tmp_path, 'recon', root_ids=('esc-1-1',))
     orch = _make_queue(tmp_path, 'orch', archive_ids=('esc-1-1',))
 
-    resolved = resolve_queue_for_decision(
+    resolved, holders = resolve_queue_for_decision(
         _record(session_id=None),
         queues=[orch, recon],
         recon_queue=recon,
@@ -271,7 +291,7 @@ def test_resolve_ambiguous_watcher_session_id_corroborated_picks_orch(tmp_path: 
     recon = _make_queue(tmp_path, 'recon', root_ids=('esc-1-1',))
     orch = _make_queue(tmp_path, 'orch', archive_ids=('esc-1-1',))
 
-    resolved = resolve_queue_for_decision(
+    resolved, holders = resolve_queue_for_decision(
         _record(project='df', session_id='watcher-df-4029467'),
         queues=[orch, recon],
         recon_queue=recon,
@@ -295,7 +315,7 @@ def test_resolve_ambiguous_uncorroborated_inference_is_unknown(tmp_path: Path) -
     b = _make_queue(tmp_path, 'b', archive_ids=('esc-1-1',))
     orch_without_the_id = _make_queue(tmp_path, 'orch')
 
-    resolved = resolve_queue_for_decision(
+    resolved, holders = resolve_queue_for_decision(
         _record(project='df', session_id='watcher-df-4029467'),
         queues=[a, b, orch_without_the_id],
         recon_queue=None,
@@ -313,7 +333,7 @@ def test_resolve_ambiguous_uncorroborated_recon_inference_is_unknown(tmp_path: P
     b = _make_queue(tmp_path, 'b', archive_ids=('esc-1-1',))
     recon_without_the_id = _make_queue(tmp_path, 'recon')
 
-    resolved = resolve_queue_for_decision(
+    resolved, holders = resolve_queue_for_decision(
         _record(session_id=None),
         queues=[a, b, recon_without_the_id],
         recon_queue=recon_without_the_id,
@@ -335,7 +355,7 @@ def test_resolve_ambiguous_unrecognized_session_id_shape_is_unknown(tmp_path: Pa
     b = _make_queue(tmp_path, 'b', archive_ids=('esc-1-1',))
     orch = _make_queue(tmp_path, 'orch', root_ids=('esc-1-1',))
 
-    resolved = resolve_queue_for_decision(
+    resolved, holders = resolve_queue_for_decision(
         _record(project='df', session_id='unblock-df-2085-4242'),
         queues=[a, b, orch],
         recon_queue=None,
@@ -358,7 +378,7 @@ def test_resolve_ambiguous_unmapped_project_is_unknown(tmp_path: Path) -> None:
     a = _make_queue(tmp_path, 'a', root_ids=('esc-1-1',))
     b = _make_queue(tmp_path, 'b', archive_ids=('esc-1-1',))
 
-    resolved = resolve_queue_for_decision(
+    resolved, holders = resolve_queue_for_decision(
         _record(project='unmapped-project', session_id='watcher-unmapped-project-99'),
         queues=[a, b],
         recon_queue=None,
@@ -378,7 +398,7 @@ def test_resolve_returns_a_normalized_path(tmp_path: Path) -> None:
     dotted = Path(str(tmp_path / 'x' / '..' / 'orch') + '/')
     assert str(dotted) != str(tmp_path / 'orch')
 
-    resolved = resolve_queue_for_decision(
+    resolved, holders = resolve_queue_for_decision(
         _record(),
         queues=[dotted],
         recon_queue=None,
@@ -387,6 +407,40 @@ def test_resolve_returns_a_normalized_path(tmp_path: Path) -> None:
 
     assert resolved == sr.normalize_escalations_dir(tmp_path / 'orch')
     assert Path(resolved).is_absolute()
+    assert holders == [dotted]
+
+
+def test_resolve_returns_the_holder_evidence_it_actually_used(tmp_path: Path) -> None:
+    """The resolver hands back the holder set its ladder consulted.
+
+    main() needs holders twice — once to DECIDE the stamp, once to LABEL the
+    disposition for the audit report — and the two must be the same
+    observation. Looking the id up a second time would be a second read of a
+    live tree the C8 watchers are concurrently archiving into: an escalation
+    moved between the two calls yields a report claiming 'unique-hit' for a
+    stamp the resolver derived from a two-holder set. The report is the
+    durable artifact this migration is judged by, so a label that describes a
+    holder set the decision never saw is worse than no label.
+
+    Pinned on the AMBIGUOUS case specifically, because that is where the
+    holder count is what distinguishes unique-hit from tiebreak-*.
+    """
+    recon = _make_queue(tmp_path, 'recon', root_ids=('esc-1-1',))
+    orch = _make_queue(tmp_path, 'orch', archive_ids=('esc-1-1',))
+
+    resolved, holders = resolve_queue_for_decision(
+        _record(session_id=None),
+        queues=[orch, recon],
+        recon_queue=recon,
+        orch_queue_for_project={'df': orch},
+    )
+
+    assert resolved == sr.normalize_escalations_dir(recon)
+    assert holders == [orch, recon], 'both holders must be reported, in caller order'
+    assert holders == queues_holding('esc-1-1', [orch, recon]), (
+        'the returned evidence must equal what queues_holding reports for the '
+        'same id and queues -- otherwise the label and the decision disagree'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -581,10 +635,10 @@ def test_main_verify_exits_nonzero_before_and_zero_after_apply(tmp_path: Path) -
     applied = _run(fleet, *_queue_args(orch, recon), '--apply')
     after = _run(fleet, *_queue_args(orch, recon), '--verify')
 
-    assert before.returncode == 2, before.stdout
+    assert before.returncode == EXIT_UNSTAMPED, before.stdout
     assert 'dec-unique' in before.stdout
-    assert applied.returncode == 0, applied.stderr
-    assert after.returncode == 0, after.stdout
+    assert applied.returncode == EXIT_OK, applied.stderr
+    assert after.returncode == EXIT_OK, after.stdout
 
 
 def test_main_prints_a_summary_with_counts_by_disposition(tmp_path: Path) -> None:
@@ -648,19 +702,22 @@ def test_main_fail_soft_on_a_corrupt_decision_file(tmp_path: Path) -> None:
 
 
 def test_main_requires_at_least_one_queue(tmp_path: Path) -> None:
-    """No usable queue argument is its OWN exit code, never a clean run.
+    """No queue argument is its OWN exit code, never a clean run.
 
     Without it, an operator who fat-fingers the flags gets exit 0 and a
     zero-candidate report that reads exactly like "everything is already
     stamped" -- the failure mode where a migration is believed to have run and
     did not.
+
+    Asserts the EXACT code, not merely non-zero: a bare `!= 0` would pass just
+    as happily against an unhandled traceback or a regression into the
+    write-failed code, i.e. it would not test what the name claims.
     """
     fleet, _orch, _recon = _fixture_fleet(tmp_path)
 
     proc = _run(fleet, '--apply')
 
-    assert proc.returncode != 0
-    assert proc.returncode != 2  # not to be confused with --verify's residue code
+    assert proc.returncode == EXIT_NO_QUEUE, proc.stderr
 
 
 def test_main_rejects_a_malformed_orch_queue_pair(tmp_path: Path) -> None:
@@ -669,10 +726,153 @@ def test_main_rejects_a_malformed_orch_queue_pair(tmp_path: Path) -> None:
     Silently ignoring it would drop the rule-5 tiebreak for that project and
     quietly downgrade every one of its ambiguous records to UNKNOWN -- a
     strictly-worse outcome wearing a clean exit code.
+
+    The exact code matters here too, and specifically must NOT be
+    EXIT_WRITE_FAILED: this parse happens before the candidate loop, so
+    nothing has been read let alone written, and reporting "a write failed"
+    would send an operator looking for a half-stamped population that does not
+    exist.
     """
     fleet, orch, recon = _fixture_fleet(tmp_path)
 
     proc = _run(fleet, '--queue', str(orch), '--orch-queue', str(recon))
 
-    assert proc.returncode != 0
+    assert proc.returncode == EXIT_BAD_ARGS, proc.stderr
     assert 'orch-queue' in (proc.stderr + proc.stdout)
+
+
+def test_main_argparse_usage_error_is_not_the_verify_residue_code(tmp_path: Path) -> None:
+    """A typo'd flag must not be indistinguishable from a violated invariant.
+
+    Stock argparse exits 2 on an unknown flag -- the same code this script
+    publishes for "--verify found OPEN records still lacking a queue stamp".
+    A wrapper or operator keying off 2 would read a fat-fingered flag as the
+    migration having failed to hold. _ArgParser.error routes it to
+    EXIT_BAD_ARGS instead.
+    """
+    fleet, orch, _recon = _fixture_fleet(tmp_path)
+
+    proc = _run(fleet, '--queue', str(orch), '--no-such-flag')
+
+    assert proc.returncode == EXIT_BAD_ARGS, proc.stderr
+    assert proc.returncode != EXIT_UNSTAMPED
+    assert 'no-such-flag' in proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Unusable --queue paths: the one degradation that can produce a WRONG stamp
+# ---------------------------------------------------------------------------
+
+
+def test_unusable_queues_reports_each_bad_path_and_why(tmp_path: Path) -> None:
+    """The pure classifier behind the loud report: which paths, and why."""
+    good = _make_queue(tmp_path, 'orch', root_ids=('esc-1-1',))
+    missing = tmp_path / 'never-created'
+    a_file = tmp_path / 'not-a-dir'
+    a_file.write_text('oops')
+
+    bad = unusable_queues([good, missing, a_file])
+
+    assert [p for p, _why in bad] == [missing, a_file]
+    assert dict(bad)[missing] == 'does not exist'
+    assert dict(bad)[a_file] == 'not a directory'
+    assert unusable_queues([good]) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses directory permissions')
+def test_unusable_queues_catches_an_existing_but_unreadable_dir(tmp_path: Path) -> None:
+    """An unreadable queue dir is unusable even though it exists and IS a dir.
+
+    This is the case Path.is_dir() cannot see: the stat succeeds, so a naive
+    is_dir() check passes it through as usable, and rglob then walks it to
+    exactly zero results — indistinguishable from a queue that genuinely does
+    not hold the id. That silent shrinkage of the holder set is the wrong-stamp
+    hazard, so it must be classified as unusable rather than merely empty.
+    """
+    locked = _make_queue(tmp_path, 'locked', root_ids=('esc-1-1',))
+    locked.chmod(0o000)
+    try:
+        bad = unusable_queues([locked])
+    finally:
+        locked.chmod(0o755)
+
+    assert [p for p, _why in bad] == [locked]
+    assert dict(bad)[locked] == 'not readable'
+
+
+def test_main_is_loud_about_an_unusable_queue_in_a_dry_run(tmp_path: Path) -> None:
+    """A mistyped --queue must never degrade silently.
+
+    This is the ONE degradation that can write a WRONG stamp rather than a
+    conservative one. Every other failure mode here falls towards <unknown>,
+    which merely withdraws a record from automatic reaping. A dropped queue
+    SHRINKS the holder set, so an id held by both dark_factory queues looks
+    like a unique hit against whichever one survived -- durably writing the
+    cross-queue false-closure hazard 3528/3640 exist to remove.
+
+    queues_holding stays fail-soft per queue (a queue may legitimately vanish
+    mid-run, and one bad path must not decide the fate of the other five); the
+    LOUDNESS lives here in main(), reported once up front rather than once per
+    record. See test_queues_holding_skips_a_missing_queue_dir.
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+    typo = tmp_path / 'orch-typo'
+
+    proc = _run(fleet, *_queue_args(orch, recon), '--queue', str(typo))
+
+    assert proc.returncode == EXIT_OK, proc.stderr
+    assert f'UNUSABLE-QUEUE --queue {typo}' in proc.stderr
+    assert 'does not exist' in proc.stderr
+    # Also in the summary, because the summary is what gets pasted into the
+    # audit report -- a report that does not say the run searched fewer queues
+    # than it was given overstates how much evidence its stamps rest on.
+    assert 'unusable queues: 1' in proc.stdout
+
+
+def test_main_refuses_to_apply_with_an_unusable_queue(tmp_path: Path) -> None:
+    """--apply is REFUSED while any --queue is unusable, with its own code.
+
+    A dry run over an incomplete queue set is merely a misleading report; an
+    --apply over one writes that misleading conclusion onto live records,
+    where the only signal it was ever wrong is a decision silently vanishing
+    from the cockpit later. Nothing is written, and nothing on disk changes.
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+    before = _stamps(fleet)
+    typo = tmp_path / 'recon-typo'
+
+    proc = _run(fleet, *_queue_args(orch, recon), '--queue', str(typo), '--apply')
+
+    assert proc.returncode == EXIT_UNUSABLE_QUEUE, proc.stderr
+    assert 'refusing to --apply' in proc.stderr
+    assert _stamps(fleet) == before, 'a refused --apply must write nothing'
+
+
+def test_main_warns_but_does_not_refuse_for_an_unusable_tiebreak_queue(
+    tmp_path: Path,
+) -> None:
+    """An unusable --recon-queue/--orch-queue warns; it does not block --apply.
+
+    The asymmetry is deliberate and is the reason these are reported under a
+    different label. A tiebreak target that does not exist can never
+    CORROBORATE, so every record that would have used it degrades to
+    <unknown> -- conservative, visible in the summary, and repairable by
+    re-running with the right path. Only --queue can turn an ambiguous id into
+    a false unique hit, so only --queue blocks the write.
+    """
+    fleet, orch, recon = _fixture_fleet(tmp_path)
+    typo = tmp_path / 'recon-typo'
+
+    proc = _run(
+        fleet,
+        '--queue', str(orch),
+        '--queue', str(recon),
+        '--recon-queue', str(typo),
+        '--orch-queue', f'df={orch}',
+        '--apply',
+    )
+
+    assert proc.returncode == EXIT_OK, proc.stderr
+    assert f'UNUSABLE-TIEBREAK-QUEUE {typo}' in proc.stderr
+    assert 'unusable tiebreak queues: 1' in proc.stdout
+    assert _stamps(fleet)['dec-unique'] == sr.normalize_escalations_dir(orch)

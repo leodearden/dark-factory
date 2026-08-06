@@ -177,3 +177,29 @@ stamped with that same queue**. No other bucket moved:
   (`reap_answered_decisions` skips a falsy `escalation_id` before consulting
   the queue). They are stamped so that "no OPEN record lacks a queue stamp"
   becomes a checkable invariant rather than an aspiration.
+
+## 8. Post-run CLI amendments (review pass)
+
+The run recorded above was executed with the CLI as it stood at commit
+`c764320cb8`. A subsequent review pass amended the script; the amendments are
+listed here so this report is not read as describing the current output
+verbatim. **No stamp changed** — the amendments are to reporting and argument
+handling, not to the resolver ladder. `--verify` was re-run against the live
+fleet with the amended script and is still at **exit 0**, zero residue.
+
+- The `---- summary ----` block gained an `unusable queues: N   unusable
+  tiebreak queues: N` line. Both were 0 for the run above (all sixteen paths in
+  the command line resolved to readable directories), which is why the recorded
+  block does not show it.
+- A `--queue` path that is missing, not a directory, or unreadable is now
+  reported loudly on stderr as `UNUSABLE-QUEUE`, and `--apply` is **refused**
+  while any is unusable. Previously such a path was skipped silently. That was
+  the one degradation that could produce a WRONG stamp rather than a
+  conservative one: a dropped queue shrinks the holder set, so an id held by
+  both dark_factory queues would look like a unique hit against whichever one
+  survived. Nothing in the run above depended on the old behaviour, but a
+  re-run with a typo'd path would now stop instead of writing.
+- Exit codes 4 (unusable command line) and 5 (`--apply` refused over an
+  unusable `--queue`) were added, and argparse's own usage errors were moved
+  off 2 so they can no longer be mistaken for "`--verify` found residue".
+  The 0 / 1 / 2 / 3 meanings the commands above were run under are unchanged.

@@ -54,8 +54,11 @@ Dry run is the DEFAULT; ``--apply`` is required to write anything.
 from __future__ import annotations
 
 import argparse
+import os
+import stat
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 # --- self-locating import bootstrap -----------------------------------------
 # scripts/ is not on sys.path when run standalone; bind `orchestrator` to the
@@ -84,14 +87,17 @@ def queues_holding(escalation_id: str, queues: list[Path]) -> list[Path]:
 
     Uses the SAME two-tier lookup as ``session_registry.read_escalation_status``
     — the queue-root file ``<queue>/<id>.json`` first (a still-pending
-    escalation), then a recursive search under ``<queue>/archive/`` (a
-    resolved/dismissed one, moved into a dated subdir by
-    ``escalation.queue._archive_resolved``). Matching the reaper's own notion
-    of "this queue contains that id" is load-bearing: if the two diverged, this
-    script could stamp a queue the reaper would never match against, and the
-    record would be pinned OPEN forever. The archive tier also carries most of
-    the value here — legacy records overwhelmingly point at escalations that
-    have long since resolved.
+    escalation), then a recursive search under
+    ``<queue>/<ESCALATION_ARCHIVE_SUBDIR>/`` (a resolved/dismissed one, moved
+    into a dated subdir by ``escalation.queue._archive_resolved``). Matching
+    the reaper's own notion of "this queue contains that id" is load-bearing:
+    if the two diverged, this script could stamp a queue the reaper would never
+    match against, and the record would be pinned OPEN forever. That is exactly
+    why the archive subdir is read from ``sr.ESCALATION_ARCHIVE_SUBDIR`` rather
+    than re-spelled here — a hand-synced copy of the literal is a divergence
+    waiting to happen, and nothing would fail loudly when it did. The archive
+    tier also carries most of the value here — legacy records overwhelmingly
+    point at escalations that have long since resolved.
 
     Duplicate spellings of one queue collapse to a single holder (compared via
     ``normalize_escalations_dir``). The real invocation passes the fleet-wide
@@ -114,7 +120,8 @@ def queues_holding(escalation_id: str, queues: list[Path]) -> list[Path]:
             if (queue / f'{escalation_id}.json').is_file():
                 found = True
             else:
-                found = any((queue / 'archive').rglob(f'{escalation_id}.json'))
+                archive = queue / sr.ESCALATION_ARCHIVE_SUBDIR
+                found = any(archive.rglob(f'{escalation_id}.json'))
         except OSError:
             continue
         if found:
@@ -129,8 +136,22 @@ def resolve_queue_for_decision(
     queues: list[Path],
     recon_queue: Path | None,
     orch_queue_for_project: dict[str, Path],
-) -> str:
-    """The value to stamp on *record*: a normalized queue path, or UNKNOWN_QUEUE.
+) -> tuple[str, list[Path]]:
+    """The value to stamp on *record*, WITH the holder evidence it rested on.
+
+    Returns ``(stamp, holders)`` — a normalized queue path or UNKNOWN_QUEUE,
+    plus the queues observed to hold this record's escalation id.
+
+    RETURNING THE EVIDENCE IS DELIBERATE, not a convenience. The caller must
+    also LABEL each disposition for the audit report, and the label is only
+    meaningful against the holder set the ladder below actually saw. Computing
+    holders twice would be two separate observations of a live directory tree
+    that the C8 watchers are concurrently archiving into: an escalation moved
+    between the two calls yields a report claiming e.g. "unique-hit" for a
+    stamp the resolver derived from a different holder set. The durable
+    artifact this migration is judged by would then misdescribe which stamps
+    rest on direct evidence and which on inference. One observation, one
+    decision, one label.
 
     An explicit ordered ladder. Direct evidence first; a measured tiebreak only
     to CHOOSE AMONG queues that demonstrably hold the id; UNKNOWN for
@@ -163,20 +184,20 @@ def resolve_queue_for_decision(
     # stamp" becomes a checkable invariant instead of an aspiration.
     escalation_id = record.escalation_id
     if not escalation_id:
-        return sr.UNKNOWN_QUEUE
+        return sr.UNKNOWN_QUEUE, []
 
     holders = queues_holding(escalation_id, queues)
 
     # Rule 3: the id resolves in no supplied queue -- archive retention pruned
     # it, or the owning project's queue was not passed. Refuse, don't guess.
     if not holders:
-        return sr.UNKNOWN_QUEUE
+        return sr.UNKNOWN_QUEUE, holders
 
     # Rule 2: exactly one holder -> direct evidence, no tiebreak runs. This
     # branch is deliberately ABOVE the heuristics: a measured regularity must
     # never override the id demonstrably being in one specific queue.
     if len(holders) == 1:
-        return sr.normalize_escalations_dir(holders[0])
+        return sr.normalize_escalations_dir(holders[0]), holders
 
     # Ambiguous from here down (2+ queues hold the id). Infer, then CORROBORATE.
     inferred: Path | None = None
@@ -202,10 +223,10 @@ def resolve_queue_for_decision(
         # the false-closure hazard being removed.
         canonical = sr.normalize_escalations_dir(inferred)
         if canonical in {sr.normalize_escalations_dir(h) for h in holders}:
-            return canonical
+            return canonical, holders
 
     # Rule 6: ambiguous and uncorroborated -> UNKNOWN. Human triage, not a coin flip.
-    return sr.UNKNOWN_QUEUE
+    return sr.UNKNOWN_QUEUE, holders
 
 
 # ---------------------------------------------------------------------------
@@ -214,14 +235,25 @@ def resolve_queue_for_decision(
 
 # Exit codes, named rather than spelled inline so the epilog, main()'s
 # docstring and the returns can never drift into disagreeing about what a
-# number means. Each denotes EXACTLY ONE outcome -- 2 and 3 exist separately
-# from 0 because 0 would otherwise cover both "examined everything, nothing to
-# do" and "examined nothing at all", and an operator reading only the exit code
+# number means. Each denotes EXACTLY ONE outcome -- 2..5 exist separately from
+# 0 because 0 would otherwise cover both "examined everything, nothing to do"
+# and "examined nothing at all", and an operator reading only the exit code
 # would take a total no-op for a clean run.
-EXIT_OK = 0            # ran clean, or --verify found no unstamped OPEN records
-EXIT_WRITE_FAILED = 1  # at least one --apply write FAILED
-EXIT_UNSTAMPED = 2     # --verify found OPEN records still lacking a queue stamp
-EXIT_NO_QUEUE = 3      # no usable --queue argument; nothing could be resolved
+EXIT_OK = 0              # ran clean, or --verify found no unstamped OPEN records
+EXIT_WRITE_FAILED = 1    # at least one --apply write FAILED (a write was attempted)
+EXIT_UNSTAMPED = 2       # --verify found OPEN records still lacking a queue stamp
+EXIT_NO_QUEUE = 3        # no --queue argument at all; nothing could be resolved
+EXIT_BAD_ARGS = 4        # unusable command line; nothing was read or written
+EXIT_UNUSABLE_QUEUE = 5  # --apply refused: a supplied --queue is not a readable dir
+
+# WHY EXIT_BAD_ARGS EXISTS (task 3640 amendment). argparse's own failure path
+# calls parser.error(), which exits 2 -- the code this script publishes as
+# "--verify found unstamped records". A wrapper keying off 2 would read a
+# typo'd flag as a still-violated invariant. And _parse_orch_queue_pairs used
+# to `raise SystemExit(<message>)`, which exits 1 -- the code published as
+# "a write FAILED", when in fact nothing had been read, let alone written.
+# Both now route to 4 via _ArgParser.error below, so every "your command line
+# is wrong" outcome has exactly one code and it collides with nothing.
 
 # Disposition reasons. Named constants so the per-record lines, the summary
 # block and the tests all read the SAME strings -- the report is the durable
@@ -242,9 +274,10 @@ def classify_reason(
 ) -> str:
     """Label WHY *resolved* was chosen, for the per-record line and the summary.
 
-    Derived from the same inputs the resolver saw rather than returned
-    alongside it, so the ladder stays a single expression of the policy and
-    this stays a pure description of it.
+    Kept separate from the ladder — which stays the single expression of the
+    policy — but fed the EXACT holder list the ladder returned alongside its
+    answer, never a second lookup. See resolve_queue_for_decision on why one
+    observation must feed both the decision and its label.
 
     The distinction that matters is unique-hit vs. tiebreak-*: both produce a
     real queue path, but one rests on the id being in exactly one queue and the
@@ -263,29 +296,94 @@ def classify_reason(
     return REASON_TIEBREAK_RECON if record.session_id is None else REASON_TIEBREAK_ORCH
 
 
+class _ArgParser(argparse.ArgumentParser):
+    """argparse, with its usage-error exit code moved off 2.
+
+    Stock argparse exits 2 on an unknown flag or a missing value. This script
+    publishes 2 as "--verify found OPEN records still lacking a queue stamp",
+    so a wrapper or operator keying off 2 would read a fat-fingered flag as a
+    still-violated invariant -- the precise confusion this script exists to
+    prevent elsewhere. Every bad-command-line outcome exits EXIT_BAD_ARGS.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        print(f'{self.prog}: error: {message}', file=sys.stderr)
+        raise SystemExit(EXIT_BAD_ARGS)
+
+
 def _parse_orch_queue_pairs(pairs: list[str]) -> dict[str, Path]:
-    """Parse repeated ``PROJECT=PATH`` into a mapping. Malformed -> SystemExit.
+    """Parse repeated ``PROJECT=PATH`` into a mapping. Malformed -> EXIT_BAD_ARGS.
 
     LOUD, never silent. Dropping a malformed pair would quietly disable the
     rule-5 tiebreak for that project and downgrade every one of its ambiguous
     records to UNKNOWN -- a strictly worse migration wearing a clean exit code.
+
+    Exits EXIT_BAD_ARGS, not 1: this runs BEFORE the candidate loop, so
+    nothing has been written and reporting the "a write FAILED" code would be
+    a lie about what the run touched.
     """
     mapping: dict[str, Path] = {}
     for pair in pairs:
         project, sep, path = pair.partition('=')
         if not sep or not project.strip() or not path.strip():
-            raise SystemExit(
+            print(
                 f'--orch-queue expects PROJECT=PATH, got {pair!r}. '
                 'Refusing to continue: silently dropping it would disable the '
-                "orchestrator tiebreak for that project and downgrade its "
-                'ambiguous records to <unknown>.'
+                'orchestrator tiebreak for that project and downgrade its '
+                'ambiguous records to <unknown>.',
+                file=sys.stderr,
             )
+            raise SystemExit(EXIT_BAD_ARGS)
         mapping[project.strip()] = Path(path.strip())
     return mapping
 
 
+def unusable_queues(queues: list[Path]) -> list[tuple[Path, str]]:
+    """Every supplied queue path that is NOT a readable directory, and why.
+
+    THE ONE DEGRADATION THAT CAN PRODUCE A WRONG STAMP. queues_holding is
+    fail-soft per queue by design (a queue may legitimately vanish mid-run),
+    but silence about a queue that was never usable at all is dangerous in a
+    way the script's other failure modes are not: every other degradation
+    here falls TOWARDS <unknown>, which is merely conservative. Dropping a
+    queue SHRINKS the holder set, so an id held by both dark_factory queues
+    looks like a unique hit against whichever one survived and gets stamped as
+    such -- writing the exact cross-queue false-closure hazard that tasks 3528
+    and 3640 exist to remove durably onto a live record.
+
+    One mistyped path among six --queue flags is also by far the likeliest
+    operator error, so it is reported up front, once, rather than per-record.
+
+    Deliberately does NOT lean on ``Path.is_dir()`` alone. is_dir() swallows
+    every OSError and answers False, so a permission fault would be reported
+    as "does not exist" -- a diagnosis that sends the operator to fix the
+    wrong thing. And an EXISTING but unreadable directory passes is_dir(),
+    then contributes nothing when rglob walks it: silently indistinguishable
+    from a queue that genuinely does not hold the id, which is precisely the
+    holder-set shrinkage this function exists to make loud. So the readability
+    of each directory is probed explicitly.
+    """
+    bad: list[tuple[Path, str]] = []
+    for queue in queues:
+        try:
+            mode = queue.stat().st_mode
+        except FileNotFoundError:
+            bad.append((queue, 'does not exist'))
+            continue
+        except OSError as exc:
+            bad.append((queue, f'unreadable ({exc.__class__.__name__})'))
+            continue
+        if not stat.S_ISDIR(mode):
+            bad.append((queue, 'not a directory'))
+        elif not os.access(queue, os.R_OK | os.X_OK):
+            # Walkable-but-unreadable: rglob would yield nothing and never say why.
+            bad.append((queue, 'not readable'))
+    return bad
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ArgParser(
         prog='backfill_decision_queue_stamp',
         description=(
             'Back-fill DecisionRecord.escalations_dir on OPEN cockpit decisions '
@@ -296,10 +394,14 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             'exit codes: 0 = ran clean (or --verify found no unstamped OPEN '
             'records); 1 = at least one write FAILED; 2 = --verify found OPEN '
-            'records still lacking a queue stamp; 3 = no usable --queue '
-            'argument, so nothing could be resolved. Never read 2 or 3 as a '
-            'clean run, and note that only 1 ever means a write was attempted '
-            'and rejected.'
+            'records still lacking a queue stamp; 3 = no --queue argument, so '
+            'nothing could be resolved; 4 = unusable command line (an argparse '
+            'usage error or a malformed --orch-queue pair) -- nothing was read '
+            'or written; 5 = --apply refused because a supplied --queue is not '
+            'a readable directory, which would shrink the holder set and could '
+            'turn an ambiguous id into a false unique hit. Never read anything '
+            'but 0 as a clean run, and note that only 1 ever means a write was '
+            'attempted and rejected.'
         ),
     )
     parser.add_argument(
@@ -345,7 +447,9 @@ def main(argv: list[str] | None = None) -> int:
 
     Exit codes: 0 = ran clean (or ``--verify`` found no unstamped OPEN
     records); 1 = at least one write FAILED; 2 = ``--verify`` found unstamped
-    OPEN records; 3 = no usable ``--queue`` argument.
+    OPEN records; 3 = no ``--queue`` argument; 4 = unusable command line
+    (raised as SystemExit before this returns, so it never appears in a
+    ``return`` below); 5 = ``--apply`` refused over an unusable ``--queue``.
 
     ``--verify`` short-circuits before any resolution: it answers exactly one
     question -- "does any OPEN record still lack a queue stamp?" -- which is
@@ -379,6 +483,32 @@ def main(argv: list[str] | None = None) -> int:
     recon_queue = Path(args.recon_queue) if args.recon_queue else None
     orch_queue_for_project = _parse_orch_queue_pairs(args.orch_queues)
 
+    # LOUD about a queue that was never usable (see unusable_queues). Reported
+    # for the tiebreak targets too, but only --queue can turn an ambiguous id
+    # into a false unique hit, so only --queue blocks --apply: an unusable
+    # --recon-queue/--orch-queue merely fails to corroborate and degrades that
+    # record to <unknown>, which is conservative and visible in the summary.
+    bad_queues = unusable_queues(queues)
+    bad_tiebreaks = unusable_queues(
+        ([recon_queue] if recon_queue else []) + list(orch_queue_for_project.values())
+    )
+    for path, why in bad_queues:
+        print(f'UNUSABLE-QUEUE --queue {path} ({why})', file=sys.stderr)
+    for path, why in bad_tiebreaks:
+        print(f'UNUSABLE-TIEBREAK-QUEUE {path} ({why}) '
+              '-- its records can only degrade to <unknown>', file=sys.stderr)
+    if bad_queues and args.apply:
+        print(
+            f'refusing to --apply with {len(bad_queues)} unusable --queue path(s). '
+            'A dropped queue SHRINKS the holder set, so an id held by two '
+            'queues can look like a unique hit against the one that survived '
+            'and be stamped as such -- writing the cross-queue false-closure '
+            'hazard onto a live record. Fix the path(s), or re-run without '
+            '--apply to see the dry-run report.',
+            file=sys.stderr,
+        )
+        return EXIT_UNUSABLE_QUEUE
+
     mode = 'APPLY' if args.apply else 'DRY RUN (pass --apply to write)'
     print(f'mode: {mode}')
 
@@ -396,10 +526,11 @@ def main(argv: list[str] | None = None) -> int:
     written = 0
     failed = 0
     for record in candidates:
-        holders = (
-            queues_holding(record.escalation_id, queues) if record.escalation_id else []
-        )
-        resolved = resolve_queue_for_decision(
+        # ONE observation of the live queue tree, feeding BOTH the stamp and
+        # its label. See resolve_queue_for_decision: looking twice would let a
+        # watcher archive an escalation in between and produce a report that
+        # misdescribes which stamps rest on direct evidence.
+        resolved, holders = resolve_queue_for_decision(
             record,
             queues=queues,
             recon_queue=recon_queue,
@@ -433,6 +564,12 @@ def main(argv: list[str] | None = None) -> int:
         REASON_AMBIGUOUS,
     ):
         print(f'  {reason}: {by_reason.get(reason, 0)}')
+    # Surfaced in the summary as well as on stderr: the summary block is what
+    # gets pasted into the audit report, and a report that does not say the
+    # run searched fewer queues than it was given is a report that overstates
+    # how much evidence its stamps rest on.
+    print(f'unusable queues: {len(bad_queues)}   '
+          f'unusable tiebreak queues: {len(bad_tiebreaks)}')
     print(f'written: {written}   write-failed: {failed}')
     if not args.apply:
         print('nothing was written (dry run)')
