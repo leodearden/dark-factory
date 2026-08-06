@@ -1304,12 +1304,9 @@ class TestArchitectEvalConfigs:
         assert fable.effort == 'high'
         assert fable.role == 'architect'
 
-        fable_max = by_name['architect-fable-max']
-        assert fable_max.backend == 'claude'
-        assert fable_max.model == 'claude-fable-5'
-        assert fable_max.effort == 'max'
-        assert fable_max.role == 'architect'
-
+        # architect-fable-max's field-level shape (backend/model/effort/role)
+        # is pinned by test_architect_fable_max_is_effort_matched_to_opus_incumbent
+        # below, not duplicated here — this test's job is parity + membership.
         assert {c.name for c in ARCHITECT_EVAL_CONFIGS} == {
             'architect-opus-high',
             'architect-opus-max',
