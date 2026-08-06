@@ -1361,8 +1361,8 @@ _PLAN_QUALITY_COLUMNS = (
     'invocation_error',
 )
 _PLAN_QUALITY_MEAN_COLUMNS = (
-    'config_name', 'n', 'cap_excluded', 'no_plan', 'plan_rate',
-    'mean_plan_quality',
+    'config_name', 'n', 'cap_excluded', 'no_plan', 'judged_without_reference',
+    'plan_rate', 'mean_plan_quality',
 )
 # The plan_quality cell of a cap-tainted row. Deliberately NOT a number and NOT
 # the bare '-' null sentinel (which already means "not an architect run"): a
@@ -1591,6 +1591,11 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
     four of which produced no plan at all — reads as exactly that instead of
     looking like a mean over 22 comparable plans. A config with nothing scored
     renders ``-``, never ``0.0000``.
+
+    ``judged_without_reference`` (task 3628) is the same discipline applied to
+    VALIDITY rather than to membership: a mean reported without saying how many
+    of its cells were graded with no landed diff to grade against is the same
+    silent degradation one layer up. Those cells ARE in ``n`` and in the mean.
     """
     configs = report.get('configs', [])
     rendered = [
@@ -1599,6 +1604,13 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
             'n': str(c['n']),
             'cap_excluded': str(c['cap_excluded']),
             'no_plan': str(c['no_plan']),
+            # How many of those n cells the judge scored with NO reference diff
+            # (task 3628). Rendered here rather than only in JSON because a
+            # mean reported without saying how many of its cells were judged
+            # blind is the same silent degradation one layer up.
+            'judged_without_reference': str(
+                c.get('judged_without_reference', 0) or 0
+            ),
             # The same '-'-when-None rule the mean beside it uses: a config
             # whose every cell was refused has no rate, and a fabricated 0.0
             # would assert a reliability failure we never observed (task 3379).
@@ -1673,6 +1685,18 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
         f'{architect_cells} architect cell(s)'
         + (f' ({causes})' if causes else '')
     )
+    # The σ validity bound beside the exclusion count (task 3628), stated
+    # against ITS OWN pool: the SCORED cells, not every architect cell, because
+    # that is the population whose plan_quality it bounds. Suppressed entirely
+    # when nothing was judged blind — a clean campaign must not grow a scary
+    # line — which is also what keeps this byte-deterministic.
+    judged_blind = report.get('judged_without_reference', 0) or 0
+    if judged_blind:
+        scored_cells = sum(c['n'] for c in report.get('configs', []))
+        lines.append(
+            f'judged without reference: {judged_blind} of {scored_cells} '
+            f'scored cell(s) (plan_quality bounded)'
+        )
     lines.append('')
     lines.extend(_format_plan_quality_mean_section(report))
     return '\n'.join(lines)
@@ -1703,6 +1727,15 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 # ``plan_quality 0.0000`` would read as "these candidates all planned badly"
 # when it means "these candidates produced no plan at all".
 #
+# ``pq_no_ref`` (task 3628) is the THIRD count, and differs from both above in
+# that it changes no number on this row: the flagged cells are in
+# ``plan_quality``, in ``composite`` and in ``cost_usd`` at their real values.
+# It bounds the CONFIDENCE in ``plan_quality`` — those cells were graded by the
+# judge on plausibility, with no landed diff to grade against — so a reader
+# ranking on this table can see that a high plan_quality rests partly on scores
+# with no ground truth behind them. Beside its two siblings deliberately: the
+# three describe one pool and are only interpretable together.
+#
 # ``plan_rate`` / ``cost_per_plan`` (task 3379) are the DERIVED pair over those
 # counts, and belong here for the same reason. ``plan_rate`` is the RELIABILITY
 # discriminator: the 2026-07-27 verdict found that what actually separates the
@@ -1718,8 +1751,8 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 
 _COMPOSITE_COLUMNS = (
     'config', 'composite', 'quality', 'plan_quality', 'pq_excluded',
-    'pq_no_plan', 'plan_rate', 'cost_usd', 'cost_per_plan', 'cost_source',
-    'latency_secs', 'ci95_composite', 'trials', 'fixtures',
+    'pq_no_plan', 'pq_no_ref', 'plan_rate', 'cost_usd', 'cost_per_plan',
+    'cost_source', 'latency_secs', 'ci95_composite', 'trials', 'fixtures',
 )
 _PRICE_TABLE_COLUMNS = ('config', 'role', 'input_per_1m', 'output_per_1m')
 
@@ -1831,6 +1864,11 @@ def format_composite_table(report: dict[str, Any]) -> str:
             'plan_quality': _optional_float_cell(r.get('plan_quality')),
             'pq_excluded': str(int(r.get('plan_quality_cap_excluded', 0) or 0)),
             'pq_no_plan': str(int(r.get('plan_quality_no_plan', 0) or 0)),
+            # Same .get-with-default read as its siblings, so a report dict
+            # built before task 3628 renders 0 rather than raising.
+            'pq_no_ref': str(int(
+                r.get('plan_quality_judged_without_reference', 0) or 0
+            )),
             'plan_rate': _optional_float_cell(r.get('plan_rate')),
             'cost_usd': _optional_float_cell(r.get('cost_usd', 0.0)),
             'cost_per_plan': _optional_float_cell(r.get('cost_per_plan')),
