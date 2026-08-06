@@ -1374,6 +1374,94 @@ class TestProceduralTopicClusterModel:
             ProceduralTopicCluster(topic_id='t', phrases=['a', 'b'], min_phrase_hits=0)
 
 
+class TestProceduralTopicClusterSufficientPhrases:
+    """``sufficient_phrases``: phrases distinctive enough to qualify a cluster ALONE (task 3054).
+
+    Count-only matching cannot catch a write that straddles several clusters
+    at one hit each -- the reported defect: a single note scored exactly 1
+    distinct phrase in each of three registered clusters and was blocked by
+    none, because hits do not aggregate across clusters and each cluster's
+    remaining phrases are tuned to a different sub-case's vocabulary. An
+    identifier-shaped phrase (a tool name, a private handler name) cannot
+    appear incidentally, so it should qualify its own cluster on its own.
+
+    The field is opt-in and validated as a SUBSET of ``phrases``: a phrase
+    that is not itself matchable would silently match nothing, which is the
+    same silent-no-op failure ``extra='forbid'`` and ``_validate_topic_id_slug``
+    are already on this model to prevent.
+    """
+
+    def test_defaults_to_empty_list(self):
+        cluster = ProceduralTopicCluster(topic_id='t', phrases=['alpha', 'beta'])
+        assert cluster.sufficient_phrases == []
+
+    def test_accepts_a_subset_of_phrases(self):
+        cluster = ProceduralTopicCluster(
+            topic_id='t',
+            phrases=['alpha', 'beta', 'gamma'],
+            sufficient_phrases=['alpha', 'gamma'],
+        )
+        assert cluster.sufficient_phrases == ['alpha', 'gamma']
+
+    def test_accepts_all_phrases_as_sufficient(self):
+        cluster = ProceduralTopicCluster(
+            topic_id='t',
+            phrases=['alpha', 'beta'],
+            sufficient_phrases=['alpha', 'beta'],
+        )
+        assert cluster.sufficient_phrases == ['alpha', 'beta']
+
+    def test_rejects_a_sufficient_phrase_absent_from_phrases(self):
+        """The loud-fail-at-config-load contract.
+
+        A sufficient phrase that is not also a matchable phrase can never
+        fire, so the operator's intent is silently discarded. Fail at load
+        instead, quoting BOTH the offending phrase and the ``topic_id`` so
+        the operator can find the cluster in a long config list.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            ProceduralTopicCluster(
+                topic_id='some-topic',
+                phrases=['alpha', 'beta'],
+                sufficient_phrases=['delta'],
+            )
+        message = str(excinfo.value)
+        assert repr('delta') in message, 'must quote the offending phrase'
+        assert 'some-topic' in message, 'must name the cluster it belongs to'
+
+    def test_subset_check_is_case_insensitive(self):
+        """Phrase MATCHING is case-insensitive, so a case mismatch is not a real error.
+
+        Rejecting it would be a spurious config-load failure on a cluster
+        that would in fact match exactly as the operator intended.
+        """
+        cluster = ProceduralTopicCluster(
+            topic_id='t',
+            phrases=['Alpha', 'BETA'],
+            sufficient_phrases=['alpha'],
+        )
+        assert cluster.sufficient_phrases == ['alpha']
+
+    def test_still_rejects_unknown_key(self):
+        # The new field must not have been added by loosening extra='forbid'.
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(
+                topic_id='t',
+                phrases=['a', 'b'],
+                sufficient_phrase='boom',  # type: ignore[call-arg]
+            )
+
+    def test_still_rejects_min_phrase_hits_below_one(self):
+        # The new validator must not have displaced the existing ge=1 bound.
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(
+                topic_id='t',
+                phrases=['a', 'b'],
+                sufficient_phrases=['a'],
+                min_phrase_hits=0,
+            )
+
+
 class TestProceduralTopicClusterTopicIdSlug:
     """``topic_id`` shares ONE namespace with ``metadata.topic`` (PRD D4, task 3198).
 
