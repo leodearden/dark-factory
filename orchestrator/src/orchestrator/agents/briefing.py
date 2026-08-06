@@ -53,15 +53,70 @@ def _format_commit_bullets(commits: list[dict], limit: int | None = None) -> str
     return '\n'.join(lines)
 
 
+FOREIGN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')
+"""Metadata keys, in precedence order, that name a memory result's owning project.
+
+``src_project`` is FIRST: the task-2273 CGL-eta rehome
+(``fused-memory/src/fused_memory/maintenance/rehome_scope_tag.py``, kind
+``cgl_eta_cross_target_rehome``) wrote Mem0 entries that physically live in
+``dst_project``'s collection but reference ``src_project``'s task numbers —
+``src_project`` is the authoritative origin project, so it must win over any
+co-present ``project_id``/``group_id`` on the same entry. ``dst_project`` is
+deliberately ABSENT from this tuple: consulting it would falsely certify a
+rehomed foreign fact as local, since it names where the fact was relocated
+TO, not where it came from.
+"""
+
+
+def _canonical_project(value: str) -> str:
+    """Canonicalise a project identifier for comparison.
+
+    Mirrors fused-memory's ``canonicalize_project_id`` semantics
+    (``fused_memory/utils/validation.py``; see the divergent-spelling
+    contract in ``plans/cross-graph-entity-leak-prd.md`` decision 1 / S1) —
+    strip, lowercase, ``'-'`` -> ``'_'`` — so a tag spelled ``dark-factory``
+    is not mistaken for a project distinct from ``dark_factory``.
+
+    Re-implemented locally rather than imported: orchestrator declares no
+    runtime dependency on fused-memory (it appears only in
+    ``orchestrator/pyproject.toml``'s ``[tool.pyright] extraPaths``, a
+    type-checking-only reference), so importing it here would risk an
+    ``ImportError`` in any deployment where fused-memory is not co-installed.
+    """
+    return value.strip().lower().replace('-', '_')
+
+
+def _result_project(entry: dict) -> str | None:
+    """Read a result's owning-project tag from its metadata, if any.
+
+    Walks :data:`FOREIGN_PROJECT_TAG_KEYS` in precedence order and returns
+    the first present, non-empty **string** value found in
+    ``entry['metadata']``. A non-string value (e.g. an int) is treated as
+    absent rather than crashing the comparison. Returns ``None`` — i.e.
+    untagged — when ``entry['metadata']`` is missing, not a dict, or carries
+    none of the recognised keys.
+    """
+    metadata = entry.get('metadata')
+    if not isinstance(metadata, dict):
+        return None
+    for key in FOREIGN_PROJECT_TAG_KEYS:
+        tag = metadata.get(key)
+        if isinstance(tag, str) and tag.strip():
+            return tag
+    return None
+
+
 def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[str, int]:
     """Drop cross-project results from a fused-memory ``search`` JSON payload.
 
     ``payload_text`` is the JSON-serialised ``{'results': [...]}`` dict that
     FastMCP returns as the ``search`` tool's text block (see
     :meth:`BriefingAssembler._mcp_search`). Each result's project tag is read
-    from ``entry['metadata']['project_id']``; the entry is dropped when a tag
-    is present and differs from ``project_id``, and kept otherwise —
-    including when ``metadata`` is missing, empty, or not a dict.
+    via :func:`_result_project` (see :data:`FOREIGN_PROJECT_TAG_KEYS`); the
+    entry is dropped when a tag is present and, after
+    :func:`_canonical_project` normalisation, differs from ``project_id``,
+    and kept otherwise — including when ``metadata`` is missing, empty, or
+    not a dict.
 
     Untagged results are deliberately kept rather than dropped: every
     Graphiti-sourced result has ``metadata == {}`` today (verified at
@@ -107,15 +162,15 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
         )
         return payload_text, 0
 
+    target = _canonical_project(project_id)
     kept = []
     dropped = 0
     for entry in results:
         if not isinstance(entry, dict):
             kept.append(entry)
             continue
-        metadata = entry.get('metadata')
-        tag = metadata.get('project_id') if isinstance(metadata, dict) else None
-        if tag and tag != project_id:
+        tag = _result_project(entry)
+        if tag is not None and _canonical_project(tag) != target:
             dropped += 1
             continue
         kept.append(entry)
