@@ -40,6 +40,7 @@ from orchestrator.verify_plan import (
     VerifyPlan,
     derive_verify_plan,
     deselecting_expression_for_command,
+    widen_fallback_for_marker_deselection,
 )
 
 # ---------------------------------------------------------------------------
@@ -972,3 +973,96 @@ class TestDeselectingExpressionForCommand:
             ['mod/tests/test_a.py'],
             _permissive_reader(reads),
         ) is None
+
+
+def _fallback_mc(test_command: str | None) -> ModuleConfig:
+    """The shape ``verify._build_fallback_config`` emits, with *test_command* substituted.
+
+    ``prefix='__fallback__'`` and the lint/type-check commands are carried so
+    every assertion below can check that widening touches the pytest slot ONLY —
+    marker deselection is a pytest-only concern.
+    """
+    return ModuleConfig(
+        prefix='__fallback__',
+        test_command=test_command,
+        lint_command='ruff check tests/test_a.py',
+        type_check_command='pyright tests/test_a.py',
+    )
+
+
+class TestWidenFallbackRefuses:
+    """``widen_fallback_for_marker_deselection(fallback, reader)`` — the REFUSAL half.
+
+    The one-directional fail-safe: this function takes the ALREADY-EXECUTED
+    fallback ModuleConfig (post ``_build_fallback_config`` + ``_apply_cargo_scope``),
+    so the executed command's OWN SHAPE — never a guess about which branch
+    produced it — decides.  Every shape ``_build_fallback_config`` can emit that
+    must not widen is pinned here, and each returns the input ModuleConfig
+    unchanged (identity, not merely equality) with a None reason.
+
+    Every reader serves a DESELECTING pyproject at EVERY ``*pyproject.toml``
+    path AND a ``slow``-marked module at EVERY ``*.py`` path, so no refusal can
+    pass vacuously: if the guard under test stopped firing, the widening would.
+    """
+
+    @staticmethod
+    def _refuses(test_command: str | None, overrides: dict[str, str | None] | None = None):
+        """Assert *test_command* is refused, and return the reads for further checks."""
+        reads: list[str] = []
+        fallback = _fallback_mc(test_command)
+        widened, reason = widen_fallback_for_marker_deselection(
+            fallback, _permissive_reader(reads, overrides),
+        )
+        assert widened is fallback, 'a refusal must return the input config untouched'
+        assert reason is None
+        return reads
+
+    def test_no_test_command_is_refused(self):
+        """``_build_fallback_config``'s "no collectable tests" branch leaves it None."""
+        assert self._refuses(None) == []
+
+    def test_the_mixed_root_plus_subproject_chain_is_refused(self):
+        """Task 2368's shape parses raw-retained: which clause gets scoped is unrecoverable."""
+        reads = self._refuses(
+            'cd sub && uv run pytest tests/test_a.py && cd .. && pytest tests/test_b.py',
+        )
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
+    def test_the_uv_extras_shape_is_refused(self):
+        """Task 2641's ``uv run --extra dev pytest`` also parses raw-retained."""
+        reads = self._refuses('cd sub && uv run --extra dev pytest tests/test_a.py')
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
+    @pytest.mark.parametrize('test_command', ['npm test', './scripts/test.sh'])
+    def test_a_non_pytest_command_is_refused(self, test_command):
+        """A pyproject's addopts describe a suite these commands never invoke."""
+        self._refuses(test_command)
+
+    #: A configured suite is run VERBATIM by ``_build_fallback_config`` (never
+    #: file-scoped), so it has no file targets to drop — nothing to widen.
+    @pytest.mark.parametrize('test_command', ['pytest', "uv run pytest -m 'not slow'"])
+    def test_an_unscoped_suite_has_nothing_to_widen(self, test_command):
+        self._refuses(test_command)
+
+    #: The conftest branch emits a DIRECTORY target (``_fallback_pytest_targets``),
+    #: and a configured ``pytest tests/`` is directory-shaped too.  The
+    #: ``is_file()``-guarded worktree reader answers None for a directory, so no
+    #: proof of deselection can exist — the refusal is structural, not incidental.
+    @pytest.mark.parametrize(
+        'test_command', ['pytest . mod/tests/test_a.py', 'pytest mod/tests'],
+    )
+    def test_a_directory_target_is_unprovable_and_refused(self, test_command):
+        self._refuses(test_command)
+
+    def test_one_unmarked_target_is_enough_to_refuse(self):
+        """ALL, not ANY — a single still-collecting file means the run is not empty."""
+        self._refuses(
+            'pytest mod/tests/test_a.py mod/tests/test_b.py',
+            {'mod/tests/test_b.py': _UNMARKED_PLAIN_SOURCE},
+        )
+
+    def test_a_rootdir_declaring_no_marker_expression_is_refused(self):
+        """No ``-m`` anywhere means nothing was deselected — today's FILE_SCOPED run stands."""
+        self._refuses(
+            'pytest mod/tests/test_a.py', {'pyproject.toml': _PLAIN_PYPROJECT},
+        )
