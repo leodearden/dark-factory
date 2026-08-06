@@ -15,6 +15,7 @@ mixed-colour (sync writer/readers, async debt functions); the split is structura
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -777,3 +778,134 @@ class TestReadOccurrences:
         from orchestrator.flake_ledger import read_occurrences
 
         assert read_occurrences(tmp_path / 'absent' / 'runs.db') == []
+
+
+class _FakeTaskClient:
+    """Records every ``submit_task`` call, so a test can assert that α files NOTHING.
+
+    Task ζ is what makes ``open_debt`` file a de-flake task; keeping the seam here and
+    asserting it stays unused makes α's scope boundary machine-checked rather than
+    trusted.
+    """
+
+    def __init__(self) -> None:
+        self.submit_calls: list[dict] = []
+
+    async def submit_task(self, arguments: dict) -> str:
+        self.submit_calls.append(arguments)
+        return 'ticket-fake-123'
+
+
+@pytest.mark.asyncio
+class TestOpenDebt:
+    """``open_debt`` opens/advances the single ``flake_debt`` row for a test.
+
+    ASYNC-ONLY CLASS — a sync ``def test_`` here is a collection ERROR (see the module
+    docstring).  ``open_debt`` is declared async in α even though its body is pure sync
+    SQLite, so ζ can add task filing without changing the function colour and churning
+    every ``await`` at ε's merge-path call sites.
+    """
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    LATER = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+
+    async def test_fresh_open_writes_one_row(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['test_id'] == self.TEST_ID
+        assert raw['project_id'] == 'dark_factory'
+        assert raw['opened_at'] == self.NOW.isoformat()
+        assert raw['last_occurrence_at'] == self.NOW.isoformat()
+        assert raw['resolved_at'] is None
+        assert raw['open_count'] == 1
+        # α STORES owner_task_id but never populates it — ζ files the task.
+        assert raw['owner_task_id'] is None
+        assert raw['prior_resolved_at'] is None
+        assert raw['prior_resolving_commit'] is None
+
+        assert row is not None
+        assert row.test_id == self.TEST_ID
+        assert row.project_id == 'dark_factory'
+        assert row.opened_at == self.NOW.isoformat()
+        assert row.last_occurrence_at == self.NOW.isoformat()
+        assert row.resolved_at is None
+        assert row.open_count == 1
+        assert row.owner_task_id is None
+        assert row.prior_resolved_at is None
+        assert row.prior_resolving_commit is None
+
+    async def test_returned_row_equals_read_debt(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import open_debt, read_debt
+
+        db_path = tmp_path / 'runs.db'
+        row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+
+        assert row == read_debt(db_path, self.TEST_ID)
+
+    async def test_default_clock_is_tz_aware_utc(self, tmp_path: Path) -> None:
+        """§5.4: tasks.db has no ``created_at``, so this column is θ's only clock for
+        "how long has this debt been open?"."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        row = await open_debt(db_path, 'dark_factory', self.TEST_ID)
+
+        assert row is not None
+        assert row.opened_at
+        parsed = datetime.fromisoformat(row.opened_at)
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == timedelta(0)
+
+    async def test_reopen_while_still_open_is_not_a_re_entry(self, tmp_path: Path) -> None:
+        """The debt never closed, so this is the SAME cycle: ``open_count`` and
+        ``opened_at`` hold, and only ``last_occurrence_at`` advances.  Counting it as a
+        re-entry would make η's recurrence trigger fire on an ordinary repeat."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.LATER)
+
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['open_count'] == 1
+        assert raw['opened_at'] == self.NOW.isoformat()
+        assert raw['last_occurrence_at'] == self.LATER.isoformat()
+        assert raw['resolved_at'] is None
+
+        assert row is not None
+        assert row.open_count == 1
+        assert row.opened_at == self.NOW.isoformat()
+        assert row.last_occurrence_at == self.LATER.isoformat()
+
+    async def test_read_debt_returns_none_for_an_unknown_test(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import open_debt, read_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+
+        assert read_debt(db_path, 'never-seen') is None
+
+    async def test_read_debt_on_a_missing_db_returns_none(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_debt
+
+        assert read_debt(tmp_path / 'absent' / 'runs.db', self.TEST_ID) is None
+
+    async def test_alpha_accepts_task_client_but_files_nothing(self, tmp_path: Path) -> None:
+        """α's scope boundary, machine-checked: the seam exists so ζ can fill it, and
+        α must not file a task through it."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient()
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+        )
+
+        assert client.submit_calls == []
+        assert row is not None
+        assert row.owner_task_id is None
