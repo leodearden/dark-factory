@@ -383,14 +383,24 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # _guarded_py_files to REPO_ROOT.glob('*.py') deletes the gate with the PATH
 # half staying green, MEASURED as `1 failed, 5 passed`),
 # test_every_skills_consuming_test_stays_under_a_gated_directory (CORRECTION 1's
-# inventory stays real and stays covered) and
-# test_no_unlisted_skills_mentioning_test_escapes_triage (the OPPOSITE drift: a
-# NEW skills/ consumer that never reaches the inventory, which would leave the
-# enumeration above silently under-describing the real set and weaken
-# CORRECTION 1's own cost argument). The last two are why the enumeration above
+# inventory stays real and stays covered — which is why the enumeration above
 # and that file's SKILLS_CONSUMING_TESTS tuple must be edited TOGETHER: each is
 # gated against drifting from the tree, neither against drifting from the
-# other. A documented-but-ungated invariant
+# other).
+#
+# THE OPPOSITE DRIFT IS KNOWINGLY UNGATED: a NEW skills/ consumer that never
+# reaches the inventory leaves the enumeration above under-describing the real
+# set. A ratchet for it was shipped and REMOVED ON REVIEW — it swept every
+# tracked test module for the literal `skills/` and so made comment and
+# docstring PROSE in four unrelated packages a merge-blocking gate on
+# tests/scripts/ (measured: a cosmetic reword in
+# scripts/tests/test_legibility_sampling.py produced `1 failed, 5 passed`),
+# while still missing real consumers that never spell the token
+# (orchestrator/tests/test_harness_watcher_supervisor.py). Do NOT reintroduce
+# it, including as a regex/word-boundary variant. The gap is one-directional
+# and safe: an under-counted consumer set makes CORRECTION 1's cost argument
+# against option (b) WEAKER, never unsound — more consumers only make the union
+# more expensive. A documented-but-ungated invariant
 # is the same defect class this block's predecessor demonstrated: it was pure
 # prose, and was already carrying two falsified claims when re-measured.
 # Production code is cited BY SYMBOL throughout and never by file:line —

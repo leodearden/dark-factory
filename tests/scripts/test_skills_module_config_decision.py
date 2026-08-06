@@ -25,15 +25,38 @@ failure text observed against a named scratch mutation, following
 ``1f83dbed15``" precedent. The scratch artifacts are reverted before commit.
 
 RE-CONFIRMED at base main ``5078f6df15``, 28 commits ahead of the
-``7c6039327d`` every MEASURED RED below cites. Four of them were re-run against
-freshly recreated scratch mutations at the handed-off base — the direct-child
-``skills/test_probe.py`` trigger, the ``_guarded_py_files`` narrowing (still
-``1 failed, 5 passed``, the path-level sibling still green), the untriaged new
-consumer, and the ``-k some_expr`` phantom-target parse (still ``OLD
+``7c6039327d`` every MEASURED RED below cites. Three of the surviving ratchets
+were re-run against freshly recreated scratch mutations at the handed-off base
+— the direct-child ``skills/test_probe.py`` trigger, the ``_guarded_py_files``
+narrowing (still ``1 failed, 5 passed``, the path-level sibling still green),
+and the ``-k some_expr`` phantom-target parse (still ``OLD
 ['tests/scripts/', 'some_expr']`` vs ``NEW ['tests/scripts']``) — and every
 failure text reproduced VERBATIM. The original shas are kept rather than
 overwritten: rewriting them would claim a first observation that was not taken
 at that base.
+
+A FOURTH RATCHET WAS REMOVED ON REVIEW, and the removal is recorded rather
+than silently absorbed (task 3460's correct-rather-than-delete precedent).
+``test_no_unlisted_skills_mentioning_test_escapes_triage`` swept every tracked
+test module for the literal ``skills/`` and required each hit to appear in one
+of two hand-maintained sets here. Its staleness half had already been removed
+for making other packages' comment PROSE a merge-blocking gate on this module
+(measured: a cosmetic reword of a comment in
+``scripts/tests/test_legibility_sampling.py`` produced ``1 failed, 5 passed``
+here, from a diff touching nothing this file gates). The surviving half had
+the identical coupling merely inverted — ADDING the substring ``skills/`` to a
+docstring anywhere in ``escalation/tests/``, ``fused-memory/tests/``,
+``orchestrator/tests/`` or ``scripts/tests/`` red-walled this guard — while
+being a self-confessed LOWER BOUND that misses the case that matters:
+``orchestrator/tests/test_harness_watcher_supervisor.py`` is a real consumer
+containing the token ZERO times. High false-positive rate on cosmetic edits in
+unrelated packages, known false negatives on real consumers, so the whole
+detector went. DO NOT REINTRODUCE IT, and specifically do not reintroduce it
+as a word-boundary or regex variant: that preserves the identical dependency
+on other packages' prose behind a cleverer matcher. The ADD-direction drift is
+knowingly ungated — the enumeration in the DECIDED block may under-describe the
+real consumer set, which only makes CORRECTION 1's cost argument against
+option (b) weaker (more consumers = more expensive union), never unsound.
 
 MUST NOT SKIP. No ``pytest.importorskip`` and no try/except-and-skip anywhere:
 a missing ``git``, an unimportable ``orchestrator.config`` or an unimportable
@@ -153,64 +176,6 @@ SKILLS_CONSUMING_TESTS = (
     "scripts/tests/test_legibility_inventory.py",
 )
 
-# The literal token whose presence in a test file makes it a CANDIDATE consumer.
-_SKILLS_TOKEN = "skills/"
-
-# Tracked test files that contain the literal ``skills/`` but do NOT read or
-# execute any real path under the repo's skills/ tree. Every entry carries the
-# reason it is not a consumer, because a bare list of paths would be
-# indistinguishable from an unexamined suppression list.
-#
-# THIS SET EXISTS SO A NEW CONSUMER CANNOT ARRIVE SILENTLY. The inventory above
-# is hand-maintained, which catches a consumer that MOVES or DIES but is blind
-# to one that is ADDED. Requiring every ``skills/``-mentioning test to sit in
-# exactly one of the two sets turns "someone wrote a new test that reads
-# skills/" from invisible drift into a failure whose fix is a one-line triage
-# decision: real consumer -> inventory, prose/synthetic -> here, with a reason.
-#
-# STALENESS IS DELIBERATELY NOT GATED. An entry whose file no longer mentions
-# the token is INERT, not a failure — a staleness assertion was shipped, then
-# removed on review because it made other packages' comment prose a
-# merge-blocking gate here. Prune such entries opportunistically; the full
-# record and the "do not reintroduce it" rationale live in
-# test_no_unlisted_skills_mentioning_test_escapes_triage's docstring.
-_SKILLS_MENTION_NON_CONSUMERS = {
-    # Builds '/repo/skills/spawn/spawn-claude.sh' as a FAKE argv string against
-    # a synthetic repo root; never touches this repo's tree.
-    "cockpit/tests/test_app.py": "synthetic /repo/... argv string",
-    "cockpit/tests/test_spawn_bar.py": "synthetic /repo/... argv string",
-    # Writes a tmp_path 'skills/foo.md' FIXTURE to exercise the docs-only
-    # verify-scope branches. The path is fabricated under tmp_path.
-    "orchestrator/tests/test_verify.py": "tmp_path 'skills/foo.md' fixture",
-    "orchestrator/tests/test_verify_scope_inversion_boundary.py": (
-        "tmp_path 'skills/foo.md' fixture"
-    ),
-    "orchestrator/tests/test_verify_scope_kappa.py": (
-        "tmp_path 'skills/foo.md' fixture"
-    ),
-    "orchestrator/tests/test_verify_scope_lambda.py": (
-        "tmp_path 'skills/foo.md' fixture"
-    ),
-    # Mentions a skill directory or file only in PROSE — a docstring or a
-    # comment naming where a behaviour is documented. No filesystem access.
-    "escalation/tests/test_watcher_rearm.py": "prose docstring mention",
-    "fused-memory/tests/test_config_schema.py": "prose docstring mention",
-    "orchestrator/tests/test_harness_deterministic_recon_sweep.py": (
-        "prose comment mention"
-    ),
-    "scripts/tests/test_legibility_sampling.py": "prose comment mention",
-    "scripts/tests/test_legibility_transcript_persistence.py": (
-        "prose comment mention"
-    ),
-    # This guard. It reaches skills/ only THROUGH the probe module it gates
-    # (skills_ruff_probe._guarded_py_files), and passes skills/ pathspecs to
-    # git — it is not independent evidence of consumer coverage, so listing it
-    # in the inventory would make CORRECTION 1's cost argument self-referential.
-    "tests/scripts/test_skills_module_config_decision.py": (
-        "this guard; reaches skills/ only via the probe it gates"
-    ),
-}
-
 
 def _git_ls_files(*pathspecs: str) -> list[str]:
     """Tracked paths matching *pathspecs*, via real ``git ls-files``.
@@ -253,47 +218,6 @@ def _git_ls_files(*pathspecs: str) -> list[str]:
         f"pass vacuously; stderr: {proc.stderr.strip()!r}"
     )
     return [line for line in proc.stdout.splitlines() if line]
-
-
-def _git_grep_files(token: str, *pathspecs: str) -> list[str]:
-    """Tracked paths matching *pathspecs* that contain the LITERAL *token*.
-
-    ``-F`` so the token is a fixed string, not a regex — ``skills/`` has no
-    metacharacters today, but a future token with a ``.`` in it must not
-    quietly widen the sweep.
-
-    No try/except-and-skip, same contract as ``_git_ls_files``: exit status 0
-    means matches, 1 means none, anything else is a broken git and must FAIL
-    the caller rather than be read as "no matches".
-    """
-    proc = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "grep", "-l", "-F", "--", token, *pathspecs],
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode in (0, 1), (
-        f"`git grep -l -F -- {token!r} {' '.join(pathspecs)}` exited "
-        f"{proc.returncode} (task 3554) — expected 0 (matches) or 1 (none). A "
-        f"broken git must fail this guard rather than read as 'no matches'; "
-        f"stderr: {proc.stderr.strip()!r}"
-    )
-    return [line for line in proc.stdout.splitlines() if line]
-
-
-def _looks_like_a_test_module(rel_path: str) -> bool:
-    """``test_*.py`` / ``*_test.py`` by BASENAME, whatever directory it sits in.
-
-    The pathspec sweep that feeds this is deliberately over-broad
-    (``*test_*.py`` matches ``pytest_markers.py`` and
-    ``cleanup_test_collections.py``), because narrowing it at the git level
-    reintroduces the very wildmatch asymmetry ``_git_ls_files`` documents:
-    MEASURED at this base, ``git ls-files -- '*/tests/**/test_*.py'`` does NOT
-    match ``orchestrator/tests/test_skill_prompt.py``, since ``**`` needs one
-    more ``/`` after ``/tests/``. Sweeping wide and filtering by basename in
-    Python has no such edge.
-    """
-    name = pathlib.PurePosixPath(rel_path).name
-    return name.startswith("test_") or name.endswith("_test.py")
 
 
 def test_no_skills_prefixed_module_config_is_registered() -> None:
@@ -866,8 +790,15 @@ def test_every_skills_consuming_test_stays_under_a_gated_directory() -> None:
     checked rather than accidentally uncovered.
 
     THE OPPOSITE DRIFT — a NEW consumer that never reaches this tuple — is not
-    detectable here and is pinned separately by
-    ``test_no_unlisted_skills_mentioning_test_escapes_triage``.
+    detectable here and is DELIBERATELY UNGATED anywhere. The ratchet that once
+    pinned it was removed on review for coupling this module to other packages'
+    docstring and comment prose; the full record, and why a regex or
+    word-boundary variant is not an acceptable replacement, is in this module's
+    docstring. The asymmetry is tolerable in a way the drift above is not: an
+    unrecorded extra consumer makes CORRECTION 1's cost argument against option
+    (b) understate the union's size, i.e. errs toward the conclusion already
+    taken, whereas a consumer that MOVES, DIES or leaves a gated directory
+    removes coverage the decision actually credits.
     """
     collected, non_pytest = _collected_by_prefix()
 
@@ -921,106 +852,4 @@ def test_every_skills_consuming_test_stays_under_a_gated_directory() -> None:
         f"{DF_CONFIG_NAME} credits to the consumers' suites is no longer "
         f"there. Re-take the decision on the record in that block rather than "
         f"editing this tuple."
-    )
-
-
-def test_no_unlisted_skills_mentioning_test_escapes_triage() -> None:
-    """Every ``skills/``-mentioning test must be triaged into exactly one set.
-
-    THE OPPOSITE DRIFT from its sibling above. That test catches a listed
-    consumer that MOVES or DIES; this one catches a consumer that is ADDED and
-    never listed. Both matter because CORRECTION 1 of the DECIDED block argues
-    option (b) is too expensive on the strength of the consumer set spanning
-    three uv projects — an argument that weakens silently if the real set is
-    larger than the recorded one, and the recorded one is mirrored in PROSE in
-    that block.
-
-    HOW IT WORKS. Sweep every tracked ``test_*.py`` / ``*_test.py`` for the
-    literal ``skills/``; every hit must be in ``SKILLS_CONSUMING_TESTS`` or in
-    ``_SKILLS_MENTION_NON_CONSUMERS``. A new file in neither fails with a
-    one-line triage instruction. The exclusion set is not a free suppression
-    channel: each entry carries its reason.
-
-    CORRECTED, NOT SILENTLY REWRITTEN — task 3460's correct-rather-than-delete
-    precedent, the house convention this file's own DECIDED block follows and
-    which is already used twice in this module. This paragraph previously
-    claimed that "a stale entry — one that no longer mentions ``skills/`` at
-    all — also fails, so the set cannot silently accumulate". A staleness
-    assertion WAS shipped here and was REMOVED on review. WHY: it made comment
-    and docstring PROSE in five unrelated packages a load-bearing gate on this
-    module, so a cosmetic reword elsewhere red-walled a merge-blocking config —
-    measured, by rewording one comment in
-    ``scripts/tests/test_legibility_sampling.py``, as ``1 failed, 5 passed``
-    here from a diff touching nothing this file gates. WHY REMOVAL IS SAFE: an
-    unmatched exclusion key is INERT. ``untriaged`` only ever consults
-    ``triaged`` for MEMBERSHIP, so a key that matches no file cannot make any
-    file that still mentions the token pass.
-
-    THE REPLACEMENT POLICY IS OPPORTUNISTIC PRUNING, and it is a policy rather
-    than an oversight: drop stale entries when this file is next touched for
-    another reason. Do NOT reintroduce a staleness check, and do NOT "fix" the
-    coupling with a word-boundary or regex variant — that keeps the identical
-    dependency on other packages' prose while hiding it behind a cleverer
-    matcher.
-
-    A SUBSET ASSERTION, NOT AN EQUALITY, AND THE MEASUREMENT SAYS WHY. A
-    literal-token sweep is a LOWER BOUND on the consumer set, with a measured
-    counterexample at this base: ``orchestrator/tests/
-    test_harness_watcher_supervisor.py`` contains the string ``skills``
-    ZERO times (``git grep -n -- 'skills'`` over it returns nothing) yet is a
-    real consumer — it calls ``load_skill_system_prompt('escalation-watcher-
-    auto')``, which reads the in-repo ``skills/escalation-watcher-auto/
-    SKILL.md``. So the inventory legitimately EXCEEDS the sweep, and asserting
-    equality would go red on a correct inventory. Only the direction that can
-    hide a new consumer is asserted.
-
-    MEASURED RED at base main ``7c6039327d`` against a single uncommitted
-    scratch mutation — an untriaged new consumer
-    (``orchestrator/tests/test_scratch_skills_consumer.py`` containing
-    ``skills/spawn/spawn-claude.sh``), ``git add -N``'d::
-
-        AssertionError: test file(s) mention 'skills/' but appear in NEITHER
-        the consumer inventory NOR the non-consumer exclusion set (task 3554):
-        ['orchestrator/tests/test_scratch_skills_consumer.py'].
-
-    RE-MEASURED AGAINST THE POST-REMOVAL BODY at base main ``0f65bf916d``,
-    because surgery on a guard can cut away its bite along with its cost. With
-    that same scratch consumer recreated, the failure text above reproduces
-    VERBATIM. And in the other direction, with
-    ``scripts/tests/test_legibility_sampling.py``'s comment reworded to drop
-    its ``skills/`` mention, this module now reports all-passed where it
-    reported ``1 failed, 5 passed`` before the removal. Both scratch mutations
-    were reverted before commit.
-    """
-    mentioning = sorted(
-        rel
-        for rel in _git_grep_files(_SKILLS_TOKEN, "*test_*.py", "*_test.py")
-        if _looks_like_a_test_module(rel)
-    )
-
-    # NON-VACUITY. This module itself contains the token and is a tracked
-    # test file, so an empty sweep means the pathspecs or the grep broke
-    # rather than that the repo genuinely has no mentions.
-    assert mentioning, (
-        f"the `{_SKILLS_TOKEN}` sweep over tracked test files returned NOTHING "
-        f"(task 3554) — impossible while this very module contains the token, "
-        f"so the pathspecs or `git grep` are broken and this drift detector "
-        f"would pass vacuously."
-    )
-
-    triaged = set(SKILLS_CONSUMING_TESTS) | set(_SKILLS_MENTION_NON_CONSUMERS)
-    untriaged = [rel for rel in mentioning if rel not in triaged]
-    assert not untriaged, (
-        f"test file(s) mention {_SKILLS_TOKEN!r} but appear in NEITHER the "
-        f"consumer inventory NOR the non-consumer exclusion set (task 3554): "
-        f"{untriaged}. Triage each into exactly one, in "
-        f"tests/scripts/test_skills_module_config_decision.py: if it READS or "
-        f"EXECUTES a real path under the repo's skills/ tree, add it to "
-        f"SKILLS_CONSUMING_TESTS *and* to the consumer enumeration in the "
-        f"`DECIDED — skills/orchestrator.yaml` block of {DF_CONFIG_NAME}, "
-        f"which must not drift from it. If the mention is prose, or a "
-        f"synthetic/tmp_path path that never touches this repo's skills/, add "
-        f"it to _SKILLS_MENTION_NON_CONSUMERS with its reason. A growing real "
-        f"consumer set makes CORRECTION 1's cost argument against option (b) "
-        f"stronger, not weaker — but only if it is recorded."
     )
