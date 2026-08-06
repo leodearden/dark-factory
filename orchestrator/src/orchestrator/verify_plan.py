@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from typing import Literal
@@ -447,12 +447,12 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     return VerifyCmd(tool=scoped.tool, raw=f'{render(scoped)} {tail}')
 
 
-def _marker_deselecting_expression(
-    mc: ModuleConfig,
-    collectable_tests: list[str],
+def deselecting_expression_for_command(
+    test_command: str | None,
+    targets: Sequence[str],
     worktree_reader: Callable[[str], str | None],
 ) -> str | None:
-    """The module's effective ``-m`` expression when it provably deselects EVERY target.
+    """*test_command*'s effective ``-m`` expression when it provably deselects EVERY target.
 
     Returns None — "keep today's FILE_SCOPED behaviour" — for every other case,
     including any unreadable file or unparseable expression. See
@@ -460,9 +460,23 @@ def _marker_deselecting_expression(
     both reads go through the SAME injected *worktree_reader*, so this function
     introduces no filesystem access of its own.
 
+    SHARED BY BOTH ARMS (task 3513): the module arm passes ``mc.test_command``
+    plus that module's touched COLLECTABLE_TEST files
+    (:func:`_derive_module_runs` arm 4a, task 3494); the fallback arm passes the
+    ALREADY-EXECUTED fallback command plus its resolved file targets
+    (:func:`widen_fallback_for_marker_deselection`). Keeping ONE implementation
+    of "which commands are refused" and "where the ini file is looked for" is
+    load-bearing: were the two arms to answer differently, the arm with the
+    weaker guards would over-fire on a config its command never applies.
+
+    *targets* are worktree-ROOT-relative (the frame *worktree_reader* reads in),
+    while the command's own targets may be cwd-relative — only the CONFIG path
+    below follows the command's ``cwd_rel``. A caller holding cwd-relative
+    targets must resolve them first.
+
     WHERE the ini file is looked for: pytest reads ``addopts`` from its
-    ROOTDIR, which follows the command's effective cwd — NOT from
-    ``mc.prefix``. The two come apart in this very repo: the ``scripts`` and
+    ROOTDIR, which follows the command's effective cwd — NOT from any module
+    prefix. The two come apart in this very repo: the ``scripts`` and
     ``tests/scripts`` modules both run ``uv run --project shared pytest
     tests/scripts/ ...`` from the REPO ROOT (no ``--directory``), so a
     ``scripts/pyproject.toml`` would never be the config pytest actually
@@ -473,8 +487,8 @@ def _marker_deselecting_expression(
     Three guards REFUSE rather than guess. Each is fail-safe — no widening,
     i.e. exactly the pre-3494 FILE_SCOPED behaviour:
 
-    1. a ``test_command`` that does not parse as PYTEST at all (``npm test``,
-       a shell script): the module's ``addopts`` describe a suite this command
+    1. a *test_command* that does not parse as PYTEST at all (``npm test``,
+       a shell script): a pyproject's ``addopts`` describe a suite this command
        never invokes, so consulting them would widen on a false premise;
     2. a raw-retained command (``cmd.raw is not None`` — OPAQUE, or an ``&&``
        chain): neither the effective cwd nor which invocation gets scoped is
@@ -486,9 +500,9 @@ def _marker_deselecting_expression(
        ``tox.ini`` addopts are invisible here, so a module configured that way
        simply never widens. A deliberate UNDER-fire, never an over-fire.
     """
-    if not mc.test_command:
+    if not test_command:
         return None
-    parsed = parse_config_command(mc.test_command)
+    parsed = parse_config_command(test_command)
     if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None:
         return None
     cwd_rel = parsed.cwd_rel
@@ -496,9 +510,9 @@ def _marker_deselecting_expression(
         'pyproject.toml' if not cwd_rel or cwd_rel == '.' else f'{cwd_rel}/pyproject.toml'
     )
     return deselecting_expression_for_targets(
-        collectable_tests,
+        targets,
         worktree_reader(config_path),
-        mc.test_command,
+        test_command,
         worktree_reader,
     )
 
@@ -578,7 +592,7 @@ def _derive_module_runs(
     ModuleConfig — through the same content-cached reader used above, so a
     target already read for STRUCTURAL detection costs nothing further — and
     ZERO target reads for a module that declares no ``-m`` expression at all.
-    See :func:`_marker_deselecting_expression` for where that ini file is
+    See :func:`deselecting_expression_for_command` for where that ini file is
     looked for and which commands are refused outright.
 
     The widened run applies the SAME addopts, so the touched file(s) remain
@@ -708,7 +722,9 @@ def _derive_module_runs(
                 )
             runs.append(PlannedRun(mc.prefix, test_cmd, ScopeKind.FULL_SUITE, reason))
         elif collectable_tests:
-            deselecting = _marker_deselecting_expression(mc, collectable_tests, worktree_reader)
+            deselecting = deselecting_expression_for_command(
+                mc.test_command, collectable_tests, worktree_reader,
+            )
             if deselecting is not None:
                 test_cmd = parse_config_command(mc.test_command)
                 # The widened run applies the SAME addopts, so the very files

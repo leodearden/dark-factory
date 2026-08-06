@@ -38,8 +38,8 @@ from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_plan import (
     ScopeKind,
     VerifyPlan,
-    deselecting_expression_for_command,
     derive_verify_plan,
+    deselecting_expression_for_command,
 )
 
 # ---------------------------------------------------------------------------
