@@ -778,7 +778,7 @@ gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, origin_finding_id,
 spawned_from, program, program_stream, stream, cross_repo,
 cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at
+human_curator_adjudicated_at, last_blocked_at
 ```
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker

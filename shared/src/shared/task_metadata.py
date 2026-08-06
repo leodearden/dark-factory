@@ -855,6 +855,12 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # with the automated task curator.
         HUMAN_CURATOR_GATE_KEY,
         'human_curator_adjudicated_at',
+        # Orchestrator block-stamp (task 3697): written by workflow.py on every
+        # block, read by agents/briefing.py for the stale-briefing check; 78
+        # tasks carry it (census 2026-08-06). Promoted rather than x_-renamed
+        # because it is machine-written against a live reader — renaming it on
+        # one task would fork the vocabulary and be re-added on the next block.
+        'last_blocked_at',
     }
 )
 
