@@ -670,9 +670,14 @@ class TestRecordFlakeOccurrenceEmptyTestIds:
         unconfirmable denominator θ's class-1 check divides by."""
         import logging
 
-        from orchestrator.flake_ledger import FlakeVerdict
+        from orchestrator.flake_ledger import FlakeVerdict, ensure_schema
 
+        # Provisioned up front — the realistic precondition (a live runs.db already
+        # carries the tables), and it makes the count below a genuine "nothing was
+        # written" assertion rather than an artifact of a missing table.
         db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
             self._record(db_path, verdict=FlakeVerdict(verdict_name), test_ids=())
 

@@ -203,6 +203,27 @@ def record_flake_occurrence(
     §8.3's idempotency key is ``(test_id, observed_at, call_site)``, and a write-time
     stamp would make every retry a distinct row.
     """
+    # §8: EMPTY test_ids is legal only for `unconfirmable`.  An unconfirmable
+    # observation that resolved no node-ids is still COUNTED, under the sentinel —
+    # θ's class-1 health check is an unconfirmable RATE, so dropping the row would
+    # make "could not even determine which tests failed" invisible.  UNKNOWN_TEST_ID
+    # must never reach `open_debt`: it names no test, so it can own no de-flake task.
+    if s.test_ids:
+        test_ids = s.test_ids
+    elif s.verdict is FlakeVerdict.unconfirmable:
+        test_ids = (UNKNOWN_TEST_ID,)
+    else:
+        # A confirmed verdict about zero tests is meaningless.  Degrade loudly rather
+        # than accept it: a sentinel row here would corrupt the denominator θ's
+        # unconfirmable rate divides by.
+        logger.warning(
+            'flake_ledger: %s verdict with empty test_ids at call_site=%s; dropping '
+            '(a confirmed verdict about zero tests is meaningless)',
+            s.verdict.value,
+            s.call_site,
+        )
+        return
+
     ensure_schema(db_path)
     detail = (
         json.dumps({'unconfirmable_reason': s.unconfirmable_reason})
@@ -225,7 +246,7 @@ def record_flake_occurrence(
             s.psi_cpu_some10,  # bound directly, so None becomes SQL NULL, never 0.0
             detail,
         )
-        for test_id in s.test_ids
+        for test_id in test_ids
     ]
     conn = _connect(db_path)
     try:
