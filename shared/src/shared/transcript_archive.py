@@ -162,3 +162,55 @@ def archive_task_transcripts(
         except OSError as exc:
             _record_failure(src, task_id, exc)
     return count
+
+
+def durable_archive_path(
+    archive_root: Path,
+    task_id: str,
+    session_id: str,
+) -> Path | None:
+    """Locate *session_id*'s archived main transcript under *archive_root*.
+
+    The read side of this module. Returns the archived transcript's path, or
+    ``None`` when this session has no archive. The located layout is the one
+    :func:`_archive_one` writes::
+
+        <archive_root>/<task_id>/<encoded-cwd>/<session_id>.jsonl[.gz]
+
+    Contract (plans/session-resume-eligibility-seam-prd.md §8):
+
+    * **I-A total** — never raises, for any input. Modelled on
+      :func:`shared.cli_invoke._resolve_transcript_path`: one blanket
+      ``except Exception`` → ``None``, not an enumeration of ``OSError``
+      subclasses. Callers on the dispatch path (the orchestrator's
+      session-resume guard and its fallback emit) lean on that totality to
+      stay total themselves.
+    * **I-B cwd-agnostic** — the encoded-cwd component is *globbed*, never
+      assumed, so a session archived from one worktree lane is still found
+      after re-dispatch into a different lane.
+    * **I-C format-agnostic** — matches both the gzipped ``.jsonl.gz`` shape
+      and the plain ``.jsonl`` shape task 3618 moves to, so the cutover needs
+      no flag day and this locator carries no dependency on it.
+    * **I-D read-only** — glob and ``stat`` only. Nothing is created, moved,
+      deleted or decompressed here; *restoration* is task 3578's, under task
+      3619's archive-before-delete guard.
+    * **I-E sole locator** — this is the only session-id-keyed lookup into the
+      archive. Consumers call it rather than re-deriving the layout, so the
+      producer and every reader cannot drift (INV-5).
+    * **I-F deterministic** — when several lanes archived the same session,
+      the newest-mtime match wins, with a stable tiebreak.
+
+    Returns ``Path | None``, never ``bool`` (PRD decision D6): existence is
+    spelled ``is not None``, and task 3578's restore reuses the very path
+    returned here instead of growing a second glob that would have to agree
+    with this one byte-for-byte forever.
+
+    .. note::
+       Built up across task 3727's steps: this initial body satisfies only
+       I-B/I-D/I-E. Steps 4, 6 and 8 widen it to satisfy I-C (format span and
+       the directory-decoy filter), I-F (newest-mtime + tiebreak) and I-A
+       (the blanket guard and input coercion) respectively.
+    """
+    archive_root = Path(archive_root)
+    matches = list(archive_root.glob(f'{task_id}/*/{session_id}.jsonl.gz'))
+    return matches[0] if matches else None
