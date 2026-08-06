@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -587,3 +590,97 @@ async def test_lifespan_shutdown_leaves_no_aiosqlite_worker_threads(
             if getattr(conn, '_running', False):
                 with contextlib.suppress(Exception):
                     await conn.close()
+
+
+def test_metrics_loop_cancelled_mid_connect_reports_no_unhandled_thread_exception(
+    tmp_path: Path, monkeypatch
+):
+    """Nothing may escape an aiosqlite worker thread after its loop is closed.
+
+    This asserts the exact thing pytest's ``threadexception`` plugin reports —
+    an exception escaping ``_connection_worker_thread`` — so it fails for the
+    same reason the original suite ERROR fired, independently of test ordering.
+
+    SYNCHRONOUS on purpose.  The defect only manifests once the event loop that
+    owned the connect is CLOSED, and a test cannot close the loop it is running
+    on.  So this drives ``lifespan()`` on a loop it owns, closes it, and only
+    then drops the last reference to whatever the pool left behind.  That final
+    ``gc.collect()`` is the trigger: ``aiosqlite.Connection.__del__`` calls
+    ``stop()``, whose STOP sentinel makes the worker thread call
+    ``future.get_loop().call_soon_threadsafe(...)`` on the now-closed loop →
+    ``RuntimeError: Event loop is closed`` raised *inside the thread*, escaping
+    through ``_connection_worker_thread`` to ``threading.excepthook``, which
+    pytest then blames on whatever test is running at that instant.
+
+    Post-fix the trigger cannot fire: ``close_all()`` closed the connection
+    while the loop was still alive, so ``__del__`` finds ``_connection is None``
+    and returns without queueing anything.
+    """
+    apply_isolated_env(monkeypatch, tmp_path)
+    config = DashboardConfig.from_env()
+    db_paths = _create_metrics_loop_db_files(config)
+
+    escaped: list[threading.ExceptHookArgs] = []
+    original_hook = threading.excepthook
+
+    def _recording_hook(args) -> None:
+        thread_name = getattr(args.thread, 'name', '') or ''
+        target_name = getattr(getattr(args.thread, '_target', None), '__name__', '')
+        if '_connection_worker_thread' in (thread_name + target_name):
+            escaped.append(args)
+            return
+        original_hook(args)
+
+    landed = asyncio.Event()
+    opened: list[aiosqlite.Connection] = []
+
+    async def _drive_lifespan() -> None:
+        local_app = FastAPI(lifespan=lifespan)
+        with (
+            patch('dashboard.app.collect_snapshot', new=AsyncMock(return_value=None)),
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(return_value=None),
+            ),
+            patch('aiosqlite.connect', _holding_readonly_connect(landed, opened)),
+        ):
+            async with lifespan(local_app):
+                await asyncio.wait_for(landed.wait(), timeout=5.0)
+            await asyncio.sleep(_CONNECT_HOLD_SECONDS + 0.5)
+
+    threading.excepthook = _recording_hook
+    loop = asyncio.new_event_loop()
+    # set_event_loop so Connection.stop()'s `asyncio.get_event_loop()` resolves
+    # to THIS (soon-closed) loop during the gc below — that is precisely the
+    # production condition being reproduced.
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_drive_lifespan())
+        assert opened, (
+            f'no read-only DbPool connect was observed for '
+            f'{[str(p) for p in db_paths]} — the metrics loop never reached '
+            f'aiosqlite.connect, so this guard asserted nothing'
+        )
+        survivors_before_gc = [c for c in opened if getattr(c, '_running', False)]
+
+        loop.close()
+        # Drop the last references and force finalisation NOW, while the closed
+        # loop is still the current one.
+        opened.clear()
+        del survivors_before_gc
+        gc.collect()
+        time.sleep(0.5)  # let any woken worker thread run to its escape
+    finally:
+        threading.excepthook = original_hook
+        if not loop.is_closed():
+            loop.close()
+        asyncio.set_event_loop(None)
+
+    assert not escaped, (
+        f'{len(escaped)} exception(s) escaped an aiosqlite worker thread after '
+        f'its event loop closed: '
+        f'{[repr(a.exc_value) for a in escaped]}. This is the roaming pytest '
+        f'ERROR — threading.excepthook attributes it to whichever test happens '
+        f'to be running. DbPool.close_all() must close every connection it '
+        f'caused to be opened while the loop is still alive.'
+    )
