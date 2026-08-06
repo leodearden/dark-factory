@@ -17,8 +17,17 @@ future prompt refactor can splice one without the other.
 
 Turn prompts whose role already carries the full block inject the short
 ``WAIT_PATTERN_REMINDER`` pointer instead, so no session receives the same
-~3.2 kB twice; the tests below pin both the pointer AND the precondition that
-makes it sound (its receiving role really does carry the block).
+block twice; the tests below pin the pointer, and the half of its soundness
+precondition that is machine-checkable (IMPLEMENTER really does carry the
+block — see ``test_amender_reminder_cannot_dangle`` for the half that is not).
+
+Size figures are deliberately absent from this file, with one flagged
+historical exception (see ``test_combined_guidance_is_stated_up_front``). The
+block's measured bytes are stated in exactly one place — the comment above
+``WAIT_PATTERN_REMINDER`` in ``roles.py`` — together with the command to
+re-derive them. An earlier revision hand-copied the figure to 6 sites in this
+file and 2 in ``roles.py``, and all 8 were wrong (task 3607 review). Say "the
+full block".
 
 Its real effect is on model behaviour and is not unit-testable, but silent
 removal during a prompt refactor is a genuine safety regression — the repo
@@ -43,10 +52,12 @@ where the wording being "still correct" is not.
 
 from __future__ import annotations
 
+import importlib.resources as pkg_resources
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import (
@@ -62,7 +73,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 # tool — i.e. it can launch a build, a full test suite, or a long verification
 # run. ``reviewer_comprehensive`` and ``judge`` hold only ``'Bash(git:*)'``
 # (read-only git, no long-running command is reachable) and are deliberately
-# excluded: the guidance would be ~2.6 kB of dead weight in every one of their
+# excluded: the whole block would be dead weight in every one of their
 # sessions.
 _BACKGROUND_CAPABLE_ROLES = frozenset({
     'architect',
@@ -138,13 +149,34 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     has to revisit the wording deliberately. The standing instruction not to
     "restore" 3900000 lives as a provenance comment above the constants in
     roles.py, which is the right home for an editorial rule.
+
+    BOTH sources of that 1800 are checked, because they are two hand-maintained
+    copies and only one of them binds. ``defaults.yaml`` is what a dispatched
+    session actually runs under (it is merged OVER the model), while the
+    pydantic ``Field`` default only applies to a config built without the
+    package defaults. They agree today, but nothing enforces that, so a
+    ``defaults.yaml``-only edit would leave the guidance stale while an
+    assertion against the ``Field`` default alone stayed green. Same shape as
+    ``test_config.py::test_default_price_table_matches_defaults_yaml``, the
+    repo's existing precedent for pinning a hand-maintained pair.
+
+    A per-project ``dark-factory-orchestrator.yaml`` can still override the
+    value below both of these; that is out of reach of any unit test and is
+    accepted — the prose is sized to the SHIPPED bound.
     """
-    idle_secs = OrchestratorConfig.model_fields['timeouts'].default_factory().working_idle_secs  # type: ignore[misc]
-    assert idle_secs == 1800, (
-        f'timeouts.working_idle_secs default moved to {idle_secs}s. The wait-pattern '
-        'guidance quotes 1800s / 30 minutes as the session idle bound and derives its '
-        '~25-minute background threshold from it — update both constants in roles.py '
-        'to stay under the new bound, then update this assertion.'
+    field_default = OrchestratorConfig.model_fields['timeouts'].default_factory().working_idle_secs  # type: ignore[misc]
+    shipped = yaml.safe_load(
+        (pkg_resources.files('orchestrator') / 'defaults.yaml').read_text()
+    )['timeouts']['working_idle_secs']
+
+    assert (field_default, shipped) == (1800, 1800), (
+        f'The session idle bound moved: defaults.yaml={shipped}s, '
+        f'config.py Field default={field_default}s (both were 1800s). The '
+        'wait-pattern guidance quotes 1800s / 30 minutes as the session idle '
+        'bound and derives its ~25-minute background threshold from it. If the '
+        'two now DISAGREE, defaults.yaml is the one that binds a dispatched '
+        'session — fix the drift first. Then update both constants in roles.py '
+        'to stay under the new bound, and update this assertion.'
     )
 
 
@@ -239,7 +271,7 @@ def test_excluded_roles_do_not_carry_combined_guidance() -> None:
 
     The two tests above catch a role GAINING Bash and a capable role LOSING the
     block. Neither catches an accidental splice into an excluded role. The
-    exclusion is justified on token cost — the block is ~3.2 kB paid on every
+    exclusion is justified on token cost — the full block is paid on every
     invocation — and ``reviewer_comprehensive`` is among the highest-frequency
     roles in the system, so an errant splice there is expensive and would ship
     silently. This makes the stated rationale enforced rather than aspirational.
@@ -264,7 +296,7 @@ def test_combined_guidance_appears_exactly_once_per_role() -> None:
     """No duplicate splice — the block is carried once, and only once.
 
     Catches a stale tail splice left behind beside the new up-front one, which
-    would silently double ~2.6 kB of prompt in every session of that role. The
+    would silently double the whole block in every session of that role. The
     ``BACKGROUND_TASK_WARNING`` count is checked separately because the combined
     unit CONTAINS it: a leftover bare ``+ BACKGROUND_TASK_WARNING`` tail would
     push that count to 2 while the combined count stayed at 1.
@@ -294,6 +326,13 @@ def test_combined_guidance_is_stated_up_front() -> None:
     This is the census-R3 defect itself: task 2761's guard was appended at the
     very end of an 11 kB prompt (and ``_FOLLOWUP_FILING_INSTRUCTIONS`` after it),
     where it does not read as an operating rule.
+
+    That 11 kB describes IMPLEMENTER **as of main before this task** (measured
+    11201 B), which is the state the defect was diagnosed in — it is not a claim
+    about the prompt this file tests, and it is the one number here that is
+    historical rather than re-derivable from the current tree. Do not "update"
+    it to the post-splice size; that would describe a prompt the defect never
+    occurred in.
 
     "Up front" is asserted STRUCTURALLY: the block's own ``##`` heading must be
     the first ``##`` heading in the prompt, i.e. nothing but the opening
@@ -339,14 +378,23 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
 
 
 def test_amender_reminder_cannot_dangle() -> None:
-    """The pointer's precondition: its receiving role carries the full block.
+    """Half the pointer's precondition: IMPLEMENTER carries the full block.
 
     ``build_amender_prompt`` injects the short ``WAIT_PATTERN_REMINDER`` rather
-    than restating all of ``BACKGROUND_WAIT_GUIDANCE``, which is only sound
-    because the amender is invoked under IMPLEMENTER (``workflow.py``, the sole
-    ``_invoke(IMPLEMENTER, ...)`` amendment call site) and IMPLEMENTER carries
-    the full block up front. Pin that precondition here: if IMPLEMENTER ever
-    loses the block, the pointer refers to rules the amender was never given.
+    than restating all of ``BACKGROUND_WAIT_GUIDANCE``. That is sound only if
+    BOTH halves hold: (a) the amender is invoked under IMPLEMENTER
+    (``workflow.py``, the sole ``_invoke(IMPLEMENTER, ...)`` amendment call
+    site), and (b) IMPLEMENTER carries the full block up front.
+
+    This test pins (b) ONLY. If IMPLEMENTER ever loses the block, the pointer
+    refers to rules the amender was never given, and this fails. Half (a) is
+    NOT pinned by this test or any other: the only way to check it is to scan
+    ``workflow.py``'s source for the call site, and a string-literal scan over
+    source is precisely the brittle pin two review cycles removed from this
+    file. So re-pointing ``build_amender_prompt`` at a role without the block
+    would dangle the pointer silently — an accepted, documented gap, recorded
+    here and above ``WAIT_PATTERN_REMINDER`` in ``roles.py`` rather than papered
+    over by a test name that implies more coverage than exists.
     """
     assert BACKGROUND_WAIT_GUIDANCE in ROLES['implementer'].system_prompt, (
         "IMPLEMENTER lost BACKGROUND_WAIT_GUIDANCE, so build_amender_prompt's "
@@ -370,7 +418,7 @@ async def test_amender_prompt_reinforces_the_wait_rules(
 
     It asserts the POINTER, not the whole block: interpolating
     ``BACKGROUND_WAIT_GUIDANCE`` verbatim here would hand the amender the same
-    ~3.2 kB twice in one session (once via IMPLEMENTER's system prompt, once
+    block twice in one session (once via IMPLEMENTER's system prompt, once
     here) — the cross-prompt twin of the double-splice that
     ``test_combined_guidance_appears_exactly_once_per_role`` forbids within a
     single prompt. The no-duplication half is asserted explicitly so a future
@@ -399,6 +447,6 @@ async def test_amender_prompt_reinforces_the_wait_rules(
     assert BACKGROUND_WAIT_GUIDANCE not in prompt, (
         'The amender turn-prompt inlines the full BACKGROUND_WAIT_GUIDANCE. '
         "IMPLEMENTER's system prompt already carries it up front, so this "
-        'duplicates ~3.2 kB verbatim in every amendment pass. Use the short '
-        'WAIT_PATTERN_REMINDER pointer instead.'
+        'duplicates the entire block verbatim in every amendment pass. Use the '
+        'short WAIT_PATTERN_REMINDER pointer instead.'
     )

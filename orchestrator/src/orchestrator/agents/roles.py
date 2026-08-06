@@ -447,20 +447,42 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 
 
 # Pointer form for a TURN prompt whose role system_prompt already carries the
-# full block above.  Restating all ~3.2 kB at the failure site would hand the
-# agent the identical text twice in one session -- the very double-splice that
-# test_combined_guidance_appears_exactly_once_per_role polices WITHIN a system
-# prompt, just spread across the system/turn pair where that test cannot see
-# it.  The point of the at-the-failure-site injection was always ADJACENCY (put
-# the rule next to the action item that trips it), and a pointer buys that at
-# ~2% of the tokens.
+# full block above.  Restating the whole block at the failure site would hand
+# the agent the identical text twice in one session -- the very double-splice
+# that test_combined_guidance_appears_exactly_once_per_role polices WITHIN a
+# system prompt, just spread across the system/turn pair where that test cannot
+# see it.  The point of the at-the-failure-site injection was always ADJACENCY
+# (put the rule next to the action item that trips it), and the pointer buys
+# that for ~15% of the block's bytes.
+#
+# THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
+# BACKGROUND_WAIT_GUIDANCE 4480 B (= BACKGROUND_TASK_WARNING 1071 +
+# WAIT_PATTERN_GUIDANCE 3409), WAIT_PATTERN_REMINDER 662 B -> 662/4480 = 14.8%.
+# Re-derive rather than trust these after any edit to the strings:
+#   python -c "from orchestrator.agents.roles import *; \
+#              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
+# Every other mention of the block's size in roles.py and
+# test_roles_wait_pattern.py is deliberately QUALITATIVE ("the full block").
+# An earlier revision hand-copied the figure to 8 sites (2 here, 6 in the test
+# file) and every one was wrong: 5 said "~3.2 kB" and 2 said "~2.6 kB" against
+# a real 4.4 kB, and 1 said the pointer costs "~2% of the tokens" against a
+# real ~15% -- a 7x error (task 3607 review).  Prose copies do not move when
+# the string they describe does.  Do not reintroduce a number anywhere else --
+# cite this comment instead.
 #
 # Use this ONLY where the receiving role is statically known to carry
 # BACKGROUND_WAIT_GUIDANCE, or the pointer dangles and the agent is left with
 # neither half.  Today that is build_amender_prompt alone, which is invoked
 # under IMPLEMENTER at exactly one call site (workflow.py `_invoke(IMPLEMENTER,
-# ...)`); test_roles_wait_pattern.py pins that precondition rather than
-# trusting this comment.  Same no-literal-braces rule as the constants above.
+# ...)`).  Note precisely what is and is not machine-checked: the IMPLEMENTER
+# half of that precondition IS pinned (test_roles_wait_pattern.py asserts
+# IMPLEMENTER carries the block), but "the amender runs under IMPLEMENTER" is
+# NOT -- that call site is reachable only by reading workflow.py, and a
+# source-text scan for `_invoke(IMPLEMENTER` is exactly the brittle
+# literal-over-prose pin this feature's tests were twice told to drop.  So if
+# you re-point build_amender_prompt at another role, no test will stop you;
+# check that role carries the block yourself.  Same no-literal-braces rule as
+# the constants above.
 #
 # Keep it SUBSTANTIVE when editing: a pointer still has to STATE the operative
 # rules at the failure site -- foreground with an explicit `timeout`, or else
