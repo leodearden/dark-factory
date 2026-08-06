@@ -131,17 +131,15 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # tests/scripts/ alone. That is the trade this task deliberately makes: before
 # it, that same one-line edit ran NONE of the touched module's own tests.
 #
-# verify_command_timeout_secs stays UNSET here, so this module keeps inheriting
-# the repo-root whole-fleet 3600s ceiling — see the note at the bottom of this
-# file; sizing it remains follow-up 3458's, which should start from the six
-# measured runs above (four of the union, two of the command it replaced)
-# rather than re-deriving a baseline. The risk direction is safe, but the
-# margin is thinner than the early runs suggested: this command is strictly
-# longer than the one it replaces, and the SLOWEST observed run (930.59s wall)
-# is only ~3.9x under that ceiling, not the ~6.4x the first three runs implied.
-# Still safe unset — and that gap between ~3.9x and ~6.4x is exactly why the
-# knob is left unset rather than guessed at: a tight budget here red-walls
-# every merge repo-wide under load, which not setting one cannot.
+# CLOSURE RECORD (task 3458). verify_command_timeout_secs no longer stays
+# UNSET here — see the PER-MODULE VERIFY BUDGET block at the bottom of this
+# file, which sizes it at 2400s from exactly the six measured runs above
+# (four of the union, two of the command it replaced), using the SLOWEST
+# (930.59s wall, run 4) rather than the mean. The margin this paragraph used
+# to worry about — "only ~3.9x under that ceiling, not the ~6.4x the first
+# three runs implied" — is why 2400s (~2.6x the worst run) is the tightest
+# honestly declarable value: anything tighter risks red-walling this very
+# verification pass under load.
 #
 # THE DUPLICATE-RUN COST IS NOT RESOLVED BY THIS CHANGE. tests/scripts/ still
 # executes twice per full verify — once from this config and once from the
@@ -277,12 +275,88 @@ lint_command: "uv run --project shared ruff check scripts/"
 # pre-burn-down tree).
 type_check_command: "npx pyright scripts/"
 
-# verify_command_timeout_secs is deliberately left UNSET here, which means this
-# module inherits the repo-root whole-fleet ceiling (3600s) for each of its
-# checks — the same class of gap tests/scripts/ closed with its measured 600s
-# budget. Sizing it honestly needs multi-run measurement of the verbatim
-# FULL_SUITE command forms on this oversubscribed host, which task 3445 did not
-# perform; recorded here rather than guessed. Follow-up 3458 — which should NOT
-# read this note alone and conclude no measurement exists: task 3460 measured
-# the pytest form six times, and the MEASURED GREEN block above records every
-# run, including the 930.59s outlier that is the one a budget must survive.
+# PER-MODULE VERIFY BUDGET (task 3458, closing the gap this file recorded as
+# knowingly-open above — see the CLOSURE RECORD in the COST DELTA block).
+#
+# (1) MEASUREMENT PROVENANCE — every run this budget is sized against, so a
+# later reader sees the whole measured set, not the convenient half. Two
+# fresh, independent, sequential runs of the verbatim command above, at this
+# branch's base commit 37f761f5a4:
+#
+#   run 5   exit 0   2099 passed, 1 skipped   355.79s pytest / 360.47s wall
+#   run 6   exit 0   2099 passed, 1 skipped   275.44s pytest / 293.32s wall
+#
+# PLUS the four runs of this same union command already recorded above in the
+# MEASURED GREEN / COST DELTA blocks (task 3460):
+#
+#   run 1   exit 0   1926 passed, 1 skipped   430.96s pytest / 444.17s wall
+#   run 2   exit 0   1926 passed, 1 skipped   518.61s pytest / 565.37s wall
+#   run 3   exit 0   1931 passed, 1 skipped   310.33s pytest
+#   run 4   exit 0   1931 passed, 1 skipped   914.61s pytest / 930.59s wall
+#
+# The passed-count rose 1926/1931 -> 2099 between task 3460 and runs 5-6 from
+# unrelated commits landing on main in the interim, not from any change to
+# this command; runs 5-6 are otherwise the same command against the same two
+# target trees as runs 3-4.
+#
+# (2) THE SIZING ARITHMETIC. W = 930.59s (run 4), the largest wall-clock of
+# the five runs that recorded one; run 3 recorded only a pytest-internal
+# duration (310.33s pytest, no wall-clock captured), well under W either way,
+# so it cannot change which run is worst — never the mean. A mean would land
+# near 530s, which run 4 alone disproves: it is a recorded HONEST GREEN run
+# of this exact command on a byte-identical tree, so a budget under it would
+# manufacture infra_timeout on the green path — the exact defect this task
+# exists to prevent. The recorded wall-clocks span ~293s to ~931s for the
+# same command on this oversubscribed host; that spread is LOAD at
+# measurement time, not suite variance, which is exactly why the max and not
+# the mean is the sizing input (the same reasoning
+# tests/scripts/orchestrator.yaml applies to its own budget).
+# verify_command_timeout_secs: 2400 is ~2.6x W — the same multiple
+# tests/scripts/orchestrator.yaml uses for its own 600s budget (~2.6x its
+# 233.50s worst of two runs) — kept identical across the two sibling configs
+# deliberately, not coincidentally.
+#
+# (3) SCOPE: this is a PER-COMMAND budget. It bounds the TEST leg on its own,
+# not test+lint+type summed — each leg is timed independently by
+# verify._resolve_verify_timeout / run_verification. The type leg is
+# separately measured above at 46.3s / 42.1s (TYPE block); lint was not
+# separately timed but is orders of magnitude cheaper than either.
+#
+# (4) HOW MUCH THIS ACTUALLY BUYS, stated plainly rather than oversold: a
+# narrowing from the repo-root 3600s ceiling to 2400s — a hang surfaces in
+# ~40 minutes instead of ~60. That is modest, and deliberately NOT the
+# tests/scripts sibling's "surfaces a hang in minutes" framing: that suite
+# measures ~105-233s, so its 600s budget buys a far sharper narrowing than
+# this one can. Nothing tighter is honestly declarable here without risking
+# the green path itself, because an observed HONEST GREEN run has measured
+# 930.59s. THE DUPLICATE-RUN COST IS STILL NOT RESOLVED BY THIS CHANGE —
+# tests/scripts/ still executes twice per full verify (see "THE DUPLICATE-RUN
+# COST IS NOT RESOLVED BY THIS CHANGE" above); that remains task 3383's
+# dedupe-by-command guard in verify.run_full_verification, a fix of a
+# different class from a yaml budget.
+#
+# (5) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET — no build
+# step on this module to budget for. Per verify._resolve_verify_timeout's
+# cascade, an unset module cold knob does NOT inherit this warm value: a cold
+# verify falls through to the repo-root verify_cold_command_timeout_secs
+# (5400s), and a merge-cold verify falls through first to
+# config.merge_verify_cold_command_timeout_secs (7200s, shipped by the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml, not overridden
+# by the root yaml). This asymmetry is deliberate, not an oversight, and is
+# GATED — not merely asserted here — by
+# tests/scripts/test_scripts_module_config.py::
+# test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling.
+#
+# (6) RAISE-TOGETHER RULE. If this suite's measured cost grows toward 2400s,
+# re-measure and raise BOTH this value and MIN_MODULE_BUDGET_SECS in
+# tests/scripts/test_scripts_module_config.py — never quietly widen one
+# without the other; that guard exists specifically to make a silent widening
+# impossible.
+#
+# GATED by tests/scripts/test_scripts_module_config.py::
+# test_scripts_module_carries_its_own_measured_verify_budget (this value:
+# declared / measurement-derived floor / strictly below the root ceiling /
+# honoured by the real verify._resolve_verify_timeout resolver) and by
+# test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling
+# (point (5) above).
+verify_command_timeout_secs: 2400
