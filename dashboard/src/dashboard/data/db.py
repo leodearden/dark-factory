@@ -21,18 +21,37 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar('_T')
 
+def track_task(task: asyncio.Task, *registries: set[asyncio.Task]) -> None:
+    """Keep a fire-and-forget *task* alive in every *registries* set until it ends.
+
+    The event loop holds only a WEAK reference to a Task, so one that nothing
+    else references can be garbage-collected mid-flight; membership in a
+    registry is what supplies the strong reference.  The single done-callback
+    installed here removes the task from ALL the registries and consumes its
+    exception ONCE, so asyncio does not log "exception was never retrieved".
+
+    Shared (rather than re-spelled per call site) because this repo now has
+    three of these registries — ``_PENDING_CLOSES``, ``DbPool._pending_closes``
+    and ``_ABANDONED_PROBES`` in dashboard/app.py — and two of them track the
+    SAME task, which previously meant two callbacks running the identical three
+    lines and retrieving the same exception twice.
+    """
+    for registry in registries:
+        registry.add(task)
+
+    def _release(finished: asyncio.Task) -> None:
+        for registry in registries:
+            registry.discard(finished)
+        if not finished.cancelled():
+            finished.exception()  # consume so "never retrieved" isn't logged
+
+    task.add_done_callback(_release)
+
+
 # Fire-and-forget close() tasks for connections that landed with no owner (see
-# DbPool._adopt_or_close).  The event loop holds only a WEAK reference to a
-# Task, so an unreferenced one can be garbage-collected mid-flight; this set
-# holds the strong reference until each task's own done-callback removes it.
-# Mirrors _ABANDONED_PROBES in dashboard/app.py.
+# DbPool._adopt_or_close).  Registry semantics and why the strong reference is
+# needed: see track_task above.  Mirrors _ABANDONED_PROBES in dashboard/app.py.
 _PENDING_CLOSES: set[asyncio.Task] = set()
-
-
-def _discard_pending_close(task: asyncio.Task) -> None:
-    _PENDING_CLOSES.discard(task)
-    if not task.cancelled():
-        task.exception()  # consume so "exception was never retrieved" isn't logged
 
 
 # How long :meth:`DbPool.close_all` waits for in-flight ``aiosqlite.connect()``
@@ -128,15 +147,11 @@ class DbPool:
         self._open_locks: dict[Path, asyncio.Lock] = {}
         self._open_locks_lock: asyncio.Lock = asyncio.Lock()
         # Fire-and-forget close tasks scheduled by _adopt_or_close, tracked
-        # PER INSTANCE as well as in the module-global _PENDING_CLOSES.  The two
-        # sets have distinct jobs and neither subsumes the other, so do not
-        # "tidy" either away:
-        #   * _PENDING_CLOSES (module-global) is what survives if the DbPool
-        #     itself is garbage-collected while a close is in flight — the event
-        #     loop holds only a WEAK reference to a Task.
-        #   * _pending_closes (this one) is the only handle close_all() has on
-        #     those tasks, and gathering them is what makes "close_all() has
-        #     returned" mean "every close it caused has finished".
+        # PER INSTANCE as well as in the module-global _PENDING_CLOSES (one
+        # track_task call registers both).  Neither set subsumes the other:
+        # _PENDING_CLOSES survives this DbPool being garbage-collected mid-close,
+        # while _pending_closes is the only handle close_all() has on those
+        # tasks.  Do not "tidy" either away.
         self._pending_closes: set[asyncio.Task] = set()
 
     async def get(self, db_path: Path) -> aiosqlite.Connection | None:
@@ -240,12 +255,23 @@ class DbPool:
                 if existing is not None and existing is not conn:
                     await self._close_once(conn, resolved)
                     return existing
-                conn.row_factory = aiosqlite.Row
-                self._conns[resolved] = conn
+                self._install(conn, resolved)
                 return conn
             except (FileNotFoundError, sqlite3.OperationalError, OSError):
                 logger.warning('DbPool: cannot open %s', resolved, exc_info=True)
                 return None
+
+    def _install(self, conn: aiosqlite.Connection, path: Path) -> None:
+        """Adopt *conn* into the pool as THE connection for *path*.
+
+        The two installation sites (:meth:`get`'s normal return and
+        :meth:`_adopt_or_close`'s adoption) must configure the connection
+        identically — a connection reached by one route and read by a caller
+        expecting the other would silently return tuples instead of
+        :class:`aiosqlite.Row`.
+        """
+        conn.row_factory = aiosqlite.Row
+        self._conns[path] = conn
 
     def _forget_inflight(self, task: asyncio.Task) -> None:
         """Drop a finished connect task from ``_inflight``.
@@ -300,7 +326,18 @@ class DbPool:
         try:
             await conn.close()
         except Exception:
-            logger.debug('DbPool: error closing connection for %s', path, exc_info=True)
+            # WARNING, not DEBUG.  A close() that RAISED means this connection
+            # was not drained, so its (non-daemon) aiosqlite worker thread may
+            # outlive the event loop — the same fact _drain_inflight reports for
+            # a straggler connect, and strictly more severe than it, so it must
+            # not be quieter.  Name the path so the report is actionable (INV-2,
+            # structured-facts-at-failure / no-silent-fail-soft).
+            logger.warning(
+                'DbPool: error closing connection for %s; its aiosqlite worker '
+                'thread may outlive this event loop',
+                path,
+                exc_info=True,
+            )
         finally:
             # Resolved in the `finally`, not after the await: if the FIRST closer
             # is itself cancelled mid-close the joiners must still be released,
@@ -343,36 +380,24 @@ class DbPool:
             return
         conn = task.result()
         if not self._closed and path not in self._conns:
-            conn.row_factory = aiosqlite.Row
-            self._conns[path] = conn
+            self._install(conn, path)
             return
         # Nothing is awaiting this connection, so the close has to be scheduled
         # rather than awaited.  _close_once makes it safe for close_all()'s
         # drain to be closing the very same connection concurrently.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop: the close cannot be performed at all, and
-            # aiosqlite's own ResourceWarning would be the only trace. Say so.
-            logger.warning(
-                'DbPool: connect for %s landed with no running event loop; '
-                'its aiosqlite worker thread cannot be reaped',
-                path,
-            )
-            return
+        #
+        # get_running_loop() cannot raise here: this function is only ever
+        # installed via Task.add_done_callback, and asyncio always invokes
+        # done-callbacks through loop.call_soon — i.e. from inside the running
+        # loop — including when the task is already done at add_done_callback()
+        # time.  No no-loop fallback, therefore, because there is no reachable
+        # branch for one to guard.
+        loop = asyncio.get_running_loop()
         close_task = loop.create_task(self._close_once(conn, path))
-        # Registered in BOTH sets — see the __init__ comment for why neither is
-        # redundant.
-        _PENDING_CLOSES.add(close_task)
-        self._pending_closes.add(close_task)
-        close_task.add_done_callback(_discard_pending_close)
-        close_task.add_done_callback(self._discard_pending_close)
-
-    def _discard_pending_close(self, task: asyncio.Task) -> None:
-        """Per-instance mirror of the module-level :func:`_discard_pending_close`."""
-        self._pending_closes.discard(task)
-        if not task.cancelled():
-            task.exception()  # consume so "exception was never retrieved" isn't logged
+        # Registered in BOTH sets by one call — see the __init__ comment for why
+        # neither is redundant, and track_task for why one shared done-callback
+        # replaced the two identical ones this used to install.
+        track_task(close_task, _PENDING_CLOSES, self._pending_closes)
 
     @property
     def open_count(self) -> int:
@@ -463,9 +488,19 @@ class DbPool:
         # loop above is running, this is the ONLY handle on its close.
         # return_exceptions=True so one failed close cannot abort the rest of
         # shutdown.
-        pending = tuple(self._pending_closes)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        #
+        # Loop to a FIXED POINT rather than gathering one snapshot.  A straggler
+        # still in _inflight keeps its _adopt_or_close callback attached, so one
+        # that lands DURING the gather schedules a fresh close task that a
+        # single snapshot — taken before it existed — would never join, and
+        # close_all() would return with a close in flight: precisely the state
+        # the invariant above forbids, and the original leak by a third route.
+        # Terminates because each round's tasks remove themselves via their own
+        # done-callbacks before the gather resumes us, and the only thing that
+        # can add more is an in-flight connect landing — of which there are
+        # finitely many, since _closed is already True so get() starts no more.
+        while self._pending_closes:
+            await asyncio.gather(*self._pending_closes, return_exceptions=True)
 
 
 async def with_db(

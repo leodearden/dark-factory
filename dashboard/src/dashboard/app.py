@@ -58,7 +58,7 @@ from dashboard.data.costs import (
     aggregate_cost_summary,
     aggregate_cost_trend,
 )
-from dashboard.data.db import DbPool
+from dashboard.data.db import DbPool, track_task
 from dashboard.data.escalation_analytics import (
     archive_scan_succeeded,
     build_escalation_analytics,
@@ -445,15 +445,9 @@ def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
 
 # Abandoned _probe_db tasks (see below) — the event loop only holds a WEAK
 # reference to a Task, so an unreferenced one can be garbage-collected
-# mid-flight; this set holds the strong reference until each task's own
+# mid-flight; this set holds the strong reference until track_task's
 # done-callback removes it.
 _ABANDONED_PROBES: set[asyncio.Task] = set()
-
-
-def _discard_abandoned_probe(task: asyncio.Task) -> None:
-    _ABANDONED_PROBES.discard(task)
-    if not task.cancelled():
-        task.exception()  # consume so "exception was never retrieved" isn't logged
 
 
 async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
@@ -510,8 +504,7 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     done, _pending = await asyncio.wait({task}, timeout=budget)
     if task not in done:
         task.cancel()  # fire-and-forget — do NOT await the unwinding
-        _ABANDONED_PROBES.add(task)
-        task.add_done_callback(_discard_abandoned_probe)
+        track_task(task, _ABANDONED_PROBES)
         return 'timeout'  # ONLY a real budget expiry is a 'timeout'
     try:
         return task.result()
