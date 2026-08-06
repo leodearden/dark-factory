@@ -1767,6 +1767,111 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         assert result[0].topic_id == 'architect-plan-revalidation-requeue-lock'
 
 
+class TestStraddlingThreeClustersRegression:
+    """The reported task-3054 defect: a write that straddles three clusters at one hit each.
+
+    Hits do NOT aggregate across clusters, and each cluster's remaining
+    phrases are tuned to a DIFFERENT sub-case's vocabulary, so a note
+    scoring exactly one distinct phrase in each of three registered
+    clusters reached no cluster's ``min_phrase_hits`` and was blocked by
+    none -- even though ``report_task_already_done`` is an identifier that
+    unambiguously names cluster 3's topic on its own.
+
+    FIXTURE PROVENANCE: reconstructed from the task-3054 description
+    because reify Mem0 entry 5697ff2f-4f9b-49bb-be89-5643b94802ec now
+    returns ``found=false`` (deleted or consolidated since the 2026-07-25
+    filing), so its verbatim text is unrecoverable. The reconstruction is
+    made SELF-VALIDATING by the characterization test below, which asserts
+    the fixture reproduces the reported one-hit-in-each-of-three signature
+    before the outcome test asserts it is now blocked -- so this pins the
+    defect SHAPE rather than trusting the reconstruction.
+    """
+
+    FIXTURE = (
+        'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
+        'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
+        'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
+        'was scrubbed. The architect then sees no plan and may wrongly call '
+        'report_task_already_done instead of replanning.'
+    )
+
+    # The three clusters' phrase lists AS THEY STOOD BEFORE this task, pinned as
+    # LITERALS rather than read from the live seed on purpose: the
+    # plan-revalidation cluster gains two phrases that this fixture also matches,
+    # so a characterization written against the live seed would pass here and
+    # then silently stop characterizing the defect.
+    PRE_FIX_PHRASES = {
+        'eval-worktree-plan-tools-missing': [
+            'plan-tools',
+            'plan_tools',
+            'plan.json',
+            'eval-worktree',
+            'eval worktree',
+            'create_plan',
+            'add_plan_step',
+        ],
+        'architect-report-task-already-done-main-reachability': [
+            'report_task_already_done',
+            'main-reachable',
+            'merge-base --is-ancestor',
+            '_handle_already_done_report',
+        ],
+        'architect-plan-revalidation-requeue-lock': [
+            '.task/plan.json',
+            'plan-revalidation',
+            'requeue rebase',
+            'lost-plan reconstruction',
+            'committed TDD steps',
+        ],
+    }
+
+    def test_fixture_reproduces_the_reported_one_hit_per_cluster_signature(self):
+        """CHARACTERIZATION: exactly one distinct phrase hits in each of three clusters.
+
+        This is what made the write unblockable under count-only matching:
+        three clusters at 1 hit each, all below ``min_phrase_hits=2``.
+        """
+        content_lower = self.FIXTURE.lower()
+        for topic_id, phrases in self.PRE_FIX_PHRASES.items():
+            hits = sorted({p.lower() for p in phrases if p.lower() in content_lower})
+            assert len(hits) == 1, f'{topic_id} expected exactly 1 pre-fix hit, got {hits}'
+
+    def test_fixture_is_now_blocked_and_routes_to_the_report_task_already_done_gate(self):
+        """OUTCOME: the identifier-shaped phrase now qualifies its cluster alone.
+
+        Routing is unambiguous precisely because sufficiency is per-phrase:
+        ``report_task_already_done`` belongs to exactly one cluster, so the
+        block names one gate task rather than guessing among three.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        result = find_matching_topic_cluster(self.FIXTURE, clusters)
+        assert result is not None, 'the straddling write must no longer slip through'
+        assert result[0].topic_id == 'architect-report-task-already-done-main-reachability'
+
+    def test_merge_base_note_alone_still_does_not_match(self):
+        """NEGATIVE CONTROL: widening cluster 3 must not promote a generic git command.
+
+        Mirrors ``test_does_not_match_unrelated_merge_base_note`` above, but
+        against the FULL default list -- a plain git-ancestry note must not
+        become blockable just because its cluster gained sufficient phrases.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
+            'commit is an ancestor of a branch tip before cherry-picking.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
+
+    def test_main_reachable_alone_still_does_not_match(self):
+        """NEGATIVE CONTROL: 'main-reachable' is too generic to be sufficient."""
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'The merge worker only advances to a main-reachable tip, so a '
+            'branch that has not landed yet is skipped this cycle.'
+        )
+        assert find_matching_topic_cluster(note, clusters) is None
+
+
 class TestRuffFormatNotAnEnforcedGateCluster:
     """Topic-guard cluster for the "`ruff format` is not an enforced gate;
     only `ruff check` / pyright gate commits" family (gate task 3342, still
