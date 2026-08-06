@@ -127,7 +127,7 @@ llama.cpp only, see hazard):
 | Qwen3.5-9B | dense, Q4/AWQ | ~6GB | IFEval 91.5, BFCL-V4 66.1 (official card) — best published conformance-adjacent scores; huge KV headroom |
 | Mistral-Small-3.2-24B | dense, AWQ | ~14GB | mature quant ecosystem; release targeted stronger function calling |
 | Phi-4 14B | dense, Q4 | ~9GB | SOB Value Accuracy 0.798 (top small model); **16K ctx — screening must verify graphiti's longest prompts fit** |
-| MoE stretch: Qwen3.6-35B-A3B or Gemma-4-26B-A4B | GGUF IQ4/Q4 | ~17GB | 115–133 tok/s on a 3090 (6× dense-on-vLLM) — but llama.cpp silently falls back to *unconstrained* output on Pydantic `$ref`/`$defs` schemas (llama.cpp #21228), so this arm runs `json_object` mode + a hard client-side validator; tightest VRAM |
+| MoE stretch: Qwen3.6-35B-A3B or Gemma-4-26B-A4B | GGUF IQ4/Q4 | ~17GB — **does not fit the measured ~16.4 GiB budget; sizing unresolved (Open Q3)** | 115–133 tok/s on a 3090 (6× dense-on-vLLM) — but llama.cpp silently falls back to *unconstrained* output on Pydantic `$ref`/`$defs` schemas (llama.cpp #21228), so this arm runs `json_object` mode + a hard client-side validator; tightest VRAM |
 
 Embedding arms (serving: TEI or vLLM-pooling, OpenAI-compatible `/v1/embeddings` — screening picks;
 incumbent `text-embedding-3-small` runs as its own arm):
@@ -324,8 +324,14 @@ units, the single human hold is the λ operator gate on the standard age-surface
    whatever screening shows serving query-latency best; batch re-embeds may run in-process. Decide in α/ι.
 2. **Phi-4 context fit** — measure graphiti's longest real prompt at screening; drop the arm if it
    doesn't fit with margin. Decide in η.
-3. **MoE stretch-arm engine details** (which of the two models, GGUF quant level, client-side
-   validator placement). Decide in α/η.
+3. **MoE stretch-arm engine details AND sizing** (which of the two models, GGUF quant level,
+   client-side validator placement) — **now also an open sizing question**: the arm's ~17GB does
+   not fit the measured ~16.4 GiB operating budget (D10; the comparison was previously made against
+   the stale 19–20GB nominal figure). Options, recorded but NOT chosen here: (i) re-quantize to a
+   lower bit width; (ii) swap for a smaller MoE model; (iii) document the arm as requiring the
+   desktop's ~3.2–3.3 GB be freed (no desktop session resident during the arm's run); (iv) drop the
+   arm. Owner: PRD Open Q3, via task 3713 step 22, ultimately ruled on by the PRD owner (Leo).
+   Decide in α/η.
 4. **Corpus size N** (~150–300) from control-variance and wall-clock measured in ζ. Decide in δ/ζ.
 5. **Qwen3-Embedding-4B production-residency estimate** (quantized footprint next to the winning
    LLM) — only needed if 4B wins on quality. Decide in ι/λ.
