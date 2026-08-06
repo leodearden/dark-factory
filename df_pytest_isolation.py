@@ -313,3 +313,43 @@ def deploy_clock_violation_reason(
             'compare the {ts, iso} body against the deploy you expect.'
         )
     return None
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_deploy_clocks_unwritten():
+    """Fail the run if it falsified a REAL deploy clock in this checkout.
+
+    The repo root is ``Path(__file__).resolve().parent`` — this module SITS at
+    the repo root, and in a task worktree that correctly yields the WORKTREE
+    root, which is precisely the ``REPO_DIR`` that
+    ``scripts/restart-all-orchestrators.sh`` computes for its ``CLOCK_FILE``
+    default.  So the guard watches exactly the file a forgetful spawner would
+    hit, in whichever checkout the suite is running from.
+
+    SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp``
+    documents — cost (a function-scoped autouse fixture runs once per test,
+    times every xdist worker) and coverage (a write from a module- or
+    session-scoped fixture must be caught too, and that is where expensive
+    subprocess setup tends to live).
+
+    DETECTS ONLY — it never restores or rolls the file back.  The main checkout
+    is machine-operated (CLAUDE.md): the deployed watchdog and a real
+    ``restart-all-orchestrators.sh --drain`` can legitimately stamp the clock
+    while a suite runs there.  A restoring guard would silently roll back a
+    GENUINE fleet-deploy stamp, re-opening the very 8h window this defence
+    exists to close — and doing it invisibly, which is strictly worse than the
+    bug.  Hence the failure message names the benign concurrent-redeploy
+    reading alongside the test-bug one.
+
+    A failure raised in teardown surfaces as a run-level ERROR with a non-zero
+    exit code even when every test passed.  That is the intended loudness: the
+    damage is to production state, not to any one test's result.
+    """
+    root = Path(__file__).resolve().parent
+    before = deploy_clock_snapshot(root)
+    try:
+        yield
+    finally:
+        reason = deploy_clock_violation_reason(before, deploy_clock_snapshot(root))
+        if reason is not None:
+            pytest.fail(reason, pytrace=False)

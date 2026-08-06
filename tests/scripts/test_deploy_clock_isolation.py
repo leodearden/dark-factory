@@ -54,6 +54,27 @@ from df_pytest_isolation import (  # noqa: E402
 # defence it exists to detect. Reach it through the module instead.
 _GUARD_NAME = '_df_deploy_clocks_unwritten'
 
+# pytest's fixture marker is private and has MOVED: <=8.x hangs it off the
+# decorated function as `_pytestfixturefunction`, 9.x wraps the function in a
+# `FixtureFunctionDefinition` carrying `_fixture_function_marker`. Both spellings
+# are accepted, and neither-found is an explicit failure rather than a skipped
+# assertion — a private-API pin that silently stops finding its target is worse
+# than no pin, because it still reads as coverage.
+_MARKER_ATTRS = ('_fixture_function_marker', '_pytestfixturefunction')
+
+
+def _fixture_marker(fixture: object) -> object:
+    for attr in _MARKER_ATTRS:
+        marker = getattr(fixture, attr, None)
+        if marker is not None:
+            return marker
+    pytest.fail(
+        f'cannot find pytest\'s fixture marker on {fixture!r} under any of '
+        f'{_MARKER_ATTRS}. pytest moved its private fixture API again — find the '
+        'new spelling and add it, do NOT delete this assertion.',
+        pytrace=False,
+    )
+
 _FLEET_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 _FM_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
 
@@ -275,7 +296,7 @@ class TestGuardIsLiveInThisRun:
         subprocess setup tends to live), and without ``autouse`` nothing would
         ever request it.
         """
-        marker = getattr(df_pytest_isolation, _GUARD_NAME)._pytestfixturefunction
+        marker = _fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
 
         assert marker.scope == 'session', f'scope is {marker.scope!r}, expected session'
         assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
