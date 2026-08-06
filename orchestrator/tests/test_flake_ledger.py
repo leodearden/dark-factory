@@ -251,3 +251,123 @@ class TestEnsureSchema:
         from orchestrator.flake_ledger import ledger_db_path
 
         assert ledger_db_path(tmp_path) == tmp_path / 'data' / 'orchestrator' / 'runs.db'
+
+
+class TestFlakeVerdict:
+    """PRD §8's verdict vocabulary — produced by β, consumed by ε/ζ, persisted here.
+
+    One discriminator serves both merge gates, so the vocabulary is the thing that
+    keeps them from drifting into different notions of "passes in isolation" (INV-5).
+    """
+
+    def test_exact_member_set(self) -> None:
+        """Exactly three verdicts.  Asserted as a SET equality so a fourth cannot be
+        added silently — a new verdict changes what every consumer must handle."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        assert {v.value for v in FlakeVerdict} == {
+            'passes_in_isolation',
+            'fails_in_isolation',
+            'unconfirmable',
+        }
+
+    def test_value_equals_name(self) -> None:
+        """The project convention (test_event_store.py:107-111) — what lets a member
+        bind straight into SQL and travel the VerifyResult wire with no codec."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        for v in FlakeVerdict:
+            assert isinstance(v.value, str)
+            assert v.value == v.name
+
+    def test_is_str_comparable(self) -> None:
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        assert FlakeVerdict.passes_in_isolation == 'passes_in_isolation'
+        assert FlakeVerdict.fails_in_isolation == 'fails_in_isolation'
+        assert FlakeVerdict.unconfirmable == 'unconfirmable'
+
+    def test_vocabulary_names_the_observation_not_the_remedy(self) -> None:
+        """§5.5: the verdict is ``passes_in_isolation``, never ``flaky_test: true``.
+        A verdict records what was OBSERVED; calling a test "flaky" prejudges the
+        remedy and is the vocabulary this PRD exists to replace."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        assert not any('flaky' in v.value for v in FlakeVerdict)
+
+
+class TestFlakeSuppression:
+    """PRD §8's discriminator output — produced wherever the worktree is (local or
+    remote), consumed ONLY on the dispatcher, riding VerifyResult across the wire."""
+
+    def _suppression(self, **overrides):
+        from orchestrator.flake_ledger import FlakeSuppression, FlakeVerdict
+
+        kwargs = {
+            'verdict': FlakeVerdict.passes_in_isolation,
+            'test_ids': ('tests/test_a.py::test_one',),
+            'observed_at': '2026-08-06T12:00:00+00:00',
+            'call_site': 'merge_gate',
+            'runner': 'local',
+            'psi_cpu_some10': 17.5,
+            'unconfirmable_reason': None,
+        }
+        kwargs.update(overrides)
+        return FlakeSuppression(**kwargs)
+
+    def test_field_order(self) -> None:
+        """Declaration order is the contract — ε constructs these and the codec
+        round-trips them."""
+        import dataclasses
+
+        from orchestrator.flake_ledger import FlakeSuppression
+
+        assert [f.name for f in dataclasses.fields(FlakeSuppression)] == [
+            'verdict',
+            'test_ids',
+            'observed_at',
+            'call_site',
+            'runner',
+            'psi_cpu_some10',
+            'unconfirmable_reason',
+        ]
+
+    def test_is_frozen(self) -> None:
+        """Frozen: the discriminator is PURE (§8.1 invariant 5), so its output is a
+        value, not a mutable buffer a later stage can quietly amend."""
+        import dataclasses
+
+        s = self._suppression()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            s.verdict = 'fails_in_isolation'  # type: ignore[misc]
+
+    def test_holds_supplied_values(self) -> None:
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s = self._suppression(test_ids=('a::t1', 'b::t2'))
+        assert s.verdict is FlakeVerdict.passes_in_isolation
+        assert s.test_ids == ('a::t1', 'b::t2')
+        assert s.observed_at == '2026-08-06T12:00:00+00:00'
+        assert s.call_site == 'merge_gate'
+        assert s.runner == 'local'
+        assert s.psi_cpu_some10 == 17.5
+        assert s.unconfirmable_reason is None
+
+    def test_optional_fields_accept_none(self) -> None:
+        """``psi_cpu_some10`` is None when ``PsiSample.read_ok`` is False — NEVER a
+        fabricated 0.0, which would read as "the host was idle"."""
+        s = self._suppression(psi_cpu_some10=None, unconfirmable_reason=None)
+        assert s.psi_cpu_some10 is None
+        assert s.unconfirmable_reason is None
+
+    def test_unconfirmable_carries_a_reason_and_may_have_no_test_ids(self) -> None:
+        """§8: EMPTY ``test_ids`` is legal only for ``unconfirmable``."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s = self._suppression(
+            verdict=FlakeVerdict.unconfirmable,
+            test_ids=(),
+            unconfirmable_reason='node-ids mapped to no discovered subproject',
+        )
+        assert s.test_ids == ()
+        assert s.unconfirmable_reason == 'node-ids mapped to no discovered subproject'
