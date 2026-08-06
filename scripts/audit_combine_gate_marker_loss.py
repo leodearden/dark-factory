@@ -74,6 +74,8 @@ from _task_db_scan import (  # noqa: F401  (tasks_db_path/discover_project_roots
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
     discover_project_roots,
+    format_coverage_block,
+    format_kv_line,
     run_audit_cli,
     tasks_db_path,
 )
@@ -950,12 +952,21 @@ _COVERAGE_CAVEAT = (
 
 
 def _format_finding_line(finding: Finding) -> str:
-    """One finding, in the precedent's ``key=value`` style."""
-    return (
-        f"  task_id={finding.task_id} tag={finding.tag} "
-        f"status={finding.status} key={finding.key} "
-        f"severity={finding.severity} source={finding.expected_source}"
-    )
+    """One finding, in the precedent's ``key=value`` style.
+
+    That style is now ENFORCED rather than merely asserted in prose:
+    format_kv_line is the shared spelling both audit scripts render through.
+    The KEY names are spelled explicitly here because ``source`` is
+    deliberately shorter than the ``expected_source`` attribute it carries.
+    """
+    return format_kv_line([
+        ("task_id", finding.task_id),
+        ("tag", finding.tag),
+        ("status", finding.status),
+        ("key", finding.key),
+        ("severity", finding.severity),
+        ("source", finding.expected_source),
+    ])
 
 
 def _format_coverage(coverage: AuditCoverage) -> list[str]:
@@ -964,22 +975,27 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
     Never omitted and never abbreviated when there are no findings: the whole
     point is that the finding list is an observable subset, and a reader must
     be told the size of the unobservable remainder.
+
+    The details NAME the unreadable sidecars, never just count them. A count
+    alone tells an operator that coverage is incomplete but not where to look,
+    which swallows the failure at the reporting boundary (no-silent-fail-soft).
+
+    Only the ALIGNMENT is shared with audit_wiped_metadata_files.py (via
+    format_coverage_block); _COVERAGE_CAVEAT and the labels below are this
+    script's, and say what this script could not see.
     """
-    lines = [
+    return format_coverage_block(
         _COVERAGE_CAVEAT,
-        f"    combine targets scanned:            {coverage.total_combine_targets}",
-        f"    with a creating ticket:             {coverage.targets_with_ticket}",
-        f"    with a capability manifest:         {coverage.targets_with_manifest}",
-        f"    with NO comparison source:          {coverage.targets_without_comparison_source}",
-        f"    contested manifest bindings:        {coverage.ambiguous_manifest_bindings}",
-        f"    manifests that failed to parse:     {coverage.manifest_parse_failures}",
-    ]
-    # NAME the unreadable sidecars, never just count them. A count alone tells
-    # an operator that coverage is incomplete but not where to look, which
-    # swallows the failure at the reporting boundary (no-silent-fail-soft).
-    for detail in coverage.manifest_parse_failure_details:
-        lines.append(f"      - {detail}")
-    return lines
+        [
+            ("combine targets scanned:", coverage.total_combine_targets),
+            ("with a creating ticket:", coverage.targets_with_ticket),
+            ("with a capability manifest:", coverage.targets_with_manifest),
+            ("with NO comparison source:", coverage.targets_without_comparison_source),
+            ("contested manifest bindings:", coverage.ambiguous_manifest_bindings),
+            ("manifests that failed to parse:", coverage.manifest_parse_failures),
+        ],
+        details=coverage.manifest_parse_failure_details,
+    )
 
 
 def _format_section(label: str, findings: list[Finding]) -> list[str]:
