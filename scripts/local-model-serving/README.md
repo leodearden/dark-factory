@@ -233,6 +233,64 @@ against.
 
 ---
 
+## Provisioned runtimes (measured, step 19)
+
+Both serving images are pinned in `arms.yaml` by **tag and digest**. A tag can be
+re-pushed under you; a digest cannot, and `lms_serve.image_ref()` prefers the
+digest whenever one is present — so a re-run serves the same bits, not merely the
+same name.
+
+| stack | pinned tag | digest | measured version |
+|---|---|---|---|
+| vLLM | `vllm/vllm-openai:v0.26.0` | `sha256:ffb2d59b…4abf52` | vLLM **0.26.0**, torch 2.11.0+cu130 |
+| llama.cpp | `ghcr.io/ggml-org/llama.cpp:server-cuda-b10276` | `sha256:48a88af7…17dd2` | `llama-server --version` → **10276 (6ea215d17)** |
+
+vLLM 0.26.0 satisfies the PRD's "≥0.26" requirement as a measurement, not a
+claim. The build-number tag is used for llama.cpp rather than the floating
+`server-cuda`; both resolved to the same digest when measured (2026-08-06), and
+the numbered one stays legible after `server-cuda` moves on.
+
+TEI is deliberately **not** pulled yet. It is only needed if Open Q1 sends an
+embedding arm to the fallback stack, which step 22 decides from measurement.
+
+### What the live smoke actually proved
+
+Run as a transient `systemd --user` unit on the reserved port 8410, against
+`HuggingFaceTB/SmolLM2-135M-Instruct` — a non-slate stand-in, since step 19
+downloads no slate weights:
+
+- **GPU passthrough into the container.** `torch.cuda.is_available()` → `True`,
+  `NVIDIA GeForce RTX 3090` from inside the image. Docker's default runtime here
+  is `runc`, so this confirms the per-run `--gpus all` in `_docker_preamble` is
+  doing the work.
+- **Port plumbing and model identity.** `/v1/models` answered 200 on 8410 with
+  `id: "lms-smoke"` — the `--served-model-name`, not the HF repo id. That is
+  precisely the field `check_model_identity` matches on, so the identity leg that
+  guards against the 2026-04-08 404 bug is verified end to end.
+- **Structured outputs on a `$defs`/`$ref` schema.** The committed
+  `build_llm_probe_request` body — whose schema genuinely carries `$defs` and
+  `$ref` — was accepted by vLLM 0.26's structured-outputs path, and the returned
+  text was constrained to exactly the nested probe shape. This is the capability
+  the whole eval rests on, and it is now measured rather than assumed.
+- **Coexistence.** whisper-writer held its 4050 MiB throughout, and stopping the
+  unit released every byte the arm had taken (free VRAM returned to 16840 MiB).
+
+Two findings worth carrying forward rather than burying:
+
+1. `hf-internal-testing/tiny-random-LlamaForCausalLM` is **not** usable as a
+   plumbing stand-in on this stack: its `head_dim=4` trips flex_attention's
+   `NYI: embedding dimension … must be at least 16`. That is a property of the
+   toy model, not of the image — but it costs a wasted 60 s start, so the note
+   is here.
+2. The 135M stand-in hit `PROBE_MAX_TOKENS` (512) and its truncated-but-
+   structurally-correct output was reported as `not_json`. Constrained decoding
+   worked; the model simply looped. A real slate arm should not, but if step 23
+   sees `not_json` on an arm whose content is valid JSON up to the cut, the cause
+   is the token budget and the reason code deserves to distinguish
+   `finish_reason == "length"` — fix it there, with the offline test first.
+
+---
+
 ## Verification artifact
 
 `verification/health-report.json` is written by a live run

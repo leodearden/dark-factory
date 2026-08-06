@@ -38,6 +38,7 @@ arms:
     axis: llm
     stack: vllm
     image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
     model_ref: QuantTrio/Qwen3.5-9B-AWQ
     quant: awq
     port: 8410
@@ -56,6 +57,7 @@ arms:
     axis: llm
     stack: vllm
     image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
     model_ref: jeffcookio/Mistral-Small-3.2-24B-Instruct-2506-awq-sym
     quant: awq
     port: 8411
@@ -74,6 +76,7 @@ arms:
     axis: llm
     stack: vllm
     image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
     model_ref: stelterlab/phi-4-AWQ
     quant: awq
     port: 8412
@@ -98,7 +101,14 @@ arms:
   - arm_id: moe-stretch
     axis: llm
     stack: llamacpp
-    image: TBD-Q3-llamacpp-server-cuda-tag-pinned-in-step-19
+    # Pinned in step 19 by tag AND digest.  Verified on this host:
+    # `llama-server --version` => version 10276 (6ea215d17), GNU 14.2.0 x86_64.
+    # The build tag is legible where the floating `server-cuda` tag is not, and
+    # both resolved to the same digest when measured (2026-08-06).
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda-b10276
+    image_digest: sha256:48a88af72b29e865d64f464e3dc1e4fbbad4a36c5e2298d72d13b690f9d17dd2
+    # STILL a placeholder: Open Q3 owns the model+quant, resolved in step 22.
+    # is_placeholder therefore stays True and every tool keeps refusing this arm.
     model_ref: TBD-Q3-Qwen3.6-35B-A3B-GGUF-or-gemma-4-26B-A4B-it-GGUF
     quant: TBD-Q3
     port: 8413
@@ -138,6 +148,7 @@ arms:
     stack: vllm
     fallback_stack: tei
     image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
     model_ref: Qwen/Qwen3-Embedding-0.6B
     quant: none
     port: 8414
@@ -158,6 +169,7 @@ arms:
     stack: vllm
     fallback_stack: tei
     image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
     model_ref: ibm-granite/granite-embedding-english-r2
     quant: none
     port: 8415
@@ -178,6 +190,7 @@ arms:
     stack: vllm
     fallback_stack: tei
     image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
     model_ref: Qwen/Qwen3-Embedding-4B
     quant: none
     port: 8416
@@ -200,6 +213,7 @@ arms:
     stack: vllm
     fallback_stack: tei
     image: vllm/vllm-openai:v0.26.0
+    image_digest: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
     model_ref: Alibaba-NLP/gte-modernbert-base
     quant: none
     port: 8417
