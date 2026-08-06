@@ -193,6 +193,25 @@ class DbPool:
                 if self._closed:
                     await self._close_once(conn, resolved)
                     return None
+                # Post-shield CACHE re-check.  The _closed re-check alone is not
+                # enough: _adopt_or_close installs into _conns WITHOUT holding
+                # _open_locks[resolved] — the cancelled getter released that lock
+                # while unwinding through `async with lock` — so an adopted
+                # connection for this very path can appear while this coroutine
+                # is suspended in the shield.  Overwriting it would drop it from
+                # _conns with nothing else referencing it, putting it in neither
+                # _conns nor _inflight: close_all() could never reach it and its
+                # (non-daemon) worker thread would outlive the process's useful
+                # life.  Keep the incumbent and close what we opened.
+                #
+                # This is one half of a pair covering both landing orders; the
+                # other half is _adopt_or_close's own `path not in self._conns`
+                # guard, which handles the reverse (pooled connection first,
+                # adoption second).  Neither guard alone is sufficient.
+                existing = self._conns.get(resolved)
+                if existing is not None and existing is not conn:
+                    await self._close_once(conn, resolved)
+                    return existing
                 conn.row_factory = aiosqlite.Row
                 self._conns[resolved] = conn
                 return conn
