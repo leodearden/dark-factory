@@ -232,13 +232,23 @@ arms:
   # serving-stack confound from iota's query-latency comparison.  TEI was never
   # pulled; fallback_stack stays recorded but unused.
   #
-  # Measured: granite 796 MiB/192 ms, gte-modernbert 788 MiB/286 ms,
-  # qwen3-0.6b 16603 MiB/700 ms, qwen3-4b 16078 MiB/580 ms.  The two ~790 MiB
-  # arms are encoder models; the two ~16 GiB arms are DECODERS that emit
-  # embeddings, and vLLM hands a decoder a paged KV cache sized to fill
-  # --gpu-memory-utilization whether a pooling model can use it or not.  That
-  # makes est_vram_gib decorative for those two -- see README, "the budget
-  # verdict's subject is miscalibrated".
+  # RE-MEASURED 2026-08-06 AFTER the pooling KV bound landed, superseding the
+  # figures this comment used to carry (qwen3-0.6b 16603 MiB, qwen3-4b 16078
+  # MiB): granite 789 MiB/129 ms, gte-modernbert 788 MiB/115 ms, qwen3-0.6b
+  # 3584 MiB/507 ms, qwen3-4b 10114 MiB/630 ms.  The two ~790 MiB arms are
+  # encoder models; the other two are DECODERS that emit embeddings, and vLLM
+  # hands a decoder a paged KV cache sized to fill --gpu-memory-utilization
+  # whether a pooling model can use it or not.
+  #
+  # est_vram_gib is therefore NO LONGER decorative for those two -- that claim
+  # described the pre-bound world.  lms_serve bounds a pooling arm to
+  # est_vram_gib + 0.5, and the measurements above land within a few MiB of that
+  # bound (3.0+0.5, 10.0+0.5), which is what makes the number load-bearing again.
+  #
+  # NOTE for iota: L2 norms are NOT uniform across this slate.  Both Qwen arms
+  # return unit vectors; granite returns ~30.4 and gte-modernbert ~37.1.  All
+  # pass the health check (its floor is 1e-6), but a raw dot product used as a
+  # cosine proxy would score them on a different scale.  See README.
   #
   # max_model_len is 8192 uniformly: it is granite-r2's and gte-modernbert's
   # native ceiling, memory texts are far shorter, and a uniform bound keeps

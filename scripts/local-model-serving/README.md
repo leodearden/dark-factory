@@ -46,16 +46,28 @@ healthy" when the slate is quietly narrower than the PRD commissioned.
 
 ### The slate
 
-| arm_id | axis | stack | port | structured output | dims | est. VRAM |
-|---|---|---|---|---|---|---|
-| `qwen3.5-9b` | llm | vllm | 8410 | `json_schema` | — | 6.0 GiB |
-| `mistral-small-3.2-24b` | llm | vllm | 8411 | `json_schema` | — | 14.0 GiB |
-| `phi-4-14b` | llm | vllm | 8412 | `json_schema` | — | 9.0 GiB |
-| `moe-stretch` | llm | llamacpp | 8413 | `json_object` | — | 17.0 GiB ⚠ |
-| `qwen3-embedding-0.6b` | embedding | vllm | 8414 | — | 1024 | 2.0 GiB |
-| `granite-embedding-english-r2` | embedding | vllm | 8415 | — | 768 | 1.0 GiB |
-| `qwen3-embedding-4b` | embedding | vllm | 8416 | — | 2560 | 9.0 GiB |
-| `gte-modernbert-base` | embedding | vllm | 8417 | — | 768 | 1.0 GiB |
+| arm_id | axis | stack | port | structured output | reasoning | dims | declared / MEASURED VRAM |
+|---|---|---|---|---|---|---|---|
+| `qwen3.5-9b` | llm | vllm | 8410 | `json_schema` | **on** (`qwen3` parser) | — | 12.0 / **14507 MiB** |
+| `phi-4-14b` | llm | vllm | 8412 | `json_schema` | off | — | 9.0 ⚠ / **15519 MiB** |
+| `moe-stretch` | llm | llamacpp | 8413 | `json_object` | off | — | 14.5 / **14604 MiB** |
+| `qwen3-embedding-0.6b` | embedding | vllm | 8414 | — | — | 1024 | 3.0 / **3584 MiB** |
+| `granite-embedding-english-r2` | embedding | vllm | 8415 | — | — | 768 | 1.0 / **789 MiB** |
+| `qwen3-embedding-4b` | embedding | vllm | 8416 | — | — | 2560 | 10.0 / **10114 MiB** |
+| `gte-modernbert-base` | embedding | vllm | 8417 | — | — | 768 | 1.0 / **788 MiB** |
+
+Port 8411 is **retired, not reassigned**: `mistral-small-3.2-24b` was dropped
+from the slate on 2026-08-06 (see *The dropped arm* below). Reusing the port
+would make every artifact keyed on it ambiguous.
+
+⚠ `phi-4-14b` declares 9.0 GiB and measured **15519 MiB resident** — it is the
+binding VRAM row on the slate, with only 1.37 GiB of headroom, despite carrying
+the smallest declared footprint of the three LLM arms. `est_vram_gib` is the
+*admission floor* `arm_fits` gates on, not the resident figure (a generate arm
+sizes its KV cache to fill the share derived from free VRAM), but 9.0 is still
+an understatement — its weight-only figure was not captured, so it is left
+uncorrected rather than guessed at. `qwen3.5-9b` had the same defect and was
+corrected 6.0 → 12.0 from vLLM's reported 11.21 GiB of weights.
 
 **Ports 8410–8417 are reserved for this rig**, one per arm, bound to loopback
 only. The block was chosen to clear what already listens on this host — 8002
@@ -64,7 +76,9 @@ manifest whose arm declares a port outside the block, and refuses two arms
 sharing one: a shared port is the precondition for the 2026-04-08 bug where a
 stale unit answered a probe and mis-attributed an entire run's metrics.
 
-⚠ `moe-stretch` does not currently fit — see *Open Q3* below.
+`moe-stretch` fits comfortably: Open Q3 resolved to gemma-4-26B-A4B QAT at
+UD-Q4_K_XL (13.27 GiB of weights) precisely because it does, where Qwen3.6-35B-
+A3B's smallest true 4-bit quant does not. See *Open Q3* below.
 
 ---
 
@@ -422,139 +436,93 @@ the card — which is how `0.6b` (2.0 -> 3.0) and `4b` (9.0 -> 10.0) were caught
 
 ---
 
-## Live slate run (measured, step 23 — 2026-08-06, IN PROGRESS)
+## Live slate run (measured, step 23 — 2026-08-06, COMPLETE)
 
-Every arm run through the committed chain, one at a time, on a host whose
-baseline was confirmed clean first (7302 MiB used, whisper-writer the only
-compute app at 4050 MiB, no ollama model resident — esc-3713-7). Six of eight
-arms answer correctly and fit; two carry real, diagnosed defects.
+Every arm run through the committed chain, one at a time, 30 m 22 s of live host
+time on a card confirmed clean at 7205 MiB idle beforehand (whisper-writer the
+only compute app at 4050 MiB, no ollama model resident). **7 of 7 PASS.**
 
-| arm | ready | resident (footprint) | budget | probe | verdict |
-|---|---|---|---|---|---|
-| `granite-embedding-english-r2` | 116 s | 762 MiB | 16814 MiB | 606 ms | **PASS** |
-| `gte-modernbert-base` | 114 s | 787 MiB | 16839 MiB | 102 ms | **PASS** |
-| `qwen3-embedding-0.6b` | 155 s | 3581 MiB | 16839 MiB | 706 ms | **PASS** |
-| `qwen3-embedding-4b` | 158 s | 10113 MiB | 16839 MiB | 828 ms | **PASS** |
-| `qwen3.5-9b` | 451 s | 14441 MiB | 16847 MiB | 2849 ms | **PASS** |
-| `phi-4-14b` | 196 s | 15456 MiB | 16831 MiB | 3054 ms | **PASS** |
-| `mistral-small-3.2-24b` | — | — | — | — | **start refused** |
-| `moe-stretch` | 31 s | 14611 MiB | 16820 MiB | 5600 ms | **`empty_completion`** |
+| arm | ready | resident (footprint) | budget | probe | entities | verdict |
+|---|---|---|---|---|---|---|
+| `granite-embedding-english-r2` | 101 s | 789 MiB | 16922 MiB | 129 ms | — | **PASS** |
+| `gte-modernbert-base` | 111 s | 788 MiB | 16922 MiB | 115 ms | — | **PASS** |
+| `qwen3-embedding-0.6b` | 116 s | 3584 MiB | 16921 MiB | 507 ms | — | **PASS** |
+| `qwen3-embedding-4b` | 157 s | 10114 MiB | 16911 MiB | 630 ms | — | **PASS** |
+| `qwen3.5-9b` | 438 s | 14507 MiB | 16910 MiB | 43501 ms | 4/4 (4 top-level) | **PASS** |
+| `phi-4-14b` | 171 s | 15519 MiB | 16918 MiB | 2854 ms | 3/4 (2 top-level) | **PASS** |
+| `moe-stretch` | 20 s | 14604 MiB | 16915 MiB | 2465 ms | 4/4 (4 top-level) | **PASS** |
 
-Every arm released **every** byte on stop: the card returned to 7275–7310 MiB
-after each one, and whisper-writer was undisturbed throughout.
+Every arm released **every** byte on stop (card back to 7198–7217 MiB within the
+first 3 s poll), whisper-writer held 4050 MiB undisturbed throughout, and no two
+arms were ever co-resident.
 
-The subject correction is what makes the LLM arms reportable at all. Under the
-old total-usage reading `qwen3.5-9b` measured 21.75 GiB and failed; it takes
-14.10 GiB of the 16.45 GiB that was free before it started. The generate-branch
-safety margin is visible in the numbers too — the same arm's footprint fell from
-14961 MiB to 14441 MiB, and every LLM arm now lands ~1.4 GiB clear of its budget
-instead of at the last byte.
+`phi-4-14b` is the row the extraction floor was ruled on: `FalkorDB` appears
+**only as an attribute value** and `Leo` **only in the free-text summary**, which
+the floor does not scan. So it captures 3 of 4 and promotes 2 — both numbers are
+in the row, the floor passes it, and `top_level_entities_named` records the
+representation difference for η without α judging it.
 
-### Two defects the live run found
+### Latency here is a COLD single sample — do not rank arms on it
 
-1. **`mistral-small-3.2-24b` — the manifest declared the wrong quant.**
-   `jeffcookio/Mistral-Small-3.2-24B-Instruct-2506-awq-sym` is named `awq` but
-   its own `config.json` says `quant_method: compressed-tensors` (format
-   `pack-quantized`, 4 bits). vLLM 0.26 refused the model outright:
-   `Quantization method specified in the model config (compressed-tensors) does
-   not match the quantization method specified in the 'quantization' argument
-   (awq)`. That refusal is the right behaviour — a mismatch guessed past would
-   serve numbers the eval would then attribute to a model it did not run.
-   `arms.yaml` is corrected to `compressed-tensors` from the measurement; the
-   arm has not yet been re-run under the correction.
+`qwen3.5-9b` measured 2849 ms cold and ~350 ms warm at `reasoning: off` — a 12×
+gap. These numbers are one measurement each, taken on the first request after
+load, and they are **not** ζ's p95-under-load envelope metric. Task **3781**
+fixes the instrument (warm the engine, not the prefix cache; report cold and warm
+separately). The one exception is `qwen3.5-9b` at `reasoning: on`: 43.5 s cold vs
+41.0 s warm, because that cost is genuine generation rather than load.
 
-2. **`moe-stretch` — the probe's token budget is spent on thinking.**
-   The arm loads and serves (31 s to ready, 14611 MiB, 104 t/s), and llama.cpp's
-   own log shows it generating the full `PROBE_MAX_TOKENS` (512) and stopping on
-   length: `eval time = 4904.60 ms / 512 tokens`. `message.content` came back
-   empty, so the probe reported `empty_completion`. **Root-caused and resolved —
-   see *Reasoning mode* below.** It was never a token-budget question: the arm
-   was being served with thinking force-enabled by a stack default nobody chose.
+### The dropped arm
 
-Neither is a budget failure and neither is hand-editable. `health-report.json`
-is therefore **not yet committed**: the anti-fabrication gate stays red until
-the slate is re-run under the corrected probe contract.
+`mistral-small-3.2-24b` was commissioned by the PRD and **dropped on 2026-08-06**
+(Leo's ruling, esc-3713-10) after live measurement proved it unservable here.
 
----
+Its declared quant *was* wrong, and that defect is fixed and verified: `awq` →
+`compressed-tensors`, measured from the weights' own `config.json`; vLLM 0.26
+then accepted the model and resolved `max_model_len 16384`. The arm still never
+reached weight loading, for an unrelated reason — it is a **vision**-language
+model (`mistral3.py`, Pixtral tower), vLLM unconditionally sizes a multimodal
+encoder budget at startup by pushing a dummy `[IMG]` prompt through
+`PixtralProcessor`, and the quantized repo's repacked tokenizer encodes it to
+**zero** image tokens against a text count of one:
 
-## Reasoning mode — declared, never inherited (esc-3713-10)
+```
+ValueError: Mismatch in `image` token count between text and `input_ids`.
+Got ids=[0] and text=[1].
+```
 
-Diagnosed live on 2026-08-06. Two findings, and the second is the serious one.
+transformers separately warns that repo needs `fix_mistral_regex=True`, pointing
+at the same object. Root cause is the quantizer's tokenizer, not the quant and
+not the weights — the card never moved (7212 → 7221 MiB).
 
-### The mode was being set by accident, differently per arm
+Re-admitting the arm needs a different quantized repo or an upstream tokenizer
+fix, **not** a flag suppressing the multimodal path: the eval would then be
+measuring a model configured differently from the one the PRD costed. The PRD
+text correction is tracked as task **3804**.
 
-`moe-stretch`'s empty completion was not a budget problem. `/apply-template`
-shows the mechanism directly: gemma-4's own chat template defaults
-`enable_thinking` to **false** and suppresses reasoning by pre-closing the
-thought channel (`<|turn>model\n<|channel>thought\n<channel|>`) — and llama.cpp
-b10276 **overrides that to true**. 509 of the 512 tokens went into an
-unterminated thought; `message.reasoning_content` held 1912 chars and
-`message.content` was `''`.
+**Consequence, flagged rather than absorbed:** the LLM slate is three arms, so
+η's survivor funnel narrows 3 → at most 3 and has near-nil selectivity on that
+axis. Whether that warrants re-opening the slate is Leo's call, recorded on
+tasks 3720 and 3804.
 
-Meanwhile `qwen3.5-9b`'s template defaults thinking **on** and ends the prompt
-with an *open* `<think>` tag — and vLLM, with no `--reasoning-parser`, fills the
-xgrammar bitmask from token 0, so the model is told to think and then
-structurally prevented from doing so.
+### Embedding vectors are NOT uniformly normalized — ι must not assume they are
 
-So the two thinking-capable arms were running in **opposite modes, by accident,
-and nothing recorded it** — a confound sitting inside the eval's own independent
-variable. `arms.yaml` now declares `reasoning:` per arm (`lms_manifest` refuses
-an LLM arm that omits it) and the report row carries the mode it was measured
-in. `phi-4-14b` and `mistral-small-3.2-24b` have no thinking construct at all.
+Measured L2 norms on the probe query:
 
-| arm | mode | tokens | latency | probe entities found |
-|---|---|---|---|---|
-| `moe-stretch` | off | 236–276 | 2.3–2.9 s | **4/4** |
-| `moe-stretch` | on | 1807 (84% thought) | 16.5–17.2 s | **4/4** |
-| `qwen3.5-9b` | off | 18–39 | 0.35 s warm | **0/4** |
-| `qwen3.5-9b` | on + `--reasoning-parser qwen3` | 2639 | ~35 s | **4/4** |
+| arm | L2 norm |
+|---|---|
+| `qwen3-embedding-0.6b` | 1.0000 |
+| `qwen3-embedding-4b` | 1.0000 |
+| `granite-embedding-english-r2` | **30.36** |
+| `gte-modernbert-base` | **37.09** |
 
-Reasoning is therefore **model-dependent, not generally good**: it buys gemma-4
-nothing at 6.4× the wall clock, and is the difference between an extraction and
-an empty object for qwen3.5. Which mode each arm is measured in is **ζ's**
-pre-registered call (task 3719), expressed by setting these manifest fields —
-not a per-run choice at η or θ.
-
-### The probe was passing empty extractions
-
-`qwen3.5-9b`'s committed **PASS** was a pass on
-`{"entities": [], "summary": "No entities extracted from the provided text."}`.
-`ProbeExtraction` accepts it because an empty list is a valid
-`list[ProbeEntity]` — so the client-side validator this package calls its
-safeguard could not tell a correct extraction from a refusal to extract, and
-every non-reasoning qwen configuration returned zero entities.
-
-`verify_llm_response` now applies an **extraction floor**: the completion must
-name at least `PROBE_MIN_ENTITIES` (3) of the four entities `PROBE_TEXT`
-contains, or it fails with `extraction_missed_entities`. Deliberately a floor
-and not a score — ranking extraction quality is η's job on δ's real-episode
-corpus; this only answers α's own question, whether the endpoint can do the
-thing at all.
-
-### Two smaller defects fixed alongside
-
-* **`COMPLETION_TRUNCATED` was unreachable on vLLM.** llama.cpp returns
-  `content: ''`, vLLM with a reasoning parser returns `content: null`. Only the
-  empty string reached the truncation branch, so a vLLM arm that spent its whole
-  budget reasoning reported `malformed_response` — blaming the harness's own cap
-  on a broken body. `_extract_reasoning` now reads both stacks' spellings
-  (`reasoning_content` and `reasoning`) and the null path is checked for
-  truncation before it is called malformed.
-* **`PROBE_MAX_TOKENS` is now derived, not chosen.** It mirrors the product's own
-  `llm.max_tokens` (`fused-memory/config/config.yaml:15`, 4096) — the output
-  budget the memory subsystem actually gives its LLM, asserted against that file
-  by test so the two cannot drift. The old 512 was a runaway watchdog that had
-  quietly become a capability gate. Runaway containment is unchanged:
-  `COMPLETION_TIMEOUT_S` still bounds the request at 180 s.
-
-### Known, not yet fixed
-
-Every latency in the slate table above is a **single-sample cold** measurement —
-`qwen3.5-9b` measured 2849 ms cold and ~350 ms warm, a 12× difference. These
-numbers are not comparable across arms and are **not** ζ's p95-under-load
-envelope metric. Tracked separately.
-
----
+All four pass the health check, whose floor is only `1e-6` (a zero vector carries
+no direction and would make every similarity undefined). But **half the embedding
+slate returns non-unit vectors**, so anything that treats a raw dot product as
+cosine similarity — a standard optimisation when vectors are assumed
+pre-normalized — will score those two arms on a completely different scale from
+the Qwen pair. Cosine proper is unaffected; Qdrant normalises on insert under
+`Cosine` distance but **not** under `Dot`. ι must normalise explicitly or pin the
+distance metric, and say which in its report.
 
 ## Verification artifact
 
@@ -588,8 +556,8 @@ vector of their declared length:
 |---|---|---|---|---|
 | `granite-embedding-english-r2` | 123 s | 192 ms | 796 MiB | PASS |
 | `gte-modernbert-base` | 122 s | 286 ms | 788 MiB | PASS |
-| `qwen3-embedding-0.6b` | 143 s | 700 ms | **16603 MiB** | PASS |
-| `qwen3-embedding-4b` | 142 s | 580 ms | **16078 MiB** | PASS |
+| `qwen3-embedding-0.6b` | 143 s | 700 ms | ~~16603 MiB~~ **3584 MiB** | PASS |
+| `qwen3-embedding-4b` | 142 s | 580 ms | ~~16078 MiB~~ **10114 MiB** | PASS |
 
 Uniformity was the preferred outcome and measurement allowed it: one stack across
 all four removes a serving-stack confound from ι's query-latency comparison, so
