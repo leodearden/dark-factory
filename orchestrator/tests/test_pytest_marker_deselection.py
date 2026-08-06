@@ -27,7 +27,8 @@ import pytest
 import yaml
 from test_verify_plan import DATA_MODULE_DIFF, ROOT_CONFTEST_DIFF, SOURCE_ONLY_DIFF
 
-from orchestrator.config import ModuleConfig
+from orchestrator import verify, verify_plan
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.pytest_markers import (
     deselecting_expression_for_targets,
     expression_definitely_deselects,
@@ -1167,3 +1168,118 @@ class TestWidenFallbackWidensOnFullDeselection:
         widened, reason = widen_fallback_for_marker_deselection(fallback, read)
         assert widened is fallback
         assert reason is None
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestExecutedFallbackPlanRecordsTheWidening:
+    """``verify._executed_fallback_plan(plan, fallback, pytest_reason=...)``.
+
+    In the fallback branch the plan is a RECORD, not the execution driver:
+    ``run_scoped_verification`` hands ``run_verification`` the ModuleConfig, not
+    the plan.  The widening therefore happens to the EXECUTED config, and this
+    reconciliation is what keeps the record honest about it.
+
+    The fact is passed EXPLICITLY rather than re-derived here: after widening,
+    a ``test_command == 'pytest'`` is byte-identical to an un-widened bare
+    default suite, so this layer cannot tell the two apart and would have to
+    re-run the probe — a second call, and a second chance to disagree with the
+    executed layer.
+
+    ``code_default_config`` is required: the autouse ``_isolate_orch_config``
+    fixture pins ORCH_CONFIG_PATH at the real dark-factory-orchestrator.yaml,
+    whose configured ``test_command`` would take the "configured suite runs
+    verbatim" arm instead of the bare-default file-scoped one this task is about.
+    """
+
+    _WIDENED_REASON = (
+        "pytest: touched test file(s) tests/test_smoke.py are ALL deselected by the "
+        "effective -m 'not smoke' — fallback full suite instead of a zero-collecting "
+        'file-scoped run (rc=5); those file(s) stay deselected in this run too and '
+        'are NOT executed by it'
+    )
+
+    @staticmethod
+    def _decision_plan(files: list[str], tmp_path: Path):
+        """The fallback-branch DECISION plan, from the bare-default config."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.test_command == 'pytest', (
+            'premise: only the bare default reaches the file-scoped fallback arm'
+        )
+        return verify_plan.derive_verify_plan(files, [], config, lambda _p: None)
+
+    @staticmethod
+    def _widened_fallback() -> ModuleConfig:
+        """What ``widen_fallback_for_marker_deselection`` handed the executor."""
+        return ModuleConfig(
+            prefix='__fallback__',
+            test_command='pytest',
+            lint_command='ruff check tests/test_smoke.py',
+            type_check_command='pyright tests/test_smoke.py',
+        )
+
+    def test_the_pytest_run_records_the_widening(self, tmp_path):
+        plan = self._decision_plan(['tests/test_smoke.py'], tmp_path)
+        assert _run_for(plan, '__fallback__', 'pytest:').scope_kind is ScopeKind.FILE_SCOPED
+
+        executed = verify._executed_fallback_plan(
+            plan, self._widened_fallback(), pytest_reason=self._WIDENED_REASON,
+        )
+        run = _run_for(executed, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.reason == self._WIDENED_REASON
+        # PlannedRun's invariant: scoped_targets is non-empty iff FILE_SCOPED.
+        assert run.scoped_targets == ()
+        # cmd is still the raw-wrapped EXECUTED command the reconciliation builds.
+        assert run.cmd is not None
+        assert run.cmd.raw == 'pytest'
+
+    def test_the_other_tool_slots_are_untouched(self, tmp_path):
+        """Task 3219's scoped_targets propagation must not regress on lint/pyright."""
+        plan = self._decision_plan(['tests/test_smoke.py'], tmp_path)
+        executed = verify._executed_fallback_plan(
+            plan, self._widened_fallback(), pytest_reason=self._WIDENED_REASON,
+        )
+        for tool_word in ('lint:', 'pyright:'):
+            before = _run_for(plan, '__fallback__', tool_word)
+            after = _run_for(executed, '__fallback__', tool_word)
+            assert after is not None and before is not None
+            assert after.scope_kind is ScopeKind.FILE_SCOPED
+            assert after.reason == before.reason
+            assert after.scoped_targets == before.scoped_targets == ('tests/test_smoke.py',)
+
+    def test_omitting_the_reason_is_byte_identical_to_today(self, tmp_path):
+        """The default path must not move — the widening is strictly opt-in."""
+        plan = self._decision_plan(['tests/test_smoke.py'], tmp_path)
+        fallback = self._widened_fallback()
+        assert (
+            verify._executed_fallback_plan(plan, fallback).to_dict()
+            == verify._executed_fallback_plan(plan, fallback, pytest_reason=None).to_dict()
+        )
+
+    def test_a_skipped_pytest_slot_does_not_crash(self, tmp_path):
+        """A source-only diff skips pytest; only the 'pytest:'-prefixed run may move."""
+        plan = self._decision_plan(['src/mod.py'], tmp_path)
+        assert _run_for(plan, '__fallback__', 'pytest:').scope_kind is ScopeKind.SKIPPED
+
+        executed = verify._executed_fallback_plan(
+            plan,
+            ModuleConfig(prefix='__fallback__', lint_command='ruff check src/mod.py'),
+            pytest_reason=self._WIDENED_REASON,
+        )
+        lint = _run_for(executed, '__fallback__', 'lint:')
+        assert lint is not None
+        assert lint.reason == 'lint: file-scoped to touched file(s)'
+        assert lint.scope_kind is ScopeKind.FILE_SCOPED
+
+    def test_the_no_py_files_shape_passes_through_unchanged(self, tmp_path):
+        """A run with no recognised tool prefix is not keyed to any ModuleConfig slot."""
+        plan = self._decision_plan(['src/lib.rs'], tmp_path)
+        assert len(plan.runs) == 1
+
+        executed = verify._executed_fallback_plan(
+            plan,
+            ModuleConfig(prefix='__fallback__', test_command='pytest'),
+            pytest_reason=self._WIDENED_REASON,
+        )
+        assert executed.runs == plan.runs
