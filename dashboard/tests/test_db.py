@@ -46,6 +46,55 @@ async def _reap(conns: list[aiosqlite.Connection]) -> None:
                 await conn.close()
 
 
+class TestLiveAiosqliteWorkerThreads:
+    """Self-check for the leak detector every thread assertion below depends on.
+
+    ``live_aiosqlite_worker_threads()`` keys on TWO private attributes —
+    CPython's ``threading.Thread._target`` and aiosqlite's module-level
+    ``_connection_worker_thread`` — and reads both through
+    ``getattr(..., None)``.  If either moves it returns ``[]``, and every leak
+    assertion built on it (``survivors`` here, ``leaked`` in
+    ``test_durability.py``) passes VACUOUSLY: the exact silent-fail-soft the
+    detector exists to prevent.  ``Thread._target``'s lifetime is already
+    implementation-coupled — ``Thread.run()`` deletes it in its ``finally`` —
+    so this is not a hypothetical.
+
+    A positive round-trip against a REAL connection pins both attributes at
+    once and cannot degrade to a quiet pass, which a ``hasattr`` guard on one
+    of the two names could (and, being a bare module-level ``assert``, was also
+    stripped under ``python -O``).
+    """
+
+    async def test_detects_and_then_stops_detecting_a_real_connection(self):
+        before = set(live_aiosqlite_worker_threads())
+        conn = await aiosqlite.connect(':memory:')
+        try:
+            found = [t for t in live_aiosqlite_worker_threads() if t not in before]
+            assert len(found) == 1, (
+                f'live_aiosqlite_worker_threads() found {len(found)} new worker '
+                f'thread(s) for one open aiosqlite connection, expected 1 — the '
+                f'private-attribute pin (Thread._target / '
+                f'aiosqlite.core._connection_worker_thread) no longer matches '
+                f'aiosqlite {aiosqlite.__version__}, so every leak assertion in '
+                f'this file and test_durability.py is now vacuous'
+            )
+            assert found[0] is conn._thread, (
+                f'the detected worker is not this connection\'s thread '
+                f'({found[0]!r} is not {conn._thread!r})'
+            )
+        finally:
+            await conn.close()
+
+        conn._thread.join(timeout=2.0)
+        assert not conn._thread.is_alive(), 'worker thread did not exit after close()'
+        still = [t for t in live_aiosqlite_worker_threads() if t not in before]
+        assert not still, (
+            f'live_aiosqlite_worker_threads() still reports {len(still)} worker '
+            f'thread(s) after close() — the detector reports dead threads as '
+            f'live, so leak assertions would fire spuriously'
+        )
+
+
 class TestDbPool:
     """Tests for the DbPool connection cache."""
 
@@ -641,7 +690,13 @@ class TestDbPool:
             opened.append(conn)
             return conn
 
-        before = {id(t) for t in live_aiosqlite_worker_threads()}
+        # Hold the Thread OBJECTS, not their id()s: an id is reusable once the
+        # original object is collected, so a Thread freed mid-test whose address
+        # a newly-created worker inherits would be silently classified as
+        # pre-existing and the survivors assertion below would go quiet.  The
+        # strong references are what make the comparison mean anything.  Matches
+        # test_durability.py's baseline.
+        before = set(live_aiosqlite_worker_threads())
         try:
             with patch('aiosqlite.connect', wrapper):
                 # (1) Getter A suspends mid-connect, then is cancelled.  The
@@ -717,7 +772,7 @@ class TestDbPool:
                 )
 
             survivors = [
-                t for t in live_aiosqlite_worker_threads() if id(t) not in before
+                t for t in live_aiosqlite_worker_threads() if t not in before
             ]
             assert not survivors, (
                 f'{len(survivors)} aiosqlite worker thread(s) survived '
@@ -735,16 +790,23 @@ class TestDbPool:
     ):
         """close_all() must not RETURN while a close it caused is still running.
 
-        ``_close_once`` early-returns on ``conn in self._closing`` — it SKIPS
-        rather than WAITS.  During ``close_all()`` the ordering is deterministic:
-        the landing connect fires ``_adopt_or_close`` (whose done-callback was
+        Current behaviour (the thing under test): ``_close_once`` JOINS a close
+        already in flight for the same ``Connection``, awaiting the shared
+        future under ``asyncio.shield`` instead of returning.  ``close_all()``
+        additionally gathers the fire-and-forget close tasks ``_adopt_or_close``
+        scheduled, so it cannot return while one is still running.
+
+        The RED condition this pins is history: BEFORE step-12, ``_close_once``
+        early-returned on ``conn in self._closing`` — it SKIPPED rather than
+        JOINED.  During ``close_all()`` the ordering is deterministic: the
+        landing connect fires ``_adopt_or_close`` (whose done-callback was
         registered in ``get()``, hence ahead of ``asyncio.wait``'s own), which
         with ``_closed`` already True schedules a FIRE-AND-FORGET ``_close_once``
         task; that task's first step is queued via ``call_soon`` ahead of
-        ``_drain_inflight``'s resumption, so it enters ``await conn.close()``
-        first and ``_drain_inflight``'s own ``_close_once(...)`` then hits the
-        ``_closing`` guard and returns instantly.  Nothing awaits the scheduled
-        task, so ``close_all()`` returns with the close still in flight.
+        ``_drain_inflight``'s resumption, so it entered ``await conn.close()``
+        first and ``_drain_inflight``'s own ``_close_once(...)`` then hit the
+        ``_closing`` guard and returned instantly.  Nothing awaited the
+        scheduled task, so ``close_all()`` returned with the close in flight.
 
         Why that is a real bug and not just untidy: under uvicorn — or a
         ``TestClient`` portal that closes the loop promptly after shutdown — the
@@ -958,6 +1020,168 @@ class TestDbPool:
             # As in the in-flight-close test above: never reap blind while a
             # close may still be running — a second concurrent close() queues a
             # STOP sentinel nothing will resolve.
+            for conn in opened:
+                with contextlib.suppress(TimeoutError):
+                    await _wait_until(
+                        lambda c=conn: not getattr(c, '_running', False),
+                        timeout=2.0,
+                    )
+            await _reap(opened)
+
+    async def test_close_all_waits_for_straggler_adopted_during_the_final_gather(
+        self, tmp_path, monkeypatch
+    ):
+        """close_all() must join a close scheduled AFTER its join already started.
+
+        The last residual window, and the reason ``close_all()`` drains
+        ``_pending_closes`` to a FIXED POINT rather than gathering one snapshot.
+        A straggler that missed ``_INFLIGHT_DRAIN_TIMEOUT`` is still in
+        ``_inflight`` with ``_adopt_or_close`` attached, so it can land *while*
+        that gather is awaiting: the close it schedules is added to
+        ``_pending_closes`` after the snapshot was taken and a single-shot
+        gather would never join it.  ``close_all()`` would then return with a
+        close in flight — the same stranded-worker-thread state as the two
+        tests above, reached by a third route, and a direct contradiction of the
+        invariant :meth:`DbPool.close_all`'s docstring states.
+
+        Choreography — three connections, all gated on their INSTANCE ``close``
+        as in the test above.  X is pooled, so ``close_all()`` can be held inside
+        its ``_conns`` loop.  Y is a straggler that lands BEFORE the gather, so
+        it is in the snapshot.  Z is a straggler that lands DURING it.
+
+        The barrier between "Y is in the snapshot" and "Z lands during the
+        gather" is exact, not a sleep: ``pool.open_count`` drops to 0 at
+        ``_conns.clear()``, and between that and the gather ``close_all()``
+        executes no ``await``, so it cannot be observed anywhere in between.
+        Once the poll sees 0, ``close_all()`` is necessarily parked in the
+        gather.
+
+        Deterministic in BOTH directions.  RED: once ``release_y`` completes the
+        snapshot's only task, nothing remains but a ``return``, so 0.1s is ample
+        for ``closer`` to finish.  GREEN: ``closer`` CANNOT finish, because the
+        re-check finds Z's close and gathers it, and that one is blocked on
+        ``release_z``.
+
+        The straggler WARNING fires here — Y and Z both miss the budget by
+        construction.  That is expected; this test does not assert against it.
+        """
+        monkeypatch.setattr('dashboard.data.db._INFLIGHT_DRAIN_TIMEOUT', 0.01)
+        db_x = tmp_path / 'x.db'
+        db_y = tmp_path / 'y.db'
+        db_z = tmp_path / 'z.db'
+        for path in (db_x, db_y, db_z):
+            sqlite3.connect(str(path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        opened: list[aiosqlite.Connection] = []
+
+        x_close_started = asyncio.Event()
+        release_x = asyncio.Event()
+        started: dict[str, asyncio.Event] = {'y': asyncio.Event(), 'z': asyncio.Event()}
+        release: dict[str, asyncio.Event] = {'y': asyncio.Event(), 'z': asyncio.Event()}
+        inside: dict[str, asyncio.Event] = {'y': asyncio.Event(), 'z': asyncio.Event()}
+        gate: dict[str, asyncio.Event] = {'y': asyncio.Event(), 'z': asyncio.Event()}
+
+        conn_x = await pool.get(db_x)
+        assert conn_x is not None
+        opened.append(conn_x)
+        real_close_x = conn_x.close
+
+        async def gated_close_x():
+            x_close_started.set()
+            await release_x.wait()
+            await real_close_x()
+
+        conn_x.close = gated_close_x
+
+        async def wrapper(*args, **kwargs):
+            # Keyed on the path rather than a call counter: the two stragglers
+            # open DIFFERENT databases, so this cannot mis-attribute a gate.
+            key = 'z' if 'z.db' in str(args[0]) else 'y'
+            inside[key].set()
+            await gate[key].wait()
+            conn = await real_connect(*args, **kwargs)
+            real_close = conn.close
+
+            async def gated_close(k=key, rc=real_close):
+                started[k].set()
+                await release[k].wait()
+                await rc()
+
+            conn.close = gated_close
+            opened.append(conn)
+            return conn
+
+        async def cancelled_getter(db_path, key):
+            getter = asyncio.create_task(pool.get(db_path))
+            await asyncio.wait_for(inside[key].wait(), timeout=2.0)
+            getter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await getter
+
+        try:
+            with patch('aiosqlite.connect', wrapper):
+                await cancelled_getter(db_y, 'y')
+                await cancelled_getter(db_z, 'z')
+
+                closer = asyncio.create_task(pool.close_all())
+                # Both stragglers have now blown the 0.01s drain budget and
+                # close_all() is suspended inside the _conns loop on X.
+                await asyncio.wait_for(x_close_started.wait(), timeout=2.0)
+
+                # Y lands first, so its close IS in the snapshot the gather
+                # would take.
+                gate['y'].set()
+                await asyncio.wait_for(started['y'].wait(), timeout=2.0)
+
+                # Exact barrier: open_count hits 0 at _conns.clear(), and
+                # close_all() does not await again before the gather.
+                release_x.set()
+                await _wait_until(lambda: pool.open_count == 0)
+
+                # Z lands DURING the gather — after the snapshot existed.
+                gate['z'].set()
+                await asyncio.wait_for(started['z'].wait(), timeout=2.0)
+
+                # Retire the snapshot's only member.  A single-shot gather now
+                # has nothing left to wait on.
+                release['y'].set()
+                await asyncio.sleep(0.1)
+
+                assert not closer.done(), (
+                    'close_all() returned while a straggler adopted DURING its '
+                    'final join was still being closed; a single snapshot of '
+                    '_pending_closes cannot see a close scheduled after it was '
+                    'taken, so the worker thread is stranded if the loop is '
+                    'torn down now'
+                )
+
+                release['z'].set()
+                await asyncio.wait_for(closer, timeout=2.0)
+
+            assert len(opened) == 3, (
+                f'expected 3 connections (pooled X, stragglers Y and Z), got '
+                f'{len(opened)}'
+            )
+            conn_z = opened[2]
+            assert conn_z._running is False, (
+                f'straggler Z not closed (_running is {conn_z._running!r})'
+            )
+            assert conn_z._connection is None, (
+                f'straggler Z not closed (_connection is {conn_z._connection!r})'
+            )
+            conn_z._thread.join(timeout=2.0)
+            assert not conn_z._thread.is_alive(), (
+                'the aiosqlite worker thread of the straggler adopted during '
+                'the final gather did not exit after close_all returned'
+            )
+        finally:
+            gate['y'].set()
+            gate['z'].set()
+            release_x.set()
+            release['y'].set()
+            release['z'].set()
             for conn in opened:
                 with contextlib.suppress(TimeoutError):
                     await _wait_until(

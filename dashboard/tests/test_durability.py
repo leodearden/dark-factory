@@ -512,16 +512,27 @@ async def test_lifespan_shutdown_leaves_no_aiosqlite_worker_threads(
 
     End-to-end reduction of the reported cross-file pytest ERROR (task 3466).
     ``lifespan()`` cancels ``metrics_task`` at shutdown; when that task is
-    suspended inside ``await aiosqlite.connect(...)`` the ``Connection`` is
-    never returned to ``DbPool.get()``, so it never lands in ``_conns`` and
-    ``close_all()`` cannot see it.  ``aiosqlite.Connection._connect()`` catches
-    only ``Exception`` — never ``CancelledError`` — so it never calls
-    ``_stop_running()`` either.  The daemon worker thread is orphaned, and once
-    this loop closes its ``call_soon_threadsafe`` raises ``RuntimeError: Event
-    loop is closed`` OUT of ``_connection_worker_thread``, where pytest's
-    ``threadexception`` plugin attributes it to whatever test happens to be
-    running at that instant — hence "roaming target", "cross-file only",
-    "passes standalone".
+    suspended awaiting a ``DbPool`` connect, the ``Connection`` is never
+    returned to ``DbPool.get()``, so it never lands in ``_conns`` and
+    ``close_all()`` cannot see it.
+
+    The exact window matters, because aiosqlite partly defends itself (verified
+    against 0.22.1).  A cancellation landing INSIDE ``Connection._connect()``
+    self-heals: ``_connect`` catches ``BaseException`` — not merely
+    ``Exception`` — and calls ``stop()`` before re-raising.  The window this
+    test drives is the one AFTER that: the connect COMPLETES, so a live worker
+    thread and a fully-built ``Connection`` exist, and only then is the awaiting
+    getter cancelled — leaving a running worker the pool has never seen.  And
+    even ``stop()`` is not a rescue once the loop is gone, because its STOP
+    sentinel is delivered by the worker calling
+    ``future.get_loop().call_soon_threadsafe(...)``: on a closed loop that
+    raises ``RuntimeError: Event loop is closed`` OUT of
+    ``_connection_worker_thread``, where pytest's ``threadexception`` plugin
+    attributes it to whatever test happens to be running at that instant —
+    hence "roaming target", "cross-file only", "passes standalone".  The worker
+    is also NON-daemon (``Thread(target=_connection_worker_thread, ...)`` with
+    no ``daemon=True``), so a stranded one additionally blocks process exit;
+    that is what the ``finally`` block below exists to stop.
 
     Deterministic by construction: the patched connect signals ``landed`` only
     after a real ``Connection`` (and therefore a real worker thread) exists,

@@ -33,10 +33,19 @@ def live_aiosqlite_worker_threads() -> list[threading.Thread]:
     detail and ``_connection_worker_thread`` is an aiosqlite private module
     function.  Both are verified against **aiosqlite >=0.22.x** — bump and
     re-verify this pin if either moves, exactly as the ``_connection`` /
-    ``_running`` / ``_thread`` pin in ``test_db.py`` documents.  The
-    ``getattr(..., None)`` guards below mean a moved attribute degrades to "no
-    workers found" rather than an ``AttributeError`` mid-assertion; the
-    ``_PIN_OK`` assertion at import time is what makes such a move LOUD.
+    ``_running`` / ``_thread`` pin in ``test_db.py`` documents.
+
+    The ``getattr(..., None)`` guards below mean a moved attribute degrades to
+    "no workers found" rather than an ``AttributeError`` mid-assertion — which
+    would make every leak assertion built on this pass VACUOUSLY.  What makes
+    such a move LOUD is
+    ``test_db.py::TestLiveAiosqliteWorkerThreads::test_detects_and_then_stops_detecting_a_real_connection``:
+    it opens one real connection and asserts this function finds exactly that
+    thread, then stops finding it after ``close()``.  A positive round-trip is
+    used rather than a ``hasattr`` guard on ONE of the two names because
+    ``Thread._target`` is equally load-bearing and equally movable (``Thread.run``
+    already deletes it in its ``finally``), and because a bare module-level
+    ``assert`` is stripped under ``python -O``.
     """
     live: list[threading.Thread] = []
     for thread in threading.enumerate():
@@ -44,17 +53,6 @@ def live_aiosqlite_worker_threads() -> list[threading.Thread]:
         if getattr(target, '__name__', None) == '_connection_worker_thread':
             live.append(thread)
     return live
-
-
-# Import-time guard for the private-attribute pin above: if aiosqlite ever
-# renames `_connection_worker_thread`, `live_aiosqlite_worker_threads()` would
-# silently return [] and every leak assertion built on it would pass vacuously.
-# Fail LOUDLY at collection instead (INV: no-silent-fail-soft).
-assert hasattr(aiosqlite.core, '_connection_worker_thread'), (
-    'aiosqlite.core._connection_worker_thread not found — the worker-thread '
-    'name pin in live_aiosqlite_worker_threads() must be updated for this '
-    f'aiosqlite version ({aiosqlite.__version__})'
-)
 
 
 def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
