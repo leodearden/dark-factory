@@ -47,7 +47,6 @@ import types
 from pathlib import Path
 
 import pytest
-
 from shared.memory_eval_metrics import (
     parse_metric_series,
     serialize_metric_series,
