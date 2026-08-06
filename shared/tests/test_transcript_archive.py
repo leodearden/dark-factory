@@ -322,3 +322,62 @@ class TestDurableArchivePathLookup:
 
         assert found == main
         assert found.is_file()
+
+    def test_b6_newest_mtime_wins_across_lanes(self, tmp_path):
+        """B6 (I-F): two lanes archived the same session — newest wins.
+
+        The observed re-dispatched-across-lanes case (reify tasks 5848/5766).
+        The OLDER copy is written first and lives under the lexically-earlier
+        lane dir, so a naive first-match glob returns exactly the wrong one.
+        Newest rather than oldest because a resumed session's transcript only
+        ever grows, so the newest archive is the most complete one.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b6'
+        task_id = '42'
+
+        older = _write(root / task_id / ENC / f'{sid}.jsonl.gz', b'older')
+        newer = _write(root / task_id / ENC_B / f'{sid}.jsonl.gz', b'newer')
+        os.utime(older, (1_000_000, 1_000_000))
+        os.utime(newer, (2_000_000, 2_000_000))
+
+        assert durable_archive_path(root, task_id, sid) == newer
+
+    def test_b6_repeat_calls_are_stable(self, tmp_path):
+        """B6 (I-F): the same question gets the same answer every time."""
+        root = tmp_path / 'archive'
+        sid = 'sess-b6-stable'
+        task_id = '42'
+
+        older = _write(root / task_id / ENC / f'{sid}.jsonl.gz', b'older')
+        newer = _write(root / task_id / ENC_B / f'{sid}.jsonl.gz', b'newer')
+        os.utime(older, (1_000_000, 1_000_000))
+        os.utime(newer, (2_000_000, 2_000_000))
+
+        answers = {durable_archive_path(root, task_id, sid) for _ in range(5)}
+
+        assert answers == {newer}
+
+    def test_b6_equal_mtimes_still_resolve_deterministically(self, tmp_path):
+        """B6 (I-F): an exact mtime tie still yields one stable answer.
+
+        Exact ties are plausible rather than theoretical: _archive_one mirrors
+        the SOURCE mtime onto the archived copy via os.utime, so one session
+        archived from two lanes can tie to the nanosecond. Under a tie, mtime
+        alone is not a total order and max() falls back to filesystem-dependent
+        glob iteration order — non-reproducible across calls and machines, and
+        any resume built on it non-reproducible with it.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b6-tie'
+        task_id = '42'
+
+        a = _write(root / task_id / ENC / f'{sid}.jsonl.gz', b'lane-a')
+        b = _write(root / task_id / ENC_B / f'{sid}.jsonl.gz', b'lane-b')
+        os.utime(a, (1_500_000, 1_500_000))
+        os.utime(b, (1_500_000, 1_500_000))
+
+        answers = {durable_archive_path(root, task_id, sid) for _ in range(5)}
+
+        assert len(answers) == 1
+        assert answers.pop() in {a, b}
