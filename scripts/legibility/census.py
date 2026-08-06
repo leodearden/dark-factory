@@ -1340,7 +1340,9 @@ def run_census(
     # Real probe accounting for the report's cost note. A legibility tool
     # that under-reports its own spend -- in the very artifact an operator
     # reads to check --max-verify-clusters -- is the same defect class this
-    # pipeline exists to find.
+    # pipeline exists to find. Counts THIS function's probes (the preflight
+    # below and the stage gate); the verifier's own in-verify probes are
+    # added from its reported count at the verify site.
     probe_count = [1]
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
@@ -1467,6 +1469,15 @@ def run_census(
             escalate_fn=escalate_fn,
             unverified=exc.unverified,
         )
+    # The default verifier probes internally (detectors (a)/(b)/(c)) and
+    # reports how many probes it spent, so the cost note below counts those
+    # too rather than only run_census's own two. A verify_fn that omits the
+    # key -- every fake in the tests, any custom verifier -- contributes 0,
+    # and a non-int is ignored rather than crashing a finished census over a
+    # cosmetic count.
+    reported_probes = verify_result.get("headroom_probes")
+    probe_count[0] += reported_probes if isinstance(reported_probes, int) else 0
+
     verified = verify_result.get("verified") or []
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
@@ -1642,7 +1653,9 @@ def run_census(
 
     # verify is ONE call PER CLUSTER (_build_default_verify_fn), not one call
     # total -- and the per-cluster count is precisely what an operator using
-    # --max-verify-clusters reads this line to check.
+    # --max-verify-clusters reads this line to check. headroom-probe is the
+    # run's REAL probe spend: this function's preflight and stage gate PLUS
+    # whatever the verifier reported spending on its own in-verify detectors.
     cost_note = (
         f"invoke calls: {config.models.census_miner} miner="
         f"{sum(s.total for s in mining_result.batch_stats)}, "
@@ -2001,9 +2014,52 @@ def _build_default_verify_fn(
     wires ``headroom_probe=functools.partial(preflight_headroom,
     verify_invoke, model=cfg.models.trickle)``, so every real run keeps full
     detection.
+
+    Two properties of the probe seam itself, both owned by the ``_probe()``
+    wrapper below rather than restated at the three call sites:
+
+    * **It is counted.** The result dict carries ``headroom_probes`` -- how
+      many probes this verifier actually spent -- which ``run_census`` folds
+      into the report's cost note. Reported through the return value rather
+      than a counter passed in, because the seam is wired by ``main()`` and a
+      counter would need a second wiring site nothing forces anyone to
+      connect. A caller that ignores the key loses only the count.
+    * **It never raises.** *headroom_probe* is injected and carries no
+      exception contract, so a raising seam is folded into
+      ``HeadroomResult(ok=False)`` exactly as ``preflight_headroom`` folds an
+      invocation error -- a deferral, not an exception escaping into
+      ``main()``'s exit-1 path after the whole mining spend.
     """
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
+        # Every probe THIS verifier spends, reported back in the result dict
+        # so run_census's cost note can state the run's real probe spend.
+        # It rides the return value rather than a mutable counter passed in
+        # because the probe seam is wired by main(), not by run_census: a
+        # counter would need a second wiring site that nothing forces anyone
+        # to connect, and an unwired counter is exactly how the cost note
+        # came to under-report in the first place.
+        probes = [0]
+
+        def _probe():
+            """Call the injected probe seam: counted, and never raising.
+
+            *headroom_probe* is an injected seam with no exception contract.
+            Production wires ``preflight_headroom``, which folds any failure
+            into ``HeadroomResult(ok=False)`` -- but a seam that RAISES here
+            would escape ``_verify_fn``, sail past ``run_census``'s
+            ``except CensusHeadroomExhausted`` and land in ``main()``'s
+            hard-failure path: exit 1 plus a traceback escalation, after the
+            whole mining spend, on a path that has ALREADY failed once.
+            Matching ``preflight_headroom``'s own fail-safe stance turns that
+            into the deferral this guard exists to produce.
+            """
+            probes[0] += 1
+            try:
+                return headroom_probe()
+            except Exception as exc:  # noqa: BLE001 - a raising probe defers, never crashes the census
+                return HeadroomResult(ok=False, reason=f"headroom probe raised: {exc}")
+
         for index, cluster in enumerate(clusters):
             # The hitting cluster plus everything never attempted. Computed
             # identically at every raise site so the counts cannot disagree
@@ -2015,7 +2071,7 @@ def _build_default_verify_fn(
             except Exception as exc:  # noqa: BLE001 - an unverifiable claim rejects, never crashes
                 # (b) One re-probe, only on a path that has already failed.
                 if headroom_probe is not None:
-                    probe = headroom_probe()
+                    probe = _probe()
                     if not probe.ok:
                         raise CensusHeadroomExhausted(
                             stage="verify",
@@ -2041,7 +2097,7 @@ def _build_default_verify_fn(
                 # here the marker only TRIGGERS: a probe decides.
                 marker = looks_like_blocking_banner(raw or "")
                 if marker is not None and headroom_probe is not None:
-                    probe = headroom_probe()
+                    probe = _probe()
                     if not probe.ok:
                         raise CensusHeadroomExhausted(
                             stage="verify",
@@ -2076,7 +2132,7 @@ def _build_default_verify_fn(
                 and (index + 1) % probe_every == 0
                 and remaining > 1
             ):
-                probe = headroom_probe()
+                probe = _probe()
                 if not probe.ok:
                     raise CensusHeadroomExhausted(
                         stage="verify",
@@ -2088,7 +2144,12 @@ def _build_default_verify_fn(
                         verified=len(verified),
                         unverified=remaining - 1,
                     )
-        return {"verified": verified, "rejected": rejected, "fixed": []}
+        return {
+            "verified": verified,
+            "rejected": rejected,
+            "fixed": [],
+            "headroom_probes": probes[0],
+        }
 
     return _verify_fn
 

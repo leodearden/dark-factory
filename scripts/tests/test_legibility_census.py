@@ -16,6 +16,7 @@ state.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -3780,3 +3781,213 @@ def test_report_cost_note_reports_one_probe_when_nothing_is_verified(tmp_path):
     cost_line = kwargs["report_path"].read_text(encoding="utf-8").split("## Cost", 1)[1]
     assert "verify=0" in cost_line
     assert "headroom-probe=1" in cost_line
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / AMENDMENT: the probe count must include the probes spent INSIDE
+# verification.
+#
+# run_census counted only its own two probes (preflight + the stage gate). The
+# three in-verify detectors probe through the `headroom_probe` seam, which
+# main() wires with no counter -- so a healthy 20-cluster run at
+# probe_every=5 really spends 1 + 1 + 3 = 5 trickle probes and the report
+# still printed `headroom-probe=2`. Under-reporting its own spend, in the very
+# artifact an operator reads to size a run, is the defect class this pipeline
+# exists to find.
+# ---------------------------------------------------------------------------
+
+_TWELVE_NOVEL = 12
+
+
+def _twelve_novel_invoke(prompt, model):
+    """Fake coder-LLM reply chooser yielding TWELVE distinct novel candidates.
+
+    Session ids are zero-padded (`nov-00` .. `nov-11`) because this chooser
+    keys on a substring and a bare `nov-1` is a prefix of `nov-10`/`nov-11`.
+    Twelve is the smallest count that crosses more than one probe_every=5
+    backstop boundary, so the cost note has something to under-report.
+    """
+    for i in range(_TWELVE_NOVEL):
+        if f"nov-{i:02d}" in prompt:
+            return json.dumps(
+                {
+                    "matches": [],
+                    "candidates": [
+                        {
+                            "title": f"novel cluster {i:02d}",
+                            "cause": f"cause for cluster {i:02d}",
+                            "area": "orchestrator",
+                            "origin_phase": "implement",
+                            "manifested_phase": "verify",
+                            "evidence_quote": f"quote for cluster {i:02d}",
+                        }
+                    ],
+                }
+            )
+    return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+
+def _twelve_novel_batch():
+    return [_hand_digest(f"nov-{i:02d}", f"novel body {i:02d}") for i in range(_TWELVE_NOVEL)]
+
+
+def test_default_verify_fn_reports_the_headroom_probes_it_spent():
+    """The verifier reports its probe spend back in the result dict.
+
+    That report is the ONLY way run_census can know what the probes inside
+    verification cost: the seam is wired by main(), not by run_census, so a
+    counter would have to be threaded through a second wiring site that
+    nothing forces anyone to connect.
+    """
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
+    )
+
+    result = verify_fn(_clusters(12), model="sonnet")
+
+    assert len(probe.calls) == 2, "backstops after clusters 5 and 10"
+    assert result["headroom_probes"] == 2, "and the result SAYS so"
+
+
+def test_default_verify_fn_reports_zero_probes_when_it_has_no_probe_seam():
+    """No probe seam -> nothing spent -> the report says 0, not nothing."""
+    verify_fn = mod._build_default_verify_fn("/tmp/root", lambda prompt, model: _verdict())
+
+    result = verify_fn(_clusters(12), model="sonnet")
+
+    assert result["headroom_probes"] == 0
+
+
+def test_report_cost_note_counts_the_in_verify_backstop_probes(tmp_path):
+    """END-TO-END: the cost note counts the REAL verifier's own probes.
+
+    Wires the REAL `_build_default_verify_fn` with a real `preflight_headroom`
+    probe -- the production shape -- over 12 novel clusters at probe_every=5.
+    The honest count is 4: preflight, the pre-verify stage gate, and the two
+    backstops after clusters 5 and 10.
+
+    `test_report_cost_note_counts_real_headroom_probes` cannot catch this: it
+    injects a FAKE verify_fn over 3 clusters, so no in-verify probe is ever
+    spent in the scenario it pins.
+    """
+    def response_fn(prompt, model):
+        if prompt == mod._HEADROOM_PROBE_PROMPT:
+            return "pong"
+        if prompt.startswith("You are the periodic-census verifier"):
+            return _verdict()
+        return _twelve_novel_invoke(prompt, model)
+
+    fake_invoke = _make_fake_invoke(response_fn)
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[_twelve_novel_batch()],
+        verify_fn=mod._build_default_verify_fn(
+            str(tmp_path),
+            fake_invoke,
+            headroom_probe=functools.partial(
+                mod.preflight_headroom, fake_invoke, model="haiku",
+            ),
+            probe_every=5,
+        ),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done", f"reason={outcome.reason!r}"
+    cost_line = kwargs["report_path"].read_text(encoding="utf-8").split("## Cost", 1)[1]
+    assert "verify=12" in cost_line
+    assert "headroom-probe=4" in cost_line, (
+        "preflight + the stage gate + the two in-verify backstops -- "
+        f"got: {cost_line.splitlines()[:4]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / AMENDMENT: `headroom_probe` is an INJECTED seam with no
+# exception contract.
+#
+# Production wires `preflight_headroom`, which folds any failure into
+# HeadroomResult(ok=False) -- but a seam that RAISES would escape _verify_fn,
+# sail past run_census's `except CensusHeadroomExhausted` and land in main()'s
+# hard-failure path: exit 1 plus a traceback escalation, after the whole
+# mining spend, on a path that has ALREADY failed once. That is strictly worse
+# than the deferral this feature exists to produce.
+# ---------------------------------------------------------------------------
+
+def _raising_probe(exc=None):
+    """A `headroom_probe` seam that raises instead of returning a verdict."""
+    def probe():
+        raise exc or RuntimeError("probe transport blew up")
+
+    return probe
+
+
+def test_default_verify_fn_treats_a_raising_probe_as_no_headroom():
+    """Detector (b): a raising re-probe defers, it does not crash the census."""
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+        return _verdict()
+
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=_raising_probe(), probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(4), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 1
+    assert exc.unverified == 3
+    assert "raised" in (exc.reason or "").lower(), (
+        "the reason says the probe itself failed, not that a banner was seen"
+    )
+
+
+def test_default_verify_fn_backstop_treats_a_raising_probe_as_no_headroom():
+    """Detector (c): same fail-safe stance at the periodic backstop."""
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root",
+        lambda prompt, model: _verdict(),
+        headroom_probe=_raising_probe(),
+        probe_every=5,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(12), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 5
+    assert exc.unverified == 7
+    assert "raised" in (exc.reason or "").lower()
+
+
+def test_default_verify_fn_unparseable_banner_treats_a_raising_probe_as_no_headroom():
+    """Detector (a): a raising confirmation probe defers rather than escaping."""
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root",
+        _prose_at_cluster_two_invoke(),
+        headroom_probe=_raising_probe(),
+        probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(4), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 1
+    assert exc.unverified == 3
+    assert "raised" in (exc.reason or "").lower()
