@@ -5,13 +5,14 @@ the agent-legibility survey's cross-cutting root causes
 (`plans/agent-legibility-survey-2026-07-13.md` §3) as named,
 checkable design-time questions; INV-6..INV-7 were added 2026-08-02
 from the task/escalation strand investigation
-(`docs/task-escalation-state-spec.md`). They gate `/prd` decompose (G7,
-`skills/prd/references/gates.md`) and `/review` phase 2's cross-module
-audit — both consumers Read this doc at run time;
+(`docs/task-escalation-state-spec.md`); INV-8 was added 2026-08-06 from
+the reconciliation loop-blocking incident (task 3778). They gate `/prd`
+decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
+cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
 ids are load-bearing: G7 waivers, `/review`'s `invariant_findings`, and
 the confusion census's optional `invariant_violated` field all reference
-them. Numeric aliases INV-1..INV-7 are prose convenience only.
+them. Numeric aliases INV-1..INV-8 are prose convenience only.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -159,10 +160,49 @@ progress-refreshed deadline + escalation-of-escalation; orphan-L0 reaper
 `blocked` + open L2 as the explicit unbounded marker (task 1792);
 gate-backlog age reporting (tasks 3520-3522).
 
+## INV-8 `loop-thread-occupancy-bounded`
+
+**Rule**: In a long-lived async process, no coroutine occupies the
+event-loop thread for an unbounded time. Any call that can block
+(subprocess, network, filesystem, lock, sleep) is either non-blocking or
+offloaded (`asyncio.to_thread`/executor); AND any per-item work fanned
+out over a collection has its loop-invariant part hoisted out of the body
+and its item count explicitly bounded. Neither limb alone bounds
+occupancy — offloading an unbounded fan-out still burns unbounded wall
+clock, and capping a still-blocking fan-out still stalls the loop — so
+both are required.
+
+**Checkable design question(s)**: For each coroutine this feature adds or
+touches: what is the worst-case wall time it holds the loop thread, and
+what makes that case worst rather than typical? If it iterates a
+collection, who bounds that collection's size, and which work inside the
+body is invariant across iterations? If it shells out, does the process
+spawn itself (fork/exec) run on the loop thread?
+
+**Evidence**: `_render_live_workflow_section`
+(`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py:2480`
+— a sync `def` called from `async def assemble_payload`) fanned three
+blocking `subprocess.run(['git', ...])` calls over the uncapped
+`filtered.active_tasks`: 56.7 ms/task × 514 (dark_factory) and
+82.7 ms/task × 525 (reify) => 29-43 s per render on the loop thread.
+`/health` went 12-35 ms idle -> 31-43 s under recon load; 184 freezes
+>=12 s over Aug 02-05. `asyncio.timeout(5)` could not fire because the
+loop enforcing it *was* the blocked thread. 726 of the sampled
+subprocesses were a byte-identical, render-invariant
+`git worktree list --porcelain`. (task 3778)
+
+**House pattern**: `asyncio.to_thread` at the boundary
+(`fused-memory/src/fused_memory/middleware/task_interceptor.py:945`;
+`middleware/task_curator.py:1623`); the async subprocess runner `_run`
+(`orchestrator/src/orchestrator/git_ops.py:1726`); hoist the
+loop-invariant probe out of the body and bound the fan-out with an
+explicit cap that logs what it dropped (no silent truncation); loop-lag
+heartbeat firing above a threshold (INV-4 applied to scheduling).
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
-The slug vocabulary is *this* doc — the seven ids above. The coding pipeline
+The slug vocabulary is *this* doc — the eight ids above. The coding pipeline
 that populates the field is owned by `plans/confusion-reduction-prd.md`,
 which ships the field in its γ task and names this doc reciprocally in its
 §10 (Cross-PRD relationship). A slug violated repeatedly across census
@@ -173,4 +213,4 @@ batches is an enforcement gap: file a guard task.
 Calibration fixtures — two seeded violations per invariant plus a rehearsal
 verdict table exercising the as-landed G7 and `/review` phase-2 text — live
 at `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14;
-INV-6/INV-7 fixtures added 2026-08-02).
+INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06).
