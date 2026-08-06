@@ -58,7 +58,6 @@ tests/scripts/conftest.py puts this directory on sys.path — pytest's
 that on its own.
 """
 
-import os
 import pathlib
 import shutil
 import subprocess
@@ -67,19 +66,16 @@ import pytest
 
 from systemd_unit_invariants import assert_restart_backoff_effective, restart_directive
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
-
-# Mirrors scripts/setup-host.sh:114 (`UNIT_DIR="$HOME/.config/systemd/user"`),
-# with an XDG_CONFIG_HOME override layered on top for robustness — the
-# installer itself does not honour XDG_CONFIG_HOME, so the two can only
-# diverge if a future host sets that variable while the installer stays
-# unchanged; on this host (XDG_CONFIG_HOME unset) both resolve to the
-# identical /home/leo/.config/systemd/user, as measured.
-UNIT_DIR = (
-    pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config"))
-    / "systemd"
-    / "user"
-)
+# Mirrors scripts/setup-host.sh:114 (`UNIT_DIR="$HOME/.config/systemd/user"`)
+# exactly. Deliberately NOT XDG_CONFIG_HOME-aware: the installer itself does
+# not honour that variable, so making this guard honour it would only ever
+# point the guard at a directory setup-host.sh never writes to — the unit
+# would not be found there, _require_installed_unit would skip, and the
+# guard would silently check nothing while the real installed unit (at
+# $HOME/.config/systemd/user, unconditionally) drifted. Mirroring the
+# installer's actual, non-configurable path is the whole point of a parity
+# guard.
+UNIT_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
 
 UNIT_BASENAME = "orchestrator-know-live.service"
 INSTALLED_UNIT_PATH = UNIT_DIR / UNIT_BASENAME
