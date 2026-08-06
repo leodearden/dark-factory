@@ -806,3 +806,500 @@ def test_probe_embedding_arm_fails_on_a_non_200(install_fake_httpx):
     assert result.verdict == 'FAIL'
     assert result.reason == lms_healthcheck.Reason.HTTP_STATUS
     assert '503' in result.detail
+
+
+# ===========================================================================
+# Part 3 (step 15) -- report assembly, table rendering, CLI and exit codes.
+#
+# This is the layer an operator and a downstream task actually consume, and it
+# has one failure mode worse than any wrong verdict: a report that LOOKS
+# complete while being partial or stale.  Three properties defend against it.
+#
+# 1.  The human-readable table is rendered FROM the report object and takes
+#     nothing else, so the text and the JSON cannot drift apart.  A table that
+#     recomputed anything could show PASS beside a FAIL row.
+#
+# 2.  A broken GPU probe raises rather than degrading.  `used_mib = 0` off a
+#     missing nvidia-smi would render a PASSING vram block with maximal
+#     headroom -- the single most trustworthy-looking wrong answer this rig
+#     can produce.
+#
+# 3.  The exit code distinguishes "an arm is broken" from "the budget is
+#     blown": they have different fixes, and a caller that only sees non-zero
+#     has to re-diagnose from scratch.  `--active` with nothing running is its
+#     own outcome too, so a sweep that measured NOTHING can never be read as a
+#     sweep where everything passed.
+# ===========================================================================
+
+
+import datetime as _datetime
+import inspect
+
+import lms_ctl
+import lms_vram
+
+MEASURED_TOTAL_MIB = 24576
+MEASURED_USED_MIB = 7362
+MEASURED_FREE_MIB = 16761
+
+
+def _snapshot(
+    used_mib=MEASURED_USED_MIB,
+    total_mib=MEASURED_TOTAL_MIB,
+    free_mib=MEASURED_FREE_MIB,
+) -> object:
+    """The measured host reading, as one injected GPU snapshot."""
+    return lms_vram.GpuSnapshot(
+        identity=lms_vram.GpuIdentity(
+            name='NVIDIA GeForce RTX 3090', driver_version='580.159.04',
+        ),
+        reading=lms_vram.GpuReading(
+            total_mib=total_mib, used_mib=used_mib, free_mib=free_mib,
+        ),
+    )
+
+
+def _over_budget_snapshot() -> object:
+    """21000 MiB used -- past PRD D10's 19.5 GiB nominal ceiling."""
+    return _snapshot(used_mib=21000, free_mib=MEASURED_TOTAL_MIB - 21000)
+
+
+def _passing_probe(arm):
+    return lms_healthcheck.ProbeResult(
+        verdict='PASS', reason=lms_healthcheck.Reason.OK, detail='ok', latency_ms=12.5,
+    )
+
+
+def _failing_probe(arm):
+    return lms_healthcheck.ProbeResult(
+        verdict='FAIL',
+        reason=lms_healthcheck.Reason.IDENTITY_MISMATCH,
+        detail='port 8410 serves something else entirely',
+        latency_ms=3.0,
+    )
+
+
+def _report(arms=None, probe=_passing_probe, snapshot=None):
+    return lms_healthcheck.run_healthcheck(
+        arms if arms is not None else [_arm()],
+        gpu_probe=lambda: snapshot if snapshot is not None else _snapshot(),
+        probe=probe,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report assembly
+# ---------------------------------------------------------------------------
+
+
+def test_the_report_carries_a_schema_version():
+    """Step 21's verification test and every downstream consumer key off this.
+
+    Without it, a later shape change silently reinterprets an old artifact
+    rather than rejecting it.
+    """
+    report = _report()
+
+    assert report.schema_version == lms_healthcheck.REPORT_SCHEMA_VERSION
+    assert isinstance(report.schema_version, int)
+
+
+def test_the_report_is_stamped_with_an_aware_utc_timestamp():
+    """A naive timestamp would make a stale artifact indistinguishable from a
+    fresh one across a timezone change -- and this artifact's whole job is to
+    prove a live run happened."""
+    report = _report()
+
+    stamped = _datetime.datetime.fromisoformat(report.measured_at)
+
+    assert stamped.tzinfo is not None
+    assert stamped.utcoffset() == _datetime.timedelta(0)
+
+
+def test_the_report_carries_a_gpu_identity_block():
+    """Which card, which driver.  An arm's numbers are meaningless without it:
+    the same manifest on a different GPU produces different verdicts, and the
+    artifact has to say which host it was measured on."""
+    report = _report()
+
+    assert report.gpu.name == 'NVIDIA GeForce RTX 3090'
+    assert report.gpu.driver_version == '580.159.04'
+    assert report.gpu.total_mib == MEASURED_TOTAL_MIB
+
+
+def test_there_is_one_row_per_arm_carrying_the_contract_fields():
+    arms = [_arm(), _unprefixed_arm()]
+
+    report = _report(arms=arms)
+
+    assert [row.arm_id for row in report.arms] == ['qwen3.5-9b',
+                                                   'granite-embedding-english-r2']
+    row = report.arms[0]
+    assert row.axis == 'llm'
+    assert row.stack == 'vllm'
+    assert row.served_model_name == 'qwen3.5-9b'
+    assert row.verdict == 'PASS'
+    assert row.reason == lms_healthcheck.Reason.OK
+    assert row.latency_ms == 12.5
+
+
+def test_a_row_endpoint_is_the_arms_loopback_base_url():
+    """127.0.0.1, never `localhost`: the latter can resolve to ::1 while the
+    server listens on IPv4 only, which presents as a dead arm
+    (scripts/run_vllm_eval.py:505-512)."""
+    report = _report()
+
+    assert report.arms[0].endpoint == 'http://127.0.0.1:8410'
+    assert 'localhost' not in report.arms[0].endpoint
+
+
+def test_the_vram_block_reports_both_budget_figures_and_the_free_reading():
+    """PRD D10's nominal ceiling AND the measured operating budget travel
+    together, because this host's real budget (~16.4 GiB) is smaller than the
+    PRD assumed and a report showing only one of the two figures either hides
+    the finding or asserts capacity that does not exist."""
+    report = _report()
+
+    vram = report.vram
+    assert vram.total_mib == MEASURED_TOTAL_MIB
+    assert vram.used_mib == MEASURED_USED_MIB
+    assert vram.free_mib == MEASURED_FREE_MIB
+    assert vram.nominal_ceiling_gib == lms_vram.NOMINAL_CEILING_GIB
+    assert vram.operating_budget_gib == lms_vram.MEASURED_OPERATING_BUDGET_GIB
+    assert vram.nominal_ceiling_gib != vram.operating_budget_gib
+    assert vram.headroom_gib > 0
+    assert vram.verdict == 'PASS'
+
+
+def test_the_vram_block_fails_when_usage_exceeds_the_nominal_ceiling():
+    report = _report(snapshot=_over_budget_snapshot())
+
+    assert report.vram.verdict == 'FAIL'
+    assert report.vram.headroom_gib < 0
+
+
+def test_overall_is_pass_only_when_every_row_and_the_vram_block_pass():
+    report = _report(arms=[_arm(), _unprefixed_arm()])
+
+    assert all(row.verdict == 'PASS' for row in report.arms)
+    assert report.vram.verdict == 'PASS'
+    assert report.overall == 'PASS'
+
+
+def test_overall_is_fail_when_a_single_arm_fails():
+    def probe(arm):
+        return _failing_probe(arm) if arm.arm_id == 'qwen3.5-9b' else _passing_probe(arm)
+
+    report = _report(arms=[_arm(), _unprefixed_arm()], probe=probe)
+
+    assert report.vram.verdict == 'PASS'
+    assert report.overall == 'FAIL'
+
+
+def test_overall_is_fail_when_only_the_vram_block_fails():
+    """Every arm answering correctly while the card is over budget is still a
+    failed run: the PRD's user-observable signal is nvidia-smi WITHIN the
+    budget, and an overall PASS here would certify a state that evicts
+    whisper-writer."""
+    report = _report(snapshot=_over_budget_snapshot())
+
+    assert all(row.verdict == 'PASS' for row in report.arms)
+    assert report.overall == 'FAIL'
+
+
+def test_a_dead_arm_does_not_abort_the_sweep(install_fake_httpx):
+    """Measured verdicts for the other arms must survive the first dead one.
+
+    Otherwise the report is both incomplete AND silent about being
+    incomplete -- it would simply be missing rows nobody asked after.
+    """
+    dead, alive = _arm(), _unprefixed_arm()
+
+    def fake_get(url, **kwargs):
+        if ':8410' in url:
+            raise OSError('[Errno 111] Connection refused')
+        return _Resp(200, _models_payload('granite-embedding-english-r2'))
+
+    def fake_post(url, **kwargs):
+        return _Resp(
+            200,
+            _embedding_payload(
+                [0.01 * i for i in range(R2_DIMS)],
+                model='granite-embedding-english-r2',
+            ),
+        )
+
+    install_fake_httpx(post=fake_post, get=fake_get)
+
+    report = lms_healthcheck.run_healthcheck(
+        [dead, alive], gpu_probe=lambda: _snapshot(),
+    )
+
+    assert [row.arm_id for row in report.arms] == [
+        'qwen3.5-9b', 'granite-embedding-english-r2',
+    ]
+    assert report.arms[0].verdict == 'FAIL'
+    assert report.arms[0].reason == lms_healthcheck.Reason.TRANSPORT_ERROR
+    assert report.arms[1].verdict == 'PASS'
+    assert report.overall == 'FAIL'
+
+
+def test_an_unparseable_gpu_probe_propagates_the_typed_error(install_fake_httpx):
+    """No report at all beats a report with a passing VRAM block.
+
+    A swallowed probe failure would render `used 0 MiB, headroom 19.5 GiB` --
+    the most trustworthy-looking wrong answer this rig can produce, and the
+    one an operator is least likely to question.
+    """
+    def exploding_probe():
+        raise lms_vram.VramProbeError('nvidia-smi returned no memory rows')
+
+    with pytest.raises(lms_vram.VramProbeError):
+        lms_healthcheck.run_healthcheck(
+            [_arm()], gpu_probe=exploding_probe, probe=_passing_probe,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Exit codes
+# ---------------------------------------------------------------------------
+
+
+def test_exit_code_is_zero_only_when_every_row_and_the_vram_block_pass():
+    assert lms_healthcheck.exit_code_for(_report()) == 0
+
+
+def test_an_arm_failure_and_a_vram_failure_have_distinct_exit_codes():
+    """Different diagnoses, different fixes.  Collapsing both to 1 costs the
+    caller the whole diagnosis again."""
+    arm_failed = _report(probe=_failing_probe)
+    vram_failed = _report(snapshot=_over_budget_snapshot())
+
+    arm_code = lms_healthcheck.exit_code_for(arm_failed)
+    vram_code = lms_healthcheck.exit_code_for(vram_failed)
+
+    assert arm_code != 0
+    assert vram_code != 0
+    assert arm_code != vram_code
+    assert arm_code == lms_healthcheck.EXIT_ARM_FAILED
+    assert vram_code == lms_healthcheck.EXIT_VRAM_FAILED
+
+
+def test_an_arm_failure_dominates_a_simultaneous_vram_failure():
+    report = _report(probe=_failing_probe, snapshot=_over_budget_snapshot())
+
+    assert lms_healthcheck.exit_code_for(report) == lms_healthcheck.EXIT_ARM_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Table rendering
+# ---------------------------------------------------------------------------
+
+
+def test_the_table_takes_only_the_report_so_text_and_json_cannot_disagree():
+    """A structural guarantee, not a hopeful one: given no arms, no HTTP and
+    no GPU, `render_table` has nothing left to recompute."""
+    signature = inspect.signature(lms_healthcheck.render_table)
+
+    assert list(signature.parameters) == ['report']
+
+
+def test_the_table_shows_every_row_with_its_verdict_and_reason():
+    def probe(arm):
+        return _failing_probe(arm) if arm.arm_id == 'qwen3.5-9b' else _passing_probe(arm)
+
+    report = _report(arms=[_arm(), _unprefixed_arm()], probe=probe)
+
+    table = lms_healthcheck.render_table(report)
+
+    for row in report.arms:
+        assert row.arm_id in table
+        assert row.verdict in table
+    assert 'identity_mismatch' in table
+    assert 'FAIL' in table
+
+
+def test_the_table_follows_the_report_when_a_verdict_changes():
+    """The anti-drift check: edit the structure, the text must move with it."""
+    report = _report()
+    assert 'FAIL' not in lms_healthcheck.render_table(report)
+
+    flipped = report.model_copy(
+        update={
+            'arms': [
+                report.arms[0].model_copy(
+                    update={
+                        'verdict': 'FAIL',
+                        'reason': lms_healthcheck.Reason.EMPTY_COMPLETION,
+                    }
+                )
+            ],
+            'overall': 'FAIL',
+        }
+    )
+
+    table = lms_healthcheck.render_table(flipped)
+
+    assert 'FAIL' in table
+    assert 'empty_completion' in table
+
+
+def test_the_table_shows_both_vram_figures():
+    table = lms_healthcheck.render_table(_report())
+
+    assert str(lms_vram.NOMINAL_CEILING_GIB) in table
+    assert str(lms_vram.MEASURED_OPERATING_BUDGET_GIB) in table
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cli_env(monkeypatch):
+    """Patch the CLI's three seams: the GPU, the arm prober, the unit manager."""
+    calls = {'probed': []}
+
+    def probe(arm):
+        calls['probed'].append(arm.arm_id)
+        return _passing_probe(arm)
+
+    monkeypatch.setattr(lms_vram, 'probe_gpu_snapshot', lambda *a, **k: _snapshot())
+    monkeypatch.setattr(lms_healthcheck, 'probe_arm', probe)
+    monkeypatch.setattr(lms_ctl, 'active_arms', lambda: set())
+    return calls
+
+
+def test_cli_all_covers_every_arm_in_the_committed_manifest(cli_env, capsys):
+    expected = lms_manifest.load_arms().arm_ids()
+
+    code = lms_healthcheck.main(['--all'])
+
+    assert code == 0
+    assert cli_env['probed'] == expected
+    assert len(expected) == 8
+
+
+def test_cli_arm_selects_exactly_one(cli_env, capsys):
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b'])
+
+    assert code == 0
+    assert cli_env['probed'] == ['qwen3.5-9b']
+
+
+def test_cli_arm_rejects_an_unknown_id_loudly(cli_env, capsys):
+    code = lms_healthcheck.main(['--arm', 'no-such-arm'])
+
+    assert code == lms_healthcheck.EXIT_MANIFEST_ERROR
+    assert cli_env['probed'] == []
+    assert 'no-such-arm' in capsys.readouterr().err
+
+
+def test_cli_active_covers_only_the_running_arms(cli_env, monkeypatch, capsys):
+    monkeypatch.setattr(lms_ctl, 'active_arms', lambda: {'phi-4-14b'})
+
+    code = lms_healthcheck.main(['--active'])
+
+    assert code == 0
+    assert cli_env['probed'] == ['phi-4-14b']
+
+
+def test_cli_active_with_nothing_running_is_a_distinct_non_crash_outcome(
+    cli_env, capsys, tmp_path,
+):
+    """A sweep that measured NOTHING must never exit 0.
+
+    `--active` is the natural thing to put in a wrapper script, and an empty
+    unit list returning success would certify a slate nobody probed.
+    """
+    out_path = tmp_path / 'health-report.json'
+
+    code = lms_healthcheck.main(['--active', '--output', str(out_path)])
+
+    assert code == lms_healthcheck.EXIT_NO_ACTIVE_ARMS
+    assert code != 0
+    assert 'no active arms' in capsys.readouterr().out.lower()
+    assert not out_path.exists()
+
+
+def test_cli_requires_a_selector(cli_env):
+    with pytest.raises(SystemExit):
+        lms_healthcheck.main([])
+
+
+def test_cli_output_writes_the_json_artifact_step_21_validates(cli_env, tmp_path):
+    out_path = tmp_path / 'verification' / 'health-report.json'
+
+    code = lms_healthcheck.main(['--all', '--output', str(out_path)])
+
+    assert code == 0
+    written = json.loads(out_path.read_text())
+
+    assert written['schema_version'] == lms_healthcheck.REPORT_SCHEMA_VERSION
+    assert written['overall'] == 'PASS'
+    assert written['gpu']['name'] == 'NVIDIA GeForce RTX 3090'
+    assert {row['arm_id'] for row in written['arms']} == set(
+        lms_manifest.load_arms().arm_ids()
+    )
+    assert all(row['verdict'] == 'PASS' for row in written['arms'])
+    for key in (
+        'total_mib', 'used_mib', 'free_mib', 'nominal_ceiling_gib',
+        'operating_budget_gib', 'headroom_gib', 'verdict',
+    ):
+        assert key in written['vram']
+    for key in ('arm_id', 'axis', 'stack', 'endpoint', 'served_model_name',
+                'verdict', 'reason', 'latency_ms'):
+        assert key in written['arms'][0]
+
+
+def test_cli_written_artifact_is_pure_json_with_no_enum_repr(cli_env, tmp_path):
+    """`Reason` is a StrEnum: dumped in python mode it would serialise as an
+    object repr that no downstream JSON consumer can match on."""
+    out_path = tmp_path / 'health-report.json'
+    lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(out_path)])
+
+    raw = out_path.read_text()
+
+    assert 'Reason.' not in raw
+    assert json.loads(raw)['arms'][0]['reason'] == 'ok'
+
+
+def test_cli_exit_code_reflects_a_failing_arm(cli_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(lms_healthcheck, 'probe_arm', _failing_probe)
+    out_path = tmp_path / 'health-report.json'
+
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(out_path)])
+
+    assert code == lms_healthcheck.EXIT_ARM_FAILED
+    # The artifact is still written: a failing run's evidence is the point.
+    assert json.loads(out_path.read_text())['overall'] == 'FAIL'
+
+
+def test_cli_reports_a_broken_gpu_probe_and_writes_no_artifact(cli_env, monkeypatch,
+                                                               tmp_path, capsys):
+    def exploding(*args, **kwargs):
+        raise lms_vram.VramProbeError('nvidia-smi: command not found')
+
+    monkeypatch.setattr(lms_vram, 'probe_gpu_snapshot', exploding)
+    out_path = tmp_path / 'health-report.json'
+
+    code = lms_healthcheck.main(['--all', '--output', str(out_path)])
+
+    assert code == lms_healthcheck.EXIT_PROBE_ERROR
+    assert 'nvidia-smi' in capsys.readouterr().err
+    assert not out_path.exists()
+
+
+def test_every_cli_exit_code_is_distinct():
+    codes = [
+        lms_healthcheck.EXIT_OK,
+        lms_healthcheck.EXIT_ARM_FAILED,
+        lms_healthcheck.EXIT_MANIFEST_ERROR,
+        lms_healthcheck.EXIT_VRAM_FAILED,
+        lms_healthcheck.EXIT_PROBE_ERROR,
+        lms_healthcheck.EXIT_NO_ACTIVE_ARMS,
+    ]
+
+    assert len(set(codes)) == len(codes)
+    assert lms_healthcheck.EXIT_OK == 0
