@@ -165,22 +165,27 @@ gate-backlog age reporting (tasks 3520-3522).
 **Rule**: In a long-lived async process, no coroutine occupies the
 event-loop thread for an unbounded time. Any call that can block
 (subprocess, network, filesystem, lock, sleep) is either non-blocking or
-offloaded (`asyncio.to_thread`/executor); AND any per-item work fanned
-out over a collection has its loop-invariant part hoisted out of the body
-and its item count explicitly bounded. Neither limb alone bounds
+offloaded (`asyncio.to_thread`/executor); AND any per-item work that can
+block or whose per-item cost is non-trivial, fanned out over a collection
+whose size is not already bounded by an upstream contract (pagination, a
+config cap, a fixed enum), has its loop-invariant part hoisted out of the
+body and its item count explicitly bounded. Neither limb alone bounds
 occupancy — offloading an unbounded fan-out still burns unbounded wall
-clock, and capping a still-blocking fan-out still stalls the loop — so
-both are required.
+clock, and capping a still-blocking fan-out still stalls the loop — so a
+fan-out tripping both needs both fixes. A cheap, fully non-blocking loop
+over an upstream-bounded collection trips neither.
 
 **Checkable design question(s)**: For each coroutine this feature adds or
 touches: what is the worst-case wall time it holds the loop thread, and
 what makes that case worst rather than typical? If it iterates a
-collection, who bounds that collection's size, and which work inside the
-body is invariant across iterations? If it shells out, does the process
-spawn itself (fork/exec) run on the loop thread?
+collection doing work that can block or is non-trivial per item, who
+bounds that collection's size — "already bounded upstream, by pagination
+or a config cap or a fixed enum" is a complete answer — and which work
+inside the body is invariant across iterations? If it shells out, does
+the process spawn itself (fork/exec) run on the loop thread?
 
 **Evidence**: `_render_live_workflow_section`
-(`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py:2480`
+(`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py`
 — a sync `def` called from `async def assemble_payload`) fanned three
 blocking `subprocess.run(['git', ...])` calls over the uncapped
 `filtered.active_tasks`: 56.7 ms/task × 514 (dark_factory) and
@@ -192,11 +197,11 @@ subprocesses were a byte-identical, render-invariant
 `git worktree list --porcelain`. (task 3778)
 
 **House pattern**: `asyncio.to_thread` at the boundary
-(`fused-memory/src/fused_memory/middleware/task_interceptor.py:945`;
-`middleware/task_curator.py:1623`); the async subprocess runner `_run`
-(`orchestrator/src/orchestrator/git_ops.py:1726`); hoist the
-loop-invariant probe out of the body and bound the fan-out with an
-explicit cap that logs what it dropped (no silent truncation); loop-lag
+(`fused-memory/src/fused_memory/middleware/task_interceptor.py::_apply_status_transition`;
+`middleware/task_curator.py::curate_batch_prepared`); the async
+subprocess runner `orchestrator/src/orchestrator/git_ops.py::_run`;
+hoist the loop-invariant probe out of the body and bound the fan-out with
+an explicit cap that logs what it dropped (no silent truncation); loop-lag
 heartbeat firing above a threshold (INV-4 applied to scheduling).
 
 ## Census seam
