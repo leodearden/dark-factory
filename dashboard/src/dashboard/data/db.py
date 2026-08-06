@@ -88,6 +88,23 @@ class DbPool:
     therefore run in its own task tracked in ``_inflight``, awaited under
     :func:`asyncio.shield` so a cancelled caller does not cancel the connect
     itself, and drained by :meth:`close_all` before it returns.
+
+    Two further invariants keep that ownership single-valued and complete:
+
+    * **Exactly one connection per path survives, even when an adoption races a
+      concurrent getter.**  ``_adopt_or_close`` installs into ``_conns`` without
+      holding ``_open_locks[path]`` (the cancelled getter released it while
+      unwinding), so a getter suspended in its own connect for the same path can
+      resume to find the slot already filled.  It keeps the INCUMBENT and closes
+      the connection it opened.  A second connection for one path is reachable
+      by nothing and would strand its worker thread.
+    * **:meth:`close_all` does not return while any close it caused is still in
+      flight.**  ``_close_once`` JOINS a concurrent close rather than skipping
+      it, and ``close_all`` gathers the fire-and-forget closes
+      ``_adopt_or_close`` scheduled.  Returning early would hand callers a pool
+      that looks drained while a worker thread is still mid-``close()`` — and a
+      loop torn down at that instant strands it, which is the original leak by a
+      different route.
     """
 
     def __init__(self) -> None:
@@ -310,6 +327,14 @@ class DbPool:
         CLOSE otherwise — the pool is already drained, or a connection for
         *path* won the race — because a second connection for one path is not
         reachable by :meth:`close_all` and would strand its worker thread.
+
+        The ``path not in self._conns`` guard below is one HALF of a pair; the
+        other half is the post-shield ``existing is not conn`` re-check in
+        :meth:`get`.  They cover the two landing orders of the same race — this
+        one handles "a pooled connection already won", ``get`` handles "the
+        adoption already won" — and neither is sufficient alone, because
+        adoption happens without the per-path lock a getter would otherwise be
+        serialised by.
         """
         if task.cancelled() or task.exception() is not None:
             # A connect that raised already stopped its own worker thread:
