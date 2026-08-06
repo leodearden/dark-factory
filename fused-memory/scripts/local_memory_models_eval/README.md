@@ -23,10 +23,24 @@ uv run python fused-memory/scripts/local_memory_models_eval/build_corpus.py --ve
 ```
 
 It re-runs the sampler from the criteria the manifest records about **itself**
-— seed, N, dimensions, allocation rule — and compares the result to the
+— seed, N, dimensions, allocation rule, window — and compares the result to the
 recorded episode list, then re-hashes every episode's content. It never reads
 the manifest's own `episodes` list as the answer to what should be selected;
 that check would pass on any manifest, including a tampered one.
+
+Re-derivation samples the population **as of the recorded window**:
+`criteria.window.max_created_at` is a *bound*, not a description, so only
+episodes at or before it were ever in the sampling frame and only they are fed
+back through the sampler. That is what keeps the check pinned to the manifest's
+own frame instead of drifting as the factory keeps writing — see below. A
+manifest that does not state its window fails as `bad_manifest` rather than
+being silently checked against an unbounded population.
+
+The bound applies to the re-derivation only. `missing_episodes` and
+`hash_drift` are evaluated against the **full** live population, because "does
+the store still hold these 200 episodes, with the same bytes?" is a different
+question from "what was the sampling frame", and windowing it would hide a real
+deletion behind a bound the artifact itself supplies.
 
 Exit codes are per failure class, because each has a different remedy:
 
@@ -42,21 +56,31 @@ Exit codes are per failure class, because each has a different remedy:
 To rebuild rather than check, drop `--verify`; add `--dry-run` to print the
 stratification report and write nothing.
 
-### `id_mismatch` on a grown store is expected, and is not tampering
+### Why the window bound is load-bearing
 
 `dark_factory` is written continuously by the running fleet — it grew from
 2,770 episodes to 2,775 in the two hours between this task's census and its
-build. Re-derivation runs against the population **as it is now**, so once new
-episodes land the cell counts shift, largest-remainder allocation moves a seat
-or two, and `--verify` reports `id_mismatch`.
+build, and to 2,776 within minutes of that. Episode count is not a quantity
+that holds still.
 
-That is loud rather than silent, which is the right failure — but it does mean
-a green `--verify` is a statement about *today's* store, not a permanent
-property of the artifact. The legs that stay durable are `missing_episodes` and
-`hash_drift`: those answer "are the 200 episodes ε/ζ/θ replay still present,
-with the same bytes?", which is the question the downstream arms actually need.
+An unwindowed re-derivation samples whatever the store holds at check time, so
+each new episode shifts a cell denominator, largest-remainder allocation moves
+a seat or two, and `--verify` reports `id_mismatch` on a perfectly correct
+artifact. That failure is loud, but it is *wrong*, and a check that cries wolf
+within minutes of every build is a check reviewers learn to ignore — which is
+the same outcome as having no check, arrived at more slowly.
 
-Verified green at build time (2026-08-06, population 2,775).
+Bounding the frame at `criteria.window.max_created_at` fixes this at the
+source: growth after the build is outside the frame by construction, so a green
+`--verify` is a durable statement about the artifact rather than a statement
+about one particular minute in the store's history. The population count no
+longer has to match for verification to pass — and when a re-derivation *does*
+fail, the `id_mismatch` detail says whether the frame reconciled, so a genuine
+shift is still distinguishable from tampering.
+
+Verified green against the live store at build time (2026-08-06, population
+2,775 recorded) and re-verified green afterwards at a larger live population,
+which is the property the bound buys.
 
 ## Stratification
 

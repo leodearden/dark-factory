@@ -129,7 +129,7 @@ import random
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -239,32 +239,60 @@ class EpisodeRecord:
 # ---------------------------------------------------------------------------
 
 
-def month_bucket(created_at: object) -> str:
-    """Return the ``YYYY-MM`` time stratum for *created_at*.
+def parse_timestamp(value: object, *, field: str = 'created_at') -> datetime:
+    """Parse one of the store's ISO-8601 spellings into an aware datetime.
 
-    Accepts the ISO-8601 spellings the store has accumulated — ``+00:00``
-    offset, ``Z`` suffix, naive, and a space separator — and normalizes them to
-    one bucket per calendar month. Without that normalization a single month
-    would split across strata purely by which code path persisted the row.
+    The single normalization point for every timestamp this module reads.
+    ``dark_factory`` has accumulated four spellings of the same instant —
+    ``+00:00`` offset, ``Z`` suffix, naive, and a space separator — and they
+    must all land on one value, or a single month splits across strata purely
+    by which code path persisted the row.
 
-    Raises :class:`CorpusBuildError` on anything unparseable, rather than
-    returning an ``'unknown'`` bucket. An ``'unknown'`` bucket would quietly
-    become an extra stratum, and the stratification report would look complete
-    while describing a corpus whose time axis had partially collapsed.
+    A **naive** value is read as UTC. Every writer in the tree stamps UTC, and
+    the alternative is worse: a naive value that stays naive cannot be compared
+    against an aware one at all, so :func:`verify_manifest`'s window bound
+    would raise ``TypeError`` on exactly the rows it is meant to filter.
+
+    An aware value is returned with its own offset intact, **not** converted to
+    UTC. :func:`month_bucket` reads ``.year``/``.month`` straight off this
+    result, so converting here would silently re-bucket an episode written at,
+    say, ``2026-05-01T00:30+05:00`` into the previous month.
+
+    *field* names the caller's field in the error text, so a bad manifest
+    criterion and a bad store row are distinguishable in the message.
+
+    Raises :class:`CorpusBuildError` on anything unparseable rather than
+    returning a sentinel — see :func:`month_bucket` for why a fallback bucket
+    would make the stratification report lie.
     """
-    if not isinstance(created_at, str) or not created_at.strip():
-        raise CorpusBuildError(
-            f'created_at must be a non-empty ISO-8601 string, got {created_at!r}'
-        )
-    text = created_at.strip().replace(' ', 'T', 1)
+    if not isinstance(value, str) or not value.strip():
+        raise CorpusBuildError(f'{field} must be a non-empty ISO-8601 string, got {value!r}')
+    text = value.strip().replace(' ', 'T', 1)
     if text.endswith(('Z', 'z')):
         text = text[:-1] + '+00:00'
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError as exc:
         raise CorpusBuildError(
-            f'created_at is not a parseable ISO-8601 timestamp: {created_at!r} ({exc})'
+            f'{field} is not a parseable ISO-8601 timestamp: {value!r} ({exc})'
         ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def month_bucket(created_at: object) -> str:
+    """Return the ``YYYY-MM`` time stratum for *created_at*.
+
+    Normalization lives in :func:`parse_timestamp`; this is the bucketing on
+    top of it.
+
+    Raises :class:`CorpusBuildError` on anything unparseable, rather than
+    returning an ``'unknown'`` bucket. An ``'unknown'`` bucket would quietly
+    become an extra stratum, and the stratification report would look complete
+    while describing a corpus whose time axis had partially collapsed.
+    """
+    parsed = parse_timestamp(created_at)
     return f'{parsed.year:04d}-{parsed.month:02d}'
 
 
@@ -1009,6 +1037,22 @@ def _read_criteria(manifest: object) -> tuple[dict, list[dict]]:
         raise CorpusBuildError(f'manifest criteria n must be an int, got {criteria["n"]!r}')
     if not isinstance(criteria['seed'], str):
         raise CorpusBuildError(f'manifest criteria seed must be a str, got {criteria["seed"]!r}')
+    window = criteria.get('window')
+    if not isinstance(window, dict) or 'max_created_at' not in window:
+        raise CorpusBuildError(
+            'manifest criteria is missing window.max_created_at — verification cannot '
+            're-derive against an unbounded population, and a manifest that cannot '
+            'state its own sampling frame must not be verified as if it had one'
+        )
+    if not isinstance(window['max_created_at'], str):
+        raise CorpusBuildError(
+            f'manifest criteria window.max_created_at must be a str, '
+            f'got {window["max_created_at"]!r}'
+        )
+    # Parse for effect: an unparseable bound is a bad manifest, reported here
+    # with the other criteria checks rather than surfacing later as a
+    # re-derivation failure, which would name the wrong culprit.
+    parse_timestamp(window['max_created_at'], field='criteria.window.max_created_at')
     episodes = manifest.get('episodes')
     if not isinstance(episodes, list) or not episodes:
         raise CorpusBuildError('manifest has no non-empty "episodes" list')
@@ -1036,6 +1080,23 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
        would be vacuous, passing on any manifest including a tampered one, and
        a check that always says yes is worse than no check because it launders
        the artifact.
+
+    **Re-derivation runs against the population as of the recorded window.**
+    ``dark_factory`` is written continuously by the running fleet, so the live
+    population is strictly larger every time anyone checks. Sampling from that
+    grown population changes the cell denominators, which moves a
+    largest-remainder seat, which changes the corpus — so an unwindowed
+    re-derivation reports ``id_mismatch`` on a perfectly good artifact within
+    minutes of building it, and the check degrades into noise a reviewer learns
+    to ignore. ``criteria.window.max_created_at`` is therefore a **bound**, not
+    a description: only episodes at or before it were ever in the sampling
+    frame, and only they are fed to :func:`select` here.
+
+    The window is deliberately applied to the re-derivation ONLY. ``missing``
+    and the hash-drift lookup run against the FULL population, because "the
+    store still holds what the corpus names, with the same bytes" is a
+    different question from "what was the sampling frame" — windowing those
+    would hide a real deletion behind a bound the manifest itself supplies.
 
     Failures are reported in priority order — a broken manifest before a
     missing episode, a missing episode before an id mismatch, an id mismatch
@@ -1065,9 +1126,15 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
         )
 
     try:
+        cutoff = parse_timestamp(
+            criteria['window']['max_created_at'], field='criteria.window.max_created_at'
+        )
+        windowed = [
+            record for record in population if parse_timestamp(record.created_at) <= cutoff
+        ]
         rederived = [
             record.uuid
-            for record in select(population, criteria['n'], seed=criteria['seed']).selected
+            for record in select(windowed, criteria['n'], seed=criteria['seed']).selected
         ]
     except CorpusBuildError as exc:
         return VerifyReport(
@@ -1077,12 +1144,20 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
         )
 
     if rederived != recorded_ids:
+        recorded_size = criteria.get('population_size')
+        frame = ''
+        if isinstance(recorded_size, int) and recorded_size != len(windowed):
+            frame = (
+                f'; the sampling frame does not reconcile either — the window holds '
+                f'{len(windowed)} episodes now but the manifest recorded '
+                f'{recorded_size}'
+            )
         return VerifyReport(
             status='id_mismatch',
             detail=(
                 f're-deriving from the recorded criteria (seed={criteria["seed"]!r}, '
                 f'n={criteria["n"]}) produced a different corpus than the manifest '
-                f'records'
+                f'records{frame}'
             ),
             checked=len(recorded_ids),
             rederived=rederived,

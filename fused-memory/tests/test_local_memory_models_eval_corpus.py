@@ -1079,6 +1079,176 @@ class TestVerifyManifestReDerives:
         assert report.status == 'id_mismatch'
 
 
+class TestVerifyIsPinnedToTheRecordedWindow:
+    """Re-derivation samples the frame the manifest names, not today's store.
+
+    The regression this class exists for: `dark_factory` is written
+    continuously, so between building the corpus and checking it the population
+    has already grown. Sampling the grown population shifts the cell
+    denominators, largest-remainder moves a seat, and `--verify` reports
+    `id_mismatch` on a perfectly good artifact — measured live during this
+    task, population 2775 at build and 2776 minutes later. Without the window
+    bound a green verify is a statement about a store that no longer exists.
+    """
+
+    def _later(self, uuid: str, created_at: str, kind: str = 'temporal_facts'):
+        """One record at an explicit instant, bypassing `_record`'s fixed time."""
+        return _mod.EpisodeRecord(
+            uuid=uuid,
+            name=f'ep-{uuid[:8]}',
+            group_id='dark_factory',
+            source_description=f'add_memory:{kind}',
+            created_at=created_at,
+            content=f'content of {uuid}',
+        )
+
+    def test_the_recorded_window_bounds_the_population_under_test(self):
+        """Guard the fixture: the appended episodes really are outside it."""
+        manifest = _built(population=_population(SYNTHETIC_CELLS))
+        assert manifest['criteria']['window']['max_created_at'] == '2026-07-16T12:00:00+00:00'
+
+    def test_an_episode_written_after_the_window_does_not_break_verification(self):
+        """The bug, directly: the factory keeps writing and verify stays green."""
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        assert _mod.verify_manifest(manifest, population).status == 'ok'
+
+        grown = [
+            *population,
+            # A brand-new month cell, as an episode written "now" would be.
+            self._later('aaaaaaaa-0000-0000-0000-000000000000', '2026-08-01T09:00:00+00:00'),
+            # And a later episode inside an EXISTING cell, which shifts that
+            # cell's denominator and permutation rather than adding a stratum.
+            self._later('bbbbbbbb-0000-0000-0000-000000000000', '2026-07-16T12:00:01+00:00'),
+        ]
+        report = _mod.verify_manifest(manifest, grown)
+        assert report.status == 'ok', report.detail
+        assert report.rederived == [e['uuid'] for e in manifest['episodes']]
+
+    def test_the_appended_episodes_would_have_broken_an_unwindowed_check(self):
+        """Prove the regression test bites.
+
+        If growth did not perturb the sample, the test above would pass with
+        the window filter deleted and would be guarding nothing. Re-deriving
+        from the grown population WITHOUT the bound must differ.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        grown = [
+            *population,
+            self._later('aaaaaaaa-0000-0000-0000-000000000000', '2026-08-01T09:00:00+00:00'),
+            self._later('bbbbbbbb-0000-0000-0000-000000000000', '2026-07-16T12:00:01+00:00'),
+        ]
+        unwindowed = _uuids(_mod.select(grown, manifest['criteria']['n'], seed='s').selected)
+        assert unwindowed != [e['uuid'] for e in manifest['episodes']]
+
+    def test_an_episode_inside_the_window_still_fails_verification(self):
+        """The negative companion — the window must not disable the check.
+
+        An episode dated INSIDE the recorded frame but absent from the build
+        population means the frame itself is not what the manifest says it was.
+        If that passed too, windowing would be indistinguishable from deleting
+        the re-derivation.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        infill = [
+            *population,
+            self._later('cccccccc-0000-0000-0000-000000000000', '2026-05-16T12:00:00+00:00'),
+        ]
+        report = _mod.verify_manifest(manifest, infill)
+        assert report.status == 'id_mismatch'
+
+    def test_timestamps_are_compared_normalized_not_as_strings(self):
+        """The store spells the same instant four ways.
+
+        `'2026-07-16 12:00:00Z'` sorts after `'2026-07-16T12:00:00+00:00'` as a
+        string while naming the same instant, so a string comparison would drop
+        a boundary episode out of the frame and fail re-derivation.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        restyled = [
+            _mod.EpisodeRecord(
+                **{
+                    **dataclasses.asdict(r),
+                    'created_at': r.created_at.replace('T', ' ').replace('+00:00', 'Z'),
+                }
+            )
+            for r in population
+        ]
+        report = _mod.verify_manifest(manifest, restyled)
+        assert report.status == 'ok', report.detail
+
+    def test_a_naive_timestamp_is_read_as_utc_not_rejected(self):
+        """Aware-vs-naive comparison is a TypeError, not a verdict."""
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        naive = [
+            _mod.EpisodeRecord(
+                **{**dataclasses.asdict(r), 'created_at': r.created_at.replace('+00:00', '')}
+            )
+            for r in population
+        ]
+        report = _mod.verify_manifest(manifest, naive)
+        assert report.status == 'ok', report.detail
+
+    @pytest.mark.parametrize(
+        'window',
+        [None, {}, {'min_created_at': '2026-04-06T00:19:33+00:00'}, {'max_created_at': 7},
+         {'max_created_at': 'not-a-timestamp'}],
+    )
+    def test_a_manifest_that_cannot_state_its_frame_is_bad_manifest(self, window):
+        """The dependency is explicit, not assumed.
+
+        Verification now reads `criteria.window.max_created_at`, so a manifest
+        that omits or mangles it must fail as structurally unusable rather than
+        be silently checked against an unbounded population.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        criteria = {k: v for k, v in manifest['criteria'].items() if k != 'window'}
+        if window is not None:
+            criteria['window'] = window
+        report = _mod.verify_manifest({**manifest, 'criteria': criteria}, population)
+        assert report.status == 'bad_manifest'
+        assert 'window' in report.detail or 'max_created_at' in report.detail
+
+    def test_the_window_does_not_hide_a_deleted_episode(self):
+        """`missing` stays on the UNFILTERED population.
+
+        "The store still holds what the corpus names" is a different question
+        from "what was the sampling frame". If the window were applied to the
+        presence check too, a deletion could hide behind a bound the manifest
+        itself supplies.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        gone = manifest['episodes'][0]['uuid']
+        grown_and_reduced = [
+            *(r for r in population if r.uuid != gone),
+            self._later('aaaaaaaa-0000-0000-0000-000000000000', '2026-08-01T09:00:00+00:00'),
+        ]
+        report = _mod.verify_manifest(manifest, grown_and_reduced)
+        assert report.status == 'missing_episodes'
+        assert gone in report.missing
+
+    def test_the_window_does_not_hide_content_drift_outside_it(self):
+        """Hash drift is checked against the store as it is, not as it was."""
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        target = manifest['episodes'][0]['uuid']
+        drifted = [
+            _mod.EpisodeRecord(**{**dataclasses.asdict(r), 'content': 'EDITED'})
+            if r.uuid == target
+            else r
+            for r in population
+        ] + [self._later('aaaaaaaa-0000-0000-0000-000000000000', '2026-08-01T09:00:00+00:00')]
+        report = _mod.verify_manifest(manifest, drifted)
+        assert report.status == 'hash_drift'
+        assert target in report.hash_drift
+
+
 class TestVerifyCatchesTampering:
     """A tampered criterion must fail loudly, with a structured diff."""
 
