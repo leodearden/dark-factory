@@ -26,7 +26,7 @@ Binds each leaf signal's asserted capabilities to evidence (G3+G6 paid once, her
 
 | Capability | Evidence binding | Verdict |
 |---|---|---|
-| Registry fixture + probe runner exist and run live | task 3208 merged (`d635e87d60`); first live run 2026-08-05 produced `metrics/report-20260805T093831Z.*` in 3m34s | PASS |
+| Registry fixture + probe runner exist and run live | task 3208 merged (`d635e87d60`); first live run 2026-08-05 produced `metrics/report-20260805T093831Z.*` in 3m34s, committed at `plans/memory-eval-e1-first-live-run/e1-retrieval-health/` (task 3694) since the probe's own `fused-memory/data/memory-evals/` output is gitignored | PASS |
 | Registry schema supports per-topic canonical/claims/held-out | existing entries carry all three (`memory_eval_topic_registry.json`); the collapsed briefing topic is a content choice, not a schema limit | PASS |
 | 3211 is editable and not yet snapshotted | 3211 `pending`, deps [3207,3208,3209,3210], no timer installed, no grandfather artifact on disk — verified 2026-08-05 | PASS |
 | Pinning test can import the templates module | same `shared` workspace-dep evidence as β | PASS |
