@@ -47,6 +47,10 @@ class _PerPortHandler:
     ``TaskRuntimeSnapshot(...).model_dump(mode='json')``) to return on
     tools/call. ``fail_ports`` raise httpx.ConnectError. ``slow_ports``
     sleep before responding (to drive the timeout path).
+    ``error_status_ports`` maps port -> HTTP status returned on the
+    tools/call leg, which ``mcp_tool_call``'s ``raise_for_status()`` turns
+    into an ``httpx.HTTPStatusError`` (the "orchestrator answered, but
+    badly" arm of the unreachable bucket).
     """
 
     def __init__(
@@ -55,10 +59,12 @@ class _PerPortHandler:
         *,
         fail_ports: set[int] | None = None,
         slow_ports: dict[int, float] | None = None,
+        error_status_ports: dict[int, int] | None = None,
     ):
         self.responses = responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
+        self.error_status_ports = error_status_ports or {}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
@@ -75,6 +81,12 @@ class _PerPortHandler:
         if method.startswith('notifications/'):
             return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
         # tools/call
+        if port in self.error_status_ports:
+            return httpx.Response(
+                self.error_status_ports[port],
+                json={'error': 'boom'},
+                headers={'mcp-session-id': 'test-session-id'},
+            )
         inner = self.responses.get(port, TaskRuntimeSnapshot().model_dump(mode='json'))
         return _mcp_response(inner, request_id)
 
@@ -206,3 +218,111 @@ class TestFetchTaskRuntime:
             result = await fetch_task_runtime(client, _urls(8100, 8102, 8105))
 
         assert set(result) == {'proj8100', 'proj8102', 'proj8105'}
+
+
+class TestProbeReasonDiscriminator:
+    """_probe_one must name the FAULT DOMAIN of a failed probe (task 3517).
+
+    ``offline=True`` alone cannot tell an operator whether the orchestrator
+    is down or the dashboard was too starved to ask within its own deadline
+    — the two demand opposite responses. The 2026-07-30 event was
+    misdiagnosed as an orchestrator outage for exactly this reason.
+    """
+
+    async def test_timeout_is_deadline_exceeded_not_unreachable(self):
+        """A fired probe deadline is the DASHBOARD's budget expiring — it says
+        nothing about the orchestrator's health."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(slow_ports={8105: 0.5})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_task_runtime(
+                client, _urls(8105), per_call_timeout=0.05,
+            )
+
+        assert result['proj8105'].offline is True
+        assert result['proj8105'].offline_reason == 'deadline_exceeded'
+
+    async def test_connect_error_is_unreachable(self):
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(fail_ports={8102})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_task_runtime(client, _urls(8102))
+
+        assert result['proj8102'].offline is True
+        assert result['proj8102'].offline_reason == 'unreachable'
+
+    async def test_http_error_status_is_unreachable(self):
+        """The orchestrator answered, but with a 500 — still its fault domain."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(error_status_ports={8104: 500})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_task_runtime(client, _urls(8104))
+
+        assert result['proj8104'].offline is True
+        assert result['proj8104'].offline_reason == 'unreachable'
+
+    async def test_malformed_payload_is_unreachable_and_still_warns(self, caplog):
+        """Malformed payload shares the 'unreachable' member — same fault
+        domain, same operator next-action — and keeps its own WARNING."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        bad = {'offline': False, 'tasks': [_entry_kwargs(task_id='not-an-int')]}
+        handler = _PerPortHandler({8103: bad})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('WARNING'):
+                result = await fetch_task_runtime(client, _urls(8103))
+
+        assert result['proj8103'].offline is True
+        assert result['proj8103'].offline_reason == 'unreachable'
+        assert any('8103' in rec.getMessage() for rec in caplog.records), (
+            'expected a WARNING naming the offending URL'
+        )
+
+    async def test_healthy_project_has_no_reason(self):
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler({8100: TaskRuntimeSnapshot().model_dump(mode='json')})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_task_runtime(client, _urls(8100))
+
+        assert result['proj8100'].offline is False
+        assert result['proj8100'].offline_reason is None
+
+    async def test_connect_failure_logs_at_warning_naming_url_and_reason(self, caplog):
+        """This path logs DEBUG today, so a starved-or-down orchestrator is
+        invisible at default log level. It must be a WARNING that names both
+        the URL and the reason token."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(fail_ports={8102})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('WARNING'):
+                await fetch_task_runtime(client, _urls(8102))
+
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any('8102' in m and 'unreachable' in m for m in messages), (
+            f'expected a WARNING naming the URL and the unreachable reason; got {messages}'
+        )
+
+    async def test_deadline_failure_logs_at_warning_with_its_own_reason(self, caplog):
+        """The two reasons must be separable in the LOG too, not just the model
+        — an operator grepping for a diagnosis reads the log first."""
+        from dashboard.data.task_runtime import fetch_task_runtime
+        handler = _PerPortHandler(slow_ports={8105: 0.5})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with caplog.at_level('WARNING'):
+                await fetch_task_runtime(
+                    client, _urls(8105), per_call_timeout=0.05,
+                )
+
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any('8105' in m and 'deadline_exceeded' in m for m in messages), (
+            f'expected a WARNING naming the URL and the deadline reason; got {messages}'
+        )
+        assert not any('unreachable' in m for m in messages), (
+            'a fired deadline must not be reported as an unreachable orchestrator'
+        )
