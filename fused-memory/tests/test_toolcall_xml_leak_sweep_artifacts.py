@@ -299,11 +299,25 @@ def _unrepaired_danger_records(report: dict) -> list[dict]:
 def _production_danger_flags() -> tuple[set[str], str]:
     """The danger-flag set the SCRIPT actually acts on, plus where it came from.
 
-    Prefers a real exported constant if the script ever grows one (the clean
-    fix, which needs an edit outside this task's locked scope). Falls back to
-    reading the flag names straight out of ``resolve_exit_code``'s source: that
-    function IS the production consumer of these flags, so its own text is the
-    closest available substitute for a shared constant.
+    PREFERS a real exported constant. The moment the script grows one (the
+    clean fix — see the note on the getsource exception below), this binds to
+    it and the source-reading branch goes dormant with no test-side edit.
+
+    Falls back to reading the flag names out of ``resolve_exit_code``'s source,
+    because that function IS the production consumer of these flags and is
+    today the only place they are enumerated.
+
+    NORM EXCEPTION, stated rather than smuggled: fused-memory's tests
+    deliberately avoid ``inspect.getsource`` tripwires — four sites document
+    having REMOVED them as brittle (test_tool_errors.py, test_stages.py,
+    test_mem0_tombstone.py, test_bulk_reset_guard.py, citing da8e5a4c96) — and
+    the standing preference is a runtime-behaviour test instead. That norm
+    targets guards that pin WORDING or assert "pattern X must not reappear",
+    which go stale on any behaviour-preserving rewrite. This is a different
+    thing: it binds a VOCABULARY that has no exported constant to bind to, and
+    the behavioural half is here too (``test_each_flag_forces_a_non_zero_exit``
+    drives the real predicate). The exception is also self-limiting — it
+    disappears when the constant is exported, which is filed as follow-up.
     """
     for name in ('HUMAN_ADJUDICATION_FLAGS', 'DANGER_FLAGS'):
         exported = getattr(_mod, name, None)
@@ -313,6 +327,19 @@ def _production_danger_flags() -> tuple[set[str], str]:
     # Only record.get(...) — report.get('counts'/'truncated'/'records') are the
     # run-level conditions, not per-record human-adjudication outcomes.
     names = re.findall(r"record\.get\(\s*'([A-Za-z_][A-Za-z0-9_]*)'", source)
+    if not names:
+        # The one brittleness the norm warns about, made ACTIONABLE instead of
+        # cryptic: a behaviour-preserving refactor (iterating some constant
+        # this helper does not know the name of) empties the parse, and a bare
+        # set-difference would then read as "the script dropped all four
+        # flags". Say what actually happened and what to do about it.
+        pytest.fail(
+            'resolve_exit_code() no longer spells the danger flags inline, so '
+            'this module can no longer derive them from it. If they now live '
+            'in a module-level constant, name it HUMAN_ADJUDICATION_FLAGS (or '
+            'add its name to _production_danger_flags) so DANGER_FLAGS binds '
+            'to the real thing instead of drifting from it silently.'
+        )
     return set(names), 'resolve_exit_code() source'
 
 
