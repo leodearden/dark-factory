@@ -430,9 +430,11 @@ phrasing as it read on 2026-08-06, not a live pin.
 
 **Addendum result: 2/2 match** (cumulative 16/16). No wording change to
 `docs/legibility/design-invariants.md`'s INV-8 checkable question, to
-G7's walk instruction, or to Step 5.5 was needed — the walk matched on
-its first pass. The one gate-text edit this change did require (G7's
-trigger-shape entry) is not a rehearsal miss: that list is the
+G7's walk instruction, or to Step 5.5 was needed *to make the walk
+match* — it matched on its first pass. (A later review pass did narrow
+the rule's fan-out limb, for over-firing rather than under-firing; see
+the re-walk note below.) The one gate-text edit this change did require
+(G7's trigger-shape entry) is not a rehearsal miss: that list is the
 enumerated fallback for projects with no invariants file, so it never
 auto-extends on any invariant addition.
 
@@ -444,7 +446,24 @@ ground truth rather than re-deriving a fact a local emitter already held,
 so not INV-2), and reading live git is corroboration rather than action
 on a snapshot (not INV-3).
 
-## Reconciliation
+**Re-walked 2026-08-06 (review amendment).** After the walk above, review
+narrowed INV-8's second limb and its checkable question: the fan-out
+clause now reaches only per-item work that can block or is non-trivial,
+over a collection not already bounded by an upstream contract
+(pagination, a config cap, a fixed enum), and "already bounded upstream"
+is now named as a complete answer — a scope fix against over-firing on
+cheap non-blocking loops, not a rehearsal miss. Both rows were re-walked
+against the narrowed text as landed and both still yield `Y`:
+`INV-8-PRD` shells out per task at ~30 ms (blocking *and* non-trivial)
+over "every task on the live board", which names no upstream bound, and
+`INV-8-CODE` loops over a set its own comment marks `uncapped — the whole
+live board` around a blocking `subprocess.run`. In both, limb 1 fires
+independently of the narrowing — the call is neither non-blocking nor
+offloaded. The narrowing is monotone (it can only shrink what INV-8
+flags), so the other fixtures' single-invariant isolation is preserved a
+fortiori. The verdicts and count above stand as written.
+
+## Reconciliation — 2026-07-14 base walk
 
 Not required. The step-7 rehearsal above found no miss on its first
 walk — all 10 fixtures already flagged with the correct slug against the
@@ -453,3 +472,14 @@ as-landed `skills/prd/references/gates.md` §G7 text and
 wording changes were made to `docs/legibility/design-invariants.md`,
 `skills/prd/references/gates.md`, or
 `skills/review/references/phase2-architecture.md`.
+
+**Both later addenda did edit G7 — neither was a rehearsal miss.** The
+2026-08-02 walk updated G7's illustrative family-inventory row (INV-1..5
+-> INV-1..7) and its Calibration pointer; the 2026-08-06 walk added an
+INV-8 entry to G7's trigger-shape list, extended the family row to
+INV-1..8, and updated the Calibration pointer and "What it catches"
+prose. That material is *enumerated* in gates.md rather than read from
+the normative doc, so it never auto-extends on an invariant addition —
+unlike G7's walk instruction and Step 5.5, which Read the doc at run time
+and have needed no edit for any addition so far. Each addendum above
+gives its own account.
