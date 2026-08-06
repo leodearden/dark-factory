@@ -2127,6 +2127,97 @@ def _pin_cell(rate: Any) -> str:
     return _cell(rate)
 
 
+def stored_gap_bullet_prefix(arm: str) -> str:
+    """The machine-findable anchor for one arm's stored-vs-credited bullet.
+
+    Same contract as :func:`pin_bullet_prefix` — renderer and test both go
+    through here, so the bullet's prose stays free to change and only the
+    numbers are pinned.  Deliberately NOT the same string: that anchor is
+    ``- **`{shape}`** —``, and a per-ARM bullet reusing it would give the pin
+    test two bullets where it asserts exactly one.
+    """
+    return f'- `{arm}` stored vs credited:'
+
+
+def _gap_cell(gap: float) -> str:
+    """A stored-vs-credited gap, where a rounded-down nonzero would be a lie.
+
+    Same rule as :func:`_pin_cell`, for the same reason: this block sorts arms
+    by whether the two columns AGREE, so a real gap must never print as
+    ``0.00`` — the value the surrounding sentence reads as "identical".
+    """
+    if gap and abs(gap) < _PIN_RATE_ROUNDS_TO_ZERO:
+        return _PIN_RATE_UNDERFLOW if gap > 0 else f'-{_PIN_RATE_UNDERFLOW}'
+    return _cell(gap)
+
+
+def _stored_gap_lines(report: dict[str, Any]) -> list[str]:
+    """The stored-vs-credited comparison, DERIVED from the arms it describes.
+
+    Every run-specific finding in this renderer is computed from ``report``
+    (see the pin bullets below), and this one is no exception on purpose.
+    This file is a rerunnable generator: a hand-typed sentence about a
+    previous run's numbers silently becomes a false statement sitting three
+    lines above the table that contradicts it, in the one artifact gate η
+    reads.  The numbers here move when the table's do, or not at all.
+
+    The causal claim is kept general for the same reason.  Agreement is NOT
+    evidence that a shape "runs no grouping transform": ``apply_topic_anchor``
+    also injects the canonical and so also diverges the two columns wherever
+    the pin fires.  What agreement licenses is the narrower statement that no
+    read-side transform changed what the credited column counted on that arm.
+    """
+    lines: list[str] = [
+        '',
+        'As measured in THIS run, per arm (derived from the table above, not '
+        'asserted — no threshold is set on either column):',
+        '',
+    ]
+    bullets: list[str] = []
+    for arm in ARM_VARIANTS:
+        discoverability = report['arms'][arm]['discoverability']
+        credited = discoverability['canonical_in_top_5_rate']
+        stored = discoverability['stored_canonical_in_top_5_rate']
+        anchor = stored_gap_bullet_prefix(arm)
+        if credited is None or stored is None:
+            bullets.append(
+                f'{anchor} {_cell(stored)} vs {_cell(credited)} — not '
+                f'comparable; one of the two columns was never measured.'
+            )
+            continue
+        if credited == stored:
+            bullets.append(
+                f'{anchor} {_cell(stored)} vs {_cell(credited)} — identical, '
+                f'so no read-side transform changed what the credited column '
+                f'counted on this arm.'
+            )
+            continue
+        bullets.append(
+            f'{anchor} {_cell(stored)} vs {_cell(credited)} — a gap of '
+            f'{_gap_cell(credited - stored)}, which is what the read-side '
+            f'transforms added on top of what retrieval put in front of the '
+            f'reader.'
+        )
+    lines += bullets
+    lines += [
+        '',
+        'Where the two agree, `canonical in top-5` is reporting retrieval '
+        'alone on that arm.  Where they diverge, the gap is a READ '
+        'TRANSFORM\'s contribution rather than a retrieval difference: '
+        '`apply_grouped_read` credits a synthesised document wearing the '
+        'canonical\'s `record_id`, and `apply_topic_anchor` injects the '
+        'canonical outright, so either can move the credited column on a '
+        'query where the store never returned the canonical\'s own record.  '
+        'Which of the two moved it is what `pin changed window` disambiguates '
+        '— a shape whose pin never fired can only have been moved by '
+        'grouping.  Whether the gap is worth crediting is gate η\'s call, and '
+        'it is a different call from "this shape retrieves the canonical '
+        'better".  Read the same two columns on the `held_out` rows of the '
+        'by-kind table, which are the only rows measuring generalisation.',
+    ]
+    return lines
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     """The operator-facing artifact: prose, decision table, D10, provenance.
 
@@ -2206,18 +2297,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         'arm, pin, window or threshold was re-tuned to move either column, '
         'and both numbers are recorded exactly as measured (gate G6/D10 '
         'assert no threshold on any of them).',
-        '',
-        'What that reads as in THIS run: the two columns agree exactly for '
-        '`status_quo` and for `c_peers`, neither of which runs a grouping '
-        'transform, and diverge only under `b_grouped` — whose '
-        'transform-blind rate lands on `c_peers`\'.  So `b_grouped`\'s '
-        'discoverability lead in the table above is the read transform\'s '
-        'contribution, not a retrieval difference: the same records were '
-        'retrieved, and grouping put the canonical\'s body in the window '
-        'anyway.  Whether that is worth crediting is gate η\'s call, and it '
-        'is a different call from "grouping retrieves the canonical better".  '
-        'The same split shows on the `held_out` rows of the by-kind table, '
-        'which are the only ones measuring generalisation.',
+    ]
+
+    # Run-specific, so DERIVED rather than typed — see `_stored_gap_lines`.
+    lines += _stored_gap_lines(report)
+
+    lines += [
         '',
         '`pin changed window` is the diagnostic that makes the `+pin` rows '
         'readable.  Every variant is scored over a window of the SAME size '
