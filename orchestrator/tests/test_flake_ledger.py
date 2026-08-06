@@ -686,3 +686,90 @@ class TestRecordFlakeOccurrenceEmptyTestIds:
         assert len(warnings) == 1
         assert warnings[0].levelno == logging.WARNING
         assert verdict_name in warnings[0].getMessage()
+
+
+class TestReadOccurrences:
+    """The reader filters ι (per-test recurrence chains) and θ (windowed rates) need,
+    so neither hand-rolls SQL against these tables — §5.2's API-only rule."""
+
+    T_EARLY = '2026-08-06T11:00:00+00:00'
+    T_MID = '2026-08-06T12:00:00+00:00'
+    T_LATE = '2026-08-06T13:00:00+00:00'
+    TEST_A = 'tests/test_a.py::test_one'
+    TEST_B = 'tests/test_b.py::test_two'
+
+    def _seed(self, db_path: Path) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        # Seeded OUT of chronological order deliberately, so `ORDER BY id` alone
+        # cannot satisfy the ordering assertions below.  This is realistic: a remote
+        # observation is written on the dispatcher after the local one that followed
+        # it, so insertion order genuinely diverges from observation order.
+        for observed_at, test_id, call_site in [
+            (self.T_MID, self.TEST_B, 'main_probe'),
+            (self.T_LATE, self.TEST_B, 'merge_gate'),
+            (self.T_EARLY, self.TEST_A, 'merge_gate'),
+            (self.T_MID, self.TEST_A, 'merge_gate'),
+        ]:
+            record_flake_occurrence(
+                db_path,
+                'dark_factory',
+                _suppression(test_ids=(test_id,), observed_at=observed_at, call_site=call_site),
+                merge_sha=None,
+                task_id=None,
+            )
+
+    def test_unfiltered_returns_all_in_a_pinned_order(self, tmp_path: Path) -> None:
+        """Ordering is a CONTRACT, not incidental ``ORDER BY id``: ι prints these
+        chains, so they must read chronologically even though the rows were inserted
+        by separate calls."""
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        assert [(r.observed_at, r.test_id) for r in read_occurrences(db_path)] == [
+            (self.T_EARLY, self.TEST_A),
+            (self.T_MID, self.TEST_A),
+            (self.T_MID, self.TEST_B),
+            (self.T_LATE, self.TEST_B),
+        ]
+
+    def test_filters_by_test_id(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        rows = read_occurrences(db_path, test_id=self.TEST_A)
+        assert [r.observed_at for r in rows] == [self.T_EARLY, self.T_MID]
+        assert {r.test_id for r in rows} == {self.TEST_A}
+
+    def test_since_is_inclusive_at_the_boundary(self, tmp_path: Path) -> None:
+        """ISO-8601 UTC strings with a fixed offset sort lexicographically in the same
+        order as chronologically, which is why a TEXT column suffices."""
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        rows = read_occurrences(db_path, since=self.T_MID)
+        assert [(r.observed_at, r.test_id) for r in rows] == [
+            (self.T_MID, self.TEST_A),
+            (self.T_MID, self.TEST_B),
+            (self.T_LATE, self.TEST_B),
+        ]
+
+    def test_filters_compose(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_occurrences
+
+        db_path = tmp_path / 'runs.db'
+        self._seed(db_path)
+
+        rows = read_occurrences(db_path, test_id=self.TEST_B, since=self.T_LATE)
+        assert [(r.observed_at, r.test_id) for r in rows] == [(self.T_LATE, self.TEST_B)]
+
+    def test_missing_db_returns_empty(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_occurrences
+
+        assert read_occurrences(tmp_path / 'absent' / 'runs.db') == []
