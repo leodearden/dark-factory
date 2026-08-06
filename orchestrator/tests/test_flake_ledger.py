@@ -371,3 +371,156 @@ class TestFlakeSuppression:
         )
         assert s.test_ids == ()
         assert s.unconfirmable_reason == 'node-ids mapped to no discovered subproject'
+
+
+def _suppression(**overrides):
+    """A ``FlakeSuppression`` with sane defaults; override any field by keyword."""
+    from orchestrator.flake_ledger import FlakeSuppression, FlakeVerdict
+
+    kwargs = {
+        'verdict': FlakeVerdict.passes_in_isolation,
+        'test_ids': ('tests/test_a.py::test_one',),
+        'observed_at': '2026-08-06T12:00:00+00:00',
+        'call_site': 'merge_gate',
+        'runner': 'local',
+        'psi_cpu_some10': 17.5,
+        'unconfirmable_reason': None,
+    }
+    kwargs.update(overrides)
+    return FlakeSuppression(**kwargs)
+
+
+class TestRecordFlakeOccurrence:
+    """The task's headline observable signal: an observation written through the API
+    reads back identical, one row per examined test."""
+
+    def test_writes_one_row_per_test_id(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_occurrences, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(test_ids=('tests/test_a.py::test_one', 'tests/test_b.py::test_two'))
+        assert (
+            record_flake_occurrence(db_path, 'dark_factory', s, merge_sha='abc123', task_id='3785')
+            is None
+        )
+
+        rows = read_occurrences(db_path)
+        assert [r.test_id for r in rows] == [
+            'tests/test_a.py::test_one',
+            'tests/test_b.py::test_two',
+        ]
+
+    def test_round_trips_every_field(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_occurrences, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression()
+        record_flake_occurrence(db_path, 'dark_factory', s, merge_sha='abc123', task_id='3785')
+
+        (row,) = read_occurrences(db_path)
+        # observed_at is the SUPPLIED string, not a write-time stamp — §8.3's
+        # idempotency key is only stable if the discriminator owns this value.
+        assert row.observed_at == '2026-08-06T12:00:00+00:00'
+        assert row.test_id == 'tests/test_a.py::test_one'
+        assert row.project_id == 'dark_factory'
+        assert row.verdict == 'passes_in_isolation'
+        assert row.call_site == 'merge_gate'
+        assert row.runner == 'local'
+        assert row.merge_sha == 'abc123'
+        assert row.task_id == '3785'
+        # SQLite REAL is an IEEE-754 double and so is a Python float, so this is
+        # bit-exact — deliberately `==`, not pytest.approx.
+        assert row.psi_cpu_some10 == 17.5
+        assert row.detail == '{}'
+
+    def test_on_disk_columns_match_independently_of_the_reader(self, tmp_path: Path) -> None:
+        """Asserted with raw sqlite3 so a reader-mapping bug cannot make this pass."""
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        record_flake_occurrence(
+            db_path, 'dark_factory', _suppression(), merge_sha='abc123', task_id='3785'
+        )
+
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_occurrence ORDER BY id')
+        assert raw['observed_at'] == '2026-08-06T12:00:00+00:00'
+        assert raw['test_id'] == 'tests/test_a.py::test_one'
+        assert raw['project_id'] == 'dark_factory'
+        assert raw['verdict'] == 'passes_in_isolation'
+        assert raw['call_site'] == 'merge_gate'
+        assert raw['runner'] == 'local'
+        assert raw['merge_sha'] == 'abc123'
+        assert raw['task_id'] == '3785'
+        assert raw['psi_cpu_some10'] == 17.5
+        assert raw['detail'] == '{}'
+
+    def test_psi_none_stores_sql_null_not_zero(self, tmp_path: Path) -> None:
+        """PSI honesty (§4/§5.3): a failed ``PsiSample.read_ok`` means "we do not know
+        the host pressure".  Storing 0.0 would read as "the host was idle" — the exact
+        fabrication that turns an overload into a mystery flake."""
+        from orchestrator.flake_ledger import read_occurrences, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        record_flake_occurrence(
+            db_path,
+            'dark_factory',
+            _suppression(psi_cpu_some10=None),
+            merge_sha=None,
+            task_id=None,
+        )
+
+        nulls = _rows(db_path, 'SELECT psi_cpu_some10 IS NULL AS is_null FROM flake_occurrence')
+        assert nulls[0]['is_null'] == 1
+
+        (row,) = read_occurrences(db_path)
+        assert row.psi_cpu_some10 is None
+        assert row.psi_cpu_some10 != 0.0
+        assert row.merge_sha is None
+        assert row.task_id is None
+
+    def test_detail_is_empty_json_when_no_reason(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        record_flake_occurrence(
+            db_path, 'dark_factory', _suppression(), merge_sha=None, task_id=None
+        )
+
+        assert _rows(db_path, 'SELECT detail FROM flake_occurrence')[0]['detail'] == '{}'
+
+    def test_detail_carries_the_unconfirmable_reason_as_json(self, tmp_path: Path) -> None:
+        import json
+
+        from orchestrator.flake_ledger import FlakeVerdict, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        record_flake_occurrence(
+            db_path,
+            'dark_factory',
+            _suppression(
+                verdict=FlakeVerdict.unconfirmable,
+                unconfirmable_reason='node-ids mapped to no discovered subproject',
+            ),
+            merge_sha=None,
+            task_id=None,
+        )
+
+        detail = _rows(db_path, 'SELECT detail FROM flake_occurrence')[0]['detail']
+        assert json.loads(detail)['unconfirmable_reason'] == (
+            'node-ids mapped to no discovered subproject'
+        )
+
+    def test_creates_the_schema_on_a_fresh_path(self, tmp_path: Path) -> None:
+        """Callers hold a path, not a store object (§8.3), so the writer provisions the
+        schema itself — no separate ``ensure_schema`` call is required of ε or ι."""
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        db_path = tmp_path / 'nested' / 'runs.db'
+        assert not db_path.exists()
+
+        record_flake_occurrence(
+            db_path, 'dark_factory', _suppression(), merge_sha=None, task_id=None
+        )
+
+        assert db_path.exists()
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 1
