@@ -158,6 +158,13 @@ timestamp recording **when the attribution was asserted**.
   reported but never gating) from genuinely new stamps
   (`stamp_class=fresh` — which gate). For that reason the field is
   optional, not conditionally required, and must stay that way.
+- **Absent ≠ unparseable.** That argument turns on the field being
+  *missing*. A `stamped_at` that is *present* but unparseable proves the
+  opposite — a post-3576 write whose freshness merely cannot be read — so
+  the predicate classes it `stamp_class=corrupt`, logs it at `WARNING`,
+  and **gates** on it. Only `legacy` is exempt from gating; silently
+  demoting a corrupt stamp would be a fail-open in exactly the direction
+  the gate exists to catch.
 
 ### Terminal-task write freeze (recon-stage boundary)
 

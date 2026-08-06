@@ -33,6 +33,15 @@ write through the (non-bypassable) server chokepoint since then populates
 it. Such records are LEGACY BACKLOG by construction: they are still
 reported — printed with ``stamp_class=legacy`` — but they do not gate.
 
+That "absence proves it predates 3576" argument covers an ABSENT field
+only. A field that is PRESENT but unparseable proves the opposite — it
+came from a post-3576 write — so it is classed ``stamp_class=corrupt``,
+logged at WARNING, and GATES. Silently demoting a corrupt stamp to
+non-gating would be exactly the fail-open this predicate exists to
+prevent. Its freshness still falls back to ``updatedAt`` (the never-raises
+contract), so a corrupt stamp on an untouched-since-``--since`` task is
+still excluded on timing.
+
 Two orthogonal signals, deliberately kept separate (task 3576):
 
   - ``stamped_at`` supplies FRESHNESS scoping (``stamp_class``), and is
@@ -41,34 +50,67 @@ Two orthogonal signals, deliberately kept separate (task 3576):
     and is reporting only.
 
 They answer different questions and neither substitutes for the other. A
-timestamp cannot distinguish legitimate named-sibling attribution from
+timestamp cannot distinguish one-task-one-commit attribution from
 spurious bare-merge-commit sharing — those differ in citation SHAPE, not
 in time; two stamps written in the same second can be one legitimate and
 one spurious. Conversely fan-out says nothing about when a stamp was
 written. See :func:`classify_sub_patterns` for the fan-out rule.
 
-Contract (exit code only — this script parses no output, per the
-DeterministicRunner predicate convention):
+Contract (the DeterministicRunner branches on the exit code alone, per
+the predicate convention; stdout is human/log triage plus one machine
+-readable trailing line — see "Trailing JSON summary" below):
 
   - Exit 0: no NEW spurious found_on_main stamp was written since
-    ``--since`` — i.e. zero flagged records with
-    ``stamp_class='fresh'``. Legacy (pre-3576) offenders may still be
-    present and printed; exit 0 means "the freshness window no longer
-    re-admits legacy rows", NOT "the backlog was corrected".
-  - Exit 1: at least one flagged record is genuinely fresh (its
-    ``stamped_at`` is after ``--since``) — OR the task backend is not
-    configured (an infra/config problem). This predicate's contract is
-    intentionally coarse: non-zero-for-any-reason means "did not pass"
-    (fail loud/closed rather than silently degrade), with no separate exit
-    code distinguishing a check failure from an infra failure. A
-    structured stdout summary is printed for EVERY flagged record —
-    gating or not — one line per offending task (task_id, cited commit
-    sha, flag class, ``stamp_class``, ``sub_pattern``) for human/log
-    triage; the DeterministicRunner itself never parses it, only the exit
-    code.
+    ``--since`` — i.e. zero flagged records with a GATING
+    ``stamp_class`` (``fresh`` or ``corrupt``). Legacy (pre-3576)
+    offenders may still be present and printed; exit 0 means "the
+    freshness window no longer re-admits legacy rows", NOT "the backlog
+    was corrected".
+  - Exit 1: at least one flagged record gates — genuinely fresh (its
+    ``stamped_at`` is after ``--since``) or corrupt (a present-but-
+    unparseable ``stamped_at``, which proves a post-3576 write) — OR the
+    task backend is not configured (an infra/config problem). This
+    predicate's contract is intentionally coarse:
+    non-zero-for-any-reason means "did not pass" (fail loud/closed rather
+    than silently degrade), with no separate exit code distinguishing a
+    check failure from an infra failure. A structured stdout summary is
+    printed for EVERY flagged record — gating or not — one line per
+    offending task (task_id, cited commit sha, flag class,
+    ``stamp_class``, ``sub_pattern``) for human/log triage, followed by a
+    single trailing JSON counts object.
   - Exit 2: ``--since`` could not be parsed — a caller usage error, kept
     on its own code so it is never mistaken for "offenders found" (1) by
     a caller branching on exit code alone.
+
+Trailing JSON summary
+---------------------
+
+The LAST stdout line is always a compact JSON counts object
+(``{"gating": N, "legacy": N, "total_flagged": N, "stamp_classes": {...},
+"sub_patterns": {...}}``). It exists for the orchestrator's provenance
+note, not for this script's own contract.
+
+``DeterministicRunner._summarize_predicate_output`` folds a passing
+predicate's output into ``done_provenance.note``, which fused-memory's
+reconciliation ``_format_outcome_echo`` then INGESTS INTO MEMORY. Its
+extractor runs two tiers: tier 1 parses a trailing JSON block and is a
+true structural allowlist; tier 2 keeps the last non-log-shaped line as a
+best-effort heuristic. Before task 3576 this script only ever printed
+offender lines on the exit-1 path, so a passing run's last line was a
+timestamped log line that tier 2's denylist rejected. Now a PASSING run
+routinely prints legacy offender lines — which carry neither timestamp
+nor level token, so tier 2 would keep whichever offender happened to sort
+last, stamping the self-contradictory note ``predicate check passed
+(rc=0): task_id=705 ... stamp_class=legacy``. Emitting the JSON object
+last makes tier 1 win, so the note carries the aggregate verdict instead
+of an arbitrary offender row.
+
+The object is deliberately COUNTS ONLY — no task ids, no shas. That keeps
+it bounded by the fixed class vocabulary (3 integers plus two small
+mappings, ~200 chars at worst) rather than by the offender count, so it
+can never trip the extractor's 400-char cap, which elides an oversized
+payload WHOLESALE and would silently degrade the note back to the bare
+verdict on precisely the runs with the most to report.
 
 Deliberately narrower than the audit's own ``_FLAGGED_VERDICTS``: this
 predicate's contract (PRD decomposition label ι) is specifically
@@ -96,11 +138,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 from datetime import UTC, datetime
 from typing import Any
 
+# Deliberately exempt from this file's deferred-import convention (see _run,
+# which defers `os`, the sibling audit module, and the fused_memory backend/
+# config imports). `dark-factory-shared` is a hard install dependency of the
+# fused-memory package — declared in fused-memory/pyproject.toml, not an
+# optional or path-sensitive one — so importing it at module level adds no
+# environment requirement that running this script did not already have. The
+# sibling audit script (audit_found_on_main_provenance.py) imports it at
+# module level from this same directory for the same reason. The deferred
+# imports below exist for a DIFFERENT reason: they are either sys.path[0]-
+# sensitive (the sibling script) or heavyweight, and the test suite
+# importlib-loads this module in isolation.
 from shared.task_metadata import parse_metadata
 
 logger = logging.getLogger('check_found_on_main_spurious_rate')
@@ -109,6 +163,13 @@ logger = logging.getLogger('check_found_on_main_spurious_rate')
 # own _FLAGGED_VERDICTS (which also includes commit_not_on_main/reverted;
 # see module docstring for why those are out of scope here).
 _SPURIOUS_VERDICTS = frozenset({'misattributed', 'deliverable_absent'})
+
+# stamp_class values that GATE the exit code. `fresh` is a stamp written
+# after --since. `corrupt` is a present-but-unparseable stamp: unlike an
+# ABSENT one it proves a post-3576 write, so the "predates the field"
+# argument that excuses `legacy` does not cover it — fail closed. Only
+# `legacy` (absent stamp, freshness fell back to updatedAt) is non-gating.
+_GATING_STAMP_CLASSES = frozenset({'fresh', 'corrupt'})
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +267,18 @@ def find_spurious_since(
     actually asks — "was this attribution asserted after *since*?" — exactly
     rather than by approximation.
 
-    Each record is annotated with ``stamp_class``: ``'fresh'`` when its
-    freshness came from ``stamped_at``, ``'legacy'`` when it fell back to
-    ``updatedAt``. See :func:`gating_offenders` for what that gates.
+    Each record is annotated with ``stamp_class``:
+
+      - ``'fresh'`` — freshness came from a parseable ``stamped_at``.
+      - ``'corrupt'`` — a ``stamped_at`` is PRESENT but unparseable, so
+        freshness fell back to ``updatedAt``. Logged at WARNING and still
+        gating: a present stamp proves a post-3576 write, so the "absence
+        proves it predates 3576" argument that excuses ``'legacy'`` does
+        not apply.
+      - ``'legacy'`` — no ``stamped_at`` at all; freshness fell back to
+        ``updatedAt``. Non-gating.
+
+    See :func:`gating_offenders` for what that gates.
 
     Returns records sorted by ``int(task_id)`` for deterministic output.
     """
@@ -233,8 +303,24 @@ def find_spurious_since(
         freshness_dt = _parse_task_timestamp(stamped_at)
         stamp_class = 'fresh'
         if freshness_dt is None:
+            # ABSENT vs. PRESENT-BUT-UNPARSEABLE are NOT the same signal and
+            # must not collapse to one class. Only absence supports the
+            # "predates task 3576" argument that makes a record non-gating;
+            # a corrupt stamp is a post-3576 write whose freshness merely
+            # cannot be read, so it gates and is logged rather than silently
+            # demoted. Warn here — before the since-filter — so a corrupt
+            # stamp is never swallowed by the timing exclusion below either.
+            if stamped_at is None:
+                stamp_class = 'legacy'
+            else:
+                stamp_class = 'corrupt'
+                logger.warning(
+                    'task %s: done_provenance.stamped_at is present but '
+                    'unparseable (%r); falling back to updatedAt for '
+                    'freshness and classing it stamp_class=corrupt (gating)',
+                    task_id, stamped_at,
+                )
             freshness_dt = _parse_task_timestamp(updated_at)
-            stamp_class = 'legacy'
         if freshness_dt is None or freshness_dt <= since:
             continue
 
@@ -258,17 +344,31 @@ def classify_sub_patterns(report: dict[str, Any]) -> dict[str, str]:
     Fan-out = how many DISTINCT found_on_main task ids cite a given commit:
 
       - ``>= 2`` -> ``'shared_bare_merge'``: several unrelated tasks all
-        pointing at one bare "Merge task/X into main" commit. This is the
-        spurious sharing sub-pattern (8 of recon's 13 cases; corroborated
-        by esc-3398-1 for task 3301).
-      - ``== 1`` -> ``'named_sibling'``: one task citing one sibling's
-        commit — the legitimate attribution sub-pattern (the other 5).
+        pointing at one commit — in recon's sample, a bare "Merge task/X
+        into main". Sharing IS positive evidence of the spurious
+        sub-pattern (8 of recon's 13 cases; corroborated by esc-3398-1 for
+        task 3301), since a commit cannot legitimately be the deliverable
+        of several unrelated tasks.
+      - ``== 1`` -> ``'sole_citer'``: no other audited found_on_main task
+        cites this commit. Named for exactly what is measured and NOTHING
+        more. Recon's other 5 cases were legitimate one-task-one-sibling
+        attributions, but fan-out of 1 does not establish that: a single
+        task citing a bare merge commit that no other task happens to cite
+        also lands here. The label must not read as a verdict — an
+        operator sees it on the stdout triage line, and the earlier name
+        ``named_sibling`` asserted a legitimacy this measurement cannot
+        support.
+
+    Reporting only — ``sub_pattern`` never gates the exit code (see
+    :func:`gating_offenders`), so a fan-out-1 record being merely
+    "not shared" rather than "known good" cannot mis-gate; it can only
+    mislead triage, which is why the name was narrowed to the measurement.
 
     Counted over the FULL ``report['tasks']`` list — every audited
     found_on_main task, whatever its verdict — not just the flagged subset.
     A spurious task sharing a commit with an ``ok`` task is still
     ``shared_bare_merge``; the sharing is the signal, and counting only
-    flagged entries would misclassify it as ``named_sibling``.
+    flagged entries would misclassify it as ``sole_citer``.
 
     Details with no ``commit`` are skipped rather than grouped under a
     ``None`` key. Pure function; never raises.
@@ -280,23 +380,36 @@ def classify_sub_patterns(report: dict[str, Any]) -> dict[str, str]:
             continue
         tasks_by_commit.setdefault(commit, set()).add(str(detail.get('task_id', '')))
     return {
-        commit: ('shared_bare_merge' if len(task_ids) >= 2 else 'named_sibling')
+        commit: ('shared_bare_merge' if len(task_ids) >= 2 else 'sole_citer')
         for commit, task_ids in tasks_by_commit.items()
     }
 
 
 def gating_offenders(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter *records* to the ones that gate the exit code — the fresh ones.
+    """Filter *records* to the ones that gate the exit code.
+
+    Gating classes are ``'fresh'`` and ``'corrupt'``; only ``'legacy'`` is
+    excluded.
 
     A record is ``stamp_class='legacy'`` when its freshness had to fall back
-    to ``updatedAt`` because the blob carries no usable
-    ``done_provenance.stamped_at``. Absence of that field is sound proof the
-    stamp predates task 3576: fused-memory's ``_validate_done_provenance``
-    is the single server-side write site for ``kind='found_on_main'``
-    provenance, and every write through it since 3576 landed populates the
-    field — so a blob lacking it cannot have been written since. (That
-    chokepoint is not bypassable by callers: ``update_task`` refuses to let
-    ``metadata.done_provenance`` be written around it — task 2201/C1.)
+    to ``updatedAt`` because the blob carries NO
+    ``done_provenance.stamped_at`` at all. Absence of that field is sound
+    proof the stamp predates task 3576: fused-memory's
+    ``_validate_done_provenance`` is the single server-side write site for
+    ``kind='found_on_main'`` provenance, and every write through it since
+    3576 landed populates the field — so a blob lacking it cannot have been
+    written since. (That chokepoint is not bypassable by callers:
+    ``update_task`` refuses to let ``metadata.done_provenance`` be written
+    around it — task 2201/C1.)
+
+    That argument turns entirely on ABSENCE, so it does NOT extend to a
+    ``stamped_at`` that is present but unparseable — such a blob provably
+    came from a post-3576 write, and only its freshness is unreadable.
+    Those are classed ``'corrupt'`` and GATE (and are logged at WARNING
+    where detected, in :func:`find_spurious_since`). Folding them into
+    ``'legacy'`` would be a silent fail-open in exactly the direction this
+    predicate exists to catch: a corrupt stamp would stop gating without
+    anyone being told.
 
     Legacy records are excluded from the GATE but never from the REPORT:
     :func:`find_spurious_since` still returns them and ``_run`` still prints
@@ -310,16 +423,18 @@ def gating_offenders(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     Pure filter — never mutates *records*, and preserves their order (which
     :func:`find_spurious_since` already sorted by numeric task id).
     """
-    return [r for r in records if r.get('stamp_class') == 'fresh']
+    return [r for r in records if r.get('stamp_class') in _GATING_STAMP_CLASSES]
 
 
 def format_summary(offenders: list[dict[str, Any]]) -> list[str]:
     """One structured stdout line per offending task: task_id, cited sha,
     flag class, plus the two task-3576 annotations — ``stamp_class``
-    (fresh|legacy, which decides whether the record gates) and
-    ``sub_pattern`` (shared_bare_merge|named_sibling, which is reporting
-    only). Human/log-triage only — the DeterministicRunner predicate
-    contract is exit-code-only and parses no output (see module docstring).
+    (fresh|corrupt|legacy, which decides whether the record gates) and
+    ``sub_pattern`` (shared_bare_merge|sole_citer, which is reporting
+    only). Human/log-triage only — the DeterministicRunner branches on the
+    exit code, never on these lines (see module docstring). The aggregate
+    counts the orchestrator's provenance note DOES pick up are emitted
+    separately, as the trailing JSON line ``_run`` prints after these.
 
     Every offender is rendered, legacy ones included: a legacy record stops
     gating but must never stop being visible. Annotations absent from a
@@ -390,17 +505,26 @@ async def _run(args: argparse.Namespace, since: datetime) -> int:
         summary_lines = format_summary(offenders)
 
         sub_pattern_counts: dict[str, int] = {}
+        stamp_class_counts: dict[str, int] = {}
         for o in offenders:
-            key = str(o.get('sub_pattern'))
-            sub_pattern_counts[key] = sub_pattern_counts.get(key, 0) + 1
+            sub_key = str(o.get('sub_pattern'))
+            sub_pattern_counts[sub_key] = sub_pattern_counts.get(sub_key, 0) + 1
+            stamp_key = str(o.get('stamp_class'))
+            stamp_class_counts[stamp_key] = stamp_class_counts.get(stamp_key, 0) + 1
 
+        # Report the non-gating count as its own class rather than deriving
+        # it as (total - gating): with `corrupt` now gating alongside
+        # `fresh`, that subtraction would silently relabel corrupt records
+        # as legacy in the log.
+        legacy_count = stamp_class_counts.get('legacy', 0)
         logger.info(
             'found_on_main spurious-rate check: %d found_on_main task(s) audited, '
             '%d flagged misattributed/deliverable_absent since %s '
-            '(%d gating [fresh], %d legacy [pre-3576, reported only]); '
-            'sub-patterns: %s',
+            '(%d gating [fresh|corrupt], %d legacy [pre-3576, reported only]); '
+            'stamp classes: %s; sub-patterns: %s',
             report.get('total', 0), len(offenders), since.isoformat(),
-            len(gating), len(offenders) - len(gating),
+            len(gating), legacy_count,
+            ', '.join(f'{k}={v}' for k, v in sorted(stamp_class_counts.items())) or 'none',
             ', '.join(f'{k}={v}' for k, v in sorted(sub_pattern_counts.items())) or 'none',
         )
         # Print ALL offenders, not just the gating ones: a legacy record
@@ -408,6 +532,23 @@ async def _run(args: argparse.Namespace, since: datetime) -> int:
         # gating_offenders for the residual-risk argument).
         for line in summary_lines:
             print(line)
+
+        # The trailing JSON counts object MUST be the final stdout line —
+        # see the module docstring's "Trailing JSON summary" section. It is
+        # what DeterministicRunner._summarize_predicate_output's tier-1
+        # (structural, allowlist) extractor picks up for
+        # done_provenance.note; without it, tier 2's heuristic would keep
+        # whichever offender line sorted last and stamp a note reading
+        # "predicate check passed (rc=0): task_id=... stamp_class=legacy".
+        # Printed unconditionally, including when there are no offenders at
+        # all, so the note shape does not depend on the result.
+        print(json.dumps({
+            'gating': len(gating),
+            'legacy': legacy_count,
+            'total_flagged': len(offenders),
+            'stamp_classes': stamp_class_counts,
+            'sub_patterns': sub_pattern_counts,
+        }, sort_keys=True))
 
         return 1 if gating else 0
     finally:
