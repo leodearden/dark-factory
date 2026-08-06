@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -63,6 +64,7 @@ from _task_db_scan import (
     format_json,
     group_matches_by_db,
     resolve_project_roots,
+    run_audit_cli,
     run_scan_cli,
     sweep_databases,
     sweep_project_roots,
@@ -634,6 +636,269 @@ def test_sweep_project_roots_does_not_swallow_non_sqlite_errors():
     except ValueError:
         return
     raise AssertionError("a non-sqlite3 error must propagate, not be skipped")
+
+
+# --- run_audit_cli(argv, parser=, audit_fn=, render=, is_dirty=, on_roots=) -
+
+def _audit_cli(
+    argv,
+    audit_fn,
+    render=lambda audits, args: f"rendered:{len(audits)}",
+    is_dirty=lambda audits: False,
+    on_roots=None,
+):
+    """In-process harness modelled on ``_cli`` above.
+
+    Subprocess execution is left to the two audit scripts' own suites, where it
+    is load-bearing (it is what proves the flat-sibling ``import _task_db_scan``
+    resolves for a DIRECTLY-EXECUTED script).
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project-root", dest="project_roots", action="append")
+    parser.add_argument("--json", action="store_true")
+    return run_audit_cli(
+        argv,
+        parser=parser,
+        audit_fn=audit_fn,
+        render=render,
+        is_dirty=is_dirty,
+        on_roots=on_roots,
+    )
+
+
+def _unreadable(root):
+    raise sqlite3.Error("file is not a database")
+
+
+def test_run_audit_cli_exits_2_when_no_root_resolves(tmp_path, capsys):
+    """The report must NOT be rendered on the exit-2 path.
+
+    Nothing was audited and no audit list exists, so emitting a well-formed
+    empty payload here would hand a stdout-only consumer a clean-looking result
+    for a run that never started.
+    """
+    missing = tmp_path / "nope"
+
+    assert _audit_cli(["--project-root", str(missing)], lambda root, args: "a") == 2
+
+    captured = capsys.readouterr()
+    assert NO_PROJECT_ROOT_RESOLVED_MESSAGE in captured.err
+    assert captured.out == ""
+
+
+def test_run_audit_cli_exits_0_when_nothing_is_dirty(project_root_with_tasks_db, tmp_path, capsys):
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+
+    exit_code = _audit_cli(
+        ["--project-root", str(root)],
+        lambda root_, args: "audit",
+        is_dirty=lambda audits: False,
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out.strip() == "rendered:1"
+
+
+def test_run_audit_cli_exits_1_when_is_dirty_fires(project_root_with_tasks_db, tmp_path):
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+
+    exit_code = _audit_cli(
+        ["--project-root", str(root)],
+        lambda root_, args: "audit",
+        is_dirty=lambda audits: True,
+    )
+
+    assert exit_code == 1
+
+
+def test_run_audit_cli_exits_3_when_every_root_is_unreadable(
+    project_root_with_tasks_db, tmp_path, capsys
+):
+    """Every resolved project failing to audit is NOT a clean sweep.
+
+    The report is still rendered before the exit-3 branch, so stdout STILL
+    reads clean — that is precisely why the exit code is the only honest
+    signal, and why 3 is kept distinct from 0 per
+    docs/legibility/design-invariants.md's no-silent-fail-soft rule.
+    """
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+
+    assert _audit_cli(["--project-root", str(root)], _unreadable) == 3
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "rendered:0"
+    assert "results below are incomplete" in captured.err
+    assert "NOTHING was audited (this is not a clean result)" in captured.err
+
+
+def test_run_audit_cli_exits_0_when_some_roots_unreadable_and_rest_clean(
+    project_root_with_tasks_db, tmp_path, capsys
+):
+    """THE PARTIAL-FAILURE GUARD — the standing regression check on the gate.
+
+    One root raising beside one clean root is exit 0, not 3: a project was
+    genuinely audited and found clean. Mirrors
+    test_run_scan_cli_exits_0_when_some_dbs_unreadable_and_rest_clean; gating
+    exit 3 on "some root failed and nothing was found" would wrongly fire here.
+    """
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    project_root_with_tasks_db(good)
+    project_root_with_tasks_db(bad)
+
+    def audit(root, args):
+        if root == str(bad):
+            raise sqlite3.Error("file is not a database")
+        return "audit"
+
+    exit_code = _audit_cli(
+        ["--project-root", str(good), "--project-root", str(bad)], audit
+    )
+
+    assert exit_code == 0
+    assert "results below are incomplete" in capsys.readouterr().err
+
+
+def test_run_audit_cli_still_exits_1_when_a_readable_root_is_dirty_despite_failures(
+    project_root_with_tasks_db, tmp_path
+):
+    """A finding in a readable project is not masked by a sibling failure."""
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    project_root_with_tasks_db(good)
+    project_root_with_tasks_db(bad)
+
+    def audit(root, args):
+        if root == str(bad):
+            raise sqlite3.Error("file is not a database")
+        return "dirty"
+
+    exit_code = _audit_cli(
+        ["--project-root", str(good), "--project-root", str(bad)],
+        audit,
+        is_dirty=lambda audits: "dirty" in audits,
+    )
+
+    assert exit_code == 1
+
+
+def test_run_audit_cli_passes_the_parsed_namespace_to_audit_fn_and_render(
+    project_root_with_tasks_db, tmp_path, capsys
+):
+    """Both callbacks see the parsed flags.
+
+    argv is parsed INSIDE the helper, so a per-root flag (wiped's
+    --min-fidelity, combine's --project-id) can only reach the callbacks this
+    way — the calling script has nothing to close over.
+    """
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+    seen_roots = []
+
+    def audit(root_, args):
+        assert args.json is True
+        seen_roots.append(root_)
+        return "audit"
+
+    def render(audits, args):
+        assert args.json is True
+        return f"json={args.json} audits={audits}"
+
+    assert _audit_cli(["--project-root", str(root), "--json"], audit, render=render) == 0
+    assert seen_roots == [str(root)]
+    assert capsys.readouterr().out.strip() == "json=True audits=['audit']"
+
+
+def test_run_audit_cli_gives_is_dirty_only_the_successfully_audited_objects(
+    project_root_with_tasks_db, tmp_path
+):
+    """An unreadable root contributes NO placeholder to the is_dirty input.
+
+    This is the caller-visible half of sweep_project_roots' one-audit-per-root
+    contract: a predicate iterating the list must never meet a None standing in
+    for a project that failed.
+    """
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    project_root_with_tasks_db(good)
+    project_root_with_tasks_db(bad)
+    seen = []
+
+    def audit(root, args):
+        if root == str(bad):
+            raise sqlite3.Error("file is not a database")
+        return "audit:good"
+
+    def is_dirty(audits):
+        seen.append(list(audits))
+        return False
+
+    _audit_cli(["--project-root", str(good), "--project-root", str(bad)], audit, is_dirty=is_dirty)
+
+    assert seen == [["audit:good"]]
+
+
+def test_run_audit_cli_calls_on_roots_before_the_empty_roots_return(tmp_path, capsys):
+    """The hook fires even when NO root resolved, and its output comes first.
+
+    This is the verbatim position audit_combine_gate_marker_loss.py's multi-root
+    --project-id warning has always occupied: after root resolution, BEFORE the
+    empty-roots early return. Preserving it keeps the extraction a pure diff and
+    lets a future hook observe the empty case.
+    """
+    missing = tmp_path / "nope"
+    seen = []
+
+    def on_roots(roots, args):
+        seen.append((list(roots), args.json))
+        print("hook ran", file=sys.stderr)
+
+    exit_code = _audit_cli(
+        ["--project-root", str(missing)], lambda root, args: "a", on_roots=on_roots
+    )
+
+    assert exit_code == 2
+    assert seen == [([], False)]
+
+    err = capsys.readouterr().err
+    assert err.index("hook ran") < err.index(NO_PROJECT_ROOT_RESOLVED_MESSAGE)
+
+
+def test_run_audit_cli_calls_on_roots_once_with_the_resolved_roots(
+    project_root_with_tasks_db, tmp_path
+):
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+    calls = []
+
+    def on_roots(roots, args):
+        calls.append(list(roots))
+
+    _audit_cli(["--project-root", str(root)], lambda root_, args: "a", on_roots=on_roots)
+
+    assert calls == [[str(root)]]
+
+
+def test_run_audit_cli_works_without_an_on_roots_hook(project_root_with_tasks_db, tmp_path):
+    """on_roots defaults to None — only one of the two adopters supplies it."""
+    root = tmp_path / "proj"
+    project_root_with_tasks_db(root)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project-root", dest="project_roots", action="append")
+    parser.add_argument("--json", action="store_true")
+
+    exit_code = run_audit_cli(
+        ["--project-root", str(root)],
+        parser=parser,
+        audit_fn=lambda root_, args: "a",
+        render=lambda audits, args: "body",
+        is_dirty=lambda audits: False,
+    )
+
+    assert exit_code == 0
 
 
 # ---------------------------------------------------------------------------
