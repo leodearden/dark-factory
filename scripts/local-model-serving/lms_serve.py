@@ -114,7 +114,15 @@ def _memory_share_for(arm: ArmEntry, gpu: lms_vram.GpuReading) -> float:
     That splits the two axes, because they want opposite things:
 
     * A **generate** arm needs KV -- it is the context window.  Its share comes
-      from the live free reading, so an emptier card buys real headroom.
+      from the live free reading MINUS :data:`lms_vram.SAFETY_MARGIN_GIB`, so an
+      emptier card buys real headroom while the first allocation spike still has
+      somewhere to go.  The margin was missing from this branch until
+      esc-3713-6: the arms with the LARGEST allocations were the only ones sized
+      to the last byte of free VRAM, which is precisely what that constant's
+      docstring exists to prevent, on a card where whisper-writer must stay
+      resident.  It is also what makes the budget verdict satisfiable by
+      construction rather than by luck -- the share bounds the footprint at
+      ``free - margin``, so ``footprint <= free`` holds with headroom to spare.
     * A **pooling** arm cannot read a KV cache at all, yet vLLM still hands a
       DECODER-based embedder one sized to fill the share.  Measured on
       qwen3-embedding-0.6b: weights 1.12 GiB, overhead 0.42 GiB, KV cache
@@ -135,7 +143,9 @@ def _memory_share_for(arm: ArmEntry, gpu: lms_vram.GpuReading) -> float:
         return lms_vram.gpu_memory_utilization_for(
             arm.est_vram_gib + lms_vram.SAFETY_MARGIN_GIB, gpu.total_gib,
         )
-    return lms_vram.gpu_memory_utilization_for(gpu.free_gib, gpu.total_gib)
+    return lms_vram.gpu_memory_utilization_for(
+        gpu.free_gib - lms_vram.SAFETY_MARGIN_GIB, gpu.total_gib,
+    )
 
 
 def _vllm_argv(arm: ArmEntry, gpu: lms_vram.GpuReading) -> list[str]:

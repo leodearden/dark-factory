@@ -857,9 +857,24 @@ def _snapshot(
     )
 
 
+#: The card immediately BEFORE the arm started: the KDE/X11 desktop and nothing
+#: else.  Every budget verdict subtracts this (esc-3713-6), so the default
+#: report below describes an arm that took 7362 - 3312 = 4050 MiB.
+BASELINE_USED_MIB = 3312
+BASELINE_FREE_MIB = 20811
+MEASURED_FOOTPRINT_MIB = MEASURED_USED_MIB - BASELINE_USED_MIB
+
+
+def _baseline(used_mib=BASELINE_USED_MIB, free_mib=BASELINE_FREE_MIB):
+    return lms_vram.GpuReading(
+        total_mib=MEASURED_TOTAL_MIB, used_mib=used_mib, free_mib=free_mib,
+    )
+
+
 def _over_budget_snapshot() -> lms_vram.GpuSnapshot:
-    """21000 MiB used -- past PRD D10's 19.5 GiB nominal ceiling."""
-    return _snapshot(used_mib=21000, free_mib=MEASURED_TOTAL_MIB - 21000)
+    """24400 MiB used against a 3312 MiB baseline: the ARM took 21088 MiB,
+    more than the 20811 MiB that was free before it started."""
+    return _snapshot(used_mib=24400, free_mib=MEASURED_TOTAL_MIB - 24400)
 
 
 def _passing_probe(arm):
@@ -877,11 +892,12 @@ def _failing_probe(arm):
     )
 
 
-def _report(arms=None, probe=_passing_probe, snapshot=None):
+def _report(arms=None, probe=_passing_probe, snapshot=None, baseline=None):
     return lms_healthcheck.run_healthcheck(
         arms if arms is not None else [_arm()],
         gpu_probe=lambda: snapshot if snapshot is not None else _snapshot(),
         probe=probe,
+        baseline=baseline if baseline is not None else _baseline(),
     )
 
 
@@ -1030,7 +1046,7 @@ def test_a_dead_arm_does_not_abort_the_sweep(install_fake_httpx):
     install_fake_httpx(post=fake_post, get=fake_get)
 
     report = lms_healthcheck.run_healthcheck(
-        [dead, alive], gpu_probe=lambda: _snapshot(),
+        [dead, alive], gpu_probe=lambda: _snapshot(), baseline=_baseline(),
     )
 
     assert [row.arm_id for row in report.arms] == [
@@ -1055,6 +1071,7 @@ def test_an_unparseable_gpu_probe_propagates_the_typed_error(install_fake_httpx)
     with pytest.raises(lms_vram.VramProbeError):
         lms_healthcheck.run_healthcheck(
             [_arm()], gpu_probe=exploding_probe, probe=_passing_probe,
+            baseline=_baseline(),
         )
 
 
@@ -1155,14 +1172,22 @@ def test_the_table_shows_both_vram_figures():
 
 
 @pytest.fixture
-def cli_env(monkeypatch):
-    """Patch the CLI's three seams: the GPU, the arm prober, the unit manager."""
+def cli_env(monkeypatch, tmp_path):
+    """Patch the CLI's four seams: the GPU, the baselines, the prober, systemd.
+
+    The baseline store is a real directory with real files, populated as
+    `lms_ctl.start` would: the CLI has no baseline parameter on purpose, so the
+    only way a report gets one is that something actually started the arm.
+    """
     calls = {'probed': []}
 
     def probe(arm):
         calls['probed'].append(arm.arm_id)
         return _passing_probe(arm)
 
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'baselines'))
+    for arm_id in lms_manifest.load_arms().arm_ids():
+        lms_vram.record_baseline(arm_id, _baseline())
     monkeypatch.setattr(lms_vram, 'probe_gpu_snapshot', lambda *a, **k: _snapshot())
     monkeypatch.setattr(lms_healthcheck, 'probe_arm', probe)
     monkeypatch.setattr(lms_ctl, 'active_arms', lambda: set())
@@ -1242,8 +1267,9 @@ def test_cli_output_writes_the_json_artifact_step_21_validates(cli_env, tmp_path
     )
     assert all(row['verdict'] == 'PASS' for row in written['arms'])
     for key in (
-        'total_mib', 'used_mib', 'free_mib', 'nominal_ceiling_gib',
-        'operating_budget_gib', 'headroom_gib', 'verdict',
+        'total_mib', 'used_mib', 'free_mib', 'baseline_mib', 'budget_mib',
+        'arm_footprint_mib', 'nominal_ceiling_gib', 'operating_budget_gib',
+        'headroom_gib', 'verdict',
     ):
         assert key in written['vram']
     for key in ('arm_id', 'axis', 'stack', 'endpoint', 'served_model_name',
@@ -1301,3 +1327,189 @@ def test_every_cli_exit_code_is_distinct():
 
     assert len(set(codes)) == len(codes)
     assert lms_healthcheck.EXIT_OK == 0
+
+
+# ---------------------------------------------------------------------------
+# The budget verdict's subject (esc-3713-6)
+# ---------------------------------------------------------------------------
+
+
+def test_the_vram_block_charges_the_arm_only_for_what_it_took():
+    """The correction, at report level.
+
+    Under the old subject the block compared TOTAL card usage with PRD D10's
+    nominal 19.5 GiB, which charged every arm a second time for the desktop
+    baseline D10 had already subtracted.
+    """
+    vram = _report().vram
+
+    assert vram.baseline_mib == BASELINE_USED_MIB
+    assert vram.budget_mib == BASELINE_FREE_MIB
+    assert vram.arm_footprint_mib == MEASURED_FOOTPRINT_MIB
+    assert vram.used_mib - vram.baseline_mib == vram.arm_footprint_mib
+    assert vram.verdict == 'PASS'
+
+
+def test_the_nominal_ceiling_is_reported_but_no_longer_gates():
+    """PRD D10's figure stays legible in the artifact and stops deciding.
+
+    An arm at 21.75 GiB total -- the real qwen3.5-9b measurement -- used to FAIL
+    while serving correctly.  It passes now, and the ceiling it exceeds is still
+    right there in the block for a reader to see.
+    """
+    report = _report(snapshot=_snapshot(used_mib=22271, free_mib=2305),
+                     baseline=_baseline(used_mib=7310, free_mib=16813))
+
+    assert report.vram.used_gib > report.vram.nominal_ceiling_gib
+    assert report.vram.arm_footprint_mib == 14961
+    assert report.vram.verdict == 'PASS'
+
+
+def test_a_missing_baseline_produces_no_report_at_all(monkeypatch, tmp_path):
+    """Same stance as a dead GPU probe: no artifact beats a wrong one.
+
+    Defaulting to lms_vram.MEASURED_BASELINE_GIB here would silently restore
+    the frozen baseline esc-3713-6 ruled out, and the artifact would look
+    identical either way.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    with pytest.raises(lms_vram.VramProbeError, match='no baseline'):
+        lms_healthcheck.run_healthcheck(
+            [_arm()], gpu_probe=lambda: _snapshot(), probe=_passing_probe,
+        )
+
+
+def test_every_row_carries_its_own_measurement_time_and_footprint():
+    """The merged slate artifact keeps ONE vram block, so without these the
+    other seven arms' measurements would leave the artifact entirely."""
+    row = _report().arms[0]
+
+    assert _datetime.datetime.fromisoformat(row.measured_at).tzinfo is not None
+    assert row.arm_footprint_mib == MEASURED_FOOTPRINT_MIB
+
+
+def test_the_table_shows_the_arm_footprint_and_the_budget_it_was_judged_against():
+    table = lms_healthcheck.render_table(_report())
+
+    assert str(MEASURED_FOOTPRINT_MIB) in table
+    assert 'baseline' in table.lower()
+
+
+# ---------------------------------------------------------------------------
+# merge_reports — the slate is measured one arm at a time
+# ---------------------------------------------------------------------------
+
+
+def _single(arm, snapshot=None, probe=_passing_probe, baseline=None):
+    return _report(arms=[arm], probe=probe, snapshot=snapshot, baseline=baseline)
+
+
+def test_merging_per_arm_runs_yields_one_row_per_arm():
+    """This card cannot hold the slate at once and the PRD's funnel does not
+    ask it to, so the committed artifact is necessarily assembled."""
+    first = _single(_arm())
+    second = _single(_arm(arm_id='phi-4-14b', served_model_name='phi-4-14b',
+                          port=8412))
+
+    merged = lms_healthcheck.merge_reports([first, second])
+
+    assert [row.arm_id for row in merged.arms] == ['qwen3.5-9b', 'phi-4-14b']
+    assert merged.overall == 'PASS'
+    assert merged.schema_version == lms_healthcheck.REPORT_SCHEMA_VERSION
+
+
+def test_merging_refuses_two_runs_of_the_same_arm():
+    """The cheapest way to fake this artifact is to re-run a failing arm and
+    append the good result; silently keeping one of the two would allow it."""
+    with pytest.raises(lms_healthcheck.ReportMergeError, match='qwen3.5-9b'):
+        lms_healthcheck.merge_reports([_single(_arm()), _single(_arm())])
+
+
+def test_merging_refuses_reports_from_different_gpus():
+    other_card = lms_vram.GpuSnapshot(
+        identity=lms_vram.GpuIdentity(name='NVIDIA A100', driver_version='999'),
+        reading=_snapshot().reading,
+    )
+    second = _single(_arm(arm_id='phi-4-14b', served_model_name='phi-4-14b',
+                          port=8412), snapshot=other_card)
+
+    with pytest.raises(lms_healthcheck.ReportMergeError, match='different GPUs'):
+        lms_healthcheck.merge_reports([_single(_arm()), second])
+
+
+def test_merging_nothing_is_an_error_not_an_empty_pass():
+    with pytest.raises(lms_healthcheck.ReportMergeError):
+        lms_healthcheck.merge_reports([])
+
+
+def test_the_merged_block_is_the_binding_measurement():
+    """The arm that came closest to its budget is the one worth reporting."""
+    small = _single(_arm())
+    big = _single(
+        _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412),
+        snapshot=_snapshot(used_mib=20000, free_mib=4576),
+    )
+
+    merged = lms_healthcheck.merge_reports([small, big])
+
+    assert merged.vram.arm_footprint_mib == 20000 - BASELINE_USED_MIB
+    assert merged.vram.arm_footprint_mib > small.vram.arm_footprint_mib
+
+
+def test_a_failing_budget_survives_the_merge():
+    """Keeping a passing block while an input failed would put `overall` out of
+    reach of its own evidence -- a green light no one would re-check."""
+    ok = _single(_arm())
+    over = _single(
+        _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412),
+        snapshot=_over_budget_snapshot(),
+    )
+
+    merged = lms_healthcheck.merge_reports([ok, over])
+
+    assert merged.vram.verdict == 'FAIL'
+    assert merged.overall == 'FAIL'
+
+
+def test_a_failing_arm_row_survives_the_merge():
+    merged = lms_healthcheck.merge_reports([
+        _single(_arm()),
+        _single(_arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412),
+                probe=_failing_probe),
+    ])
+
+    assert merged.overall == 'FAIL'
+    assert lms_healthcheck.exit_code_for(merged) == lms_healthcheck.EXIT_ARM_FAILED
+
+
+def test_the_report_carries_the_delivered_check_marker():
+    """JSON carries no comments, so the marker must live in a real field."""
+    assert _report().prd_marker == 'PRD-MARKER:local-memory-models-eval serving'
+
+
+def test_cli_merge_writes_the_combined_artifact(cli_env, tmp_path):
+    parts = []
+    for arm_id in ('qwen3.5-9b', 'phi-4-14b'):
+        path = tmp_path / f'{arm_id}.json'
+        assert lms_healthcheck.main(['--arm', arm_id, '--output', str(path)]) == 0
+        parts.append(str(path))
+
+    out = tmp_path / 'health-report.json'
+    code = lms_healthcheck.main(['--merge', *parts, '--output', str(out)])
+
+    assert code == 0
+    written = json.loads(out.read_text())
+    assert {row['arm_id'] for row in written['arms']} == {'qwen3.5-9b', 'phi-4-14b'}
+    assert written['prd_marker'] == 'PRD-MARKER:local-memory-models-eval serving'
+
+
+def test_cli_merge_reports_a_refusal_loudly_and_writes_nothing(cli_env, tmp_path):
+    path = tmp_path / 'one.json'
+    assert lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(path)]) == 0
+    out = tmp_path / 'merged.json'
+
+    code = lms_healthcheck.main(['--merge', str(path), str(path), '--output', str(out)])
+
+    assert code == lms_healthcheck.EXIT_MERGE_ERROR
+    assert not out.exists()

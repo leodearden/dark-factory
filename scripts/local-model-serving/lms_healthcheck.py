@@ -625,7 +625,14 @@ def probe_arm(arm: ArmEntry) -> ProbeResult:
 
 #: Bump when the artifact's shape changes.  A consumer that finds an
 #: unrecognised version must refuse the file rather than reinterpret it.
-REPORT_SCHEMA_VERSION = 1
+#: v2 (2026-08-06, esc-3713-6): the vram block gained the live per-arm baseline
+#: and the arm footprint the verdict is now judged on; rows gained their own
+#: measured_at and footprint so a merged slate report stays attributable.
+REPORT_SCHEMA_VERSION = 2
+
+#: The delivered-check literal for task 3713.  Spelled once, here, and carried
+#: into the JSON artifact as a field.
+PRD_MARKER = 'PRD-MARKER:local-memory-models-eval serving'
 
 EXIT_OK = 0
 #: At least one arm answered wrongly, or not at all.
@@ -641,6 +648,9 @@ EXIT_PROBE_ERROR = 4
 #: `--active` found no running units.  Non-zero on purpose: a sweep that
 #: measured NOTHING must never be mistaken for a sweep where everything passed.
 EXIT_NO_ACTIVE_ARMS = 5
+#: `--merge` refused to combine the inputs.  Distinct from an arm failure: the
+#: arms may all be fine and the ASSEMBLY wrong, which is a different fix.
+EXIT_MERGE_ERROR = 6
 
 
 class GpuBlock(BaseModel):
@@ -667,17 +677,29 @@ class ArmRow(BaseModel):
     reason: Reason
     detail: str
     latency_ms: float
+    #: When THIS row was measured.  The merged artifact spans one run per arm,
+    #: so a single top-level `measured_at` cannot say when any given arm was up.
+    measured_at: str
+    #: What the card held over baseline while this arm was serving.  Carried per
+    #: row because the merged report keeps only ONE vram block, and without this
+    #: the other seven arms' footprints would leave the artifact entirely.
+    arm_footprint_mib: int
 
 
 class VramBlock(BaseModel):
-    """The budget answer, carrying both reference figures.
+    """The budget answer, carrying every number it was computed from.
 
-    `nominal_ceiling_gib` is PRD D10's number and is what `verdict` is judged
-    against, because the PRD states its user-observable signal in those terms.
-    `operating_budget_gib` is what this host actually has free with
-    whisper-writer and the KDE/X11 desktop resident, and is what the per-arm
-    pre-flight enforces.  Reporting only one of the two would either hide the
-    deviation or assert capacity this host does not have.
+    `verdict` judges `arm_footprint_mib` (`used_mib - baseline_mib`) against
+    `budget_mib` -- the free VRAM measured immediately BEFORE this arm started.
+    That subject was corrected on 2026-08-06 (esc-3713-6): judging TOTAL card
+    usage against PRD D10's nominal ceiling charged every arm a second time for
+    the ~7.3 GiB desktop+whisper baseline D10 had already subtracted, and failed
+    a 9B AWQ that was serving correctly.
+
+    `nominal_ceiling_gib` (PRD D10's 19.5) and `operating_budget_gib` (this
+    host's 2026-08-05 measurement) are both REPORTED and NON-GATING.  They stay
+    so the deviation this task measured remains legible in the artifact instead
+    of living in a commit message.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -685,8 +707,19 @@ class VramBlock(BaseModel):
     total_mib: int
     used_mib: int
     free_mib: int
+    #: nvidia-smi `used` taken immediately before the arm started -- LIVE, never
+    #: `lms_vram.MEASURED_BASELINE_GIB`.  A frozen baseline would misattribute
+    #: desktop drift to the arm, in the direction that flatters it.
+    baseline_mib: int
+    #: nvidia-smi `free` at that same baseline reading; the ceiling `verdict`
+    #: applies.
+    budget_mib: int
+    arm_footprint_mib: int
     used_gib: float
     free_gib: float
+    baseline_gib: float
+    budget_gib: float
+    arm_footprint_gib: float
     nominal_ceiling_gib: float
     operating_budget_gib: float
     headroom_gib: float
@@ -703,6 +736,10 @@ class HealthReport(BaseModel):
     arms: list[ArmRow]
     vram: VramBlock
     overall: Verdict
+    #: The delivered-check literal, in a real FIELD because JSON carries no
+    #: comments.  `test_lms_marker_contract.py` enumerates committed files; this
+    #: is how the artifact satisfies the same grep the source files do.
+    prd_marker: str = PRD_MARKER
 
 
 def _now_iso() -> str:
@@ -716,6 +753,7 @@ def run_healthcheck(
     arms: Sequence[ArmEntry],
     gpu_probe: Callable[[], lms_vram.GpuSnapshot] | None = None,
     probe: Callable[[ArmEntry], ProbeResult] | None = None,
+    baseline: lms_vram.GpuReading | None = None,
 ) -> HealthReport:
     """Probe every arm and assemble the report.
 
@@ -734,7 +772,21 @@ def run_healthcheck(
 
     snapshot = read_gpu()
     reading = snapshot.reading
+    # The baseline is read BEFORE any probing, and its absence propagates for
+    # the same reason a dead GPU probe does: without the reading taken before
+    # these arms started, the report cannot say what the arms took, only what
+    # the card holds -- and that was the miscalibrated subject esc-3713-6 fixed.
+    base = baseline if baseline is not None else lms_vram.read_baselines(
+        [arm.arm_id for arm in arms]
+    )
+    budget = lms_vram.evaluate_budget(
+        reading.used_mib,
+        reading.total_mib,
+        baseline_mib=base.used_mib,
+        baseline_free_mib=base.free_mib,
+    )
 
+    measured_at = _now_iso()
     rows: list[ArmRow] = []
     for arm in arms:
         result = probe_one(arm)
@@ -749,16 +801,23 @@ def run_healthcheck(
                 reason=result.reason,
                 detail=result.detail,
                 latency_ms=result.latency_ms,
+                measured_at=measured_at,
+                arm_footprint_mib=budget.arm_footprint_mib,
             )
         )
 
-    budget = lms_vram.evaluate_budget(reading.used_mib, reading.total_mib)
     vram = VramBlock(
         total_mib=reading.total_mib,
         used_mib=reading.used_mib,
         free_mib=reading.free_mib,
+        baseline_mib=budget.baseline_mib,
+        budget_mib=budget.budget_mib,
+        arm_footprint_mib=budget.arm_footprint_mib,
         used_gib=reading.used_gib,
         free_gib=reading.free_gib,
+        baseline_gib=budget.baseline_gib,
+        budget_gib=budget.budget_gib,
+        arm_footprint_gib=budget.arm_footprint_gib,
         nominal_ceiling_gib=budget.nominal_ceiling_gib,
         operating_budget_gib=budget.operating_budget_gib,
         headroom_gib=budget.headroom_gib,
@@ -771,7 +830,7 @@ def run_healthcheck(
     )
     return HealthReport(
         schema_version=REPORT_SCHEMA_VERSION,
-        measured_at=_now_iso(),
+        measured_at=measured_at,
         gpu=GpuBlock(
             name=snapshot.identity.name,
             driver_version=snapshot.identity.driver_version,
@@ -779,6 +838,85 @@ def run_healthcheck(
         ),
         arms=rows,
         vram=vram,
+        overall='PASS' if everything_passed else 'FAIL',
+    )
+
+
+class ReportMergeError(Exception):
+    """Two per-arm reports cannot be combined into one slate artifact."""
+
+
+def merge_reports(reports: Sequence[HealthReport]) -> HealthReport:
+    """Combine per-arm runs into the one committed slate artifact.
+
+    The PRD's funnel does not run all units simultaneously and this card cannot
+    hold them, so the slate is measured one arm at a time.  Merging is therefore
+    unavoidable -- and every way it could launder a failure is refused here:
+
+    * Reports from different GPUs, or different schema versions, do not merge.
+      A row measured on another card cannot be compared with these.
+    * A duplicate `arm_id` does not merge.  Silently keeping one of two runs
+      would let a failed arm be papered over by a re-run appended to the same
+      file, which is the single cheapest way to fake this artifact.
+    * The surviving vram block is the FIRST FAILING one if any input failed, and
+      otherwise the one with the LARGEST arm footprint -- the binding
+      measurement.  Keeping only a passing block while an input failed would put
+      `overall` out of reach of its own evidence.
+
+    Per-arm footprints survive on each row, so collapsing to one vram block
+    loses no measurement.
+    """
+    if not reports:
+        raise ReportMergeError(
+            'nothing to merge; an artifact assembled from zero runs would '
+            'describe a slate nobody measured'
+        )
+
+    versions = {r.schema_version for r in reports}
+    if len(versions) > 1:
+        raise ReportMergeError(
+            f'reports carry mixed schema versions {sorted(versions)}; they '
+            'describe different report shapes and cannot be combined'
+        )
+
+    gpus = {(r.gpu.name, r.gpu.driver_version, r.gpu.total_mib) for r in reports}
+    if len(gpus) > 1:
+        raise ReportMergeError(
+            f'reports were measured on different GPUs {sorted(gpus)}; every '
+            'verdict is relative to specific hardware'
+        )
+
+    rows: list[ArmRow] = []
+    seen: dict[str, ArmRow] = {}
+    for report in reports:
+        for row in report.arms:
+            if row.arm_id in seen:
+                raise ReportMergeError(
+                    f'arm {row.arm_id!r} appears in more than one report '
+                    f'({seen[row.arm_id].verdict} at {seen[row.arm_id].measured_at}, '
+                    f'{row.verdict} at {row.measured_at}). Merging would pick a '
+                    'winner between two measurements of the same arm; re-run the '
+                    'slate instead'
+                )
+            seen[row.arm_id] = row
+            rows.append(row)
+
+    failing = [r for r in reports if r.vram.verdict == 'FAIL']
+    binding = (
+        failing[0] if failing
+        else max(reports, key=lambda r: r.vram.arm_footprint_mib)
+    )
+
+    everything_passed = (
+        all(row.verdict == 'PASS' for row in rows)
+        and binding.vram.verdict == 'PASS'
+    )
+    return HealthReport(
+        schema_version=binding.schema_version,
+        measured_at=max(r.measured_at for r in reports),
+        gpu=binding.gpu,
+        arms=rows,
+        vram=binding.vram,
         overall='PASS' if everything_passed else 'FAIL',
     )
 
@@ -833,12 +971,15 @@ def render_table(report: HealthReport) -> str:
     out.extend(
         [
             '',
-            f'VRAM {report.vram.verdict}: {report.vram.used_mib} MiB used / '
-            f'{report.vram.total_mib} MiB total, {report.vram.free_mib} MiB free',
-            f'  PRD D10 nominal ceiling: {report.vram.nominal_ceiling_gib} GiB '
-            f'(headroom {report.vram.headroom_gib} GiB)',
-            f'  measured operating budget on this host: '
-            f'{report.vram.operating_budget_gib} GiB',
+            f'VRAM {report.vram.verdict}: the arm took '
+            f'{report.vram.arm_footprint_mib} MiB '
+            f'({report.vram.used_mib} used - {report.vram.baseline_mib} baseline) '
+            f'of the {report.vram.budget_mib} MiB free before it started',
+            f'  headroom {report.vram.headroom_gib} GiB; card total '
+            f'{report.vram.total_mib} MiB, now {report.vram.free_mib} MiB free',
+            f'  reported, NOT gating — PRD D10 nominal ceiling '
+            f'{report.vram.nominal_ceiling_gib} GiB, measured operating budget '
+            f'on this host {report.vram.operating_budget_gib} GiB',
             f'  {report.vram.reason}',
             '',
             f'OVERALL: {report.overall}',
@@ -848,6 +989,17 @@ def render_table(report: HealthReport) -> str:
         if row.verdict == 'FAIL':
             out.append(f'  {row.arm_id}: {row.reason} — {row.detail}')
     return '\n'.join(out)
+
+
+def _write_report(report: HealthReport, output: str | None) -> None:
+    if not output:
+        return
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # `mode='json'` so the StrEnum reasons serialise as their string values:
+    # a python-mode dump emits a repr no downstream consumer can match on.
+    out_path.write_text(json.dumps(report.model_dump(mode='json'), indent=2) + '\n')
+    print(f'\nwrote {out_path}')
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -862,8 +1014,28 @@ def main(argv: list[str] | None = None) -> int:
         '--active', action='store_true',
         help='only the arms whose lms-arm@ unit is currently running',
     )
+    selector.add_argument(
+        '--merge', nargs='+', metavar='REPORT',
+        help='combine per-arm JSON reports into one slate artifact',
+    )
     parser.add_argument('--output', help='write the JSON report to this path')
     args = parser.parse_args(argv)
+
+    if args.merge:
+        try:
+            parts = [
+                HealthReport.model_validate_json(Path(p).read_text())
+                for p in args.merge
+            ]
+            report = merge_reports(parts)
+        except (ReportMergeError, ValidationError, OSError) as exc:
+            # Nothing is written on refusal: a partially-merged artifact on disk
+            # would later read as "the slate was checked".
+            print(f'lms_healthcheck: cannot merge: {exc}', file=sys.stderr)
+            return EXIT_MERGE_ERROR
+        print(render_table(report))
+        _write_report(report, args.output)
+        return exit_code_for(report)
 
     try:
         manifest = load_arms()
@@ -895,15 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_PROBE_ERROR
 
     print(render_table(report))
-
-    if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        # `mode='json'` so the StrEnum reasons serialise as their string values:
-        # a python-mode dump emits a repr no downstream consumer can match on.
-        out_path.write_text(json.dumps(report.model_dump(mode='json'), indent=2) + '\n')
-        print(f'\nwrote {out_path}')
-
+    _write_report(report, args.output)
     return exit_code_for(report)
 
 

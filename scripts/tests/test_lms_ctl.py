@@ -67,6 +67,18 @@ if __name__ == "__main__":
 
 
 @pytest.fixture
+def baseline_dir(tmp_path, monkeypatch):
+    """Point the per-arm baseline store at tmp_path.
+
+    Without this a test would write into $XDG_RUNTIME_DIR and a real arm's
+    baseline could be clobbered by the suite.
+    """
+    root = tmp_path / 'baselines'
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(root))
+    return root
+
+
+@pytest.fixture
 def fake_systemctl(tmp_path, monkeypatch):
     """Shim a recording `systemctl` onto PATH; return a calls() accessor."""
     bin_dir = tmp_path / 'bin'
@@ -129,10 +141,55 @@ def test_unit_name_round_trips_through_arm_id_from_unit():
 # ---------------------------------------------------------------------------
 
 
-def test_start_issues_exactly_one_systemctl_start(fake_systemctl):
+def test_start_issues_exactly_one_systemctl_start(fake_systemctl, baseline_dir):
     lms_ctl.start(_arm(), gpu=MEASURED_GPU)
 
     assert fake_systemctl.calls() == [['start', 'lms-arm@qwen3.5-9b.service']]
+
+
+def test_start_records_the_pre_start_gpu_reading_as_this_arm_s_baseline(
+    fake_systemctl, baseline_dir,
+):
+    """The budget verdict's subtrahend is produced BY the start event.
+
+    esc-3713-6 made a live per-arm baseline binding: a frozen constant
+    misattributes desktop drift to the arm, and does so in the
+    fabrication-relevant direction.  Capturing it here -- rather than accepting
+    it as a healthcheck flag -- means the number cannot be typed in afterwards
+    to make a report fit.
+    """
+    lms_ctl.start(_arm(), gpu=MEASURED_GPU)
+
+    recorded = lms_vram.read_baseline('qwen3.5-9b')
+
+    assert recorded.used_mib == MEASURED_GPU.used_mib
+    assert recorded.free_mib == MEASURED_GPU.free_mib
+    assert recorded.total_mib == MEASURED_GPU.total_mib
+
+
+def test_a_refused_start_records_no_baseline(fake_systemctl, baseline_dir):
+    """A baseline with no arm behind it would later be subtracted from some
+    OTHER arm's reading, silently discounting it."""
+    moe = _arm(arm_id='moe-stretch', stack='llamacpp',
+               structured_output_mode='json_object', est_vram_gib=17.0, port=8413)
+
+    with pytest.raises(lms_ctl.ArmPreflightError):
+        lms_ctl.start(moe, gpu=MEASURED_GPU)
+
+    assert not lms_vram.baseline_path('moe-stretch').exists()
+
+
+def test_restarting_an_arm_overwrites_its_previous_baseline(
+    fake_systemctl, baseline_dir,
+):
+    """A stale baseline from an earlier run would charge the new run for memory
+    the earlier one had already released."""
+    lms_ctl.start(_arm(), gpu=MEASURED_GPU)
+    later = lms_vram.GpuReading(total_mib=24576, used_mib=8000, free_mib=16123)
+
+    lms_ctl.start(_arm(), gpu=later)
+
+    assert lms_vram.read_baseline('qwen3.5-9b').used_mib == 8000
 
 
 def test_stop_issues_exactly_one_systemctl_stop(fake_systemctl):

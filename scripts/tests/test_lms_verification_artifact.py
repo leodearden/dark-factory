@@ -215,22 +215,97 @@ def test_passing_rows_carry_a_real_measured_latency(report: HealthReport) -> Non
 
 
 def test_vram_block_passes_within_the_recorded_budget(report: HealthReport) -> None:
-    """nvidia-smi within budget — the second half of the PRD's stated signal."""
+    """nvidia-smi within budget — the second half of the PRD's stated signal.
+
+    The SUBJECT of this check was corrected on 2026-08-06 (esc-3713-6, approved
+    by the steward before the artifact existed).  It used to re-derive
+    `used_mib <= nominal_ceiling_gib * 1024`, i.e. TOTAL card usage against PRD
+    D10's nominal 19.5 GiB.  That charged every arm a second time for the
+    ~7.3 GiB desktop+whisper baseline D10 had already subtracted, and it was not
+    a big-arm technicality: a 9B AWQ measured 21.75 GiB total and failed while
+    serving schema-constrained completions correctly.
+
+    This is still the same INTERNAL-CONSISTENCY check — "the verdict and the
+    numbers it was computed from disagree" — re-derived against the corrected
+    subject, and it is strictly stronger than the version it replaces: the
+    footprint, its live baseline and the live budget must all be present AND
+    mutually coherent, where before only one comparison was re-run.
+    """
     vram = report.vram
     assert vram.verdict == 'PASS', (
-        f'VRAM verdict is {vram.verdict}: {vram.reason}. The run exceeded the '
-        f'budget (used {vram.used_gib} GiB against a nominal ceiling of '
-        f'{vram.nominal_ceiling_gib} GiB).'
+        f'VRAM verdict is {vram.verdict}: {vram.reason}. The arm took '
+        f'{vram.arm_footprint_gib} GiB against the {vram.budget_gib} GiB free '
+        'before it started.'
     )
-    assert vram.used_mib <= vram.nominal_ceiling_gib * 1024, (
-        f'used_mib={vram.used_mib} exceeds the nominal ceiling '
-        f'{vram.nominal_ceiling_gib} GiB even though the verdict says PASS; '
-        'the verdict and the numbers it was computed from disagree'
+    assert vram.arm_footprint_mib <= vram.budget_mib, (
+        f'arm_footprint_mib={vram.arm_footprint_mib} exceeds the budget '
+        f'{vram.budget_mib} MiB free at baseline even though the verdict says '
+        'PASS; the verdict and the numbers it was computed from disagree'
+    )
+    assert vram.used_mib - vram.baseline_mib == vram.arm_footprint_mib, (
+        f'used={vram.used_mib} minus baseline={vram.baseline_mib} is not the '
+        f'reported footprint {vram.arm_footprint_mib}; the block was assembled, '
+        'not measured'
     )
     assert vram.total_mib == vram.used_mib + vram.free_mib, (
         'total/used/free do not add up, so the block was not produced by a '
         'single nvidia-smi reading'
     )
+
+
+def test_vram_baseline_is_a_real_pre_start_reading(report: HealthReport) -> None:
+    """The subtrahend must be measured, and measured BEFORE the arm.
+
+    Required alongside the subject correction (esc-3713-6).  A zero baseline
+    means the pre-start probe never ran, and subtracting it would credit the
+    desktop's memory to the arm; a baseline at or above `used` means the reading
+    was not taken before this run at all.  Either way the footprint below it
+    would be fiction, and fiction in the flattering direction.
+    """
+    vram = report.vram
+    assert vram.baseline_mib > 0, (
+        f'baseline_mib={vram.baseline_mib}: no pre-start nvidia-smi reading '
+        'stands behind this report'
+    )
+    assert vram.baseline_mib < vram.used_mib, (
+        f'baseline_mib={vram.baseline_mib} is not below used_mib='
+        f'{vram.used_mib}; the arm appears to have freed memory, so this '
+        'baseline was not taken before this run'
+    )
+    assert 0 < vram.budget_mib <= vram.total_mib, (
+        f'budget_mib={vram.budget_mib} is not a plausible free reading on a '
+        f'{vram.total_mib} MiB card'
+    )
+
+
+def test_every_arm_actually_occupied_the_card(report: HealthReport) -> None:
+    """A zero or negative footprint means the arm never started.
+
+    A model server that loaded weights onto a GPU cannot take no VRAM, so this
+    catches the artifact assembled from readings taken while nothing was
+    running — the shape a fabricated report naturally takes.
+    """
+    assert report.vram.arm_footprint_mib > 0, (
+        f'the merged vram block reports arm_footprint_mib='
+        f'{report.vram.arm_footprint_mib}'
+    )
+    weightless = sorted(
+        row.arm_id for row in report.arms if row.arm_footprint_mib <= 0
+    )
+    assert not weightless, (
+        f'arms {weightless} report a footprint of zero or less; a model server '
+        'holding weights on this GPU cannot take no VRAM'
+    )
+
+
+def test_each_arm_row_was_measured_at_a_knowable_time(report: HealthReport) -> None:
+    """The slate is measured one arm at a time, so a single top-level stamp
+    cannot say when any given arm was actually up."""
+    for row in report.arms:
+        stamp = datetime.fromisoformat(row.measured_at)
+        assert stamp.tzinfo is not None, (
+            f'{row.arm_id}: measured_at={row.measured_at!r} is timezone-naive'
+        )
 
 
 def test_vram_block_reports_both_budget_figures(report: HealthReport) -> None:

@@ -111,6 +111,11 @@ def start(
 ) -> None:
     reading = gpu if gpu is not None else lms_vram.probe_gpu()
     preflight(arm, reading, exclusive=exclusive)
+    # The reading the pre-flight just admitted this arm on IS the "immediately
+    # before it started" baseline the budget verdict subtracts (esc-3713-6).
+    # Recorded here, after the refusal path and before the side effect, so a
+    # refused arm leaves no baseline behind for another arm's report to pick up.
+    lms_vram.record_baseline(arm.arm_id, reading)
     _systemctl('start', unit_name(arm))
 
 

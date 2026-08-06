@@ -17,6 +17,9 @@ the dangerous answer: `used_mib = 0` reports a *passing* budget with maximal
 headroom off a broken probe, which is precisely the reading an operator would
 trust.
 """
+import json
+from datetime import datetime
+
 import pytest
 
 import lms_manifest
@@ -166,12 +169,37 @@ def test_gpu_memory_utilization_raises_on_an_impossible_budget(budget_gib, total
 
 
 # ---------------------------------------------------------------------------
-# (c) evaluate_budget — reports BOTH figures
+# (c) evaluate_budget — the ARM's footprint against the LIVE budget
 # ---------------------------------------------------------------------------
+#
+# The subject of this verdict was corrected on 2026-08-06 (esc-3713-6).  It used
+# to judge TOTAL card usage against PRD D10's nominal 19.5 GiB, which charged
+# every arm a second time for the ~7.3 GiB desktop+whisper baseline D10 had
+# already subtracted -- so a 9B AWQ that served correctly measured 21.75 GiB
+# total and FAILED.  PRD l.165/l.192 derive 19.5 as the allowance *to the arm*.
+#
+# It now judges `used - baseline` against the free VRAM measured at that same
+# baseline reading.  Both reference figures still travel with every verdict, and
+# the safety margin is deliberately NOT re-added here: it is applied once, at
+# allocation time, in `lms_serve._memory_share_for`.  Charging it twice would put
+# a correctly-sized arm on a false knife edge.
+
+_BASELINE_MIB = 7362
+_BASELINE_FREE_MIB = 16761
+
+
+def _budget(used_mib, total_mib=24576, baseline_mib=_BASELINE_MIB,
+            baseline_free_mib=_BASELINE_FREE_MIB):
+    return lms_vram.evaluate_budget(
+        used_mib=used_mib,
+        total_mib=total_mib,
+        baseline_mib=baseline_mib,
+        baseline_free_mib=baseline_free_mib,
+    )
 
 
 def test_evaluate_budget_reports_both_the_nominal_ceiling_and_the_measured_budget():
-    verdict = lms_vram.evaluate_budget(used_mib=7362, total_mib=24576)
+    verdict = _budget(used_mib=14000)
 
     assert verdict.nominal_ceiling_gib == pytest.approx(19.5)
     assert verdict.operating_budget_gib == pytest.approx(
@@ -182,49 +210,95 @@ def test_evaluate_budget_reports_both_the_nominal_ceiling_and_the_measured_budge
     assert verdict.operating_budget_gib < verdict.nominal_ceiling_gib
 
 
-def test_evaluate_budget_passes_when_usage_is_inside_the_budget():
-    verdict = lms_vram.evaluate_budget(used_mib=7362, total_mib=24576)
+def test_evaluate_budget_charges_the_arm_only_for_what_the_arm_took():
+    """The correction, stated as arithmetic.
 
+    22271 MiB used with a 7310 MiB baseline is a 14961 MiB arm -- the real
+    `qwen3.5-9b` measurement from 2026-08-06.  Under the old total-usage subject
+    that arm read as 21.75 GiB and failed; it took 14.61 GiB and fitted.
+    """
+    verdict = _budget(used_mib=22271, baseline_mib=7310, baseline_free_mib=16813)
+
+    assert verdict.arm_footprint_mib == 14961
+    assert verdict.arm_footprint_gib == pytest.approx(14.61, abs=0.01)
+    assert verdict.budget_mib == 16813
     assert verdict.verdict == 'PASS'
-    assert verdict.used_gib == pytest.approx(7.19, abs=0.01)
-    assert verdict.headroom_gib == pytest.approx(19.5 - 7.19, abs=0.02)
+    assert verdict.headroom_gib == pytest.approx((16813 - 14961) / 1024, abs=0.01)
 
 
-def test_evaluate_budget_fails_when_usage_exceeds_the_budget():
-    verdict = lms_vram.evaluate_budget(used_mib=21000, total_mib=24576)
+def test_evaluate_budget_fails_when_the_arm_exceeds_the_live_free_reading():
+    verdict = _budget(used_mib=24500, baseline_mib=1000, baseline_free_mib=16761)
 
+    assert verdict.arm_footprint_mib == 23500
     assert verdict.verdict == 'FAIL'
     assert verdict.headroom_gib < 0
     assert 'budget' in verdict.reason.lower()
 
 
-def test_evaluate_budget_honours_an_explicit_budget_override():
-    verdict = lms_vram.evaluate_budget(
-        used_mib=17000, total_mib=24576, budget_gib=16.0,
-    )
+def test_evaluate_budget_uses_the_live_budget_not_the_frozen_constant():
+    """A frozen 16.37 GiB budget would misattribute desktop drift to the arm.
 
-    assert verdict.verdict == 'FAIL'
-    assert verdict.budget_gib == pytest.approx(16.0)
-    # Both reference figures still travel with the verdict.
-    assert verdict.nominal_ceiling_gib == pytest.approx(19.5)
+    The two calls below differ ONLY in what was free when the baseline was
+    taken.  If the constant were the operative number they would agree, and an
+    arm run on an emptier card would be judged against capacity it did not have.
+    """
+    roomy = _budget(used_mib=20000, baseline_mib=4000, baseline_free_mib=20000)
+    cramped = _budget(used_mib=20000, baseline_mib=4000, baseline_free_mib=15000)
+
+    assert roomy.budget_mib == 20000
+    assert cramped.budget_mib == 15000
+    assert roomy.verdict == 'PASS'
+    assert cramped.verdict == 'FAIL'
 
 
-def test_evaluate_budget_at_exactly_the_budget_passes():
-    used_mib = int(round(19.5 * 1024))
+def test_evaluate_budget_does_not_re_add_the_safety_margin():
+    """The margin is applied once, in the share -- not again in the verdict.
 
-    verdict = lms_vram.evaluate_budget(used_mib=used_mib, total_mib=24576)
+    Double-counting it would fail an arm that fits its allocation exactly, which
+    is the knife edge esc-3713-6 explicitly ruled out.
+    """
+    verdict = _budget(used_mib=7362 + 16761, baseline_mib=7362,
+                      baseline_free_mib=16761)
 
+    assert verdict.arm_footprint_mib == 16761
     assert verdict.verdict == 'PASS'
     assert verdict.headroom_gib == pytest.approx(0.0, abs=0.01)
 
 
+def test_evaluate_budget_carries_the_raw_numbers_it_was_computed_from():
+    """The artifact's internal-consistency gate re-derives the verdict from
+    these, so a verdict that dropped them could not be checked at all."""
+    verdict = _budget(used_mib=14000)
+
+    assert verdict.used_mib == 14000
+    assert verdict.total_mib == 24576
+    assert verdict.baseline_mib == _BASELINE_MIB
+    assert verdict.used_mib - verdict.baseline_mib == verdict.arm_footprint_mib
+
+
 @pytest.mark.parametrize(
-    ('used_mib', 'total_mib'),
-    [(-1, 24576), (7362, 0), (30000, 24576)],
+    ('used_mib', 'total_mib', 'baseline_mib', 'baseline_free_mib'),
+    [
+        (-1, 24576, 7362, 16761),        # negative usage
+        (7362, 0, 7362, 16761),          # no card
+        (30000, 24576, 7362, 16761),     # used beyond the card
+        (14000, 24576, 0, 16761),        # zero baseline: the probe was dead
+        (14000, 24576, -5, 16761),       # negative baseline
+        (14000, 24576, 15000, 16761),    # baseline above used: not the same run
+        (14000, 24576, 7362, 0),         # no free VRAM at baseline
+        (14000, 24576, 7362, 30000),     # free beyond the card
+    ],
 )
-def test_evaluate_budget_raises_on_an_incoherent_reading(used_mib, total_mib):
+def test_evaluate_budget_raises_on_an_incoherent_reading(
+    used_mib, total_mib, baseline_mib, baseline_free_mib,
+):
     with pytest.raises(lms_vram.VramProbeError):
-        lms_vram.evaluate_budget(used_mib=used_mib, total_mib=total_mib)
+        lms_vram.evaluate_budget(
+            used_mib=used_mib,
+            total_mib=total_mib,
+            baseline_mib=baseline_mib,
+            baseline_free_mib=baseline_free_mib,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -279,3 +353,114 @@ def test_arm_fits_explains_the_refusal():
 
 def test_arm_fit_reason_is_empty_when_the_arm_fits():
     assert lms_vram.arm_fit_reason(_arm(est_vram_gib=6.0), free_gib=16.4) == ''
+
+
+# ---------------------------------------------------------------------------
+# (e) the per-arm baseline — measured LIVE, immediately before the arm starts
+# ---------------------------------------------------------------------------
+#
+# esc-3713-6 made this binding: the baseline MUST be an nvidia-smi reading taken
+# just before THAT arm started, never the frozen MEASURED_BASELINE_GIB.  A frozen
+# baseline misattributes desktop drift to the arm, and it does so in the
+# fabrication-relevant direction -- a desktop that shrank between the constant's
+# capture and the run hands the arm a discount it did not earn.
+#
+# Recording it at `lms_ctl start` rather than accepting it as a healthcheck flag
+# is the point: the number is produced by the start event itself, so it cannot be
+# typed in after the fact to make a report fit.
+
+
+def _reading(used_mib=7310, free_mib=16813, total_mib=24576):
+    return lms_vram.GpuReading(
+        total_mib=total_mib, used_mib=used_mib, free_mib=free_mib,
+    )
+
+
+def test_baseline_round_trips_through_the_recorded_file(tmp_path, monkeypatch):
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    lms_vram.record_baseline('qwen3.5-9b', _reading())
+    restored = lms_vram.read_baseline('qwen3.5-9b')
+
+    assert restored.used_mib == 7310
+    assert restored.free_mib == 16813
+    assert restored.total_mib == 24576
+
+
+def test_baseline_is_written_per_arm_and_does_not_collide(tmp_path, monkeypatch):
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    lms_vram.record_baseline('qwen3.5-9b', _reading(used_mib=7310))
+    lms_vram.record_baseline('phi-4-14b', _reading(used_mib=7900, free_mib=16223))
+
+    assert lms_vram.read_baseline('qwen3.5-9b').used_mib == 7310
+    assert lms_vram.read_baseline('phi-4-14b').used_mib == 7900
+
+
+def test_reading_a_missing_baseline_raises_rather_than_defaulting(
+    tmp_path, monkeypatch,
+):
+    """No baseline means nobody measured the card before this arm started.
+
+    Defaulting to MEASURED_BASELINE_GIB here would silently reintroduce exactly
+    the frozen number esc-3713-6 ruled out, and the artifact would look
+    identical either way.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    with pytest.raises(lms_vram.VramProbeError, match='no baseline'):
+        lms_vram.read_baseline('qwen3.5-9b')
+
+
+def test_a_corrupt_baseline_file_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    lms_vram.baseline_path('qwen3.5-9b').write_text('not json at all')
+
+    with pytest.raises(lms_vram.VramProbeError):
+        lms_vram.read_baseline('qwen3.5-9b')
+
+
+def test_the_recorded_baseline_is_stamped_with_an_aware_utc_time(
+    tmp_path, monkeypatch,
+):
+    """A baseline with no time on it cannot be told apart from last week's."""
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    lms_vram.record_baseline('qwen3.5-9b', _reading())
+    payload = json.loads(lms_vram.baseline_path('qwen3.5-9b').read_text())
+
+    stamped = datetime.fromisoformat(payload['measured_at'])
+    assert stamped.tzinfo is not None
+
+
+def test_read_baselines_takes_the_most_conservative_of_several(
+    tmp_path, monkeypatch,
+):
+    """Probing several arms at once has several baselines; the LOWEST prior
+    usage attributes the MOST memory to the arms, which is the reading that
+    cannot flatter them."""
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    lms_vram.record_baseline('a', _reading(used_mib=7310, free_mib=16813))
+    lms_vram.record_baseline('b', _reading(used_mib=9000, free_mib=15123))
+
+    chosen = lms_vram.read_baselines(['a', 'b'])
+
+    assert chosen.used_mib == 7310
+    assert chosen.free_mib == 16813
+
+
+def test_read_baselines_raises_when_asked_for_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    with pytest.raises(lms_vram.VramProbeError):
+        lms_vram.read_baselines([])
+
+
+def test_clearing_a_baseline_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    lms_vram.record_baseline('a', _reading())
+
+    lms_vram.clear_baseline('a')
+    lms_vram.clear_baseline('a')
+
+    assert not lms_vram.baseline_path('a').exists()

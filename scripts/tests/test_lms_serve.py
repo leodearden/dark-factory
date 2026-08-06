@@ -221,9 +221,39 @@ def test_vllm_gpu_memory_utilization_is_derived_from_the_measured_reading():
     argv = lms_serve.build_launch_argv(arm, MEASURED_GPU)
 
     expected = lms_vram.gpu_memory_utilization_for(
-        MEASURED_GPU.free_gib, MEASURED_GPU.total_gib,
+        MEASURED_GPU.free_gib - lms_vram.SAFETY_MARGIN_GIB, MEASURED_GPU.total_gib,
     )
     assert _value_after(argv, '--gpu-memory-utilization') == str(expected)
+
+
+def test_a_generate_arm_reserves_the_same_safety_margin_a_pooling_arm_does():
+    """The margin is not optional for LLM arms (esc-3713-6).
+
+    SAFETY_MARGIN_GIB's own docstring says an arm sized to the last byte of free
+    VRAM OOMs on the first allocation spike -- and this generate branch was
+    handing exactly that: `gpu_memory_utilization_for(free_gib, total_gib)`.
+    The pooling branch already reserved it, so the asymmetry meant the arms with
+    the LARGEST allocations were the ones with no margin at all, on a card where
+    whisper-writer must stay resident.
+
+    It also makes the budget verdict satisfiable by construction: the share
+    bounds footprint <= free - margin, so `footprint <= free` holds with real
+    headroom instead of by luck.
+    """
+    share = float(_value_after(
+        lms_serve.build_launch_argv(_arm(), MEASURED_GPU),
+        '--gpu-memory-utilization',
+    ))
+    granted_gib = share * MEASURED_GPU.total_gib
+
+    assert granted_gib <= MEASURED_GPU.free_gib - lms_vram.SAFETY_MARGIN_GIB + 0.01, (
+        f'a generate arm was granted {granted_gib:.2f} GiB of the '
+        f'{MEASURED_GPU.free_gib} GiB free, leaving less than the '
+        f'{lms_vram.SAFETY_MARGIN_GIB} GiB margin'
+    )
+    # Still generous: the margin costs headroom, it does not lobotomise the
+    # context window the way capping a generate arm at its weights would.
+    assert granted_gib > MEASURED_GPU.free_gib - 2 * lms_vram.SAFETY_MARGIN_GIB
 
 
 def test_vllm_gpu_memory_utilization_is_never_the_0_95_pod_era_default():
@@ -356,9 +386,13 @@ def test_vllm_llm_arm_keeps_the_free_vram_derived_share():
     llm_argv = lms_serve.build_launch_argv(_arm(est_vram_gib=6.0), MEASURED_GPU)
 
     expected = lms_vram.gpu_memory_utilization_for(
-        MEASURED_GPU.free_gib, MEASURED_GPU.total_gib,
+        MEASURED_GPU.free_gib - lms_vram.SAFETY_MARGIN_GIB, MEASURED_GPU.total_gib,
     )
     assert _value_after(llm_argv, '--gpu-memory-utilization') == str(expected)
+    # The share it keeps is far above its 6.0 GiB declaration: the point is that
+    # KV is load-bearing here, and only the OOM margin is withheld.
+    assert float(_value_after(llm_argv, '--gpu-memory-utilization')) * \
+        MEASURED_GPU.total_gib > 6.0 + lms_vram.SAFETY_MARGIN_GIB
 
 
 # ---------------------------------------------------------------------------
