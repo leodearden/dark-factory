@@ -172,6 +172,91 @@ async def test_no_slot_in_progress_task_parked_as_blocked(queue):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'status',
+    [
+        # Exhaustive over shared.task_statuses.TaskStatus MINUS 'in-progress'.
+        # A future 10th member must not silently slip through the trigger.
+        'pending',
+        'blocked',
+        'deferred',
+        'review',
+        'merge-deferred',
+        'infra-hold',
+        'done',
+        'cancelled',
+        # ...plus the Scheduler.get_status read-failure sentinel.
+        None,
+    ],
+)
+async def test_no_slot_non_in_progress_status_not_parked(queue, status):
+    """The park trigger stays narrow: ONLY 'in-progress' is ever parked.
+
+    Regression guard against widening the guard in ``release_workflow`` from a
+    positive ``cur == 'in-progress'`` equality test into anything negative
+    (``cur not in TERMINAL_STATUSES`` and friends).  Three statuses in this
+    list would be actively harmful to park, and the fourth reason is fail-safe:
+
+    - ``merge-deferred``: derails atomic merge trains.  The group-merge status
+      pre-check rejects a train whose members are not all merge-deferred (see
+      ``TRAIN_INCOMPLETE_REASON_PREFIX`` in ``orchestrator/merge_queue.py``,
+      "Train merge rejected: not all members are merge-deferred"), and
+      ``Scheduler._deps_satisfied`` keys its intra-train dependency allowance
+      on the literal ``'merge-deferred'``.  Worse, both
+      ``_RECONCILE_SWEEP_STATUSES`` and
+      ``_WARM_LANE_RECLAIM_PROTECTED_STATUSES`` in ``orchestrator/harness.py``
+      protect ``merge-deferred`` while deliberately EXCLUDING ``blocked``, so
+      the park would strip the intact worktree the merge worker is promised.
+    - ``infra-hold``: the hold has no separate metadata flag — as the
+      infra-held resume branch in ``orchestrator/harness.py`` puts it, "the
+      status IS the hold".  Parking to ``blocked`` erases it and reproduces
+      the 3465 footprint starvation.
+    - ``done`` / ``cancelled``: terminal by decision; never drag them back.
+    - ``None``: ``Scheduler.get_status`` returns ``None`` on ANY MCP read
+      failure (its docstring says "or None on failure").  The positive
+      equality test is exactly what makes a failed read fail SAFE — a
+      negative test would park on every transient MCP hiccup.
+
+    Cross-file anchors above are cited by SYMBOL, not line number: those files
+    drift by 60-115 lines between plan and merge.
+    """
+    harness = _FakeHarness(status=status)
+    # No slot registered — the no-slot arm, same as the orphaned-park test.
+    server = create_server(queue, harness=harness)
+    result = await _call_release(server, task_id='42', timeout_secs=1)
+
+    assert result['parked'] is None
+    harness.scheduler.set_task_status.assert_not_awaited()
+    harness.scheduler.note_workflow_cancelled.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_live_slot_in_progress_not_parked(queue):
+    """A still-live slot is never parked, even at 'in-progress'.
+
+    Pins the ``if not harness.is_workflow_active(task_id):`` guard that fences
+    the park block: parking a task whose workflow is still running would race
+    that workflow's own status writes.
+
+    Strictly stronger than ``test_active_task_times_out_when_slot_does_not_clear``
+    above, which builds ``_FakeHarness()`` with the default ``status=None`` and
+    so has its ``parked is None`` satisfied by the get_status-returned-None
+    path regardless — it would stay green with the guard deleted.  Seeding
+    ``status='in-progress'`` here makes this the first test that genuinely
+    fails if the guard is removed.
+    """
+    harness = _FakeHarness(status='in-progress')
+    harness.events['42'] = asyncio.Event()  # registered and NEVER popped
+
+    server = create_server(queue, harness=harness)
+    result = await _call_release(server, task_id='42', timeout_secs=1)
+
+    assert result['slot_cleared'] is False
+    assert result['parked'] is None
+    harness.scheduler.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_terminal_task_not_parked(queue):
     """Slot clears but the task already went terminal ('done') → no park.
 
