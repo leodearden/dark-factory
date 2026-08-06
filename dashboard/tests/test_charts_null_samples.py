@@ -30,8 +30,11 @@ THE SAME DEFECT IN THE PADDED CHARTS (task 3489) — ``LineChart``,
 class with the same failure modes plus two of their own: StackedAreaChart's
 ``(st.values[i] || 0)`` conflated a measured 0 with a missing sample AND fed a
 hole-as-zero partial sum to the axis maximum, and HistBar's ``minHeight: 1``
-rendered a hole as a visible 1px stub.  They now delegate to the padded
-primitives in the same module.
+applied to every slot, rendering a hole as a visible 1px stub.  They now
+delegate to the padded primitives in the same module.  (HistBar keeps that floor
+on its MEASURED branch, where it is what stops a real 0 — ``height: 0%``, which
+paints nothing — from rendering exactly like a hole.  What was wrong was
+flooring the slot rather than the measurement.)
 
 WHY THE PROBES ARE PER COMPONENT — the components' folds differ textually
 (LineChart's poisoning fold is ``Math.max(...all``, BarChart's is
@@ -176,13 +179,14 @@ _HIST_BAR_BANNED = (
         'scales each RAW value directly into a height percentage, so a `null` '
         'is indistinguishable from a measured zero',
     ),
-    (
-        'minHeight: 1',
-        'floors every bar at 1px, so a MISSING sample renders as a visible '
-        'stub — a fabricated measurement, drawn at a fixed size no data '
-        'produced. A hole must render no bar at all, and a measured zero its '
-        'honest zero-height one',
-    ),
+    # NOT probed here: `minHeight: 1`.  A blunt substring ban on the floor would
+    # also ban it on the MEASURED branch, where it is what keeps a real zero
+    # (`height: 0%`, which paints nothing) visible as a drawn-but-empty bar.
+    # What was actually wrong pre-fix is that the floor applied to every slot,
+    # hole included — a branch-shaped fact a substring cannot express.  It is
+    # pinned by test_hist_bar_draws_nothing_for_a_hole_but_floors_a_measurement
+    # below instead, which reads the two style branches and is proven to fail on
+    # the pre-fix body by its own control.
 )
 
 _CONTRACTS: dict[str, _Contract] = {
@@ -526,6 +530,115 @@ def test_component_renders_nothing_when_the_builder_yields_no_line(
         f'rather than an <svg> containing a synthetic flat line along the '
         f'chart floor.'
     )
+
+
+def _balanced_brace_block(src: str, start: int) -> str:
+    """Return the balanced ``{...}`` block beginning at ``src[start]``, or ''."""
+    if start < 0 or start >= len(src) or src[start] != '{':
+        return ''
+    depth = 0
+    for j in range(start, len(src)):
+        if src[j] == '{':
+            depth += 1
+        elif src[j] == '}':
+            depth -= 1
+            if depth == 0:
+                return src[start : j + 1]
+    return ''
+
+
+def _hole_and_measured_style_branches(body: str) -> tuple[str, str] | None:
+    """Split a ``<cond> === null ? {hole} : {measured}`` style into its two branches.
+
+    Returns ``None`` when the body has no such conditional at all — which is
+    precisely what the PRE-FIX HistBar looks like, since it styled every slot
+    the same way.  The negative control below depends on that distinction, so a
+    missing conditional must come back as None rather than as an assertion here.
+    """
+    m = re.search(r'===\s*null\s*\?', body)
+    if m is None:
+        return None
+
+    hole_start = body.find('{', m.end())
+    hole = _balanced_brace_block(body, hole_start)
+    if not hole:
+        return None
+
+    rest = body[hole_start + len(hole) :]
+    colon = rest.find(':')
+    if colon == -1:
+        return None
+    measured = _balanced_brace_block(rest, rest.find('{', colon))
+    if not measured:
+        return None
+
+    return hole, measured
+
+
+def test_hist_bar_draws_nothing_for_a_hole_but_floors_a_measurement(charts_jsx: str) -> None:
+    """A hole and a measured zero must not render identically.
+
+    Two failures are possible here and they pull in opposite directions.  The
+    pre-fix one: ``minHeight: 1`` on every slot turned a MISSING sample into a
+    visible 1px stub — a fabricated measurement drawn at a fixed size no data
+    produced.  The mirror one: dropping the floor entirely leaves a measured
+    zero at ``height: 0%``, which paints nothing at all, so a real zero and a
+    hole are once again indistinguishable — the conflation this component was
+    fixed to end — and any sub-pixel nonzero value disappears with them.
+
+    So the floor is a property of the MEASURED branch, not of the slot.  That is
+    branch-shaped, which is why it is asserted structurally rather than by a
+    substring probe (see the note in ``_HIST_BAR_BANNED``).
+    """
+    body = _component_body(charts_jsx, 'HistBar')
+    branches = _hole_and_measured_style_branches(body)
+
+    assert branches is not None, (
+        'HistBar no longer styles its slots through a `f === null ? ... : ...` '
+        'conditional. A single unconditional style cannot distinguish a hole '
+        'from a measurement — that is exactly the pre-fix shape.'
+    )
+    hole, measured = branches
+
+    assert hole != measured, 'the hole and measured styles must differ'
+
+    for painted in ('height', 'background', 'minHeight', 'borderRadius'):
+        assert painted not in hole, (
+            f'HistBar\'s HOLE branch sets `{painted}`: {hole}. A slot with no '
+            f'measurement must keep its flex position and draw nothing — no '
+            f'height, no fill, and above all no floor, which is what rendered '
+            f'a hole as a fabricated 1px stub pre-fix.'
+        )
+
+    assert 'height' in measured and 'background' in measured, (
+        f'HistBar\'s MEASURED branch does not paint a bar: {measured}'
+    )
+    assert 'minHeight' in measured, (
+        f'HistBar\'s MEASURED branch has no visible floor: {measured}. A '
+        f'measured 0 scales to `height: 0%` and paints no pixels, so without '
+        f'one a real zero renders exactly like a hole — the conflation this '
+        f'component was fixed to end. Floor the MEASURED branch only (or mark '
+        f'the zero some other visible way); do not floor the slot.'
+    )
+
+
+def test_hist_bar_branch_contract_fails_on_pre_fix_source() -> None:
+    """The negative control for the assertion above.
+
+    The pre-fix HistBar styled every slot with one unconditional object carrying
+    ``minHeight: 1``, so it has no hole branch to find.  If the extractor ever
+    started returning branches for that body, the contract above would be
+    asserting something the defect also satisfies.
+    """
+    body = _strip_comments(_PRE_FIX_HIST_BAR)
+
+    assert _hole_and_measured_style_branches(body) is None, (
+        'the pre-fix HistBar body parsed as having a hole/measured style split. '
+        'It has none — it floors every slot at 1px unconditionally — so '
+        'test_hist_bar_draws_nothing_for_a_hole_but_floors_a_measurement would '
+        'be a false GREEN.'
+    )
+    assert 'minHeight: 1' in body, 'the pre-fix floor is still in the frozen control body'
 
 
 @pytest.mark.parametrize('name', _DELEGATING_COMPONENTS)

@@ -426,15 +426,23 @@ function HistBar({ values, maxOverride, height = 50, color = PALETTE.accent }) {
   return (
     <div style={{ display: 'flex', alignItems: 'flex-end', gap: 2, height }}>
       {/* A hole keeps its flex slot — so the bars either side stay in their own
-          positions — but draws no bar. The 1px floor this used to carry turned
-          every hole into a visible stub: a fabricated measurement at a fixed
-          size no data produced. A measured 0 keeps its honest zero height. */}
+          positions — but draws NOTHING: no height, no background, no floor.
+          The 1px floor used to apply to every slot, which turned a hole into a
+          visible stub: a fabricated measurement at a fixed size no data
+          produced.
+
+          It stays on the MEASURED branch, though, and that is deliberate. A
+          measured 0 renders `height: 0%`, which paints no pixels — so without a
+          floor a real zero and a hole would be indistinguishable again, the
+          exact conflation this component was fixed to end (and any sub-pixel
+          nonzero value would vanish with it). Floored, a measurement reads as a
+          drawn-but-empty bar and a hole as no bar at all. */}
       {fractions.map((f, i) => (
         <div
           key={i}
           style={f === null
             ? { flex: 1 }
-            : { flex: 1, height: `${f * 100}%`, background: color, borderRadius: '2px 2px 0 0' }}
+            : { flex: 1, height: `${f * 100}%`, background: color, borderRadius: '2px 2px 0 0', minHeight: 1 }}
         />
       ))}
     </div>

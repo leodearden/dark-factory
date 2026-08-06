@@ -385,6 +385,10 @@ function axisPaths(values, geom) {
 // coerced to 0 gave a zero-height bar indistinguishable from a measured zero,
 // and HistBar's `minHeight: 1` floor turned that same hole into a visible 1px
 // stub — a fabricated measurement, drawn at a fixed size no data produced.
+// (That floor is legitimate on a MEASURED bar, and HistBar keeps it there: a
+// real 0 paints no pixels without one, so the two would collapse together
+// again. What no number could express is the hole, which is why this returns
+// a null the caller can branch on.)
 // Handing back a null forces the caller to decide explicitly, which is what
 // lets it drop the bar while KEEPING the slot's category label and x position:
 // an absent bar in a labelled slot reads as "not measured", where an absent
