@@ -229,8 +229,15 @@ def record_flake_occurrence(
     ]
     conn = _connect(db_path)
     try:
+        # OR IGNORE, against the `idx_flake_occurrence_dedup` UNIQUE index, is §8.3's
+        # idempotency key `(test_id, observed_at, call_site)` enforced declaratively.
+        # Deliberately NOT left to the catch-all: a plain INSERT would (1) abort the
+        # rest of the batch on the first duplicate, silently LOSING the genuinely new
+        # rows beside it, and (2) turn every legitimate merge-path retry into a loud
+        # warning, training operators to ignore the log line B12 relies on. One
+        # executemany in one transaction, so the batch still lands atomically.
         conn.executemany(
-            'INSERT INTO flake_occurrence '
+            'INSERT OR IGNORE INTO flake_occurrence '
             '(observed_at, test_id, project_id, verdict, call_site, runner, '
             ' merge_sha, task_id, psi_cpu_some10, detail) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
