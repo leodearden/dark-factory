@@ -112,6 +112,20 @@ def _config_arg_from_exec_start(exec_start_value: str) -> str | None:
     Mirrors test_orchestrator_service_files.py's _exec_start_config_arg
     token parse (also accepts `--config=VALUE`), copied inline rather than
     imported across test modules.
+
+    Known, intentional divergence from that canonical parser: the canonical
+    helper raises a MalformedExecStart-style exception for a dangling
+    trailing `--config` (the flag with no value), keeping that case
+    distinct from "no --config at all". This copy collapses both to None.
+    Every caller in this module already asserts `config_arg is not None`,
+    so a dangling `--config` still fails the test here too — just with this
+    module's generic "carries no --config argument" message rather than a
+    MalformedExecStart-specific one. Lifting both parsers into a shared
+    helper (e.g. tests/scripts/systemd_unit_invariants.py) would close this
+    gap for real and is the better long-term fix, but that module and
+    test_orchestrator_service_files.py both sit outside this task's locked
+    scope (scripts/setup-host.sh and this module only) — tracked as
+    follow-up rather than reached for here.
     """
     tokens = exec_start_value.split()
     for i, token in enumerate(tokens):
@@ -336,3 +350,70 @@ def test_installed_unit_manager_execstart_config_is_canonical() -> None:
         "task 3641) — the dashboard's _discover_escalation_urls keys on "
         "that exact filename."
     )
+
+
+# ---------------------------------------------------------------------------
+# PARSER layer — portable, fixture-string coverage for the token parsers
+#
+# Deliberately NOT @pytest.mark.integration and NOT gated on
+# _require_installed_unit()/systemctl: these read no host state, only
+# inline fixture strings, so they run in the default suite on every
+# machine — including CI and every other dev box, where the four tests
+# above skip. Without a negative-case owner of its own, a regression in
+# either parser (an off-by-one on tokens[i + 1], a broken --config= or
+# argv[]= prefix branch) would be invisible everywhere except the one host
+# that actually exercises it, and would surface there as a confusing
+# failure about the unit rather than about the parser — mirroring why
+# test_systemd_restart_backoff.py's docstring records that this directory's
+# convention is for a shared assertion to have its own negative-case owner.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("exec_start_value", "expected"),
+    [
+        pytest.param(
+            "/usr/bin/orchestrator run --config /etc/dark-factory-orchestrator.yaml",
+            "/etc/dark-factory-orchestrator.yaml",
+            id="space-separated",
+        ),
+        pytest.param(
+            "/usr/bin/orchestrator run --config=/etc/dark-factory-orchestrator.yaml",
+            "/etc/dark-factory-orchestrator.yaml",
+            id="equals-form",
+        ),
+        pytest.param(
+            "/usr/bin/orchestrator run --config",
+            None,
+            id="dangling-flag-no-value",
+        ),
+        pytest.param(
+            "/usr/bin/orchestrator run --project foo",
+            None,
+            id="no-config-flag-at-all",
+        ),
+    ],
+)
+def test_config_arg_from_exec_start_parses_all_forms(exec_start_value, expected) -> None:
+    """_config_arg_from_exec_start's token scan, pinned against inline fixtures."""
+    assert _config_arg_from_exec_start(exec_start_value) == expected
+
+
+def test_argv_from_exec_start_show_extracts_argv_segment() -> None:
+    """_argv_from_exec_start_show isolates argv[] from a full struct blob.
+
+    Fixture is the measured `systemctl --user show ... -p ExecStart` shape
+    (see the function's own docstring), with paths shortened for
+    readability.
+    """
+    blob = (
+        "{ path=/usr/bin/uv ; argv[]=/usr/bin/uv run --config /etc/x.yaml ; "
+        "ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; "
+        "code=(null) ; status=0/0 }"
+    )
+    assert _argv_from_exec_start_show(blob) == "/usr/bin/uv run --config /etc/x.yaml"
+
+
+def test_argv_from_exec_start_show_returns_none_without_argv_segment() -> None:
+    """An unexpected struct shape with no argv[]= segment yields None, not a crash."""
+    assert _argv_from_exec_start_show("{ path=/usr/bin/uv ; ignore_errors=no }") is None
