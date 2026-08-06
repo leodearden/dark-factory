@@ -3016,6 +3016,21 @@ def measure_arm(
 
         canonical_in_5: float | None = None
         canonical_rank: int | None = None
+        #: The SAME question asked of the raw store hits, before any
+        #: read-side transform ran.  It exists because the transformed
+        #: numbers above are not purely a property of retrieval:
+        #: `apply_grouped_read` synthesises its grouped document with
+        #: `record_id=canonical.record_id` and `topic_discoverability`
+        #: identifies the canonical by `record_id`, so under `b_grouped` any
+        #: child hit that folds upward is scored as "the canonical was
+        #: found" — while under `c_peers`/`status_quo` the canonical's own
+        #: stored record must itself have ranked.  `apply_topic_anchor`
+        #: injects it too.  Measured over `[hit.record for hit in hits]`,
+        #: this pair is blind to BOTH transforms and so answers the strictly
+        #: narrower question: did the canonical's own STORED record rank?
+        #: Disclosure, not correction — see the reading guide.
+        stored_canonical_in_5: float | None = None
+        stored_canonical_rank: int | None = None
         canonical_id = seeded.canonical_by_cluster.get(query.cluster_id)
         if canonical_id is not None:
             found = topic_discoverability(top_5, query.topic, canonical_id, 5)
@@ -3031,6 +3046,19 @@ def measure_arm(
                 query.topic, canonical_id, 5,
             )
             canonical_rank = deep['canonical_rank']
+            # ONE call, over the untransformed hits: `topic_discoverability`
+            # already scans the full list for the rank and derives
+            # `canonical_in_top_k` from it against the k it is passed, so a
+            # second windowed call would be redundant.  No `read_path` here
+            # is the whole point — neither `apply_grouped_read` nor
+            # `apply_topic_anchor` runs, so nothing can materialise a record
+            # the store did not return.  Read-only over hits already
+            # fetched: no arm, pin, window or threshold is re-tuned.
+            stored = topic_discoverability(
+                [hit.record for hit in hits], query.topic, canonical_id, 5,
+            )
+            stored_canonical_in_5 = 1.0 if stored['canonical_in_top_k'] else 0.0
+            stored_canonical_rank = stored['canonical_rank']
 
         rows.append({
             'kind': query.kind,
@@ -3042,6 +3070,10 @@ def measure_arm(
             # for a non-observation.
             'canonical_in_5': canonical_in_5,
             'canonical_rank': canonical_rank,
+            # Same None-not-0.0 discipline, for the same reason: a query with
+            # no canonical was never asked either question.
+            'stored_canonical_in_5': stored_canonical_in_5,
+            'stored_canonical_rank': stored_canonical_rank,
             'has_canonical': canonical_id is not None,
             'tokens': float(tokens_returned(top_10, 10, estimator)['tokens']),
         })
