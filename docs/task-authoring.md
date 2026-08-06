@@ -883,6 +883,68 @@ the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
 value into a single `annotations` field.
 
+### `allow_mcp_markup`: a write-time flag, not a metadata key
+
+`metadata={'allow_mcp_markup': True}` is the sanctioned move for a write
+that **deliberately quotes the MCP envelope literals** — documenting the
+leak, pasting a specimen, quoting a rejection's `matched_pattern`. It is
+honoured at all four guarded write boundaries: `submit_task`,
+`update_task`, `add_memory`, `add_episode`.
+
+**Why it belongs in this section.** The convention that grew up instead —
+paraphrase the literals, then park the evidence under a bespoke
+timestamped metadata key such as `markup_tripwire_rejections_<date>` —
+manufactures *both* failure classes at once: a `code=unknown_key` census
+line (Tier-C, above) for every such key, and a bounced write for every
+author who quotes the literals without the flag. It was self-perpetuating
+because it was documented inside task 3083's own `details`, so each reader
+learned the workaround rather than the flag. Task 3697 retires it.
+
+**Scope of the gate.** The guard reads only the caller's *text* arguments,
+never the metadata blob: `title` / `description` / `details` / `prompt` on
+`submit_task` and `update_task`, and `content` on `add_memory` and
+`add_episode`. Metadata is handed to the guard for exactly one purpose —
+reading this flag. So it is a description that trips the tripwire, not a
+metadata *value* that happens to contain the literals. `update_task`'s own
+docstring states the same contract
+(`fused-memory/src/fused_memory/server/tools.py`).
+
+**Fail-closed: only a literal boolean `True`.** `'yes'`, `1` and `'true'`
+do not enable it — `markup_override_requested` tests
+`parsed.get(...) is True` (`markup_tripwire.py`). That strictness is the
+containment argument, not pedantry: the failure being contained is an
+accidental harness serialization leak, and an accidental leak never sets
+an explicit flag. A deliberate author can.
+
+**Write-time-only — it never persists.** `strip_markup_override`
+(`markup_tripwire.py`) removes the key at every one of the four
+boundaries before the metadata reaches storage, so the flag never lands in
+stored metadata and never mints an `unknown_key` census line of its own.
+It is non-mutating (the caller's own dict is left intact) and honours both
+accepted metadata shapes — dict in / dict out, JSON string in / JSON
+string out. Pinned by
+`fused-memory/tests/server/test_markup_tripwire_gate.py::test_override_flag_is_stripped_before_persistence`
+and `::test_override_flag_is_not_persisted_into_task_metadata`.
+
+**This is routine, not exotic.** The 2026-08-05 decompose session that
+filed the toolcall-markup-containment batch had its *first* `submit_task`
+rejected by this tripwire for quoting the literals, and needed the flag on
+seven of the nine tasks it filed. The guard was working as designed; the
+missing piece was the convention around it.
+
+**What it is not: an escape hatch for an accidental leak.** If you did not
+mean to quote the markup, strip the fragment and resubmit — do not reword
+the payload to sneak it past the guard, and report a recurrence per the
+hint the rejection itself carries. Using the flag to push an accidental
+leak through the boundary defeats the containment it exists to provide.
+
+The authoritative enumeration of the literals lives in exactly one place,
+`fused-memory/src/fused_memory/server/markup_tripwire.py`, and is
+deliberately **not** repeated here: restating them in this file would
+oblige every future task write quoting this section to set the override,
+which is precisely the loop this section exists to break. For the full
+picture see `docs/mcp-toolcall-xml-leak.md` §4, "The boundary rejection".
+
 ### Promoting a convention
 
 A key only stops warning once it's added to the `_BLESSED_METADATA_KEYS`
