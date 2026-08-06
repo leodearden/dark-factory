@@ -353,6 +353,57 @@ download anonymous and fail only later, only on the gated repos.
 
 ---
 
+## OPEN: the budget verdict's subject is miscalibrated (blocks step 23)
+
+Measured in step 22, unresolved here on purpose — it is a design question, not a
+bug to be quietly patched under an anti-fabrication gate.
+
+Every arm measured so far answers correctly, and **every vLLM arm nonetheless
+fails the VRAM verdict**, because two budget notions in this package disagree
+about their subject:
+
+| check | subject | ceiling | `qwen3-embedding-0.6b` |
+|---|---|---|---|
+| `arm_fits` (pre-flight) | the **arm's** footprint | measured free, 16.37 GiB | 2.0 + 0.5 ≤ 16.37 → **admits** |
+| `evaluate_budget` (verdict) | **total** card usage | PRD nominal, 19.5 GiB | 23.35 > 19.5 → **FAILs** |
+
+An arm therefore passes the pre-flight and then fails the verdict, having done
+nothing wrong. The PRD's own arithmetic says which subject is intended:
+
+> l.192 — GPU headroom measured (24GB − ~4GB whisper-writer)
+> l.165 — whisper-writer stays resident: all capacity math against ~19–20GB, not 24GB
+
+19.5 GiB is what D10 derives as available **to the arm** (card minus
+whisper-writer). Applying it to *total* usage charges the arm for the 7.15 GiB
+desktop+whisper baseline a second time — and the desktop's ~3.2 GiB was not in
+D10's model at all, which is the same omission this README's *VRAM budget*
+section already records.
+
+Under the total-usage reading the real per-arm allowance collapses to
+19.5 − 7.15 = **12.35 GiB**, which would knock `mistral-small-3.2-24b` (14 GiB of
+weights) and `moe-stretch` (13.27 GiB) off the slate on a technicality, while
+both fit the 16.4 GiB the card actually has free.
+
+Two changes are needed and neither is a one-line edit, which is why they are
+recorded rather than rushed:
+
+1. **`evaluate_budget` should judge the arm's footprint** (`used − baseline`)
+   against the measured operating budget, not total usage against the nominal
+   ceiling. `lms_vram.MEASURED_BASELINE_GIB` (7.19) already exists for this.
+   `test_lms_verification_artifact.py`'s `used_mib <= nominal_ceiling` assertion
+   moves with it — deliberately called out, because relaxing an assertion inside
+   the anti-fabrication gate is exactly the move that needs a reviewer, not an
+   agent acting alone.
+2. **vLLM arms need `--kv-cache-memory` bounded per arm** so a 0.6B embedder
+   cannot take 14.56 GiB of unusable KV cache. Until then `est_vram_gib` is
+   decorative for decoder-based arms and the pre-flight's arithmetic is false.
+
+Until both land, `lms_healthcheck` exits 3 (budget) rather than 0 for any vLLM
+arm, and `verification/health-report.json` cannot honestly be greened. Hand-
+editing a PASS row to get there is precisely what the gate exists to prevent.
+
+---
+
 ## Verification artifact
 
 `verification/health-report.json` is written by a live run
@@ -374,30 +425,73 @@ resolved from live measurement, not from the docs.
 
 > TEI vs vLLM-pooling vs in-process for batch re-embeds. Decide in α/ι.
 
-**Status: pending live measurement.** All four embedding arms currently declare
-`stack: vllm` (the pooling runner), with TEI recorded per-arm as the fallback in
-`fallback_stack`. `lms_serve` already builds a TEI argv, so switching an arm is a
-manifest edit, not a code change.
+**Status: RESOLVED by measurement, step 22 (2026-08-06) — vLLM pooling for all
+four. TEI is not needed and was never pulled.**
 
-*To be filled in by step 22: which arms load under the vLLM pooling runner,
-which needed TEI, and the measured query latency behind the choice. ι owns the
-batch-re-embed half of the question.*
+Every arm was started through the committed chain and probed with the committed
+health check. All four loaded under the vLLM pooling runner and returned a valid
+vector of their declared length:
+
+| arm | load | probe | resident VRAM | probe verdict |
+|---|---|---|---|---|
+| `granite-embedding-english-r2` | 123 s | 192 ms | 796 MiB | PASS |
+| `gte-modernbert-base` | 122 s | 286 ms | 788 MiB | PASS |
+| `qwen3-embedding-0.6b` | 143 s | 700 ms | **16603 MiB** | PASS |
+| `qwen3-embedding-4b` | 142 s | 580 ms | **16078 MiB** | PASS |
+
+Uniformity was the preferred outcome and measurement allowed it: one stack across
+all four removes a serving-stack confound from ι's query-latency comparison, so
+the latency column above is comparable as it stands. `fallback_stack: tei` stays
+in the manifest as the recorded fallback, unused.
+
+#### The resident-VRAM split is architectural, and it matters
+
+The two ~790 MiB arms are **encoder** (BERT-family) models. The two ~16 GiB arms
+are **decoder** models that happen to emit embeddings — and vLLM gives a decoder a
+paged KV cache sized to fill `--gpu-memory-utilization`, whether or not a pooling
+model can ever use it. vLLM's own accounting for `qwen3-embedding-0.6b`:
+
+```
+weights 1.12 GiB · peak activation 0.30 GiB · non-torch 0.05 GiB
+CUDA graph 0.07 GiB · KV cache 14.56 GiB   (136,272 tokens)
+```
+
+A 0.6B model with a declared `est_vram_gib: 2.0` took 16.2 GiB, of which 14.56
+GiB is KV cache it cannot use. This is **not** an arm failure — the endpoint
+answers correctly, which is what Q1 asked — but it makes `est_vram_gib`
+decorative for these arms and is the direct cause of the budget conflict recorded
+below. vLLM names the lever itself: `--kv-cache-memory=<bytes>`.
 
 ### Open Q3 — MoE stretch-arm model and quant
 
 > Which of the two models, GGUF quant level, client-side validator placement.
 > Decide in α/η.
 
-**Status: unresolved — the arm is a placeholder.** `moe-stretch` carries `TBD-`
-values, so `ArmEntry.is_placeholder` is true and every tool refuses to launch or
-fetch it rather than 404ing on a literal `TBD-Q3` model id and recording that as
-an arm failure.
+**Status: RESOLVED by measurement, step 22 (2026-08-06) —
+`unsloth/gemma-4-26B-A4B-it-qat-GGUF`, quant `UD-Q4_K_XL`, 13.27 GiB.**
 
-The measured constraint: its nominal ~17 GiB does **not** fit this host's
-~16.4 GiB operating budget, though it would have fitted PRD D10's nominal 19.5.
-The resolution must therefore be one of — a smaller quant, a smaller MoE, or an
-explicit "requires the desktop VRAM freed" caveat — chosen against the measured
-figure.
+The decision is arithmetic, not preference. Real GGUF file sizes, read from the
+HF API rather than estimated:
 
-*To be filled in by step 22: the selected model, quant, image, measured resident
-footprint, and which of the three routes was taken. Validator placement is ε's.*
+| candidate | quant | real size | fits 16.4 GiB? |
+|---|---|---|---|
+| Qwen3.6-35B-A3B | UD-IQ4_XS | **16.51 GiB** | no — weights alone exceed the budget |
+| Qwen3.6-35B-A3B | UD-IQ3_S | 12.74 GiB | yes, at a real quality cost |
+| gemma-4-26B-A4B-it | UD-IQ4_XS | 12.66 GiB | yes |
+| gemma-4-26B-A4B-it **qat** | UD-Q4_K_XL | **13.27 GiB** | yes ← **pinned** |
+
+The PRD's ~17 GiB IQ4 estimate was for Qwen, and it is real: its smallest true
+4-bit quant is 16.51 GiB of weights before a single KV byte. That **would** have
+fitted D10's nominal 19.5 GiB and does not fit the measured 16.4 — exactly the
+deviation this task was asked to resolve honestly rather than inherit.
+
+Gemma was chosen over dropping Qwen to IQ3 because its QAT weights are
+quantization-aware *trained* at 4 bits by Google, so Q4_K_XL is near-lossless
+rather than a post-training approximation: **the arm that fits is also the one
+that does not trade quality to fit.** Gemma's sliding-window attention helps
+again on KV — 25 of its 30 layers use a 1024-token window, so 16k context costs
+~0.82 GiB of KV instead of the ~3.8 GiB a full-attention model of this shape
+would need. `est_vram_gib` is set to 14.5 on that basis.
+
+The file is downloaded and staged (14,249,047,104 bytes). Validator placement
+remains ε's.

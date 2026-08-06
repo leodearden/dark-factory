@@ -398,13 +398,18 @@ def test_placeholder_arm_raises_rather_than_launching_a_literal_tbd():
 def test_every_committed_non_placeholder_arm_builds_an_argv():
     manifest = lms_manifest.load_arms()
 
-    built = 0
+    built = []
     for arm in manifest.arms:
         if arm.is_placeholder:
             continue
         argv = lms_serve.build_launch_argv(arm, MEASURED_GPU)
         assert argv[:2] == ['docker', 'run']
-        built += 1
+        built.append(arm.arm_id)
 
-    # 7 of the 8 arms; moe-stretch is the TBD-Q3 placeholder.
-    assert built == 7
+    # Derived from the manifest, never a literal count.  This assertion used to
+    # read `== 7` ("8 arms minus the TBD-Q3 placeholder") and step 22's Open Q3
+    # resolution turned it red for the RIGHT reason -- but a count is the wrong
+    # shape: it goes stale on every slate change and says nothing about WHICH
+    # arm failed to build.
+    expected = [a.arm_id for a in manifest.arms if not a.is_placeholder]
+    assert built == expected

@@ -324,4 +324,6 @@ def test_every_committed_non_placeholder_arm_builds_a_fetch_argv():
         and lms_fetch_weights.fetch_argv(arm, TOKEN_ENV)[:2] == ['systemd-run', '--user']
     ]
 
-    assert len(built) == 7  # 8 arms minus the TBD-Q3 moe-stretch placeholder
+    # Derived, never a literal count -- see the twin assertion in
+    # test_lms_serve.py.  Step 22's Open Q3 resolution made the old `== 7` red.
+    assert built == [a.arm_id for a in manifest.arms if not a.is_placeholder]

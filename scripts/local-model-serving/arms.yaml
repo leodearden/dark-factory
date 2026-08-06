@@ -107,10 +107,28 @@ arms:
     # both resolved to the same digest when measured (2026-08-06).
     image: ghcr.io/ggml-org/llama.cpp:server-cuda-b10276
     image_digest: sha256:48a88af72b29e865d64f464e3dc1e4fbbad4a36c5e2298d72d13b690f9d17dd2
-    # STILL a placeholder: Open Q3 owns the model+quant, resolved in step 22.
-    # is_placeholder therefore stays True and every tool keeps refusing this arm.
-    model_ref: TBD-Q3-Qwen3.6-35B-A3B-GGUF-or-gemma-4-26B-A4B-it-GGUF
-    quant: TBD-Q3
+    # Open Q3 RESOLVED from measured file sizes, step 22 (2026-08-06).
+    #
+    # Gemma-4-26B-A4B, not Qwen3.6-35B-A3B, and the reason is arithmetic rather
+    # than preference.  Real GGUF sizes pulled from the HF API:
+    #
+    #   Qwen3.6-35B-A3B  UD-IQ4_XS  16.51 GiB   <- the PRD's nominal IQ4 choice
+    #   Qwen3.6-35B-A3B  UD-IQ3_S   12.74 GiB
+    #   gemma-4-26B-A4B  UD-IQ4_XS  12.66 GiB
+    #   gemma-4-26B-A4B  qat UD-Q4_K_XL  13.27 GiB   <- pinned
+    #
+    # Qwen's smallest TRUE 4-bit quant is 16.51 GiB of weights alone, which
+    # exceeds the whole 16.4 GiB measured budget before a single KV byte.  It
+    # would have fitted PRD D10's nominal 19.5 GiB -- this is precisely the
+    # deviation D10's arithmetic hides.  Serving Qwen here would mean dropping
+    # to IQ3_S and paying a real quality tax on the eval's stretch arm.
+    #
+    # Gemma's QAT weights are quantization-aware TRAINED at 4-bit by Google, so
+    # Q4_K_XL is near-lossless rather than a post-training approximation: the
+    # arm that fits is also the one that does not trade quality to fit.
+    model_ref: unsloth/gemma-4-26B-A4B-it-qat-GGUF
+    gguf_file: gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf
+    quant: q4_k_xl
     port: 8413
     served_model_name: moe-stretch
     # json_object ONLY, and this is enforced by lms_manifest, not merely
@@ -119,24 +137,35 @@ arms:
     # Alpha guarantees the endpoint; the forced client selection is beta's and
     # the hard client-side validator is epsilon's.
     structured_output_mode: json_object
-    est_vram_gib: 17.0
+    est_vram_gib: 14.5
     max_model_len: 16384
     max_num_seqs: 4
     notes: >-
-      PRD Open Q3, resolved from live measurement in this task's step 22.
-      Candidates Qwen3.6-35B-A3B and gemma-4-26B-A4B-it; 115-133 tok/s on a
-      3090 (6x dense-on-vLLM).  est_vram_gib 17.0 is the PRD's nominal IQ4
-      figure and DOES NOT FIT the measured 16.4 GiB budget -- so the VRAM
-      pre-flight refuses this arm today, on purpose, until step 22 pins a
-      quant that actually fits.
+      PRD Open Q3, resolved from measurement in step 22.  Gemma-4-26B-A4B QAT
+      at UD-Q4_K_XL: 13.27 GiB of weights, chosen because Qwen3.6-35B-A3B's
+      smallest true 4-bit quant (IQ4_XS, 16.51 GiB) does not fit the measured
+      16.4 GiB budget at all.  est_vram_gib 14.5 is weights plus the KV cache
+      this arm's sliding-window attention actually needs: 25 of its 30 layers
+      use a 1024-token window, so 16k context costs ~0.82 GiB of KV rather
+      than the ~3.8 GiB a full-attention model of this shape would need.
 
   # ---------------------------------------------------------------------
   # Embedding axis (PRD lines 132-137)
   #
-  # stack: vllm across all four is the Open Q1 hypothesis -- one stack removes
-  # a serving-stack confound from iota's query-latency comparison.  Each arm
-  # records TEI as its fallback_stack; step 22 re-pins per arm from what the
-  # vLLM pooling runner actually loads.
+  # Open Q1 RESOLVED, step 22 (2026-08-06): stack: vllm for ALL FOUR.  Each was
+  # started through the committed chain and probed; all four loaded under the
+  # pooling runner and returned a valid vector of their declared length, so the
+  # preferred uniform stack is what measurement allowed -- one stack removes a
+  # serving-stack confound from iota's query-latency comparison.  TEI was never
+  # pulled; fallback_stack stays recorded but unused.
+  #
+  # Measured: granite 796 MiB/192 ms, gte-modernbert 788 MiB/286 ms,
+  # qwen3-0.6b 16603 MiB/700 ms, qwen3-4b 16078 MiB/580 ms.  The two ~790 MiB
+  # arms are encoder models; the two ~16 GiB arms are DECODERS that emit
+  # embeddings, and vLLM hands a decoder a paged KV cache sized to fill
+  # --gpu-memory-utilization whether a pooling model can use it or not.  That
+  # makes est_vram_gib decorative for those two -- see README, "the budget
+  # verdict's subject is miscalibrated".
   #
   # max_model_len is 8192 uniformly: it is granite-r2's and gte-modernbert's
   # native ceiling, memory texts are far shorter, and a uniform bound keeps
