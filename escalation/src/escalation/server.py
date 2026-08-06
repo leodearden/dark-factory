@@ -1757,9 +1757,13 @@ def create_server(
         ``DONE`` if terminal, ``REQUEUED`` otherwise — never creates new
         escalations as a result of this call.
 
-        Once the workflow slot has cleared, if the task is still
-        ``in-progress`` (the typical /unblock shape: an escalated task whose
-        agent was paused) it is parked as ``blocked``.  ``blocked`` is the
+        Once no workflow slot is live, if the task is still ``in-progress``
+        (the typical /unblock shape: an escalated task whose agent was paused)
+        it is parked as ``blocked``.  This applies **whether or not a slot was
+        registered when the call started**: an orphaned ``in-progress`` task
+        whose lane was already reaped — ``was_active`` False — is parked too,
+        and is in fact the shape most in need of the hold, since nothing else
+        is stopping the scheduler from re-dispatching it.  ``blocked`` is the
         reaper-immune holding state — it stops the orchestrator from
         re-dispatching the task AND protects the worktree from the stranded-
         in-progress reconciliation sweep while the human finishes the work.
@@ -1769,13 +1773,18 @@ def create_server(
         Returns:
             ``{released, was_active, slot_cleared, parked}``
             - ``was_active``: True if a workflow slot was registered when
-              the call started.
+              the call started.  False does NOT mean "nothing happened" — the
+              park below still applies.
             - ``released``: True if ``cancel_workflow`` accepted the request.
-            - ``slot_cleared``: True if the workflow finished within
-              ``timeout_secs``.
-            - ``parked``: the status the task was parked into (``'blocked'``)
-              once the slot cleared, or ``None`` if no park occurred (slot
-              still active, or task already terminal/non-in-progress).
+            - ``slot_cleared``: True if no slot is live by the end of the call
+              (either it finished within ``timeout_secs``, or there was never
+              one to begin with).
+            - ``parked``: the status the task was parked into (``'blocked'``),
+              or ``None`` if no park occurred.  ``None`` means exactly one of:
+              a slot was still active at the deadline, or the task was not at
+              ``in-progress`` (already terminal, parked elsewhere, or the
+              status read failed).  Callers should CONFIRM the park by reading
+              this field rather than assuming it.
         """
         if harness is None:
             return {
@@ -1814,6 +1823,19 @@ def create_server(
         if not harness.is_workflow_active(task_id):
             cur = await harness.scheduler.get_status(task_id)
             if cur == 'in-progress':
+                if not released:
+                    # No slot existed, so Harness.cancel_workflow returned False on its
+                    # `event is None` arm without reaching note_workflow_cancelled — this
+                    # park would land with ZERO grace and the scheduler's
+                    # _phase_redispatch_stranded_blocked phase would flip it back to
+                    # 'pending' within one 15 s idle tick.  Stamp it here so the orphan
+                    # park gets the same _RECONCILE_CANCEL_GRACE_S window a slot-cancel
+                    # park gets.  Sync call — note_workflow_cancelled is a plain `def`.
+                    # Guarded on `not released`: on the slot-cancel arm cancel_workflow
+                    # already stamped, and re-stamping would re-anchor that window.
+                    # Must precede the write below — the scheduler tick can observe the
+                    # 'blocked' row the instant it is persisted.
+                    harness.scheduler.note_workflow_cancelled(task_id)
                 await harness.scheduler.set_task_status(task_id, 'blocked')
                 parked = 'blocked'
 
