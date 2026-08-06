@@ -235,6 +235,17 @@ try:
     FM_LIVENESS_STREAK_THRESHOLD = int(os.environ["FM_LIVENESS_STREAK_THRESHOLD"])
 except (KeyError, ValueError):
     FM_LIVENESS_STREAK_THRESHOLD = 3
+# CLAMPED, unlike the two knobs below, and the asymmetry is deliberate. Their
+# <=0 means "disable the cap" — a safe direction, since a disabled cap only
+# removes a restriction on an already-justified restart. Here <=0 would mean
+# "disable the streak", and because _record_fm_liveness_failure always returns
+# >=1 the gate `streak < FM_LIVENESS_STREAK_THRESHOLD` would then never hold:
+# FM_LIVENESS_STREAK_THRESHOLD=0 silently restores the exact
+# one-non-healthy-verdict-per-kill behaviour this task exists to REMOVE. A
+# numeric 0/-1 sails through the try/except above (it parses fine), so the
+# fallback cannot catch it — hence the floor. An operator who genuinely wants
+# unbounded revives can set FM_LIVENESS_RESTART_MIN_INTERVAL_SECS=0 instead.
+FM_LIVENESS_STREAK_THRESHOLD = max(1, FM_LIVENESS_STREAK_THRESHOLD)
 
 # Maximum age of a persisted streak entry before it is treated as expired and
 # the count restarts at 1. 300s = 5x the 60s tick cadence: a larger gap means
@@ -942,11 +953,25 @@ def _read_json_state(path: str) -> dict | None:
     spam the journal on every 60s tick. Corrupt/unreadable files ARE logged —
     those are genuine degradations, and swallowing them silently is exactly the
     silent-degradation failure mode the project's norms forbid.
+
+    A well-formed but NON-OBJECT body (``[1, 2]``, ``"hello"``, ``null`` — a
+    partially-overwritten or hand-edited file) is logged for the same reason:
+    it is indistinguishable in consequence from a corrupt one, since every
+    caller then loses its state. Before the task-3764 extraction this case
+    raised TypeError inside _read_last_fm_deploy_epoch and WAS logged; letting
+    it become a silent None would have made the deploy backstop and the
+    liveness cap both vanish with zero journal evidence.
     """
     try:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
-        return raw if isinstance(raw, dict) else None
+        if not isinstance(raw, dict):
+            log(
+                f"ignoring non-object watchdog state at {path}: "
+                f"{type(raw).__name__}"
+            )
+            return None
+        return raw
     except FileNotFoundError:
         return None
     except (OSError, ValueError, TypeError) as exc:

@@ -6048,6 +6048,48 @@ def test_fm_liveness_streak_threshold_malformed_env_falls_back(
     assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 3
 
 
+@pytest.mark.parametrize("raw", ["0", "-1", "-7"])
+def test_fm_liveness_streak_threshold_clamps_to_at_least_one(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """A non-positive FM_LIVENESS_STREAK_THRESHOLD is CLAMPED to 1, not honoured.
+
+    0/-1 parse fine, so the try/except fallback cannot catch them. Left
+    unclamped, `streak < FM_LIVENESS_STREAK_THRESHOLD` would never hold (the
+    recorder always returns >=1), silently restoring the exact
+    one-non-healthy-verdict-per-kill behaviour this task removes. The other
+    two knobs in this block DO treat <=0 as "disable", so an operator
+    reasonably tries the same spelling here — it must fail safe.
+    """
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", raw)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 1
+
+
+def test_liveness_pass_threshold_zero_still_requires_a_full_streak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """BEHAVIOURAL: FM_LIVENESS_STREAK_THRESHOLD=0 must not revert the old behaviour.
+
+    The clamp is only meaningful if the pass honours it end-to-end. With the
+    env var set to 0 the pass must still demand a recorded failure (the
+    clamped threshold of 1) rather than treating the gate as vacuous — and
+    critically, a 'healthy' verdict must still restart nothing.
+    """
+    monkeypatch.setenv("FM_LIVENESS_STREAK_THRESHOLD", "0")
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_THRESHOLD == 1
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["healthy", "wedged"])
+
+    wdog.fused_memory_liveness_pass()
+    assert restarted == [], "a healthy verdict must never restart fm, whatever N is"
+
+    wdog.fused_memory_liveness_pass()
+    assert restarted == ["fused-memory.service"], (
+        f"the clamped N=1 threshold must still gate on a recorded failure; got {restarted}"
+    )
+
+
 def test_fm_liveness_streak_max_age_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """FM_LIVENESS_STREAK_MAX_AGE_SECS defaults to 300 (5x the 60s timer cadence)."""
     monkeypatch.delenv("FM_LIVENESS_STREAK_MAX_AGE_SECS", raising=False)
@@ -6362,6 +6404,35 @@ def test_read_json_state_corrupt_json_returns_none_and_logs(
 
     assert wdog._read_json_state(str(target)) is None
     assert logged, "a corrupt state file is a real degradation and must be logged"
+
+
+def test_read_json_state_non_object_body_returns_none_and_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A well-formed but NON-OBJECT body yields None AND a log line.
+
+    ``[1, 2]`` / ``"hello"`` parse fine but carry no state, so every caller
+    loses its clock or streak — indistinguishable in consequence from a
+    corrupt file, and therefore a genuine degradation that must leave journal
+    evidence. Before the task-3764 extraction this case raised TypeError on
+    ``raw["ts"]`` inside _read_last_fm_deploy_epoch and WAS logged; a silent
+    None here would make the fm deploy backstop and the liveness restart cap
+    both vanish with nothing in the journal to explain it.
+    """
+    wdog = _load_watchdog()
+    for body in ("[1, 2]", '"hello"', "null", "3"):
+        logged: list[str] = []
+        monkeypatch.setattr(wdog, "log", lambda m, sink=logged: sink.append(m))
+        target = tmp_path / "nonobject.json"
+        target.write_text(body)
+
+        assert wdog._read_json_state(str(target)) is None, (
+            f"a non-object body must yield None: {body!r}"
+        )
+        assert logged, f"a non-object state body must be logged: {body!r}"
+        assert any(str(target) in m for m in logged), (
+            f"the log line must name the offending path: {logged!r}"
+        )
 
 
 def test_read_json_state_oserror_returns_none_and_logs(
