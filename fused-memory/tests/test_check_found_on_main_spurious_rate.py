@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -57,6 +58,37 @@ def _report(tasks: list[dict], ref: str = 'main') -> dict:
 
 def _task(task_id: str, updated_at: str) -> dict:
     return {'id': task_id, 'updatedAt': updated_at}
+
+
+def _stamped_task(
+    task_id: str,
+    updated_at: str,
+    stamped_at: str | None,
+    *,
+    commit: str = 'a' * 40,
+    as_json: bool = False,
+) -> dict:
+    """A raw task dict carrying a found_on_main done_provenance blob.
+
+    ``stamped_at=None`` models a legacy (pre-3576) stamp: the key is absent
+    from the blob entirely, which is the load-bearing "predates the field"
+    signal. ``as_json`` renders metadata as a JSON string rather than a
+    dict — both shapes reach this code in practice and parse_metadata
+    accepts either.
+    """
+    provenance: dict = {
+        'kind': 'found_on_main',
+        'commit': commit,
+        'note': f'sibling landed this for {task_id}',
+    }
+    if stamped_at is not None:
+        provenance['stamped_at'] = stamped_at
+    metadata: dict = {'done_provenance': provenance}
+    return {
+        'id': task_id,
+        'updatedAt': updated_at,
+        'metadata': json.dumps(metadata) if as_json else metadata,
+    }
 
 
 SINCE = datetime(2026, 7, 16, 0, 0, 0, tzinfo=UTC)
@@ -167,6 +199,71 @@ class TestFindSpuriousSince:
         ]
         offenders = find_spurious_since(report, tasks, SINCE)
         assert [o['task_id'] for o in offenders] == ['3']
+
+
+class TestFreshnessKeyedOffStampedAt:
+    """Freshness comes from ``done_provenance.stamped_at`` when present.
+
+    This is the whole point of task 3576: ``updatedAt`` is bumped by ANY
+    write to the task, so an old stamp touched later for an unrelated
+    reason (a re-tag, the audit's own --apply annotation, a dependency
+    edit) re-enters the window forever — the mechanical loop that keeps the
+    2683 soak gate at EXIT 1 on every re-run.
+    """
+
+    def test_old_stamp_touched_after_since_is_excluded(self):
+        # THE regression this task exists to kill: updatedAt says "fresh",
+        # stamped_at says the attribution was asserted months ago.
+        report = _report([_detail('300', 'misattributed')])
+        tasks = [_stamped_task('300', AFTER_SINCE, BEFORE_SINCE)]
+        assert find_spurious_since(report, tasks, SINCE) == []
+
+    def test_fresh_stamp_on_otherwise_untouched_task_is_included(self):
+        # The converse: the stamp itself is new even though updatedAt
+        # (whatever bumped it) reads as older.
+        report = _report([_detail('301', 'misattributed')])
+        tasks = [_stamped_task('301', BEFORE_SINCE, AFTER_SINCE)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['301']
+
+    def test_legacy_blob_without_stamped_at_falls_back_to_updated_at(self):
+        # Back-compat: ~193 historical stamps carry no stamped_at at all.
+        report = _report([_detail('302', 'misattributed')])
+        tasks = [_stamped_task('302', AFTER_SINCE, None)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['302']
+
+    def test_unparseable_stamped_at_falls_back_to_updated_at(self):
+        # The never-raises contract: a corrupt stamp degrades to the old
+        # behaviour rather than blowing up the predicate.
+        report = _report([_detail('303', 'misattributed')])
+        tasks = [_stamped_task('303', AFTER_SINCE, 'not-a-timestamp')]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['303']
+
+    def test_unparseable_stamped_at_with_old_updated_at_still_excluded(self):
+        report = _report([_detail('304', 'misattributed')])
+        tasks = [_stamped_task('304', BEFORE_SINCE, 'not-a-timestamp')]
+        assert find_spurious_since(report, tasks, SINCE) == []
+
+    def test_metadata_as_json_string_is_handled(self):
+        # get_tasks() hands back metadata as a JSON string in some paths;
+        # parse_metadata accepts both shapes and so must this.
+        report = _report([_detail('305', 'misattributed')])
+        tasks = [_stamped_task('305', AFTER_SINCE, BEFORE_SINCE, as_json=True)]
+        assert find_spurious_since(report, tasks, SINCE) == []
+
+    def test_malformed_metadata_does_not_raise(self):
+        report = _report([_detail('306', 'misattributed')])
+        tasks = [{'id': '306', 'updatedAt': AFTER_SINCE, 'metadata': '{not json'}]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['306']
+
+    def test_stamped_at_exactly_at_since_is_excluded(self):
+        # Strictly-after semantics, matching the existing updatedAt path.
+        report = _report([_detail('307', 'misattributed')])
+        tasks = [_stamped_task('307', AFTER_SINCE, '2026-07-16T00:00:00Z')]
+        assert find_spurious_since(report, tasks, SINCE) == []
 
 
 # ===========================================================================
