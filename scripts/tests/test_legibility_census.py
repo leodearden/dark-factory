@@ -3241,10 +3241,11 @@ def _make_recording_probe(*results):
 def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner():
     """Detector (a): the cap text arrives as the verify reply itself.
 
-    This is the FREE detector -- the reply is already paid for, so scanning
-    it costs nothing and no probe is needed. It is also the common case: the
-    CLI prints the cap banner to stdout, which parse_coder_output would
-    otherwise turn into a parse failure and thus a rejection.
+    This is the common case -- the CLI prints its cap banner to stdout, which
+    parse_coder_output would otherwise turn into a parse failure and thus a
+    rejection. The banner-matching CONTENT is only the TRIGGER: a probe
+    CONFIRMS the cap before the run is aborted, so the detector can never
+    decide from content alone that the account is capped.
     """
     cap = REAL_CLI_CAP_MESSAGES[0]
     replies = [_verdict(), _verdict(), cap, _verdict(), _verdict()]
@@ -3254,7 +3255,9 @@ def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner():
         calls.append(prompt)
         return replies[len(calls) - 1]
 
-    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker: 'weekly limit'")
+    )
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
     )
@@ -3267,7 +3270,7 @@ def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner():
     assert exc.reason and "banner" in exc.reason.lower()
     assert exc.verified == 2, "the two clusters adjudicated before the cap"
     assert exc.unverified == 3, "the hitting cluster plus the two never attempted"
-    assert probe.calls == [], "this detector must not spend a probe -- the reply was free"
+    assert len(probe.calls) == 1, "exactly one confirming probe, on a path that already failed"
 
 
 # ---------------------------------------------------------------------------
@@ -3407,6 +3410,101 @@ def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts
     assert not any(
         c.get("category") == "infra_issue" for c in fake_escalate_fn.calls
     ), "no false 'the account is capped' escalation"
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / REVIEW FIX, part 2/2: the RESIDUAL half of the same false-
+# positive class.
+#
+# Confining the scan to parse FAILURES stops a well-formed verdict being
+# re-read as a banner, but an unparseable reply is still arbitrary model
+# output about cap-related subject matter: if the model ignores the prompt's
+# "STRICT JSON ONLY (no prose, no markdown fences)" instruction and answers in
+# prose about a usage-limit cluster, the marker still matches and the run
+# still aborts with nothing written -- the identical self-perpetuating stall,
+# just reached less often.
+#
+# The principle these pin: banner-matching CONTENT may only TRIGGER a probe,
+# never itself decide that the account is capped.
+# ---------------------------------------------------------------------------
+
+_UNPARSEABLE_CAP_THEMED_PROSE = (
+    "Verified. The rotation really was interrupted by a usage limit at turns "
+    "17 and 27, per the digest."
+)
+
+
+def _prose_at_cluster_two_invoke():
+    """`invoke` returning STRICT-JSON-violating prose for cluster #2 of 4.
+
+    The prose is about a cap-themed cluster, so it matches a marker -- and it
+    is unparseable, so it reaches the scan. This is the residual case that
+    survives the parse-success split.
+    """
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            return _UNPARSEABLE_CAP_THEMED_PROSE
+        return _verdict()
+
+    return invoke
+
+
+def test_default_verify_fn_rejects_unparseable_cap_themed_prose_when_the_probe_says_healthy():
+    """A healthy probe means the marker matched CONTENT, not a real cap.
+
+    The fail-closed default for an unparseable verdict is preserved: the
+    cluster rejects and the loop runs to completion, exactly as it would for
+    any other malformed reply.
+    """
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", _prose_at_cluster_two_invoke(), headroom_probe=probe, probe_every=100,
+    )
+
+    result = verify_fn(_clusters(4), model="sonnet")
+
+    assert len(probe.calls) == 1, "one confirming probe, only on the matched-marker path"
+    assert len(result["verified"]) == 3, "the loop ran to completion"
+    assert [c["title"] for c in result["rejected"]] == ["cluster-1"]
+
+
+def test_default_verify_fn_raises_when_an_unparseable_banner_reply_is_probe_confirmed():
+    """A probe that reports no capacity turns the same content into an abort."""
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker: 'weekly limit'")
+    )
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", _prose_at_cluster_two_invoke(), headroom_probe=probe, probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(4), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 1
+    assert exc.unverified == 3
+    reason = (exc.reason or "").lower()
+    assert "usage limit" in reason, "the reason names the matched marker"
+    assert "probe" in reason, "and says a probe confirmed it, not that content decided it"
+
+
+def test_default_verify_fn_never_infers_a_cap_from_content_without_a_probe():
+    """With no probe there is no way to confirm, so a cap is never inferred.
+
+    This is the whole principle in one assertion: content triggers, the probe
+    decides. Absent a probe, banner-matching content is just another
+    unparseable verdict.
+    """
+    verify_fn = mod._build_default_verify_fn("/tmp/root", _prose_at_cluster_two_invoke())
+
+    result = verify_fn(_clusters(4), model="sonnet")
+
+    assert len(result["verified"]) == 3
+    assert [c["title"] for c in result["rejected"]] == ["cluster-1"]
 
 
 def test_default_verify_fn_raises_when_an_invocation_error_reprobes_capped():
