@@ -587,6 +587,85 @@ class TestDbPool:
         finally:
             await _reap(opened)
 
+    async def test_close_all_warns_when_inflight_connect_exceeds_drain_budget(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """A connect that outlives the drain budget must be reported, not dropped.
+
+        Two invariants in one, both load-bearing:
+
+        1. ``close_all()`` RETURNS.  The drain budget is bounded on purpose — an
+           unbounded wait would let one wedged sqlite open hang application
+           shutdown forever (the failure mode ``_probe_db`` exists to avoid) and
+           would turn a leak into a hang inside pytest teardown.
+        2. The residual is announced LOUDLY, with the concrete db path.  A
+           bounded wait ALONE is a silent fail-soft: the pool would return
+           knowing an aiosqlite worker thread may outlive the event loop, and
+           that fact is unrecoverable anywhere else (INV-2,
+           structured-facts-at-failure / no-silent-fail-soft).
+        """
+        monkeypatch.setattr('dashboard.data.db._INFLIGHT_DRAIN_TIMEOUT', 0.05)
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        opened: list[aiosqlite.Connection] = []
+
+        inside_connect = asyncio.Event()
+        # Deliberately NOT set until the assertions are done: the connect can
+        # therefore never land inside the drain budget.
+        release = asyncio.Event()
+
+        async def wrapper(*args, **kwargs):
+            inside_connect.set()
+            await release.wait()
+            conn = await real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        try:
+            with patch('aiosqlite.connect', wrapper):
+                getter = asyncio.create_task(pool.get(db_path))
+                await asyncio.wait_for(inside_connect.wait(), timeout=2.0)
+                getter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await getter
+
+                caplog.clear()
+                with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
+                    # (1) Bounded: this must not hang on the stuck connect.
+                    await asyncio.wait_for(pool.close_all(), timeout=2.0)
+
+                # (2) Loud: exactly one WARNING, naming the path and the budget.
+                warnings = [
+                    r
+                    for r in caplog.records
+                    if r.name == 'dashboard.data.db' and r.levelno == logging.WARNING
+                ]
+                assert len(warnings) == 1, (
+                    f'expected exactly 1 WARNING about the undrained connect, '
+                    f'got {len(warnings)}: {[r.getMessage() for r in warnings]}'
+                )
+                message = warnings[0].getMessage()
+                assert str(db_path.resolve()) in message, (
+                    f'straggler WARNING must name the still-pending db path '
+                    f'{db_path.resolve()}; got: {message!r}'
+                )
+                assert 'drain' in message.lower() or 'land' in message.lower(), (
+                    f'straggler WARNING must state that the connect did not '
+                    f'land within the drain budget; got: {message!r}'
+                )
+
+                # Release the stuck connect and let the pool reap the late
+                # arrival, so this test leaves no live worker thread behind.
+                release.set()
+                await _wait_until(lambda: bool(opened))
+                await _wait_until(lambda: not opened[0]._running)
+        finally:
+            release.set()
+            await _reap(opened)
+
 
 class TestWithDb:
     """Tests for the with_db helper."""
