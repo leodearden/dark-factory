@@ -1,42 +1,38 @@
-"""Regression test pinning delete_memory's silent no-op on truncated UUIDs.
+"""Regression tests pinning delete_memory's HARD ERROR on truncated UUIDs.
 
-stage1.py's "UUID Resolution Discipline" section (reconciliation/prompts/stage1.py
-~line 101-103) tells agents to *never* construct `delete_memory` ids from
-truncated 8-char hex prefixes (e.g. search-result snippet prefixes like
-'2531b4d8') because Graphiti returns `{status: deleted}` and silently no-ops
-instead of erroring — providing no signal that nothing was actually deleted.
+Task 3132 (PRD memory-write-path-convergence §9 leaf η) inverted this file's
+original premise. It used to pin the *silent no-op*: an 8-char hex prefix
+lifted out of a search-result snippet (e.g. '2531b4d8') produced a fully
+confirming `{'status': 'deleted'}` envelope, a `success=True` write-journal
+entry and a `memory_deleted` event, while nothing was deleted. DF 1144 tried
+to fix that with prompt wording alone; a prompt cannot enforce an API
+contract, so the failure recurred. The enforcement now lives in the API:
+`MemoryService.delete_memory` raises `InputValidationError` on any id that is
+not a canonical 36-char UUID.
 
-That claim was previously unpinned by any test (task 1175's deliverable never
-landed on main — see task 2673, the clean refile). This file pins the
-lower-level half of the documented behavior:
+`TestMemoryServiceDeleteMemoryRejectsTruncatedUuid` pins that guard. It uses
+a real `MemoryService` with mocked backends rather than an `AsyncMock`
+service, because an `AsyncMock` would intercept `delete_memory` before the
+guard could run — and it is the service-level guard specifically that makes
+the enforcement real for the internal (non-MCP) reconciliation and script
+callers, not just for agents.
 
-`GraphitiBackend.remove_edge` — when the driver has no edge matching the
-given uuid (as is always the case for a truncated 8-char prefix, since it can
-never equal a full 36-char UUID primary key — see the length invariant
-below), `EntityEdge.get_by_uuid` raises `EdgeNotFoundError`, which
-`remove_edge` swallows and treats as "already deleted" — it returns `None`
-without raising and without calling `edge.delete`.
-
-The upper-level half — `MemoryService.delete_memory(store='graphiti')`
-returning `{'status': 'deleted', ...}` regardless of whether `remove_edge`
-actually found anything — is already pinned in test_memory_service.py's
-TestDeleteMemory (test_delete_graphiti's status/store assertions,
-test_delete_memory_graphiti_calls_remove_edge's remove_edge(memory_id,
-group_id=...) call assertion). delete_memory is a pure passthrough over
-remove_edge's return value and has no awareness of whether the id it was
-given was truncated, so those existing tests plus the not-found-branch test
-below jointly cover the full silent-no-op path without duplicating
-assertions across files.
-
-If `delete_memory`/`remove_edge` is ever hardened to raise on a truncated or
-otherwise-nonexistent UUID, this test will fail and stage1.py's UUID
-Resolution Discipline section must be updated to match the new behavior.
+`TestGraphitiBackendRemoveEdgeTruncatedUuid` is deliberately UNCHANGED and
+still passing. `GraphitiBackend.remove_edge` still swallows
+`EdgeNotFoundError` and returns `None` without calling `edge.delete`, and
+that is still correct for a genuinely already-deleted edge — hardening it
+would change idempotent-delete semantics for every caller. It is retained
+because it documents the layer *behind* the new guard: anything that
+bypassed the guard would still fail silently, which is precisely why the
+guard has to sit above it.
 """
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from fused_memory.utils.validation import InputValidationError
 
 # A search-result snippet prefix, per stage1.py's own example — 8 hex chars,
 # nowhere near a valid 36-char UUID.
@@ -50,6 +46,29 @@ TRUNCATED_PREFIX = '2531b4d8'
 # injected error is representative of what a truncated prefix actually
 # causes in production, rather than pinning behavior for an arbitrary string.
 assert len(TRUNCATED_PREFIX) != 36
+
+# A well-formed id, for the non-regression assertions: an over-broad validator
+# that also rejected real ids would break every legitimate delete.
+CANONICAL_UUID = 'fccfa232-16fe-404a-880a-8eca32eb974e'
+assert len(CANONICAL_UUID) == 36
+
+
+@pytest.fixture
+def service(mock_config):
+    """Real MemoryService with mocked backends.
+
+    Deliberately NOT an AsyncMock service: an AsyncMock would intercept
+    `delete_memory` wholesale, so the guard under test would never run. Only
+    the real method makes service-layer enforcement observable.
+    """
+    from fused_memory.services.memory_service import MemoryService
+
+    svc = MemoryService(mock_config)
+    svc.graphiti = MagicMock()
+    svc.graphiti.remove_edge = AsyncMock()
+    svc.mem0 = MagicMock()
+    svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    return svc
 
 
 class TestGraphitiBackendRemoveEdgeTruncatedUuid:
@@ -100,15 +119,94 @@ class TestGraphitiBackendRemoveEdgeTruncatedUuid:
             )
 
 
-# NOTE (task 2673 amendment pass): a second class here previously duplicated
-# MemoryService.delete_memory(store='graphiti') coverage that already exists
-# in test_memory_service.py's TestDeleteMemory (test_delete_graphiti's
-# status/store assertions, test_delete_memory_graphiti_calls_remove_edge's
-# remove_edge(memory_id, group_id=...) call assertion). delete_memory is a
-# pure passthrough over remove_edge's return value, so it has no awareness
-# of whether the id it was given was truncated — swapping in
-# TRUNCATED_PREFIX exercised the same wrapper contract as those existing
-# tests with a different string literal, not new behavior. Dropped rather
-# than folded into test_memory_service.py, which is outside this task's
-# locked file scope; see the module docstring above for how the remaining
-# coverage jointly pins the full path.
+# NOTE (task 3132): a second class here once duplicated
+# MemoryService.delete_memory(store='graphiti') passthrough coverage and was
+# dropped in task 2673's amendment pass, on the grounds that delete_memory
+# "has no awareness of whether the id it was given was truncated". That is no
+# longer true — the class below is what makes it false, and it therefore pins
+# genuinely new behaviour rather than restating test_memory_service.py's
+# happy-path wrapper assertions with a different string literal.
+
+
+class TestMemoryServiceDeleteMemoryRejectsTruncatedUuid:
+    """MemoryService.delete_memory raises on any non-full-UUID id.
+
+    This is the API-level enforcement DF 1144's prompt fix could not achieve:
+    it binds the internal callers (reconciliation stages, the scripts/
+    maintenance sweeps) as well as the MCP boundary.
+    """
+
+    @pytest.mark.asyncio
+    async def test_graphiti_store_raises(self, service):
+        with pytest.raises(InputValidationError) as exc_info:
+            await service.delete_memory(
+                memory_id=TRUNCATED_PREFIX, store='graphiti', project_id='test'
+            )
+        assert TRUNCATED_PREFIX in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_mem0_store_raises(self, service):
+        """One guard covers BOTH store paths — not two copies that must agree."""
+        with pytest.raises(InputValidationError) as exc_info:
+            await service.delete_memory(
+                memory_id=TRUNCATED_PREFIX, store='mem0', project_id='test'
+            )
+        assert TRUNCATED_PREFIX in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_graphiti_backend_not_reached(self, service):
+        with pytest.raises(InputValidationError):
+            await service.delete_memory(
+                memory_id=TRUNCATED_PREFIX, store='graphiti', project_id='test'
+            )
+        service.graphiti.remove_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mem0_backend_not_reached(self, service):
+        with pytest.raises(InputValidationError):
+            await service.delete_memory(
+                memory_id=TRUNCATED_PREFIX, store='mem0', project_id='test'
+            )
+        service.mem0.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_write_journal_entry_on_rejection(self, service):
+        """The false audit trail is a distinct harm of the old behaviour: a
+        rejected delete must leave no success=True write-op record."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        mock_journal.log_backend_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        with pytest.raises(InputValidationError):
+            await service.delete_memory(
+                memory_id=TRUNCATED_PREFIX, store='mem0', project_id='test'
+            )
+
+        mock_journal.log_write_op.assert_not_awaited()
+        mock_journal.log_backend_op.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_memory_deleted_event_on_rejection(self, service):
+        """A rejected delete must not announce a deletion to reconciliation."""
+        buffer = MagicMock()
+        buffer.push = AsyncMock()
+        service._event_buffer = buffer
+
+        with pytest.raises(InputValidationError):
+            await service.delete_memory(
+                memory_id=TRUNCATED_PREFIX, store='graphiti', project_id='test'
+            )
+
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_canonical_uuid_still_deletes(self, service):
+        """Non-regression: guards against an over-broad validator."""
+        result = await service.delete_memory(
+            memory_id=CANONICAL_UUID, store='graphiti', project_id='test'
+        )
+        assert result['status'] == 'deleted'
+        service.graphiti.remove_edge.assert_called_once_with(
+            CANONICAL_UUID, group_id='test'
+        )
