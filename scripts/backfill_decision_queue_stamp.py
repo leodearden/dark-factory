@@ -53,6 +53,7 @@ Dry run is the DEFAULT; ``--apply`` is required to write anything.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -205,3 +206,238 @@ def resolve_queue_for_decision(
 
     # Rule 6: ambiguous and uncorroborated -> UNKNOWN. Human triage, not a coin flip.
     return sr.UNKNOWN_QUEUE
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+# Exit codes, named rather than spelled inline so the epilog, main()'s
+# docstring and the returns can never drift into disagreeing about what a
+# number means. Each denotes EXACTLY ONE outcome -- 2 and 3 exist separately
+# from 0 because 0 would otherwise cover both "examined everything, nothing to
+# do" and "examined nothing at all", and an operator reading only the exit code
+# would take a total no-op for a clean run.
+EXIT_OK = 0            # ran clean, or --verify found no unstamped OPEN records
+EXIT_WRITE_FAILED = 1  # at least one --apply write FAILED
+EXIT_UNSTAMPED = 2     # --verify found OPEN records still lacking a queue stamp
+EXIT_NO_QUEUE = 3      # no usable --queue argument; nothing could be resolved
+
+# Disposition reasons. Named constants so the per-record lines, the summary
+# block and the tests all read the SAME strings -- the report is the durable
+# audit artifact for a migration over live state, and a reason label that
+# drifts from what the code did makes it worthless.
+REASON_UNIQUE = 'unique-hit'
+REASON_TIEBREAK_RECON = 'tiebreak-recon'
+REASON_TIEBREAK_ORCH = 'tiebreak-orch'
+REASON_NO_ESCALATION_ID = 'no-escalation-id'
+REASON_NO_HOLDERS = 'no-holders'
+REASON_AMBIGUOUS = 'ambiguous-uncorroborated'
+
+
+def classify_reason(
+    record: sr.DecisionRecord,
+    resolved: str,
+    holders: list[Path],
+) -> str:
+    """Label WHY *resolved* was chosen, for the per-record line and the summary.
+
+    Derived from the same inputs the resolver saw rather than returned
+    alongside it, so the ladder stays a single expression of the policy and
+    this stays a pure description of it.
+
+    The distinction that matters is unique-hit vs. tiebreak-*: both produce a
+    real queue path, but one rests on the id being in exactly one queue and the
+    other on a measured session_id regularity choosing among several. Collapsing
+    them would hide, from the human reviewing this migration, exactly which
+    stamps rest on inference.
+    """
+    if not record.escalation_id:
+        return REASON_NO_ESCALATION_ID
+    if not holders:
+        return REASON_NO_HOLDERS
+    if resolved == sr.UNKNOWN_QUEUE:
+        return REASON_AMBIGUOUS
+    if len(holders) == 1:
+        return REASON_UNIQUE
+    return REASON_TIEBREAK_RECON if record.session_id is None else REASON_TIEBREAK_ORCH
+
+
+def _parse_orch_queue_pairs(pairs: list[str]) -> dict[str, Path]:
+    """Parse repeated ``PROJECT=PATH`` into a mapping. Malformed -> SystemExit.
+
+    LOUD, never silent. Dropping a malformed pair would quietly disable the
+    rule-5 tiebreak for that project and downgrade every one of its ambiguous
+    records to UNKNOWN -- a strictly worse migration wearing a clean exit code.
+    """
+    mapping: dict[str, Path] = {}
+    for pair in pairs:
+        project, sep, path = pair.partition('=')
+        if not sep or not project.strip() or not path.strip():
+            raise SystemExit(
+                f'--orch-queue expects PROJECT=PATH, got {pair!r}. '
+                'Refusing to continue: silently dropping it would disable the '
+                "orchestrator tiebreak for that project and downgrade its "
+                'ambiguous records to <unknown>.'
+            )
+        mapping[project.strip()] = Path(path.strip())
+    return mapping
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='backfill_decision_queue_stamp',
+        description=(
+            'Back-fill DecisionRecord.escalations_dir on OPEN cockpit decisions '
+            'that predate task 3528 queue-stamping. DRY RUN BY DEFAULT: without '
+            '--apply nothing is written. Only OPEN records with no existing '
+            'stamp are ever touched.'
+        ),
+        epilog=(
+            'exit codes: 0 = ran clean (or --verify found no unstamped OPEN '
+            'records); 1 = at least one write FAILED; 2 = --verify found OPEN '
+            'records still lacking a queue stamp; 3 = no usable --queue '
+            'argument, so nothing could be resolved. Never read 2 or 3 as a '
+            'clean run, and note that only 1 ever means a write was attempted '
+            'and rejected.'
+        ),
+    )
+    parser.add_argument(
+        '--queue', dest='queues', action='append', default=[], metavar='PATH',
+        help='An escalation queue to search for escalation ids. May be repeated.',
+    )
+    parser.add_argument(
+        '--recon-queue', default=None, metavar='PATH',
+        help=(
+            'The fleet-wide reconciliation queue, used as the corroborated '
+            'tiebreak target for records with a null session_id.'
+        ),
+    )
+    parser.add_argument(
+        '--orch-queue', dest='orch_queues', action='append', default=[], metavar='PROJECT=PATH',
+        help=(
+            "A project id -> its orchestrator queue, used as the corroborated "
+            'tiebreak target for records filed by a watcher-<slug>-<pid> '
+            'session. May be repeated; the live records spell project ids '
+            'inconsistently, so map every spelling that appears.'
+        ),
+    )
+    parser.add_argument(
+        '--fleet-root', default=None, metavar='PATH',
+        help='Override $CLAUDE_FLEET_ROOT (default: ~/.claude/fleet).',
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='Actually write. Without this the run is inert.',
+    )
+    parser.add_argument(
+        '--verify', action='store_true',
+        help=(
+            'Report-only: exit 2 while any OPEN record lacks a queue stamp, '
+            '0 once none do. Writes nothing even with --apply.'
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Exit codes: 0 = ran clean (or ``--verify`` found no unstamped OPEN
+    records); 1 = at least one write FAILED; 2 = ``--verify`` found unstamped
+    OPEN records; 3 = no usable ``--queue`` argument.
+
+    ``--verify`` short-circuits before any resolution: it answers exactly one
+    question -- "does any OPEN record still lack a queue stamp?" -- which is
+    task 3640's WORK-item-4 invariant, and it must be able to answer that
+    without being handed the queue topology.
+    """
+    args = _build_parser().parse_args(argv)
+    root = Path(args.fleet_root) if args.fleet_root else None
+
+    if args.verify:
+        residue = [
+            d for d in sr.list_decisions(root=root)
+            if d.state == sr.DecisionState.OPEN and not d.escalations_dir
+        ]
+        for decision in residue:
+            print(f'UNSTAMPED {decision.id} project={decision.project} '
+                  f'escalation_id={decision.escalation_id}')
+        print(f'---- summary ----\nunstamped open records: {len(residue)}')
+        return EXIT_UNSTAMPED if residue else EXIT_OK
+
+    queues = [Path(q) for q in args.queues]
+    if not queues:
+        print(
+            'no --queue given: nothing could be resolved. Refusing to report a '
+            'clean run, which would be indistinguishable from "everything is '
+            'already stamped".',
+            file=sys.stderr,
+        )
+        return EXIT_NO_QUEUE
+
+    recon_queue = Path(args.recon_queue) if args.recon_queue else None
+    orch_queue_for_project = _parse_orch_queue_pairs(args.orch_queues)
+
+    mode = 'APPLY' if args.apply else 'DRY RUN (pass --apply to write)'
+    print(f'mode: {mode}')
+
+    # Scope: OPEN and unstamped, nothing else. A non-OPEN record is not
+    # false-closable (the reaper skips it before consulting the queue at all),
+    # and an already-stamped record carries first-hand evidence from its filer
+    # that this script's inference must not overwrite.
+    candidates = [
+        d for d in sr.list_decisions(root=root)
+        if d.state == sr.DecisionState.OPEN and not d.escalations_dir
+    ]
+    print(f'candidates: {len(candidates)}')
+
+    by_reason: dict[str, int] = {}
+    written = 0
+    failed = 0
+    for record in candidates:
+        holders = (
+            queues_holding(record.escalation_id, queues) if record.escalation_id else []
+        )
+        resolved = resolve_queue_for_decision(
+            record,
+            queues=queues,
+            recon_queue=recon_queue,
+            orch_queue_for_project=orch_queue_for_project,
+        )
+        reason = classify_reason(record, resolved, holders)
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        holder_names = ','.join(str(h) for h in holders) or '-'
+        line = (
+            f'{record.id} project={record.project} '
+            f'escalation_id={record.escalation_id} session_id={record.session_id} '
+            f'holders=[{holder_names}] -> {resolved} ({reason})'
+        )
+        if args.apply:
+            updated = sr.set_decision_escalations_dir(record.id, resolved, root=root)
+            if updated is None:
+                failed += 1
+                print(f'{line} WRITE-FAILED')
+                continue
+            written += 1
+        print(line)
+
+    print('---- summary ----')
+    print(f'candidates: {len(candidates)}')
+    for reason in (
+        REASON_UNIQUE,
+        REASON_TIEBREAK_RECON,
+        REASON_TIEBREAK_ORCH,
+        REASON_NO_ESCALATION_ID,
+        REASON_NO_HOLDERS,
+        REASON_AMBIGUOUS,
+    ):
+        print(f'  {reason}: {by_reason.get(reason, 0)}')
+    print(f'written: {written}   write-failed: {failed}')
+    if not args.apply:
+        print('nothing was written (dry run)')
+    return EXIT_WRITE_FAILED if failed else EXIT_OK
+
+
+if __name__ == '__main__':
+    sys.exit(main())

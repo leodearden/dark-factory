@@ -460,6 +460,19 @@ def _stamps(fleet: Path) -> dict[str, str]:
     return {d.id: d.escalations_dir for d in sr.list_decisions(root=fleet)}
 
 
+def _dispositions(stdout: str, tmp_root: Path) -> str:
+    """The per-record disposition lines only, with tmp paths normalized.
+
+    Excludes the mode banner and the trailing dry-run notice, which SHOULD
+    differ between a dry run and an apply.
+    """
+    return '\n'.join(
+        line.replace(str(tmp_root), 'X')
+        for line in stdout.splitlines()
+        if line.startswith('dec-')
+    )
+
+
 def test_main_dry_run_is_the_default_and_writes_nothing(tmp_path: Path) -> None:
     """No --apply -> inert. The single most important property of a migration
     over live fleet state that no test may assert against: an operator must be
@@ -499,10 +512,18 @@ def test_main_apply_stamps_exactly_what_the_dry_run_predicted(tmp_path: Path) ->
     assert stamps['dec-unique'] == sr.normalize_escalations_dir(orch_b)
     assert stamps['dec-nothing'] == sr.UNKNOWN_QUEUE
     assert stamps['dec-ambiguous'] == sr.UNKNOWN_QUEUE
-    # The dry run named the same two outcomes for the same two ids.
-    assert dry.stdout.replace(str(tmp_path / 'a'), 'X') == applied.stdout.replace(
-        str(tmp_path / 'b'), 'X'
-    )
+    # Every per-record DISPOSITION line matches, tmp-path-normalized. The mode
+    # banner and the trailing dry-run notice are deliberately excluded -- those
+    # SHOULD differ, and asserting on them would pin cosmetics instead of the
+    # property that matters (the dry run predicted the applied outcome).
+    assert _dispositions(dry.stdout, tmp_path / 'a') == _dispositions(applied.stdout, tmp_path / 'b')
+    # ...and what it predicted is what actually landed on disk.
+    for decision_id, value in stamps.items():
+        if decision_id in ('dec-unique', 'dec-nothing', 'dec-ambiguous'):
+            assert f'{decision_id} ' in dry.stdout
+            assert value.replace(str(tmp_path / 'b'), 'X') in _dispositions(
+                dry.stdout, tmp_path / 'a'
+            )
 
 
 def test_main_apply_never_touches_out_of_scope_records(tmp_path: Path) -> None:
