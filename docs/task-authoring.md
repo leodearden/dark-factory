@@ -116,7 +116,7 @@ marked `done` on the strength of an unverified claim.
 | `kind` | Meaning | Conditional requirements |
 |---|---|---|
 | `merged` | Landed via the normal merge queue | `commit` required |
-| `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required |
+| `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
 | `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run` | — |
 | `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | — |
@@ -129,6 +129,35 @@ it is likewise exempt from the reopen-freshness gate (which only inspects
 callers, on both the fresh `done` transition and the same-status
 `done`→`done` repair path — a recon stage may never self-authorize an
 operational close.
+
+#### `stamped_at` (server-written, `found_on_main` only)
+
+`found_on_main` stamps additionally carry `stamped_at`: an ISO-8601 UTC
+timestamp recording **when the attribution was asserted**.
+
+- **Never supply it.** It is written server-side by fused-memory's
+  `_validate_done_provenance` chokepoint, which every `found_on_main`
+  producer funnels through (the fresh `done` transition, the same-status
+  repair seam, agent `set_task_status` calls, and the orchestrator's
+  `Scheduler.mark_done`). A caller-supplied value is **discarded with a
+  warning**, not rejected — rejecting would break the repair seam, which
+  re-submits an already-stamped blob. A repair **refreshes** the stamp,
+  which is correct: a repair is a fresh assertion of the attribution.
+- **Scoped to `found_on_main`.** No other kind carries it. `merged`
+  already has independent landing evidence (merge-queue journal +
+  ancestor check + commit citation); `found_on_main` is the
+  attribution-by-inference kind that lacked any record of *when* the
+  inference was made.
+- **Its absence is load-bearing.** `updatedAt` cannot answer "when was
+  this asserted?" — any later write to the task bumps it. So stamps
+  written before task 3576 landed have no `stamped_at`, and because every
+  write through the chokepoint since then populates it, **absence proves
+  the stamp predates 3576**. The soak-gate predicate
+  (`fused-memory/scripts/check_found_on_main_spurious_rate.py`) uses
+  exactly this to separate legacy backlog (`stamp_class=legacy` —
+  reported but never gating) from genuinely new stamps
+  (`stamp_class=fresh` — which gate). For that reason the field is
+  optional, not conditionally required, and must stay that way.
 
 ### Terminal-task write freeze (recon-stage boundary)
 
