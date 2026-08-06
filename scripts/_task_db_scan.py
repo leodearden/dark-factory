@@ -301,3 +301,85 @@ def run_scan_cli(
         return 3
 
     return 1 if matches else 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — audit-script CLI plumbing (the two audit scripts).
+#
+# Adopted by audit_wiped_metadata_files.py and audit_combine_gate_marker_loss.py
+# (task 3616, closing task 3286's follow-on finding that the two audit main()s
+# were ~65 near-identical lines). This tier sweeps PROJECT ROOTS rather than db
+# paths, and its per-root callback returns exactly ONE audit object per root —
+# see sweep_project_roots' contract, which is what the exit-3 gate rests on.
+#
+# Each script keeps what genuinely differs: its own --project-root/--json
+# parser and epilog wording, its own report/JSON renderers, its own
+# "is this dirty?" predicate, and (for wiped) the --min-fidelity filter.
+# ---------------------------------------------------------------------------
+
+# The exit-2 signal, emitted verbatim by both audit scripts. Named to parallel
+# NO_DB_RESOLVED_MESSAGE above, which carries the db-flavoured spelling.
+NO_PROJECT_ROOT_RESOLVED_MESSAGE = (
+    "no project root resolvable with a readable tasks.db (checked "
+    "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
+    "dark-factory default)"
+)
+
+# Named rather than spelled inline so each script's epilog, its main()
+# docstring and run_audit_cli's returns can never drift into disagreeing about
+# what a number means — the property audit_combine_gate_marker_loss.py's
+# per-script EXIT_* names were introduced for, preserved here now that the
+# returns live behind a module boundary. Each denotes EXACTLY ONE outcome;
+# that is the whole reason 3 exists rather than being folded into 0.
+AUDIT_EXIT_OK = 0                # audited; nothing dirty found
+AUDIT_EXIT_FINDINGS = 1          # at least one dirty result (is_dirty fired)
+AUDIT_EXIT_NO_ROOT = 2           # no project root resolved to a readable tasks.db
+AUDIT_EXIT_NOTHING_AUDITED = 3   # roots resolved but EVERY one failed to audit
+
+
+def sweep_project_roots(
+    roots: Sequence[str],
+    audit_fn: Callable[[str], Any],
+) -> tuple[list[Any], list[str]]:
+    """Run *audit_fn* over every root in *roots*, returning (audits, unreadable).
+
+    CONTRACT — :func:`run_audit_cli`'s exit-3 gate depends on it: *audit_fn*
+    returns EXACTLY ONE audit object per root, or raises ``sqlite3.Error``.
+    Under that contract ``len(audits) + len(unreadable) == len(roots)`` always
+    holds, so "no audits but some unreadable" is precisely "every root failed".
+    An *audit_fn* that instead returned None to "skip" a root would break that
+    equality and silently re-open the false green exit 3 exists to close
+    (docs/legibility/design-invariants.md, no-silent-fail-soft).
+
+    A single unreadable project (e.g. a corrupt/locked tasks.db, or a transient
+    "database is locked"/"file is not a database" condition) does not abort the
+    sweep: it is logged to stderr and skipped so every other resolvable project
+    is still audited and reported. Only ``sqlite3.Error`` is caught — any other
+    exception propagates, so a real bug in *audit_fn* surfaces instead of being
+    silently downgraded to "unreadable project".
+
+    Writes the per-project warnings during the loop and the aggregate "results
+    below are incomplete" warning after it, so a caller printing its report
+    afterwards keeps the warnings above the results.
+
+    Structurally parallel to :func:`sweep_databases` on purpose: keeping the
+    two shapes aligned is what makes "pure extraction, no behaviour change"
+    checkable by diff.
+    """
+    audits: list[Any] = []
+    unreadable: list[str] = []
+    for root in roots:
+        try:
+            audits.append(audit_fn(root))
+        except sqlite3.Error as exc:
+            print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
+            unreadable.append(root)
+
+    if unreadable:
+        print(
+            f"warning: {len(unreadable)} project(s) skipped due to read errors "
+            "(see warnings above); results below are incomplete",
+            file=sys.stderr,
+        )
+
+    return audits, unreadable
