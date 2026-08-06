@@ -41,6 +41,7 @@ _mod = _load_module()
 parse_since = _mod.parse_since
 find_spurious_since = _mod.find_spurious_since
 format_summary = _mod.format_summary
+gating_offenders = _mod.gating_offenders
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +265,92 @@ class TestFreshnessKeyedOffStampedAt:
         report = _report([_detail('307', 'misattributed')])
         tasks = [_stamped_task('307', AFTER_SINCE, '2026-07-16T00:00:00Z')]
         assert find_spurious_since(report, tasks, SINCE) == []
+
+
+class TestStampClassAndGatingOffenders:
+    """The fresh/legacy split, and what it gates.
+
+    Legacy offenders are still RETURNED (and still printed) — only the
+    exit-code gate is narrowed to fresh ones. Dropping them outright would
+    make the gate structurally blind to any future write path that bypasses
+    _validate_done_provenance: an unstamped-but-new blob would be classed
+    legacy and never gate, silently.
+    """
+
+    def test_stamp_class_fresh_when_keyed_off_stamped_at(self):
+        report = _report([_detail('400', 'misattributed')])
+        tasks = [_stamped_task('400', BEFORE_SINCE, AFTER_SINCE)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['stamp_class'] for o in offenders] == ['fresh']
+
+    def test_stamp_class_legacy_when_fell_back_to_updated_at(self):
+        report = _report([_detail('401', 'misattributed')])
+        tasks = [_stamped_task('401', AFTER_SINCE, None)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['stamp_class'] for o in offenders] == ['legacy']
+
+    def test_stamp_class_legacy_for_task_with_no_metadata_at_all(self):
+        report = _report([_detail('402', 'misattributed')])
+        tasks = [_task('402', AFTER_SINCE)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['stamp_class'] for o in offenders] == ['legacy']
+
+    def test_every_record_carries_a_stamp_class(self):
+        report = _report([
+            _detail('403', 'misattributed'),
+            _detail('404', 'deliverable_absent'),
+        ])
+        tasks = [
+            _stamped_task('403', BEFORE_SINCE, AFTER_SINCE),
+            _stamped_task('404', AFTER_SINCE, None),
+        ]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert len(offenders) == 2
+        assert all('stamp_class' in o for o in offenders)
+
+    def test_gating_offenders_keeps_only_fresh(self):
+        report = _report([
+            _detail('405', 'misattributed'),
+            _detail('406', 'misattributed'),
+        ])
+        tasks = [
+            _stamped_task('405', BEFORE_SINCE, AFTER_SINCE),  # fresh
+            _stamped_task('406', AFTER_SINCE, None),          # legacy
+        ]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in offenders] == ['405', '406']
+        assert [o['task_id'] for o in gating_offenders(offenders)] == ['405']
+
+    def test_all_legacy_backlog_yields_empty_gating_list_but_is_still_reported(self):
+        # The 13 known offenders, modelled: every one legacy, every one
+        # still returned by find_spurious_since so it stays printable.
+        report = _report([_detail(str(500 + i), 'misattributed') for i in range(13)])
+        tasks = [_stamped_task(str(500 + i), AFTER_SINCE, None) for i in range(13)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert len(offenders) == 13
+        assert gating_offenders(offenders) == []
+
+    def test_gating_offenders_on_empty_list(self):
+        assert gating_offenders([]) == []
+
+    def test_gating_offenders_preserves_sort_order(self):
+        report = _report([
+            _detail('200', 'misattributed'),
+            _detail('50', 'misattributed'),
+        ])
+        tasks = [
+            _stamped_task('200', BEFORE_SINCE, AFTER_SINCE),
+            _stamped_task('50', BEFORE_SINCE, AFTER_SINCE),
+        ]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        assert [o['task_id'] for o in gating_offenders(offenders)] == ['50', '200']
+
+    def test_gating_offenders_does_not_mutate_input(self):
+        report = _report([_detail('407', 'misattributed')])
+        tasks = [_stamped_task('407', AFTER_SINCE, None)]
+        offenders = find_spurious_since(report, tasks, SINCE)
+        gating_offenders(offenders)
+        assert len(offenders) == 1, 'the helper must be a pure filter'
 
 
 # ===========================================================================
