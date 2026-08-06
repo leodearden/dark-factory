@@ -172,6 +172,76 @@ async def test_no_slot_in_progress_task_parked_as_blocked(queue):
 
 
 @pytest.mark.asyncio
+async def test_no_slot_park_stamps_reaper_grace(queue):
+    """The orphan park must open the reconcile grace window itself.
+
+    On the no-slot arm ``Harness.cancel_workflow`` bails on its
+    ``event is None`` branch and returns False WITHOUT reaching its
+    ``scheduler.note_workflow_cancelled`` call — so a park landed here gets
+    ZERO grace, and ``Scheduler._phase_redispatch_stranded_blocked`` (guarded
+    by ``workflow_cancel_recent``) flips it straight back to 'pending' within
+    one idle tick.  The park would be undone before the human noticed.
+
+    Ordering matters as much as the call: the scheduler tick can observe the
+    'blocked' row the instant it is persisted, so the stamp must land BEFORE
+    the status write, never after.
+    """
+    harness = _FakeHarness(status='in-progress')
+    # No slot registered — the orphaned arm.
+    manager = MagicMock()
+    manager.attach_mock(harness.scheduler.note_workflow_cancelled, 'stamp')
+    manager.attach_mock(harness.scheduler.set_task_status, 'set_status')
+
+    server = create_server(queue, harness=harness)
+    result = await _call_release(server, task_id='42', timeout_secs=1)
+
+    assert result['parked'] == 'blocked'
+    # Sync call, NOT awaited — the real Scheduler.note_workflow_cancelled is
+    # a plain `def`.
+    harness.scheduler.note_workflow_cancelled.assert_called_once_with('42')
+    # Stamp strictly precedes the status write.
+    ordering = [c[0] for c in manager.mock_calls]
+    assert ordering.index('stamp') < ordering.index('set_status'), (
+        f'grace stamp must precede the blocked write, got {ordering!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_slot_park_does_not_restamp_grace(queue):
+    """The slot-cancel arm must NOT be re-stamped — explicit non-goal.
+
+    When a slot was live, ``Harness.cancel_workflow`` already stamped the
+    grace window before returning True.  Re-stamping after the wait loop would
+    re-anchor that window to a later moment, silently extending it by however
+    long the caller waited — a real behaviour change to the slot-cancel path
+    that task 3724 puts out of scope.  Hence the ``not released`` guard.
+
+    This is the test that fails if the stamp is made unconditional.
+    """
+    harness = _FakeHarness(status='in-progress')
+    ev = asyncio.Event()
+    harness.events['42'] = ev
+
+    async def _watcher():
+        await ev.wait()
+        await asyncio.sleep(0.05)
+        harness.events.pop('42', None)
+
+    server = create_server(queue, harness=harness)
+    asyncio.create_task(_watcher())
+    result = await _call_release(server, task_id='42', timeout_secs=2)
+
+    assert result['was_active'] is True
+    assert result['released'] is True
+    assert result['parked'] == 'blocked'
+    # cancel_workflow already opened the window on this arm; the tool must not
+    # touch it.  (_FakeHarness.cancel_workflow mirrors the real one's no-stamp
+    # behaviour only on the None-event arm, so any call seen here came from
+    # the tool itself.)
+    harness.scheduler.note_workflow_cancelled.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     'status',
     [
