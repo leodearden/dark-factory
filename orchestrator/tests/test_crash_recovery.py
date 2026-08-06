@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import SessionResumeConfig
+from orchestrator.config import SessionResumeConfig, TranscriptArchiveConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
@@ -2590,3 +2590,136 @@ class TestRecoverCrashedTasksC2Namespace:
             assert any(name in m for m in info_messages), (
                 f'missing explicit skip/report line naming {name}'
             )
+
+
+# ── archive_available instrumentation helpers (task 3727) ────────────────────
+# A lane-encoded project dir DELIBERATELY unlike any config dir these tests
+# build, so a passing lookup proves the encoded-cwd component was globbed
+# rather than reconstructed from the caller's own cwd (I-B).
+_ARCHIVE_ENC = '-home-leo-src-dark-factory--worktrees-9999'
+
+
+def _make_archive(project_root: Path, task_id: str, session_id: str) -> Path:
+    """Lay down one archived transcript at the real producer layout.
+
+    ``<project_root>/data/orchestrator/agent-transcripts/<task_id>/<enc>/
+    <session_id>.jsonl.gz`` — the path shared.transcript_archive._archive_one
+    writes and durable_archive_path globs.
+    """
+    dest = (
+        project_root
+        / 'data/orchestrator/agent-transcripts'
+        / task_id
+        / _ARCHIVE_ENC
+        / f'{session_id}.jsonl.gz'
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b'archived-transcript-bytes')
+    return dest
+
+
+@pytest.mark.asyncio
+class TestSessionResumeArchiveAvailable:
+    """archive_available on session_resume_fallback (task 3727, PRD §8).
+
+    Every fallback emit reports whether that session was actually RECOVERABLE
+    from the durable transcript archive — the measurement task 3619 will move
+    and leaf δ may later gate on. It is instrumentation ONLY (D8 / INV-3
+    instrument-before-acting): it must never change what dispatches, so every
+    assertion here also pins that the reason, the resume decision and the
+    storm streak are exactly what they were before the field existed.
+    """
+
+    async def test_no_transcript_reports_archive_present(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Archive PRESENT under a foreign lane → archive_available is True.
+
+        The recoverable population: the transcript is gone from the live
+        config dir but survives in the durable archive, under an encoded-cwd
+        dir belonging to no lane this test uses.
+        """
+        session = {
+            'session_id': 'uuid-arch-yes',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-empty-yes'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        _make_archive(harness.config.project_root, 'ar1', 'uuid-arch-yes')
+
+        resume_id = await _drive_session_slot(
+            harness, 'ar1', session, config_dir=empty_cfg
+        )
+
+        # D8: the resume decision and the reason are untouched.
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'no_transcript'
+        # `is True`, not truthy: the field must be a real JSON bool for
+        # json_extract(data, '$.archive_available') to be queryable in runs.db.
+        assert kwargs['data']['archive_available'] is True
+        # D8: a genuine corroboration failure still feeds the storm streak.
+        assert harness._session_resume_fallback_streak == 1
+
+    async def test_no_transcript_reports_archive_absent(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Empty archive root → archive_available is False."""
+        session = {
+            'session_id': 'uuid-arch-no',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-empty-no'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        resume_id = await _drive_session_slot(
+            harness, 'ar2', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['archive_available'] is False
+        assert harness._session_resume_fallback_streak == 1
+
+    async def test_stale_also_carries_the_field(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """reason == 'stale' carries it too — it rides the BRANCH, not one reason."""
+        real = SessionResumeConfig()
+        stale_at = datetime.now(UTC) - timedelta(seconds=2 * real.freshness_window_secs)
+        session = {
+            'session_id': 'uuid-arch-stale',
+            'role': 'implementer',
+            'started_at': stale_at.isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-arch-stale')
+        harness.config.session_resume = SessionResumeConfig()
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        _make_archive(harness.config.project_root, 'ar3', 'uuid-arch-stale')
+
+        resume_id = await _drive_session_slot(harness, 'ar3', session, config_dir=cfg)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'stale'
+        assert kwargs['data']['archive_available'] is True
+        assert harness._session_resume_fallback_streak == 1
