@@ -1080,6 +1080,11 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
         from orchestrator.verify import _serial_pytest_str  # noqa: PLC0415
 
         serial = _serial_pytest_str(_FLEET_TEST_COMMAND)
+        # `_serial_pytest_str` is typed `str | None -> str | None` because it
+        # returns its argument unchanged on a None/non-parsing command; the
+        # None arm is unreachable for a str argument, so narrow it explicitly
+        # rather than leaving `split_and_chain_segments(str)` a type error.
+        assert serial is not None, 'serialising a str command must return a str'
         assert serial != _FLEET_TEST_COMMAND, 'the fleet chain must actually serialise'
         segments = split_and_chain_segments(serial)
         assert segments is not None, 'the serialised chain must still be segmentable'
