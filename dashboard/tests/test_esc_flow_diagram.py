@@ -321,19 +321,25 @@ def test_index_html_registers_esc_flow_diagram_load_order(index_html_body: str) 
     )
 
 
-def test_index_html_cache_buster_bumped_for_esc_flow(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must still share a single
-    version, and that version must be >= 33 (the uniform bump that
-    accompanies registering the two new esc_flow_* files).
+def test_index_html_cache_buster_not_reverted_below_esc_flow_floor(
+    index_html_body: str,
+) -> None:
+    """Every /static/redux/* asset must stay at or past the floor that
+    accompanied registering the two new esc_flow_* files.
+
+    This is an ANTI-REVERT PIN, not a live bump check: index.html is far past
+    33 today, so it fails only if someone rolls the cache-busters back below
+    what esc_flow_* registration needed. Whether the versions are UNIFORM, and
+    whether the newest bump landed, are both asserted in test_index_html.py.
     """
-    versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
-        'bump all of them uniformly to the same value.'
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    v = int(next(iter(versions)))
-    assert v >= 33, (
-        f'index.html cache-buster version is {v}, expected >= 33 (uniform bump for esc_flow_* registration).'
+    assert min(versions) >= 33, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        'expected >= 33 (the floor esc_flow_* registration landed at).'
     )
 
 

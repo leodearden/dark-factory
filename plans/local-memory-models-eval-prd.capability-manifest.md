@@ -40,7 +40,7 @@ literal marker line `PRD-MARKER:local-memory-models-eval <artifact-slug>`
 |---|---|---|
 | vLLM ≥0.26 OpenAI-compatible structured outputs (`json_schema`, xgrammar) | research-verified 2026-08-05 against current vLLM docs (PRD appendix); measured conformance 81–100% with guided decoding (SqueezeBits benchmark) | PASS |
 | llama.cpp MoE arm constraint honesty | ggml-org/llama.cpp#21228: silent fallback to unconstrained output on `$ref`/`$defs` schemas → arm pinned to `json_object` + client-side validator (validator = ε; forced mode = β) | PASS |
-| GPU headroom 19–20GB | measured: 24GB − ~4GB whisper-writer resident (Leo, PRD D10) | PASS |
+| GPU headroom: ~16.4 GiB free VRAM available to an arm (measured) | 2026-08-05 decompose-time derivation: 24GB − ~4GB whisper-writer resident (Leo, PRD D10) — SUPERSEDED 2026-08-06 by direct measurement: `nvidia-smi` free ≈ 16.4 GiB (`--query-compute-apps` omits the KDE/X11 desktop's graphics contexts, ~3.2–3.3 GB, so the subtraction overstated headroom) | PASS (corrected 2026-08-06 — see PRD D10) |
 | Candidate weights exist (incl. **no Qwen3-Embedding-2B** — family is 0.6B/4B/8B) | HF cards / QwenLM GitHub verified 2026-08-05 (PRD appendix) | PASS |
 
 Delivered-check: grep `PRD[-]MARKER:local-memory-models-eval serving` in

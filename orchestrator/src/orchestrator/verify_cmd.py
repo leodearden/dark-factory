@@ -242,15 +242,68 @@ def _has_shell_grouping_or_substitution(raw: str) -> bool:
     return False
 
 
+def _unquoted_chars(raw: str) -> tuple[list[tuple[int, str]], bool]:
+    """POSIX quote/escape walk: ``(index, char)`` for every char OUTSIDE quotes.
+
+    Returns ``(chars, unterminated)``. *chars* lists every position in *raw*
+    reached with no active quote context, left to right; quote delimiters,
+    everything between them, and backslash-escaped characters are never
+    included — a caller that only needs *raw*'s STRUCTURAL surface (chain
+    operators, parens, backticks) gets quote-safety for free by scanning
+    *chars* instead of *raw* itself, without hand-rolling the quote rules
+    again. *unterminated* is True when *raw* ends inside an unclosed quote.
+
+    Rules match ``shlex.split``: a backslash escapes (and is consumed along
+    with) the following character outside quotes and inside double quotes;
+    inside single quotes a backslash is a plain literal with no escaping
+    power; a quote closes only on its own kind.
+
+    The shared stepping rule under both ``_scan_and_chain`` (operator/paren
+    scanning for `&&`-chain splitting) and ``_split_at_unbalanced_close``
+    (paren-depth trimming for the pytest-invocation appender) — one home for
+    the POSIX quoting rules instead of two hand-maintained copies that could
+    silently disagree. Task 3338 applied this same one-scanner principle to
+    ``_scan_and_chain``'s own strict/non-strict split; the task 3650
+    amendment extends it across both consumers, which is also what makes
+    ``_split_at_unbalanced_close`` quote-AWARE (see its docstring) rather
+    than the quote-blind first cut that shipped with this task.
+    """
+    chars: list[tuple[int, str]] = []
+    i = 0
+    n = len(raw)
+    quote: str | None = None
+    while i < n:
+        ch = raw[i]
+        if quote is None:
+            if ch == '\\':
+                i += 2
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                i += 1
+                continue
+            chars.append((i, ch))
+            i += 1
+            continue
+        # Inside quotes: only a double-quote context honours backslash escapes.
+        if quote == '"' and ch == '\\':
+            i += 2
+            continue
+        if ch == quote:
+            quote = None
+        i += 1
+    return chars, quote is not None
+
+
 def _scan_and_chain(raw: str, *, strict: bool) -> list[str] | None:
     """THE `&&`-chain scanner. Splits *raw* at quote depth 0, VERBATIM.
 
-    A character-scan state machine tracking single-quote / double-quote state
-    and backslash escapes (POSIX rules, matching ``shlex.split``: a backslash
-    escapes outside quotes and inside double quotes, but is literal inside
-    single quotes). A `&&` inside quotes is an argument value — pytest's
-    ``-k 'a && b'`` is the real case — not a chain operator, so it is not a
-    split point.
+    Walks ``_unquoted_chars(raw)`` — a character-scan state machine tracking
+    single-quote / double-quote state and backslash escapes (POSIX rules,
+    matching ``shlex.split``: a backslash escapes outside quotes and inside
+    double quotes, but is literal inside single quotes). A `&&` inside quotes
+    is an argument value — pytest's ``-k 'a && b'`` is the real case — not a
+    chain operator, so it is not a split point.
 
     Clauses keep every byte between separators, boundary whitespace included,
     so ``'&&'.join(...) == raw`` exactly in the non-strict mode. That
@@ -282,58 +335,41 @@ def _scan_and_chain(raw: str, *, strict: bool) -> list[str] | None:
     """
     clauses: list[str] = []
     start = 0
-    i = 0
-    quote: str | None = None
     depth = 0
-    n = len(raw)
-    while i < n:
-        ch = raw[i]
-        if quote is None:
-            if ch == '\\':
-                i += 2
-                continue
-            if ch in ('"', "'"):
-                quote = ch
-                i += 1
-                continue
-            if strict and ch == '(':
-                depth += 1
-                i += 1
-                continue
-            if strict and ch == ')':
-                depth -= 1
-                if depth < 0:
-                    # Unbalanced: a `)` with no opener. Refuse rather than
-                    # slice a construct we have already mis-read.
-                    return None
-                i += 1
-                continue
-            if strict and ch == '`':
-                # Backtick substitution: this scanner does not track its
-                # interior, so an `&&` inside one could become a bogus split.
-                return None
-            if ch == '&' and raw[i + 1 : i + 2] == '&':
-                if depth == 0:
-                    clauses.append(raw[start:i])
-                    start = i + 2
-                i += 2
-                continue
-            if strict and depth == 0 and ch in ('&', ';', '|'):
-                # A lone `&` backgrounds the clause (its rc is the shell's, not
-                # the command's); `;` runs the next clause unconditionally; `|`
-                # and `||` reassign the clause's exit status. All three break
-                # per-segment rc attribution, which is the whole product here.
-                return None
-            i += 1
+    skip_next = False
+    chars, unterminated = _unquoted_chars(raw)
+    for i, ch in chars:
+        if skip_next:
+            # The second `&` of an `&&` this loop already consumed below.
+            skip_next = False
             continue
-        # Inside quotes: only a double-quote context honours backslash escapes.
-        if quote == '"' and ch == '\\':
-            i += 2
+        if strict and ch == '(':
+            depth += 1
             continue
-        if ch == quote:
-            quote = None
-        i += 1
-    if strict and (quote is not None or depth != 0):
+        if strict and ch == ')':
+            depth -= 1
+            if depth < 0:
+                # Unbalanced: a `)` with no opener. Refuse rather than
+                # slice a construct we have already mis-read.
+                return None
+            continue
+        if strict and ch == '`':
+            # Backtick substitution: this scanner does not track its
+            # interior, so an `&&` inside one could become a bogus split.
+            return None
+        if ch == '&' and raw[i + 1 : i + 2] == '&':
+            if depth == 0:
+                clauses.append(raw[start:i])
+                start = i + 2
+            skip_next = True
+            continue
+        if strict and depth == 0 and ch in ('&', ';', '|'):
+            # A lone `&` backgrounds the clause (its rc is the shell's, not
+            # the command's); `;` runs the next clause unconditionally; `|`
+            # and `||` reassign the clause's exit status. All three break
+            # per-segment rc attribution, which is the whole product here.
+            return None
+    if strict and (unterminated or depth != 0):
         # Unbalanced quote or paren at end of scan.
         return None
     clauses.append(raw[start:])
@@ -1305,7 +1341,68 @@ def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
 # operator (&&, ||, ;) or end of string — the span serial_pytest's raw-chain
 # path rewrites. Word-bounded so it doesn't match inside 'pytest_xdist' etc.
 # Moved from verify.py's _PYTEST_INVOCATION_RE / _force_serial_pytest.
+#
+# Deliberately left broad — it does NOT exclude ')' — even though a matched
+# span can therefore run past a subshell-closing ')' (the committed fleet
+# test_command's cockpit clause is exactly this shape:
+# ``( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/
+# --timeout=300 )``). The tempting fix, adding ')' to the excluded class
+# (``[^&|;)]*``), was measured and REJECTED (task 3650): it repairs that one
+# chain but silently corrupts any invocation whose own arguments legitimately
+# contain a ')' — e.g. ``pytest -k "not (slow or integration)" tests/``
+# becomes ``pytest -k "not (slow or integration -p no:xdist -o
+# addopts='')" tests/``, which still passes ``bash -n`` while running the
+# wrong tests (the flags land inside the quoted expression and `tests/` is
+# orphaned outside the invocation). That trades today's loud syntax error for
+# a silent wrong-tests-run, which is strictly worse. Keep this pattern
+# byte-identical; fix placement in ``_append_to_raw_pytest_invocations``
+# instead, via ``_split_at_unbalanced_close``.
 _PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
+
+
+def _split_at_unbalanced_close(segment: str) -> tuple[str, str]:
+    """Split *segment* at its first depth-0, UNQUOTED ')', or return it whole.
+
+    Scans *segment*'s unquoted characters only (via ``_unquoted_chars``,
+    shared with ``_scan_and_chain``) tracking paren depth (``(`` increments,
+    ``)`` decrements) and returns ``(body, closer)`` split at the first
+    ``)`` that would take depth below zero — i.e. a ``)`` NOT opened by a
+    ``(`` occurring earlier in *segment* itself, and not itself sitting
+    inside a quoted argument. Such a ``)`` closes a group that started
+    before *segment* (e.g. the subshell wrapping a pytest invocation), so it
+    and everything from it onward belong outside the invocation's own
+    arguments. A ``)`` that IS balanced within *segment* (e.g. inside a
+    ``-k "not (slow)"`` expression or a ``$(...)`` substitution) stays in
+    *body*; so does one that sits inside quotes at depth 0 (e.g.
+    ``-k "a)"`` — the quote makes it a literal character, never a
+    structural paren, regardless of surrounding depth). Returns
+    ``(segment, '')`` when *segment* contains no such unbalanced ``)``.
+
+    Quote-AWARE (task 3650 amendment). The first cut of this function was
+    quote-blind — counted every ``(``/``)`` regardless of quoting — on the
+    premise that parens inside quotes are themselves balanced in any sane
+    command. Measured wrong: a ``)`` INSIDE a quoted argument need not be
+    paired with a ``(`` at all (``-k "a)"`` is ordinary pytest usage), and a
+    quote-blind scan mistakes it for this invocation's own unbalanced close.
+    ``_append_to_raw_pytest_invocations('pytest -k "a)" tests/ && true', ...)``
+    then spliced the recovery suffix INSIDE the quotes and orphaned
+    ``tests/`` outside the invocation — ``bash -n`` still exits 0, so that
+    traded a loud syntax error for a silent wrong-tests-run, exactly the
+    failure mode this module's ``_PYTEST_INVOCATION_RE`` comment rejects the
+    char-class-widening fix for. Building on ``_unquoted_chars`` instead of a
+    second, weaker hand-rolled paren counter fixes this for free: a ``)``
+    inside quotes is never even offered to the depth check below.
+    """
+    chars, _unterminated = _unquoted_chars(segment)
+    depth = 0
+    for i, ch in chars:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            if depth == 0:
+                return segment[:i], segment[i:]
+            depth -= 1
+    return segment, ''
 
 
 def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
@@ -1313,42 +1410,43 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
 
     Shared rewrite closure for ``serial_pytest``/``apply_pytest_numprocesses``'s
     raw-retained (chained) path: matches each ``_PYTEST_INVOCATION_RE`` span,
-    peels the trailing run of whitespace and SUBSHELL TERMINATORS off it,
-    appends *suffix*, then re-attaches that tail — so both an
-    immediately-following chain operator (e.g. `` && ``) and an enclosing
-    subshell's ``)`` survive untouched. *suffix* should include its own
-    leading space (e.g. ``' -n 16'``).
+    then anchors the append to the end of the pytest invocation's own
+    ARGUMENTS rather than to the end of the matched span — the span can run
+    past a subshell-closing ')' (see ``_PYTEST_INVOCATION_RE``'s comment),
+    and appending there would produce an unparseable shell command. Each
+    matched span is split via ``_split_at_unbalanced_close`` into a ``body``
+    (the invocation's own arguments, ')'-free at depth 0) and a ``closer``
+    (a subshell-closing ')' onward, or ``''`` if none); *suffix* is appended
+    to ``body``, and ``closer`` is re-attached last. Within ``body``,
+    trailing whitespace is stripped, *suffix* appended, then the trailing
+    whitespace re-attached so an immediately-following chain operator (e.g.
+    `` && ``) survives untouched. *suffix* should include its own leading
+    space (e.g. ``' -n 16'``).
 
-    **Why terminators are peeled (task 3478).** ``_PYTEST_INVOCATION_RE``'s
-    ``[^&|;]*`` class stops at the chain operators but NOT at ``)``, so on a
-    clause like ``( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest
-    tests/ )`` the span runs PAST the closing paren. Appending there yields
-    ``( ... pytest tests/ ) -p no:xdist``, which bash refuses to parse at all
-    (``syntax error near unexpected token``) — so the defect is not a clause
-    quietly losing its flags but the WHOLE chain becoming unrunnable. The
-    committed fleet ``test_command`` contains exactly such a subshell, and
-    ``serial_pytest`` drives the env-transient and flaky-scoped recovery
-    re-runs, so this fired at shipped defaults with no knob set.
+    Tasks 3650 and 3478 diagnosed this defect independently and landed
+    competing fixes; the merge kept 3650's quote-aware
+    ``_split_at_unbalanced_close`` split over 3478's quote-blind peel, which
+    trimmed trailing ``)`` while ``count(')') > count('(')`` over the whole
+    span. Counting parens inside quotes as structural breaks it both ways: a
+    quoted ``(`` masks a real closer (measured — on ``( cd x && pytest -k
+    "foo(" tests/ )`` the span scores balanced, the peel never fires, and the
+    rewrite stays the ``) -n 4`` bash syntax error this function exists to
+    prevent), and symmetrically a quoted ``)`` is mistaken for one (see
+    ``_split_at_unbalanced_close``'s docstring). Scanning only unquoted
+    characters is what removes both halves of that failure.
 
-    The peel is gated on ``count(')') > count('(')`` — an UNBALANCED trailing
-    paren, which within a single invocation span can only be a terminator the
-    class over-matched into. A balanced paren belonging to an argument, e.g.
-    ``-k 'test_a and (b or c)'``, fails that test and correctly keeps the
-    suffix at the end. Looping handles nesting.
-
-    Widening the class to ``[^&|;()]*`` is the tempting one-character fix and
-    is WRONG: it would halt the span at an argument's OPENING paren and
-    splice the suffix into the middle of that ``-k`` expression — a silent
-    wrong-command, strictly worse than the syntax error it replaces.
+    3478's independently-derived regression tests are retained in
+    ``TestRawRewriteDoesNotSwallowSubshellTerminator`` and pass against this
+    implementation — the operational impact they pin (``serial_pytest``
+    drives the env-transient and flaky-scoped recovery re-runs, so this
+    fired at shipped defaults with no knob set) is recorded there.
     """
     def _rewrite(match: re.Match[str]) -> str:
         segment = match.group(0)
-        # Shrink `core` past trailing whitespace and unbalanced `)`; whatever
-        # it gives up is the tail, re-attached verbatim after the suffix.
-        core = segment.rstrip()
-        while core.endswith(')') and core.count(')') > core.count('('):
-            core = core[:-1].rstrip()
-        return f'{core}{suffix}{segment[len(core):]}'
+        body, closer = _split_at_unbalanced_close(segment)
+        stripped = body.rstrip()
+        trailing = body[len(stripped) :]
+        return f'{stripped}{suffix}{trailing}{closer}'
 
     return _PYTEST_INVOCATION_RE.sub(_rewrite, raw)
 

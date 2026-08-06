@@ -184,6 +184,15 @@ into a visible one at the moment it happens, and `matched_pattern` plus a
 > `9f2d2ae6`) were lost exactly that way. Once a specimen is consolidated
 > away, the incidence rate can no longer be measured.
 
+**Captured runs.** `docs/toolcall-xml-leak-sweep-2026-08-05/` holds the first
+authoritative live-corpus measurement (task 3567): an exhaustive walk of 21,080
+points found **41 leak-carrying records (~0.19%)** — 1 `repairable_duplicate`,
+40 `manual_review`, 0 `repairable_tail`. The verbatim report, a provenance
+sidecar, and the per-record adjudication are committed there. Both 2026-07-27
+specimens named above were already gone by then, so that directory is now the
+corpus of record — and `dry-run-report.json` doubles as a ready-made regression
+fixture of 41 real specimens with verified classifications.
+
 From `fused-memory/`:
 
 ```bash
@@ -204,6 +213,17 @@ python scripts/sweep_toolcall_xml_leak.py --exhaustive
 # 3. Apply. Repairs the confidently-classified records only.
 python scripts/sweep_toolcall_xml_leak.py --apply --exhaustive
 ```
+
+> **Do NOT run `--apply` from a sandboxed agent session.** Measured 2026-08-05
+> (task 3567): the sandbox denies file *creation* under `~/.mem0`, so SQLite
+> cannot create its rollback journal and mem0's history write fails with
+> *"attempt to write a readonly database"* — while the Qdrant delete, being a
+> network call to `localhost:6333`, succeeds. That splits delete-then-re-add
+> exactly down the middle. One record was deleted from Qdrant with no re-add;
+> its text survived only because the dry-run report had already been committed.
+> The db file itself is mode `0644`, uid 1000, `W_OK=True` — this is an
+> environment property, not a filesystem permissions defect, and not a sweep
+> defect. Run `--apply` from an ordinary interactive shell.
 
 `--apply` exits **non-zero** if it left any `manual_review` record behind, so
 a partial sweep can never be mistaken for a complete one, and likewise if the
@@ -254,6 +274,15 @@ non-raising add that fails any of them is treated **identically to a throw**.
 | `content_lost_in_flight` | The delete landed but the re-add did **not** persist (raised, or returned without evidence of a mem0 write). The original text now exists **only in the printed JSON report**. | Restore it by hand from the report — it carries the old id, the original content, the repaired content, and `metadata_preserved` / `metadata_dropped` — **before** re-running the sweep. |
 | `skipped_not_mem0_routed` | A repairable record whose `category` does not route to mem0 (or is absent/unrecognised). Left **entirely untouched**: nothing deleted, nothing added. | Needs a human decision. Neither option is safe unattended — a plain re-add would route the repaired text to Graphiti only and the Qdrant copy the delete removed would be gone, while `dual_write=True` would duplicate the Graphiti copy that the mem0-scoped delete deliberately left alive. |
 | `record_error` | That record's repair aborted on an unexpected error (a `delete_memory` transport failure, a Qdrant outage). The sweep **continued** to the remaining records rather than unwinding. | Whether the delete landed is **unknown** — check the record's id in the store before re-running. The sweep deliberately does not guess. |
+
+A worked example of that last row —
+`docs/toolcall-xml-leak-sweep-2026-08-05/investigation.md` §4. There the delete
+*had* landed, making it a `content_lost_in_flight` situation arriving under the
+`record_error` flag. Two lessons generalise. First, **read the record flags, not
+just the exit code**: exit 1 was overdetermined on that run (40 leftover
+`manual_review` records *and* the `record_error`), so the exit code alone would
+have hidden the mutation. Second, the id check in that cell is not optional — it
+is what established the delete had landed, and it must be a **read-only** lookup.
 
 ### The report always survives, even a fatal abort
 
@@ -342,6 +371,13 @@ Not addressed here.
 
 ## Related
 
+- `docs/toolcall-xml-leak-sweep-2026-08-05/` (task 3567) — the first live-corpus
+  sweep: verbatim report, provenance sidecar, and `investigation.md` carrying the
+  incidence measurement, the hand-adjudication of all 40 `manual_review` records,
+  and the partial-mutation incident that `--apply` hit from a sandboxed session
+- `fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py` — validates any
+  committed sweep artifact by re-running `classify_record` over each record's own
+  stored content; hermetic, so it does not need Qdrant up
 - `fused-memory/src/fused_memory/utils/toolcall_xml_leak.py` — the detector,
   and the rationale for its deliberately conservative real-whitespace
   discriminator (which excludes the tasks 2938/2939 false-positive shape)

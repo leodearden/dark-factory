@@ -5,9 +5,14 @@
 # task_id values for α β γ δ ε ζ θ ι were stamped automatically by commit_planning
 # (task 2578) when the batch was flipped deferred -> pending.
 #
-# η (3697) was HAND-STAMPED: it is deliberately NOT in that flip and remains `deferred`,
-# because its only FAIL binding below (authority-to-mutate-task-3083) is reserved to the
-# operator. See the .md twin, Finding 1.
+# η (3697) was HAND-STAMPED: it was deliberately held out of that flip and filed `deferred`,
+# because its only FAIL binding below (authority-to-mutate-task-3083) was reserved to the
+# operator (see the .md twin, Finding 1). That hold has since been DISCHARGED by operator
+# Ruling 1 on 2026-08-05: η was released, task 3697 is `pending`, and the binding now reads
+# PASS. Its decompose-time FAIL claim is preserved verbatim in that capability's binding
+# prose rather than deleted — mirroring the .md twin, which leaves its findings as written
+# and records rulings alongside them. See the .md twin, "Operator rulings, 2026-08-05
+# (post-decompose)", Ruling 1.
 prd: plans/toolcall-markup-containment-prd.md
 schema_version: 1
 tasks:
@@ -285,16 +290,27 @@ tasks:
       - docs/
       expect: present
   - name: authority-to-mutate-task-3083
-    binding: 'rejection-absent (authority not held) — mutating task 3083 is reserved
-      to the operator by standing instruction. This FAIL is the binding that blocks
-      η from queueing: η is filed deferred and deliberately EXCLUDED from the commit_planning
-      flip. Every other task in the batch clears. See manifest Finding 1'
-    verdict: FAIL
+    binding: 'DECOMPOSE-TIME VERDICT, 2026-08-05 — FAIL, left as written: "rejection-absent
+      (authority not held) — mutating task 3083 is reserved to the operator by standing
+      instruction. This FAIL is the binding that blocks η from queueing: η is filed
+      deferred and deliberately EXCLUDED from the commit_planning flip. Every other
+      task in the batch clears. See manifest Finding 1". || DISCHARGED by operator
+      Ruling 1, 2026-08-05 (post-decompose): the operator authorized the mutation,
+      so the capability is now HELD and the verdict below reads PASS. Task 3697 was
+      set `pending`; the η title and description were rewritten in place to drop the
+      hold notice. Resolved by operator authorization, NOT by re-scoping — the capability
+      asserted is unchanged, only the authority behind it. The manifest schema
+      (shared/src/shared/capability_manifest.py, extra=forbid) has no rulings field,
+      so the superseded claim and its discharge are both recorded here in prose,
+      mirroring the .md twin, which leaves Finding 1 as written and records the ruling
+      alongside it. See the .md twin, "Operator rulings, 2026-08-05 (post-decompose)",
+      Ruling 1'
+    verdict: PASS
     delivered_check:
       kind: manual
-      reason: 'the hold is an operator decision (INV-7: owner named, reason recorded
-        here and in the task description); its exit is a one-call commit_planning
-        once released'
+      reason: 'authority is an operator decision (INV-7: owner named, reason recorded
+        here and in the task description), never a repo grep; the hold exit — a one-call
+        release — was taken by Ruling 1 on 2026-08-05'
 - label: θ
   task_id: 3695
   title: Upstream harness bug report (parser over-consumption)

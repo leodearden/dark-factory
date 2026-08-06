@@ -491,3 +491,147 @@ see "Why plain `.jsonl` and not the live archive's `.jsonl.gz`" above.
 Changing a query, an id, or a score will fail the round-trip test by
 design — the test asserts the fixture's authored facts verbatim, which is
 what makes it a fixture rather than a smoke test.
+
+---
+
+## `e2_arm_claims.jsonl`, `e2_query_set.jsonl`, `e2_distractor_slab.jsonl`
+
+The three fixtures the **E2 storage-shape bake-off** (task 3199,
+`scripts/bake_off_storage_shape.py`, PRD `memory-metadata-vocabulary.md`
+leaf ζ / D9) is run over. They are documented together because they are
+one experiment's controlled inputs and are only meaningful as a set.
+
+E2 materialises the *same* knowledge in three storage shapes —
+`status_quo` / `c_peers` / `b_grouped`, each × the 3111 topic-anchor pin
+on or off — into seeded ephemeral collections, queries all of them with
+one shared query set, and emits a per-arm decision table to
+`plans/e2-storage-shape-bakeoff-report.{json,md}`.
+
+All three are **frozen**: this is what makes the experiment controlled
+and rerunnable (eval-design §5 E2, *"Drift: none — frozen fixture"*).
+Regenerating one silently would invalidate comparison against any report
+already committed.
+
+### Blind-authoring protocol (resolves PRD §10's open question)
+
+The eval doc names E2's own biggest weakness: *"arm quality reflects
+authoring skill — the experiment is gameable by authoring one arm well
+and another lazily."* PRD §10 left the mitigation open (two-agent
+cross-check vs single-author-blind-to-metrics).
+
+Resolved here as **single-author-blind-to-metrics, mechanized by commit
+ordering**: `e2_arm_claims.jsonl` (`2e365d5435`) and `e2_query_set.jsonl`
+(`600fd8441b`) were authored and committed as *prerequisites*, before a
+single metric function existed in `scripts/bake_off_storage_shape.py` —
+which at those commits was a docstring-only stub (`b1100b1856`). **Git
+history is the audit trail**: it proves no metric code was in the tree
+when the arms were decomposed, so the arms cannot have been tuned toward
+a number. The report records these SHAs.
+
+The anti-laziness floor is **claim-coverage parity** — every claim id
+must be realizable in every arm, asserted mechanically by the bake-off.
+It is deliberately **not** total-content-length parity: arm (a)'s long
+originals versus arm (c)'s short peers differ *by construction*, and that
+difference IS the tokens-per-query metric (D4). Asserting it away would
+delete the result.
+
+### Record schema
+
+`e2_arm_claims.jsonl` — 176 rows, the editorial decomposition of each
+cluster into short single-claim peers:
+
+| field | meaning |
+|---|---|
+| `claim_id` | `<topic>-NN`, contiguous per cluster |
+| `cluster_id` | the α cluster this claim was decomposed from |
+| `topic` | taken **verbatim** from the E1 registry entry whose `provenance.cluster_id` matches (PRD D4: one namespace — no slug is invented here) |
+| `text` | the short single-claim peer body (80–400 chars) |
+| `source_memory_id` | which original α record carries this claim; always a record of its **own** cluster. This is what makes claim-coverage parity checkable for the `status_quo` arm |
+| `canonical` | exactly one `true` per cluster — the short index claim |
+| `b_arm_role` | `canonical`, or a `KIND_REGISTRY` member (`amendment` 122, `sighting` 34) used as the `kind` of a `b_grouped` child |
+| `contested` | 18 rows, concentrated in the two `pseudo_contradiction` clusters — the data pinning PRD V2's *"a contested child is NEVER suppressed"* |
+
+`e2_query_set.jsonl` — 236 rows:
+
+| field | meaning |
+|---|---|
+| `query_id` | `<topic>-pNN` for a phrasing, `<claim_id>-q` for a claim query |
+| `kind` | `topic_phrasing` (60) or `claim` (176) |
+| `text` | the query as typed |
+| `topic`, `cluster_id` | the target topic and its cluster |
+| `expects_claim_ids` | the topic's canonical claim for a phrasing; the single targeted claim for a claim query |
+| `held_out` | 20 rows — one per topic, inherited from the registry |
+
+`e2_distractor_slab.jsonl` — 300 rows, `{distractor_id, content,
+category}` only. A distractor carries **no** vocabulary metadata key
+(`topic`, `canonical`, `kind`, `parent_id`, `supersedes`) — by
+construction it must never be topic-anchorable, or it would stop being a
+distractor.
+
+### Derivation provenance
+
+**Claims** — decomposed from the 20 curator-gate clusters of the
+charter-locked `write_triage_calibration.jsonl`, read **read-only**
+(`shared/tests/test_locking.py:122`,
+`tests/test_lock_charter_guard.py:191`). Topic slugs come read-only from
+`memory_eval_topic_registry.json`, whose 20 curator-gate cluster ids
+overlap the α fixture 20/20. Claim counts per cluster are 4–20, scaled to
+the canonical's length, not equalized — see the parity note above.
+
+**Queries** — the 60 `topic_phrasing` rows are seeded **verbatim** from
+the registry's `phrasings`, so E1 and E2 share phrasings and E2 inherits
+a held-out probe per topic for free. The 176 `claim` rows are authored,
+one per claim id: that per-claim coverage is what makes claim-recall@k
+measure *"does the specific claim a query targets surface"* rather than
+mere topic proximity.
+
+Claim queries are authored as **questions, never as restatements of the
+claim**. Copying claim text into a query would hand arm (c) a trivially
+exact lexical match against its own short peers and invalidate the
+comparison. Measured on the committed file: median query-vs-claim
+`SequenceMatcher` ratio **0.090**, max **0.538** (the max falls on the
+shortest claims, where a question unavoidably shares their small
+vocabulary). Each query carries at least one discriminating specific — a
+symbol, path, flag, error string or number — so it separates from its
+topic siblings.
+
+**Distractor slab** — the realistic contamination every arm's collection
+is seeded with (eval-design §5 E2: *"seed each arm's collection with a
+realistic slab of distractor entries — worth doing, the contamination
+result today says distractors matter"*). Sampled 2026-08-01 by read-only
+Qdrant payload scroll (no embedder, no writes) of the live `fused_reify`
+and `fused_dark_factory` collections. Exact sampling parameters:
+
+- categories `observations_and_summaries` and `procedural_knowledge`
+  only (the former is 16k of the 24k live corpus per PRD §2);
+- content length 200–4000 chars, so a distractor is realistic
+  competition rather than a stub;
+- survivors sorted by point id, then an **even stride** taken per
+  (project, category) cell to the quota below — deterministic, not
+  random, so the slab is re-derivable;
+- quotas 105/105 `observations_and_summaries` and 45/45
+  `procedural_knowledge` for `dark_factory`/`reify` = **300 rows**,
+  drawn from a survivor pool of 14 622 (dark_factory 4 430 + 1 656,
+  reify 6 633 + 1 903);
+- emitted sorted by `distractor_id`.
+
+### Exclusions
+
+A candidate distractor was dropped if **any** of these held — the point
+is that no distractor may accidentally be a right answer:
+
+- its point id appears in the α fixture as a `memory_id` **or** a
+  `cluster_id`;
+- its stored `hash`, or the md5 of its content, matches an α record's
+  content; or its whitespace-normalised content equals an α record's;
+- its content contains any registry `claim_queries[].needles` string
+  (≥5 chars) — those are the exact strings E1 probes for;
+- its content contains **≥2 distinctive tokens of a single fixture
+  topic**, where distinctive tokens are that topic's slug segments of ≥4
+  chars minus a stoplist of generic ones (`task`, `test`, `main`,
+  `gate`, `only`, …). Two topic-specific tokens co-occurring is the
+  signal that a candidate is about a fixture topic rather than merely
+  sharing a common word with it.
+
+Verified on the committed file: 300/300 ids unique, zero α id or content
+overlap, zero reserved vocabulary keys present.

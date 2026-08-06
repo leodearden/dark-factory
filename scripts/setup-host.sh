@@ -135,13 +135,27 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Orchestrator systemd units + watchdog
 # ---------------------------------------------------------------------------
-# Installs and enables:
+# Installs and enables (kept in step with scripts/orchestrator-*.service by
+# test_setup_host_installs_every_orchestrator_unit — every template must be
+# copied here, and every template with an [Install] section must be enabled):
 #   - /home/leo/bin/wait-for-port.py        (port-wait helper used by ExecStartPre)
-#   - orchestrator-dark-factory.service     (dark-factory orchestrator, supervised)
-#   - orchestrator-reify.service            (reify orchestrator, supervised)
-#   - orchestrator-autopilot-video.service  (autopilot-video orchestrator, supervised)
-#   - orchestrator-solar-challenge-platform.service (platform orchestrator, supervised)
+#   - orchestrator-reify.service            (reify orchestrator, escalation 8100)
+#   - orchestrator-dark-factory.service     (dark-factory orchestrator, escalation 8102)
+#   - orchestrator-know-live.service        (know-live orchestrator, escalation 8105)
+#   - orchestrator-my-solar-challenge.service (my-solar-challenge, escalation 8106)
+#   - orchestrator-solar-challenge-platform.service (platform, escalation 8107)
+#   - orchestrator-pump-web-ui.service      (pump-web-ui orchestrator, escalation 8108)
+#   - orchestrator-autopilot-video.service  (autopilot-video orchestrator, escalation 8101)
 #   - orchestrator-watchdog.service/.timer  (60s liveness probe + dead-enabled revival)
+#     The .service is static (no [Install]) — the .timer carries the install, so
+#     only the timer is enabled below. `systemctl enable` on it would error.
+#
+# Drift direction (task 3641): know-live and pump-web-ui were transcribed from
+# the running host into the repo, i.e. committed-follows-installed, so this
+# installer run is a no-op for them on THIS host. The sole line intentionally
+# ahead of the host is RestartSteps=4 in orchestrator-pump-web-ui.service, which
+# this run propagates outward — without it systemd ignores that unit's
+# RestartMaxDelaySec= cap and its advertised 10s->60s backoff never engages.
 #
 # The orchestrator units run `uv run --frozen ...`, so process start never
 # implicitly re-syncs the shared dark-factory/.venv. After any dependency change
@@ -164,6 +178,8 @@ cp "$REPO_ROOT/scripts/orchestrator-reify.service"          "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-autopilot-video.service" "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-my-solar-challenge.service" "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-solar-challenge-platform.service" "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-know-live.service"      "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-pump-web-ui.service"    "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"       "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"         "$UNIT_DIR/"
 
@@ -183,6 +199,14 @@ systemctl --user enable orchestrator-autopilot-video.service
 systemctl --user enable orchestrator-my-solar-challenge.service
 # solar-challenge-platform joined 2026-06-21 (escalation port 8107). Enabled by default.
 systemctl --user enable orchestrator-solar-challenge-platform.service
+# know-live (escalation port 8105) has had a committed template since e5273d8623
+# and a running unit on the host, but was never wired in here — an omission, not
+# a policy: this script marks real exclusions with an explicit "Deliberately NOT
+# wired" note and carries none for know-live. Enabled by default like the rest.
+systemctl --user enable orchestrator-know-live.service
+# pump-web-ui joined 2026-07-17 (escalation port 8108) and likewise ran on the
+# host with no committed template until task 3641 transcribed it. Enabled by default.
+systemctl --user enable orchestrator-pump-web-ui.service
 ok "orchestrator units + watchdog installed and enabled"
 
 # ---------------------------------------------------------------------------

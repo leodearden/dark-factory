@@ -2,7 +2,7 @@
 
 **Project:** dark-factory (orchestrator-briefing edge + fused-memory service). **Status:** active, 2026-08-05. **Approach:** B+H (contract + two-way boundary tests on the search-merge seam).
 
-**Provenance:** esc-3253-1 evidence session 2026-08-05 — live per-query measurement of the four hardcoded briefing queries, the first-ever E1 probe run (`fused-memory/data/memory-evals/e1-retrieval-health/{metrics,report}-20260805T093831Z.*`), and controlled needle tests against known-stored content. The gate esc-3253-1 / task 3253 remains open for the operator; this PRD is the rework the gate's resolution will point at.
+**Provenance:** esc-3253-1 evidence session 2026-08-05 — live per-query measurement of the four hardcoded briefing queries, the first-ever E1 probe run (`plans/memory-eval-e1-first-live-run/e1-retrieval-health/{metrics,report}-20260805T093831Z.*` — committed and git-tracked by task 3694; the probe's own output landed under the gitignored `fused-memory/data/memory-evals/` and was unreachable from any clone), and controlled needle tests against known-stored content. The gate esc-3253-1 / task 3253 remains open for the operator; this PRD is the rework the gate's resolution will point at.
 
 ## Goal
 

@@ -219,50 +219,197 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # established, after every line pin copied forward had already rotted at HEAD.
 lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
 #
-# WHY NOT skills/orchestrator.yaml (task 3485).
+# DECIDED — skills/orchestrator.yaml (task 3554, deciding what task 3485
+# deferred). Supersedes 3485's "WHY NOT" block, which stood here as a
+# DEFERRAL. This is a DECISION: no skills/orchestrator.yaml. The ruff head
+# above remains the declaration lever for `skills`; do not remove it.
 #
-# Task 3485 was explicitly asked to choose between extending the ruff head
-# above and registering a module config for skills/. It chose the head. The
-# rationale is recorded here because the alternative is the obvious-looking
-# "better" fix and would otherwise be re-proposed on every read.
+# This is not the same answer for the same reasons. Two of 3485's load-bearing
+# premises were FALSIFIED on re-measurement, and both are corrected in place
+# below rather than deleted — task 3460's precedent, and the same treatment
+# the SCOPE HONESTY block above gives its own superseded draft. A claim that
+# was load-bearing and turned out false must stay visible, or a future reader
+# cannot tell the premise moved.
 #
-# FEASIBLE, BUT NOT SUFFICIENT. _discover_module_configs registers a module
-# iff the directory directly contains an `orchestrator.yaml` carrying at least
-# one overridable field, and it SKIPS prefix == '.'. A skills/orchestrator.yaml
-# (prefix `skills`, depth 1) is well inside the effective lock_depth of 4 — the
-# package-bundled orchestrator/src/orchestrator/defaults.yaml ships
-# lock_depth: 4, layered over the pydantic Field default of 2 — so it would in
-# fact be discovered. But it could never cover conftest.py or
-# df_pytest_isolation.py, which sit at the repo ROOT and are excluded by that
-# same prefix == '.' skip. Widening the head above is therefore REQUIRED
-# regardless; once made, it covers `skills` through the same lever with no
-# routing change at all.
+# STILL TRUE FROM 3485, restated because the decision depends on it.
+# _discover_module_configs registers a module iff the directory DIRECTLY
+# contains an `orchestrator.yaml` carrying at least one overridable field, and
+# it SKIPS prefix == '.'. A skills/orchestrator.yaml (prefix `skills`, depth 1)
+# is well inside the effective lock_depth of 4 — the package-bundled
+# orchestrator/src/orchestrator/defaults.yaml ships lock_depth: 4, layered over
+# the pydantic Field default of 2 — so it WOULD be discovered. Registering one
+# is feasible. It is declined. And it could never cover conftest.py or
+# df_pytest_isolation.py regardless, so widening the head above was REQUIRED
+# independent of this decision.
 #
-# WHAT REGISTERING ONE WOULD BUY: a strictly stronger gate. A module config
-# participates in run_full_verification's asyncio.gather over
-# module_configs.values(); this root command does not (see SCOPE HONESTY
-# above).
+# THE DECIDING FACT, which is what turns a deferral into a decision, and which
+# 3485 could not see because the lever did not exist until its own commit
+# created it. tests/scripts/test_root_lint_covers_nonmember_py.py::
+# test_root_level_and_skills_py_are_clean_under_the_members_rule_set does not
+# inspect a command STRING — it SUBPROCESSES ruff over
+# REPO_ROOT.glob('*.py') + (REPO_ROOT/'skills').rglob('*.py') with
+# --output-format json and asserts the parsed finding set is EMPTY, under an
+# explicit no-importorskip contract so a missing ruff FAILS rather than skips.
+# That test lives in tests/scripts/, which IS a registered module config, and
+# BOTH tests/scripts' test_command (`pytest tests/scripts/`) and scripts'
+# (`pytest tests/scripts/ scripts/tests/`) collect it — and
+# verify.run_full_verification asyncio-gathers over module_configs.values().
 #
-# WHAT IT WOULD COST: a TEST-routing change, and a new vacuous gate. Today a
-# skills/-only diff matches no module config, so run_scoped_verification falls
-# through to _build_fallback_config and runs the whole fleet test chain.
-# Registering a module config makes module_configs non-empty, and a config
-# with no test_command yields a ScopeKind.SKIPPED PlannedRun that
-# _run_or_skip_timed turns into a CheckRun.skipped — VACUOUSLY PASSING at
-# rc=0. That closes one vacuous gate by opening another, which is precisely
-# the failure class tasks 3350, 3445 and 3485 exist to prevent. Declaring an
-# honest test_command instead is a separate design question: skills/ has no
-# tests/ directory of its own, and pointing it at tests/scripts/ would
-# replicate the byte-identical duplicate-run cost tests/scripts/
-# orchestrator.yaml already documents about itself.
+# So skills/**/*.py ruff cleanliness is ALREADY enforced on every review
+# checkpoint, run_main_tip_sweep and merge full-verify — through a module
+# config's test_command, NOT through any lint_command. The "strictly stronger
+# gate" 3485 said registering would buy is therefore ALREADY HELD. Registering
+# would buy a redundant second ruff pass, and pay for it twice over: (i) a
+# config with a falsy test_command yields a ScopeKind.SKIPPED PlannedRun that
+# _executed_module_configs_from_plan renders back to None and
+# _run_or_skip_timed turns into a CheckRun.skipped — VACUOUSLY PASSING at rc=0,
+# the exact failure class tasks 3350, 3445 and 3485 exist to prevent; and (ii)
+# it would DOWNGRADE the one skills/ diff shape that gets a real test gate
+# today (see CORRECTION 2). Both costs, no benefit.
 #
-# CONCLUSION: widen the root command here; leave skills/orchestrator.yaml to a
-# follow-up that can settle the test-routing question on its own merits. Filed
-# from task 3485 as [tkt_0RS0CK3MYE2HG5H7TDMGQP24QB] — a curator TICKET id,
-# not a task id: the curator runs asynchronously and decides create/combine/
-# drop, so the resulting task number is not knowable at this commit. That
-# follow-up cannot subsume the widening above; do not "consolidate" by
-# removing the non-member targets from the ruff head.
+# CORRECTION 1 to 3485. "skills/ has no tests/ directory of its own, and
+# pointing it at tests/scripts/ would replicate the byte-identical duplicate-run
+# cost" — the first clause is true LITERALLY (`git ls-files 'skills/**/tests/**'
+# 'skills/**/test_*.py' 'skills/**/*_test.py'` is empty), but the inference
+# drawn from it is FALSE. An honest test_command is not a tests/scripts/
+# pointer: the tests that actually READ or EXECUTE real paths under skills/ at
+# runtime span THREE uv projects. Enumerated first-hand, not copied forward:
+#   orchestrator/tests/test_skill_prompt.py       — exercises
+#       orchestrator.agents.skill_prompt.load_skill_system_prompt, which walks
+#       up from its own __file__ to the IN-REPO skills/<name>/SKILL.md (not
+#       ~/.claude/skills); reads skills/unblock-auto/ and
+#       skills/escalation-watcher-auto/.
+#   orchestrator/tests/test_harness_watcher_supervisor.py — uses that real
+#       loader's output as its oracle.
+#   orchestrator/tests/test_session_hooks.py      — EXECUTES the real
+#       skills/spawn/hooks/*.sh.
+#   tests/scripts/test_spawn_claude.py            — EXECUTES the real
+#       skills/spawn/spawn-claude.sh.
+#   tests/scripts/test_systemd_restart_backoff.py — reads
+#       skills/factory-init/references/supervised-unit.md.
+#   tests/scripts/test_root_lint_covers_nonmember_py.py — rglobs
+#       skills/**/*.py and RUNS ruff over them (the deciding fact above).
+#   scripts/tests/test_legibility_inventory.py    — reads
+#       skills/spawn/spawn-claude.sh to cross-check a bash/Python encoder mirror.
+# So the union includes orchestrator/tests/ — the fleet's largest suite —
+# duplicated on every review checkpoint, main-tip sweep and merge full-verify.
+# That is far worse than the single-suite duplication 3485 assumed, and it
+# kills option (b) on cost alone. Naming the individual files instead avoids
+# the bulk cost but is NOT MONOTONE in the diff — it would replace the fleet
+# chain a skills/ .py diff gets today with a fixed file list, trading one gap
+# for another, which task 3294's source-only floor and task 3460's "coverage
+# must be MONOTONE in the diff" both forbid. (Deliberately stated without a
+# COUNT of these files or of skills/ itself: a hard-coded count of a
+# directory's contents rots on the next file added — task 3460 recorded the
+# same lesson twice against a "40" that was already stale at HEAD.)
+#
+# CORRECTION 2 to 3485. "Today a skills/-only diff matches no module config, so
+# run_scoped_verification falls through to _build_fallback_config and runs the
+# whole fleet test chain" — true ONLY for a diff touching the single tracked
+# .py file. For the DOMINANT shape (almost every skill directory is .md/.sh/
+# .json only), run_scoped_verification reaches `if not
+# _has_source_files(existing_files)` and returns a TRIVIAL PASS at role='task':
+# nothing runs at all. Registering a module config does not change that either,
+# because _has_source_files keys on .py/.rs and
+# _executed_module_configs_from_plan drops a module contributing no runs — so
+# the short-circuit still fires. Registration buys NOTHING for the dominant
+# diff shape, which is the opposite of what the original block implies.
+#
+# MEASUREMENT, re-taken first-hand at base main 7c6039327d rather than
+# inherited (this task declares NO command, so the fix-and-declare atomicity
+# hazard does not arise — but the record must not carry a stale number):
+#
+#   uv run --project shared ruff check skills/
+#       -> All checks passed!   exit 0
+#   uv run --project shared ruff check --select E,F,UP,B,SIM,I --ignore E501 \
+#       --line-length 100 skills/
+#       -> All checks passed!   exit 0   (--output-format json -> [])
+#
+# FINDING BREAKDOWN BY RULE CODE AND FILE: NONE, under EITHER rule set.
+# FIXED-not-excluded is therefore VACUOUSLY satisfied — stated rather than
+# omitted, because "no exclusions were needed" and "exclusions were quietly
+# used" read identically when the clause is simply absent. Nothing was fixed,
+# nothing was excluded, no target was narrowed.
+#
+# WHICH RULE SET THOSE NUMBERS CAME FROM, so a future reader is not misled by
+# landing order: task 3457's root [tool.ruff] table had NOT landed at this base
+# (no [tool.ruff] in the root pyproject.toml; `git ls-files '*ruff.toml'` is
+# empty), so skills/ resolves ruff's BUILT-IN defaults (E4/E7/E9 + F) today.
+# Both states were measured green, and the built-in set is a strict SUBSET of
+# {E,F,UP,B,SIM,I}, so 3457 landing cannot retroactively red-wall main.
+#
+# RE-CONFIRMED at base main 5078f6df15, which is 28 commits AHEAD of the
+# 7c6039327d the numbers above were first taken at, and skills/ was NOT
+# untouched in between (5 .md files changed: _shared/ticket-failure-handling.md,
+# escalation-watcher/SKILL.md, orchestrate/SKILL.md, review/references/
+# phase3-triage.md, unblock/SKILL.md). Both ruff forms re-run verbatim at the
+# handed-off base: `All checks passed!`, exit 0, ZERO findings, unchanged. The
+# original sha is kept rather than overwritten — rewriting it would falsely
+# claim the first observation was taken at the later base — but a stale base
+# behind an unqualified number is exactly the rot this block's own
+# FIXED-not-excluded discipline exists to prevent, so the re-measurement is
+# recorded rather than assumed. No .py under skills/ was added or changed
+# between the two bases, which is why the finding set could not move.
+#
+# RESIDUAL GAPS, stated plainly rather than left invisible — the decision is
+# "leave as-is", which makes it especially easy to read as "nothing is wrong":
+#   * skills/factory-init/scripts/find_escalation_port.py, the only tracked .py
+#     under skills/, has NO behavioural test anywhere. Its only gate is the
+#     lint coverage above. Filed as [tkt_0RS401FD4JNB5SW8F8JB1DQ38K].
+#   * skills/**/*.sh and SKILL.md bodies are BEHAVIOURAL artifacts —
+#     spawn-claude.sh, spawn/hooks/*.sh, and the SKILL.md text
+#     load_skill_system_prompt injects into agent system prompts — whose
+#     consumer tests exist (enumerated in CORRECTION 1) but never run on the
+#     diff that CHANGES them, for the _has_source_files reason in CORRECTION 2.
+#     Fixing that is a verify/verify_plan production change, a different class
+#     from a yaml edit. Filed as [tkt_0RS401ZAKSC9EJFQDX8KCXCSD3].
+# Both are curator TICKET ids, not task ids: the curator runs asynchronously
+# and decides create/combine/drop, so the resulting task number is not knowable
+# at this commit. 3485's own follow-up for this question was
+# [tkt_0RS0CK3MYE2HG5H7TDMGQP24QB]; this block is its answer.
+#
+# REVISIT TRIGGER, gated rather than merely suggested: if skills/ ever grows a
+# test suite of its own, a narrow, honest, non-duplicating test_command becomes
+# available for the first time and this decision must be RE-TAKEN here.
+# test_skills_has_no_tests_of_its_own fails the moment that happens.
+#
+# Guarded by tests/scripts/test_skills_module_config_decision.py —
+# test_no_skills_prefixed_module_config_is_registered (the decision itself),
+# test_skills_has_no_tests_of_its_own (the revisit trigger),
+# test_skills_py_ruff_probe_is_collected_by_a_registered_module_config_test_command
+# (the deciding fact, PATH half: some module config still collects the probe),
+# test_skills_py_ruff_probe_still_globs_skills_at_runtime (the deciding fact,
+# RUNTIME half: the probe still points ruff AT skills/ — narrowing
+# _guarded_py_files to REPO_ROOT.glob('*.py') deletes the gate with the PATH
+# half staying green, MEASURED as `1 failed, 5 passed`),
+# test_every_skills_consuming_test_stays_under_a_gated_directory (CORRECTION 1's
+# inventory stays real and stays covered — which is why the enumeration above
+# and that file's SKILLS_CONSUMING_TESTS tuple must be edited TOGETHER: each is
+# gated against drifting from the tree, neither against drifting from the
+# other).
+#
+# THE OPPOSITE DRIFT IS KNOWINGLY UNGATED: a NEW skills/ consumer that never
+# reaches the inventory leaves the enumeration above under-describing the real
+# set. A ratchet for it was shipped and REMOVED ON REVIEW — it swept every
+# tracked test module for the literal `skills/` and so made comment and
+# docstring PROSE in four unrelated packages a merge-blocking gate on
+# tests/scripts/ (measured: a cosmetic reword in
+# scripts/tests/test_legibility_sampling.py produced `1 failed, 5 passed`),
+# while still missing real consumers that never spell the token
+# (orchestrator/tests/test_harness_watcher_supervisor.py). Do NOT reintroduce
+# it, including as a regex/word-boundary variant. The gap is one-directional
+# and safe: an under-counted consumer set makes CORRECTION 1's cost argument
+# against option (b) WEAKER, never unsound — more consumers only make the union
+# more expensive. A documented-but-ungated invariant
+# is the same defect class this block's predecessor demonstrated: it was pure
+# prose, and was already carrying two falsified claims when re-measured.
+# Production code is cited BY SYMBOL throughout and never by file:line —
+# task 3445's explicit correction, after every copied-forward line pin had
+# already rotted at HEAD.
+#
+# Do NOT "consolidate" by removing the non-member targets from the ruff head
+# above: it is the only lever for the two repo-root files, and removing
+# `skills` also breaks test_root_lint_command_targets_every_root_level_and_skills_py.
 # The bare ``npx pyright`` spelling is DELIBERATE and safe (task 3367 /
 # esc-3359-1): every ``cd`` target below pins pyright's own interpreter via
 # ``[tool.pyright] venvPath = ".."`` / ``venv = ".venv"`` in its pyproject.toml,

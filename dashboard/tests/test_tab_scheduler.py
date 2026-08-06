@@ -298,17 +298,19 @@ def test_multiselect_select_none_keeps_real_selection(shell_jsx_body):
 
 
 # ---------------------------------------------------------------------------
-# step-15: index.html cache-buster is bumped to >= 19
+# step-15: index.html cache-buster stays at or above the scheduler floor (19)
 # ---------------------------------------------------------------------------
 
 
-def test_index_html_cache_buster_bumped(index_html_body):
+def test_index_html_cache_buster_not_reverted_below_scheduler_floor(index_html_body):
     """Every /static/redux/* asset in index.html must carry a ?v= cache-buster
-    that is equal and >= 19.
+    that is >= 19.
 
-    The current value is 18.  Any change to styles.css, shell.jsx,
-    tab_scheduler.jsx, or app.jsx requires bumping the version so browsers
-    reload the changed assets.
+    This is an ANTI-REVERT PIN, not a live bump check: index.html is far past
+    19 today, so it fails only if someone rolls the cache-busters back below
+    what the scheduler tab needed. Whether the versions are UNIFORM, and
+    whether the newest bump landed, are both asserted in test_index_html.py —
+    do not restate either claim here.
 
     Asserts:
     - All ?v= values found on /static/redux/* paths are integers >= 19

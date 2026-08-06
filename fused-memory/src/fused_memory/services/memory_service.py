@@ -1198,6 +1198,7 @@ class MemoryService:
             write_timeout_seconds=qcfg.write_timeout_seconds,
             transient_max_attempts=qcfg.transient_max_attempts,
             transient_error_names=qcfg.transient_error_names,
+            on_terminal=self._record_queue_terminal_outcome,
         )
         self.durable_queue.register_callback(
             'dual_write_episode', self._dual_write_callback
@@ -1335,6 +1336,35 @@ class MemoryService:
                     error=str(e),
                 )
             raise
+
+    async def _record_queue_terminal_outcome(
+        self,
+        write_op_id: str,
+        terminal_status: str,
+        error: str | None = None,
+    ) -> None:
+        """Write a durable-queue terminal outcome back onto its write_op row.
+
+        Passed to ``DurableWriteQueue(on_terminal=...)`` in ``initialize()``.
+        Because it lives at the queue seam, every enqueue site inherits the
+        write-back: ``add_episode``, ``add_memory``'s Graphiti leg, and the
+        retained ``mem0_add`` dispatcher alike.
+
+        This is a BOUND METHOD rather than a captured ``WriteJournal``
+        reference so ``self._write_journal`` is resolved at CALL time — the
+        same lazy-collaborator idiom as ``execute_write=self._execute_durable_write``.
+        It has to be: ``server/main.py`` calls ``memory_service.initialize()``
+        (which constructs the queue) BEFORE ``set_write_journal()``, so the
+        journal is still ``None`` when the hook is wired.
+        """
+        journal = self._write_journal
+        if journal is None:
+            return
+        await journal.record_terminal_outcome(
+            write_op_id=write_op_id,
+            terminal_status=terminal_status,
+            terminal_error=error,
+        )
 
     @staticmethod
     def _mem0_payload_digest(
@@ -2253,37 +2283,52 @@ class MemoryService:
             session_id=payload.get('session_id'),
         )
         metadata = payload.get('metadata', {})
+        # Resolved once, outside the try, so every attempt journals against a
+        # stable id when the payload carries no '_write_op_id'.
+        journal_write_op_id = write_op_id or str(uuid_mod.uuid4())
 
-        result = await self._journaled_backend_call(
-            write_op_id=write_op_id,
-            causation_id=causation_id,
-            backend='mem0',
-            operation='add',
-            payload={'content': payload['content'][:200]},
-            coro=self.mem0.add(
-                content=payload['content'], scope=scope, metadata=metadata
-            ),
-        )
-
-        # Log Layer 1 for the queued write
-        if self._write_journal:
-            await self._write_journal.log_write_op(
-                write_op_id=write_op_id or str(uuid_mod.uuid4()),
+        result = None
+        error_msg = None
+        try:
+            result = await self._journaled_backend_call(
+                write_op_id=write_op_id,
                 causation_id=causation_id,
-                source='durable_queue',
-                operation='add_memory',
-                project_id=payload['project_id'],
-                agent_id=payload.get('agent_id'),
-                session_id=payload.get('session_id'),
-                params={
-                    'content': payload['content'][:200],
-                    'category': metadata.get('category', ''),
-                },
-                result_summary=str(result)[:500] if result else None,
-                success=True,
+                backend='mem0',
+                operation='add',
+                payload={'content': payload['content'][:200]},
+                coro=self.mem0.add(
+                    content=payload['content'], scope=scope, metadata=metadata
+                ),
             )
-
-        return result
+            return result
+        except Exception as e:
+            error_msg = f'{type(e).__name__}: {e}'
+            raise
+        finally:
+            # Log Layer 1 for the queued write on BOTH paths (task 3582). This
+            # used to run only after a successful await, so a mem0_add that
+            # dead-lettered never produced a write_ops row at all — leaving the
+            # queue's terminal write-back nothing well-formed to land on, and
+            # the failure invisible to the journal. The `finally` mirrors
+            # add_episode's, and log_write_op is an upsert, so the retries of a
+            # single item converge on one row whose last attempt wins.
+            if self._write_journal:
+                await self._write_journal.log_write_op(
+                    write_op_id=journal_write_op_id,
+                    causation_id=causation_id,
+                    source='durable_queue',
+                    operation='add_memory',
+                    project_id=payload['project_id'],
+                    agent_id=payload.get('agent_id'),
+                    session_id=payload.get('session_id'),
+                    params={
+                        'content': payload['content'][:200],
+                        'category': metadata.get('category', ''),
+                    },
+                    result_summary=str(result)[:500] if result else None,
+                    success=error_msg is None,
+                    error=error_msg,
+                )
 
     async def _execute_mem0_classify_and_add(
         self, payload: dict[str, Any]
