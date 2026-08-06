@@ -291,6 +291,68 @@ Two findings worth carrying forward rather than burying:
 
 ---
 
+## End-to-end chain smoke (measured, step 20)
+
+Step 19 proved the *image*. Step 20 proved the **committed chain**, run for real
+on the cheapest arm on the slate — `granite-embedding-english-r2`, 149M, 573 MB
+of weights — before committing to the full slate's downloads. Every command was
+the committed one; nothing was hand-run:
+
+```
+lms_fetch_weights --arm granite-embedding-english-r2 --weights-only   # transient unit, 11 s
+lms_ctl start granite-embedding-english-r2                            # pre-flight → systemctl
+lms_ctl wait-ready granite-embedding-english-r2                       # ready in 123 s
+lms_healthcheck --arm granite-embedding-english-r2                    # PASS, exit 0
+lms_ctl stop granite-embedding-english-r2
+```
+
+| measurement | value |
+|---|---|
+| weight fetch (transient unit, cold) | 11 s / 573 MB |
+| unit start → `/v1/models` serving the arm | **123 s** (`wait-ready`, 5 s poll) |
+| — container start + vLLM import | 38 s |
+| — engine-core boot to "Starting to load model" | 50 s |
+| — weight load | 1.6 s (0.29 GiB) |
+| — profile, KV cache, warmup | 22.0 s (16.6 s of it `torch.compile`) |
+| **resident VRAM while serving** | **796 MiB** (7309 → 8105 MiB used) |
+| embeddings probe latency | 192 ms |
+| VRAM after `stop` | 7309 MiB — **exactly** the pre-start baseline |
+| whisper-writer throughout | 4050 MiB, undisturbed |
+
+What this establishes that step 19 could not: the unit template instantiates
+against a real `arms.yaml` arm, the pre-flight admits an arm that fits, the
+launcher's argv serves the manifest's `served_model_name` (so `wait-ready`'s
+identity leg matches), port 8415 of the reserved block is reachable, the
+embeddings probe validates a real 768-dim vector, and `ExecStop=docker stop`
+plus `--rm` release **every** byte and leave no container behind.
+
+### Two findings for step 23
+
+1. **`--gpu-memory-utilization` behaves differently per runner.** The pooling
+   runner treated the derived `0.684` as a *ceiling* and took 796 MiB — nowhere
+   near the 16.8 GiB that fraction of the card would allow. The **generate**
+   runner sizes its KV cache to actually fill that budget, so the three vLLM LLM
+   arms will behave nothing like this arm did. Do not read "the embedding arm
+   only took 796 MiB" as evidence the derivation is conservative; step 23 must
+   measure each LLM arm's resident footprint on its own.
+2. **The 123 s start is mostly fixed cost, not model size.** Only 1.6 s of it
+   was weights. A 14 GiB AWQ arm adds load time on top of the same ~110 s floor,
+   which is why the unit's `TimeoutStartSec=900` is not generous — it is roughly
+   right, and `wait-ready`'s default 900 s timeout matches it deliberately.
+
+### Defect found and fixed by this run
+
+`lms_fetch_weights` echoed the argv it was about to submit **including the real
+`--setenv=HF_TOKEN=hf_…` value**, putting the secret on the operator's terminal
+and into any transcript or log capturing it. Fixed with `redact_argv()`, which
+returns a printable copy with the value masked and the flag left visible, while
+the executed argv keeps the real token — the two are deliberately different
+objects, and `test_redact_argv_does_not_mutate_the_argv_that_gets_executed`
+exists because a redaction that leaked into the executed argv would turn every
+download anonymous and fail only later, only on the gated repos.
+
+---
+
 ## Verification artifact
 
 `verification/health-report.json` is written by a live run

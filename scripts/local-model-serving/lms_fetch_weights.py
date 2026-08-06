@@ -115,8 +115,33 @@ def pull_image_argv(arm: ArmEntry) -> list[str]:
     ]
 
 
+#: What replaces the token in the ECHOED argv.  The flag itself stays visible:
+#: an operator debugging an unexpectedly anonymous download needs to see THAT a
+#: token was passed without the secret landing in their scrollback.
+TOKEN_REDACTION = '<redacted>'
+
+_TOKEN_FLAG = '--setenv=HF_TOKEN='
+
+
+def redact_argv(argv: list[str]) -> list[str]:
+    """A copy of `argv` safe to print, with the HF token masked.
+
+    Returns a NEW list and never mutates its argument: the executed argv must
+    keep the real token, or every download silently goes anonymous -- which
+    succeeds on ungated repos and fails only later, only on the gated ones.
+    """
+    return [
+        f'{_TOKEN_FLAG}{TOKEN_REDACTION}' if element.startswith(_TOKEN_FLAG) else element
+        for element in argv
+    ]
+
+
 def _submit(argv: list[str], *, dry_run: bool) -> int:
-    print(' '.join(argv), flush=True)
+    # Echo the redacted copy, run the real one.  Discovered in step 20's live
+    # smoke: the unredacted echo put the secret on the terminal and into the
+    # transcript, and `systemd-run --setenv` would have put it in the journal's
+    # unit properties besides.
+    print(' '.join(redact_argv(argv)), flush=True)
     if dry_run:
         return 0
     return subprocess.run(argv, check=False).returncode

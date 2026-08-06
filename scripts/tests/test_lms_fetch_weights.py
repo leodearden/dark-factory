@@ -164,6 +164,81 @@ def test_the_token_is_never_echoed_by_the_reported_unit_name():
 
 
 # ---------------------------------------------------------------------------
+# the echoed command line must not carry the token
+#
+# Found in step 20's live run: `_submit` echoed the argv it was about to run,
+# which put the real `hf_...` secret on the operator's terminal, into the
+# orchestrator transcript that captured it, and into any log the operator
+# piped it to.  The token still has to REACH systemd-run, so redaction belongs
+# in the echo path only -- which is exactly what makes it worth a test: the
+# redacted and executed argv are deliberately different objects, and nothing
+# else would notice if they silently converged.
+# ---------------------------------------------------------------------------
+
+
+def test_redact_argv_masks_the_token_value_but_keeps_the_flag_visible():
+    argv = lms_fetch_weights.fetch_argv(_arm(), TOKEN_ENV)
+
+    redacted = lms_fetch_weights.redact_argv(argv)
+
+    assert not any('hf_measured_value' in element for element in redacted)
+    # The flag itself must still show: an operator debugging an anonymous
+    # download needs to see THAT a token was passed, just not which one.
+    assert any(element.startswith('--setenv=HF_TOKEN=') for element in redacted)
+
+
+def test_redact_argv_changes_nothing_else():
+    argv = lms_fetch_weights.fetch_argv(_arm(), TOKEN_ENV)
+
+    redacted = lms_fetch_weights.redact_argv(argv)
+
+    assert len(redacted) == len(argv)
+    for original, shown in zip(argv, redacted):
+        if original.startswith('--setenv=HF_TOKEN='):
+            continue
+        assert shown == original
+
+
+def test_redact_argv_does_not_mutate_the_argv_that_gets_executed():
+    """The executed argv must keep the real token -- redacting in place would
+    turn every download anonymous, which succeeds until it meets a gated repo."""
+    argv = lms_fetch_weights.fetch_argv(_arm(), TOKEN_ENV)
+
+    lms_fetch_weights.redact_argv(argv)
+
+    assert '--setenv=HF_TOKEN=hf_measured_value' in argv
+
+
+def test_submitting_a_fetch_echoes_the_redacted_form(capsys, monkeypatch):
+    """End to end through the CLI: the secret must not reach stdout/stderr.
+
+    `--dry-run` is what makes this offline -- it echoes without submitting --
+    and the echo is precisely the leak, so the dry-run path is the honest place
+    to assert it.
+    """
+    monkeypatch.setenv('HF_DOWNLOAD_TOKEN', 'hf_measured_value')
+    monkeypatch.delenv('HF_TOKEN', raising=False)
+    monkeypatch.setattr(lms_fetch_weights, 'load_arms', lambda: _FakeManifest(_arm()))
+
+    exit_code = lms_fetch_weights.main(
+        ['--arm', 'qwen3.5-9b', '--weights-only', '--dry-run']
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert 'hf_measured_value' not in captured.out + captured.err
+    assert 'lms-fetch-qwen3.5-9b' in captured.out
+
+
+class _FakeManifest:
+    def __init__(self, *arms):
+        self.arms = list(arms)
+
+    def by_id(self, arm_id):
+        return next(a for a in self.arms if a.arm_id == arm_id)
+
+
+# ---------------------------------------------------------------------------
 # GGUF arms fetch ONE quant, not a whole repo
 # ---------------------------------------------------------------------------
 
