@@ -37,6 +37,7 @@ escaped.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
@@ -1088,6 +1089,140 @@ class TestRunApplyPreflightMetadataGuard:
         assert record['classification'] == 'repairable_tail'
         assert 'skipped_metadata_would_be_rejected' not in record
         assert _mod.resolve_exit_code(report) == 0
+
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    The measured incident this guard exists for: this sweep was run under
+    ``--apply`` from a sandboxed agent session. Its repair is delete-then-re-add
+    and the two halves live on different substrates -- the Qdrant delete is a
+    NETWORK call to localhost:6333 (landlock governs the filesystem only, so it
+    succeeded) while mem0's history write is SQLite under ``~/.mem0`` (denied).
+    Memory 7d073281 was removed and never came back.
+
+    Refusing before the first mutation is the only safe response, because
+    ``_repair_record`` calls ``delete_memory`` OUTSIDE any try and mem0's
+    ``_delete_memory`` removes the Qdrant point BEFORE writing history: once a
+    repair starts in a write-denied environment the point is already gone. A
+    per-record probe would detect a fleet-wide condition one record too late.
+    """
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete."""
+        self._deny(monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        with pytest.raises(_mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'):
+            await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_the_scan_not_before_the_first_repair(
+        self, monkeypatch
+    ):
+        """It aborts without even scanning -- one probe per run, not per record,
+        and no wasted pagination over a corpus it was never going to repair."""
+        self._deny(monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(_args(apply=True), service)
+
+        service.scan_memory_content.assert_not_awaited()
+
+    def test_the_refusal_is_loud_and_reaches_mains_fatal_abort_path(
+        self, monkeypatch, capsys
+    ):
+        """Pinned surfacing: the exception PROPAGATES out of ``run``, so ``main``
+        catches it, prints the partial report with ``aborted: true``, and exits
+        2. A silent zero-exit refusal is the exact failure mode this task
+        exists to prevent, so the non-zero outcome is asserted end-to-end.
+
+        Sync, not async: ``main`` calls ``asyncio.run`` itself. Drives ``main``
+        with ``TestMainEmitsThePartialReport``'s idiom -- pin ``new_progress``
+        to reach main's container, and replace ``asyncio.run`` so ``_run_live``
+        never constructs a real MemoryService.
+        """
+        self._deny(monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+        monkeypatch.setattr(sys, 'argv', ['sweep_toolcall_xml_leak.py', '--apply'])
+        progress = _mod.new_progress()
+        monkeypatch.setattr(_mod, 'new_progress', lambda: progress)
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(_mod.run(_args(apply=True), service, progress))
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        exit_code = _mod.main()
+
+        assert exit_code == 2
+        report = json.loads(capsys.readouterr().out)
+        assert report['aborted'] is True
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability to
+        mutate. Gating it would break the module's core promise -- that the
+        classification report can always be obtained safely, from anywhere.
+        """
+        self._deny(monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(), service)
+
+        assert report['dry_run'] is True
+        assert _record_for(report, 'r')['classification'] == 'repairable_tail'
+        service.scan_memory_content.assert_awaited_once()
+        service.delete_memory.assert_not_awaited()
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment repairs exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_awaited_once()
+        service.add_memory.assert_awaited_once()
+        assert _record_for(report, 'r')['repaired'] is True
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        await _mod.run(_args(apply=True), service)
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per record'
+        assert 'sweep_toolcall_xml_leak' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
 
 
 class TestCarriedMetadata:
