@@ -171,7 +171,9 @@ class TestFetchTaskRuntime:
 
         assert result['proj8100'].offline is False
         assert len(result['proj8100'].tasks) == 1
-        assert result['proj8102'] == TaskRuntimeSnapshot(offline=True)
+        assert result['proj8102'] == TaskRuntimeSnapshot(
+            offline=True, offline_reason='unreachable',
+        )
 
     async def test_timeout_yields_offline_snapshot_for_slow_project_only(self):
         from dashboard.data.task_runtime import fetch_task_runtime
@@ -186,7 +188,9 @@ class TestFetchTaskRuntime:
             )
 
         assert result['proj8100'].offline is False
-        assert result['proj8105'] == TaskRuntimeSnapshot(offline=True)
+        assert result['proj8105'] == TaskRuntimeSnapshot(
+            offline=True, offline_reason='deadline_exceeded',
+        )
 
     async def test_malformed_payload_degrades_only_that_project(self, caplog):
         """An out-of-contract payload (task_id not coercible to int) degrades
@@ -202,7 +206,9 @@ class TestFetchTaskRuntime:
                 result = await fetch_task_runtime(client, _urls(8100, 8103))
 
         assert result['proj8100'].offline is False
-        assert result['proj8103'] == TaskRuntimeSnapshot(offline=True)
+        assert result['proj8103'] == TaskRuntimeSnapshot(
+            offline=True, offline_reason='unreachable',
+        )
         assert any('proj8103' in rec.message or '8103' in rec.message for rec in caplog.records), (
             'expected a WARNING naming the offending project/URL'
         )
