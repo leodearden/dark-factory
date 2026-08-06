@@ -217,6 +217,19 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # Production code is cited BY SYMBOL throughout this block and never by
 # file:line — task 3445's explicit correction of the convention task 3350
 # established, after every line pin copied forward had already rotted at HEAD.
+#
+# MIRRORED IN CONTRIBUTING.md (task 3558). The ruff head below is restated
+# VERBATIM there for contributors, inside a `lint-command-mirror` marker, and
+# pinned by tests/scripts/test_contributing_lint_command_drift.py. Widening
+# this head without updating that line is now a RED merge verify, not a silent
+# local-green/CI-red split — it drifted twice before the guard existed (task
+# 3397 added sampler + cockpit; task 3485 added conftest.py,
+# df_pytest_isolation.py, skills), both times while CONTRIBUTING.md ALREADY
+# carried a "treat this file as the source of truth if these drift" pointer.
+# That measured failure is why the tie is now mechanical rather than prose.
+# The doc mirrors the ruff leg ONLY, never the check_bare_magicmock_config.py
+# tail: disjoint target list, and gate-internal rather than something a
+# contributor runs.
 lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
 #
 # DECIDED — skills/orchestrator.yaml (task 3554, deciding what task 3485
