@@ -19,10 +19,10 @@ import { createRequire } from 'node:module';
 
 import fmt from '../../src/dashboard/static/redux/runtime_format.js';
 
-const { rtCell, rtAge } = fmt;
+const { rtCell, rtAge, rtProbe, rtProbeSummary } = fmt;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/runtime_format.js';
-const EXPECTED_FUNCTION_NAMES = ['rtCell', 'rtAge'];
+const EXPECTED_FUNCTION_NAMES = ['rtCell', 'rtAge', 'rtProbe', 'rtProbeSummary'];
 
 test('default-imported module exposes the runtime-format functions', () => {
   for (const name of EXPECTED_FUNCTION_NAMES) {
@@ -125,4 +125,144 @@ test('rtAge: a fractional-minute value is rounded to the nearest whole minute', 
   // like "3.5m" if that contract ever slips).
   assert.equal(rtAge(3.5), '4m');
   assert.equal(rtAge(3.4), '3m');
+});
+
+// ---------------------------------------------------------------------------
+// rtProbe — the per-row probe-status descriptor (task 3517). Turns a row's
+// `runtime_status` (emitted by active_tasks._runtime_fields, originating in
+// task_runtime._probe_one) into {label, hint, tone}, so an operator sees WHY
+// the runtime cells are dashed instead of only seeing the dashes.
+// ---------------------------------------------------------------------------
+
+const DEGRADED_STATUSES = ['not_configured', 'unreachable', 'deadline_exceeded', 'unknown'];
+const TONES = ['muted', 'warn', 'bad'];
+
+test('rtProbe: the healthy status renders nothing', () => {
+  assert.equal(rtProbe('ok'), null);
+});
+
+test('rtProbe: every degraded status yields a usable descriptor', () => {
+  for (const status of DEGRADED_STATUSES) {
+    const d = rtProbe(status);
+    assert.ok(d, `rtProbe(${status}) should return a descriptor`);
+    assert.equal(typeof d.label, 'string');
+    assert.ok(d.label.length > 0, `${status} label should be non-empty`);
+    assert.equal(typeof d.hint, 'string');
+    assert.ok(d.hint.length > 0, `${status} hint should be non-empty`);
+    assert.ok(TONES.includes(d.tone), `${status} tone ${d.tone} not in ${TONES}`);
+  }
+});
+
+test('rtProbe: the four degraded labels are pairwise distinct', () => {
+  // Separability IS the feature — identical labels would reproduce the
+  // blank-cell ambiguity this task exists to remove.
+  const labels = DEGRADED_STATUSES.map((s) => rtProbe(s).label);
+  assert.equal(new Set(labels).size, labels.length, `labels not distinct: ${labels}`);
+});
+
+test('rtProbe: deadline_exceeded points at the dashboard, unreachable at the orchestrator', () => {
+  const deadline = rtProbe('deadline_exceeded').hint.toLowerCase();
+  assert.ok(
+    deadline.includes('dashboard') || deadline.includes('probe'),
+    `deadline hint should name the dashboard/probe, got: ${deadline}`,
+  );
+  const unreachable = rtProbe('unreachable').hint.toLowerCase();
+  assert.ok(
+    unreachable.includes('orchestrator'),
+    `unreachable hint should name the orchestrator, got: ${unreachable}`,
+  );
+});
+
+test('rtProbe: unknown/garbage input falls back to the unknown descriptor', () => {
+  // Never throw and never return null for a non-'ok' value: an unrenderable
+  // status must still tell the operator we do not know, not silently vanish
+  // into a blank cell.
+  const expected = rtProbe('unknown');
+  for (const bogus of [null, undefined, 'garbage', '', 42, {}]) {
+    assert.deepEqual(rtProbe(bogus), expected, `rtProbe(${String(bogus)})`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// rtProbeSummary — aggregates task rows into the Tasks-tab banner. Derived
+// frontend-side from ACTIVE_TASKS rows (deliberately not a new payload key).
+// ---------------------------------------------------------------------------
+
+const row = (project, runtime_status) => ({ project, runtime_status });
+
+test('rtProbeSummary: nothing degraded returns null', () => {
+  assert.equal(rtProbeSummary([]), null);
+  assert.equal(rtProbeSummary([row('a', 'ok'), row('b', 'ok')]), null);
+});
+
+test('rtProbeSummary: groups degraded projects by status, deduped', () => {
+  const summary = rtProbeSummary([
+    row('alpha', 'unreachable'),
+    row('alpha', 'unreachable'),
+    row('alpha', 'unreachable'),
+    row('beta', 'deadline_exceeded'),
+    row('gamma', 'ok'),
+  ]);
+  assert.ok(summary);
+  // Each project counted ONCE regardless of how many rows it contributes.
+  assert.deepEqual(summary.byStatus.unreachable, ['alpha']);
+  assert.deepEqual(summary.byStatus.deadline_exceeded, ['beta']);
+  assert.ok(!('ok' in summary.byStatus), 'healthy projects must not be listed');
+});
+
+test('rtProbeSummary: a row with no runtime_status is treated as ok', () => {
+  // Back-compat with an older cached payload that predates the field.
+  assert.equal(rtProbeSummary([{ project: 'a' }, { project: 'b' }]), null);
+  const summary = rtProbeSummary([{ project: 'a' }, row('b', 'unreachable')]);
+  assert.deepEqual(summary.byStatus.unreachable, ['b']);
+});
+
+test('rtProbeSummary: selfInflicted only when >=2 probed projects ALL timed out', () => {
+  const summary = rtProbeSummary([
+    row('alpha', 'deadline_exceeded'),
+    row('beta', 'deadline_exceeded'),
+  ]);
+  assert.equal(summary.selfInflicted, true);
+  assert.equal(summary.probedCount, 2);
+  assert.ok(
+    summary.text.toLowerCase().includes('dashboard'),
+    `self-inflicted text should name the dashboard, got: ${summary.text}`,
+  );
+});
+
+test('rtProbeSummary: one probed project timing out is NOT self-inflicted', () => {
+  // Degenerate: equally consistent with that one orchestrator being down, so
+  // blaming the dashboard would be the same unfounded diagnosis in reverse.
+  const summary = rtProbeSummary([row('alpha', 'deadline_exceeded')]);
+  assert.equal(summary.selfInflicted, false);
+});
+
+test('rtProbeSummary: a healthy project alongside a timeout is NOT self-inflicted', () => {
+  const summary = rtProbeSummary([
+    row('alpha', 'deadline_exceeded'),
+    row('beta', 'ok'),
+  ]);
+  assert.equal(summary.selfInflicted, false);
+});
+
+test('rtProbeSummary: mixed degraded reasons are NOT self-inflicted', () => {
+  // A real outage is per-project — one of these really is unreachable.
+  const summary = rtProbeSummary([
+    row('alpha', 'deadline_exceeded'),
+    row('beta', 'unreachable'),
+  ]);
+  assert.equal(summary.selfInflicted, false);
+});
+
+test('rtProbeSummary: never-probed projects do not count toward "all probed"', () => {
+  // not_configured projects were never probed at all, so counting them would
+  // make the heuristic fire on a deployment where only one orchestrator is
+  // even configured.
+  const summary = rtProbeSummary([
+    row('alpha', 'deadline_exceeded'),
+    row('beta', 'not_configured'),
+    row('gamma', 'not_configured'),
+  ]);
+  assert.equal(summary.probedCount, 1);
+  assert.equal(summary.selfInflicted, false);
 });
