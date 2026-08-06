@@ -101,16 +101,31 @@ def find_matching_topic_cluster(
     content: str,
     clusters: list[ProceduralTopicCluster],
 ) -> tuple[ProceduralTopicCluster, list[str]] | None:
-    """Select the first topic cluster *content* matches by distinct-phrase count.
+    """Select the first topic cluster *content* matches, by phrase count OR sufficiency.
 
     For each cluster in order, counts the DISTINCT ``phrases`` (compared
     case-insensitively) that appear as substrings of *content*, and returns
-    ``(cluster, sorted matched phrases)`` for the first cluster whose distinct
-    hit count is ``>= cluster.min_phrase_hits``. A phrase repeated in *content*
-    counts once (distinct-phrase membership, not occurrence count); an empty
-    phrase is ignored (it would otherwise substring-match everything). Returns
-    ``None`` when *content* is empty, *clusters* is empty, or no cluster
-    qualifies.
+    ``(cluster, sorted matched phrases)`` for the first cluster that qualifies.
+    A cluster qualifies when EITHER:
+
+    * its distinct hit count is ``>= cluster.min_phrase_hits`` (the original
+      rule), OR
+    * at least one hit phrase is declared in ``cluster.sufficient_phrases``
+      -- phrases so distinctive they cannot appear incidentally, which
+      therefore qualify the cluster alone (task 3054).
+
+    The second arm exists because hits do NOT aggregate across clusters: a
+    write touching one distinctive phrase in each of several clusters used to
+    be blocked by none, even though each phrase unambiguously identified its
+    own topic. Note the consequence for callers -- on a sufficient-phrase
+    match the returned ``matched_phrases`` may contain FEWER entries than the
+    cluster's ``min_phrase_hits``. That is correct, not a guard bug: it
+    reports exactly what fired.
+
+    A phrase repeated in *content* counts once (distinct-phrase membership,
+    not occurrence count); an empty phrase is ignored (it would otherwise
+    substring-match everything). Returns ``None`` when *content* is empty,
+    *clusters* is empty, or no cluster qualifies.
 
     Pure and synchronous — mirrors :func:`find_near_duplicate_memory`: it does
     no I/O and no embedding round-trip, and raises nothing on empty input. This
@@ -126,7 +141,17 @@ def find_matching_topic_cluster(
             for phrase in cluster.phrases
             if phrase and phrase.lower() in content_lower
         }
-        if len(matched) >= cluster.min_phrase_hits:
+        # Read defensively, matching this module's posture for every other
+        # config leaf (`_reconciliation_attr`, `resolve_topic_guard_clusters`):
+        # an operator-supplied or older cluster object without the field
+        # degrades to today's count-only behaviour rather than raising
+        # AttributeError inside the add_memory hot path.
+        sufficient = {
+            phrase.lower()
+            for phrase in (getattr(cluster, 'sufficient_phrases', None) or [])
+            if phrase
+        }
+        if matched and (len(matched) >= cluster.min_phrase_hits or matched & sufficient):
             return cluster, sorted(matched)
     return None
 
