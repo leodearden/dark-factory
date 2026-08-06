@@ -150,6 +150,28 @@ async def test_in_progress_task_parked_as_blocked(queue):
 
 
 @pytest.mark.asyncio
+async def test_no_slot_in_progress_task_parked_as_blocked(queue):
+    """No live slot + task still 'in-progress' → parked as 'blocked'.
+
+    The ORPHANED shape (reify 5858 / 5069): the orchestrator lane was already
+    reaped, so no workflow slot is registered, but the task row is still stuck
+    at 'in-progress'.  Left unparked, the scheduler re-dispatched it out from
+    under a human mid manual-merge.  ``was_active`` being False is precisely
+    the case MOST in need of the reaper-immune hold, not a reason to skip it.
+    """
+    harness = _FakeHarness(status='in-progress')
+    # No slot registered — harness.events stays empty.
+    server = create_server(queue, harness=harness)
+    result = await _call_release(server, task_id='42', timeout_secs=1)
+
+    assert result['released'] is False
+    assert result['was_active'] is False
+    assert result['slot_cleared'] is True
+    assert result['parked'] == 'blocked'
+    harness.scheduler.set_task_status.assert_awaited_once_with('42', 'blocked')
+
+
+@pytest.mark.asyncio
 async def test_terminal_task_not_parked(queue):
     """Slot clears but the task already went terminal ('done') → no park.
 
