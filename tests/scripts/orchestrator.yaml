@@ -46,6 +46,42 @@
 # classifies STRUCTURAL and under merge-role merge_verify_breadth=full.
 test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
 
+# THIS COMMAND ALSO CARRIES THE skills/ LINT GATE (task 3554), which is not
+# recoverable from the string itself and is why the note exists.
+#
+# test_root_lint_covers_nonmember_py.py::
+# test_root_level_and_skills_py_are_clean_under_the_members_rule_set
+# SUBPROCESSES ruff over REPO_ROOT.glob('*.py') + (REPO_ROOT/'skills').rglob(
+# '*.py') and asserts an empty finding set. That test lives in tests/scripts/,
+# so this DIRECTORY target is what carries skills/**/*.py lint into
+# verify.run_full_verification's asyncio.gather over module_configs.values() —
+# i.e. onto every review checkpoint, run_main_tip_sweep and merge full-verify.
+# The repo-root lint_command's ruff head DECLARES `skills` as a target but
+# cannot deliver that: its verbatim form is reached only via
+# verify.run_verification with module_config is None (see the root config's
+# SCOPE HONESTY block).
+#
+# So narrowing this command away from the tests/scripts/ directory — to a file
+# list, or to a subset — would SILENTLY kill the skills/ lint gate: nothing
+# would report skipped and nothing would exit non-zero. Task 3554 declined to
+# register skills/orchestrator.yaml partly BECAUSE this gate already holds, so
+# removing it would invalidate that decision, not merely lose coverage.
+# test_skills_module_config_decision.py::
+# test_skills_py_ruff_probe_is_collected_by_a_registered_module_config_test_command
+# fails if that happens. It deliberately does NOT assert that THIS config is
+# the carrier — scripts/orchestrator.yaml's test_command collects tests/scripts/
+# too, and task 3383's pending dedupe-by-command fix will legitimately change
+# that arrangement — only that SOME registered module config still carries it.
+#
+# That is only HALF the gate, and the other half is not this config's to keep:
+# collecting the probe's PATH is worthless if the probe stops globbing skills/.
+# test_skills_py_ruff_probe_still_globs_skills_at_runtime pins that half by
+# CALLING _guarded_py_files and inspecting its result. MEASURED at base main
+# 7c6039327d: narrowing that function to REPO_ROOT.glob('*.py') deletes the
+# skills/ lint gate outright while the path-level assertion above stays green
+# (`1 failed, 5 passed`). So an edit here can only break the half named above —
+# do not read a green run of that one test as the gate being intact.
+
 # KNOWN COST, recorded rather than left invisible (task 3350 amendment;
 # restated by task 3460, which falsified this block's original premise).
 #
