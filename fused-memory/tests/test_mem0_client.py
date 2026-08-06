@@ -1334,3 +1334,153 @@ class TestMem0BackendScanPayloadTextIntegration:
             ))['scanned'] == 1
         finally:
             await backend.close()
+
+
+class TestBuildConfigDictEndpointPlumbing:
+    """_build_config_dict is a pure function of config — no Qdrant, no
+    AsyncMemory, no _get_instance. Greenfield: nothing tested this dict before.
+    """
+
+    # --- default (shipped-config) behaviour: must stay byte-identical ---
+
+    def test_default_omits_embedding_dims_entirely(self, backend):
+        """The load-bearing byte-identical assertion.
+
+        mem0/embeddings/openai.py sets
+        ``_pass_dimensions_to_api = self.config.embedding_dims is not None``.
+        We omit the key today, so ``dimensions`` is NEVER sent on an
+        embeddings request. Emitting the key at all — even as 1536 — would
+        start sending it on every request under the shipped config. Hence the
+        emit-only-when-non-default rule; do not "simplify" it away.
+        """
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert backend.config.embedder.dimensions == 1536
+        assert 'embedding_dims' not in config_dict['embedder']['config']
+
+    def test_default_emits_incumbent_base_urls(self, backend):
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['llm']['config']['openai_base_url'] == 'https://api.openai.com/v1'
+        assert (
+            config_dict['embedder']['config']['openai_base_url']
+            == 'https://api.openai.com/v1'
+        )
+
+    def test_default_vector_store_dims_match_mem0s_own_default(self, backend):
+        """Emitting this key is a no-op at the shipped config — mem0's Qdrant
+        default is already 1536 — but it is required for a collection to be
+        CREATED at a non-default dimensionality."""
+        from mem0.configs.vector_stores.qdrant import QdrantConfig
+
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['vector_store']['config']['embedding_model_dims'] == 1536
+        assert (
+            QdrantConfig.model_fields['embedding_model_dims'].default == 1536
+        ), 'mem0 changed its Qdrant dims default — the no-op claim above no longer holds'
+
+    def test_preexisting_keys_are_unchanged(self, backend):
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['version'] == 'v1.1'
+        assert config_dict['vector_store']['provider'] == 'qdrant'
+        assert config_dict['vector_store']['config']['url'] == backend.config.mem0.qdrant_url
+        assert config_dict['vector_store']['config']['collection_name'] == 'some_collection'
+
+        llm = config_dict['llm']['config']
+        assert config_dict['llm']['provider'] == 'openai'
+        assert llm['model'] == 'gpt-4o-mini'
+        assert llm['temperature'] == 0.1
+        assert llm['max_tokens'] == 4096
+        assert llm['api_key'] == 'test-key'
+
+        embedder = config_dict['embedder']['config']
+        assert config_dict['embedder']['provider'] == 'openai'
+        assert embedder['model'] == 'text-embedding-3-small'
+        assert embedder['api_key'] == 'test-key'
+
+    # --- local-endpoint behaviour ---
+
+    def test_llm_and_embedder_endpoints_are_independent(self, mock_config):
+        """The two provider blocks are read SEPARATELY — one is not reused for
+        both, which is what makes independent LLM/embedder endpoints possible.
+        """
+        mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
+        mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['llm']['config']['openai_base_url'] == 'http://127.0.0.1:1234/v1'
+        assert (
+            config_dict['embedder']['config']['openai_base_url']
+            == 'http://127.0.0.1:5678/v1'
+        )
+
+    def test_non_default_dims_emitted_under_both_key_names(self, mock_config):
+        """BOTH keys are required for a non-1536 arm, and they are NOT the same
+        key: the embedder key controls what dimensionality is requested from
+        the API, the vector-store key controls what Qdrant creates the
+        collection with. Setting only one silently yields a mismatch.
+        """
+        mock_config.embedder.dimensions = 768
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['embedder']['config']['embedding_dims'] == 768
+        assert config_dict['vector_store']['config']['embedding_model_dims'] == 768
+
+    def test_anthropic_llm_block_carries_no_openai_base_url(self, mock_config):
+        """openai_base_url is an OpenAIConfig-only parameter; passing it to the
+        anthropic config class would TypeError out of mem0's factory."""
+        from fused_memory.config.schema import AnthropicProviderConfig
+
+        mock_config.llm.provider = 'anthropic'
+        mock_config.llm.providers.anthropic = AnthropicProviderConfig(api_key='ak')
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['llm']['provider'] == 'anthropic'
+        assert 'openai_base_url' not in config_dict['llm']['config']
+
+    # --- key-name guard ---
+
+    def test_every_emitted_key_is_accepted_by_the_installed_mem0(self, mock_config):
+        """The highest-value assertion here.
+
+        An unknown key raises TypeError from mem0/utils/factory.py, and
+        AsyncMemory.from_config only catches pydantic ValidationError — so a
+        misspelling escapes uncaught at instance construction, in production,
+        not here. The names are easy to get wrong: the EMBEDDER takes
+        `embedding_dims`, while `embedding_model_dims` is the VECTOR STORE's
+        key. Validate what we emit against the installed signatures.
+        """
+        import inspect
+
+        from mem0.configs.embeddings.base import BaseEmbedderConfig
+        from mem0.configs.llms.openai import OpenAIConfig
+        from mem0.configs.vector_stores.qdrant import QdrantConfig
+
+        # Non-default dims so every optional key is actually emitted.
+        mock_config.embedder.dimensions = 768
+        mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
+        mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        embedder_params = set(inspect.signature(BaseEmbedderConfig.__init__).parameters)
+        llm_params = set(inspect.signature(OpenAIConfig.__init__).parameters)
+        vector_store_params = set(QdrantConfig.model_fields)
+
+        for key in config_dict['embedder']['config']:
+            assert key in embedder_params, (
+                f'embedder key {key!r} is not a BaseEmbedderConfig parameter — '
+                f'mem0 would TypeError. Did you mean one of {sorted(embedder_params)}?'
+            )
+        for key in config_dict['llm']['config']:
+            assert key in llm_params, f'llm key {key!r} is not an OpenAIConfig parameter'
+        for key in config_dict['vector_store']['config']:
+            assert key in vector_store_params, (
+                f'vector_store key {key!r} is not a QdrantConfig field'
+            )
+
+        # And pin the two easily-confused spellings explicitly.
+        assert 'embedding_dims' in embedder_params
+        assert 'embedding_model_dims' not in embedder_params
+        assert 'embedding_model_dims' in vector_store_params
