@@ -357,15 +357,19 @@ class DecisionRecord:
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
-    file may be mutated by TWO different subsystems: a C8 watcher (via
-    update_decision_state) and the C5 cockpit (via set_manual_boost). Both
-    helpers now serialize their read-modify-write span per-decision-id via
+    file may be mutated by SEVERAL different subsystems: a C8 watcher (via
+    update_decision_state), the C5 cockpit (via set_manual_boost), and -- for
+    task 3640's back-fill, running against live records while the watchers
+    are up -- scripts/backfill_decision_queue_stamp.py (via
+    set_decision_escalations_dir). All three helpers serialize their
+    read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
-    1609's escalation_id_lock), so a concurrent state-update and
-    boost-update racing on the same id no longer drops either mutation --
-    each write remains individually atomic AND the read+mutate+write span
-    is now serialized against other callers on the same id. See
-    update_decision_state/set_manual_boost for the caller-facing note.
+    1609's escalation_id_lock), so a concurrent state-update, boost-update
+    or queue-stamp racing on the same id no longer drops any of the
+    mutations -- each write remains individually atomic AND the
+    read+mutate+write span is serialized against other callers on the same
+    id. See update_decision_state/set_manual_boost/
+    set_decision_escalations_dir for the caller-facing note.
     """
 
     id: str
@@ -817,6 +821,56 @@ def set_manual_boost(
                 return None
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         logger.error('set_manual_boost: failed to read %s', path, exc_info=True)
+        return None
+    return record
+
+
+def set_decision_escalations_dir(
+    decision_id: str,
+    escalations_dir: str | Path,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Read-modify-write *decision_id*'s escalations_dir (queue stamp) field.
+
+    Added for task 3640's back-fill of the legacy open population, but written
+    as an ordinary field setter: any caller needing to (re)stamp a record's
+    owning queue should come through here rather than rewriting the JSON.
+
+    NORMALIZES ON THE WAY IN via normalize_escalations_dir, so every writer of
+    this field stores ONE canonical spelling and the reaper's axis-2 compare
+    stays honest -- a raw-stored dotted/trailing-slash spelling would compare
+    unequal to the very queue it names, and the record would silently never
+    close again (fail-open, so invisible). ``UNKNOWN_QUEUE`` passes through
+    verbatim by that same normalizer's sentinel case: it is a state, not a
+    path, and must not become cwd-dependent.
+
+    Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
+    missing file, a corrupt body, a lock-acquisition fault, or a write
+    failure -- rather than raising, matching write_decision's contract for
+    its direct C8/cockpit callers. That matters concretely for the back-fill,
+    which lists the whole decision population and then writes each id back: a
+    record closed or removed by a live watcher in between is expected, not
+    exceptional, and must not abort a migration mid-population.
+
+    Concurrency NOTE (see DecisionRecord's docstring): this read-modify-write
+    is serialized per-decision-id via decision_id_lock (a stable
+    ``<id>.json.lock`` sidecar, mirroring task 1609's escalation_id_lock).
+    Its two siblings already race each other; the back-fill is a THIRD writer,
+    running against live records while the C8 watchers and the cockpit are up,
+    which is exactly why it goes through this helper instead of rewriting
+    decision JSON itself -- doing that in a script would bypass both the lock
+    and the atomic tmp+os.replace writer and reintroduce the race 1609/3528
+    fixed.
+    """
+    path = decision_path_for_id(decision_id, root=root)
+    try:
+        with decision_id_lock(decision_id, root=root):
+            record = DecisionRecord.from_json(path.read_text())
+            record.escalations_dir = normalize_escalations_dir(escalations_dir)
+            if not write_decision(record, root=root):
+                return None
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('set_decision_escalations_dir: failed to read %s', path, exc_info=True)
         return None
     return record
 
