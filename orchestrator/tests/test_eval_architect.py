@@ -169,6 +169,38 @@ class TestEvalMetricsInvocationErrorField:
         assert 'cap_tainted' in d
         assert d['cap_tainted'] is False
 
+    def test_judged_without_reference_default_is_false(self):
+        """False, not None: an absent marker means "no degradation observed".
+
+        Exactly how ``cap_tainted`` behaves — a result persisted before the
+        field existed reads back as not-degraded rather than as unknown.
+        """
+        assert EvalMetrics().judged_without_reference is False
+
+    def test_to_dict_carries_judged_without_reference_key_defaulting_false(
+        self,
+    ):
+        """The key must SERIALIZE on healthy cells, carrying False.
+
+        Load-bearing cross-consumer contract (task 3628 σ → task 3632):
+        ``scripts/run_fable_trial_v2_campaign.py`` decides per-cell reference
+        validity by KEY PRESENCE — its ``MARKER_KEY not in metrics`` means "not
+        known-good", never False, and ``count_judged_without_reference``
+        returns None for any candidate with even one keyless cell. If this key
+        were emitted only when True (a conditional dict update, or filtering
+        falsy fields out of the persisted dict), every HEALTHY cell would be
+        indistinguishable from a pre-σ one and that consumer would report None
+        for every candidate forever.
+
+        Spelled as an ``in`` check FOLLOWED BY an ``is False`` check on
+        purpose: a single ``d['judged_without_reference'] is False`` would pass
+        just as well against a conditional-emit implementation that omits the
+        key precisely in the healthy case.
+        """
+        d = EvalMetrics().to_dict()
+        assert 'judged_without_reference' in d
+        assert d['judged_without_reference'] is False
+
 
 # ---------------------------------------------------------------------------
 # detect_invocation_error — the pure transport-refusal classifier (3118 step-3/4)
