@@ -527,6 +527,18 @@ class ProceduralTopicCluster(BaseModel):
             'Default 2 so a single incidental keyword never triggers a false block.'
         ),
     )
+    sufficient_phrases: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Opt-in subset of phrases that qualify this cluster ALONE, bypassing '
+            'min_phrase_hits (task 3054). Reserved for phrases so distinctive they '
+            'cannot appear incidentally -- identifier-shaped names like a tool or '
+            'handler name -- NEVER generic tokens or common commands, which would '
+            'turn every incidental mention into a false block. Every entry must '
+            'also appear in phrases (compared case-insensitively); a stray entry '
+            'is rejected at config load rather than silently matching nothing.'
+        ),
+    )
     hint: str = Field(
         default='',
         description=(
@@ -534,6 +546,41 @@ class ProceduralTopicCluster(BaseModel):
             'When empty, the guard substitutes a module-default hint.'
         ),
     )
+
+    @model_validator(mode='after')
+    def _validate_sufficient_phrases_subset(self) -> 'ProceduralTopicCluster':
+        """Reject a ``sufficient_phrases`` entry that is not also in ``phrases``.
+
+        Fails fast at config load/reload for the same reason
+        ``extra='forbid'`` and :meth:`_validate_topic_id_slug` do: the
+        matcher only ever tests ``phrases``, so a sufficient phrase absent
+        from that list can never fire. The cluster would load cleanly and
+        the operator's intent would be silently discarded -- a silent no-op
+        is strictly worse than a loud rejection an operator can fix. This
+        matters most because the cluster list is an operator-overridable,
+        green-tier hot-reloadable config leaf, so a typo there would quietly
+        disarm the sufficiency the operator just asked for.
+
+        Compared case-INsensitively because phrase matching itself is
+        (see :func:`~fused_memory.server.near_duplicate_guard.find_matching_topic_cluster`),
+        so a mere case mismatch is not a real error and must not be a
+        spurious config-load failure.
+
+        The message quotes the offending phrase, the owning ``topic_id``,
+        and the known phrase list, so an operator who trips this at load can
+        fix it without reading the source.
+        """
+        known = {phrase.lower() for phrase in self.phrases}
+        for phrase in self.sufficient_phrases:
+            if phrase.lower() not in known:
+                raise ValueError(
+                    f'sufficient_phrases entry {phrase!r} on topic cluster '
+                    f'{self.topic_id!r} is not present in that cluster\'s phrases '
+                    f'({self.phrases!r}). A sufficient phrase must also be a '
+                    f'matchable phrase, or it can never fire -- the matcher only '
+                    f'tests phrases. Comparison is case-insensitive.'
+                )
+        return self
 
     @field_validator('topic_id')
     @classmethod
