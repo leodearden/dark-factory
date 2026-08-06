@@ -271,3 +271,54 @@ class TestDurableArchivePathLookup:
 
         assert durable_archive_path(root, '42', sid) is not None
         assert durable_archive_path(root, '99', sid) is None
+
+    def test_b3_uncompressed_archive_is_found(self, tmp_path):
+        """B3 (I-C): the post-task-3618 plain-``.jsonl`` shape is located too."""
+        root = tmp_path / 'archive'
+        sid = 'sess-b3'
+        task_id = '42'
+
+        archived = _write(root / task_id / ENC / f'{sid}.jsonl', b'plain-bytes')
+
+        assert durable_archive_path(root, task_id, sid) == archived
+
+    def test_b3_both_formats_coexist_under_one_root(self, tmp_path):
+        """B3 (I-C): no flag day — the two shapes may sit side by side.
+
+        Task 3618 drops the gzip; during and after that cutover an archive
+        root holds both shapes for different sessions, and each lookup must
+        return its OWN file. This is exactly why this task carries no
+        dependency on 3618.
+        """
+        root = tmp_path / 'archive'
+        task_id = '42'
+
+        gz = _write(root / task_id / ENC / 'sess-old.jsonl.gz', b'gz-bytes')
+        plain = _write(root / task_id / ENC / 'sess-new.jsonl', b'plain-bytes')
+
+        assert durable_archive_path(root, task_id, 'sess-old') == gz
+        assert durable_archive_path(root, task_id, 'sess-new') == plain
+
+    def test_b3_subagent_directory_is_never_returned(self, tmp_path):
+        """The ``<session_id>/`` subagent DIRECTORY is not "the transcript".
+
+        :func:`_archive_one` mirrors subagent transcripts under a directory
+        NAMED for the session (``<enc>/<sid>/subagents/agent-*.jsonl.gz``).
+        That dir carries no ``.jsonl`` suffix so today's pattern misses it by
+        luck; the ``is_file()`` filter makes returning it structurally
+        impossible.
+        """
+        root = tmp_path / 'archive'
+        sid = 'sess-b3-decoy'
+        task_id = '42'
+
+        main = _write(root / task_id / ENC / f'{sid}.jsonl.gz', b'gz-bytes')
+        _write(
+            root / task_id / ENC / sid / 'subagents' / 'agent-1.jsonl.gz',
+            b'sub-bytes',
+        )
+
+        found = durable_archive_path(root, task_id, sid)
+
+        assert found == main
+        assert found.is_file()
