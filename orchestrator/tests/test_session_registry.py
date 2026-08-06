@@ -11,6 +11,7 @@ tests/scripts/test_spawn_claude.py's bash-level harness.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import fcntl
 import json
 import logging
@@ -679,6 +680,134 @@ def test_set_manual_boost_persists(tmp_path: Path) -> None:
     assert updated.manual_boost == 3
     [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
     assert reread.manual_boost == 3
+
+
+def test_set_decision_escalations_dir_persists_normalized(tmp_path: Path) -> None:
+    """The back-fill's writer (task 3640) normalizes ON THE WAY IN.
+
+    A non-canonical spelling passed by a caller must not be stored raw: the
+    reaper's axis-2 guard compares stored-value against reaper-value, and a
+    dotted/trailing-slash spelling stored verbatim would compare unequal to
+    the very queue it names -- the fail-open direction, so the record would
+    silently never close again. Normalizing here means every writer of this
+    field (write-decision, the back-fill) stores ONE spelling.
+    """
+    rec = _make_decision(id='dec-setescdir')
+    sr.write_decision(rec, root=tmp_path)
+    queue = tmp_path / 'escalations'
+    queue.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'escalations') + '/'
+    assert dotted != str(queue)
+
+    updated = sr.set_decision_escalations_dir(rec.id, dotted, root=tmp_path)
+
+    assert updated is not None
+    assert updated.escalations_dir == sr.normalize_escalations_dir(queue)
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.normalize_escalations_dir(queue)
+
+
+def test_set_decision_escalations_dir_stores_the_unknown_sentinel_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The composition that matters: sentinel in, sentinel on disk.
+
+    This is the one path the back-fill uses for every record whose owning
+    queue it could not determine. If the writer's normalize step turned the
+    sentinel into a cwd-relative path (the bug fixed in step-2), the live
+    fleet would end up with hundreds of records stamped
+    '/home/leo/src/dark-factory/.worktrees/3640/<unknown>' -- a value that
+    both lies about the record and varies with whoever ran the migration.
+    Running under chdir pins that the stored value is cwd-INdependent.
+    """
+    monkeypatch.chdir(tmp_path)
+    rec = _make_decision(id='dec-setescdir-unknown')
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+
+    assert updated is not None
+    assert updated.escalations_dir == sr.UNKNOWN_QUEUE
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.UNKNOWN_QUEUE
+
+
+def test_set_decision_escalations_dir_preserves_every_other_field(tmp_path: Path) -> None:
+    """A read-modify-write must modify exactly ONE field.
+
+    write_decision rewrites the whole file, so a dropped/defaulted field in
+    the round-trip is silent data loss -- and the back-fill runs this over the
+    entire open cockpit population at once, where losing e.g. `options` or
+    `manual_boost` would quietly degrade real human gates. _make_decision
+    gives every field a distinguishable value precisely so this can catch it.
+    """
+    rec = _make_decision(id='dec-setescdir-preserve', state=sr.DecisionState.OPEN)
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+
+    assert updated is not None
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread == dataclasses.replace(rec, escalations_dir=sr.UNKNOWN_QUEUE)
+    # Spelled out as well as compared wholesale, so a failure names the field.
+    assert reread.state == sr.DecisionState.OPEN
+    assert reread.manual_boost == rec.manual_boost
+    assert reread.severity == rec.severity
+    assert reread.escalation_id == rec.escalation_id
+    assert reread.session_id == rec.session_id
+    assert reread.task_id == rec.task_id
+    assert reread.options == rec.options
+    assert reread.text == rec.text
+    assert reread.filed_at == rec.filed_at
+    assert reread.project == rec.project
+
+
+def test_set_decision_escalations_dir_fail_soft_on_unknown_id(tmp_path: Path) -> None:
+    """Same fail-soft contract as its two siblings: None, never a raise.
+
+    The back-fill reads the whole decision list and then writes each id back;
+    a record closed or removed by a live watcher in between is expected, not
+    exceptional, and must not abort a migration mid-population.
+    """
+    assert sr.set_decision_escalations_dir('no-such-id', '/tmp/q', root=tmp_path) is None
+
+
+def test_set_decision_escalations_dir_fail_soft_on_corrupt_body(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A corrupt on-disk body returns None (logged at ERROR), not a traceback."""
+    corrupt_path = sr.decision_path_for_id('dec-setescdir-corrupt', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.set_decision_escalations_dir('dec-setescdir-corrupt', '/tmp/q', root=tmp_path)
+
+    assert result is None
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_set_decision_escalations_dir_is_repeatable(tmp_path: Path) -> None:
+    """Called twice on the same id it simply succeeds twice (last write wins).
+
+    The back-fill is re-runnable by design, and the lock is a stable sidecar
+    the first call creates -- so a second call must not trip over its own
+    lock file. The locking contract itself is covered by TestDecisionIdLock;
+    this only pins that repeated calls compose.
+    """
+    rec = _make_decision(id='dec-setescdir-twice')
+    sr.write_decision(rec, root=tmp_path)
+
+    first = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+    second = sr.set_decision_escalations_dir(rec.id, tmp_path / 'q', root=tmp_path)
+
+    assert first is not None
+    assert second is not None
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.normalize_escalations_dir(tmp_path / 'q')
 
 
 def test_decisions_are_per_file_isolated(tmp_path: Path) -> None:
