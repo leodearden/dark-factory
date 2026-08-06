@@ -139,7 +139,7 @@ Other top-level dirs:
      dark-factory-orchestrator.yaml. Pinned by
      tests/scripts/test_contributing_lint_command_drift.py — widen the yaml
      head and this line goes red until it is updated to match. -->
-- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard`
+- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills`
 <!-- lint-command-mirror:end -->
 - **Type-check** (pyright, run from each configured package directory so it
   picks up that package's `[tool.pyright]` block):
