@@ -93,10 +93,9 @@ import digest  # noqa: E402
 import inventory  # noqa: E402
 import sampling  # noqa: E402
 from legibility import census_trigger  # noqa: E402
-from shared.cap_markers import (  # noqa: E402
-    BLOCKING_BANNER_MARKERS,
-    looks_like_blocking_banner,
-)
+# The banner marker list itself lives in shared.cap_markers and is never
+# restated here -- this module only asks the question, via the predicate.
+from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 
 import config  # noqa: E402
 
@@ -365,26 +364,6 @@ def render_matrix(matrix: dict[str, dict[str, int]]) -> str:
 # preflight_headroom — cheap usage-headroom probe (PRD decision 5: no
 # usage API assumed -- one tiny call, scan its reply for a banner)
 # ---------------------------------------------------------------------------
-
-_HEADROOM_BANNER_MARKERS = BLOCKING_BANNER_MARKERS
-"""Case-insensitive substrings that mark a usage-limit/auth banner reply
-from the headless `claude` CLI, rather than a genuine model response.
-
-A CONTRACT owned by ``shared.cap_markers``, not a literal to be edited
-here. This name is kept only as an alias so a reader following the old
-spelling still lands somewhere real; the list itself is validated against
-verbatim real-CLI transcripts (``REAL_CLI_CAP_MESSAGES``) by both
-``shared/tests/test_cap_markers.py`` and this module's own tests.
-
-It used to be a four-entry literal here -- 'usage limit', 'rate limit',
-'please run /login', 'invalid api key' -- which missed
-"You've hit your weekly limit · resets Aug 5, 11am" entirely, so a weekly
-cap passed this probe and every verify call after it was fail-closed
-rejected as an ordinary verdict (task 3645). A near-identical list already
-existed in shared/tests/_capacity_skip.py with the right coverage, but it
-was test-only and unreachable from here. Add a newly-observed cap phrasing
-to the corpus in ``shared.cap_markers``, with a transcript to cite, and
-both suites go red until the markers cover it."""
 
 _HEADROOM_PROBE_PROMPT = "ping"
 """The tiny probe prompt -- a cheap single round trip, not a real mining
@@ -1105,7 +1084,14 @@ class CensusOutcome:
     ordinary run in which the verifier genuinely rejected everything."""
 
 
-def _defer(stage: str, reason: str | None, *, escalate_fn, unverified: int = 0) -> CensusOutcome:
+def _defer(
+    stage: str,
+    reason: str | None,
+    *,
+    escalate_fn,
+    verified: int = 0,
+    unverified: int = 0,
+) -> CensusOutcome:
     """Abort the census at *stage*: log loudly, escalate, return the outcome.
 
     ONE owner of the deferral shape, so the preflight gate, the
@@ -1124,9 +1110,14 @@ def _defer(stage: str, reason: str | None, *, escalate_fn, unverified: int = 0) 
 
     detail = reason
     if stage != "preflight":
+        # BOTH counts. They size the interruption from either side, which is
+        # what tells "capped on cluster 2 of 5" apart from "capped before a
+        # single cluster was adjudicated" -- the stage-boundary gate always
+        # reports 0 verified, an in-verify abort reports where it got to.
         detail = (
             f"{reason}\n\n"
-            f"{unverified} novel cluster(s) were NOT verified. Nothing was "
+            f"{verified} novel cluster(s) were verified before the cap; "
+            f"{unverified} were NOT verified. Nothing was "
             "persisted: no report, no matrix, no codebook merge, no filed "
             "tasks, and last_census_at was NOT advanced -- so this window "
             "WILL be re-mined and these sightings are not lost. The mining "
@@ -1141,7 +1132,7 @@ def _defer(stage: str, reason: str | None, *, escalate_fn, unverified: int = 0) 
             severity="info",
             summary=(
                 f"legibility census deferred at the {stage} stage "
-                f"({unverified} cluster(s) unverified): {reason}"
+                f"({verified} cluster(s) verified, {unverified} unverified): {reason}"
                 if stage != "preflight"
                 else f"legibility census deferred: {reason}"
             ),
@@ -1467,6 +1458,7 @@ def run_census(
             "verify",
             f"headroom exhausted during verification: {exc.reason}",
             escalate_fn=escalate_fn,
+            verified=exc.verified,
             unverified=exc.unverified,
         )
     # The default verifier probes internally (detectors (a)/(b)/(c)) and
@@ -2612,7 +2604,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if outcome.status == "deferred":
-        print(f"census: deferred -- {outcome.reason}")
+        # The FIELDS, not only the prose. The two defer flavours read much the
+        # same in `reason` but cost an operator completely different things: a
+        # preflight defer spent nothing, a verify defer sank the whole mining
+        # spend and left N clusters unadjudicated (re-mined next run, never
+        # lost). Printing neither hides that from the person watching the run.
+        print(
+            f"census: deferred -- stage={outcome.deferred_stage} "
+            f"unverified_clusters={outcome.unverified_clusters} -- {outcome.reason}"
+        )
         return 0
 
     if outcome.dry_run is not None:

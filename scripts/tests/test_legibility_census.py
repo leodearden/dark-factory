@@ -3671,6 +3671,10 @@ def test_run_census_aborts_cleanly_on_mid_verify_headroom_exhaustion(tmp_path, c
     blob = (call.get("summary") or "") + (call.get("detail") or "")
     assert "verify" in blob.lower()
     assert "4" in blob, "the escalation names the unverified count"
+    # BOTH counts, so the escalation sizes what the cap interrupted from
+    # either side -- CensusHeadroomExhausted carries `verified` precisely so
+    # an operator can tell "capped on cluster 2 of 5" from "capped on 5 of 5".
+    assert "1 cluster(s) verified" in blob, "and the count adjudicated BEFORE the cap"
 
 
 def test_run_census_calls_verify_fn_once_with_the_full_cluster_list(tmp_path):
@@ -3997,6 +4001,47 @@ def test_default_verify_fn_backstop_treats_a_raising_probe_as_no_headroom():
     assert exc.verified == 5
     assert exc.unverified == 7
     assert "raised" in (exc.reason or "").lower()
+
+
+def test_main_deferred_output_names_the_stage_and_the_unverified_count(tmp_path, monkeypatch, capsys):
+    """The CLI's deferred line must print the FIELDS, not only the prose.
+
+    `outcome.reason` reads much the same for the two defer flavours, but they
+    cost an operator completely different things: a preflight defer spent
+    nothing, a verify defer sank the whole mining spend and left N clusters
+    unadjudicated. deferred_stage/unverified_clusters exist to make that
+    distinguishable by field -- printing neither hides it from the one person
+    watching the run.
+    """
+    (tmp_path / "docs" / "legibility").mkdir(parents=True)
+    (tmp_path / "docs" / "legibility" / "legibility.yaml").write_text(
+        "project_id: dark_factory\n"
+        f"project_root: {tmp_path}\n"
+        "escalation_port: 8103\n"
+        "cwd_prefixes:\n"
+        f"  - {tmp_path}\n",
+        encoding="utf-8",
+    )
+
+    def fake_run_census(**kwargs):
+        return mod.CensusOutcome(
+            status="deferred",
+            reason="headroom exhausted during verification: probe reports no capacity",
+            deferred_stage="verify",
+            unverified_clusters=7,
+        )
+
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    # --force must never reach the trigger gate.
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+
+    out = capsys.readouterr().out
+    assert "deferred" in out
+    assert "stage=verify" in out, "WHICH gate fired"
+    assert "unverified_clusters=7" in out, "and how much work it interrupted"
+    assert "probe reports no capacity" in out, "the reason prose is still there"
 
 
 def test_default_verify_fn_unparseable_banner_treats_a_raising_probe_as_no_headroom():

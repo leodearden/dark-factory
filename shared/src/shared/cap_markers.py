@@ -82,8 +82,9 @@ AUTH_BANNER_MARKERS: tuple[str, ...] = (
     'please run /login',
     'invalid api key',
 )
-"""Auth banners.  Lifted from the census's original
-``_HEADROOM_BANNER_MARKERS``.  Kept as a SEPARATE tuple from the capacity
+"""Auth banners.  Lifted from the census's original four-entry marker literal
+(deleted with task 3645's amendment pass, which left this module the only
+home).  Kept as a SEPARATE tuple from the capacity
 markers because the two consumers want different sets — merging them would
 silently convert every auth failure in ``test_cli_invoke_integration.py``
 from a red test into a skip."""
