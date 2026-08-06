@@ -15,7 +15,6 @@ import hashlib
 import inspect
 import json
 import logging
-import re
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -24,6 +23,7 @@ from typing import Any, Literal
 from graphiti_core.errors import EdgeNotFoundError
 
 from fused_memory.services.memory_service import MemoryNotFoundError
+from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -503,14 +503,14 @@ def _stat_type_mismatch_error(key: str) -> dict[str, str]:
 # cite_* error helpers (task β)
 # ---------------------------------------------------------------------------
 
-# Compiled UUID shape gate: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
-# re.IGNORECASE: Graphiti/Neo4j and mem0 do not normalise UUID case on read-back,
-# and Python's stdlib uuid.UUID accepts mixed case — rejecting uppercase here would
-# mask real edges/memories as malformed before the service is even called.
-_UUID_RE = re.compile(
-    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-    re.IGNORECASE,
-)
+# The UUID shape gate below is `is_full_uuid` from utils/validation.py (task
+# 3132) — the same predicate delete_memory's guards and citation_verifier's
+# forwarding-pointer guard answer through, per INV-5.  It replaced a local
+# anchored regex that ACCEPTED a canonical id with a trailing newline, because
+# Python's `$` matches immediately before one; such an id passed this gate and
+# then resolved to nothing.  Only the shape predicate is shared — the
+# `invalid_uuid_shape` / `ReconReportInvalidUuid` envelope below stays this
+# module's own.
 
 _ERR_FINDING_UNKNOWN: dict[str, str] = {
     'error': 'finding_unknown',
@@ -1665,7 +1665,7 @@ class ReconReportState:
             return _ERR_FINDING_UNKNOWN.copy()
         finding_entry, finding = resolved
 
-        if not _UUID_RE.match(edge_uuid):
+        if not is_full_uuid(edge_uuid):
             return _ERR_INVALID_UUID_SHAPE.copy()
 
         if self._memory_service is None:
@@ -1874,7 +1874,7 @@ class ReconReportState:
             return _ERR_FINDING_UNKNOWN.copy()
         finding_entry, finding = resolved
 
-        if not _UUID_RE.match(memory_id):
+        if not is_full_uuid(memory_id):
             return _ERR_INVALID_UUID_SHAPE.copy()
 
         if self._memory_service is None:
@@ -1955,7 +1955,7 @@ class ReconReportState:
             return _ERR_FINDING_UNKNOWN.copy()
         finding_entry, finding = resolved
 
-        if not _UUID_RE.match(cited_run_id):
+        if not is_full_uuid(cited_run_id):
             return _ERR_INVALID_UUID_SHAPE.copy()
 
         if self._memory_service is None:
