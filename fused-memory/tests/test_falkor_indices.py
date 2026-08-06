@@ -59,9 +59,14 @@ def _upstream_statements() -> list[str]:
     zero-unparsed-remainder assertion compares the parser against upstream
     rather than against itself.
     """
-    return list(get_range_indices(GraphProvider.FALKORDB)) + list(
-        get_fulltext_indices(GraphProvider.FALKORDB)
-    )
+    # A list DISPLAY, not list() + list(): graphiti annotates both getters as
+    # list[LiteralString], and list[LiteralString] is not assignable to list[str]
+    # because list is invariant.  Unpacking into a display lets the declared
+    # return type drive inference, so the elements widen to str as intended.
+    return [
+        *get_range_indices(GraphProvider.FALKORDB),
+        *get_fulltext_indices(GraphProvider.FALKORDB),
+    ]
 
 # --- The measured FalkorDB RANGE forms, verbatim ---------------------------
 
@@ -355,7 +360,12 @@ class TestPlainEnumGotcha:
         assert GraphProvider.FALKORDB != 'falkordb'
 
     def test_bare_string_silently_returns_the_neo4j_set(self):
-        neo4j_statements = get_range_indices('falkordb')
+        # The suppression below is load-bearing, not cleanup debt.  pyright is
+        # RIGHT that 'falkordb' is the wrong type -- and that static-only
+        # rejection is precisely the gotcha this class pins: nothing rejects it
+        # at RUNTIME, where it quietly yields the neo4j set instead.  The
+        # deliberate mis-call has to survive type-checking to be exercised.
+        neo4j_statements = get_range_indices('falkordb')  # pyright: ignore[reportArgumentType]
         assert len(neo4j_statements) == 27
         assert all('IF NOT EXISTS' in s for s in neo4j_statements)
 
@@ -366,7 +376,8 @@ class TestPlainEnumGotcha:
         assert not any('IF NOT EXISTS' in s for s in falkor_statements)
 
     def test_the_neo4j_set_is_unparseable_which_is_what_makes_it_a_tripwire(self):
-        for statement in get_range_indices('falkordb'):
+        # Deliberate mis-call again -- see test_bare_string_silently_returns_the_neo4j_set.
+        for statement in get_range_indices('falkordb'):  # pyright: ignore[reportArgumentType]
             with pytest.raises(UnparsedIndexStatementError):
                 parse_index_statement(statement)
 
