@@ -58,8 +58,8 @@ class TestIdentityLockFor:
 class TestResolveOrCreateEntityResolve:
     """GraphitiBackend._resolve_or_create_entity(name, *, group_id) — 0/1-match
     resolve/no-op fast path (no collapse machinery), mirroring the
-    TestMergeEntities.backend_with_mocks orchestration-mock pattern
-    (test_merge_entities.py:154)."""
+    TestMergeEntities.backend_with_mocks orchestration-mock pattern in
+    test_merge_entities.py."""
 
     @pytest.fixture
     def backend_with_mocks(self, mock_config, make_backend):
@@ -111,8 +111,8 @@ class TestResolveOrCreateEntityCollapse:
     """GraphitiBackend._resolve_or_create_entity(name, *, group_id) — >=2-match
     collapse path: folds every non-survivor duplicate into the survivor-first
     match from find_duplicate_entity_nodes via merge_entities, mirroring the
-    TestMergeEntities.backend_with_mocks orchestration-mock pattern
-    (test_merge_entities.py:154)."""
+    TestMergeEntities.backend_with_mocks orchestration-mock pattern in
+    test_merge_entities.py."""
 
     @pytest.fixture
     def backend_with_mocks(self, mock_config, make_backend):
