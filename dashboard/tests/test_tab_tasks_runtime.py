@@ -65,6 +65,19 @@ def fmt_age_body(tab_tasks_jsx_body):
     return _extract_function_body(tab_tasks_jsx_body, 'fmtAge')
 
 
+@pytest.fixture(scope='module')
+def tasks_tab_body(tab_tasks_jsx_body):
+    """TasksTab's own source text.
+
+    CAVEAT: TasksTab is the LAST top-level function in tab_tasks.jsx, so
+    ``_extract_function_body`` returns everything from its declaration to EOF.
+    That still excludes TaskDetail / TaskGraph / PrdBox (better than
+    whole-file scoping), but do NOT use this fixture to prove a string is
+    ABSENT from other components — it cannot.
+    """
+    return _extract_function_body(tab_tasks_jsx_body, 'TasksTab')
+
+
 class TestTaskDetailRuntimeFields:
     """TaskDetail must mirror OrchTab's offline-'—' degradation for
     loops/attempts, and additionally surface lane/phase/lane_state (task
@@ -118,7 +131,82 @@ class TestRuntimeFmtDestructureIncludesRtAge:
     degradation for the `started` field."""
 
     def test_destructure_includes_rtage(self, tab_tasks_jsx_body):
-        assert re.search(r'const\s*\{\s*rtCell\s*,\s*rtAge\s*\}\s*=\s*window\.DF_RUNTIME_FMT', tab_tasks_jsx_body)
+        # Tolerates additional names after rtAge (task 3517 adds rtProbe /
+        # rtProbeSummary) while still pinning that BOTH rtCell and rtAge are
+        # destructured — the contract this test exists for.
+        assert re.search(
+            r'const\s*\{\s*rtCell\s*,\s*rtAge\s*[,}][^=]*=\s*window\.DF_RUNTIME_FMT',
+            tab_tasks_jsx_body,
+        )
+
+
+class TestRuntimeFmtDestructureIncludesProbeHelpers:
+    """window.DF_RUNTIME_FMT must also expose the probe-status helpers at the
+    top-level destructure (task 3517). Without them the Tasks tab renders all
+    three probe failure modes as identical blank cells, which is exactly the
+    2026-07-30 misdiagnosis."""
+
+    def test_destructure_includes_rtprobe(self, tab_tasks_jsx_body):
+        assert re.search(
+            r'const\s*\{[^}]*\brtProbe\b[^}]*\}\s*=\s*window\.DF_RUNTIME_FMT',
+            tab_tasks_jsx_body,
+        )
+
+    def test_destructure_includes_rtprobesummary(self, tab_tasks_jsx_body):
+        assert re.search(
+            r'const\s*\{[^}]*\brtProbeSummary\b[^}]*\}\s*=\s*window\.DF_RUNTIME_FMT',
+            tab_tasks_jsx_body,
+        )
+
+
+class TestTaskDetailSurfacesProbeStatus:
+    """TaskDetail must say WHY loops/attempts/lane/phase are dashed, not just
+    dash them (task 3517)."""
+
+    def test_routes_runtime_status_through_rtprobe(self, task_detail_body):
+        assert re.search(r'rtProbe\(\s*task\.runtime_status', task_detail_body)
+
+    def test_runtime_kv_label_present(self, task_detail_body):
+        assert re.search(r'className="k">runtime<', task_detail_body)
+
+    def test_stable_testid_hook_present(self, task_detail_body):
+        assert 'data-testid="task-runtime-probe"' in task_detail_body
+
+    def test_badge_tone_comes_from_the_descriptor(self, task_detail_body):
+        """The colour must follow the descriptor's `tone`, not be hard-coded —
+        otherwise 'no runtime endpoint' (expected) would look as alarming as
+        'orchestrator unreachable' (a real fault)."""
+        assert re.search(r'badge\s*\$\{\s*\w+\.tone\s*\}|badge\s*\'\s*\+\s*\w+\.tone', task_detail_body)
+
+
+class TestTasksTabRuntimeProbeBanner:
+    """TasksTab must surface an aggregate probe banner, distinct from the
+    existing fused-memory offline banner (task 3517)."""
+
+    def test_calls_rtprobesummary(self, tasks_tab_body):
+        assert 'rtProbeSummary(' in tasks_tab_body
+
+    def test_banner_testid_present(self, tasks_tab_body):
+        assert 'data-testid="tasks-runtime-probe-banner"' in tasks_tab_body
+
+    def test_both_banners_exist_and_are_distinct(self, tab_tasks_jsx_body):
+        """A starved-dashboard probe failure is NOT a fused-memory outage —
+        the two banners answer different questions and must not be merged."""
+        assert 'data-testid="tasks-offline-banner"' in tab_tasks_jsx_body
+        assert 'data-testid="tasks-runtime-probe-banner"' in tab_tasks_jsx_body
+
+    def test_probe_banner_is_not_gated_on_tasks_offline(self, tasks_tab_body):
+        """The probe banner must render on its own condition — gating it on
+        tasksOffline would hide a runtime-probe failure whenever fused-memory
+        happens to be up, which is the common case."""
+        match = re.search(
+            r'\{\s*([A-Za-z0-9_.&!? ]*?)\s*&&\s*\(\s*\n?\s*<div[^>]*data-testid="tasks-runtime-probe-banner"',
+            tasks_tab_body,
+        )
+        assert match is not None, 'probe banner should render under its own && guard'
+        assert 'tasksOffline' not in match.group(1), (
+            f'probe banner must not be gated on tasksOffline; guard was {match.group(1)!r}'
+        )
 
 
 class TestGraphNodeAgeRoutesThroughRtAge:

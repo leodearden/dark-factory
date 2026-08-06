@@ -689,7 +689,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 42,
+    """All /static/redux/*?v= cache-busters must share a single version >= 44,
     and graph_layout.js / prd_grouping.js / task_status_counts.js /
     runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
     must all be among the versioned assets.
@@ -699,11 +699,15 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     floor, which needs no uniformity precondition to be sound (the OLDEST
     asset is the one that would still serve stale code).
 
-    The floor tracks the newest bump — currently 42, for task 3470's
-    tab_memory_evals.jsx and tab_escalations.jsx fixes. Raising it matters
-    more than a routine bump for the usual reason: an already-open browser
-    holds a cached copy of the BROKEN file, so without a new ?v= the fix
-    never reaches it.
+    The floor tracks the newest bump — currently 44, for task 3517's
+    tab_tasks.jsx / runtime_format.js probe-status rendering. Raising it
+    matters more than a routine bump for the usual reason: an already-open
+    browser holds a cached copy of the BROKEN file, so without a new ?v= the
+    fix never reaches it. Here the cached copy renders "orchestrator
+    unreachable", "the dashboard was too starved to ask", and "no runtime
+    endpoint configured" as three IDENTICAL blank cells — precisely the
+    ambiguity that got the 2026-07-30 event misdiagnosed as an orchestrator
+    outage.
     """
     versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
     assert len(versions) == 1, (
@@ -711,10 +715,12 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = next(iter(versions))
-    assert v >= 42, (
-        f'index.html cache-buster version is {v}, expected >= 42 — the bump '
-        "that carries task 3470's tab_memory_evals.jsx and tab_escalations.jsx "
-        'fixes to already-open browsers.'
+    assert v >= 44, (
+        f'index.html cache-buster version is {v}, expected >= 44 — the bump '
+        "that carries task 3517's runtime-probe status rendering "
+        '(tab_tasks.jsx + runtime_format.js) to already-open browsers, which '
+        'would otherwise keep showing all three probe failure modes as '
+        'identical blank cells.'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
