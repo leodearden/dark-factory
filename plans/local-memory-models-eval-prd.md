@@ -7,6 +7,42 @@ records. Production cutover (LLM) and the embedding backfill/migration are **fol
 authored only after — and gated on — the verdicts.** They are deliberately unfiled today and are
 not counted as G1 consumers of anything here.
 
+> **Amendment 2026-08-06 (task 3748)** — the operating VRAM budget is the MEASURED ~16.4 GiB, not
+> the nominal 19–20GB this PRD was authored against. See D10.
+>
+> Applied corrections (2026-08-06, task 3748):
+> - Task 3720 (LME-η, pending) — **correction**: VRAM-budget bullet updated to the measured figure;
+>   MoE-sizing sentence updated twice — first to record the sizing question the correction opened,
+>   then (once α step 22 ruled) to the pinned Gemma QAT arm at 13.27 GiB. See Open Q3.
+> - Task 3721 (LME-θ, pending) — **insertion**: no VRAM figure existed; one bullet added.
+> - Task 3713 (LME-α; **in-progress** when this amendment was written, **`blocked`** — steward
+>   re-escalated to a human, no active claimant — as of this re-check) — its task **record** was
+>   deliberately not edited by this task; its **code** no longer needs editing. The code claim below
+>   is pinned to `task/3713` @ `b3745f5a5c`
+>   (2026-08-06T06:35:56+01:00; locator: `scripts/local-model-serving/lms_vram.py`, function
+>   `evaluate_budget` — the README's own section on this was still titled `OPEN: the budget verdict's
+>   subject is miscalibrated` at that exact SHA, renamed to `RESOLVED: the budget verdict's subject`
+>   only by the branch's later tip, so the function is the stable locator here, not the heading),
+>   which is **not yet on `main`** — re-read the branch tip before relying on them.
+>   - *Code — resolved.* α step 23 landed the verdict-**subject** correction (esc-3713-6).
+>     `lms_vram.evaluate_budget(used_mib, total_mib, *, baseline_mib, baseline_free_mib)` now judges
+>     the **arm's own footprint** (`used − baseline`) against the free VRAM measured immediately
+>     before that arm started. No nominal-ceiling parameter remains on that path, and
+>     `lms_healthcheck.py` passes a live per-arm baseline rather than relying on a default. This
+>     matches `arm_fits`, which already gated each arm against measured free VRAM. An earlier
+>     revision of this amendment asserted the opposite (that a `NOMINAL_CEILING_GIB = 19.5` default
+>     was still enforced against **total** card usage) and instructed α reviewers to disbelieve a
+>     healthcheck PASS on that basis. That instruction was wrong and is **withdrawn**: judge α's
+>     healthcheck output on its merits.
+>   - *Task record — now corrected too, independently of this task.* A fresh re-check (`get_task`,
+>     this amendment pass) shows 3713's `description` and `metadata.user_observable_signal` **no
+>     longer** read "19–20GB" — both now state the measured ~16.4 GiB figure, and 3713's own metadata
+>     cites this task as the source (`vram_budget_correction_source_task: 3748`,
+>     `vram_budget_corrected_at: 2026-08-06T06:04:00Z`). This task did not make that edit — it
+>     deliberately left 3713's record alone while 3713 was in-progress and live-claimed (see design
+>     decisions) — so someone or something else brought it in line first. No follow-up task is filed
+>     for this: the fix a follow-up would have requested is already done.
+
 ## Goal
 
 Two evidence-backed, pre-registered verdicts, each observable as a committed decision record plus
@@ -124,7 +160,7 @@ llama.cpp only, see hazard):
 | Qwen3.5-9B | dense, Q4/AWQ | ~6GB | IFEval 91.5, BFCL-V4 66.1 (official card) — best published conformance-adjacent scores; huge KV headroom |
 | Mistral-Small-3.2-24B | dense, AWQ | ~14GB | mature quant ecosystem; release targeted stronger function calling |
 | Phi-4 14B | dense, Q4 | ~9GB | SOB Value Accuracy 0.798 (top small model); **16K ctx — screening must verify graphiti's longest prompts fit** |
-| MoE stretch: Qwen3.6-35B-A3B or Gemma-4-26B-A4B | GGUF IQ4/Q4 | ~17GB | 115–133 tok/s on a 3090 (6× dense-on-vLLM) — but llama.cpp silently falls back to *unconstrained* output on Pydantic `$ref`/`$defs` schemas (llama.cpp #21228), so this arm runs `json_object` mode + a hard client-side validator; tightest VRAM |
+| MoE stretch: ~~Qwen3.6-35B-A3B or~~ **Gemma-4-26B-A4B-it (QAT)** | ~~GGUF IQ4/Q4~~ **`UD-Q4_K_XL`** | ~~≈17GB (Qwen IQ4 — real, but 16.51 GiB of weights before KV, so it does not fit the measured 16.4 GiB)~~ → **13.27 GiB, fits** (α step 22, Open Q3; `task/3713` @ `a161c2858b`, not yet on `main`) | 115–133 tok/s on a 3090 (6× dense-on-vLLM) — but llama.cpp silently falls back to *unconstrained* output on Pydantic `$ref`/`$defs` schemas (llama.cpp #21228), so this arm runs `json_object` mode + a hard client-side validator; tightest VRAM |
 
 Embedding arms (serving: TEI or vLLM-pooling, OpenAI-compatible `/v1/embeddings` — screening picks;
 incumbent `text-embedding-3-small` runs as its own arm):
@@ -163,6 +199,44 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
 9. **Scratch-graph guard is a hard rejection**: harness writes only to `evalmem_`-prefixed
    group_ids; anything else raises a typed error, and the boundary test observes the rejection fire.
 10. **whisper-writer stays resident** (Leo): all capacity math against ~19–20GB, not 24GB.
+    - **Superseded 2026-08-06 — the operative figure is the measured ~16.4 GiB, not the ~19–20GB in
+      the ruling above (kept verbatim by design — see the plan's design decisions).** Direct
+      measurement (task 3748, pre-1): `nvidia-smi --query-gpu=memory.total,memory.used,memory.free`
+      → `24576, 7309, 16813` MiB ⇒ **16.42 GiB free** (consistent with the architect's plan-time
+      reading of `24576, 7312, 16811` MiB ⇒ 16.42 GiB, and with the task-3713 steward's 2026-08-05
+      reading; small drift across readings is normal desktop jitter, not signal).
+    - **Why the nominal figure was wrong (the mechanism):** `nvidia-smi --query-compute-apps`
+      enumerates only CUDA *compute* applications — here exactly one row, whisper-writer at
+      4050 MiB — and does **not** enumerate the KDE/X11 desktop's graphics contexts at all. The
+      remaining **~3.18 GiB (3259 MiB, measured — task 3748 pre-1; other readings across this doc
+      land at 3259–3262 MiB, consistent within desktop jitter)** is that desktop. Therefore any
+      `24GB − whisper-writer` arithmetic overstates headroom by that same ~3.18 GiB on a host running
+      a desktop session; the nominal 19–20GB was an **arithmetic derivation**, never a measurement.
+    - The ruling above (whisper-writer stays resident) is **unchanged** — only the capacity number
+      it implies is corrected.
+    - **Consequence** (not a decision — see Open Q3): on a **weights-only** basis — the same basis
+      that disqualifies the MoE arm below — the three dense LLM arms (~6, ~9, ~14 GiB) and all
+      embedding arms fit inside ~16.4 GiB; the MoE stretch arm as then specified (~17GB, i.e.
+      Qwen3.6-35B-A3B at IQ4) does not. **Runtime fit is stricter and separate**: vLLM's paged KV
+      cache can balloon well past the weights figure (α's README, `RESOLVED alongside: the pooling
+      arms' KV balloon` — a 0.6B embedding arm declared at 2.0 GiB weights measured 16.2 GiB resident
+      before `--kv-cache-memory` / `_memory_share_for` bounded it), so "fits" for the dense arms is
+      not established here — it is α's to confirm per-arm under that cap. Surfaced at the arm table
+      and Open Q3 rather than decided here — and α step 22 subsequently **resolved** the MoE sizing
+      question against this measured figure by pinning Gemma-4-26B-A4B-it QAT `UD-Q4_K_XL` at
+      13.27 GiB (also weights-only), which fits the same comparison. See Open Q3.
+    - **Subject, made explicit:** ~16.4 GiB above is measured **free** VRAM — the pool an arm's own
+      footprint draws from — and is **not** a ceiling on total card usage. Total usage necessarily
+      includes the ~7.2 GiB whisper-writer + KDE/X11 desktop baseline, so a `total_used ≤ 16.4 GiB`
+      reading is a different, much stricter claim that this correction does **not** make. Which of
+      the two readings α's health verdict enforces was an open question when this correction was
+      written; α resolved it (esc-3713-6, step 23) in favour of the **arm-footprint** reading —
+      `evaluate_budget` judges `used − baseline` against the free VRAM measured just before that arm
+      started. Pinned to `task/3713` @ `b3745f5a5c` (locator: `lms_vram.py::evaluate_budget` — see
+      the banner above for why the function, not a README heading, is the stable pin), **not yet on
+      `main`**; re-read the branch tip rather than treating this line as current.
+    - Cites: memory `c01e7d1b-2916-4a8d-8f6e-c5e42692ce3d` (authoritative measurement),
+      `38a4fcf2-30ba-4884-82f9-412737ddda13` (contradiction resolution).
 11. **Long runs in transient `systemd --user` units**, never bare background shells.
 12. **No conflation-rate metric** — that number is owned (and about to be zeroed) by the
     referent-fidelity PRD; using it would confound both directions.
@@ -189,7 +263,9 @@ Verified-existing substrate: vLLM structured outputs via OpenAI-compatible `json
 `structured_output_mode` in installed graphiti_core 0.28.2 wheel; embedder `base_url` plumbing
 (`graphiti_client.py:533-539`); `shared/memory_eval_metrics` schema home; transcript-query corpus
 tooling; `maintenance/reindex.py` re-embed machinery; episode store (~2,635 dark_factory episodes)
-readable; GPU headroom measured (24GB − ~4GB whisper-writer).
+readable; GPU headroom measured directly (~16.4 GiB free with whisper-writer and the desktop
+resident — see D10; the earlier 24GB − ~4GB derivation overstated it by ~3.18 GiB, D10's pinned
+desktop-baseline figure).
 
 Gaps that are **prerequisite tasks in this batch** (not assumed): LLM `base_url` + client-class
 plumbing (β); Mem0 LLM/embedder `base_url` + `embedding_model_dims` plumbing (β); duration/token
@@ -261,7 +337,7 @@ manifest at decompose time.
 
 | # | Task | Modules | Kind | Signal (user-observable) | Prereqs |
 |---|---|---|---|---|---|
-| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` within the 19–20GB budget | — |
+| **α** | Serving substrate: candidate endpoints as `systemd --user` units (vLLM structured-outputs for dense LLM arms; llama.cpp for the MoE arm; TEI or vLLM-pooling for embedders), weights on disk, VRAM caps set for whisper-writer coexistence, health-check script | ops scripts (`scripts/`), no product code | operational | health script output lists every candidate endpoint answering a schema-constrained completion (LLM) / an embeddings call (embedder) with valid output, and `nvidia-smi` confirms the arm's own footprint fits the measured ~16.4 GiB of free VRAM (D10). NOTE: α resolved the verdict's subject in favour of arm-footprint-vs-free (esc-3713-6, step 23), pinned to `task/3713` @ `b3745f5a5c` — not yet on `main`, so confirm against the branch tip and α's README when judging this signal. | — |
 | **β** | Config + client plumbing: `llm.client_class` knob (`openai`\|`openai_generic`), LLM `base_url` honored (`graphiti_client.py:502-509`), Mem0 LLM/embedder `openai_base_url` + `embedding_model_dims` plumbed (`mem0_client.py:138-167`), reindex tool `base_url` (`reindex.py:160-165`); default config byte-identical behavior | `fused-memory/src/fused_memory` | normal | integration test: a config naming a local base_url + generic client constructs clients that hit a local mock server; with the shipped config, construction is behaviorally unchanged (existing tests green) | — |
 | **γ** | Durable write telemetry: `duration_ms` on `backend_ops` rows (`_journaled_backend_call`, `memory_service.py:1302-1337`) + per-write token usage surfaced from graphiti's `TokenUsageTracker` into the journal `result_summary` | `fused-memory/src/fused_memory` | normal | after any live memory write, the documented read-only sqlite query shows the new row carrying `duration_ms` and token counts — permanent operator observability, consumed by ε and by operators | — |
 | **δ** | Corpus builder: stratified sample (~150–300, size finalized in-task from control-variance needs) of real dark_factory episodes across time and payload kind, explicitly **not** conditioned on incumbent outcome; committed manifest (ids + content hashes + stratification report + the no-outcome-filter statement) | `fused-memory/scripts` (read-only against episode store) | normal | committed corpus manifest; a reviewer can re-derive the sample from the manifest's recorded criteria | — |
@@ -301,8 +377,21 @@ units, the single human hold is the λ operator gate on the standard age-surface
    whatever screening shows serving query-latency best; batch re-embeds may run in-process. Decide in α/ι.
 2. **Phi-4 context fit** — measure graphiti's longest real prompt at screening; drop the arm if it
    doesn't fit with margin. Decide in η.
-3. **MoE stretch-arm engine details** (which of the two models, GGUF quant level, client-side
-   validator placement). Decide in α/η.
+3. **MoE stretch-arm engine details AND sizing** (which of the two models, GGUF quant level,
+   client-side validator placement). The sizing half became live when D10's budget was corrected:
+   the arm's ~17GB estimate does not fit the measured ~16.4 GiB (the comparison had previously been
+   made against the stale 19–20GB nominal figure).
+   **RESOLVED by α step 22 — `unsloth/gemma-4-26B-A4B-it-qat-GGUF`, quant `UD-Q4_K_XL`, 13.27 GiB**
+   (pinned to `task/3713` @ `a161c2858b`, **not yet on `main`** — confirm against the branch tip;
+   full table in `scripts/local-model-serving/README.md` §`Open Q3`). Decided from real GGUF file
+   sizes read from the HF API, **against the measured 16.4 GiB**, which is precisely what the
+   correction in this amendment existed to ensure. The PRD's ~17GB estimate was for Qwen3.6-35B-A3B
+   and is accurate — its smallest true 4-bit quant is 16.51 GiB of weights before a single KV byte,
+   so it *would* have fitted the nominal 19.5 GiB and does not fit the measured 16.4. Gemma's QAT
+   weights are quantization-aware *trained* at 4 bits, so the arm that fits is also the one that
+   does not trade quality to fit. This lands as option (ii) of the four recorded when the question
+   was surfaced (re-quantize / swap model / require the desktop's ~3.18 GiB be freed / drop the
+   arm); nothing needed to be freed and no arm was dropped.
 4. **Corpus size N** (~150–300) from control-variance and wall-clock measured in ζ. Decide in δ/ζ.
 5. **Qwen3-Embedding-4B production-residency estimate** (quantized footprint next to the winning
    LLM) — only needed if 4B wins on quality. Decide in ι/λ.
